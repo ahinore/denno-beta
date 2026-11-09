@@ -6730,6 +6730,8 @@ unsafe impl Send for ExpIqKernels {}
 unsafe impl Sync for ExpIqKernels {}
 
 static EXP_IQ_KERNELS: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
+/// task 190: v2 (`kernels_exp_iq_v2.ptx`)。無いときは v1 へ落ちる。
+static EXP_IQ_KERNELS_V2: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 
 /// PTX の置き場所。`DENNO_EXP_IQ_PTX` があればそれ、無ければクレート配下
 /// `kernels/kernels_exp_iq.ptx`。
@@ -6742,62 +6744,92 @@ fn exp_iq_ptx_path() -> std::path::PathBuf {
     }
 }
 
+/// task 190: v2 の PTX の置き場所 (`DENNO_EXP_IQ_V2_PTX` で差し替え可)。
+fn exp_iq_v2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_IQ_V2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_v2.ptx"),
+    }
+}
+
+/// PTX を読んで関数を引く (失敗は `None` = 呼び出し側が従来経路へ)。
+fn load_exp_iq_module(path: &std::path::Path, tag: &str) -> Option<ExpIqKernels> {
+    let mut image = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "[exp-iq] {tag}: PTX が読めない ({}) : {e} → 従来経路へ",
+                path.display()
+            );
+            return None;
+        }
+    };
+    image.push(0);
+    let lib = lib().ok()?;
+    let mut module: CUmodule = std::ptr::null_mut();
+    unsafe {
+        if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+            eprintln!("[exp-iq] {tag}: cuModuleLoadData 失敗 → 従来経路へ");
+            return None;
+        }
+    }
+    let mut fns: [CUfunction; crate::model::exp_iq::SLOTS] =
+        [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
+    for (i, f) in fns.iter_mut().enumerate() {
+        let name = crate::model::exp_iq::kernel_name(i)?;
+        let mut cname = name.as_bytes().to_vec();
+        cname.push(0);
+        unsafe {
+            if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
+                != CUDA_SUCCESS
+            {
+                eprintln!("[exp-iq] {tag}: PTX に {name} が無い → 従来経路へ");
+                return None;
+            }
+        }
+    }
+    let mut silu: CUfunction = std::ptr::null_mut();
+    let mut cname = crate::model::exp_iq::SILU_KERNEL.as_bytes().to_vec();
+    cname.push(0);
+    unsafe {
+        if (lib.module_get_function)(&mut silu, module, cname.as_ptr() as *const c_char)
+            != CUDA_SUCCESS
+        {
+            eprintln!("[exp-iq] {tag}: PTX に silu が無い → 従来経路へ");
+            return None;
+        }
+    }
+    Some(ExpIqKernels { module, fns, silu })
+}
+
 /// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
 /// (= 二度と試さない。呼び出し側は CPU へ落ちる)。
 fn exp_iq_kernels() -> Option<&'static ExpIqKernels> {
     EXP_IQ_KERNELS
-        .get_or_init(|| {
-            let path = exp_iq_ptx_path();
-            let mut image = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!(
-                        "[exp-iq] PTX が読めない ({}) : {e} → CPU 経路へ",
-                        path.display()
-                    );
-                    return None;
-                }
-            };
-            image.push(0);
-            let lib = lib().ok()?;
-            let mut module: CUmodule = std::ptr::null_mut();
-            unsafe {
-                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
-                    != CUDA_SUCCESS
-                {
-                    eprintln!("[exp-iq] cuModuleLoadData 失敗 → CPU 経路へ");
-                    return None;
-                }
-            }
-            let mut fns: [CUfunction; crate::model::exp_iq::SLOTS] =
-                [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
-            for (i, f) in fns.iter_mut().enumerate() {
-                let name = crate::model::exp_iq::kernel_name(i)?;
-                let mut cname = name.as_bytes().to_vec();
-                cname.push(0);
-                unsafe {
-                    if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
-                        != CUDA_SUCCESS
-                    {
-                        eprintln!("[exp-iq] PTX に {name} が無い → CPU 経路へ");
-                        return None;
-                    }
-                }
-            }
-            let mut silu: CUfunction = std::ptr::null_mut();
-            let mut cname = crate::model::exp_iq::SILU_KERNEL.as_bytes().to_vec();
-            cname.push(0);
-            unsafe {
-                if (lib.module_get_function)(&mut silu, module, cname.as_ptr() as *const c_char)
-                    != CUDA_SUCCESS
-                {
-                    eprintln!("[exp-iq] PTX に silu が無い → CPU 経路へ");
-                    return None;
-                }
-            }
-            Some(ExpIqKernels { module, fns, silu })
-        })
+        .get_or_init(|| load_exp_iq_module(&exp_iq_ptx_path(), "v1"))
         .as_ref()
+}
+
+/// task 190: v2 カーネル (無ければ `None`)。
+fn exp_iq_kernels_v2() -> Option<&'static ExpIqKernels> {
+    EXP_IQ_KERNELS_V2
+        .get_or_init(|| load_exp_iq_module(&exp_iq_v2_ptx_path(), "v2"))
+        .as_ref()
+}
+
+/// decode の層一括 GEMV に使うカーネル一式。
+///
+/// `DENNO_EXP_IQ_V2=1` かつ v2 の PTX が読めたときだけ v2。それ以外は v1
+/// (v2 の PTX が無いときに CPU へ落とさない = 性能だけのゲート)。
+fn exp_iq_kernels_decode() -> Option<&'static ExpIqKernels> {
+    if crate::model::exp_iq::iq_v2_enabled() {
+        if let Some(k) = exp_iq_kernels_v2() {
+            return Some(k);
+        }
+    }
+    exp_iq_kernels()
 }
 
 /// この型・この k を GPU で回せるか。
@@ -7031,7 +7063,7 @@ where
     let Some(ctx) = shared_ctx() else {
         return Ok(false);
     };
-    let Some(kernels) = exp_iq_kernels() else {
+    let Some(kernels) = exp_iq_kernels_decode() else {
         return Ok(false);
     };
     // task 187: 和のカーネル (PTX が無ければ `Ok(false)` = 呼び出し側は従来経路へ)。
@@ -7156,6 +7188,14 @@ where
             dec_exp_kprof::begin_layer(nseg as u32);
             let rb_g = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
             let rb_u = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
+            // task 190: 型 (gate/up/down のスロット) と行数の表に積む
+            // (重みの実バイト数も一緒に数える = GB/s が出せる)。
+            {
+                let rb_d = crate::model::exp_iq::row_bytes(ty_d, ff).unwrap_or(0);
+                let bytes = nseg as u64
+                    * (ff as u64 * (rb_g + rb_u) as u64 + e as u64 * rb_d as u64);
+                dec_exp_kprof::note_kind(slot_g, slot_u, slot_d, nseg, ff, e, bytes);
+            }
             let mut gu = 0usize;
             for (f, ptrs, buf, rb) in [
                 (kernels.fns[slot_g], pg_addr, g, rb_g),
@@ -7858,7 +7898,7 @@ pub fn moe_experts_iq_layer_miss_up(
     let Some(ctx) = shared_ctx() else {
         return Ok(false);
     };
-    let Some(kernels) = exp_iq_kernels() else {
+    let Some(kernels) = exp_iq_kernels_decode() else {
         return Ok(false);
     };
     let Ok(l) = lib() else {
@@ -8198,6 +8238,525 @@ pub fn moe_experts_iq_layer_miss_up(
         crate::model::exp_miss_up::note_copy_ns(copy_ns);
     }
     crate::model::exp_miss_up::note_gpu_ns(t_layer.elapsed().as_nanos() as u64);
+    Ok(true)
+}
+
+// task 190: decode のミス expert を「ページアブル直の非同期 H2D」で GPU へ上げ、
+// ヒットと同じカーネルで計算する (`DENNO_DEC_MISS_FAST`)。
+//
+// task 158 の `moe_experts_iq_layer_miss_up` との違いは転送元だけ:
+//
+//   - task 158: mmap → pinned (ホスト memcpy、1 本 2 MB で 0.1〜0.2 ms) →
+//     `cuMemcpyHtoDAsync` (pinned から)。ホスト memcpy が main スレッドに載る。
+//   - ここ: mmap のまま `cuMemcpyHtoDAsync` に渡す (ドライバが内部の staging を
+//     使う)。main スレッドの memcpy が消える。Gen5 の実測 (19.6 GB/s pageable)
+//     なら 1 本 2 MB で約 0.10 ms をコピーエンジン側だけで払う。
+//
+// ヒット側は task 187 の `dno_dec_exp_sum` でデバイス和にするので、D2H は
+// 「和 e 要素 + ミス n 本 x e」だけ。ミスの寄与はホストで expert index 昇順に
+// 足す (今と同じ順序)。
+//
+// 失敗はすべて `Ok(false)` = 呼び出し側は従来経路 (CPU でミス + 重ね打ち) へ。
+
+/// miss-fast の作業域 (grow-only・スレッドローカル)。
+struct MissFastScratch {
+    /// ミス重みのデバイス置き場 (expert ごとに連結)。
+    dg: Option<DevBuffer>,
+    du: Option<DevBuffer>,
+    dd: Option<DevBuffer>,
+    /// ミス用のポインタ表 / segment 表。
+    pg: Option<DevBuffer>,
+    pu: Option<DevBuffer>,
+    pd: Option<DevBuffer>,
+    sgu: Option<DevBuffer>,
+    sgd: Option<DevBuffer>,
+    /// ミスの gate / up / act / down 出力 (ヒット側と混ぜない)。
+    g: Option<DevBuffer>,
+    u: Option<DevBuffer>,
+    act: Option<DevBuffer>,
+    h: Option<DevBuffer>,
+    /// 和とミス寄与の D2H を受ける pinned。
+    sum_pin: Option<PinMem>,
+    miss_pin: Option<PinMem>,
+    /// 重みの H2D 専用ストリームと完了イベント。
+    stream: Option<CopyStream>,
+    ev_ready: Option<CopyEvent>,
+}
+
+thread_local! {
+    static MISS_FAST: std::cell::RefCell<MissFastScratch> = const {
+        std::cell::RefCell::new(MissFastScratch {
+            dg: None,
+            du: None,
+            dd: None,
+            pg: None,
+            pu: None,
+            pd: None,
+            sgu: None,
+            sgd: None,
+            g: None,
+            u: None,
+            act: None,
+            h: None,
+            sum_pin: None,
+            miss_pin: None,
+            stream: None,
+            ev_ready: None,
+        })
+    };
+}
+
+/// `dno_dec_exp_sum` を 1 発積む (`ph` = 寄与, `pw` = 重み, `po` = 出力)。
+fn iq_launch_sum(
+    ctx: &CudaCtx,
+    f: CUfunction,
+    ph: u64,
+    pw: u64,
+    po: u64,
+    e: usize,
+    nseg: usize,
+) -> Result<()> {
+    const THREADS: usize = 256;
+    if e == 0 {
+        return Ok(());
+    }
+    let blocks = e.div_ceil(THREADS) as u32;
+    unsafe {
+        let (mut ph, mut pw) = (ph, pw);
+        let mut psh = std::ptr::null_mut::<c_void>();
+        let mut psgw = 0.0f32;
+        let mut po = po;
+        let (mut pe, mut pn, mut phs) = (e as c_int, nseg as c_int, 0 as c_int);
+        let mut args = [
+            &mut ph as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut psh as *mut _ as *mut c_void,
+            &mut psgw as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut pe as *mut _ as *mut c_void,
+            &mut pn as *mut _ as *mut c_void,
+            &mut phs as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(
+            f,
+            (blocks.max(1), 1, 1),
+            (THREADS as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// task 190: ミス expert を GPU で計算する (`DENNO_DEC_MISS_FAST`)。
+///
+/// `out_sum` にヒットぶんの重み付き和 (`e` 要素)、`miss_out` にミスぶんの寄与
+/// (`n_miss * e` 要素、`ids_miss` の順) を書く。`Ok(false)` は「やらなかった」。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_layer_sum_miss(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    ids_hit: &[u16],
+    miss: &[MissExpertBytes<'_>],
+    ids_miss: &[u16],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    w_hit: &[f32],
+    out_sum: &mut [f32],
+    miss_out: &mut Vec<f32>,
+) -> Result<bool> {
+    let n_hit = pg.len();
+    let n_miss = miss.len();
+    if n_miss == 0
+        || n_miss > crate::model::exp_miss_up::MAX_MISS
+        || n_hit == 0
+        || pu.len() != n_hit
+        || pd.len() != n_hit
+        || ids_hit.len() != n_hit
+        || ids_miss.len() != n_miss
+        || w_hit.len() != n_hit
+        || n_in == 0
+        || ff == 0
+        || e == 0
+        || x.len() < n_in
+        || out_sum.len() < e
+    {
+        return Ok(false);
+    }
+    if !moe_gemv_iq_ready(ty_g, n_in)
+        || !moe_gemv_iq_ready(ty_u, n_in)
+        || !moe_gemv_iq_ready(ty_d, ff)
+    {
+        return Ok(false);
+    }
+    let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
+        crate::model::exp_iq::slot(ty_g),
+        crate::model::exp_iq::slot(ty_u),
+        crate::model::exp_iq::slot(ty_d),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(plan_gu_hit), Some(plan_d_hit), Some(plan_gu_miss), Some(plan_d_miss)) = (
+        crate::model::exp_iq::launch_plan(n_hit, ff),
+        crate::model::exp_iq::launch_plan(n_hit, e),
+        crate::model::exp_iq::launch_plan(n_miss, ff),
+        crate::model::exp_iq::launch_plan(n_miss, e),
+    ) else {
+        return Ok(false);
+    };
+    let Some(ctx) = shared_ctx() else {
+        return Ok(false);
+    };
+    let Some(kernels) = exp_iq_kernels_decode() else {
+        return Ok(false);
+    };
+    let Some(sumk) = dec_epi_kernels() else {
+        return Ok(false);
+    };
+    let Ok(l) = lib() else {
+        return Ok(false);
+    };
+    let (
+        Some(stream_create),
+        Some(event_create),
+        Some(event_record),
+        Some(stream_wait_event),
+    ) = (
+        l.stream_create,
+        l.event_create,
+        l.event_record,
+        l.stream_wait_event,
+    )
+    else {
+        return Ok(false);
+    };
+    let (Some(rb_g), Some(rb_u), Some(rb_d)) = (
+        crate::model::exp_iq::row_bytes(ty_g, n_in),
+        crate::model::exp_iq::row_bytes(ty_u, n_in),
+        crate::model::exp_iq::row_bytes(ty_d, ff),
+    ) else {
+        return Ok(false);
+    };
+    let (bytes_g, bytes_u, bytes_d) = (rb_g * ff, rb_u * ff, rb_d * e);
+    if miss
+        .iter()
+        .any(|m| m.gate.len() != bytes_g || m.up.len() != bytes_u || m.down.len() != bytes_d)
+    {
+        return Ok(false);
+    }
+    ctx.make_current()?;
+
+    let seg_gu_hit = crate::model::expert_batch::seg_table_shared_x(ids_hit, ff);
+    let seg_d_hit = crate::model::expert_batch::seg_table_per_act(ids_hit, ff, e);
+    let seg_gu_miss = crate::model::expert_batch::seg_table_shared_x(ids_miss, ff);
+    let seg_d_miss = crate::model::expert_batch::seg_table_per_act(ids_miss, ff, e);
+    if seg_gu_hit.len() != seg_d_hit.len() || seg_gu_miss.len() != seg_d_miss.len() {
+        return Ok(false);
+    }
+
+    let nh_hit = n_hit * e;
+    let ng_hit = n_hit * ff;
+    let ng_miss = n_miss * ff;
+    let nh_miss = n_miss * e;
+    IQ_SCRATCH.with(|cell| -> Result<()> {
+        let mut sc = cell.borrow_mut();
+        MoeScratch::ensure_tagged(&mut sc.x, n_in * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.g, ng_hit * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.u, ng_hit * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.act, ng_hit * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.h, nh_hit * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pg, n_hit * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pu, n_hit * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pd, n_hit * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(
+            &mut sc.sgu,
+            seg_gu_hit.len() * 4,
+            crate::mem_audit::TAG_GDN_SC,
+        )?;
+        MoeScratch::ensure_tagged(
+            &mut sc.sgd,
+            seg_d_hit.len() * 4,
+            crate::mem_audit::TAG_GDN_SC,
+        )?;
+        MoeScratch::ensure_tagged(&mut sc.wt, n_hit * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.psum, e * 4, crate::mem_audit::TAG_GDN_SC)?;
+        // ヒットの prologue (同期コピー。数百バイト)。
+        {
+            let xb = sc.x.as_ref().expect("確保済み");
+            xb.copy_from(&x[..n_in])?;
+            dbg_htod(n_in * 4);
+            sc.pg.as_ref().expect("確保済み").copy_from(pg)?;
+            sc.pu.as_ref().expect("確保済み").copy_from(pu)?;
+            sc.pd.as_ref().expect("確保済み").copy_from(pd)?;
+            sc.wt.as_ref().expect("確保済み").copy_from(w_hit)?;
+            sc.sgu.as_ref().expect("確保済み").copy_from(&seg_gu_hit)?;
+            sc.sgd.as_ref().expect("確保済み").copy_from(&seg_d_hit)?;
+            dbg_htod(n_hit * 8 * 3 + n_hit * 4 + (seg_gu_hit.len() + seg_d_hit.len()) * 4);
+        }
+        // ミス側の受け皿と表 (起動前 = 同期コピーが null ストリームを待たない)。
+        MISS_FAST.with(|mcell| -> Result<()> {
+            let mut ms = mcell.borrow_mut();
+            MoeScratch::ensure_tagged(&mut ms.dg, n_miss * bytes_g, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.du, n_miss * bytes_u, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.dd, n_miss * bytes_d, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.pg, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.pu, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.pd, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.g, ng_miss * 4, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.u, ng_miss * 4, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.act, ng_miss * 4, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.h, nh_miss * 4, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(
+                &mut ms.sgu,
+                seg_gu_miss.len() * 4,
+                crate::mem_audit::TAG_GDN_SC,
+            )?;
+            MoeScratch::ensure_tagged(
+                &mut ms.sgd,
+                seg_d_miss.len() * 4,
+                crate::mem_audit::TAG_GDN_SC,
+            )?;
+            Scratch::ensure_pin(&mut ms.sum_pin, e * 4)?;
+            Scratch::ensure_pin(&mut ms.miss_pin, nh_miss * 4)?;
+            if ms.stream.is_none() {
+                const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+                let mut st: CUstream = std::ptr::null_mut();
+                if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+                    bail!("cuStreamCreate (miss fast) が失敗");
+                }
+                let mut ev: CUevent = std::ptr::null_mut();
+                if unsafe { event_create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                    unsafe {
+                        if let Some(f) = l.stream_destroy {
+                            let _ = f(st);
+                        }
+                    }
+                    bail!("cuEventCreate (miss fast) が失敗");
+                }
+                ms.stream = Some(CopyStream(st));
+                ms.ev_ready = Some(CopyEvent(ev));
+            }
+            let (dg_p, du_p, dd_p) = (
+                ms.dg.as_ref().expect("確保済み").ptr,
+                ms.du.as_ref().expect("確保済み").ptr,
+                ms.dd.as_ref().expect("確保済み").ptr,
+            );
+            let tpg: Vec<u64> = (0..n_miss)
+                .map(|j| dg_p + (j * bytes_g) as u64)
+                .collect();
+            let tpu: Vec<u64> = (0..n_miss)
+                .map(|j| du_p + (j * bytes_u) as u64)
+                .collect();
+            let tpd: Vec<u64> = (0..n_miss)
+                .map(|j| dd_p + (j * bytes_d) as u64)
+                .collect();
+            ms.pg.as_ref().expect("確保済み").copy_from(&tpg)?;
+            ms.pu.as_ref().expect("確保済み").copy_from(&tpu)?;
+            ms.pd.as_ref().expect("確保済み").copy_from(&tpd)?;
+            ms.sgu.as_ref().expect("確保済み").copy_from(&seg_gu_miss)?;
+            ms.sgd.as_ref().expect("確保済み").copy_from(&seg_d_miss)?;
+            dbg_htod(n_miss * 8 * 3 + (seg_gu_miss.len() + seg_d_miss.len()) * 4);
+            Ok(())
+        })?;
+
+        // 1. ミス重みの H2D を**ヒットの起動より先**にコピーストリームへ積む。
+        //    転送元は mmap のまま (bounce しない)。
+        MISS_FAST.with(|mcell| -> Result<()> {
+            let ms = mcell.borrow();
+            let stream = ms.stream.as_ref().expect("作成済み").0;
+            let ev = ms.ev_ready.as_ref().expect("作成済み").0;
+            let (dg_p, du_p, dd_p) = (
+                ms.dg.as_ref().expect("確保済み").ptr,
+                ms.du.as_ref().expect("確保済み").ptr,
+                ms.dd.as_ref().expect("確保済み").ptr,
+            );
+            unsafe {
+                for (j, m) in miss.iter().enumerate() {
+                    for (dst, src, bytes) in [
+                        (dg_p + (j * bytes_g) as u64, m.gate.as_ptr(), bytes_g),
+                        (du_p + (j * bytes_u) as u64, m.up.as_ptr(), bytes_u),
+                        (dd_p + (j * bytes_d) as u64, m.down.as_ptr(), bytes_d),
+                    ] {
+                        if (l.memcpy_htod_async)(dst, src as *const c_void, bytes, stream)
+                            != CUDA_SUCCESS
+                        {
+                            bail!("cuMemcpyHtoDAsync (miss fast) が失敗");
+                        }
+                    }
+                }
+                if event_record(ev, stream) != CUDA_SUCCESS {
+                    bail!("cuEventRecord (miss fast) が失敗");
+                }
+            }
+            Ok(())
+        })?;
+
+        let xb = sc.x.as_ref().expect("確保済み");
+        let g = sc.g.as_ref().expect("確保済み");
+        let u = sc.u.as_ref().expect("確保済み");
+        let act = sc.act.as_ref().expect("確保済み");
+        let h = sc.h.as_ref().expect("確保済み");
+        let psum = sc.psum.as_ref().expect("確保済み");
+        // 2. ヒット: gate / up / silu / down / 和 (すべて null ストリーム)。
+        unsafe {
+            dec_exp_kprof::begin_layer(n_hit as u32);
+            {
+                let bytes = n_hit as u64
+                    * (ff as u64 * (rb_g + rb_u) as u64 + e as u64 * rb_d as u64);
+                dec_exp_kprof::note_kind(slot_g, slot_u, slot_d, n_hit, ff, e, bytes);
+            }
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_g],
+                plan_gu_hit,
+                sc.pg.as_ref().expect("確保済み").ptr,
+                xb.ptr,
+                g.ptr,
+                sc.sgu.as_ref().expect("確保済み").ptr,
+                n_hit,
+                n_in,
+                ff,
+                rb_g,
+            )?;
+            dec_exp_kprof::mark(dec_exp_kprof::GATE);
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_u],
+                plan_gu_hit,
+                sc.pu.as_ref().expect("確保済み").ptr,
+                xb.ptr,
+                u.ptr,
+                sc.sgu.as_ref().expect("確保済み").ptr,
+                n_hit,
+                n_in,
+                ff,
+                rb_u,
+            )?;
+            dec_exp_kprof::mark(dec_exp_kprof::UP);
+            iq_launch_silu(ctx, kernels.silu, g.ptr, u.ptr, act.ptr, ng_hit)?;
+            dec_exp_kprof::mark(dec_exp_kprof::SILU);
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_d],
+                plan_d_hit,
+                sc.pd.as_ref().expect("確保済み").ptr,
+                act.ptr,
+                h.ptr,
+                sc.sgd.as_ref().expect("確保済み").ptr,
+                n_hit,
+                ff,
+                e,
+                rb_d,
+            )?;
+            dec_exp_kprof::mark(dec_exp_kprof::DOWN);
+            iq_launch_sum(
+                ctx,
+                sumk.sum,
+                h.ptr,
+                sc.wt.as_ref().expect("確保済み").ptr,
+                psum.ptr,
+                e,
+                n_hit,
+            )?;
+            dec_exp_kprof::mark(dec_exp_kprof::SUM);
+        }
+        // 3. コピー完了を待ってからミスのカーネルを同じストリームへ積む
+        //    (ヒットの計算の裏でコピーが進む)。
+        MISS_FAST.with(|mcell| -> Result<()> {
+            let ms = mcell.borrow();
+            let ev = ms.ev_ready.as_ref().expect("作成済み").0;
+            unsafe {
+                if stream_wait_event(std::ptr::null_mut(), ev, 0) != CUDA_SUCCESS {
+                    bail!("cuStreamWaitEvent (miss fast) が失敗");
+                }
+            }
+            let (mg, mu, mact, mh) = (
+                ms.g.as_ref().expect("確保済み"),
+                ms.u.as_ref().expect("確保済み"),
+                ms.act.as_ref().expect("確保済み"),
+                ms.h.as_ref().expect("確保済み"),
+            );
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_g],
+                plan_gu_miss,
+                ms.pg.as_ref().expect("確保済み").ptr,
+                xb.ptr,
+                mg.ptr,
+                ms.sgu.as_ref().expect("確保済み").ptr,
+                n_miss,
+                n_in,
+                ff,
+                rb_g,
+            )?;
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_u],
+                plan_gu_miss,
+                ms.pu.as_ref().expect("確保済み").ptr,
+                xb.ptr,
+                mu.ptr,
+                ms.sgu.as_ref().expect("確保済み").ptr,
+                n_miss,
+                n_in,
+                ff,
+                rb_u,
+            )?;
+            iq_launch_silu(ctx, kernels.silu, mg.ptr, mu.ptr, mact.ptr, ng_miss)?;
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_d],
+                plan_d_miss,
+                ms.pd.as_ref().expect("確保済み").ptr,
+                mact.ptr,
+                mh.ptr,
+                ms.sgd.as_ref().expect("確保済み").ptr,
+                n_miss,
+                ff,
+                e,
+                rb_d,
+            )?;
+            Ok(())
+        })?;
+        // 4. D2H は 2 本 (和 e 要素 / ミス n 本 x e)。同期は 1 回だけ。
+        unsafe {
+            let sum_pin = MISS_FAST.with(|c| c.borrow().sum_pin.as_ref().map(|p| p.ptr));
+            let miss_pin = MISS_FAST.with(|c| c.borrow().miss_pin.as_ref().map(|p| p.ptr));
+            if let Some(sp) = sum_pin {
+                check(
+                    (l.memcpy_dtoh_async)(sp, psum.ptr, e * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (miss fast sum)",
+                )?;
+            }
+            let mh_ptr = MISS_FAST.with(|c| c.borrow().h.as_ref().map(|b| b.ptr));
+            if let (Some(mp), Some(mh)) = (miss_pin, mh_ptr) {
+                check(
+                    (l.memcpy_dtoh_async)(mp, mh, nh_miss * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (miss fast h)",
+                )?;
+            }
+        }
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        dec_exp_kprof::mark(dec_exp_kprof::D2H);
+        sync_default_or_ctx(ctx, dec_overlap_enabled())?;
+        dec_exp_kprof::end_layer();
+        dbg_d2h((e + nh_miss) * 4);
+        MISS_FAST.with(|mcell| -> Result<()> {
+            let ms = mcell.borrow();
+            let sp = ms.sum_pin.as_ref().expect("確保済み");
+            out_sum[..e].copy_from_slice(&sp.as_slice::<f32>()[..e]);
+            miss_out.resize(nh_miss, 0.0);
+            let mp = ms.miss_pin.as_ref().expect("確保済み");
+            miss_out[..nh_miss].copy_from_slice(&mp.as_slice::<f32>()[..nh_miss]);
+            Ok(())
+        })?;
+        Ok(())
+    })?;
     Ok(true)
 }
 
@@ -35559,6 +36118,90 @@ pub mod dec_exp_kprof {
     static BUCKET_N: [AtomicU64; MAX_HITS + 1] = [const { AtomicU64::new(0) }; MAX_HITS + 1];
     static BUCKET_NS: [AtomicU64; MAX_HITS + 1] = [const { AtomicU64::new(0) }; MAX_HITS + 1];
 
+    // ------------------------------------------------------------------
+    // task 190: 型 (gate/up/down のスロット) × 行数 の表
+    //
+    // 「expert カーネルが IQ の型と行数でいくらか」を出すための積算。1 層 =
+    // gate / up / silu / down の 4 起動なので、層の合計 ns を (型, 行数) に
+    // 積む。行数は 1 層の起動が扱う出力行の合計 (`nseg*(ff + e)` に相当)。
+    // ------------------------------------------------------------------
+
+    /// (slot_g, slot_u, slot_d) の組み合わせ数。
+    pub const FKIND: usize = crate::model::exp_iq::SLOTS * crate::model::exp_iq::SLOTS
+        * crate::model::exp_iq::SLOTS;
+    /// 行数のバケット数 (2 の冪で 1,000 行を下限にする)。
+    pub const FROW: usize = 8;
+
+    /// 1 セルぶんの積算。
+    struct KAcc {
+        calls: AtomicU64,
+        experts: AtomicU64,
+        bytes: AtomicU64,
+        ns: AtomicU64,
+    }
+
+    static KFMT: [KAcc; FKIND] = [const {
+        KAcc {
+            calls: AtomicU64::new(0),
+            experts: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+        }
+    }; FKIND];
+    static KROW: [KAcc; FROW] = [const {
+        KAcc {
+            calls: AtomicU64::new(0),
+            experts: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+        }
+    }; FROW];
+
+    thread_local! {
+        /// この層の (slot_g*36 + slot_u*6 + slot_d)。
+        static KIND: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        static K_NSEG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static K_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static K_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// 層の (型, 行数, 重みバイト) を控える ([`begin_layer`] の直後に呼ぶ)。
+    ///
+    /// `rows_gu` = gate/up の出力行 (通常 ff)、`rows_d` = down の出力行 (通常 e)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_kind(
+        slot_g: usize,
+        slot_u: usize,
+        slot_d: usize,
+        nseg: usize,
+        rows_gu: usize,
+        rows_d: usize,
+        bytes: u64,
+    ) {
+        if !on() {
+            return;
+        }
+        let slots = crate::model::exp_iq::SLOTS;
+        let kind = (slot_g.min(slots - 1)) * slots * slots
+            + (slot_u.min(slots - 1)) * slots
+            + slot_d.min(slots - 1);
+        KIND.with(|c| c.set(kind));
+        K_NSEG.with(|c| c.set(nseg as u64));
+        K_ROWS.with(|c| c.set((nseg * (rows_gu + rows_d)) as u64));
+        K_BYTES.with(|c| c.set(bytes));
+    }
+
+    /// 行数のバケット (1,000 行 = 0、2,000 = 1、4,000 = 2、... 128,000 以上 = 7)。
+    fn row_bucket(rows: u64) -> usize {
+        let mut b = 0usize;
+        let mut lim = 2_000u64;
+        while b + 1 < FROW && rows >= lim {
+            b += 1;
+            lim *= 2;
+        }
+        b
+    }
+
     /// 計測するか (台帳と同じ `DENNO_Q4_PROFILE`。テストの強制も含む)。
     pub fn on() -> bool {
         crate::model::q4ledger::enabled()
@@ -35574,6 +36217,13 @@ pub mod dec_exp_kprof {
             BUCKET_N[i].store(0, Ordering::Relaxed);
             BUCKET_NS[i].store(0, Ordering::Relaxed);
         }
+        for a in KFMT.iter().chain(KROW.iter()) {
+            a.calls.store(0, Ordering::Relaxed);
+            a.experts.store(0, Ordering::Relaxed);
+            a.bytes.store(0, Ordering::Relaxed);
+            a.ns.store(0, Ordering::Relaxed);
+        }
+        KIND.with(|c| c.set(usize::MAX));
         POOL_DEAD.with(|d| d.set(false));
     }
 
@@ -35616,6 +36266,69 @@ pub mod dec_exp_kprof {
             ));
         }
         out.push(b);
+        // task 190: 型 (gate/up/down) ごとの表。
+        let mut f = String::from("[exp-iq-kprof] 型ごと (g/u/d): calls experts rows bytes us/expert GB/s");
+        let mut any = false;
+        for (k, a) in KFMT.iter().enumerate() {
+            let calls = a.calls.load(Ordering::Relaxed);
+            if calls == 0 {
+                continue;
+            }
+            any = true;
+            let slots = crate::model::exp_iq::SLOTS;
+            let (g, u, d) = (k / (slots * slots), (k / slots) % slots, k % slots);
+            let experts = a.experts.load(Ordering::Relaxed);
+            let bytes = a.bytes.load(Ordering::Relaxed);
+            let ns = a.ns.load(Ordering::Relaxed);
+            let us_ex = if experts > 0 {
+                ns as f64 / 1e3 / experts as f64
+            } else {
+                0.0
+            };
+            let gbs = if ns > 0 {
+                bytes as f64 / ns as f64
+            } else {
+                0.0
+            };
+            f.push_str(&format!(
+                " | {g}/{u}/{d} {calls}層 {experts}本 {:.1}MB {us_ex:.1}us/本 {gbs:.0}GB/s",
+                bytes as f64 / 1e6
+            ));
+        }
+        if any {
+            out.push(f);
+        }
+        // task 190: 行数バケットごとの表 (1 層 = gate/up + down の出力行の合計)。
+        let mut r = String::from("[exp-iq-kprof] 行数ごと: rows calls experts us/launch us/expert GB/s");
+        let mut any = false;
+        for (i, a) in KROW.iter().enumerate() {
+            let calls = a.calls.load(Ordering::Relaxed);
+            if calls == 0 {
+                continue;
+            }
+            any = true;
+            let experts = a.experts.load(Ordering::Relaxed);
+            let bytes = a.bytes.load(Ordering::Relaxed);
+            let ns = a.ns.load(Ordering::Relaxed);
+            let lo = if i == 0 { 0u64 } else { 2_000u64 << (i - 1) };
+            let us_call = ns as f64 / 1e3 / calls as f64;
+            let us_ex = if experts > 0 {
+                ns as f64 / 1e3 / experts as f64
+            } else {
+                0.0
+            };
+            let gbs = if ns > 0 {
+                bytes as f64 / ns as f64
+            } else {
+                0.0
+            };
+            r.push_str(&format!(
+                " | >={lo} {calls}層 {experts}本 {us_call:.1}us {us_ex:.1}us/本 {gbs:.0}GB/s"
+            ));
+        }
+        if any {
+            out.push(r);
+        }
         out
     }
 
@@ -35696,6 +36409,25 @@ pub mod dec_exp_kprof {
         let h = (HITS.with(|c| c.get()) as usize).min(MAX_HITS);
         BUCKET_N[h].fetch_add(1, Ordering::Relaxed);
         BUCKET_NS[h].fetch_add(sum, Ordering::Relaxed);
+        // task 190: gate + up + silu + down の 4 段だけを「expert カーネル」として
+        // (型, 行数) に積む (D2H と和は別物なので入れない)。
+        let gemv_ns = acc[GATE] + acc[UP] + acc[SILU] + acc[DOWN];
+        let kind = KIND.with(|c| c.get());
+        if kind != usize::MAX && gemv_ns > 0 {
+            let nseg = K_NSEG.with(|c| c.get());
+            let rows = K_ROWS.with(|c| c.get());
+            let bytes = K_BYTES.with(|c| c.get());
+            let cell = &KFMT[kind.min(FKIND - 1)];
+            cell.calls.fetch_add(1, Ordering::Relaxed);
+            cell.experts.fetch_add(nseg, Ordering::Relaxed);
+            cell.bytes.fetch_add(bytes, Ordering::Relaxed);
+            cell.ns.fetch_add(gemv_ns, Ordering::Relaxed);
+            let cell = &KROW[row_bucket(rows).min(FROW - 1)];
+            cell.calls.fetch_add(1, Ordering::Relaxed);
+            cell.experts.fetch_add(nseg, Ordering::Relaxed);
+            cell.bytes.fetch_add(bytes, Ordering::Relaxed);
+            cell.ns.fetch_add(gemv_ns, Ordering::Relaxed);
+        }
     }
 
     /// イベントを 1 本打つ (プールから取る)。

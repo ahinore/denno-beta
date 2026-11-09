@@ -9050,6 +9050,63 @@ fn moe_experts_iq_gpu_batched(
     let n_miss_used = miss_slots(overlap, miss_pos.len());
     let miss_slice: &[usize] = &miss_pos[..n_miss_used];
     let mut miss_h = vec![0.0f32; n_miss_used * e];
+    // task 190 (`DENNO_DEC_MISS_FAST`): ミスを CPU で計算せず、mmap から
+    // ページアブル直の非同期 H2D でデバイスへ上げてヒットと同じカーネルで回す。
+    // 和のカーネルが要るので `sumdev` のときだけ。失敗は従来経路へ (fail closed)。
+    if sumdev && crate::model::exp_miss_up::fast_enabled() && !miss_pos.is_empty() {
+        let hw: Vec<f32> = pos.iter().map(|&t| weights[t]).collect();
+        let ids_hit: Vec<u16> = pos.iter().map(|&t| sel[t] as u16).collect();
+        let ids_miss: Vec<u16> = miss_pos.iter().map(|&t| sel[t] as u16).collect();
+        let mut miss_bytes: Vec<crate::cuda::MissExpertBytes<'_>> =
+            Vec::with_capacity(miss_pos.len());
+        let mut have_bytes = true;
+        for &ei in &miss_pos {
+            match (
+                lw.gate_exps.slice(sel[ei]),
+                lw.up_exps.slice(sel[ei]),
+                lw.down_exps.slice(sel[ei]),
+            ) {
+                (Ok(g), Ok(u), Ok(d)) => {
+                    miss_bytes.push(crate::cuda::MissExpertBytes { gate: g, up: u, down: d })
+                }
+                _ => {
+                    have_bytes = false;
+                    break;
+                }
+            }
+        }
+        if have_bytes {
+            let mut sum = vec![0.0f32; e];
+            let mut miss_out: Vec<f32> = Vec::new();
+            let ran = crate::cuda::moe_experts_iq_layer_sum_miss(
+                lw.gate_exps.ty,
+                lw.up_exps.ty,
+                lw.down_exps.ty,
+                &pg,
+                &pu,
+                &pd,
+                &ids_hit,
+                &miss_bytes,
+                &ids_miss,
+                x,
+                x.len(),
+                ff,
+                e,
+                &hw,
+                &mut sum,
+                &mut miss_out,
+            )
+            .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV (miss fast): {err:#}", lw.il)))?;
+            if ran {
+                return Ok(Some(IqBatchOut::Sum {
+                    sum,
+                    miss_pos,
+                    miss_h: miss_out,
+                    hits,
+                }));
+            }
+        }
+    }
     // task 187: `DENNO_DEC_EXP_SUMDEV` ではヒットの寄与をデバイスで和にして
     // `e` 要素だけ D2H する (ミスはホストで足す)。重みは選択順 (pos の順) に詰める。
     if sumdev {
@@ -9075,8 +9132,18 @@ fn moe_experts_iq_gpu_batched(
             || {
                 // task 187: 台帳の副区間 (ミスの CPU 計算。GPU の裏で走る)。
                 let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
-                expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_s)
-                    .map_err(anyhow::Error::from)
+                // task 190: ヒット本数ごとの表 (PROFILE のときだけ Instant 2 回)。
+                let t = crate::model::q4ledger::stamp();
+                let r = expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_s)
+                    .map_err(anyhow::Error::from);
+                if let Some(t) = t {
+                    crate::model::exp_iq::note_layer_miss(
+                        hits,
+                        miss_ids.len() as u32,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                }
+                r
             },
         )
         .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV (sum): {err:#}", lw.il)))?;
@@ -9111,8 +9178,18 @@ fn moe_experts_iq_gpu_batched(
             || {
                 // task 187: 台帳の副区間 (ミスの CPU 計算。GPU の裏で走る)。
                 let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
-                expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
-                    .map_err(anyhow::Error::from)
+                // task 190: ヒット本数ごとの表 (PROFILE のときだけ Instant 2 回)。
+                let t = crate::model::q4ledger::stamp();
+                let r = expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
+                    .map_err(anyhow::Error::from);
+                if let Some(t) = t {
+                    crate::model::exp_iq::note_layer_miss(
+                        hits,
+                        miss_ids.len() as u32,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                }
+                r
             },
         )
     } else {
@@ -9445,6 +9522,9 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     if !served || budget == 0 {
         return;
     }
+    // task 190: ヒット本数ごとの表 (PROFILE のときだけ Instant 2 回)。
+    let t_up = crate::model::q4ledger::stamp();
+    let mut n_up = 0u32;
     // 1 層あたりの上限: budget >= n_layer のときは均等割 (1 層に集中させない)。
     let quota = if budget >= nl { budget / nl } else { 1 };
     let mut left = LEFT.load(Ordering::Relaxed);
@@ -9468,6 +9548,7 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
                 can -= 1;
                 LEFT.store(left, Ordering::Relaxed);
                 crate::model::exp_iq::note_upload();
+                n_up += 1;
             }
             // 確保失敗・型未対応は以後やらない (リクエストは落とさない)。
             _ => {
@@ -9475,6 +9556,9 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
                 break;
             }
         }
+    }
+    if let Some(t) = t_up {
+        crate::model::exp_iq::note_layer_upload(hits, n_up, t.elapsed().as_nanos() as u64);
     }
 }
 

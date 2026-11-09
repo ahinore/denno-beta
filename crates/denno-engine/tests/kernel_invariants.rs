@@ -7679,3 +7679,53 @@ fn dec_epi_kernel_is_registered_in_build_ptx() {
         "起動配列の並びが変わった (h, w, sh, sgw, out の順)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 190: IQ expert GEMV の v2 (`kernels_exp_iq_v2.cu`) が v1 と同じ入口を
+// 同じ引数で持つこと。Rust 側は同じ関数名・同じ 8 引数で呼ぶので、名前か
+// 引数がずれると実機でしか分からない (モジュール読み込みは名前で引く)。
+// ---------------------------------------------------------------------------
+#[test]
+fn exp_iq_v2_entries_match_v1_signatures() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let v1 = std::fs::read_to_string(dir.join("kernels_exp_iq.cu")).expect("v1 の .cu");
+    let v2 = std::fs::read_to_string(dir.join("kernels_exp_iq_v2.cu")).expect("v2 の .cu");
+    // `extern "C" __global__ void NAME(PARAMS)` を集める (引数は 1 行に収める)。
+    fn entries(src: &str) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let head = "extern \"C\" __global__ void ";
+        let mut rest = src;
+        while let Some(i) = rest.find(head) {
+            let after = &rest[i + head.len()..];
+            let Some(paren) = after.find('(') else { break };
+            let name = after[..paren].trim().to_string();
+            let tail = &after[paren + 1..];
+            let Some(close) = tail.find(')') else { break };
+            let params = tail[..close]
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.insert(name, params);
+            rest = &tail[close..];
+        }
+        out
+    }
+    let a = entries(&v1);
+    let b = entries(&v2);
+    assert!(!a.is_empty(), "v1 から入口を取れない");
+    assert_eq!(
+        a.keys().collect::<Vec<_>>(),
+        b.keys().collect::<Vec<_>>(),
+        "v2 の入口の名前が v1 と違う"
+    );
+    for (name, params) in &a {
+        assert_eq!(b.get(name), Some(params), "{name} の引数が v1 と違う");
+    }
+    // 8 引数の GEMV が 6 本 (型ごと) + silu 4 引数。
+    assert_eq!(
+        a.values().filter(|p| p.matches(',').count() == 7).count(),
+        6,
+        "v1 の GEMV 入口の数"
+    );
+}

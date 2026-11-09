@@ -116,6 +116,25 @@ pub fn enabled() -> bool {
     mode() != MODE_OFF
 }
 
+/// task 190: `DENNO_DEC_MISS_FAST=1` — decode のミス expert を、mmap から
+/// **ページアブル直の非同期 H2D** でデバイス scratch へ上げ、ヒットと同じ
+/// カーネルで計算する (ホストの bounce memcpy をしない)。**既定 off**。
+///
+/// task 158 の [`ENV`] (pinned bounce) とは別のゲート。こちらは
+/// `dno_dec_exp_sum` と組み合わせ、ヒットはデバイスで和にする。
+pub const FAST_ENV: &str = "DENNO_DEC_MISS_FAST";
+
+/// [`FAST_ENV`] の解釈 (純関数)。`1` / `true` / `on` だけが真。
+pub fn fast_from_value(v: Option<&str>) -> bool {
+    crate::model::expert_vram::flag_on(v)
+}
+
+/// miss-fast 経路を使うか (プロセスで 1 回だけ env を読む)。
+pub fn fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fast_from_value(std::env::var(FAST_ENV).ok().as_deref()))
+}
+
 /// 診断行 (`[dec-miss]`) を出すか。
 pub fn stats_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
