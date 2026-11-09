@@ -8389,6 +8389,21 @@ fn moe_ffn_quant_impl(
         #[cfg(not(feature = "cuda"))]
         let iq_mode = false;
 
+        // task 190 (`DENNO_DEC_MISS_FAST`): ミスの上げ直しを**層の前**に移す。
+        // 上げた本はこの層の lookup でヒットになるので、CPU で計算せず GPU で回せる
+        // (page fault + CPU GEMV の 1 本ぶんが消える)。予算・担当層の回転・
+        // 1 本 2 MB の転送は従来と同じ (`iq_warm_misses` を前へ動かすだけ)。
+        #[cfg(feature = "cuda")]
+        let miss_fast_now = vram_mode && iq_mode && crate::model::exp_miss_up::fast_enabled();
+        #[cfg(not(feature = "cuda"))]
+        let miss_fast_now = false;
+        #[cfg(feature = "cuda")]
+        if miss_fast_now {
+            // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
+            let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
+            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
+        }
+
         // task 187: ヒットの寄与をデバイスで和にする (`DENNO_DEC_EXP_SUMDEV`)。
         // PTX が無い / 形が合わないときは `moe_experts_iq_gpu_batched` が従来経路へ落ちる。
         #[cfg(feature = "cuda")]
@@ -8575,7 +8590,7 @@ fn moe_ffn_quant_impl(
         // GPU に倒したトークンだけでなく CPU のトークンでも積む (載せないと
         // ヒット率が永久に 0 のままになる)。
         #[cfg(feature = "cuda")]
-        if vram_mode && iq_mode {
+        if vram_mode && iq_mode && !miss_fast_now {
             // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
             let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
             iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
@@ -9218,8 +9233,18 @@ fn moe_experts_iq_gpu_batched(
             || {
                 // task 187: 台帳の副区間 (ミスの CPU 計算。GPU の裏で走る)。
                 let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
-                expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_s)
-                    .map_err(anyhow::Error::from)
+                // task 190: ヒット本数ごとの表 (PROFILE のときだけ Instant 2 回)。
+                let t = crate::model::q4ledger::stamp();
+                let r = expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_s)
+                    .map_err(anyhow::Error::from);
+                if let Some(t) = t {
+                    crate::model::exp_iq::note_layer_miss(
+                        hits,
+                        miss_ids.len() as u32,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                }
+                r
             },
         )
         .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV (sum): {err:#}", lw.il)))?;
@@ -9254,8 +9279,18 @@ fn moe_experts_iq_gpu_batched(
             || {
                 // task 187: 台帳の副区間 (ミスの CPU 計算。GPU の裏で走る)。
                 let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
-                expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
-                    .map_err(anyhow::Error::from)
+                // task 190: ヒット本数ごとの表 (PROFILE のときだけ Instant 2 回)。
+                let t = crate::model::q4ledger::stamp();
+                let r = expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
+                    .map_err(anyhow::Error::from);
+                if let Some(t) = t {
+                    crate::model::exp_iq::note_layer_miss(
+                        hits,
+                        miss_ids.len() as u32,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                }
+                r
             },
         )
     } else {
@@ -9588,6 +9623,9 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     if !served || budget == 0 {
         return;
     }
+    // task 190: ヒット本数ごとの表 (PROFILE のときだけ Instant 2 回)。
+    let t_up = crate::model::q4ledger::stamp();
+    let mut n_up = 0u32;
     // 1 層あたりの上限: budget >= n_layer のときは均等割 (1 層に集中させない)。
     let quota = if budget >= nl { budget / nl } else { 1 };
     let mut left = LEFT.load(Ordering::Relaxed);
@@ -9611,6 +9649,7 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
                 can -= 1;
                 LEFT.store(left, Ordering::Relaxed);
                 crate::model::exp_iq::note_upload();
+                n_up += 1;
             }
             // 確保失敗・型未対応は以後やらない (リクエストは落とさない)。
             _ => {
@@ -9618,6 +9657,9 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
                 break;
             }
         }
+    }
+    if let Some(t) = t_up {
+        crate::model::exp_iq::note_layer_upload(hits, n_up, t.elapsed().as_nanos() as u64);
     }
 }
 

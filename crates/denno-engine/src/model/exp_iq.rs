@@ -126,6 +126,33 @@ pub fn iq_gpu_enabled() -> bool {
     *ON.get_or_init(|| iq_gpu_from_value(std::env::var(EXPERT_IQ_GPU_ENV).ok().as_deref()))
 }
 
+/// task 190: `DENNO_EXP_IQ_V2` — 層一括 GEMV を v2 カーネル
+/// (`kernels_exp_iq_v2.ptx`) で回す。**既定 on** (lab t190c で採否 yes。
+/// decode 短/3.9k/14k で -4.3〜-4.8%、prefill ±1%、md5 SAME)。
+///
+/// v2 は v1 と同じ segment 表・同じ起動形で、中の実装だけが違う
+/// (ベクタロード / 次ブロックの先読み / アキュムレータ 4 本 / 表を shared へ /
+/// IQ4_NL・Q2_0 のレーン分割)。PTX が無いときは v1 へ落ちる (fail closed)。
+/// 明示的な偽値 `0` / `off` / `false` / `no` だけ切る。
+pub const EXPERT_IQ_V2_ENV: &str = "DENNO_EXP_IQ_V2";
+
+/// [`EXPERT_IQ_V2_ENV`] の解釈 (純関数)。既定 on。
+pub fn iq_v2_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// v2 カーネルを使うか (プロセスで 1 回だけ env を読む)。
+pub fn iq_v2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| iq_v2_from_value(std::env::var(EXPERT_IQ_V2_ENV).ok().as_deref()))
+}
+
 /// [`EXPERT_IQ_UPLOAD_ENV`] の解釈 (純関数)。未設定・数値でない値は既定値。
 pub fn upload_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim) {
@@ -298,9 +325,136 @@ pub fn stats_line() -> Option<String> {
 
 /// 積算を 0 に戻す (リクエスト終端)。
 pub fn stats_reset() {
-    for c in [&LOOKUPS, &HITS, &GPU_LAYERS, &GPU_EXPERTS, &UPLOADS, &UPLOAD_NS] {
+    for c in [
+        &LOOKUPS,
+        &HITS,
+        &GPU_LAYERS,
+        &GPU_EXPERTS,
+        &UPLOADS,
+        &UPLOAD_NS,
+        &MISS_LAYERS,
+        &MISS_N,
+        &MISS_NS,
+        &UPLOAD_LAYERS,
+        &UPLOAD_N,
+        &UPLOAD_LAYERS_NS,
+    ] {
         c.store(0, Ordering::Relaxed);
     }
+    for h in 0..=MAX_HIT_BUCKET {
+        MH_LAYERS[h].store(0, Ordering::Relaxed);
+        MH_MISS[h].store(0, Ordering::Relaxed);
+        MH_MISS_NS[h].store(0, Ordering::Relaxed);
+        MH_UP[h].store(0, Ordering::Relaxed);
+        MH_UP_NS[h].store(0, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 190: ヒット本数ごとの「ミス CPU 計算」と「上げ直し」
+// ---------------------------------------------------------------------------
+//
+// `exp_miss` / `exp_upload` は台帳では 1 本の数字しか出ないので、
+// 「ヒット率が変わるとどう変わるか」が読めない。ここでは 1 層ぶんの実測を
+// ヒット本数 (GPU で回した expert 数) のバケットへ積み、リクエスト終端に
+// 1 行で出す。計測は `DENNO_Q4_PROFILE` のときだけ (Instant 2 回/層)。
+//
+// 列: ヒット本数 / 層数 / ミス本数 / ミス CPU の合計 ms / 1 トークンあたり /
+//     上げ直した本数 / 上げ直しの合計 ms / 1 本あたり us。
+
+/// ヒット本数のバケット上限 (n_expert_used = 10 まで)。
+pub const MAX_HIT_BUCKET: usize = 10;
+
+static MH_LAYERS: [AtomicU64; MAX_HIT_BUCKET + 1] =
+    [const { AtomicU64::new(0) }; MAX_HIT_BUCKET + 1];
+static MH_MISS: [AtomicU64; MAX_HIT_BUCKET + 1] =
+    [const { AtomicU64::new(0) }; MAX_HIT_BUCKET + 1];
+static MH_MISS_NS: [AtomicU64; MAX_HIT_BUCKET + 1] =
+    [const { AtomicU64::new(0) }; MAX_HIT_BUCKET + 1];
+static MH_UP: [AtomicU64; MAX_HIT_BUCKET + 1] =
+    [const { AtomicU64::new(0) }; MAX_HIT_BUCKET + 1];
+static MH_UP_NS: [AtomicU64; MAX_HIT_BUCKET + 1] =
+    [const { AtomicU64::new(0) }; MAX_HIT_BUCKET + 1];
+
+/// 直近の層ぶんの合計 (行を出すときの分母に使う)。
+static MISS_LAYERS: AtomicU64 = AtomicU64::new(0);
+static MISS_N: AtomicU64 = AtomicU64::new(0);
+static MISS_NS: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_LAYERS: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_N: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_LAYERS_NS: AtomicU64 = AtomicU64::new(0);
+
+/// 1 層ぶんのミス CPU 計算を積む (`hits` = GPU で回した本数)。
+pub fn note_layer_miss(hits: u32, n_miss: u32, ns: u64) {
+    if !crate::model::q4ledger::enabled() {
+        return;
+    }
+    let h = (hits as usize).min(MAX_HIT_BUCKET);
+    MH_LAYERS[h].fetch_add(1, Ordering::Relaxed);
+    MH_MISS[h].fetch_add(n_miss as u64, Ordering::Relaxed);
+    MH_MISS_NS[h].fetch_add(ns, Ordering::Relaxed);
+    MISS_LAYERS.fetch_add(1, Ordering::Relaxed);
+    MISS_N.fetch_add(n_miss as u64, Ordering::Relaxed);
+    MISS_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// 1 層ぶんの上げ直し (ページフォルト + H2D) を積む。
+pub fn note_layer_upload(hits: u32, n_up: u32, ns: u64) {
+    if !crate::model::q4ledger::enabled() {
+        return;
+    }
+    let h = (hits as usize).min(MAX_HIT_BUCKET);
+    MH_UP[h].fetch_add(n_up as u64, Ordering::Relaxed);
+    MH_UP_NS[h].fetch_add(ns, Ordering::Relaxed);
+    UPLOAD_LAYERS.fetch_add(1, Ordering::Relaxed);
+    UPLOAD_N.fetch_add(n_up as u64, Ordering::Relaxed);
+    UPLOAD_LAYERS_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// task 190: ヒット本数ごとの表 (PROFILE のときだけ 1 行)。
+///
+/// `tok` は窓のトークン数 (128)。「1 トークンあたり」の列に使う。
+pub fn hit_lines(tok: u64) -> Vec<String> {
+    if !crate::model::q4ledger::enabled() || !iq_gpu_enabled() {
+        return Vec::new();
+    }
+    let layers = MISS_LAYERS.load(Ordering::Relaxed);
+    if layers == 0 {
+        return Vec::new();
+    }
+    let tok = tok.max(1);
+    let mut s = String::from(
+        "[exp-iq-hit] ヒット本数ごと (gpu expert 数): 層 ミス ミスCPUms/tok 上げ本 上げms/tok us/本",
+    );
+    for h in 0..=MAX_HIT_BUCKET {
+        let n = MH_LAYERS[h].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let miss = MH_MISS[h].load(Ordering::Relaxed);
+        let miss_ms = MH_MISS_NS[h].load(Ordering::Relaxed) as f64 / 1e6;
+        let up = MH_UP[h].load(Ordering::Relaxed);
+        let up_ms = MH_UP_NS[h].load(Ordering::Relaxed) as f64 / 1e6;
+        let us_up = if up > 0 {
+            up_ms * 1e3 / up as f64
+        } else {
+            0.0
+        };
+        s.push_str(&format!(
+            " | h{h} {n}層 {miss}本 {:.3} {up}本 {:.3} {us_up:.0}us",
+            miss_ms / tok as f64,
+            up_ms / tok as f64
+        ));
+    }
+    s.push_str(&format!(
+        " || 計 {layers}層 ミス{}本/{}層 {:.3}ms/tok 上げ{}本 {:.3}ms/tok",
+        MISS_N.load(Ordering::Relaxed),
+        MISS_LAYERS.load(Ordering::Relaxed),
+        MISS_NS.load(Ordering::Relaxed) as f64 / 1e6 / tok as f64,
+        UPLOAD_N.load(Ordering::Relaxed),
+        UPLOAD_LAYERS_NS.load(Ordering::Relaxed) as f64 / 1e6 / tok as f64
+    ));
+    vec![s]
 }
 
 // カーネルのミラー (GPU 無しで索引と累積順を確かめるため)
@@ -702,6 +856,50 @@ mod tests {
             assert_eq!(count(name), Some(8), "{name} の引数の数が .cu と違う");
         }
         assert_eq!(count(SILU_KERNEL), Some(4), "{SILU_KERNEL} の引数の数");
+    }
+
+    /// task 190: v2 ゲートは**既定 on** (`DENNO_EXP_IQ_V2`、lab t190c で採用)。
+    /// PTX があれば引数の数も v1 と同じ 8 / silu は 4 であることを固定する。
+    #[test]
+    fn v2_gate_and_ptx_params() {
+        assert!(iq_v2_from_value(None));
+        assert!(iq_v2_from_value(Some("1")));
+        assert!(iq_v2_from_value(Some("on")));
+        assert!(iq_v2_from_value(Some(" ON ")));
+        assert!(!iq_v2_from_value(Some("0")));
+        assert!(!iq_v2_from_value(Some("off")));
+        assert!(!iq_v2_from_value(Some("false")));
+        assert!(!iq_v2_from_value(Some("no")));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq_v2.ptx")) else {
+            return;
+        };
+        let count = |name: &str| -> Option<usize> {
+            let head = format!(".visible .entry {name}(");
+            let i = ptx.find(&head)?;
+            let rest = &ptx[i + head.len()..];
+            let end = rest.find(')').unwrap_or(rest.len());
+            Some(rest[..end].matches(".param").count())
+        };
+        for i in 0..SLOTS {
+            let name = kernel_name(i).expect("slot");
+            assert_eq!(count(name), Some(8), "v2: {name} の引数の数が .cu と違う");
+        }
+        assert_eq!(count(SILU_KERNEL), Some(4), "v2: {SILU_KERNEL} の引数の数");
+    }
+
+    /// task 190: ヒット本数ごとの表はゲート off では空。
+    #[test]
+    fn hit_lines_are_silent_when_off() {
+        stats_reset();
+        if !crate::model::q4ledger::enabled() {
+            assert!(hit_lines(128).is_empty());
+        }
+        note_layer_miss(9, 1, 1000);
+        note_layer_upload(9, 1, 1000);
+        stats_reset();
+        assert_eq!(MISS_N.load(Ordering::Relaxed), 0);
+        assert_eq!(UPLOAD_N.load(Ordering::Relaxed), 0);
     }
 
     /// ゲートは既定 off、`DENNO_EXPERT_IQ_UPLOAD` の既定は 8。

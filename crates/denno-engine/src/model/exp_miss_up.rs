@@ -116,6 +116,34 @@ pub fn enabled() -> bool {
     mode() != MODE_OFF
 }
 
+/// task 190: `DENNO_DEC_MISS_FAST` — decode のミス expert の上げ直しを
+/// **層の後ろから前**へ移す。**既定 on** (lab t190c で採否 yes)。
+///
+/// 上げた本は同じ層の lookup でヒットになるので、その本だけ CPU の GEMV が
+/// 消える (ページフォルト + CPU 計算の 1 本ぶん)。予算・担当層の回転・
+/// 1 本 2 MB の転送経路は従来と同じ ([`crate::model::qwen4exp`] の
+/// `iq_warm_misses` を動かすだけ)。明示的な偽値だけ切る。
+///
+/// task 158 の [`ENV`] (ミスを GPU で計算する) とは別のゲート。
+pub const FAST_ENV: &str = "DENNO_DEC_MISS_FAST";
+
+/// [`FAST_ENV`] の解釈 (純関数)。既定 on。
+pub fn fast_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// miss-fast 経路を使うか (プロセスで 1 回だけ env を読む)。
+pub fn fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fast_from_value(std::env::var(FAST_ENV).ok().as_deref()))
+}
+
 /// 診断行 (`[dec-miss]`) を出すか。
 pub fn stats_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -223,6 +251,18 @@ mod tests {
         // 2 だけが cache 挿入。3 以上は未知 = off (勝手に強くしない)。
         assert_eq!(mode_from_value(Some("2")), MODE_CACHE);
         assert_eq!(mode_from_value(Some("3")), MODE_OFF);
+    }
+
+    /// task 190: `DENNO_DEC_MISS_FAST` は既定 on、明示的な偽値だけ切る。
+    #[test]
+    fn miss_fast_gate_defaults_on() {
+        assert!(fast_from_value(None));
+        assert!(fast_from_value(Some("1")));
+        assert!(fast_from_value(Some(" on ")));
+        assert!(!fast_from_value(Some("0")));
+        assert!(!fast_from_value(Some("off")));
+        assert!(!fast_from_value(Some("false")));
+        assert!(!fast_from_value(Some("no")));
     }
 
     #[test]

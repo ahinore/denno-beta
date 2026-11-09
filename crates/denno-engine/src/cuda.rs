@@ -6736,6 +6736,8 @@ unsafe impl Send for ExpIqKernels {}
 unsafe impl Sync for ExpIqKernels {}
 
 static EXP_IQ_KERNELS: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
+/// task 190: v2 (`kernels_exp_iq_v2.ptx`)。無いときは v1 へ落ちる。
+static EXP_IQ_KERNELS_V2: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 
 /// PTX の置き場所。`DENNO_EXP_IQ_PTX` があればそれ、無ければクレート配下
 /// `kernels/kernels_exp_iq.ptx`。
@@ -6748,62 +6750,92 @@ fn exp_iq_ptx_path() -> std::path::PathBuf {
     }
 }
 
+/// task 190: v2 の PTX の置き場所 (`DENNO_EXP_IQ_V2_PTX` で差し替え可)。
+fn exp_iq_v2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_IQ_V2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_v2.ptx"),
+    }
+}
+
+/// PTX を読んで関数を引く (失敗は `None` = 呼び出し側が従来経路へ)。
+fn load_exp_iq_module(path: &std::path::Path, tag: &str) -> Option<ExpIqKernels> {
+    let mut image = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "[exp-iq] {tag}: PTX が読めない ({}) : {e} → 従来経路へ",
+                path.display()
+            );
+            return None;
+        }
+    };
+    image.push(0);
+    let lib = lib().ok()?;
+    let mut module: CUmodule = std::ptr::null_mut();
+    unsafe {
+        if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+            eprintln!("[exp-iq] {tag}: cuModuleLoadData 失敗 → 従来経路へ");
+            return None;
+        }
+    }
+    let mut fns: [CUfunction; crate::model::exp_iq::SLOTS] =
+        [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
+    for (i, f) in fns.iter_mut().enumerate() {
+        let name = crate::model::exp_iq::kernel_name(i)?;
+        let mut cname = name.as_bytes().to_vec();
+        cname.push(0);
+        unsafe {
+            if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
+                != CUDA_SUCCESS
+            {
+                eprintln!("[exp-iq] {tag}: PTX に {name} が無い → 従来経路へ");
+                return None;
+            }
+        }
+    }
+    let mut silu: CUfunction = std::ptr::null_mut();
+    let mut cname = crate::model::exp_iq::SILU_KERNEL.as_bytes().to_vec();
+    cname.push(0);
+    unsafe {
+        if (lib.module_get_function)(&mut silu, module, cname.as_ptr() as *const c_char)
+            != CUDA_SUCCESS
+        {
+            eprintln!("[exp-iq] {tag}: PTX に silu が無い → 従来経路へ");
+            return None;
+        }
+    }
+    Some(ExpIqKernels { module, fns, silu })
+}
+
 /// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
 /// (= 二度と試さない。呼び出し側は CPU へ落ちる)。
 fn exp_iq_kernels() -> Option<&'static ExpIqKernels> {
     EXP_IQ_KERNELS
-        .get_or_init(|| {
-            let path = exp_iq_ptx_path();
-            let mut image = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!(
-                        "[exp-iq] PTX が読めない ({}) : {e} → CPU 経路へ",
-                        path.display()
-                    );
-                    return None;
-                }
-            };
-            image.push(0);
-            let lib = lib().ok()?;
-            let mut module: CUmodule = std::ptr::null_mut();
-            unsafe {
-                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
-                    != CUDA_SUCCESS
-                {
-                    eprintln!("[exp-iq] cuModuleLoadData 失敗 → CPU 経路へ");
-                    return None;
-                }
-            }
-            let mut fns: [CUfunction; crate::model::exp_iq::SLOTS] =
-                [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
-            for (i, f) in fns.iter_mut().enumerate() {
-                let name = crate::model::exp_iq::kernel_name(i)?;
-                let mut cname = name.as_bytes().to_vec();
-                cname.push(0);
-                unsafe {
-                    if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
-                        != CUDA_SUCCESS
-                    {
-                        eprintln!("[exp-iq] PTX に {name} が無い → CPU 経路へ");
-                        return None;
-                    }
-                }
-            }
-            let mut silu: CUfunction = std::ptr::null_mut();
-            let mut cname = crate::model::exp_iq::SILU_KERNEL.as_bytes().to_vec();
-            cname.push(0);
-            unsafe {
-                if (lib.module_get_function)(&mut silu, module, cname.as_ptr() as *const c_char)
-                    != CUDA_SUCCESS
-                {
-                    eprintln!("[exp-iq] PTX に silu が無い → CPU 経路へ");
-                    return None;
-                }
-            }
-            Some(ExpIqKernels { module, fns, silu })
-        })
+        .get_or_init(|| load_exp_iq_module(&exp_iq_ptx_path(), "v1"))
         .as_ref()
+}
+
+/// task 190: v2 カーネル (無ければ `None`)。
+fn exp_iq_kernels_v2() -> Option<&'static ExpIqKernels> {
+    EXP_IQ_KERNELS_V2
+        .get_or_init(|| load_exp_iq_module(&exp_iq_v2_ptx_path(), "v2"))
+        .as_ref()
+}
+
+/// decode の層一括 GEMV に使うカーネル一式。
+///
+/// `DENNO_EXP_IQ_V2=1` かつ v2 の PTX が読めたときだけ v2。それ以外は v1
+/// (v2 の PTX が無いときに CPU へ落とさない = 性能だけのゲート)。
+fn exp_iq_kernels_decode() -> Option<&'static ExpIqKernels> {
+    if crate::model::exp_iq::iq_v2_enabled() {
+        if let Some(k) = exp_iq_kernels_v2() {
+            return Some(k);
+        }
+    }
+    exp_iq_kernels()
 }
 
 /// この型・この k を GPU で回せるか。
@@ -7037,7 +7069,7 @@ where
     let Some(ctx) = shared_ctx() else {
         return Ok(false);
     };
-    let Some(kernels) = exp_iq_kernels() else {
+    let Some(kernels) = exp_iq_kernels_decode() else {
         return Ok(false);
     };
     // task 187: 和のカーネル (PTX が無ければ `Ok(false)` = 呼び出し側は従来経路へ)。
@@ -7162,6 +7194,14 @@ where
             dec_exp_kprof::begin_layer(nseg as u32);
             let rb_g = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
             let rb_u = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
+            // task 190: 型 (gate/up/down のスロット) と行数の表に積む
+            // (重みの実バイト数も一緒に数える = GB/s が出せる)。
+            {
+                let rb_d = crate::model::exp_iq::row_bytes(ty_d, ff).unwrap_or(0);
+                let bytes = nseg as u64
+                    * (ff as u64 * (rb_g + rb_u) as u64 + e as u64 * rb_d as u64);
+                dec_exp_kprof::note_kind(slot_g, slot_u, slot_d, nseg, ff, e, bytes);
+            }
             let mut gu = 0usize;
             for (f, ptrs, buf, rb) in [
                 (kernels.fns[slot_g], pg_addr, g, rb_g),
@@ -7864,7 +7904,7 @@ pub fn moe_experts_iq_layer_miss_up(
     let Some(ctx) = shared_ctx() else {
         return Ok(false);
     };
-    let Some(kernels) = exp_iq_kernels() else {
+    let Some(kernels) = exp_iq_kernels_decode() else {
         return Ok(false);
     };
     let Ok(l) = lib() else {
@@ -8207,6 +8247,7 @@ pub fn moe_experts_iq_layer_miss_up(
     Ok(true)
 }
 
+// ===========================================================================
 /// task 158: ミス重みの H2D 実効レートを測る (`DENNO_DEC_MISS_PROBE=1`)。
 ///
 /// decode のミスは「pinned の bounce buffer → デバイス scratch」の 1 本道なので、
@@ -36679,6 +36720,90 @@ pub mod dec_exp_kprof {
     static BUCKET_N: [AtomicU64; MAX_HITS + 1] = [const { AtomicU64::new(0) }; MAX_HITS + 1];
     static BUCKET_NS: [AtomicU64; MAX_HITS + 1] = [const { AtomicU64::new(0) }; MAX_HITS + 1];
 
+    // ------------------------------------------------------------------
+    // task 190: 型 (gate/up/down のスロット) × 行数 の表
+    //
+    // 「expert カーネルが IQ の型と行数でいくらか」を出すための積算。1 層 =
+    // gate / up / silu / down の 4 起動なので、層の合計 ns を (型, 行数) に
+    // 積む。行数は 1 層の起動が扱う出力行の合計 (`nseg*(ff + e)` に相当)。
+    // ------------------------------------------------------------------
+
+    /// (slot_g, slot_u, slot_d) の組み合わせ数。
+    pub const FKIND: usize = crate::model::exp_iq::SLOTS * crate::model::exp_iq::SLOTS
+        * crate::model::exp_iq::SLOTS;
+    /// 行数のバケット数 (2 の冪で 1,000 行を下限にする)。
+    pub const FROW: usize = 8;
+
+    /// 1 セルぶんの積算。
+    struct KAcc {
+        calls: AtomicU64,
+        experts: AtomicU64,
+        bytes: AtomicU64,
+        ns: AtomicU64,
+    }
+
+    static KFMT: [KAcc; FKIND] = [const {
+        KAcc {
+            calls: AtomicU64::new(0),
+            experts: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+        }
+    }; FKIND];
+    static KROW: [KAcc; FROW] = [const {
+        KAcc {
+            calls: AtomicU64::new(0),
+            experts: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+        }
+    }; FROW];
+
+    thread_local! {
+        /// この層の (slot_g*36 + slot_u*6 + slot_d)。
+        static KIND: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        static K_NSEG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static K_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static K_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// 層の (型, 行数, 重みバイト) を控える ([`begin_layer`] の直後に呼ぶ)。
+    ///
+    /// `rows_gu` = gate/up の出力行 (通常 ff)、`rows_d` = down の出力行 (通常 e)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_kind(
+        slot_g: usize,
+        slot_u: usize,
+        slot_d: usize,
+        nseg: usize,
+        rows_gu: usize,
+        rows_d: usize,
+        bytes: u64,
+    ) {
+        if !on() {
+            return;
+        }
+        let slots = crate::model::exp_iq::SLOTS;
+        let kind = (slot_g.min(slots - 1)) * slots * slots
+            + (slot_u.min(slots - 1)) * slots
+            + slot_d.min(slots - 1);
+        KIND.with(|c| c.set(kind));
+        K_NSEG.with(|c| c.set(nseg as u64));
+        K_ROWS.with(|c| c.set((nseg * (rows_gu + rows_d)) as u64));
+        K_BYTES.with(|c| c.set(bytes));
+    }
+
+    /// 行数のバケット (1,000 行 = 0、2,000 = 1、4,000 = 2、... 128,000 以上 = 7)。
+    fn row_bucket(rows: u64) -> usize {
+        let mut b = 0usize;
+        let mut lim = 2_000u64;
+        while b + 1 < FROW && rows >= lim {
+            b += 1;
+            lim *= 2;
+        }
+        b
+    }
+
     /// 計測するか (台帳と同じ `DENNO_Q4_PROFILE`。テストの強制も含む)。
     pub fn on() -> bool {
         crate::model::q4ledger::enabled()
@@ -36694,6 +36819,13 @@ pub mod dec_exp_kprof {
             BUCKET_N[i].store(0, Ordering::Relaxed);
             BUCKET_NS[i].store(0, Ordering::Relaxed);
         }
+        for a in KFMT.iter().chain(KROW.iter()) {
+            a.calls.store(0, Ordering::Relaxed);
+            a.experts.store(0, Ordering::Relaxed);
+            a.bytes.store(0, Ordering::Relaxed);
+            a.ns.store(0, Ordering::Relaxed);
+        }
+        KIND.with(|c| c.set(usize::MAX));
         POOL_DEAD.with(|d| d.set(false));
     }
 
@@ -36736,6 +36868,69 @@ pub mod dec_exp_kprof {
             ));
         }
         out.push(b);
+        // task 190: 型 (gate/up/down) ごとの表。
+        let mut f = String::from("[exp-iq-kprof] 型ごと (g/u/d): calls experts rows bytes us/expert GB/s");
+        let mut any = false;
+        for (k, a) in KFMT.iter().enumerate() {
+            let calls = a.calls.load(Ordering::Relaxed);
+            if calls == 0 {
+                continue;
+            }
+            any = true;
+            let slots = crate::model::exp_iq::SLOTS;
+            let (g, u, d) = (k / (slots * slots), (k / slots) % slots, k % slots);
+            let experts = a.experts.load(Ordering::Relaxed);
+            let bytes = a.bytes.load(Ordering::Relaxed);
+            let ns = a.ns.load(Ordering::Relaxed);
+            let us_ex = if experts > 0 {
+                ns as f64 / 1e3 / experts as f64
+            } else {
+                0.0
+            };
+            let gbs = if ns > 0 {
+                bytes as f64 / ns as f64
+            } else {
+                0.0
+            };
+            f.push_str(&format!(
+                " | {g}/{u}/{d} {calls}層 {experts}本 {:.1}MB {us_ex:.1}us/本 {gbs:.0}GB/s",
+                bytes as f64 / 1e6
+            ));
+        }
+        if any {
+            out.push(f);
+        }
+        // task 190: 行数バケットごとの表 (1 層 = gate/up + down の出力行の合計)。
+        let mut r = String::from("[exp-iq-kprof] 行数ごと: rows calls experts us/launch us/expert GB/s");
+        let mut any = false;
+        for (i, a) in KROW.iter().enumerate() {
+            let calls = a.calls.load(Ordering::Relaxed);
+            if calls == 0 {
+                continue;
+            }
+            any = true;
+            let experts = a.experts.load(Ordering::Relaxed);
+            let bytes = a.bytes.load(Ordering::Relaxed);
+            let ns = a.ns.load(Ordering::Relaxed);
+            let lo = if i == 0 { 0u64 } else { 2_000u64 << (i - 1) };
+            let us_call = ns as f64 / 1e3 / calls as f64;
+            let us_ex = if experts > 0 {
+                ns as f64 / 1e3 / experts as f64
+            } else {
+                0.0
+            };
+            let gbs = if ns > 0 {
+                bytes as f64 / ns as f64
+            } else {
+                0.0
+            };
+            r.push_str(&format!(
+                " | >={lo} {calls}層 {experts}本 {us_call:.1}us {us_ex:.1}us/本 {gbs:.0}GB/s"
+            ));
+        }
+        if any {
+            out.push(r);
+        }
         out
     }
 
@@ -36816,6 +37011,25 @@ pub mod dec_exp_kprof {
         let h = (HITS.with(|c| c.get()) as usize).min(MAX_HITS);
         BUCKET_N[h].fetch_add(1, Ordering::Relaxed);
         BUCKET_NS[h].fetch_add(sum, Ordering::Relaxed);
+        // task 190: gate + up + silu + down の 4 段だけを「expert カーネル」として
+        // (型, 行数) に積む (D2H と和は別物なので入れない)。
+        let gemv_ns = acc[GATE] + acc[UP] + acc[SILU] + acc[DOWN];
+        let kind = KIND.with(|c| c.get());
+        if kind != usize::MAX && gemv_ns > 0 {
+            let nseg = K_NSEG.with(|c| c.get());
+            let rows = K_ROWS.with(|c| c.get());
+            let bytes = K_BYTES.with(|c| c.get());
+            let cell = &KFMT[kind.min(FKIND - 1)];
+            cell.calls.fetch_add(1, Ordering::Relaxed);
+            cell.experts.fetch_add(nseg, Ordering::Relaxed);
+            cell.bytes.fetch_add(bytes, Ordering::Relaxed);
+            cell.ns.fetch_add(gemv_ns, Ordering::Relaxed);
+            let cell = &KROW[row_bucket(rows).min(FROW - 1)];
+            cell.calls.fetch_add(1, Ordering::Relaxed);
+            cell.experts.fetch_add(nseg, Ordering::Relaxed);
+            cell.bytes.fetch_add(bytes, Ordering::Relaxed);
+            cell.ns.fetch_add(gemv_ns, Ordering::Relaxed);
+        }
     }
 
     /// イベントを 1 本打つ (プールから取る)。

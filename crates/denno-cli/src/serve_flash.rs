@@ -496,6 +496,12 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     if let Some(line) = denno_engine::model::exp_iq::stats_line() {
         eprintln!("{line}");
     }
+    // task 190: ヒット本数ごとのミス CPU / 上げ直しの表 (PROFILE のときだけ)。
+    if tag == "decode" {
+        for line in denno_engine::model::exp_iq::hit_lines(128) {
+            eprintln!("{line}");
+        }
+    }
     denno_engine::model::exp_iq::stats_reset();
     // task 148: prefill の m 行 expert (ヒット率 / GPU 層 / 行数 / D2H と足し込みの
     // 時間 / 上げ直し)。`DENNO_EXPERT_IQ_GPU=1` かつ PF ゲート on のときだけ 1 行。

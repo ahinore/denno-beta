@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -46,6 +46,10 @@ spec() {
         # expert GEMV。数値契約は CPU とビット一致ではない (1 行を 32 レーンで
         # 分割して足す) ので FMA を許可する。
         exp_iq)       echo "kernels_exp_iq.cu|fmad" ;;
+        # task 190: IQ expert GEMV の v2 (v5 の手法: ベクタロード / 次ブロックの
+        # 先読み / アキュムレータ 4 本 / 表を shared へ)。数値契約は v1 と同じ
+        # (CPU とビット一致しない。v1 とも合計順が違う) なので FMA を許可する。
+        exp_iq_v2)    echo "kernels_exp_iq_v2.cu|fmad" ;;
         # task 148: prefill の m 行 expert GEMV。decode と同じくビット一致契約では
         # ない (1 行を 32 レーンで分割) ので FMA を許可する。
         exp_iq_pf)    echo "kernels_exp_iq_pf.cu|fmad" ;;
