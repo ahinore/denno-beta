@@ -594,15 +594,8 @@ impl SsmLayer {
     /// 診断ダンプ (`DENNO_DEBUG_GDN_DUMP_LAYER`) がこの層を指しているときだけ
     /// 従来のトークン逐次に落ちる (サブステージの追記順を保つため)。
     pub fn forward_batch(&mut self, curs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-        let nt = curs.len();
-        if nt == 0 {
-            return Ok(Vec::new());
-        }
-        if nt == 1 {
-            return Ok(vec![self.forward_token(&curs[0])?]);
-        }
         let e = self.p.n_embd;
-        let mut flat = Vec::with_capacity(nt * e);
+        let mut flat = Vec::with_capacity(curs.len() * e);
         for cur in curs {
             if cur.len() != e {
                 bail!(
@@ -611,6 +604,27 @@ impl SsmLayer {
                 );
             }
             flat.extend_from_slice(cur);
+        }
+        let outs = self.forward_batch_flat(&flat, curs.len())?;
+        Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect())
+    }
+
+    /// task 200: [`Self::forward_batch`] の平坦版。入力 `flat` (`nt` 行 ×
+    /// `n_embd`) をそのまま使い、出力も平坦な 1 本で返す (トークンごとの
+    /// `Vec<f32>` を作らない)。数値は [`Self::forward_batch`] とビット一致する。
+    pub fn forward_batch_flat(&mut self, flat: &[f32], nt: usize) -> Result<Vec<f32>> {
+        let e = self.p.n_embd;
+        if nt == 0 {
+            return Ok(Vec::new());
+        }
+        if nt == 1 {
+            return Ok(self.forward_token(&flat[..e])?);
+        }
+        if flat.len() != nt * e {
+            bail!(
+                "SsmLayer::forward_batch_flat: 入力長 {} が nt={nt} * n_embd={e} と違う",
+                flat.len()
+            );
         }
 
         let qd = self.p.qkv_dim();
@@ -641,7 +655,7 @@ impl SsmLayer {
         #[cfg(feature = "cuda")]
         if crate::model::qwen4exp::pf_gdn_chain_on() && !gdn::gdn_dbg_enabled_for(self.il as i64)
         {
-            if let Some(rows) = self.forward_batch_chain(&flat, nt)? {
+            if let Some(rows) = self.forward_batch_chain(flat, nt)? {
                 return Ok(rows);
             }
         }
@@ -653,7 +667,7 @@ impl SsmLayer {
         {
             let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_QKV);
             self.qkv_gate
-                .gemv_batch_split(&flat, nt, &mut [&mut qkv[..], &mut z[..]])?;
+                .gemv_batch_split(flat, nt, &mut [&mut qkv[..], &mut z[..]])?;
         }
         crate::model::qwen4exp::q4prof::mark(
             t,
@@ -669,7 +683,7 @@ impl SsmLayer {
         {
             let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_GATE);
             self.beta_alpha
-                .gemv_batch_split(&flat, nt, &mut [&mut beta_raw[..], &mut alpha[..]])?;
+                .gemv_batch_split(flat, nt, &mut [&mut beta_raw[..], &mut alpha[..]])?;
         }
         crate::model::qwen4exp::q4prof::mark(
             t,
@@ -835,7 +849,7 @@ impl SsmLayer {
             self.il,
             crate::model::qwen4exp::q4prof::ST_OUT,
         );
-        Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect())
+        Ok(outs)
     }
 
     /// task 167: ssm 層 1 チャンクをデバイス連鎖で回す
@@ -847,7 +861,7 @@ impl SsmLayer {
     /// beta/alpha は F32 重みのホスト投影なので、ここで先に作って連鎖へ渡す
     /// (連鎖の中間は qkv / z / y だけ = どれもホストでは使わない)。
     #[cfg(feature = "cuda")]
-    fn forward_batch_chain(&mut self, flat: &[f32], nt: usize) -> Result<Option<Vec<Vec<f32>>>> {
+    fn forward_batch_chain(&mut self, flat: &[f32], nt: usize) -> Result<Option<Vec<f32>>> {
         use crate::model::qwen4exp::q4prof;
         #[cfg(test)]
         PF_CHAIN_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -939,6 +953,7 @@ impl SsmLayer {
             std::mem::take(&mut *v)
         });
         let mut ph = [0u64; 3];
+        let mut kept_dev = false;
         let done = crate::cuda::gdn_pf_chain(
             pair,
             wout,
@@ -963,6 +978,7 @@ impl SsmLayer {
             self.il,
             0,
             &mut outs[..nt * e],
+            &mut kept_dev,
             &mut ph,
         )?;
         if !done {
@@ -973,7 +989,19 @@ impl SsmLayer {
         q4prof::add_ns(&q4prof::A_GDN, self.il, q4prof::ST_GDN, ph[1]);
         q4prof::add_ns(&q4prof::A_OUT, self.il, q4prof::ST_OUT, ph[2]);
         q4prof::bump_nt(self.il, nt);
-        let rows: Vec<Vec<f32>> = outs[..nt * e].chunks_exact(e).map(|c| c.to_vec()).collect();
+        // task 200: 出力をデバイスに残したときは作業域だけ返して空を返す
+        // (呼び出し側 `prefill_attn_chunk` が `pf_combine_dev` に回す)。
+        if kept_dev {
+            PF_CHAIN_OUT.with(|c| {
+                let mut v = c.borrow_mut();
+                if v.len() < outs.len() {
+                    *v = outs;
+                }
+            });
+            return Ok(Some(Vec::new()));
+        }
+        // task 200: 平坦な出力を 1 本だけ返す (トークンごとの Vec を作らない)。
+        let out = outs[..nt * e].to_vec();
         // 作業域を返す (次の層チャンクが同じ容量を使い回す)。
         PF_CHAIN_OUT.with(|c| {
             let mut v = c.borrow_mut();
@@ -981,7 +1009,7 @@ impl SsmLayer {
                 *v = outs;
             }
         });
-        Ok(Some(rows))
+        Ok(Some(out))
     }
 
     /// `attn_qkv` の投影だけを行う (state は進めない)。
@@ -1274,6 +1302,26 @@ impl LayerAttn for SsmAttn {
         }
     }
 
+    /// task 200: 平坦なまま受けて平坦なまま返す。ssm 層は
+    /// [`SsmLayer::forward_batch_flat`]、full 層は委譲先の平坦版に任せる。
+    fn forward_batch_flat(
+        &mut self,
+        layer: usize,
+        flat: &[f32],
+        nt: usize,
+    ) -> std::result::Result<Vec<f32>, Qwen4ExpError> {
+        let n = self.layers.len();
+        match self.layers.get_mut(layer) {
+            None => Err(one(format!(
+                "SsmAttn::forward_batch_flat: 層 {layer} は範囲外 (層数 {n})"
+            ))),
+            Some(Some(s)) => s
+                .forward_batch_flat(flat, nt)
+                .map_err(|e| Qwen4ExpError(vec![format!("層 {layer}: {e:#}")])),
+            Some(None) => self.full.forward_batch_flat(layer, flat, nt),
+        }
+    }
+
     /// 層優先の順序でも安全。`forward` は「1 層の状態を 1 トークン進める」だけで、
     /// 層どうしは独立している。層優先にしても各層の中でトークン順は保たれるので、
     /// GDN の conv / ssm 状態の進み方は逐次版と同じになる。
@@ -1478,6 +1526,41 @@ mod tests {
             }
             assert_eq!(bits(&seq.state.ssm), bits(&bat.state.ssm), "nt={nt}: ssm 状態");
             assert_eq!(bits(&seq.state.conv), bits(&bat.state.conv), "nt={nt}: conv 状態");
+        }
+    }
+
+    /// task 200: 平坦な入口 ([`SsmLayer::forward_batch_flat`]) がトークン逐次と
+    /// ビット一致する (行入口 `forward_batch` と同じ値・同じ状態)。
+    #[test]
+    fn ssm_batch_flat_matches_token_by_token_bitexact() {
+        for nt in [1usize, 2, 3, 5, 9, 17] {
+            let (mut seq, p) = small_layer();
+            let (mut bat, _) = small_layer();
+            let curs = inputs(&p, nt);
+            let flat: Vec<f32> = curs.iter().flat_map(|c| c.iter().copied()).collect();
+
+            let want: Vec<Vec<f32>> = curs
+                .iter()
+                .map(|c| seq.forward_token(c).expect("forward_token"))
+                .collect();
+            let got = bat
+                .forward_batch_flat(&flat, nt)
+                .expect("forward_batch_flat");
+
+            assert_eq!(got.len(), nt * p.n_embd, "nt={nt}: 出力長");
+            for t in 0..nt {
+                assert_eq!(
+                    bits(&got[t * p.n_embd..(t + 1) * p.n_embd]),
+                    bits(&want[t]),
+                    "nt={nt}: トークン {t} の出力がビット不一致"
+                );
+            }
+            assert_eq!(bits(&seq.state.ssm), bits(&bat.state.ssm), "nt={nt}: ssm 状態");
+            assert_eq!(
+                bits(&seq.state.conv),
+                bits(&bat.state.conv),
+                "nt={nt}: conv 状態"
+            );
         }
     }
 

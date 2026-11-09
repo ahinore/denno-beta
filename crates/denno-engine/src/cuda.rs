@@ -20616,6 +20616,22 @@ impl PfDev {
 
 thread_local! {
     static PF_DEV: std::cell::RefCell<PfDev> = const { std::cell::RefCell::new(PfDev::new()) };
+    /// task 200: ssm 連鎖がデバイスに残した層出力 (直後の combine が転送なしで読む)。
+    static PF_ATTN_DEV_OUT: std::cell::RefCell<Option<(CUdeviceptr, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+    /// task 200: この attn 呼び出しで層出力をデバイスに残してよいか (呼び出し側が設定)。
+    /// 常駐経路の平坦入口だけが true にする (従来経路は必ずホスト出力を受け取る)。
+    static PF_ATTN_DEV_REQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// task 200: 層出力をデバイスに残してよいかを設定する (attn 呼び出しの前後で切る)。
+pub fn pf_attn_dev_request(on: bool) {
+    PF_ATTN_DEV_REQ.with(|c| c.set(on));
+}
+
+/// task 200: デバイス出力の要求が出ているか (連鎖が読む)。
+pub(crate) fn pf_attn_dev_requested() -> bool {
+    PF_ATTN_DEV_REQ.with(|c| c.get())
 }
 
 /// task 154: チャンクぶんの作業域を用意する。`false` で CPU 経路へ。
@@ -21281,11 +21297,44 @@ pub fn pf_mix(
 /// `bo` は `[nt][n_embd]` (attn / ffn の出力)。`inj` は直前の [`pf_mix`] が残した
 /// デバイス上の値をそのまま使う。
 pub fn pf_combine(bo: &[f32], nt: usize, hc: usize, e: usize) -> bool {
-    if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
     if bo.len() != nt * e {
         return pf_fail("combine の bo 長が違う");
+    }
+    pf_combine_core(Some(bo), None, nt, hc, e)
+}
+
+/// task 200: 直前に ssm 連鎖が**デバイスへ書いた**層出力を、H2D せずに combine する
+/// (`DENNO_PF_ATTN_DEVRES`)。記録が無い/形が違うときは false を返す
+/// (呼び出し側は要求を落とす — attention の状態は既に進んでいる)。
+pub fn pf_combine_dev(nt: usize, hc: usize, e: usize) -> bool {
+    let Some((ptr, dnt, de)) = PF_ATTN_DEV_OUT.with(|c| c.borrow_mut().take()) else {
+        return pf_fail("combine (デバイス出力): 記録が無い");
+    };
+    if dnt != nt || de != e {
+        return pf_fail("combine (デバイス出力): 形が違う");
+    }
+    pf_combine_core(None, Some(ptr), nt, hc, e)
+}
+
+/// task 200: 直前の層出力がデバイスに残っているかを捨てる (層の入口で呼ぶ)。
+pub fn pf_attn_dev_clear() {
+    PF_ATTN_DEV_OUT.with(|c| *c.borrow_mut() = None);
+}
+
+/// task 200: ssm 連鎖が層出力をデバイスに残したことを記録する。
+pub(crate) fn pf_attn_dev_store(ptr: CUdeviceptr, nt: usize, e: usize) {
+    PF_ATTN_DEV_OUT.with(|c| *c.borrow_mut() = Some((ptr, nt, e)));
+}
+
+fn pf_combine_core(
+    bo: Option<&[f32]>,
+    dev: Option<CUdeviceptr>,
+    nt: usize,
+    hc: usize,
+    e: usize,
+) -> bool {
+    if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
     }
     let Some(k) = pf_kernels() else {
         return false;
@@ -21301,18 +21350,27 @@ pub fn pf_combine(bo: &[f32], nt: usize, hc: usize, e: usize) -> bool {
         if nt > d.nt || hc != d.hc || e != d.e {
             return Err(format!("combine の形が違う (nt={nt} hc={hc} e={e})"));
         }
-        let (Some(res), Some(dbo), Some(inj)) =
-            (d.res.as_ref(), d.bo.as_ref(), d.inj.as_ref())
-        else {
+        let (Some(res), Some(inj)) = (d.res.as_ref(), d.inj.as_ref()) else {
             return Err("作業域が無い".into());
         };
-        dbo.copy_from(bo).map_err(|e| format!("bo H2D: {e:#}"))?;
-        let (mut pr, mut pb, mut pj) = (res.ptr(), dbo.ptr(), inj.ptr());
+        // task 200: `dev` が来たら転送しない (attn が既にその位置へ書いている)。
+        let pb = match (bo, dev) {
+            (Some(b), _) => {
+                let Some(dbo) = d.bo.as_ref() else {
+                    return Err("作業域が無い (bo)".into());
+                };
+                dbo.copy_from(b).map_err(|e| format!("bo H2D: {e:#}"))?;
+                dbo.ptr()
+            }
+            (None, Some(p)) => p,
+            (None, None) => return Err("combine の入力が無い".into()),
+        };
+        let (mut pr, mut pbv, mut pj) = (res.ptr(), pb, inj.ptr());
         let (mut e_c, mut hc_c) = (e as i32, hc as i32);
         let grid = ((e.div_ceil(256)) as u32, (nt * hc) as u32, 1);
         let mut args = [
             &mut pr as *mut _ as *mut c_void,
-            &mut pb as *mut _ as *mut c_void,
+            &mut pbv as *mut _ as *mut c_void,
             &mut pj as *mut _ as *mut c_void,
             &mut e_c as *mut _ as *mut c_void,
             &mut hc_c as *mut _ as *mut c_void,
@@ -38039,6 +38097,9 @@ pub fn gdn_pf_chain(
     li: usize,
     kv: u64,
     out: &mut [f32],
+    // task 200: `true` を返したときは層出力を**デバイスに残した** (`out` は未書き込み)。
+    // 直後の `pf_combine_dev` がそのまま読む (`DENNO_PF_ATTN_DEVRES`)。
+    kept_dev: &mut bool,
     phase_ns: &mut [u64; 3],
 ) -> Result<bool> {
     let e = wq.qkv.k;
@@ -38383,13 +38444,20 @@ pub fn gdn_pf_chain(
     phase_ns[2] = t_out.elapsed().as_nanos() as u64;
 
     // ---- 層の出力と状態をホストへ ------------------------------------------
-    gdn_pf_kprof::begin(gdn_pf_kprof::OUT_D2H);
-    let got: Vec<f32> = GDN_PF_CHAIN_BUF.with(|cell| -> Result<Vec<f32>> {
-        let b = cell.borrow();
-        b.o.as_ref().expect("連鎖の出力").to_vec::<f32>(nt * e)
-    })?;
-    gdn_pf_kprof::end(gdn_pf_kprof::OUT_D2H);
-    out[..nt * e].copy_from_slice(&got);
+    // task 200: `DENNO_PF_ATTN_DEVRES` のときは層出力をデバイスに残し、直後の
+    // combine にそのまま読ませる (D2H + H2D の往復を消す)。数値は同じ。
+    *kept_dev = pf_attn_dev_requested() && crate::model::qwen4exp::pf_attn_devres_on();
+    if *kept_dev {
+        pf_attn_dev_store(po, nt, e);
+    } else {
+        gdn_pf_kprof::begin(gdn_pf_kprof::OUT_D2H);
+        let got: Vec<f32> = GDN_PF_CHAIN_BUF.with(|cell| -> Result<Vec<f32>> {
+            let b = cell.borrow();
+            b.o.as_ref().expect("連鎖の出力").to_vec::<f32>(nt * e)
+        })?;
+        gdn_pf_kprof::end(gdn_pf_kprof::OUT_D2H);
+        out[..nt * e].copy_from_slice(&got);
+    }
     gdn_state_commit(li, ptrs[4], ptrs[5], conv_dim * cs, nv, dk * dv)?;
     // prefill のあとに decode (別ストア) や CPU 経路がホスト state を seed に
     // するので、状態は毎回ホストへも戻す (従来の sig 経路と同じ)。

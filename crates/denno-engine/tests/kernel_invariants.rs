@@ -8580,3 +8580,86 @@ fn pf195_router_fast_is_wired() {
         "moe.rs に select_topk_into_fast が無い"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 200: 平坦な attn 入口 (`DENNO_PF_ATTN_FLAT`)
+// ---------------------------------------------------------------------------
+
+const SSM_SRC: &str = include_str!("../src/model/qwen4exp_ssm.rs");
+const ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
+
+/// `DENNO_PF_ATTN_FLAT` は **既定 on** (lab t200a の flat で採用)。
+/// 併せて、層ループが平坦な入口を実際に呼び、通過カウンタで発火を数える
+/// ことを固定する (ゲートを足したら発火を数える)。
+#[test]
+fn pf_attn_flat_gate_defaults_on_and_is_wired() {
+    let i = QWEN_SRC
+        .find("pub(crate) fn pf_attn_flat_from_value")
+        .expect("pf_attn_flat_from_value が無い");
+    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    assert!(
+        body.contains("None => true,"),
+        "pf_attn_flat_from_value(None) が on でない: {body}"
+    );
+    assert!(
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が無い: {body}"
+    );
+    // 層ループ (常駐経路) が平坦入口を呼び、両分岐の通過を数えていること。
+    for k in [
+        "Self::prefill_attn_chunk(",
+        "attn.forward_batch_flat(il, mixed_flat, nt)",
+        "PF_ATTN_FLAT_CALLS.fetch_add",
+        "PF_ATTN_ROWS_CALLS.fetch_add",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+    // 平坦入口そのものが ssm / full の両方に実装されていること。
+    assert!(
+        QWEN_SRC.contains("fn forward_batch_flat("),
+        "trait に forward_batch_flat が無い"
+    );
+    for (src, name) in [(SSM_SRC, "SsmLayer"), (ATTN_SRC, "FullAttn")] {
+        assert!(
+            src.contains("fn forward_batch_flat("),
+            "{name}::forward_batch_flat が無い"
+        );
+    }
+}
+
+/// `DENNO_PF_ATTN_DEVRES` は **既定 on** (lab t200b の flatdev で採用)。
+/// ssm 連鎖が層出力をデバイスに残し、combine が転送なしで読む配線を固定する。
+#[test]
+fn pf_attn_devres_gate_defaults_on_and_is_wired() {
+    let i = QWEN_SRC
+        .find("pub(crate) fn pf_attn_devres_from_value")
+        .expect("pf_attn_devres_from_value が無い");
+    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    assert!(
+        body.contains("None => true,"),
+        "pf_attn_devres_from_value(None) が on でない: {body}"
+    );
+    for k in [
+        // 呼び出し側: 要求を立てる / 空の出力をデバイス出力として受ける / combine。
+        "pf_attn_dev_request(attn_dev)",
+        "pf_attn_dev_clear();",
+        "pf_combine_dev(nt, hc, e)",
+        "let dev_out = flat_outs.is_empty();",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+    // 連鎖側: 要求とゲートの両方が立ったときだけ D2H を飛ばす。
+    for k in [
+        "fn pf_combine_dev(",
+        "fn pf_attn_dev_store(",
+        "fn pf_attn_dev_requested(",
+        "pf_attn_dev_requested() && crate::model::qwen4exp::pf_attn_devres_on()",
+        "pf_attn_dev_store(po, nt, e)",
+    ] {
+        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+    }
+    assert!(
+        SSM_SRC.contains("if kept_dev {"),
+        "SsmLayer が kept_dev を見ていない"
+    );
+}
