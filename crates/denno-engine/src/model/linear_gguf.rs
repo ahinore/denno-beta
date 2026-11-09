@@ -438,6 +438,27 @@ impl GgufLinear {
         self.router_gpu
     }
 
+    /// task 192: ルータを GPU で回す形か (呼び出し側が GEMV を先に積むための判定)。
+    ///
+    /// `gemv` の F32 / F16 / BF16 アームと同じ門番 (対象フラグ・型・env) を
+    /// ここで先に見る。true でも実際の起動に失敗したら `false` が返るので、
+    /// 呼び出し側は従来の `gemv_label` に落ちればよい。
+    pub fn router_gpu_ok(&self) -> bool {
+        if !self.router_gpu
+            || !matches!(self.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16)
+        {
+            return false;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            router_gpu_enabled()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
     /// Q8_0 の AVX2 融合カーネルを有効にする (ビット一致は保証しない)。
     pub fn with_fast_q8(mut self, on: bool) -> Self {
         self.fast_q8 = on;

@@ -8104,6 +8104,25 @@ fn moe_ffn_quant_impl(
     let k = p.n_expert_used;
     let ff = p.n_ff_exp;
 
+    // task 192: `DENNO_DEC_ROUTER_EARLY` — ルータ GEMV を共有 expert の enqueue
+    // より**先に**積む。ルータの同期は自分の GEMV の完了待ち (lab t187c で
+    // 1 層 12.7 us) なので、積むのが早いほど待ちが短くなる。数値は 1 ビットも
+    // 変わらない (同じカーネル・同じ引数・同じ入力)。
+    // decode だけに効かせる (prefill は `gdn_gpu_win` が閉じている)。
+    #[cfg(feature = "cuda")]
+    let router_early = crate::cuda::dec_router_early_on()
+        && gdn_gpu_win::active()
+        && lw.gate_inp.router_gpu_ok()
+        && crate::cuda::maybe_gpu_router_gemv_begin(
+            lw.gate_inp.uid(),
+            lw.gate_inp.blocks().as_slice(),
+            lw.gate_inp.k(),
+            lw.gate_inp.n(),
+            x,
+        );
+    #[cfg(not(feature = "cuda"))]
+    let router_early = false;
+
     // task 124: shared expert の gate/up は `x` だけで決まるので、router と
     // 選択 expert の CPU 仕事を始める前に GPU へ積む (join は下の 5. で 1 回)。
     // task 138: この発行は台帳では shared に数える。
@@ -8116,16 +8135,41 @@ fn moe_ffn_quant_impl(
 
     // task 138: 台帳の区間 (router)。gate_inp の GEMV から top-k の確定まで。
     let _l_router = q4ledger::enter(q4ledger::ROUTER);
+    // task 192: router 1 回の操作別内訳 (`DENNO_GDN_DEC_KPROF` の平均表)。
+    // 何を待ったかは `sync` 行の host に出る。
+    #[cfg(feature = "cuda")]
+    let _kp_router = crate::cuda::dec_kprof::window(
+        crate::cuda::dec_kprof::ROUTER,
+        lw.il,
+        crate::cuda::dec_kprof::cur_pos(),
+        0,
+    );
 
     // 1. ルータ
     let mut probs = vec![0.0f32; ne];
-    lw.gate_inp
-        .gemv_label("gate_inp", x, &mut probs)
-        .map_err(|err| one(format!("層 {}: ffn_gate_inp: {err}", lw.il)))?;
+    #[allow(unused_mut)]
+    let mut router_done = false;
+    #[cfg(feature = "cuda")]
+    if router_early {
+        router_done = crate::cuda::maybe_gpu_router_gemv_finish(&mut probs);
+    }
+    if !router_done {
+        lw.gate_inp
+            .gemv_label("gate_inp", x, &mut probs)
+            .map_err(|err| one(format!("層 {}: ffn_gate_inp: {err}", lw.il)))?;
+    }
+    #[cfg(feature = "cuda")]
+    let t_softmax = std::time::Instant::now();
     softmax(&mut probs);
+    #[cfg(feature = "cuda")]
+    crate::cuda::dec_kprof::note_since("softmax", t_softmax);
 
     // 2. top-k (index 昇順で返る)
+    #[cfg(feature = "cuda")]
+    let t_topk = std::time::Instant::now();
     let mut sel = select_topk(&probs, k);
+    #[cfg(feature = "cuda")]
+    crate::cuda::dec_kprof::note_since("topk", t_topk);
 
     // task 120: decode (m=1) の expert 剪定ゲート (**既定 off**)。
     //
