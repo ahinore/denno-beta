@@ -11079,6 +11079,314 @@ pub fn from_slice_pinned<T: Copy>(data: &[T]) -> Result<DevBuffer> {
     Ok(buf)
 }
 
+// ---------------------------------------------------------------------------
+// task 209: prefill の活性バッファを pinned ホストメモリにする (`DENNO_PF_PIN`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t203c の 14,018 トークン cold prefill の台帳): mix の D2H 13.78 GB が
+// 785 ms (= 17.6 GB/s) かかっている。宛先は `vec![0.0f32; nt*e]` のページャブルな
+// メモリで、driver が内部 staging を挟むためこの速さになる。このホストの実測は
+// pinned 52.6 GB/s / pageable 19.6 GB/s なので、**宛先/元を pinned にするだけ**で
+// 同じバイト列が 2.8 倍速く動く (値は 1 bit も変わらない)。
+//
+// `PfHostBuf` は「pinned が取れたら pinned、取れなければ Vec」の 1 本ぶんの
+// ホストバッファ。API はスライスだけなので、呼び出し側は確保の仕方だけを変える。
+// pinned は確保・解放が高いので、スレッド局所の空きリストで使い回す。
+
+/// `DENNO_PF_PIN` の解釈 (純関数)。**既定 on** (lab t209a の pin で採用)、
+/// 明示的な偽値だけ off。
+pub(crate) fn pf_pin_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static PF_PIN_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用: ゲートを強制する (0 = env に戻す)。
+#[cfg(test)]
+pub(crate) fn pf_pin_set_for_test(v: u8) {
+    PF_PIN_FORCE.store(v, Ordering::Relaxed);
+}
+
+/// task 209: prefill の活性バッファを pinned ホストメモリにするか (`DENNO_PF_PIN`)。
+///
+/// **既定 on** (lab t209a の pin が 3,826 -3.9% / 14,018 -3.4%、both で
+/// -4.8% / -4.0%。`=0` で切り戻し)。
+pub(crate) fn pf_pin_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_PIN_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_pin_from_value(std::env::var("DENNO_PF_PIN").ok().as_deref()))
+}
+
+thread_local! {
+    /// task 209: 使い終わった pinned ホスト領域 (スレッドごと。prefill は 1 本)。
+    static PF_HOST_FREE: std::cell::RefCell<Vec<PinMem>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// task 209: prefill の活性 1 本ぶんのホストバッファ。
+///
+/// pinned を確保できたらそちらを使い、できなければ `Vec` に落ちる。**中身は
+/// 保証しない** — 読む前に全要素を書く経路 (D2H の宛先・GEMM の出力先) だけが
+/// 使う。`Vec` に落ちたときは従来どおり 0 埋め。
+pub struct PfHostBuf {
+    mem: Option<PinMem>,
+    v: Vec<f32>,
+    len: usize,
+}
+
+impl PfHostBuf {
+    /// 長さ `len` のバッファ (中身は不定)。pinned が取れなければ 0 埋めの `Vec`。
+    pub fn new(len: usize) -> Self {
+        if len > 0 && pf_pin_on() {
+            // 空きリストから 1 本借りる (足りなければ新規に確保して差し替える)。
+            let reused = PF_HOST_FREE.with(|c| {
+                let mut q = c.borrow_mut();
+                match q.pop() {
+                    Some(m) if m.bytes >= len * 4 => Some(m),
+                    Some(m) => {
+                        q.push(m);
+                        None
+                    }
+                    None => None,
+                }
+            });
+            let mem = match reused {
+                Some(m) => Some(m),
+                None => match PinMem::alloc(len * 4) {
+                    Ok(m) => Some(m),
+                    Err(_) => {
+                        tracing::info!("[pf-pin] pinned を確保できない → Vec に落ちる (len={len})");
+                        None
+                    }
+                },
+            };
+            if let Some(mem) = mem {
+                return Self {
+                    mem: Some(mem),
+                    v: Vec::new(),
+                    len,
+                };
+            }
+        }
+        Self {
+            mem: None,
+            v: vec![0.0f32; len],
+            len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// pinned で確保できたか (台帳・テスト用)。
+    pub fn is_pinned(&self) -> bool {
+        self.mem.is_some()
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        match &self.mem {
+            Some(m) => unsafe { std::slice::from_raw_parts(m.ptr as *const f32, self.len) },
+            None => &self.v,
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [f32] {
+        match &mut self.mem {
+            Some(m) => unsafe { std::slice::from_raw_parts_mut(m.ptr as *mut f32, self.len) },
+            None => &mut self.v,
+        }
+    }
+}
+
+impl Drop for PfHostBuf {
+    fn drop(&mut self) {
+        if let Some(m) = self.mem.take() {
+            // 使い回す (スレッド局所)。コンテキスト破棄より先に drop される想定。
+            PF_HOST_FREE.with(|c| c.borrow_mut().push(m));
+        }
+    }
+}
+
+#[cfg(test)]
+mod pf_pin_tests {
+    use super::*;
+
+    /// task 209: `DENNO_PF_PIN` は **既定 on** (lab t209a の pin で採用)。
+    #[test]
+    fn pf_pin_gate_truth_table() {
+        assert!(pf_pin_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", "", " off ", "FALSE"] {
+            assert!(!pf_pin_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_pin_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    /// task 209: `DENNO_PF_MIXDEVIN` も **既定 on** (lab t209a の devin で採用)。
+    #[test]
+    fn pf_dev_in_gate_truth_table() {
+        assert!(pf_dev_in_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", "", "FALSE"] {
+            assert!(!pf_dev_in_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes"] {
+            assert!(pf_dev_in_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    /// task 209: `PfHostBuf` はスライスとして読み書きでき、長さが要求どおり。
+    /// pinned が取れる環境では pinned、取れない環境では `Vec` に落ちる (どちらも
+    /// 値の経路は同じ)。
+    #[test]
+    fn pf_host_buf_round_trips_and_falls_back() {
+        pf_pin_set_for_test(1); // 強制 off
+        let mut b = PfHostBuf::new(37);
+        assert_eq!(b.len(), 37);
+        assert!(!b.is_pinned(), "強制 off で pinned になった");
+        b.as_mut_slice()[0] = 1.5;
+        b.as_mut_slice()[36] = -2.5;
+        assert_eq!(b.as_slice()[0], 1.5);
+        assert_eq!(b.as_slice()[36], -2.5);
+        assert_eq!(b.as_slice().len(), 37);
+        drop(b);
+
+        pf_pin_set_for_test(2); // 強制 on (確保できなければ Vec に落ちる)
+        let mut b = PfHostBuf::new(8);
+        assert_eq!(b.len(), 8);
+        b.as_mut_slice()[3] = 7.0;
+        assert_eq!(b.as_slice()[3], 7.0);
+        assert_eq!(b.as_slice().len(), 8);
+        pf_pin_set_for_test(0);
+
+        // 空でも安全。
+        let b = PfHostBuf::new(0);
+        assert_eq!(b.len(), 0);
+        assert!(b.is_empty());
+    }
+
+    /// task 209: 記録は (ホストポインタ, nt, e) が全部一致したときだけ有効。
+    #[test]
+    fn pf_mixed_mark_requires_exact_match() {
+        let a = [0.0f32; 4];
+        let b = [0.0f32; 4];
+        let mark = (a.as_ptr(), 2usize, 2usize);
+        assert!(pf_mixed_mark_matches(mark, a.as_ptr(), 2, 2));
+        assert!(!pf_mixed_mark_matches(mark, b.as_ptr(), 2, 2), "別ポインタ");
+        assert!(!pf_mixed_mark_matches(mark, a.as_ptr(), 1, 2), "nt 違い");
+        assert!(!pf_mixed_mark_matches(mark, a.as_ptr(), 2, 4), "e 違い");
+        assert!(
+            !pf_mixed_mark_matches((std::ptr::null(), 2, 2), a.as_ptr(), 2, 2),
+            "未記録 (null) が一致扱いになった"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 209: router / shared が mix の出力をデバイスから直接読む
+// ---------------------------------------------------------------------------
+//
+// 層ループは mix の出力 (`mixed_flat`) を D2H したあと、同じバイト列を
+// router (`gate_inp` の F32 GEMM) と shared expert の GEMM のために **もう一度
+// H2D する** (台帳 14,018: 6.89 GB + 6.89 GB)。デバイスには `pf_mix` の出力が
+// そのまま残っているので、そこを読めば転送 2 本が消える。値は同じバイト列。
+
+/// `DENNO_PF_MIXDEVIN` の解釈 (純関数)。**既定 on** (lab t209a で採用)、
+/// 明示的な偽値だけ off。
+pub(crate) fn pf_dev_in_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static PF_DEV_IN_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用: ゲートを強制する (0 = env に戻す)。
+#[cfg(test)]
+pub(crate) fn pf_dev_in_set_for_test(v: u8) {
+    PF_DEV_IN_FORCE.store(v, Ordering::Relaxed);
+}
+
+/// task 209: router / shared が mix の出力をデバイスから読むか
+/// (`DENNO_PF_MIXDEVIN`、**既定 on**。lab t209a の devin が 3,826 -1.6% /
+/// 14,018 -0.9%、both で -4.8% / -4.0%。`=0` で切り戻し)。
+pub(crate) fn pf_dev_in_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_DEV_IN_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_dev_in_from_value(std::env::var("DENNO_PF_MIXDEVIN").ok().as_deref()))
+}
+
+thread_local! {
+    /// task 209: 「このホスト側ポインタの `mixed` はデバイスの `mixed` と同一」の記録。
+    static PF_MIXED_CUR: std::cell::Cell<(*const f32, usize, usize)> =
+        const { std::cell::Cell::new((std::ptr::null(), 0, 0)) };
+}
+
+/// ホスト側の `mixed` がデバイスの `mixed` と同じ内容であることを記録する
+/// (`pf_take_mixed` の直後に呼ぶ)。
+pub fn pf_mixed_mark(host: *const f32, nt: usize, e: usize) {
+    PF_MIXED_CUR.with(|c| c.set((host, nt, e)));
+}
+
+/// 記録を消す (非常駐経路へ落ちたとき・リクエストの終わり)。
+pub fn pf_mixed_mark_clear() {
+    PF_MIXED_CUR.with(|c| c.set((std::ptr::null(), 0, 0)));
+}
+
+/// 記録が (host, nt, e) と一致するか (純関数・テスト用)。
+pub(crate) fn pf_mixed_mark_matches(
+    mark: (*const f32, usize, usize),
+    host: *const f32,
+    nt: usize,
+    e: usize,
+) -> bool {
+    !mark.0.is_null() && std::ptr::eq(mark.0, host) && mark.1 == nt && mark.2 == e
+}
+
+/// この `xs` をデバイスの `mixed` から読んでよいなら、そのデバイスポインタ。
+///
+/// ゲート off・記録なし・ポインタ不一致・作業域の形違いはすべて `None`
+/// (呼び出し側は従来どおりホストから上げる)。
+pub(crate) fn pf_mixed_dev_in_ptr(host: *const f32, nt: usize, e: usize) -> Option<CUdeviceptr> {
+    if !pf_dev_in_on() || nt == 0 || e == 0 {
+        return None;
+    }
+    let m = PF_MIXED_CUR.with(|c| c.get());
+    if !pf_mixed_mark_matches(m, host, nt, e) {
+        return None;
+    }
+    PF_DEV.with(|c| {
+        let d = c.borrow();
+        let b = d.mixed.as_ref()?;
+        (d.e == e && nt <= d.nt && b.bytes() >= nt * e * 4).then(|| b.ptr())
+    })
+}
+
 /// s167 (P6): 専用コピーストリーム (h2 の D2H を qkv/z GEMM と重ねる)。
 /// driver オブジェクトはコンテキストに属するので Drop で明示的に破棄する
 /// (スレッド終了時に解放。`stream_destroy` が無い driver ではリークするだけで、
@@ -19511,6 +19819,52 @@ pub fn maybe_gpu_f32_gemm_batch_into(
 ) -> bool {
     #[cfg(test)]
     F32_GEMM_BATCH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if xs.len() != nt * k {
+        return false;
+    }
+    f32_gemm_batch_run(uid, bytes, k, n, BatchIn::Host(xs), nt, out, src_ty)
+}
+
+/// task 209: `xs` が既にデバイスにある版 (ホストからの H2D をしない)。
+///
+/// `dev_x` は `[nt][k]` f32 のデバイス領域。router が `pf_mix` の出力
+/// (`mixed`) をそのまま読むために使う。ホスト版と**同じカーネル・同じ入力
+/// バイト列**なので値は変わらない。
+pub fn maybe_gpu_f32_gemm_batch_dev_into(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    dev_x: CUdeviceptr,
+    nt: usize,
+    out: &mut [f32],
+    src_ty: crate::kquant::GgmlType,
+) -> bool {
+    #[cfg(test)]
+    F32_GEMM_BATCH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if dev_x == 0 {
+        return false;
+    }
+    f32_gemm_batch_run(uid, bytes, k, n, BatchIn::Dev(dev_x), nt, out, src_ty)
+}
+
+/// 入力の置き場所 (ホストのスライス / 既にデバイスにある領域)。
+enum BatchIn<'a> {
+    Host(&'a [f32]),
+    Dev(CUdeviceptr),
+}
+
+/// [`maybe_gpu_f32_gemm_batch_into`] と [`maybe_gpu_f32_gemm_batch_dev_into`] の本体。
+fn f32_gemm_batch_run(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    src: BatchIn<'_>,
+    nt: usize,
+    out: &mut [f32],
+    src_ty: crate::kquant::GgmlType,
+) -> bool {
     if !cuda_enabled() {
         return false;
     }
@@ -19522,7 +19876,6 @@ pub fn maybe_gpu_f32_gemm_batch_into(
     if k == 0
         || n == 0
         || nt < 2
-        || xs.len() != nt * k
         || out.len() != nt * n
         || bytes.len() != k.saturating_mul(n).saturating_mul(bpp)
         || k > i32::MAX as usize
@@ -19551,13 +19904,21 @@ pub fn maybe_gpu_f32_gemm_batch_into(
     let r = F32_GEMM_BATCH_SC.with(|cell| -> Result<()> {
         let mut s = cell.borrow_mut();
         let F32GemmBatchSc { x: dx, out: dout } = &mut *s;
-        Scratch::ensure(dx, nt * k * 4)?;
+        // task 209: デバイス入力のときは `x` の作業域 (と H2D) を丸ごと省く。
+        let xp = match src {
+            BatchIn::Host(xs) => {
+                Scratch::ensure(dx, nt * k * 4)?;
+                let dx = dx.as_ref().unwrap();
+                dx.copy_from(xs)?;
+                dx.ptr()
+            }
+            BatchIn::Dev(p) => p,
+        };
         Scratch::ensure(dout, nt * n * 4)?;
-        let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
-        dx.copy_from(xs)?;
+        let dout = dout.as_ref().unwrap();
         let wp = w.buf.ptr();
         unsafe {
-            let (mut pw, mut px, mut po) = (wp, dx.ptr(), dout.ptr());
+            let (mut pw, mut px, mut po) = (wp, xp, dout.ptr());
             let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k as c_int, n as c_int);
             let mut args = [
                 &mut pw as *mut _ as *mut c_void,
@@ -20638,6 +20999,8 @@ pub(crate) fn pf_attn_dev_requested() -> bool {
 ///
 /// 直前の `res` の中身は保証しない (呼び出し側が `pf_upload_res` で入れる)。
 pub fn pf_begin(nt: usize, hc: usize, e: usize, lr: usize) -> bool {
+    // task 209: 前のリクエストの「mixed はデバイスと同一」の記録を捨てる。
+    pf_mixed_mark_clear();
     if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
@@ -22686,11 +23049,54 @@ pub fn pf_shared(
     down: PfLin<'_>,
     out: &mut [f32],
 ) -> bool {
+    if x.len() != nt.saturating_mul(e) {
+        pf2_note(3);
+        return false;
+    }
+    pf_shared_impl(SharedIn::Host(x), nt, e, sff, gate, up, down, out)
+}
+
+/// task 209: 入力 `x` が既にデバイスにある版 (`[nt][e]` f32)。
+///
+/// router と同じく、`pf_mix` の出力 (`mixed`) をそのまま読む。ホスト版と
+/// **同じカーネル・同じ入力バイト列**なので値は変わらない。
+pub fn pf_shared_dev(
+    dev_x: CUdeviceptr,
+    nt: usize,
+    e: usize,
+    sff: usize,
+    gate: PfLin<'_>,
+    up: PfLin<'_>,
+    down: PfLin<'_>,
+    out: &mut [f32],
+) -> bool {
+    if dev_x == 0 {
+        pf2_note(3);
+        return false;
+    }
+    pf_shared_impl(SharedIn::Dev(dev_x), nt, e, sff, gate, up, down, out)
+}
+
+/// shared 連鎖の入力の置き場所。
+enum SharedIn<'a> {
+    Host(&'a [f32]),
+    Dev(CUdeviceptr),
+}
+
+fn pf_shared_impl(
+    src: SharedIn<'_>,
+    nt: usize,
+    e: usize,
+    sff: usize,
+    gate: PfLin<'_>,
+    up: PfLin<'_>,
+    down: PfLin<'_>,
+    out: &mut [f32],
+) -> bool {
     pf2_set_nt(nt);
     let ok_shape = nt >= PF2_MIN_ROWS
         && e > 0
         && sff > 0
-        && x.len() == nt * e
         && out.len() == nt * e
         && gate.k == e
         && gate.n == sff
@@ -22729,10 +23135,18 @@ pub fn pf_shared(
         let gub = d.gu.as_ref().expect("ensure 済み");
         let shb = d.sh.as_ref().expect("ensure 済み");
         let swb = d.x.as_ref().expect("ensure 済み");
-        xb.copy_from(x)?;
+        // task 209: デバイス入力のときは H2D をせず、その領域を直接読む
+        // (swiglu の出力は別の `d.x` に書くので入力は壊れない)。
+        let xp = match src {
+            SharedIn::Host(x) => {
+                xb.copy_from(x)?;
+                xb.ptr()
+            }
+            SharedIn::Dev(p) => p,
+        };
         // task 183: `DENNO_PF_TC_SHARED2` が on なら BM=64 のカーネルで撃つ。
-        pf2_gemm_shared(ctx, pg, pg_k, xb.ptr(), gab.ptr(), nt, e, sff)?;
-        pf2_gemm_shared(ctx, pu, pu_k, xb.ptr(), gub.ptr(), nt, e, sff)?;
+        pf2_gemm_shared(ctx, pg, pg_k, xp, gab.ptr(), nt, e, sff)?;
+        pf2_gemm_shared(ctx, pu, pu_k, xp, gub.ptr(), nt, e, sff)?;
         // swiglu: x = silu(ga) * gu (elem の既存カーネル。CPU と同じ式)
         {
             let (mut gp, mut up_p, mut op) = (gab.ptr(), gub.ptr(), swb.ptr());

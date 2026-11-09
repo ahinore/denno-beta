@@ -8663,3 +8663,76 @@ fn pf_attn_devres_gate_defaults_on_and_is_wired() {
         "SsmLayer が kept_dev を見ていない"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 209: prefill のコピー削減 (pinned ホスト / mix 出力のデバイス直読み)
+// ---------------------------------------------------------------------------
+
+/// `DENNO_PF_PIN` と `DENNO_PF_MIXDEVIN` はどちらも **既定 on** (lab t209a で採用)。
+///
+/// 併せて配線を固定する: (1) 層ループは mix の出力を `PfHostBuf` に落とし、
+/// D2H の直後に「このホスト配列はデバイスと同一」を記録する、(2) shared の
+/// 出力も `PfHostBuf` に落とす、(3) router と shared は記録が一致したときだけ
+/// デバイスの `mixed` を直接読む。
+#[test]
+fn pf209_pin_and_mixdevin_gates_default_on_and_are_wired() {
+    for name in [
+        "fn pf_pin_from_value",
+        "fn pf_dev_in_from_value",
+    ] {
+        let i = CUDA_RS
+            .find(name)
+            .unwrap_or_else(|| panic!("cuda.rs に {name} が無い"));
+        let body: String = CUDA_RS[i..].chars().take(300).collect();
+        assert!(
+            body.contains("None => true"),
+            "{name} の既定が on でない: {body}"
+        );
+    }
+    // ゲートの真理値表は unit test 側 (cuda.rs の pf_pin_tests) にある。
+    assert!(CUDA_RS.contains("mod pf_pin_tests {"), "unit test が無い");
+    // pinned バッファと借用の口。
+    for k in [
+        "pub struct PfHostBuf {",
+        "pub fn is_pinned(&self) -> bool",
+        "pub fn as_mut_slice(&mut self) -> &mut [f32]",
+        "static PF_HOST_FREE:",
+    ] {
+        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+    }
+    // デバイス直読みの口。
+    for k in [
+        "pub fn pf_mixed_mark(",
+        "pub fn pf_mixed_mark_clear(",
+        "fn pf_mixed_dev_in_ptr(",
+        "fn pf_mixed_mark_matches(",
+        "pub fn maybe_gpu_f32_gemm_batch_dev_into(",
+        "pub fn pf_shared_dev(",
+        "enum BatchIn<'a> {",
+        "enum SharedIn<'a> {",
+    ] {
+        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+    }
+    // 層ループ側の配線。
+    for k in [
+        "let mut mixed_buf = PfHostBuf::new(first_nt * e);",
+        "let mixed_flat: &mut [f32] = &mut mixed_buf.as_mut_slice()[..nt * e];",
+        "crate::cuda::pf_take_mixed(mixed_flat)",
+        "crate::cuda::pf_mixed_mark(mixed_flat.as_ptr(), nt, e);",
+        "let _mixed_mark = PfMixedMarkGuard;",
+        "let mut sh_buf = PfHostBuf::new(nt * e);",
+        "crate::cuda::pf_mixed_dev_in_ptr(xs.as_ptr(), nt, e)",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+    // 記録は resident 経路を出るときに消える (非常駐経路が拾わない)。
+    assert!(
+        QWEN_SRC.contains("crate::cuda::pf_mixed_mark_clear();"),
+        "Guard の drop が記録を消していない"
+    );
+    // router はゲートが立っていても k == e のときだけデバイスを読む。
+    assert!(
+        QWEN_SRC.contains("let dev_router_in = if lw.gate_inp.k() == e {"),
+        "router の形チェックが無い"
+    );
+}
