@@ -8246,6 +8246,21 @@ fn moe_ffn_quant_impl(
         #[cfg(not(feature = "cuda"))]
         let iq_mode = false;
 
+        // task 190 (`DENNO_DEC_MISS_FAST`): ミスの上げ直しを**層の前**に移す。
+        // 上げた本はこの層の lookup でヒットになるので、CPU で計算せず GPU で回せる
+        // (page fault + CPU GEMV の 1 本ぶんが消える)。予算・担当層の回転・
+        // 1 本 2 MB の転送は従来と同じ (`iq_warm_misses` を前へ動かすだけ)。
+        #[cfg(feature = "cuda")]
+        let miss_fast_now = vram_mode && iq_mode && crate::model::exp_miss_up::fast_enabled();
+        #[cfg(not(feature = "cuda"))]
+        let miss_fast_now = false;
+        #[cfg(feature = "cuda")]
+        if miss_fast_now {
+            // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
+            let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
+            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
+        }
+
         // task 187: ヒットの寄与をデバイスで和にする (`DENNO_DEC_EXP_SUMDEV`)。
         // PTX が無い / 形が合わないときは `moe_experts_iq_gpu_batched` が従来経路へ落ちる。
         #[cfg(feature = "cuda")]
@@ -8432,12 +8447,10 @@ fn moe_ffn_quant_impl(
         // GPU に倒したトークンだけでなく CPU のトークンでも積む (載せないと
         // ヒット率が永久に 0 のままになる)。
         #[cfg(feature = "cuda")]
-        if vram_mode && iq_mode {
+        if vram_mode && iq_mode && !miss_fast_now {
             // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
             let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
-            // task 190: miss-fast の層は上げ直し済みなので数えるだけ。
-            let upload = !(sumdev && crate::model::exp_miss_up::fast_enabled());
-            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer, upload);
+            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
         }
     }
 
@@ -9052,90 +9065,6 @@ fn moe_experts_iq_gpu_batched(
     let n_miss_used = miss_slots(overlap, miss_pos.len());
     let miss_slice: &[usize] = &miss_pos[..n_miss_used];
     let mut miss_h = vec![0.0f32; n_miss_used * e];
-    // task 190 (`DENNO_DEC_MISS_FAST`): ミスを CPU で計算せず、mmap から
-    // ページアブル直の非同期 H2D でデバイスへ上げてヒットと同じカーネルで回す。
-    // 和のカーネルが要るので `sumdev` のときだけ。失敗は従来経路へ (fail closed)。
-    if sumdev && crate::model::exp_miss_up::fast_enabled() && !miss_pos.is_empty() {
-        let hw: Vec<f32> = pos.iter().map(|&t| weights[t]).collect();
-        let ids_hit: Vec<u16> = pos.iter().map(|&t| sel[t] as u16).collect();
-        let ids_miss: Vec<u16> = miss_pos.iter().map(|&t| sel[t] as u16).collect();
-        let mut miss_bytes: Vec<crate::cuda::MissExpertBytes<'_>> =
-            Vec::with_capacity(miss_pos.len());
-        let mut have_bytes = true;
-        for &ei in &miss_pos {
-            match (
-                lw.gate_exps.slice(sel[ei]),
-                lw.up_exps.slice(sel[ei]),
-                lw.down_exps.slice(sel[ei]),
-            ) {
-                (Ok(g), Ok(u), Ok(d)) => {
-                    miss_bytes.push(crate::cuda::MissExpertBytes { gate: g, up: u, down: d })
-                }
-                _ => {
-                    have_bytes = false;
-                    break;
-                }
-            }
-        }
-        if have_bytes {
-            let mut sum = vec![0.0f32; e];
-            let mut miss_out: Vec<f32> = Vec::new();
-            // ミスを VRAM へ上げる (ヒットの起動後 = H2D が GPU の裏で進む)。
-            let miss_ei: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
-            let mut acq = |i: usize| -> anyhow::Result<Option<[u64; 3]>> {
-                let ei = miss_ei[i];
-                let key = ExpertKey {
-                    layer: lw.il as u16,
-                    expert: ei as u16,
-                };
-                let got = expert_vram::acquire(key, shapes, || {
-                    Ok([
-                        lw.gate_exps.slice(ei)?,
-                        lw.up_exps.slice(ei)?,
-                        lw.down_exps.slice(ei)?,
-                    ])
-                })
-                .map_err(|err| {
-                    anyhow::anyhow!("層 {}: expert {ei}: VRAM 経路 (miss fast): {err:#}", lw.il)
-                })?;
-                Ok(got.map(|a| {
-                    [
-                        a.dev.ptr(ExpertMatrix::Gate),
-                        a.dev.ptr(ExpertMatrix::Up),
-                        a.dev.ptr(ExpertMatrix::Down),
-                    ]
-                }))
-            };
-            let ran = crate::cuda::moe_experts_iq_layer_sum_miss(
-                lw.gate_exps.ty,
-                lw.up_exps.ty,
-                lw.down_exps.ty,
-                &pg,
-                &pu,
-                &pd,
-                &ids_hit,
-                &miss_bytes,
-                &ids_miss,
-                x,
-                x.len(),
-                ff,
-                e,
-                &hw,
-                &mut sum,
-                &mut miss_out,
-                &mut acq,
-            )
-            .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV (miss fast): {err:#}", lw.il)))?;
-            if ran {
-                return Ok(Some(IqBatchOut::Sum {
-                    sum,
-                    miss_pos,
-                    miss_h: miss_out,
-                    hits,
-                }));
-            }
-        }
-    }
     // task 187: `DENNO_DEC_EXP_SUMDEV` ではヒットの寄与をデバイスで和にして
     // `e` 要素だけ D2H する (ミスはホストで足す)。重みは選択順 (pos の順) に詰める。
     if sumdev {
@@ -9481,15 +9410,7 @@ fn moe_experts_iq_gpu_miss_up(
 ///
 /// 失敗 (確保失敗・型未対応) は静かに諦める (リクエストは落とさない)。
 #[cfg(feature = "cuda")]
-fn iq_warm_misses(
-    lw: &LayerW,
-    sel: &[usize],
-    x_len: usize,
-    e: usize,
-    ff: usize,
-    n_layer: usize,
-    upload: bool,
-) {
+fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize, n_layer: usize) {
     use crate::model::expert_vram::ExpertShape;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -9552,12 +9473,6 @@ fn iq_warm_misses(
         }
     }
     crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
-
-    // task 190: `DENNO_DEC_MISS_FAST` の層はミスを層の中で `acquire` 済み
-    // (VRAM に載っている) なので、ここで二度上げない。集計だけ残す。
-    if !upload {
-        return;
-    }
 
     // 2. 上げ直しは担当層だけ、予算の範囲で。
     let off = OFFSET.load(Ordering::Relaxed) % nl;
