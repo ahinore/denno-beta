@@ -10,8 +10,9 @@
 //! (serve_flash.rs から `#[cfg(test)] #[path] mod flash_synth;` で include)。
 
 use super::{
-    echo_matches, model_reuse_enabled, prefix_miss_line, prefix_splice_enabled, Flash, GenReq,
-    TEST_BUILD_COUNT, TEST_FAIL_STEP, TEST_LAST_REUSE,
+    aux_ctx_enabled, aux_ctx_max_tok, aux_ctx_ratio, echo_matches, model_reuse_enabled, pick_ctx,
+    prefix_miss_line, prefix_splice_enabled, CtxPick, Flash, GenReq, TEST_BUILD_COUNT,
+    TEST_FAIL_STEP, TEST_LAST_PICK, TEST_LAST_REUSE,
 };
 use crate::flash_telemetry::Telemetry;
 use denno_engine::gguf::GgufFile;
@@ -670,7 +671,9 @@ fn build_flash(dir: &TempDir) -> Flash {
         default_max: 6,
         tok,
         batch: true,
+        dec: None,
         cache: None,
+        aux: None,
         telem,
     }
 }
@@ -747,7 +750,7 @@ fn disconnect_caches_consistent_decoder() {
     );
     assert_eq!(builds() - b0, 1, "最初のリクエストで build_model が 1 回");
     let c = flash.cache.as_ref().expect("emit 失敗なのに cache が空");
-    assert_eq!(c.toks, c.dec.tokens(), "toks が decoder 状態と不一致");
+    assert_eq!(c.toks, c.state.tokens(), "toks が decoder 状態と不一致");
     assert_eq!(
         c.toks.len(),
         plen,
@@ -761,7 +764,7 @@ fn disconnect_caches_consistent_decoder() {
     let err2 = flash2.generate(&gen_req("hi"), fail_at(3)).err().expect("generate が失敗するはず");
     assert!(err2.to_string().contains("emit failed (test injection"), "err={err2}");
     let c2 = flash2.cache.as_ref().expect("emit 失敗なのに cache が空");
-    assert_eq!(c2.toks, c2.dec.tokens());
+    assert_eq!(c2.toks, c2.state.tokens());
     assert_eq!(
         c2.toks.len(),
         plen + 2,
@@ -1261,4 +1264,323 @@ fn echo_matches_allows_client_trim() {
         !echo_matches(&flash.tok, &gen, "  hell0 "),
         "途中の変更を通した"
     );
+}
+
+// ---------------------------------------------------------------------------
+// task 206: 短い脇リクエストで長い文脈を壊さない (aux 文脈)
+// ---------------------------------------------------------------------------
+
+/// 直近リクエストの [`CtxPick`]。
+fn last_pick() -> CtxPick {
+    // enum の並び (Main=0, Aux=1, Fresh=2, MainAfterEvict=3) をそのまま使う。
+    match TEST_LAST_PICK.load(Ordering::Relaxed) {
+        0 => CtxPick::Main,
+        1 => CtxPick::Aux,
+        2 => CtxPick::Fresh,
+        3 => CtxPick::MainAfterEvict,
+        n => panic!("未知の pick {n}"),
+    }
+}
+
+/// 長い会話 A の user 本文 (260 トークン弱)。合成モデルの `max_ctx` は
+/// テスト側で 512 に広げる (既定の 128 では A の続きが入らない)。
+const LONG_A: &str = concat!(
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+);
+
+/// A の続き (assistant の返送 + 次の user)。
+fn a_ext_req(text: &str) -> GenReq {
+    gen_req_msgs(&[("user", LONG_A), ("assistant", text), ("user", "next")])
+}
+
+/// 脇リクエスト B (独自の system を持つ短い要求。A とは前置きがほぼ一致しない)。
+fn side_b_req() -> GenReq {
+    GenReq::from_json(
+        &serde_json::json!({
+            "system": "you are a title generator",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 6,
+            "temperature": 0.0,
+        }),
+        6,
+    )
+    .expect("GenReq")
+}
+
+/// task 206 (1): `pick_ctx` の規約。延長できる文脈が最優先、無ければ
+/// 「主よりずっと短い」リクエストだけ脇へ回す。
+#[test]
+fn pick_ctx_rules() {
+    // 延長できる主 → 主。
+    assert_eq!(
+        pick_ctx(100, Some((90, 90)), None, true, 2048, 4),
+        CtxPick::Main
+    );
+    // 延長できる脇が主より長い → 脇 (同じ質問の繰り返し)。
+    assert_eq!(
+        pick_ctx(100, Some((10, 10)), Some((90, 90)), true, 2048, 4),
+        CtxPick::Aux
+    );
+    // 主の方が長い → 主。
+    assert_eq!(
+        pick_ctx(100, Some((90, 90)), Some((10, 10)), true, 2048, 4),
+        CtxPick::Main
+    );
+    // 部分一致しかない + ずっと短い → 脇 (主を壊さない)。
+    assert_eq!(
+        pick_ctx(20, Some((5000, 3)), Some((7, 1)), true, 2048, 4),
+        CtxPick::Aux
+    );
+    // 同じでも比率を超える (1/4 より長い) → 主。
+    assert_eq!(
+        pick_ctx(1300, Some((5000, 3)), None, true, 2048, 4),
+        CtxPick::Main
+    );
+    // 脇の容量を超える短いリクエスト → 脇を捨てて主。
+    assert_eq!(
+        pick_ctx(3000, Some((20000, 3)), None, true, 2048, 4),
+        CtxPick::MainAfterEvict
+    );
+    // ゲート off は従来どおり主。
+    assert_eq!(
+        pick_ctx(20, Some((5000, 3)), None, false, 2048, 4),
+        CtxPick::Main
+    );
+    // 文脈が無ければ新規。
+    assert_eq!(pick_ctx(20, None, None, true, 2048, 4), CtxPick::Fresh);
+    // ratio = 0 は「長さでは脇へ回さない」。
+    assert_eq!(
+        pick_ctx(20, Some((5000, 3)), None, true, 2048, 0),
+        CtxPick::Main
+    );
+}
+
+/// (1) env の読み方。
+#[test]
+fn aux_env_truth_table() {
+    assert!(aux_ctx_enabled(None));
+    assert!(aux_ctx_enabled(Some("1")));
+    for off in ["0", "false", "no"] {
+        assert!(!aux_ctx_enabled(Some(off)), "{off} を on と読んだ");
+    }
+    assert_eq!(aux_ctx_max_tok(None), 2048);
+    assert_eq!(aux_ctx_max_tok(Some("512")), 512);
+    assert_eq!(aux_ctx_max_tok(Some("0")), 8, "0 でも下限 8 に丸める");
+    assert_eq!(aux_ctx_max_tok(Some("x")), 2048, "typo は既定に落ちる");
+    assert_eq!(aux_ctx_ratio(None), 4);
+    assert_eq!(aux_ctx_ratio(Some("8")), 8);
+    assert_eq!(aux_ctx_ratio(Some("0")), 0);
+}
+
+/// task 206 (2)(3)(4): 長い A、短い B、A の続き。
+///
+/// - A の続きは A の前置きをほぼ全部再利用する (B が間に入っても壊れない)。
+/// - B の繰り返しも B の前置きを再利用する。
+/// - A の続きの出力は、ゲート off (B が A を潰す) の経路と一致する。
+/// - 2 つの文脈は互いのトークン列を書き換えない。
+#[test]
+fn long_ctx_survives_side_request() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+    std::env::remove_var("DENNO_FLASH_AUX_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_RATIO");
+
+    let dir = TempDir::new("flash-aux-a");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+
+    // 1. 長い会話 A。
+    let g1 = flash.generate(&gen_req(LONG_A), no_emit).expect("A");
+    assert_eq!(g1.text, "\t\t\t\t\t\t", "合成モデルの決定列");
+    let a_len = flash.cache.as_ref().expect("A が cache に無い").toks.len();
+    let a_toks = flash.cache.as_ref().expect("A").toks.clone();
+    assert!(a_len > 80, "A が短すぎる ({a_len})");
+
+    // 2. 短い脇リクエスト B。主の文脈は残る。
+    let g2 = flash.generate(&side_b_req(), no_emit).expect("B");
+    assert_eq!(last_pick(), CtxPick::Aux, "B が脇の文脈に載っていない");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "B が A の前置きを再利用した"
+    );
+    assert!(flash.aux.is_some(), "B の文脈が残っていない");
+    let b_len = flash.aux.as_ref().expect("B").toks.len();
+    let b_toks = flash.aux.as_ref().expect("B").toks.clone();
+    assert_eq!(
+        flash.cache.as_ref().expect("A が消えた").toks,
+        a_toks,
+        "B が A の文脈を書き換えた"
+    );
+
+    // 3. A の続き → A の前置きをほぼ全部再利用する。
+    let g3 = flash.generate(&a_ext_req(&g1.text), no_emit).expect("A ext");
+    assert_eq!(last_pick(), CtxPick::Main, "A の続きが主の文脈に載っていない");
+    let reuse = TEST_LAST_REUSE.load(Ordering::Relaxed);
+    assert_eq!(reuse, a_len, "A の前置きを全長再利用していない (reuse={reuse})");
+    assert_eq!(g3.text, "\t\t\t\t\t\t", "A の続きの出力が変わった");
+    // B はそのまま残っている (A の続きが B を潰していない)。
+    assert_eq!(
+        flash.aux.as_ref().expect("A の続きで B が消えた").toks,
+        b_toks,
+        "A の続きが B の文脈を書き換えた"
+    );
+    // A の続きを食ったあとの主の文脈 (B の繰り返しはこれを書き換えない)。
+    let a2_toks = flash.cache.as_ref().expect("A ext が cache に無い").toks.clone();
+    assert!(a2_toks.len() > a_len, "A の続きが主の文脈を延ばしていない");
+
+    // 4. B の繰り返し → また脇に載り、同じ出力になる。
+    //
+    // 再利用トークンは 0 になる: 脇の文脈は B の生成 6 トークンを含むので
+    // プロンプト (B の入力だけ) の方が短く、「キャッシュ全体が前置き」に
+    // ならない (主の文脈と同じ規約。生成部を返送しないクライアントでは
+    // KV を短くできない = GDN は畳み込みの履歴を持つため巻き戻せない)。
+    // 大事なのは主の文脈が壊れないこと (下の assert) と出力が同じこと。
+    let g4 = flash.generate(&side_b_req(), no_emit).expect("B again");
+    assert_eq!(last_pick(), CtxPick::Aux, "B の繰り返しが脇に載っていない");
+    assert_eq!(g4.text, g2.text, "B の出力が繰り返しで変わった");
+    assert!(b_len > 0);
+    assert_eq!(
+        flash.cache.as_ref().expect("A が消えた").toks,
+        a2_toks,
+        "B の繰り返しが A の文脈を書き換えた"
+    );
+
+    // 5. ゲート off (従来経路) と同じ出力か。off では B が A を潰す。
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "0");
+    let dir2 = TempDir::new("flash-aux-a2");
+    let mut off = build_flash(&dir2);
+    off.max_ctx = 512;
+    let o1 = off.generate(&gen_req(LONG_A), no_emit).expect("A off");
+    let o2 = off.generate(&side_b_req(), no_emit).expect("B off");
+    assert_eq!(
+        last_pick(),
+        CtxPick::Main,
+        "ゲート off で脇の文脈を使った"
+    );
+    assert!(off.aux.is_none(), "ゲート off で脇の文脈を作った");
+    // off では B が主の文脈を置き換える (task 206 の症状そのもの)。
+    let o3 = off.generate(&a_ext_req(&o1.text), no_emit).expect("A ext off");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "ゲート off で A の前置きが残っていた (症状が再現しない)"
+    );
+    assert_eq!(g3.text, o3.text, "ゲート on と off で A の続きの出力が違う");
+    assert_eq!(g2.text, o2.text, "ゲート on と off で B の出力が違う");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+}
+
+/// task 206 (4): 文脈を持ち回っても出力は新規構築 + full prefill と一致する。
+#[test]
+fn aux_ctx_output_matches_fresh_build() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+
+    let dir = TempDir::new("flash-aux-b");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let g1 = flash.generate(&gen_req(LONG_A), no_emit).expect("A");
+    flash.generate(&side_b_req(), no_emit).expect("B");
+    let ext = a_ext_req(&g1.text);
+    let g3 = flash.generate(&ext, no_emit).expect("A ext");
+    assert!(TEST_LAST_REUSE.load(Ordering::Relaxed) > 0, "再利用していない");
+
+    // 新規構築で同じプロンプトを full prefill。
+    let dir2 = TempDir::new("flash-aux-b2");
+    let mut fresh = build_flash(&dir2);
+    fresh.max_ctx = 512;
+    let f = fresh.generate(&ext, no_emit).expect("fresh");
+    // プロンプト長は splice の有無で 1 トークン単位にずれうる (task 131/141) ので
+    // 比べない。比べるのは出力本文 (ビット) と生成トークン数。
+    assert_eq!(g3.n_out, f.n_out, "生成トークン数が違う");
+    assert_eq!(g3.text, f.text, "状態を持ち回った出力が新規構築と違う");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+}
+
+/// task 206 (4): B のクライアント切断は A を壊さない。
+#[test]
+fn disconnect_in_side_request_keeps_main_ctx() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+
+    let dir = TempDir::new("flash-aux-c");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let g1 = flash.generate(&gen_req(LONG_A), no_emit).expect("A");
+    let a_toks = flash.cache.as_ref().expect("A").toks.clone();
+
+    // B の 1 個目の差分で切断 → 脇の文脈に途中まで残る。主は無傷。
+    let err = flash
+        .generate(&side_b_req(), fail_at(1))
+        .err()
+        .expect("切断で失敗するはず");
+    assert!(err.to_string().contains("emit failed (test injection"));
+    assert_eq!(last_pick(), CtxPick::Aux, "B が脇に載っていない");
+    assert!(flash.aux.is_some(), "切断した B の文脈が残っていない");
+    assert_eq!(
+        flash.cache.as_ref().expect("A が消えた").toks,
+        a_toks,
+        "切断した B が A の文脈を書き換えた"
+    );
+
+    // A の続きは A を全長再利用できる。
+    let g3 = flash.generate(&a_ext_req(&g1.text), no_emit).expect("A ext");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        a_toks.len(),
+        "切断のあと A の前置きを再利用できない"
+    );
+    assert_eq!(g3.text, "\t\t\t\t\t\t");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+}
+
+/// task 206 (4): 脇の容量 (メモリ上限) を超える短いリクエストは、脇を捨てて
+/// 主へ載せる (上限を超えた状態は保持しない)。
+#[test]
+fn aux_ctx_evicted_at_memory_limit() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+    std::env::set_var("DENNO_FLASH_AUX_TOK", "24");
+
+    let dir = TempDir::new("flash-aux-d");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let _g1 = flash.generate(&gen_req(LONG_A), no_emit).expect("A");
+    // 上限内の短い要求は脇に載る。
+    let small = GenReq::from_json(
+        &serde_json::json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        }),
+        1,
+    )
+    .expect("GenReq");
+    flash.generate(&small, no_emit).expect("small");
+    assert_eq!(last_pick(), CtxPick::Aux, "上限内の短い要求が脇に載らない");
+    assert!(flash.aux.is_some(), "上限内の短い要求が保存されていない");
+    assert_eq!(
+        flash.cache.as_ref().expect("A").toks.len() > 200,
+        true,
+        "主の文脈が置き換わった"
+    );
+    // B のプロンプトは 24 トークンより長い → 脇には入らない (捨てて主へ)。
+    flash.generate(&side_b_req(), no_emit).expect("B");
+    assert_eq!(
+        last_pick(),
+        CtxPick::MainAfterEvict,
+        "容量超過で脇を捨てていない"
+    );
+    assert!(flash.aux.is_none(), "容量超過なのに脇の文脈が残った");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+    std::env::remove_var("DENNO_FLASH_AUX_TOK");
 }

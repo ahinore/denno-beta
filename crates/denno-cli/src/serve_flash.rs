@@ -58,7 +58,9 @@ use denno_engine::model::qwen4exp::{
     expert_w_stats_request_end, q4prof, Qwen4Exp, Qwen4ExpParams, TapTokens,
 };
 use denno_engine::model::qwen4exp_attn::FullAttn;
-use denno_engine::model::qwen4exp_decode::{argmax, DecoderConfig, Qwen4ExpDecoder};
+use denno_engine::model::qwen4exp_decode::{
+    argmax, DecoderConfig, DecoderSeqState, Qwen4ExpDecoder,
+};
 use denno_engine::spec_ngram::{
     offer_draft, NgramIndex, DEFAULT_CAND_KEEP, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_SUFFIX,
 };
@@ -133,6 +135,11 @@ static TEST_BUILD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// `cfg(test)` なので本番ビルドには存在しない。数値経路には触れない。
 #[cfg(test)]
 static TEST_LAST_REUSE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// task 206: テスト専用の直近リクエストの [`CtxPick`] (発火テスト用)。
+/// `cfg(test)` なので本番ビルドには存在しない。数値経路には触れない。
+#[cfg(test)]
+static TEST_LAST_PICK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// task 123: テスト専用の engine 側 step 失敗の注入スイッチ (firing test 用)。
 /// `cfg(test)` なので本番ビルドには存在しない。数値経路には触れない。
@@ -290,9 +297,13 @@ impl GenReq {
     }
 }
 
-/// 直前のリクエストの状態。`toks` は `dec` が食ったトークン列 (古い順)。
+/// 1 つの文脈 (会話) の状態。`toks` は `state` が食ったトークン列 (古い順)。
+///
+/// task 206: モデル (重み) は [`Flash::dec`] に 1 つだけ持ち、ここには系列状態
+/// (KV / GDN / PLE conv / トークン列) だけを置く。状態の差し替えは move なので、
+/// 文脈を入れ替えても KV のコピーは起きない。
 struct Cached {
-    dec: Qwen4ExpDecoder,
+    state: DecoderSeqState,
     toks: Vec<u32>,
     logits: Vec<f32>,
     /// `toks` のうちプロンプト部の長さ (`toks[prompt_len..]` が生成部)。
@@ -317,6 +328,116 @@ struct CachedReq {
     enable_thinking: bool,
     /// `continue: true` のプロンプトは描画結果と対応しないので splice しない。
     cont: bool,
+}
+
+/// task 206: このリクエストをどの文脈に載せるか。
+///
+/// 決め方は [`pick_ctx`] の doc にある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtxPick {
+    /// 主の文脈 (長い会話) を延長する / 置き換える。
+    Main,
+    /// 短い脇リクエスト用の小さな文脈に載せる (主の文脈はそのまま残す)。
+    Aux,
+    /// 使える文脈が無い (新規)。主の枠に入れる。
+    Fresh,
+    /// 短い脇リクエストだが脇の容量 (`DENNO_FLASH_AUX_TOK`) を超える。
+    /// 脇の文脈は捨てて主へ載せる (メモリ上限での追い出し)。
+    MainAfterEvict,
+}
+
+impl CtxPick {
+    fn name(self) -> &'static str {
+        match self {
+            CtxPick::Main => "main",
+            CtxPick::Aux => "aux",
+            CtxPick::Fresh => "fresh",
+            CtxPick::MainAfterEvict => "main+evict",
+        }
+    }
+}
+
+/// task 206: `DENNO_FLASH_AUX_CTX` (既定 on)。`0` / `false` / `no` で切る。
+fn aux_ctx_enabled(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("false") | Some("no"))
+}
+
+/// task 206: `DENNO_FLASH_AUX_TOK` — 脇の文脈が持てるトークン数の上限 (既定 2048)。
+///
+/// 実モデルでは 1 トークンあたり KV が 48 KiB (full attention 12 層 ×
+/// k/v 512 要素 × f32) なので、2048 トークンで約 96 MiB。GDN の状態
+/// (文脈長に依存しない 117 MiB) が別に乗る。
+fn aux_ctx_max_tok(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.max(8))
+        .unwrap_or(2048)
+}
+
+/// task 206: `DENNO_FLASH_AUX_RATIO` — 主の 1/N 以下の長さなら脇の文脈へ (既定 4)。
+/// 0 で「長さでは脇へ回さない」。
+fn aux_ctx_ratio(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(4)
+}
+
+/// task 206: どの文脈に載せるかを決める (純関数。テストが規約を固定する)。
+///
+/// 引数は `(トークン数, 共通前置き長)`。規則は優先順に:
+///
+/// 1. キャッシュ全体がプロンプトの前置きになっている文脈 (= そのまま延長できる)
+///    のうち、一番長いものを選ぶ。同じ長さなら主。
+/// 2. 延長できる文脈が無く、主の文脈が無ければ [`CtxPick::Fresh`]。
+/// 3. 脇の文脈が有効で、プロンプトが主の `1/ratio` 以下
+///    (かつ脇の容量内) なら [`CtxPick::Aux`] — 主へ食わせると主が消えるため。
+/// 4. それ以外は [`CtxPick::Main`]。主より短い脇リクエストが容量を超えるときだけ
+///    [`CtxPick::MainAfterEvict`] (脇の状態を捨ててから主へ)。
+///
+/// 「共通前置きが長い方」ではなく「延長できる方」を優先するのは、途中までしか
+/// 一致しない文脈へ食わせるとその文脈が消えるから (それが task 206 の症状)。
+/// KV は短くできない (GDN は畳み込みの履歴を持つ) ので、部分一致の再利用は
+/// どのみち 0 トークンになる。
+fn pick_ctx(
+    prompt_len: usize,
+    main: Option<(usize, usize)>,
+    aux: Option<(usize, usize)>,
+    aux_on: bool,
+    aux_max_tok: usize,
+    ratio: usize,
+) -> CtxPick {
+    let extendable = |c: Option<(usize, usize)>| -> Option<(usize, usize)> {
+        c.filter(|&(n, lcp)| n <= prompt_len && lcp == n)
+    };
+    let m = extendable(main);
+    let a = if aux_on { extendable(aux) } else { None };
+    match (m, a) {
+        (Some((mn, _)), Some((an, _))) => {
+            return if an > mn { CtxPick::Aux } else { CtxPick::Main }
+        }
+        (Some(_), None) => return CtxPick::Main,
+        (None, Some(_)) => return CtxPick::Aux,
+        (None, None) => {}
+    }
+    let Some((main_len, _)) = main else {
+        return CtxPick::Fresh;
+    };
+    if !aux_on {
+        return CtxPick::Main;
+    }
+    let much_shorter = ratio > 0 && prompt_len.saturating_mul(ratio) <= main_len;
+    if much_shorter {
+        if prompt_len <= aux_max_tok {
+            return CtxPick::Aux;
+        }
+        return CtxPick::MainAfterEvict;
+    }
+    CtxPick::Main
+}
+
+/// task 206: 診断用の `長さ/共通前置き長` (文脈が無ければ `-`)。
+fn ctx_len_lcp(c: Option<&Cached>, lcp: Option<usize>) -> String {
+    match (c, lcp) {
+        (Some(c), Some(l)) => format!("{}/{}", c.toks.len(), l),
+        _ => "-".to_string(),
+    }
 }
 
 /// task 131: `DENNO_FLASH_PREFIX_SPLICE` の値から splice を試すかを決める
@@ -383,7 +504,13 @@ struct Flash {
     tok: GgufTokenizer,
     /// 層優先のバッチ prefill を使うか (`DENNO_PREFILL_BATCH=0` で切れる)
     batch: bool,
+    /// P118/task 206: 重みを持つ decoder。リクエストの間は系列状態が空。
+    /// `DENNO_FLASH_MODEL_REUSE=0` でも成功したリクエストのあとは残す (今日と同じ)。
+    dec: Option<Qwen4ExpDecoder>,
+    /// 主の文脈 (長い会話)。
     cache: Option<Cached>,
+    /// task 206: 短い脇リクエスト専用の小さな文脈。主の文脈を壊さないために持つ。
+    aux: Option<Cached>,
     /// P51: 推論テレメトリの送出先 (`DENNO_TELEMETRY=0` で無効)。
     telem: Telemetry,
 }
@@ -738,6 +865,44 @@ impl Flash {
         Ok(logits)
     }
 
+    /// task 206: decoder の系列状態を抜き出して、行き先の文脈へ保存する。
+    ///
+    /// 取り出しは move (コピーしない)。上限 (`DENNO_FLASH_AUX_TOK`) を超えた
+    /// 脇の文脈は保存しない = その場で捨てる。系列状態を差し替えられない
+    /// モデル (QSA 有効) では文脈を残さず、decoder を空に戻す。
+    #[allow(clippy::too_many_arguments)]
+    fn save_ctx(
+        &mut self,
+        dec: &mut Qwen4ExpDecoder,
+        dest: CtxPick,
+        logits: Vec<f32>,
+        n_prompt: usize,
+        from_render: bool,
+        req: CachedReq,
+        aux_max_tok: usize,
+    ) {
+        let Some(state) = dec.take_seq_state() else {
+            dec.reset();
+            self.cache = None;
+            self.aux = None;
+            return;
+        };
+        let toks = state.tokens().to_vec();
+        let c = Cached {
+            state,
+            toks,
+            logits,
+            prompt_len: n_prompt,
+            from_render,
+            req,
+        };
+        match dest {
+            CtxPick::Aux if c.toks.len() <= aux_max_tok => self.aux = Some(c),
+            CtxPick::Aux => self.aux = None,
+            _ => self.cache = Some(c),
+        }
+    }
+
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
         // task 146: 背景の事前ロードに「いま推論中」を知らせる (ロックを奪い合わない)。
@@ -804,78 +969,150 @@ impl Flash {
         // なっていた。生成済みトークンをそのまま前置きに残す経路を既定で試す。
         let splice_on = model_reuse
             && prefix_splice_enabled(std::env::var("DENNO_FLASH_PREFIX_SPLICE").ok().as_deref());
+        // task 206: 短い脇リクエストで主の文脈を壊さないための小さな文脈。
+        let aux_on = aux_ctx_enabled(std::env::var("DENNO_FLASH_AUX_CTX").ok().as_deref());
+        let aux_max_tok = aux_ctx_max_tok(std::env::var("DENNO_FLASH_AUX_TOK").ok().as_deref());
+        let aux_ratio = aux_ctx_ratio(std::env::var("DENNO_FLASH_AUX_RATIO").ok().as_deref());
         let t1 = Instant::now();
+        // 系列状態を差し替えられないモデル (DENNO_QSA=1) では文脈を持ち回れない。
+        // 判定は前のリクエストの decoder で行う (1 本目は文脈が無いので同じ)。
+        let swap_ok = self
+            .dec
+            .as_ref()
+            .map(|d| d.seq_state_supported())
+            .unwrap_or(true);
+        let aux_on = aux_on && swap_ok;
+        // task 206: どの文脈に載せるか。前置きの一致はトークン列そのもので見る。
+        let lcp_main = self.cache.as_ref().map(|c| first_mismatch(&c.toks, &prompt));
+        let lcp_aux = self.aux.as_ref().map(|c| first_mismatch(&c.toks, &prompt));
+        let pick = pick_ctx(
+            prompt.len(),
+            self.cache
+                .as_ref()
+                .map(|c| (c.toks.len(), lcp_main.unwrap_or(0))),
+            self.aux
+                .as_ref()
+                .map(|c| (c.toks.len(), lcp_aux.unwrap_or(0))),
+            aux_on,
+            aux_max_tok,
+            aux_ratio,
+        );
+        // task 206 (3): 次のターンが実際にどこまで一致したかを毎回 1 行残す。
+        // 前置きの途中 (時刻など) が変わっていれば `main=8988/5` のように出る。
+        if aux_on {
+            eprintln!(
+                "[flash] ctx: main={} aux={} pick={} plen={}",
+                ctx_len_lcp(self.cache.as_ref(), lcp_main),
+                ctx_len_lcp(self.aux.as_ref(), lcp_aux),
+                pick.name(),
+                prompt.len()
+            );
+        }
+        #[cfg(test)]
+        TEST_LAST_PICK.store(pick as u8, std::sync::atomic::Ordering::Relaxed);
+        if pick == CtxPick::MainAfterEvict {
+            // 脇の容量を超える短いリクエスト: 脇を捨ててから主へ (メモリ上限)。
+            self.aux = None;
+        }
         let mut reused = 0usize;
-        let cached = self.cache.take();
-        let (mut dec, mut logits) = match cached {
-            Some(mut c) if c.toks.len() <= prompt.len() && prompt[..c.toks.len()] == c.toks[..] => {
-                reused = c.toks.len();
-                if reused < prompt.len() {
-                    let lg = self.prefill_logits(&mut c.dec, &prompt[reused..])?;
-                    (c.dec, lg)
-                } else {
-                    (c.dec, c.logits)
-                }
+        let mut src: Option<Cached> = match pick {
+            CtxPick::Main | CtxPick::MainAfterEvict => self.cache.take(),
+            CtxPick::Aux => self.aux.take(),
+            CtxPick::Fresh => None,
+        };
+        // キャッシュ全体がプロンプトの前置きなら、そのまま延長できる。
+        let mut extend = src
+            .as_ref()
+            .map(|c| c.toks.len() <= prompt.len() && prompt[..c.toks.len()] == c.toks[..])
+            .unwrap_or(false);
+        // task 131/141: 描画済みプロンプトをキャッシュに整列し、食い残しだけを食う。
+        let mut spliced: Option<Vec<u32>> = None;
+        if !extend && splice_on && prompt_from_render {
+            if let Some(c) = src.as_ref() {
+                spliced = self.splice_prompt(c, req, &prompt)?;
             }
+        }
+        // モデル (重み) は decoder に 1 つだけ持ち、リクエストを跨いで使い回す。
+        // 前置きを延ばす / splice するリクエストは必ず使い回す。それ以外は
+        // `DENNO_FLASH_MODEL_REUSE=0` のとき従来どおり組み直す (gate の意味を保つ)。
+        // (P118: 組み直すと `GgufLinear` に新しい uid が振られ、GPU 常駐の重みを
+        // 全部再 upload する = cache-miss 1 回あたり 266 本 / 3.42 秒の無駄。)
+        let reuse_model = model_reuse || extend || spliced.is_some();
+        let mut dec = match self.dec.take() {
+            Some(d) if reuse_model => d,
             other => {
-                // task 131/141: 描画済みプロンプトをキャッシュに整列し、
-                // 食い残しだけを食う (成立しなければ従来どおり full prefill)。
-                let spliced = match (other.as_ref(), splice_on && prompt_from_render) {
-                    (Some(c), true) => self.splice_prompt(c, req, &prompt)?,
-                    _ => None,
-                };
-                let mut other = other;
-                if let Some(np) = spliced {
-                    let mut c = other.take().expect("splice は cache があるときだけ返る");
-                    if np.len() >= self.max_ctx {
-                        bail!(
-                            "プロンプト {} トークンが上限 {} に収まらない",
-                            np.len(),
-                            self.max_ctx
-                        );
-                    }
-                    reused = c.toks.len();
-                    prompt = np;
-                    let lg = self.prefill_logits(&mut c.dec, &prompt[reused..])?;
-                    (c.dec, lg)
-                } else {
-                    // 落ちた原因を 1 行残す (空でないキャッシュで reuse=0 のときだけ)。
-                    if let Some(c) = other.as_ref() {
-                        if !c.toks.is_empty() {
-                            eprintln!("{}", prefix_miss_line(&self.tok, &c.toks, &prompt));
-                        }
-                    }
-                    // P118: 前置きが一致しないときも、decoder が残っていれば
-                    // `build_model` を呼ばずに系列状態だけ消して使い回す。
-                    // 組み直すと `GgufLinear` に新しい uid が振られ、uid 引きの
-                    // GPU 常駐重みが全部再 upload される (cache-miss 1 回あたり
-                    // 266 本 / 3.42 秒)。reset は uid に触れないので重みは常駐した
-                    // ままで、数値も新規構築とビット一致する (engine 側
-                    // `reset_matches_fresh_decoder_bitexact`)。前のリクエストが
-                    // engine 側の失敗 (prefill / step) で落ちたときは cache が
-                    // None のままなので、この経路は通らず組み直す (半端に進んだ
-                    // decoder を使い回さない)。クライアント切断 (emit 失敗) の
-                    // ときは task 123 で cache が残るので、この reset 経路で
-                    // 重みの再 upload なしに使い回す。
-                    let t_model = prekprof::stamp();
-                    let mut d = match other {
-                        Some(c) if model_reuse => {
-                            let mut d = c.dec;
-                            d.reset();
-                            d
-                        }
-                        _ => {
-                            // P78: mmap と attention/KV 状態の確保は「層の外」でも重い候補。
-                            let m = self.build_model()?;
-                            Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx))
-                        }
-                    };
-                    prekprof::mark(t_model, prekprof::MODEL);
-                    let lg = self.prefill_logits(&mut d, &prompt)?;
-                    (d, lg)
-                }
+                drop(other);
+                Qwen4ExpDecoder::new(self.build_model()?, DecoderConfig::new(self.max_ctx))
             }
         };
+        if !dec.seq_state_supported() {
+            // 文脈を持ち回れない: 選んだ文脈も捨てて full prefill に落ちる。
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[flash] 系列状態を差し替えられない (DENNO_QSA=1) ので prefix cache を使わない"
+                );
+            }
+            self.cache = None;
+            self.aux = None;
+            drop(src.take());
+            extend = false;
+            spliced = None;
+        }
+        let mut logits;
+        if let Some(np) = spliced {
+            if np.len() >= self.max_ctx {
+                bail!(
+                    "プロンプト {} トークンが上限 {} に収まらない",
+                    np.len(),
+                    self.max_ctx
+                );
+            }
+            let Cached {
+                state,
+                toks,
+                logits: _,
+                ..
+            } = src.take().expect("splice は src があるときだけ返る");
+            reused = toks.len();
+            prompt = np;
+            dec.put_seq_state(state)
+                .map_err(|e| anyhow::anyhow!("系列状態を戻せない: {e}"))?;
+            logits = self.prefill_logits(&mut dec, &prompt[reused..])?;
+        } else if extend {
+            let Cached {
+                state,
+                toks,
+                logits: cached_logits,
+                ..
+            } = src.take().expect("extend は src があるときだけ");
+            reused = toks.len();
+            dec.put_seq_state(state)
+                .map_err(|e| anyhow::anyhow!("系列状態を戻せない: {e}"))?;
+            logits = if reused < prompt.len() {
+                self.prefill_logits(&mut dec, &prompt[reused..])?
+            } else {
+                cached_logits
+            };
+        } else {
+            // 落ちた原因を 1 行残す (空でないキャッシュで reuse=0 のときだけ)。
+            if let Some(c) = src.as_ref() {
+                if !c.toks.is_empty() {
+                    eprintln!("{}", prefix_miss_line(&self.tok, &c.toks, &prompt));
+                }
+            }
+            // 置き換え: 選んだ文脈の状態は捨てる (decoder は空のまま)。
+            // P118: `build_model` は呼ばない — 重みはそのまま常駐する。
+            drop(src.take());
+            debug_assert!(
+                dec.tokens().is_empty(),
+                "置き換え経路で decoder に状態が残っている"
+            );
+            let t_model = prekprof::stamp();
+            prekprof::mark(t_model, prekprof::MODEL);
+            logits = self.prefill_logits(&mut dec, &prompt)?;
+        }
         let t_prefill = t1.elapsed().as_secs_f64();
         let n_prompt = prompt.len();
         // 次のリクエストが同じ入力を送ってきたら splice できるように、
@@ -1268,21 +1505,36 @@ impl Flash {
         //   挙動を保つ)。
         // - Engine: 半端に進んだ decoder は信用しない。従来どおり捨てる
         //   (cache は None のまま = 次のリクエストで組み直す)。
+        let dest = if pick == CtxPick::Aux {
+            CtxPick::Aux
+        } else {
+            CtxPick::Main
+        };
         if let Some(GenFail::Client(e)) = failed {
             if model_reuse {
-                let toks = dec.tokens().to_vec();
-                self.cache = Some(Cached {
-                    dec,
-                    toks,
+                self.save_ctx(
+                    &mut dec,
+                    dest,
                     logits,
-                    prompt_len: n_prompt,
-                    from_render: prompt_from_render,
-                    req: req_sig.clone(),
-                });
+                    n_prompt,
+                    prompt_from_render,
+                    req_sig.clone(),
+                    aux_max_tok,
+                );
+                self.dec = Some(dec);
+            } else {
+                self.cache = None;
+                self.aux = None;
+                self.dec = None;
             }
             return Err(e);
         }
         if let Some(GenFail::Engine(e)) = failed {
+            // 半端に進んだ decoder は信用しない: モデルごと捨てて次で組み直す。
+            // (他の文脈も一緒に捨てる。task 123 の従来の後始末と同じ。)
+            self.cache = None;
+            self.aux = None;
+            self.dec = None;
             return Err(e);
         }
         // 保留していた末尾 (文字が完成しないまま終わった FFFD を含む) を最終本文へ反映。
@@ -1292,15 +1544,16 @@ impl Flash {
                 text = f;
             }
         }
-        let toks = dec.tokens().to_vec();
-        self.cache = Some(Cached {
-            dec,
-            toks,
+        self.save_ctx(
+            &mut dec,
+            dest,
             logits,
-            prompt_len: n_prompt,
-            from_render: prompt_from_render,
-            req: req_sig,
-        });
+            n_prompt,
+            prompt_from_render,
+            req_sig,
+            aux_max_tok,
+        );
+        self.dec = Some(dec);
         // task 146: リクエスト終端で使用回数を書く (decode の外・原子的)。
         if let Some(line) = denno_engine::model::exp_stats::save_now() {
             eprintln!("{line}");
@@ -1802,7 +2055,9 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         default_max: cfg.max_tokens,
         tok,
         batch,
+        dec: None,
         cache: None,
+        aux: None,
         telem: telemetry,
     };
     // 起動時に 1 回組んで、読めないならここで落とす
@@ -1831,7 +2086,12 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 // task 149: リクエスト境界。prefill の一時領域 (arena) を返し、
                 // 確保の内訳を 1 表だけ出す (1 本目と長い文脈の最初の 1 回)。
                 // `DENNO_SCRATCH_FREE=0` / `DENNO_Q4_PROFILE` なしでは何もしない。
-                let ctx_tokens = flash.cache.as_ref().map(|c| c.toks.len()).unwrap_or(0);
+                let ctx_tokens = flash
+                    .cache
+                    .as_ref()
+                    .map(|c| c.toks.len())
+                    .unwrap_or(0)
+                    .max(flash.aux.as_ref().map(|c| c.toks.len()).unwrap_or(0));
                 denno_engine::mem_audit::request_boundary(ctx_tokens, 4096);
                 // P-pf-arena: 重み登録の成否をリクエスト単位で 1 行 (登録を試みた
                 // ときだけ)。GPU_BROKEN のラッチはプロセス寿命なので reset しない。

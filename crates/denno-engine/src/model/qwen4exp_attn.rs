@@ -61,7 +61,8 @@ use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::{FusedLinear, GgufLinear};
 use crate::model::qwen4exp::{
-    gemv_batch, q4prof, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams, SpecFullSnap,
+    gemv_batch, one, q4prof, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams, SeqState,
+    SpecFullSnap,
 };
 use crate::model::qwen4exp_qsa::QsaState;
 use crate::quant::WeightBlocks;
@@ -307,6 +308,20 @@ impl AttnCache {
     /// 1 位置ぶんの行長 = `n_head_kv * head_dim`
     pub fn row(&self) -> usize {
         self.n_head_kv * self.head_dim
+    }
+    /// task 206: KV のヘッド数 (層を作り直すときに使う)。
+    pub fn n_head_kv(&self) -> usize {
+        self.n_head_kv
+    }
+    /// task 206: 1 ヘッドの次元 (層を作り直すときに使う)。
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+    /// task 206: 確保している k/v のバイト数 (容量ベース。len より大きいことがある)。
+    pub fn bytes(&self) -> usize {
+        let k: usize = self.k.iter().map(|v| v.capacity()).sum();
+        let v: usize = self.v.iter().map(|v| v.capacity()).sum();
+        (k + v) * std::mem::size_of::<f32>()
     }
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
@@ -2158,6 +2173,16 @@ impl FullAttn {
     }
 }
 
+/// task 206: [`FullAttn`] の系列状態 (KV と位置)。
+///
+/// KV は [`AttnCache`] ごと移す (コピーしない)。`AttnCache` は id と層ごとの
+/// 世代を持つので、文脈を入れ替えても GPU ミラー (id 引き) はそのまま使える
+/// — 元の文脈へ戻したとき、デバイス側の行はそのまま残っている。
+pub struct FullSeqState {
+    cache: AttnCache,
+    pos: usize,
+}
+
 impl LayerAttn for FullAttn {
     fn forward(
         &mut self,
@@ -2217,6 +2242,48 @@ impl LayerAttn for FullAttn {
             .downcast_ref::<SpecFullSnap>()
             .expect("FullAttn::spec_restore: スナップショットの型が違う");
         FullAttn::spec_restore(self, s).map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
+    }
+
+    /// task 206: KV と pos を move で差し替えられる。QSA 有効時は indexer の
+    /// 生キー (文脈長ぶん) を運ぶ口が無いので非対応。
+    fn seq_state_supported(&self) -> bool {
+        self.qsa.is_none()
+    }
+
+    /// task 206: KV ([`AttnCache`]) と pos を取り出し、空の cache と pos = 0 を置く。
+    fn seq_state_take(&mut self) -> Option<SeqState> {
+        if self.qsa.is_some() {
+            return None;
+        }
+        let fresh = AttnCache::new(
+            self.cache.n_layer(),
+            self.cache.n_head_kv(),
+            self.cache.head_dim(),
+            self.cache.max_ctx(),
+        )
+        .ok()?;
+        let bytes = self.cache.bytes() + std::mem::size_of::<usize>();
+        let cache = std::mem::replace(&mut self.cache, fresh);
+        let pos = std::mem::replace(&mut self.pos, 0);
+        Some(SeqState::new(Box::new(FullSeqState { cache, pos }), bytes))
+    }
+
+    /// task 206: KV と pos を戻す。形状が違えば `Err` (状態は変えない)。
+    fn seq_state_put(&mut self, st: SeqState) -> std::result::Result<(), Qwen4ExpError> {
+        let s = st
+            .into_inner()
+            .downcast::<FullSeqState>()
+            .map_err(|_| one("FullAttn::seq_state_put: 状態の型が違う"))?;
+        if s.cache.n_layer() != self.cache.n_layer()
+            || s.cache.n_head_kv() != self.cache.n_head_kv()
+            || s.cache.head_dim() != self.cache.head_dim()
+            || s.cache.max_ctx() != self.cache.max_ctx()
+        {
+            return Err(one("FullAttn::seq_state_put: KV の形状が今のモデルと違う"));
+        }
+        self.cache = s.cache;
+        self.pos = s.pos;
+        Ok(())
     }
 }
 

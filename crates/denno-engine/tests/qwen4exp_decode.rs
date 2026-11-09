@@ -1590,6 +1590,59 @@ fn reset_matches_fresh_decoder_bitexact() {
     }
 }
 
+/// task 206: `take_seq_state` / `put_seq_state` で文脈を入れ替えても、
+/// どの文脈の続きもビット一致する。
+///
+/// serve は 1 つのモデル (重み) を共有したまま、文脈ごとの系列状態だけを
+/// move で差し替える。ここでは:
+///
+/// 1. A を prefill した状態を取り出す (decoder は空に戻る)。
+/// 2. 空の decoder で B を回す → 新規構築で B を回した結果とビット一致
+///    (A の KV / GDN / PLE conv が 1 ビットも漏れていない)。
+/// 3. A の状態を戻す → 続きの logits が「A を回し続けた」基準とビット一致。
+///
+/// KV は `Vec` ごと移すので、コピーでも同じ結果になるはずだが、取り出し側で
+/// 空にし忘れる / 戻し側で上書きし忘れる実装ミスはここで落ちる。
+#[test]
+fn seq_state_swap_keeps_contexts_independent() {
+    let dir = TempDir::new("seqswap-a");
+    let f = open_synth(&dir, "model.gguf", false, None);
+
+    // 基準: A を新規構築で回し続けた logits と、B を新規構築で回した logits。
+    let want_a = run_steps(&mut make_decoder_full(&f, 64), &PROMPT, 6);
+    let want_b = run_steps(&mut make_decoder_full(&f, 64), &PROMPT_B, 4);
+
+    let mut d = make_decoder_full(&f, 64);
+    let lg_a = d.prefill(&PROMPT).expect("prefill A");
+    assert_eq!(bits(&lg_a), bits(&want_a[0]), "A の prefill が基準と違う");
+    let st_a = d.take_seq_state().expect("take_seq_state 非対応");
+    assert_eq!(st_a.tokens(), &PROMPT[..], "取り出した状態のトークン列が違う");
+    assert!(st_a.bytes() > 0, "状態のバイト数が 0");
+    assert_eq!(d.tokens().len(), 0, "取り出したあとの decoder が空でない");
+
+    // 空の decoder で B を回す (A の状態が漏れていないこと)。
+    let got_b = run_steps(&mut d, &PROMPT_B, 4);
+    assert_same_logits(&got_b, &want_b, "取り出し後の B");
+
+    // A を戻して続きを回す (B の状態が混ざっていないこと)。
+    d.put_seq_state(st_a).expect("put_seq_state");
+    assert_eq!(d.tokens(), &PROMPT[..], "戻したあとのトークン列が違う");
+    let mut got_a = vec![lg_a];
+    let mut lg = got_a[0].clone();
+    for _ in 0..6 {
+        let id = greedy(&lg);
+        lg = d.step(id).expect("step");
+        got_a.push(lg.clone());
+    }
+    assert_same_logits(&got_a, &want_a, "戻したあとの A");
+
+    // 取り出した状態をもう一度戻しても同じ (move が壊れていない)。
+    let st_b = d.take_seq_state().expect("2 回目の take");
+    assert_eq!(st_b.tokens().len(), PROMPT.len() + 6, "A の長さが違う");
+    d.put_seq_state(st_b).expect("2 回目の put");
+    assert_eq!(d.tokens().len(), PROMPT.len() + 6);
+}
+
 /// (a) のバッチ prefill 版 (serve 既定の経路)。
 ///
 /// reset → `prefill_batched` の logits が新規構築の `prefill_batched` と
