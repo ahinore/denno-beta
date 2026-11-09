@@ -8435,7 +8435,9 @@ fn moe_ffn_quant_impl(
         if vram_mode && iq_mode {
             // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
             let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
-            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
+            // task 190: miss-fast の層は上げ直し済みなので数えるだけ。
+            let upload = !(sumdev && crate::model::exp_miss_up::fast_enabled());
+            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer, upload);
         }
     }
 
@@ -9078,6 +9080,32 @@ fn moe_experts_iq_gpu_batched(
         if have_bytes {
             let mut sum = vec![0.0f32; e];
             let mut miss_out: Vec<f32> = Vec::new();
+            // ミスを VRAM へ上げる (ヒットの起動後 = H2D が GPU の裏で進む)。
+            let miss_ei: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+            let mut acq = |i: usize| -> anyhow::Result<Option<[u64; 3]>> {
+                let ei = miss_ei[i];
+                let key = ExpertKey {
+                    layer: lw.il as u16,
+                    expert: ei as u16,
+                };
+                let got = expert_vram::acquire(key, shapes, || {
+                    Ok([
+                        lw.gate_exps.slice(ei)?,
+                        lw.up_exps.slice(ei)?,
+                        lw.down_exps.slice(ei)?,
+                    ])
+                })
+                .map_err(|err| {
+                    anyhow::anyhow!("層 {}: expert {ei}: VRAM 経路 (miss fast): {err:#}", lw.il)
+                })?;
+                Ok(got.map(|a| {
+                    [
+                        a.dev.ptr(ExpertMatrix::Gate),
+                        a.dev.ptr(ExpertMatrix::Up),
+                        a.dev.ptr(ExpertMatrix::Down),
+                    ]
+                }))
+            };
             let ran = crate::cuda::moe_experts_iq_layer_sum_miss(
                 lw.gate_exps.ty,
                 lw.up_exps.ty,
@@ -9095,6 +9123,7 @@ fn moe_experts_iq_gpu_batched(
                 &hw,
                 &mut sum,
                 &mut miss_out,
+                &mut acq,
             )
             .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV (miss fast): {err:#}", lw.il)))?;
             if ran {
@@ -9452,7 +9481,15 @@ fn moe_experts_iq_gpu_miss_up(
 ///
 /// 失敗 (確保失敗・型未対応) は静かに諦める (リクエストは落とさない)。
 #[cfg(feature = "cuda")]
-fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize, n_layer: usize) {
+fn iq_warm_misses(
+    lw: &LayerW,
+    sel: &[usize],
+    x_len: usize,
+    e: usize,
+    ff: usize,
+    n_layer: usize,
+    upload: bool,
+) {
     use crate::model::expert_vram::ExpertShape;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -9515,6 +9552,12 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
         }
     }
     crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
+
+    // task 190: `DENNO_DEC_MISS_FAST` の層はミスを層の中で `acquire` 済み
+    // (VRAM に載っている) なので、ここで二度上げない。集計だけ残す。
+    if !upload {
+        return;
+    }
 
     // 2. 上げ直しは担当層だけ、予算の範囲で。
     let off = OFFSET.load(Ordering::Relaxed) % nl;

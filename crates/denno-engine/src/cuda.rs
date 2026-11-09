@@ -8241,30 +8241,39 @@ pub fn moe_experts_iq_layer_miss_up(
     Ok(true)
 }
 
-// task 190: decode のミス expert を「ページアブル直の非同期 H2D」で GPU へ上げ、
-// ヒットと同じカーネルで計算する (`DENNO_DEC_MISS_FAST`)。
+// ===========================================================================
+// task 190: decode のミス expert を、ヒットの GPU 計算と**同じ層の中で**
+// VRAM へ上げて計算する (`DENNO_DEC_MISS_FAST`)。
+// ===========================================================================
 //
-// task 158 の `moe_experts_iq_layer_miss_up` との違いは転送元だけ:
+// # 何が違うか
 //
-//   - task 158: mmap → pinned (ホスト memcpy、1 本 2 MB で 0.1〜0.2 ms) →
-//     `cuMemcpyHtoDAsync` (pinned から)。ホスト memcpy が main スレッドに載る。
-//   - ここ: mmap のまま `cuMemcpyHtoDAsync` に渡す (ドライバが内部の staging を
-//     使う)。main スレッドの memcpy が消える。Gen5 の実測 (19.6 GB/s pageable)
-//     なら 1 本 2 MB で約 0.10 ms をコピーエンジン側だけで払う。
+// 従来 (task 144/150/187): ミスは CPU で GEMV し (1 本 50〜200 us、コールドでは
+// ページフォルトで 200 us 超)、層の後で `iq_warm_misses` が改めて VRAM へ上げる
+// (1 本 130 us、pinned staging 経由)。同じ重みを **2 回読む**。
+//
+// ここ: ヒットのカーネルを積んだ**後**に `expert_vram::acquire` でミスを VRAM へ
+// 上げ (ホストの H2D が GPU のヒット計算と重なる)、そのデバイス領域をそのまま
+// ミスの GEMV に使う。読みは 1 回で、上げた本は LRU に載るので次のトークンで
+// ヒットになる (別の上げ直しが不要)。
 //
 // ヒット側は task 187 の `dno_dec_exp_sum` でデバイス和にするので、D2H は
-// 「和 e 要素 + ミス n 本 x e」だけ。ミスの寄与はホストで expert index 昇順に
-// 足す (今と同じ順序)。
+// 「和 e 要素 + ミス n 本 x e」だけ。ミスの寄与はホストで expert index 昇順に足す。
 //
 // 失敗はすべて `Ok(false)` = 呼び出し側は従来経路 (CPU でミス + 重ね打ち) へ。
+// ただし起動後に失敗した場合は、呼び出し側が従来経路をもう一度通す
+// (値は従来経路が上書きするので正しい。無駄な計算になるだけ)。
 
 /// miss-fast の作業域 (grow-only・スレッドローカル)。
+///
+/// ミスの重みは VRAM の LRU から借りる (自前のアリーナは持たない)。ここに持つのは
+/// ミス用の**ポインタ表と segment 表**、ミスの gate/up/act/down 出力、D2H の
+/// pinned だけ。
 struct MissFastScratch {
-    /// ミス重みのデバイス置き場 (expert ごとに連結)。
-    dg: Option<DevBuffer>,
-    du: Option<DevBuffer>,
-    dd: Option<DevBuffer>,
-    /// ミス用のポインタ表 / segment 表。
+    /// ミス用のポインタ表 (pinned に書いてから非同期 H2D する)。
+    ptr_g: Option<PinMem>,
+    ptr_u: Option<PinMem>,
+    ptr_d: Option<PinMem>,
     pg: Option<DevBuffer>,
     pu: Option<DevBuffer>,
     pd: Option<DevBuffer>,
@@ -8278,17 +8287,14 @@ struct MissFastScratch {
     /// 和とミス寄与の D2H を受ける pinned。
     sum_pin: Option<PinMem>,
     miss_pin: Option<PinMem>,
-    /// 重みの H2D 専用ストリームと完了イベント。
-    stream: Option<CopyStream>,
-    ev_ready: Option<CopyEvent>,
 }
 
 thread_local! {
     static MISS_FAST: std::cell::RefCell<MissFastScratch> = const {
         std::cell::RefCell::new(MissFastScratch {
-            dg: None,
-            du: None,
-            dd: None,
+            ptr_g: None,
+            ptr_u: None,
+            ptr_d: None,
             pg: None,
             pu: None,
             pd: None,
@@ -8300,8 +8306,6 @@ thread_local! {
             h: None,
             sum_pin: None,
             miss_pin: None,
-            stream: None,
-            ev_ready: None,
         })
     };
 }
@@ -8349,10 +8353,12 @@ fn iq_launch_sum(
 
 /// task 190: ミス expert を GPU で計算する (`DENNO_DEC_MISS_FAST`)。
 ///
+/// `acquire(i)` はミス i 本目を VRAM へ上げて 3 行列のデバイスアドレスを返す
+/// (呼び出し側が `expert_vram::acquire` を回す)。`Ok(None)` を返したら従来経路へ。
 /// `out_sum` にヒットぶんの重み付き和 (`e` 要素)、`miss_out` にミスぶんの寄与
-/// (`n_miss * e` 要素、`ids_miss` の順) を書く。`Ok(false)` は「やらなかった」。
+/// (`n_miss * e` 要素、`ids_miss` の順) を書く。
 #[allow(clippy::too_many_arguments)]
-pub fn moe_experts_iq_layer_sum_miss(
+pub fn moe_experts_iq_layer_sum_miss<F>(
     ty_g: crate::kquant::GgmlType,
     ty_u: crate::kquant::GgmlType,
     ty_d: crate::kquant::GgmlType,
@@ -8369,7 +8375,11 @@ pub fn moe_experts_iq_layer_sum_miss(
     w_hit: &[f32],
     out_sum: &mut [f32],
     miss_out: &mut Vec<f32>,
-) -> Result<bool> {
+    mut acquire: F,
+) -> Result<bool>
+where
+    F: FnMut(usize) -> Result<Option<[u64; 3]>>,
+{
     let n_hit = pg.len();
     let n_miss = miss.len();
     if n_miss == 0
@@ -8421,20 +8431,6 @@ pub fn moe_experts_iq_layer_sum_miss(
     let Ok(l) = lib() else {
         return Ok(false);
     };
-    let (
-        Some(stream_create),
-        Some(event_create),
-        Some(event_record),
-        Some(stream_wait_event),
-    ) = (
-        l.stream_create,
-        l.event_create,
-        l.event_record,
-        l.stream_wait_event,
-    )
-    else {
-        return Ok(false);
-    };
     let (Some(rb_g), Some(rb_u), Some(rb_d)) = (
         crate::model::exp_iq::row_bytes(ty_g, n_in),
         crate::model::exp_iq::row_bytes(ty_u, n_in),
@@ -8455,15 +8451,13 @@ pub fn moe_experts_iq_layer_sum_miss(
     let seg_d_hit = crate::model::expert_batch::seg_table_per_act(ids_hit, ff, e);
     let seg_gu_miss = crate::model::expert_batch::seg_table_shared_x(ids_miss, ff);
     let seg_d_miss = crate::model::expert_batch::seg_table_per_act(ids_miss, ff, e);
-    if seg_gu_hit.len() != seg_d_hit.len() || seg_gu_miss.len() != seg_d_miss.len() {
-        return Ok(false);
-    }
 
-    let nh_hit = n_hit * e;
     let ng_hit = n_hit * ff;
     let ng_miss = n_miss * ff;
+    let nh_hit = n_hit * e;
     let nh_miss = n_miss * e;
-    IQ_SCRATCH.with(|cell| -> Result<()> {
+    // `Ok(false)` = 途中で諦めた (起動済みでも呼び出し側が従来経路を通し直す)。
+    let ran = IQ_SCRATCH.with(|cell| -> Result<bool> {
         let mut sc = cell.borrow_mut();
         MoeScratch::ensure_tagged(&mut sc.x, n_in * 4, crate::mem_audit::TAG_GDN_SC)?;
         MoeScratch::ensure_tagged(&mut sc.g, ng_hit * 4, crate::mem_audit::TAG_GDN_SC)?;
@@ -8485,7 +8479,7 @@ pub fn moe_experts_iq_layer_sum_miss(
         )?;
         MoeScratch::ensure_tagged(&mut sc.wt, n_hit * 4, crate::mem_audit::TAG_GDN_SC)?;
         MoeScratch::ensure_tagged(&mut sc.psum, e * 4, crate::mem_audit::TAG_GDN_SC)?;
-        // ヒットの prologue (同期コピー。数百バイト)。
+        // ヒットの prologue (同期コピー。数百バイト)。起動より前に済ませる。
         {
             let xb = sc.x.as_ref().expect("確保済み");
             xb.copy_from(&x[..n_in])?;
@@ -8498,12 +8492,12 @@ pub fn moe_experts_iq_layer_sum_miss(
             sc.sgd.as_ref().expect("確保済み").copy_from(&seg_d_hit)?;
             dbg_htod(n_hit * 8 * 3 + n_hit * 4 + (seg_gu_hit.len() + seg_d_hit.len()) * 4);
         }
-        // ミス側の受け皿と表 (起動前 = 同期コピーが null ストリームを待たない)。
+        // ミス側の受け皿 (ポインタ表は acquire の後に書く)。
         MISS_FAST.with(|mcell| -> Result<()> {
             let mut ms = mcell.borrow_mut();
-            MoeScratch::ensure_tagged(&mut ms.dg, n_miss * bytes_g, crate::mem_audit::TAG_GDN_SC)?;
-            MoeScratch::ensure_tagged(&mut ms.du, n_miss * bytes_u, crate::mem_audit::TAG_GDN_SC)?;
-            MoeScratch::ensure_tagged(&mut ms.dd, n_miss * bytes_d, crate::mem_audit::TAG_GDN_SC)?;
+            Scratch::ensure_pin(&mut ms.ptr_g, n_miss * 8)?;
+            Scratch::ensure_pin(&mut ms.ptr_u, n_miss * 8)?;
+            Scratch::ensure_pin(&mut ms.ptr_d, n_miss * 8)?;
             MoeScratch::ensure_tagged(&mut ms.pg, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
             MoeScratch::ensure_tagged(&mut ms.pu, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
             MoeScratch::ensure_tagged(&mut ms.pd, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
@@ -8523,76 +8517,9 @@ pub fn moe_experts_iq_layer_sum_miss(
             )?;
             Scratch::ensure_pin(&mut ms.sum_pin, e * 4)?;
             Scratch::ensure_pin(&mut ms.miss_pin, nh_miss * 4)?;
-            if ms.stream.is_none() {
-                const CU_STREAM_NON_BLOCKING: u32 = 0x01;
-                let mut st: CUstream = std::ptr::null_mut();
-                if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
-                    bail!("cuStreamCreate (miss fast) が失敗");
-                }
-                let mut ev: CUevent = std::ptr::null_mut();
-                if unsafe { event_create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
-                    unsafe {
-                        if let Some(f) = l.stream_destroy {
-                            let _ = f(st);
-                        }
-                    }
-                    bail!("cuEventCreate (miss fast) が失敗");
-                }
-                ms.stream = Some(CopyStream(st));
-                ms.ev_ready = Some(CopyEvent(ev));
-            }
-            let (dg_p, du_p, dd_p) = (
-                ms.dg.as_ref().expect("確保済み").ptr,
-                ms.du.as_ref().expect("確保済み").ptr,
-                ms.dd.as_ref().expect("確保済み").ptr,
-            );
-            let tpg: Vec<u64> = (0..n_miss)
-                .map(|j| dg_p + (j * bytes_g) as u64)
-                .collect();
-            let tpu: Vec<u64> = (0..n_miss)
-                .map(|j| du_p + (j * bytes_u) as u64)
-                .collect();
-            let tpd: Vec<u64> = (0..n_miss)
-                .map(|j| dd_p + (j * bytes_d) as u64)
-                .collect();
-            ms.pg.as_ref().expect("確保済み").copy_from(&tpg)?;
-            ms.pu.as_ref().expect("確保済み").copy_from(&tpu)?;
-            ms.pd.as_ref().expect("確保済み").copy_from(&tpd)?;
             ms.sgu.as_ref().expect("確保済み").copy_from(&seg_gu_miss)?;
             ms.sgd.as_ref().expect("確保済み").copy_from(&seg_d_miss)?;
-            dbg_htod(n_miss * 8 * 3 + (seg_gu_miss.len() + seg_d_miss.len()) * 4);
-            Ok(())
-        })?;
-
-        // 1. ミス重みの H2D を**ヒットの起動より先**にコピーストリームへ積む。
-        //    転送元は mmap のまま (bounce しない)。
-        MISS_FAST.with(|mcell| -> Result<()> {
-            let ms = mcell.borrow();
-            let stream = ms.stream.as_ref().expect("作成済み").0;
-            let ev = ms.ev_ready.as_ref().expect("作成済み").0;
-            let (dg_p, du_p, dd_p) = (
-                ms.dg.as_ref().expect("確保済み").ptr,
-                ms.du.as_ref().expect("確保済み").ptr,
-                ms.dd.as_ref().expect("確保済み").ptr,
-            );
-            unsafe {
-                for (j, m) in miss.iter().enumerate() {
-                    for (dst, src, bytes) in [
-                        (dg_p + (j * bytes_g) as u64, m.gate.as_ptr(), bytes_g),
-                        (du_p + (j * bytes_u) as u64, m.up.as_ptr(), bytes_u),
-                        (dd_p + (j * bytes_d) as u64, m.down.as_ptr(), bytes_d),
-                    ] {
-                        if (l.memcpy_htod_async)(dst, src as *const c_void, bytes, stream)
-                            != CUDA_SUCCESS
-                        {
-                            bail!("cuMemcpyHtoDAsync (miss fast) が失敗");
-                        }
-                    }
-                }
-                if event_record(ev, stream) != CUDA_SUCCESS {
-                    bail!("cuEventRecord (miss fast) が失敗");
-                }
-            }
+            dbg_htod((seg_gu_miss.len() + seg_d_miss.len()) * 4);
             Ok(())
         })?;
 
@@ -8602,7 +8529,7 @@ pub fn moe_experts_iq_layer_sum_miss(
         let act = sc.act.as_ref().expect("確保済み");
         let h = sc.h.as_ref().expect("確保済み");
         let psum = sc.psum.as_ref().expect("確保済み");
-        // 2. ヒット: gate / up / silu / down / 和 (すべて null ストリーム)。
+        // 1. ヒット: gate / up / silu / down / 和 (すべて null ストリーム)。
         unsafe {
             dec_exp_kprof::begin_layer(n_hit as u32);
             {
@@ -8665,16 +8592,52 @@ pub fn moe_experts_iq_layer_sum_miss(
             )?;
             dec_exp_kprof::mark(dec_exp_kprof::SUM);
         }
-        // 3. コピー完了を待ってからミスのカーネルを同じストリームへ積む
-        //    (ヒットの計算の裏でコピーが進む)。
+        // 2. ミスを VRAM へ上げる。ヒットのカーネルはもう走っているので、
+        //    ホストの H2D はその裏で進む (pinned staging 経由)。
+        let mut tg: Vec<u64> = Vec::with_capacity(n_miss);
+        let mut tu: Vec<u64> = Vec::with_capacity(n_miss);
+        let mut td: Vec<u64> = Vec::with_capacity(n_miss);
+        for i in 0..n_miss {
+            let Some(p) = acquire(i)? else {
+                return Ok(false);
+            };
+            tg.push(p[0]);
+            tu.push(p[1]);
+            td.push(p[2]);
+        }
         MISS_FAST.with(|mcell| -> Result<()> {
             let ms = mcell.borrow();
-            let ev = ms.ev_ready.as_ref().expect("作成済み").0;
-            unsafe {
-                if stream_wait_event(std::ptr::null_mut(), ev, 0) != CUDA_SUCCESS {
-                    bail!("cuStreamWaitEvent (miss fast) が失敗");
+            let (tg, tu, td) = (&tg, &tu, &td);
+            let mut copy = |pin: &Option<PinMem>, buf: &Option<DevBuffer>, v: &[u64]| -> Result<()> {
+                let pin = pin.as_ref().expect("確保済み");
+                let dst = buf.as_ref().expect("確保済み");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        v.as_ptr(),
+                        pin.ptr as *mut u64,
+                        v.len(),
+                    );
+                    check(
+                        (l.memcpy_htod_async)(
+                            dst.ptr,
+                            pin.ptr as *const c_void,
+                            v.len() * 8,
+                            std::ptr::null_mut(),
+                        ),
+                        "cuMemcpyHtoDAsync (miss fast ptr table)",
+                    )?;
                 }
-            }
+                Ok(())
+            };
+            copy(&ms.ptr_g, &ms.pg, tg)?;
+            copy(&ms.ptr_u, &ms.pu, tu)?;
+            copy(&ms.ptr_d, &ms.pd, td)?;
+            dbg_htod(n_miss * 8 * 3);
+            Ok(())
+        })?;
+        // 3. ミスのカーネル (null ストリーム = ヒットの後ろ、ポインタ表の後ろ)。
+        MISS_FAST.with(|mcell| -> Result<()> {
+            let ms = mcell.borrow();
             let (mg, mu, mact, mh) = (
                 ms.g.as_ref().expect("確保済み"),
                 ms.u.as_ref().expect("確保済み"),
@@ -8727,13 +8690,13 @@ pub fn moe_experts_iq_layer_sum_miss(
         unsafe {
             let sum_pin = MISS_FAST.with(|c| c.borrow().sum_pin.as_ref().map(|p| p.ptr));
             let miss_pin = MISS_FAST.with(|c| c.borrow().miss_pin.as_ref().map(|p| p.ptr));
+            let mh_ptr = MISS_FAST.with(|c| c.borrow().h.as_ref().map(|b| b.ptr));
             if let Some(sp) = sum_pin {
                 check(
                     (l.memcpy_dtoh_async)(sp, psum.ptr, e * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync (miss fast sum)",
                 )?;
             }
-            let mh_ptr = MISS_FAST.with(|c| c.borrow().h.as_ref().map(|b| b.ptr));
             if let (Some(mp), Some(mh)) = (miss_pin, mh_ptr) {
                 check(
                     (l.memcpy_dtoh_async)(mp, mh, nh_miss * 4, std::ptr::null_mut()),
@@ -8755,8 +8718,11 @@ pub fn moe_experts_iq_layer_sum_miss(
             miss_out[..nh_miss].copy_from_slice(&mp.as_slice::<f32>()[..nh_miss]);
             Ok(())
         })?;
-        Ok(())
+        Ok(true)
     })?;
+    if !ran {
+        return Ok(false);
+    }
     Ok(true)
 }
 
