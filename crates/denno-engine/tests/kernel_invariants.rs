@@ -8668,7 +8668,7 @@ fn pf_attn_devres_gate_defaults_on_and_is_wired() {
 // task 209: prefill のコピー削減 (pinned ホスト / mix 出力のデバイス直読み)
 // ---------------------------------------------------------------------------
 
-/// `DENNO_PF_PIN` と `DENNO_PF_MIXDEVIN` はどちらも **既定 off**。
+/// `DENNO_PF_PIN` と `DENNO_PF_MIXDEVIN` はどちらも **既定 on** (lab t209a で採用)。
 ///
 /// 併せて配線を固定する: (1) 層ループは mix の出力を `PfHostBuf` に落とし、
 /// D2H の直後に「このホスト配列はデバイスと同一」を記録する、(2) shared の
@@ -8685,8 +8685,8 @@ fn pf209_pin_and_mixdevin_gates_default_off_and_are_wired() {
             .unwrap_or_else(|| panic!("cuda.rs に {name} が無い"));
         let body: String = CUDA_RS[i..].chars().take(300).collect();
         assert!(
-            body.contains("None => false"),
-            "{name} の既定が off でない: {body}"
+            body.contains("None => true"),
+            "{name} の既定が on でない: {body}"
         );
     }
     // ゲートの真理値表は unit test 側 (cuda.rs の pf_pin_tests) にある。

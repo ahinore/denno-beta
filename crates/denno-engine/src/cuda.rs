@@ -11093,11 +11093,12 @@ pub fn from_slice_pinned<T: Copy>(data: &[T]) -> Result<DevBuffer> {
 // ホストバッファ。API はスライスだけなので、呼び出し側は確保の仕方だけを変える。
 // pinned は確保・解放が高いので、スレッド局所の空きリストで使い回す。
 
-/// `DENNO_PF_PIN` の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_PIN` の解釈 (純関数)。**既定 on** (lab t209a の pin で採用)、
+/// 明示的な偽値だけ off。
 pub(crate) fn pf_pin_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
-        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
@@ -11112,7 +11113,8 @@ pub(crate) fn pf_pin_set_for_test(v: u8) {
 
 /// task 209: prefill の活性バッファを pinned ホストメモリにするか (`DENNO_PF_PIN`)。
 ///
-/// **既定 off** (lab の採否で決める)。
+/// **既定 on** (lab t209a の pin が 3,826 -3.9% / 14,018 -3.4%、both で
+/// -4.8% / -4.0%。`=0` で切り戻し)。
 pub(crate) fn pf_pin_on() -> bool {
     #[cfg(test)]
     {
@@ -11225,11 +11227,11 @@ impl Drop for PfHostBuf {
 mod pf_pin_tests {
     use super::*;
 
-    /// task 209: `DENNO_PF_PIN` は明示的な真値だけ on (既定 off)。
+    /// task 209: `DENNO_PF_PIN` は **既定 on** (lab t209a の pin で採用)。
     #[test]
     fn pf_pin_gate_truth_table() {
-        assert!(!pf_pin_from_value(None), "未設定は既定 off");
-        for v in ["0", "off", "false", "no", "", " off ", "2"] {
+        assert!(pf_pin_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", "", " off ", "FALSE"] {
             assert!(!pf_pin_from_value(Some(v)), "{v:?} が on になった");
         }
         for v in ["1", "on", "true", "yes", " ON "] {
@@ -11237,11 +11239,11 @@ mod pf_pin_tests {
         }
     }
 
-    /// task 209: `DENNO_PF_MIXDEVIN` も明示的な真値だけ on (既定 off)。
+    /// task 209: `DENNO_PF_MIXDEVIN` も **既定 on** (lab t209a の devin で採用)。
     #[test]
     fn pf_dev_in_gate_truth_table() {
-        assert!(!pf_dev_in_from_value(None), "未設定は既定 off");
-        for v in ["0", "off", "false", "no", "", "2"] {
+        assert!(pf_dev_in_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", "", "FALSE"] {
             assert!(!pf_dev_in_from_value(Some(v)), "{v:?} が on になった");
         }
         for v in ["1", "on", "true", "yes"] {
@@ -11305,11 +11307,12 @@ mod pf_pin_tests {
 // H2D する** (台帳 14,018: 6.89 GB + 6.89 GB)。デバイスには `pf_mix` の出力が
 // そのまま残っているので、そこを読めば転送 2 本が消える。値は同じバイト列。
 
-/// `DENNO_PF_MIXDEVIN` の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_MIXDEVIN` の解釈 (純関数)。**既定 on** (lab t209a で採用)、
+/// 明示的な偽値だけ off。
 pub(crate) fn pf_dev_in_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
-        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
@@ -11323,7 +11326,8 @@ pub(crate) fn pf_dev_in_set_for_test(v: u8) {
 }
 
 /// task 209: router / shared が mix の出力をデバイスから読むか
-/// (`DENNO_PF_MIXDEVIN`、**既定 off**)。
+/// (`DENNO_PF_MIXDEVIN`、**既定 on**。lab t209a の devin が 3,826 -1.6% /
+/// 14,018 -0.9%、both で -4.8% / -4.0%。`=0` で切り戻し)。
 pub(crate) fn pf_dev_in_on() -> bool {
     #[cfg(test)]
     {
