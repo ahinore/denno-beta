@@ -5196,6 +5196,79 @@ fn ple_inject_from_kv(
     }
 }
 
+/// PLE の手順 5: depthwise 因果 conv → silu。
+///
+/// `out[c] = silu( Σ_k w[c*kern + k] * x[c, t - (kern-1-k)*dil] )`。
+/// 参照実装は履歴を `padded = [hist + n_tokens]` として前置きするので、`back`
+/// トークン前の値は `hist_buf` の `(hist - back)` 番目のスロット。
+///
+/// task 189: k を外側・c を内側に置く。各 c の加算は k 昇順のままで c は独立
+/// なので値はビット一致する。旧ループは内側に `back == 0` の分岐があり、c 方向
+/// にベクトル化できなかった (実形 kern 4 x hc_dim 10,240 x 14,336 トークン
+/// = 5.9 億回が ple 1,152 ms の主因)。
+fn ple_conv_silu(
+    out: &mut [f32],
+    x: &[f32],
+    hist_buf: &[f32],
+    w: &[f32],
+    kern: usize,
+    dil: usize,
+    hc_dim: usize,
+) {
+    assert_eq!(out.len(), hc_dim, "conv の出力長は hc_dim");
+    assert_eq!(x.len(), hc_dim, "conv の入力長は hc_dim");
+    assert_eq!(w.len(), kern * hc_dim, "conv の重み長は kern*hc_dim");
+    let hist = (kern - 1) * dil;
+    assert_eq!(hist_buf.len(), hist * hc_dim, "conv の履歴長は hist*hc_dim");
+    for v in out.iter_mut() {
+        *v = 0.0f32;
+    }
+    for k in 0..kern {
+        let back = (kern - 1 - k) * dil;
+        // back == 0 の項だけは履歴ではなく現在の x。
+        let src: &[f32] = if back == 0 {
+            x
+        } else {
+            &hist_buf[(hist - back) * hc_dim..][..hc_dim]
+        };
+        for c in 0..hc_dim {
+            out[c] += w[c * kern + k] * src[c];
+        }
+    }
+    for v in out.iter_mut() {
+        *v = hyper::silu(*v);
+    }
+}
+
+/// task 189: [`ple_conv_silu`] の参照実装 (旧ループ: c 外側・k 内側・分岐あり)。
+/// テストでビット一致を固定するためだけに置く。
+#[cfg(test)]
+fn ple_conv_silu_ref(
+    x: &[f32],
+    hist_buf: &[f32],
+    w: &[f32],
+    kern: usize,
+    dil: usize,
+    hc_dim: usize,
+) -> Vec<f32> {
+    let hist = (kern - 1) * dil;
+    let mut v = vec![0.0f32; hc_dim];
+    for c in 0..hc_dim {
+        let mut acc = 0.0f32;
+        for k in 0..kern {
+            let back = (kern - 1 - k) * dil;
+            let s = if back == 0 {
+                x[c]
+            } else {
+                hist_buf[(hist - back) * hc_dim + c]
+            };
+            acc += w[c * kern + k] * s;
+        }
+        v[c] = hyper::silu(acc);
+    }
+    v
+}
+
 /// [`ple_inject_from_kv`] の本体。作業域は呼び出し側が持つ。
 #[allow(clippy::too_many_arguments)]
 fn ple_inject_into(
@@ -5282,23 +5355,15 @@ fn ple_inject_into(
             hist_buf.len()
         )));
     }
-    for c in 0..hc_dim {
-        // out[c] = Σ_k w[k][c] * x[c, t - (kern-1-k)*dil]
-        // GGUF の ne は [kern, hc_dim] なので、列 c の k 番目は conv1d[c*kern + k]。
-        // 参照実装は履歴を `padded = [hist + n_tokens]` として前置きするので、
-        // `back` トークン前の値は hist_buf の (hist - back) 番目のスロット。
-        let mut acc = 0.0f32;
-        for k in 0..kern {
-            let back = (kern - 1 - k) * dil;
-            let v = if back == 0 {
-                x[c]
-            } else {
-                hist_buf[(hist - back) * hc_dim + c]
-            };
-            acc += pw.conv1d[c * kern + k] * v;
-        }
-        sc.conv[c] = hyper::silu(acc);
-    }
+    ple_conv_silu(
+        &mut sc.conv[..hc_dim],
+        x,
+        hist_buf,
+        &pw.conv1d,
+        kern,
+        dil,
+        hc_dim,
+    );
     // 履歴を 1 トークン進める (古い側を捨て、末尾に今の x を入れる)。
     if hist > 0 {
         hist_buf.copy_within(hc_dim.., 0);
@@ -18560,7 +18625,38 @@ mod tests {
             crate::ple::set_pf_ple_par_for_test(None);
         }
 
-        /// task 154: 常駐ゲートを on にしても、GPU / PTX / 形の前提が無ければ
+            /// task 189: conv のループ入れ替え (k 外側) が旧ループとビット一致すること。
+        #[test]
+        fn ple_conv_loop_interchange_is_bit_exact() {
+            let mut rnd = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = move || {
+                rnd = rnd
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rnd >> 33) as f32) / (u32::MAX as f32) - 0.5
+            };
+            for &(kern, dil) in &[(4usize, 3usize), (4, 1), (2, 1), (3, 2), (5, 4), (1, 3)] {
+                let hc_dim = 37usize; // 端数 (8 の倍数でない) も通す
+                let hist = (kern - 1) * dil;
+                let x: Vec<f32> = (0..hc_dim).map(|_| next()).collect();
+                let hb: Vec<f32> = (0..hist * hc_dim).map(|_| next()).collect();
+                let w: Vec<f32> = (0..hc_dim * kern).map(|_| next()).collect();
+                let want = ple_conv_silu_ref(&x, &hb, &w, kern, dil, hc_dim);
+                let mut got = vec![0.0f32; hc_dim];
+                ple_conv_silu(&mut got, &x, &hb, &w, kern, dil, hc_dim);
+                for c in 0..hc_dim {
+                    assert_eq!(
+                        want[c].to_bits(),
+                        got[c].to_bits(),
+                        "kern={kern} dil={dil} c={c}: {} != {}",
+                        want[c],
+                        got[c]
+                    );
+                }
+            }
+        }
+
+    /// task 154: 常駐ゲートを on にしても、GPU / PTX / 形の前提が無ければ
         /// 常駐経路は **層を 1 つも進めずに** 従来経路へ戻る (logits はビット一致・
         /// attention の状態も 1 回ぶんだけ進む)。
         #[test]
