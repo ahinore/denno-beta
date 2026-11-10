@@ -24212,7 +24212,8 @@ pub(crate) fn mix_dec_upw_on() -> bool {
 /// task 192 の `DENNO_MIX_DEC_UPW` とは別名にして、fold と切り離して
 /// 単独で A/B できるようにした (task 213 は fold と束ねて測っていた)。
 /// t221b の単独: 短い点 -2.4% (3 点とも -1.9〜-2.5%)。切り戻しは
-/// `DENNO_DEC_MIX_UPW=0` (legacy の `DENNO_MIX_DEC_UPW` も併せて 0 にする)。
+/// `DENNO_DEC_MIX_UPW=0` だけでよい (legacy の `DENNO_MIX_DEC_UPW` は既定 off で、
+/// `=1` を明示しているときだけ OR で効く)。
 fn parse_dec_mix_upw(raw: Option<&str>) -> bool {
     !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
