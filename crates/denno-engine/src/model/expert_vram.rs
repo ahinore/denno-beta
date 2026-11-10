@@ -1010,9 +1010,9 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup, lookup_many,
-    note_check, peek_many, take_alloc_error, take_check, touch_many, Acquired, CheckAcc, ExpertDev,
-    ExpertShape,
+    acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup,
+    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many, Acquired,
+    CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1637,6 +1637,148 @@ mod gpu {
             shapes,
             bytes: want,
         });
+        g.insert(key, want, Arc::clone(&dev));
+        Ok(Some(Acquired { dev, hit: false }))
+    }
+
+    // -----------------------------------------------------------------------
+    // task 214: 背景スレッド用の「転送をロックの外でやる」経路
+    // -----------------------------------------------------------------------
+
+    /// [`acquire_soft`] の**転送を LRU のロックの外でやる**版 (背景スレッド専用)。
+    ///
+    /// `acquire_opts` はホスト写し + H2D (実測 1 本 0.15〜0.25 ms) の間ずっと
+    /// ロックを持つ。メインスレッドの参照 (1 層 1 回) がそこへ当たると待つので、
+    /// lab t214a では 14,157 で +6% になっていた (ワーカーのロック保持は
+    /// GPU 待ちを含んで 0.23 ms、その duty が 3〜7%)。ここでは 3 段に割る:
+    ///
+    /// 1. 参照 + 追い出し + 予算の会計 (**ロック内**、数 us)
+    /// 2. デバイス確保 + ホスト写し + H2D (**ロック外**)
+    /// 3. 挿入 (**ロック内**、数 us)
+    ///
+    /// 2 の間は「確保済みで未挿入」の 1 本ぶん (約 3 MB) だけ `used_bytes` が
+    /// 過小になる。ワーカーは 1 本ずつしか走らないので高々 1 本
+    /// (22 GB に対して 0.014%) で、追い出しが数 MB 余分に起きるだけ。
+    ///
+    /// 確保に失敗したときの「全追い出し → 再試行」はしない (1 回で諦めて
+    /// `Ok(None)`)。呼び出し側 (ワーカー) は次の 1 本へ進む。
+    pub fn acquire_deferred<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        if ALLOC_DEAD.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let Some(cache) = CACHE.get() else {
+            return Ok(None);
+        };
+        // 1. 参照と場所の確保 (ロック内)。
+        let (want, mbytes) = {
+            let mut g = cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("expert VRAM LRU のロックが poisoned"))?;
+            if let Some(dev) = g.get_mut(&key) {
+                if dev.shapes != shapes {
+                    bail!(
+                        "expert VRAM: 同じ鍵 {:?} に別の形が来た (登録済み {:?} / 今回 {:?})",
+                        key,
+                        dev.shapes,
+                        shapes
+                    );
+                }
+                return Ok(Some(Acquired {
+                    dev: Arc::clone(dev),
+                    hit: true,
+                }));
+            }
+            let mut want = 0usize;
+            let mut mbytes = [0usize; 3];
+            for (i, s) in shapes.iter().enumerate() {
+                if !crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k)
+                    && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
+                {
+                    FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                mbytes[i] = s.bytes()?;
+                want = want.saturating_add(mbytes[i]);
+            }
+            refresh_cap(&mut g);
+            match g.make_room(want) {
+                Ok(v) => drop(v),
+                Err(_) => {
+                    FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+            }
+            (want, mbytes)
+        };
+        // 2. 確保 + 転送 (ロックの外)。
+        let [gb, ub, db] = load()?;
+        let pinned = crate::cuda::expert_pin_h2d();
+        let (slot_bytes, offs) = if crate::model::expert_slab::slab_enabled() {
+            let (offs, sb) = crate::model::expert_slab::slot_layout(mbytes);
+            (sb, offs)
+        } else {
+            (0, [0usize; 3])
+        };
+        let mut bufs: Option<ExpertBufs> = None;
+        if !crate::model::expert_slab::slab_enabled() {
+            bufs = alloc_three(pinned, gb, ub, db)
+                .ok()
+                .map(ExpertBufs::Direct);
+        } else {
+            match crate::model::expert_slab::alloc_slot(slot_bytes) {
+                Ok(slot) => {
+                    let base = slot.offset();
+                    let h = slot.handle();
+                    let r = h
+                        .upload_pinned_at(base + offs[0], gb)
+                        .and_then(|_| h.upload_pinned_at(base + offs[1], ub))
+                        .and_then(|_| h.upload_pinned_at(base + offs[2], db));
+                    if r.is_ok() {
+                        bufs = Some(ExpertBufs::Slab { slot, offs });
+                    }
+                }
+                // slab のチャンクが無い → この 1 本だけ per-expert 確保へ。
+                Err(_) => {
+                    bufs = alloc_three(pinned, gb, ub, db)
+                        .ok()
+                        .map(ExpertBufs::Direct);
+                }
+            }
+        }
+        let Some(bufs) = bufs else {
+            FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        let dev = Arc::new(ExpertDev {
+            bufs,
+            shapes,
+            bytes: want,
+        });
+        // 3. 挿入 (ロック内)。転送中に誰かが同じ鍵を入れたら、そちらを使う。
+        let mut g = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert VRAM LRU のロックが poisoned"))?;
+        if let Some(existing) = g.get_mut(&key) {
+            if existing.shapes != shapes {
+                bail!(
+                    "expert VRAM: 同じ鍵 {:?} に別の形が来た (登録済み {:?} / 今回 {:?})",
+                    key,
+                    existing.shapes,
+                    shapes
+                );
+            }
+            return Ok(Some(Acquired {
+                dev: Arc::clone(existing),
+                hit: true,
+            }));
+        }
         g.insert(key, want, Arc::clone(&dev));
         Ok(Some(Acquired { dev, hit: false }))
     }
