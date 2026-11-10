@@ -223,10 +223,23 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let app = Router::new()
+    let app = build_router(app);
+    let addr = format!("0.0.0.0:{port}");
+    tracing::info!("denno-view listening on http://{} (upstream: {})", addr, upstream);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// ルート一式。テストからも組めるように main の外に出す
+/// (Router を作るのに AppState=上流接続は要らない)。
+fn build_router(app: AppState) -> Router {
+    Router::new()
         .route("/", get(dashboard))
+        .route("/2d", get(dashboard2d))
         .route("/3d", get(dashboard3d))
         .route("/frames.mjs", get(frames_mjs))
+        .route("/view2d.mjs", get(view2d_mjs))
         .route("/vendor/*path", get(vendor))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
@@ -235,12 +248,75 @@ async fn main() -> anyhow::Result<()> {
         .route("/code/src", get(code_src))
         .route("/chat", post(chat_proxy))
         .route("/v1/limits", get(limits_proxy))
-        .with_state(app);
-    let addr = format!("0.0.0.0:{port}");
-    tracing::info!("denno-view listening on http://{} (upstream: {})", addr, upstream);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .route("/api/*path", axum::routing::any(api_proxy))
+        .with_state(app)
+}
+
+/// `/api/...` の転送先 URL。上流 base の末尾スラッシュと path の先頭スラッシュを
+/// 二重にしない。query はそのまま付ける。
+fn api_url(base: &str, path: &str, query: Option<&str>) -> String {
+    let base = base.trim_end_matches('/');
+    let p = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    match query {
+        Some(q) if !q.is_empty() => format!("{base}{p}?{q}"),
+        _ => format!("{base}{p}"),
+    }
+}
+
+/// ANY /api/* — 上流 (8098) の REST API をそのまま中継する。
+/// `/api/v1/model/shape` → `{api}/v1/model/shape`。GET / POST / DELETE の
+/// ステータスと本文を素通しする (ビューワは 404 を見てモックに落ちる)。
+async fn api_proxy(
+    axum::extract::State(app): axum::extract::State<AppState>,
+    method: axum::http::Method,
+    uri: axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let path = uri.path().strip_prefix("/api").unwrap_or(uri.path());
+    let url = api_url(&app.api, path, uri.query());
+    let rmethod = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    let mut req = app.http.request(rmethod.clone(), &url);
+    if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
+        req = req.header("content-type", ct);
+    } else if rmethod == reqwest::Method::POST {
+        req = req.header("content-type", "application/json");
+    }
+    if !body.is_empty() {
+        req = req.body(body);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return axum::response::Response::builder()
+                .status(502)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    "{{\"error\":{{\"message\":\"upstream unreachable: {e}\",\"type\":\"api_error\"}}}}"
+                )))
+                .unwrap();
+        }
+    };
+    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let bytes = resp.bytes().await.unwrap_or_default();
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", ctype)
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(bytes))
+        .unwrap()
 }
 
 /// 上流 denno サーバーへ接続してフレームを broadcast に流す。
@@ -425,6 +501,24 @@ async fn dashboard3d() -> Html<&'static str> {
     Html(include_str!("index3d.html"))
 }
 
+/// GET /2d — 層マップ + チャット + 介入/ステアリング操作の 2D ビューワ。
+async fn dashboard2d() -> Html<&'static str> {
+    Html(include_str!("index2d.html"))
+}
+
+/// GET /view2d.mjs — /2d が import する純ロジック
+/// (レイアウト・色の対応・選択→本文・モック店)。DOM に触らない。
+async fn view2d_mjs() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/javascript; charset=utf-8")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from(
+            include_str!("view2d.mjs").as_bytes().to_vec(),
+        ))
+        .unwrap()
+}
+
 /// GET /frames.mjs — 3D ビューアが import するフレームデコーダ。
 /// 形式の正は `denno-telemetry` の v1 (この JS はその写し。DOM 非依存)。
 async fn frames_mjs() -> axum::response::Response {
@@ -535,7 +629,213 @@ async fn view_socket(mut socket: WebSocket, app: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::capture_body;
+    use super::{api_url, build_router, capture_body, AppState};
+    use axum::body::Bytes;
+    use axum::response::Response;
+    use axum::Router;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::broadcast;
+
+    /// Router を組むのに要る最小の AppState (上流へは繋がない)。
+    fn test_state(api: &str) -> AppState {
+        let (tx, _rx) = broadcast::channel::<Vec<u8>>(8);
+        AppState {
+            bcast: Arc::new(tx),
+            srv: Arc::new(std::sync::RwLock::new(None)),
+            kv: Arc::new(std::sync::RwLock::new(None)),
+            api: Arc::new(api.trim_end_matches('/').to_string()),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// 127.0.0.1 の空きポートで serving し、base URL を返す。
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[derive(Clone, Default)]
+    struct Seen(Arc<Mutex<Vec<String>>>);
+
+    /// 上流の代役。受けた要求を Seen に積み、契約どおりの応答を返す。
+    async fn mock_upstream(
+        axum::extract::State(seen): axum::extract::State<Seen>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: Bytes,
+    ) -> Response {
+        seen.0.lock().unwrap().push(format!(
+            "{method} {} query={} body={}",
+            uri.path(),
+            uri.query().unwrap_or(""),
+            String::from_utf8_lossy(&body)
+        ));
+        let (status, body) = match (method.as_str(), uri.path()) {
+            ("GET", "/v1/model/shape") => (
+                404,
+                r#"{"error":{"message":"not implemented"}}"#.to_string(),
+            ),
+            ("GET", "/v1/intervene") => (
+                200,
+                r#"{"epoch":7,"experts_off":[[3,9]],"blocks_off":[],"streams_off":[]}"#.to_string(),
+            ),
+            ("POST", "/v1/intervene") => (200, r#"{"epoch":8}"#.to_string()),
+            ("DELETE", "/v1/steer/apply") => (204, String::new()),
+            _ => (404, r#"{"error":{"message":"no route"}}"#.to_string()),
+        };
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn api_url_joins_base_path_and_query() {
+        assert_eq!(
+            api_url("http://127.0.0.1:8098", "/v1/model/shape", None),
+            "http://127.0.0.1:8098/v1/model/shape"
+        );
+        // base の末尾スラッシュ / path の先頭スラッシュは二重にしない
+        assert_eq!(
+            api_url("http://127.0.0.1:8098/", "v1/intervene", None),
+            "http://127.0.0.1:8098/v1/intervene"
+        );
+        assert_eq!(
+            api_url("http://h:1", "/v1/intervene", Some("a=1&b=2")),
+            "http://h:1/v1/intervene?a=1&b=2"
+        );
+        // 空 query は付けない
+        assert_eq!(
+            api_url("http://h:1", "/v1/steer", Some("")),
+            "http://h:1/v1/steer"
+        );
+    }
+
+    /// GET / POST / DELETE を上流へ送り、status と body を素通しすることを
+    /// 実サーバー 2 つ (view と上流の代役) で確かめる。
+    #[tokio::test]
+    async fn api_proxy_passes_method_status_body_and_query() {
+        let seen = Seen::default();
+        let upstream = Router::new()
+            .fallback(mock_upstream)
+            .with_state(seen.clone());
+        let up_base = serve(upstream).await;
+        let view_base = serve(build_router(test_state(&up_base))).await;
+        let c = reqwest::Client::new();
+
+        // GET: 404 と本文をそのまま返す (ビューワはこれでモックに落ちる)
+        let r = c
+            .get(format!("{view_base}/api/v1/model/shape"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+        assert_eq!(
+            r.headers().get("content-type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        let j: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        assert_eq!(j["error"]["message"], "not implemented");
+
+        // POST: 本文とクエリを渡し、上流の 200 を返す
+        let r = c
+            .post(format!("{view_base}/api/v1/intervene?x=1"))
+            .header("content-type", "application/json")
+            .body(r#"{"experts_off":[[3,7]]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let j: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        assert_eq!(j["epoch"], 8);
+
+        // DELETE: 204 (本文なし) をそのまま
+        let r = c
+            .delete(format!("{view_base}/api/v1/steer/apply"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        assert_eq!(r.bytes().await.unwrap().len(), 0);
+
+        // 上流が受けた method / path / query / body
+        let got = seen.0.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|s| s
+                == "POST /v1/intervene query=x=1 body={\"experts_off\":[[3,7]]}"),
+            "upstream saw: {got:?}"
+        );
+        assert!(
+            got.iter().any(|s| s.starts_with("GET /v1/model/shape")),
+            "upstream saw: {got:?}"
+        );
+        assert!(
+            got.iter().any(|s| s.starts_with("DELETE /v1/steer/apply")),
+            "upstream saw: {got:?}"
+        );
+    }
+
+    /// / と /3d は今までどおり、/2d と /view2d.mjs が増えている。
+    #[tokio::test]
+    async fn pages_2d_and_3d_are_served() {
+        let base = serve(build_router(test_state("http://127.0.0.1:1"))).await;
+        let c = reqwest::Client::new();
+
+        let r = c.get(format!("{base}/2d")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let html = r.text().await.unwrap();
+        assert!(html.contains("denno 2D"), "page title missing");
+        assert!(html.contains("/view2d.mjs"), "/2d must import the module");
+        assert!(html.contains("id=\"map\""), "canvas missing");
+
+        let r = c.get(format!("{base}/view2d.mjs")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript"));
+        let js = r.text().await.unwrap();
+        assert!(js.contains("export function layoutFromShape"));
+        assert!(js.contains("export function createMockStore"));
+
+        // 既存の 2 ページは壊していない
+        for p in ["/", "/3d", "/frames.mjs"] {
+            let r = c.get(format!("{base}{p}")).send().await.unwrap();
+            assert_eq!(r.status(), 200, "GET {p}");
+        }
+    }
+
+    /// 上流が落ちていれば 502 の JSON (ページはモックで動き続ける)。
+    #[tokio::test]
+    async fn api_proxy_502_when_upstream_is_down() {
+        let base = serve(build_router(test_state("http://127.0.0.1:1"))).await;
+        let r = reqwest::Client::new()
+            .get(format!("{base}/api/v1/model/shape"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 502);
+        let j: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        assert!(j["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("upstream unreachable"));
+    }
 
     /// GET /capture.bin の応答実体。ルート登録そのものはテストしない
     /// (Router を作るには AppState/上流接続が要る) が、404 の 2 経路と
