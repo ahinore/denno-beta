@@ -913,7 +913,8 @@ impl SsmLayer {
         // 連鎖の入力 x も出力 beta/alpha もデバイスにあるので、転送を挟まずに
         // F32 GEMM 2 本で作れる (lab t183a の `beta_pf` は 712 ms = 0.71 ms/回)。
         // 形が合わない (連結でない / F32 でない) ときはホスト経路のまま。
-        let ba_desc = if crate::cuda::pf_ssm_gemm_gpu_on() {
+        // task 225: 新しい専用 GEMM (`DENNO_PF_BA_FAST`) でもデバイス経路に入る。
+        let ba_desc = if crate::cuda::pf_ba_dev_on() {
             match self.beta_alpha.inner() {
                 Some(inner) => {
                     let (r0, r1) = (self.beta_alpha.range(0), self.beta_alpha.range(1));

@@ -9404,3 +9404,236 @@ fn task213_server_runs_the_gate_audit_at_startup() {
         "serve_flash の run() が起動時の監査を呼んでいない"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 225: prefill の beta/alpha GEMM / router softmax+top-k / GDN スキャン v3
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「build_ptx.sh が正しい -fmad / arch で作る」
+// 「起動形状が #define と一致する」を固定する。値の一致は GPU 側の担当。
+const GEMM_BA225_SRC: &str = include_str!("../kernels/kernels_gemm_ba225.cu");
+const ROUTER225_SRC: &str = include_str!("../kernels/kernels_router225.cu");
+const GDN_PF3_SRC: &str = include_str!("../kernels/kernels_gdn_pf3.cu");
+
+/// `.cu` の `extern "C" __global__` 宣言の引数の個数を数える。
+fn cu_kernel_nargs(src: &str, name: &str) -> usize {
+    let at = src
+        .find(&format!("{name}("))
+        .unwrap_or_else(|| panic!("{name} が無い"));
+    let rest = &src[at + name.len()..];
+    let open = rest.find('(').expect("( が無い");
+    // コメント (`// ...`) を落としてから数える (引数コメントの `[nv, dk, dv]` を
+    // 引数の区切りと数えないため)。
+    let mut body = String::new();
+    let mut in_line = false;
+    for ch in rest[open..].chars() {
+        if in_line {
+            if ch == '\n' {
+                in_line = false;
+            }
+            continue;
+        }
+        if ch == '/' && body.ends_with('/') {
+            body.pop();
+            in_line = true;
+            continue;
+        }
+        body.push(ch);
+    }
+    let mut depth = 0usize;
+    let mut n = 0usize;
+    for ch in body.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            ',' if depth == 1 => n += 1,
+            _ => {}
+        }
+    }
+    n + 1
+}
+
+#[test]
+fn task225_ba225_kernel_is_wired() {
+    assert!(GEMM_BA225_SRC.contains("dno_gemm_f32_ba"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gemm_f32_ba\\0\""),
+        "cuda.rs が dno_gemm_f32_ba を読んでいない"
+    );
+    for line in [
+        "#define BA225_ROWS 48",
+        "#define BA225_TOKS 64",
+        "#define BA225_KTILE 32",
+        "#define BA225_THREADS 256",
+    ] {
+        assert!(GEMM_BA225_SRC.contains(line), "{line} が無い");
+    }
+    assert_eq!(
+        cu_kernel_nargs(GEMM_BA225_SRC, "dno_gemm_f32_ba"),
+        6,
+        "引数の個数がホストの起動と違う"
+    );
+    // ホスト側の定数がカーネルのタイルと一致する (起動形状の食い違い防止)。
+    assert!(
+        CUDA_RS.contains("pub(crate) const BA225_ROWS: usize = 48;"),
+        "BA225_ROWS が .cu の BA225_ROWS と違う"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) const BA225_TOKS: usize = 64;"),
+        "BA225_TOKS が .cu の BA225_TOKS と違う"
+    );
+    assert!(
+        CUDA_RS.contains("ctx.launch_async(fns.ba_gemm, grid, (256, 1, 1), 0, &mut args)"),
+        "beta/alpha GEMM の block が 256 でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gemm_ba225)   echo \"kernels_gemm_ba225.cu|nofmad\""),
+        "build_ptx.sh の gemm_ba225 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gemm_ba225"),
+        "targets_all に gemm_ba225 が無い"
+    );
+    // 出力 1 要素 1 アキュムレータ・k 昇順の FMA (決定論)。
+    assert!(
+        GEMM_BA225_SRC.contains("acc[i][j] = __fmaf_rn(wv[i], xv[j], acc[i][j]);"),
+        "積和が明示 FMA の k 昇順になっていない"
+    );
+}
+
+#[test]
+fn task225_router225_kernel_is_wired() {
+    assert!(ROUTER225_SRC.contains("dno_router_softmax_topk"));
+    assert!(
+        CUDA_RS.contains("b\"dno_router_softmax_topk\\0\""),
+        "cuda.rs が dno_router_softmax_topk を読んでいない"
+    );
+    for line in [
+        "#define RT_MAX_PER 32",
+        "#define RT_MAX_K 32",
+        "#define RT_WARPS 4",
+        "#define RT_THREADS (RT_WARPS * 32)",
+    ] {
+        assert!(ROUTER225_SRC.contains(line), "{line} が無い");
+    }
+    assert_eq!(
+        cu_kernel_nargs(ROUTER225_SRC, "dno_router_softmax_topk"),
+        7,
+        "引数の個数がホストの起動と違う (logits/sels/wts/rowsum/nt/ne/k)"
+    );
+    assert!(
+        ROUTER225_SRC.contains("const int t = blockIdx.x * RT_WARPS + wid;"),
+        "1 ブロック 4 ワープ = 4 トークンの割り方が変わっている"
+    );
+    assert!(
+        CUDA_RS.contains("let grid = (nt.div_ceil(4) as u32, 1, 1);"),
+        "router カーネルの grid が ceil(nt/4) でない"
+    );
+    assert!(
+        CUDA_RS.contains("ctx.launch_async(f_rt, grid, (128, 1, 1), 0, &mut args)"),
+        "router カーネルの block が 128 でない"
+    );
+    // ゲートは qwen4exp の router 経路に配線されている (mask 有りはホストへ)。
+    assert!(
+        QWEN4EXP_RS.contains("crate::cuda::pf_router_dev_on()"),
+        "router のデバイス経路が qwen4exp に配線されていない"
+    );
+    assert!(
+        QWEN4EXP_RS.contains("&& expert_mask.is_none()"),
+        "mask 有り (介入中) でデバイス経路に入ってしまう"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("router225)    echo \"kernels_router225.cu|nofmad\""),
+        "build_ptx.sh の router225 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("router225"),
+        "targets_all に router225 が無い"
+    );
+}
+
+#[test]
+fn task225_gdn_pf3_kernel_is_wired() {
+    assert!(GDN_PF3_SRC.contains("dno_gdn_pf_scan32"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_scan32\\0\""),
+        "cuda.rs が dno_gdn_pf_scan32 を読んでいない"
+    );
+    for line in [
+        "#define PF3_DK 128",
+        "#define PF3_LANES 8",
+        "#define PF3_NR 16",
+        "#define PF3_COLS 32",
+        "#define PF3_THREADS 256",
+        "#define PF3_DCONV 4",
+        "#define PF3_CS 3",
+        "#define PF3_RING 4",
+    ] {
+        assert!(GDN_PF3_SRC.contains(line), "{line} が無い");
+    }
+    // 8 レーン x 16 行 = 128 行、block = 32 列 x 8 レーン = 256 スレッド。
+    assert_eq!(8 * 16, 128, "レーン x 行が dk でない");
+    assert_eq!(32 * 8, 256, "列 x レーンがスレッド数でない");
+    assert_eq!(
+        cu_kernel_nargs(GDN_PF3_SRC, "dno_gdn_pf_scan32"),
+        17,
+        "引数の個数が v2 (gdn_pf2_launch) と違う"
+    );
+    // 縮約は 8 レーン (xor 1 -> 2 -> 4)。
+    for what in ["sq", "sk2", "skv", "o"] {
+        for off in [1, 2, 4] {
+            assert!(
+                GDN_PF3_SRC.contains(&format!("__shfl_xor_sync(0xffffffffu, {what}, {off})")),
+                "{what} の xor {off} 縮約が無い"
+            );
+        }
+    }
+    assert!(
+        GDN_PF3_SRC.contains("float S[PF3_NR];"),
+        "状態配列がレジスタ常駐の形になっていない"
+    );
+    // barrier は「プロローグ 1 + ループ末尾 1」の 2 個。
+    assert_eq!(
+        GDN_PF3_SRC.matches("__syncthreads()").count(),
+        2,
+        "barrier が 2 個でない"
+    );
+    assert!(
+        CUDA_RS.contains("(nv as u32, GDN_PF3_BLOCKS, 1)"),
+        "v3 スキャンの grid が (nv, 4) でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF3_BLOCKS: u32 = 4;"),
+        "GDN_PF3_BLOCKS が 4 でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf3)      echo \"kernels_gdn_pf3.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf3 が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gdn_pf3"),
+        "targets_all に gdn_pf3 が無い"
+    );
+    // v2 の norm を再利用する (演算列を増やさない)。
+    assert!(
+        CUDA_RS.contains("let norm = gdn_pf2_kernels()?.norm;"),
+        "v3 が v2 の norm を使っていない"
+    );
+}

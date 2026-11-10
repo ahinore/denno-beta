@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix gemm_ba225 router225 gdn_pf3)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -160,6 +160,18 @@ spec() {
         # task 216: decode の mix の up と hc_mixed を 1 本に畳む版。
         # 2 本版と同じ鎖・同じ木・同じ式なので -fmad=false。
         mix_upmix)    echo "kernels_mix_upmix.cu|nofmad" ;;
+        # task 225: prefill の ssm beta/alpha 射影 (F32 重み 2,560 x 48) を
+        # 48 行 x 64 トークンのタイルで回す GEMM。出力 1 要素 1 アキュムレータ・
+        # k 昇順の明示 __fmaf_rn なので -fmad=false (演算列を読めるようにする)。
+        gemm_ba225)   echo "kernels_gemm_ba225.cu|nofmad" ;;
+        # task 225: prefill の router softmax + top-k を 1 ワープ = 1 トークンで
+        # 回す。選択規則と再正規化の加算順はホストと同一 (和の木だけ違う) なので
+        # -fmad=false (明示演算のみ)。
+        router225)    echo "kernels_router225.cu|nofmad" ;;
+        # task 225: prefill GDN スキャン v3 (1 ヘッド 4 ブロック x 8 レーン)。
+        # 丸めは要素ごとに v2 と同一にしたいので -fmad=false。arch も v2 と
+        # 同じ compute_90 に揃える (JIT 差を作らない)。
+        gdn_pf3)      echo "kernels_gdn_pf3.cu|nofmad|compute_90" ;;
         *)            return 1 ;;
     esac
 }

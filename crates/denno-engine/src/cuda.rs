@@ -38590,6 +38590,464 @@ fn gguf_gemm_dev_launch(
 }
 
 // ---------------------------------------------------------------------------
+// task 225: prefill の ssm beta/alpha 射影 (F32、n <= 256) を専用 GEMM で回す
+// (`DENNO_PF_BA_FAST`、既定 off)
+// ---------------------------------------------------------------------------
+//
+// lab t222c (14,018 トークン、PROFILE=1) の `sub ssm beta_pf` は 612.7 ms。
+// 中身はホストの `gemv_batch_split` (F32 重み 2,560 x 96 を 16 スレッドで回す)
+// で実効 0.4 TFLOP/s。同じ層の qkv GEMM は 93.6 TFLOP/s。
+// 既存のデバイス版 (`dno_gemm_f32_mt` を `DENNO_PF_SSM_GEMM_GPU` で使う) は
+// lab t183a で 712 ms と**ホストより遅い** (1 ブロック 16 行 x 32 トークン、
+// n = 48 では 3 x 16 = 48 ブロック、2 アキュムレータ/スレッドで latency 律速)。
+//
+// `dno_gemm_f32_ba` (kernels_gemm_ba225.cu) は 48 行 x 64 トークンのタイルで
+// 12 アキュムレータ/スレッド。入力も出力もデバイスにあるので転送は 0。
+// 数値は F32 の `__fmaf_rn` を k 昇順に積む (ホストの mul+add 逐次和とは丸めだけ
+// が違う。決定論)。
+
+/// `dno_gemm_f32_ba` の 1 ブロック行数 (カーネルの BA225_ROWS)。
+pub(crate) const BA225_ROWS: usize = 48;
+/// `dno_gemm_f32_ba` の 1 ブロックトークン数 (カーネルの BA225_TOKS)。
+pub(crate) const BA225_TOKS: usize = 64;
+
+struct BaGemmFns {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// **フィールド名は他と共有しないこと**: kernel_invariants の起動サイト走査は
+    /// `fns.<field>` をカーネル名へ引くので、同名のフィールドが別カーネルを指すと
+    /// 表が壊れる (task 225 で `gemm` が mix_pf と衝突した)。
+    ba_gemm: CUfunction,
+}
+
+unsafe impl Send for BaGemmFns {}
+unsafe impl Sync for BaGemmFns {}
+
+/// PTX の置き場所 (`DENNO_PF_BA_PTX` があればそれ)。
+fn ba_gemm_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_BA_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_ba225.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+fn ba_gemm_fns(ctx: &CudaCtx) -> Option<&'static BaGemmFns> {
+    static K: OnceLock<Option<BaGemmFns>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = ba_gemm_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[pf225-ba] PTX が読めない ({}) : {e} → ホストの射影へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[pf225-ba] cuModuleLoadData 失敗 → ホストの射影へ");
+                return None;
+            }
+            let mut ba_gemm: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut ba_gemm,
+                module,
+                b"dno_gemm_f32_ba\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[pf225-ba] PTX に dno_gemm_f32_ba が無い → ホストの射影へ");
+                return None;
+            }
+            let _ = ctx;
+            log_kernel_attr(lib, ba_gemm, "dno_gemm_f32_ba");
+            Some(BaGemmFns { module, ba_gemm })
+        }
+    })
+    .as_ref()
+}
+
+/// `DENNO_PF_BA_FAST` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn pf_ba_fast_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static BA225_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_ba_fast_for_test(v: Option<bool>) {
+    BA225_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// beta/alpha を専用 GEMM で回すか (既定 off。lab の結果で決める)。
+pub(crate) fn pf_ba_fast_on() -> bool {
+    #[cfg(test)]
+    {
+        match BA225_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_ba_fast_from_value(std::env::var("DENNO_PF_BA_FAST").ok().as_deref()))
+}
+
+/// beta/alpha を**デバイスで**作るか (旧 `DENNO_PF_SSM_GEMM_GPU` か新
+/// `DENNO_PF_BA_FAST` のどちらか)。連鎖の入口 (`ba_desc`) と
+/// [`gdn_pf_chain`] の前提検査が同じ判定を見るようにここへ集約する。
+pub(crate) fn pf_ba_dev_on() -> bool {
+    pf_ssm_gemm_gpu_on() || pf_ba_fast_on()
+}
+
+/// 形のゲート (純関数)。n は 1 本あたりの出力行 (実モデルは 48)。
+pub(crate) fn pf_ba_fast_ok(nt: usize, k: usize, n: usize) -> bool {
+    nt >= 1 && k >= 1 && n >= 1 && n <= 256
+}
+
+/// 専用 GEMM を 1 本撃つ (beta と alpha で 2 回)。`false` = 撃てなかった。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pf_ba_gemm_dev_launch(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    x: CUdeviceptr,
+    y: CUdeviceptr,
+    nt: usize,
+    k: usize,
+    n: usize,
+) -> Result<bool> {
+    if !pf_ba_fast_ok(nt, k, n) {
+        return Ok(false);
+    }
+    let Some(fns) = ba_gemm_fns(ctx) else {
+        return Ok(false);
+    };
+    let (mut pw, mut px, mut py) = (w, x, y);
+    let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k as c_int, n as c_int);
+    let mut args = [
+        &mut pw as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut py as *mut _ as *mut c_void,
+        &mut nt_c as *mut _ as *mut c_void,
+        &mut k_c as *mut _ as *mut c_void,
+        &mut n_c as *mut _ as *mut c_void,
+    ];
+    let grid = (
+        nt.div_ceil(BA225_TOKS) as u32,
+        n.div_ceil(BA225_ROWS) as u32,
+        1,
+    );
+    unsafe { ctx.launch_async(fns.ba_gemm, grid, (256, 1, 1), 0, &mut args)? };
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// task 225: prefill の router softmax + top-k をデバイスで回す
+// (`DENNO_PF_ROUTER_DEV`、既定 off)
+// ---------------------------------------------------------------------------
+//
+// lab t222c: `sub router softmax` 239.9 ms (ホスト)。logits は既に GPU の f32
+// GEMM で作っているが、全行 (14k で 1,378 MB) をホストへ降ろして 512 列の
+// softmax と top-k を回していた。ここでは logits をデバイスに残し、softmax →
+// top-k → 再正規化までを `dno_router_softmax_topk` (kernels_router225.cu) で
+// 行って、**選んだ k 個の index と重みだけ**をホストへ返す。
+//
+// 数値: 和の結合順が違うので softmax の分母が 1 ulp 級に動く (丸めだけの差)。
+// 選択規則 (値の降順・同値は小さい index・出力は index 昇順) と再正規化の加算順
+// (index 昇順) はホストの `router_topk_rows` / `router_renorm` と同一。
+
+struct RouterDevFns {
+    #[allow(dead_code)]
+    module: CUmodule,
+    kernel: CUfunction,
+}
+
+unsafe impl Send for RouterDevFns {}
+unsafe impl Sync for RouterDevFns {}
+
+fn router_dev_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_ROUTER_DEV_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_router225.ptx"),
+    }
+}
+
+fn router_dev_fns(ctx: &CudaCtx) -> Option<&'static RouterDevFns> {
+    static K: OnceLock<Option<RouterDevFns>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = router_dev_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[pf225-rt] PTX が読めない ({}) : {e} → ホストの softmax へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[pf225-rt] cuModuleLoadData 失敗 → ホストの softmax へ");
+                return None;
+            }
+            let mut kernel: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut kernel,
+                module,
+                b"dno_router_softmax_topk\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[pf225-rt] PTX に dno_router_softmax_topk が無い → ホストへ");
+                return None;
+            }
+            let _ = ctx;
+            log_kernel_attr(lib, kernel, "dno_router_softmax_topk");
+            Some(RouterDevFns { module, kernel })
+        }
+    })
+    .as_ref()
+}
+
+/// `DENNO_PF_ROUTER_DEV` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn pf_router_dev_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static ROUTER_DEV_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_router_dev_for_test(v: Option<bool>) {
+    ROUTER_DEV_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// router の softmax + top-k をデバイスで回すか (既定 off)。
+pub(crate) fn pf_router_dev_on() -> bool {
+    #[cfg(test)]
+    {
+        match ROUTER_DEV_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_router_dev_from_value(std::env::var("DENNO_PF_ROUTER_DEV").ok().as_deref()))
+}
+
+/// カーネルの前提 (k <= 32 / ne <= 1024)。純関数。
+pub(crate) fn pf_router_dev_ok(nt: usize, ne: usize, k: usize) -> bool {
+    nt >= 1 && (1..=32).contains(&k) && (1..=1024).contains(&ne)
+}
+
+struct RouterDevSc {
+    x: Option<DevBuffer>,
+    logits: Option<DevBuffer>,
+    sels: Option<DevBuffer>,
+    wts: Option<DevBuffer>,
+    rowsum: Option<DevBuffer>,
+}
+
+thread_local! {
+    static ROUTER_DEV_SC: std::cell::RefCell<RouterDevSc> = const {
+        std::cell::RefCell::new(RouterDevSc {
+            x: None,
+            logits: None,
+            sels: None,
+            wts: None,
+            rowsum: None,
+        })
+    };
+}
+
+/// task 225: logits をデバイスに残したまま softmax → top-k → 再正規化まで回す。
+///
+/// `dev_x` が `Some` なら入力は既にデバイスにある (`DENNO_PF_MIXDEVIN` の
+/// `mixed`)、`None` ならホストの `xs` を上げる。`sels` / `wts` は `nt * k`、
+/// `rowsum` は `nt` 要素。`false` = デバイスでやらなかった (呼び出し側は
+/// 従来のホスト経路へ)。
+#[allow(clippy::too_many_arguments)]
+pub fn pf_router_dev_topk(
+    uid: u64,
+    bytes: &[u8],
+    k_in: usize,
+    n: usize,
+    dev_x: Option<CUdeviceptr>,
+    xs: Option<&[f32]>,
+    nt: usize,
+    k: usize,
+    sels: &mut [u32],
+    wts: &mut [f32],
+    rowsum: &mut [f32],
+    src_ty: crate::kquant::GgmlType,
+) -> bool {
+    let bpp = match src_ty {
+        crate::kquant::GgmlType::F32 => 4usize,
+        crate::kquant::GgmlType::Bf16 | crate::kquant::GgmlType::F16 => 2,
+        _ => return false,
+    };
+    if !cuda_enabled()
+        || !pf_router_dev_ok(nt, n, k)
+        || sels.len() != nt * k
+        || wts.len() != nt * k
+        || rowsum.len() != nt
+        || k_in == 0
+        || bytes.len() != k_in.saturating_mul(n).saturating_mul(bpp)
+        || match (dev_x, xs) {
+            (Some(p), _) => p == 0,
+            (None, Some(x)) => x.len() != nt * k_in,
+            (None, None) => true,
+        }
+    {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return false;
+    }
+    let Some(f_gemm) = gemm_f32_mt_fn(ctx) else {
+        return false;
+    };
+    let Some(f_rt) = router_dev_fns(ctx) else {
+        return false;
+    };
+    let f_rt = f_rt.kernel;
+    let w = match weights_for_gemm_f32(uid, bytes, k_in, n, src_ty) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    let Ok(lib) = lib() else {
+        return false;
+    };
+    let r = ROUTER_DEV_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let RouterDevSc {
+            x: dx,
+            logits: dlogit,
+            sels: dsel,
+            wts: dwt,
+            rowsum: drs,
+        } = &mut *s;
+        let xp = match (dev_x, xs) {
+            (Some(p), _) => p,
+            (None, Some(host)) => {
+                Scratch::ensure(dx, nt * k_in * 4)?;
+                let dx = dx.as_ref().unwrap();
+                dx.copy_from(host)?;
+                dx.ptr()
+            }
+            (None, None) => return Ok(()),
+        };
+        Scratch::ensure(dlogit, nt * n * 4)?;
+        Scratch::ensure(dsel, nt * k * 4)?;
+        Scratch::ensure(dwt, nt * k * 4)?;
+        Scratch::ensure(drs, nt * 4)?;
+        let (dlogit, dsel, dwt, drs) = (
+            dlogit.as_ref().unwrap(),
+            dsel.as_ref().unwrap(),
+            dwt.as_ref().unwrap(),
+            drs.as_ref().unwrap(),
+        );
+        let wp = w.buf.ptr();
+        unsafe {
+            // 1) logits = W @ x^T (既存の f32 GEMM。デバイスに残す)
+            let (mut pw, mut px, mut po) = (wp, xp, dlogit.ptr());
+            let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k_in as c_int, n as c_int);
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut nt_c as *mut _ as *mut c_void,
+                &mut k_c as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+            ];
+            let grid = (
+                n.div_ceil(GEMM_MT_ROWS) as u32,
+                nt.div_ceil(GEMM_MT_TOKS) as u32,
+                1,
+            );
+            ctx.launch_async(f_gemm, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+            // 2) softmax + top-k + 再正規化
+            let (mut pl, mut ps, mut pwt, mut prs) =
+                (dlogit.ptr(), dsel.ptr(), dwt.ptr(), drs.ptr());
+            let (mut nt_c, mut ne_c, mut k_c) = (nt as c_int, n as c_int, k as c_int);
+            let mut args = [
+                &mut pl as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut pwt as *mut _ as *mut c_void,
+                &mut prs as *mut _ as *mut c_void,
+                &mut nt_c as *mut _ as *mut c_void,
+                &mut ne_c as *mut _ as *mut c_void,
+                &mut k_c as *mut _ as *mut c_void,
+            ];
+            let grid = (nt.div_ceil(4) as u32, 1, 1);
+            ctx.launch_async(f_rt, grid, (128, 1, 1), 0, &mut args)?;
+            ctx.sync()?;
+            // 3) 選んだ k 個と重みだけ降ろす
+            check(
+                (lib.memcpy_dtoh)(
+                    sels.as_mut_ptr() as *mut c_void,
+                    dsel.ptr(),
+                    nt * k * 4,
+                ),
+                "cuMemcpyDtoH (router sels)",
+            )?;
+            check(
+                (lib.memcpy_dtoh)(wts.as_mut_ptr() as *mut c_void, dwt.ptr(), nt * k * 4),
+                "cuMemcpyDtoH (router wts)",
+            )?;
+            check(
+                (lib.memcpy_dtoh)(
+                    rowsum.as_mut_ptr() as *mut c_void,
+                    drs.ptr(),
+                    nt * 4,
+                ),
+                "cuMemcpyDtoH (router rowsum)",
+            )?;
+        }
+        Ok(())
+    });
+    r.is_ok()
+}
+
+// ---------------------------------------------------------------------------
 // task 173: prefill の GDN スキャンを「状態レジスタ常駐 + 4 レーン分割」へ
 // ---------------------------------------------------------------------------
 //
@@ -39291,6 +39749,395 @@ mod gdn_pf2_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 225: prefill GDN スキャン v3 (ヘッドあたり 4 ブロック x 8 レーン)
+// (`DENNO_PF_SCAN3`、既定 off)
+// ---------------------------------------------------------------------------
+//
+// lab t222c: `ssm scan_pf` は 1,470.3 ms = 2.9 us/トークン。v2
+// (`dno_gdn_pf_scan64`) は 1 ブロック = 64 列で 96 ブロックしかなく (170 SM)、
+// 8 ワープ/ブロックなので 4.5 ワープ/SM。1 トークンの依存鎖 (32 行の skv 和 →
+// 32 行の更新 + o 和) が latency にそのまま出る。
+// v3 は 1 ブロック = 32 列 x 8 レーン = 256 スレッド (1 レーン 16 行) で
+// 192 ブロック。リングを 4 段にして t+3 のグローバル読みを t の計算の前に発行し、
+// silu とリング書きを計算の後に回す。値は v2 と丸め順だけが違う (縮約の木が
+// 8 レーン)。
+
+/// v3 スキャンの 1 ブロックあたりの列数 (カーネルの PF3_COLS)。
+pub(crate) const GDN_PF3_COLS: usize = 32;
+/// v3 スキャンのスレッド数 (カーネルの PF3_THREADS)。
+pub(crate) const GDN_PF3_THREADS: usize = 256;
+/// v3 スキャンが 1 ヘッドを割るブロック数 (128 列 / 32 列)。
+pub(crate) const GDN_PF3_BLOCKS: u32 = 4;
+
+struct GdnPf3Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    scan32: CUfunction,
+    /// 出力の gated RMS norm は v2 の PTX のものを使う (同じ演算列)。
+    norm: CUfunction,
+}
+
+unsafe impl Send for GdnPf3Kernels {}
+unsafe impl Sync for GdnPf3Kernels {}
+
+/// PTX の置き場所 (`DENNO_GDN_PF3_PTX` があればそれ)。
+fn gdn_pf3_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GDN_PF3_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf3.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。norm は v2 の PTX から取る。
+fn gdn_pf3_kernels() -> Option<&'static GdnPf3Kernels> {
+    static K: OnceLock<Option<GdnPf3Kernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = gdn_pf3_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[gdn-pf3] PTX が読めない ({}) : {e} → v2 のスキャンへ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[gdn-pf3] cuModuleLoadData 失敗 → v2 のスキャンへ");
+                return None;
+            }
+            let mut scan32: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut scan32,
+                module,
+                b"dno_gdn_pf_scan32\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[gdn-pf3] PTX に dno_gdn_pf_scan32 が無い → v2 のスキャンへ");
+                return None;
+            }
+            log_kernel_attr(lib, scan32, "dno_gdn_pf_scan32");
+            // 出力の norm は v2 の PTX (同じ演算列) をそのまま使う。
+            let norm = gdn_pf2_kernels()?.norm;
+            Some(GdnPf3Kernels {
+                module,
+                scan32,
+                norm,
+            })
+        }
+    })
+    .as_ref()
+}
+
+/// `DENNO_PF_SCAN3` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn gdn_pf3_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static PF3_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_gdn_pf3_for_test(v: Option<bool>) {
+    PF3_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// v3 スキャンを使うか (既定 off。lab の結果で決める)。
+pub(crate) fn gdn_pf3_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF3_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf3_from_value(std::env::var("DENNO_PF_SCAN3").ok().as_deref()))
+}
+
+/// v3 スキャンが受ける形か (純関数。カーネルの前提と同じ)。
+pub(crate) fn gdn_pf3_ok(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) -> bool {
+    gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+}
+
+/// task 225: v3 スキャンを撃つ (scan32 → v2 の norm の 2 起動)。引数の並びは
+/// カーネルの宣言順で、v2 の [`gdn_pf2_launch`] と同じ。
+#[allow(clippy::too_many_arguments)]
+fn gdn_pf3_launch(
+    ctx: &CudaCtx,
+    fns: &GdnPf3Kernels,
+    qkv: CUdeviceptr,
+    z: CUdeviceptr,
+    beta: CUdeviceptr,
+    alpha: CUdeviceptr,
+    conv_st_in: CUdeviceptr,
+    ssm_in: CUdeviceptr,
+    wconv: CUdeviceptr,
+    wa: CUdeviceptr,
+    wdt: CUdeviceptr,
+    wnorm: CUdeviceptr,
+    y_out: CUdeviceptr,
+    conv_st_out: CUdeviceptr,
+    ssm_out: CUdeviceptr,
+    n: usize,
+    nk: usize,
+    nv: usize,
+    conv_dim: usize,
+    eps: f32,
+    q_scale: f32,
+) -> Result<()> {
+    {
+        let (mut pq, mut pb, mut pa) = (qkv, beta, alpha);
+        let (mut pci, mut psi) = (conv_st_in, ssm_in);
+        let (mut pwc, mut pwa, mut pwd) = (wconv, wa, wdt);
+        let (mut py, mut pco, mut pso) = (y_out, conv_st_out, ssm_out);
+        let (mut ni, mut nki, mut nvi) = (n as c_int, nk as c_int, nv as c_int);
+        let (mut cdi, mut epsi, mut qsi) = (conv_dim as c_int, eps, q_scale);
+        let mut args = [
+            &mut pq as *mut _ as *mut c_void,
+            &mut pb as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut pci as *mut _ as *mut c_void,
+            &mut psi as *mut _ as *mut c_void,
+            &mut pwc as *mut _ as *mut c_void,
+            &mut pwa as *mut _ as *mut c_void,
+            &mut pwd as *mut _ as *mut c_void,
+            &mut py as *mut _ as *mut c_void,
+            &mut pco as *mut _ as *mut c_void,
+            &mut pso as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nki as *mut _ as *mut c_void,
+            &mut nvi as *mut _ as *mut c_void,
+            &mut cdi as *mut _ as *mut c_void,
+            &mut epsi as *mut _ as *mut c_void,
+            &mut qsi as *mut _ as *mut c_void,
+        ];
+        // 1 ヘッドを 4 ブロックが分担する (32 列ずつ)。
+        unsafe {
+            ctx.launch_async(
+                fns.scan32,
+                (nv as u32, GDN_PF3_BLOCKS, 1),
+                (GDN_PF3_THREADS as u32, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+    }
+    {
+        let (mut py, mut pz, mut pwn) = (y_out, z, wnorm);
+        let (mut ni, mut nvi) = (n as c_int, nv as c_int);
+        let mut epsi = eps;
+        let mut args = [
+            &mut py as *mut _ as *mut c_void,
+            &mut pz as *mut _ as *mut c_void,
+            &mut pwn as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nvi as *mut _ as *mut c_void,
+            &mut epsi as *mut _ as *mut c_void,
+        ];
+        let groups = n.saturating_mul(nv);
+        let per_block = GDN_PF2_NORM_THREADS / 4;
+        let grid = (groups.div_ceil(per_block)) as u32;
+        unsafe {
+            ctx.launch_async(
+                fns.norm,
+                (grid, 1, 1),
+                (GDN_PF2_NORM_THREADS as u32, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pf225_gate_tests {
+    use super::*;
+
+    /// 3 本のゲートはどれも既定 off (`0`/`off`/`false`/`no`/空だけが off)。
+    #[test]
+    fn pf225_gates_default_off() {
+        for (name, f) in [
+            ("DENNO_PF_BA_FAST", pf_ba_fast_from_value as fn(Option<&str>) -> bool),
+            ("DENNO_PF_ROUTER_DEV", pf_router_dev_from_value),
+            ("DENNO_PF_SCAN3", gdn_pf3_from_value),
+        ] {
+            assert!(!f(None), "{name}: 未設定は既定 off");
+            for v in ["0", "off", "false", "no", "", " off "] {
+                assert!(!f(Some(v)), "{name}: {v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", "2"] {
+                assert!(f(Some(v)), "{name}: {v:?} が off のまま");
+            }
+        }
+    }
+
+    /// 形のゲート。
+    #[test]
+    fn pf225_shape_gates() {
+        // beta/alpha: 実モデルは n = nv = 48 (beta と alpha で 2 回撃つ)。
+        assert!(pf_ba_fast_ok(1024, 2560, 48));
+        assert!(pf_ba_fast_ok(1, 1, 1));
+        assert!(!pf_ba_fast_ok(0, 2560, 48));
+        assert!(!pf_ba_fast_ok(1024, 0, 48));
+        assert!(!pf_ba_fast_ok(1024, 2560, 0));
+        assert!(!pf_ba_fast_ok(1024, 2560, 257), "n > 256 は受けない");
+        // router: ne = 512 / k = 8 前後。
+        assert!(pf_router_dev_ok(1024, 512, 8));
+        assert!(pf_router_dev_ok(1, 32, 1));
+        assert!(!pf_router_dev_ok(0, 512, 8));
+        assert!(!pf_router_dev_ok(1024, 512, 0));
+        assert!(!pf_router_dev_ok(1024, 512, 33), "k > 32 は受けない");
+        assert!(!pf_router_dev_ok(1024, 1025, 8), "ne > 1024 は受けない");
+        // scan v3 は v2 と同じ前提。
+        let conv_dim = 2 * 16 * 128 + 48 * 128;
+        assert!(gdn_pf3_ok(512, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf3_ok(512, 16, 48, 128, 128, 3, conv_dim));
+    }
+
+    /// `dno_gemm_f32_ba` のタイル算術の写し (添字の取り違えだけを落とす)。
+    fn ba_mirror(w: &[f32], x: &[f32], nt: usize, k: usize, n: usize) -> Vec<f32> {
+        const TH: usize = 256;
+        let mut y = vec![0f32; nt * n];
+        for by in 0..n.div_ceil(BA225_ROWS) {
+            for bx in 0..nt.div_ceil(BA225_TOKS) {
+                let mut acc = vec![0f32; TH * 12];
+                for k0 in (0..k).step_by(32) {
+                    let mut ws = vec![0f32; 32 * BA225_ROWS];
+                    let mut xs = vec![0f32; 32 * BA225_TOKS];
+                    for j in 0..(BA225_ROWS * 32 / TH) {
+                        for tid in 0..TH {
+                            let id = tid + j * TH;
+                            let rr = id >> 5;
+                            let kk = id & 31;
+                            let gr = by * BA225_ROWS + rr;
+                            let gk = k0 + kk;
+                            ws[kk * BA225_ROWS + rr] =
+                                if gr < n && gk < k { w[gr * k + gk] } else { 0.0 };
+                        }
+                    }
+                    for j in 0..(BA225_TOKS * 32 / TH) {
+                        for tid in 0..TH {
+                            let id = tid + j * TH;
+                            let tt = id >> 5;
+                            let kk = id & 31;
+                            let gt = bx * BA225_TOKS + tt;
+                            let gk = k0 + kk;
+                            xs[kk * BA225_TOKS + tt] =
+                                if gt < nt && gk < k { x[gt * k + gk] } else { 0.0 };
+                        }
+                    }
+                    for tid in 0..TH {
+                        let (tx, ty) = (tid & 15, tid >> 4);
+                        for kk in 0..32 {
+                            for i in 0..3 {
+                                let wv = ws[kk * BA225_ROWS + ty * 3 + i];
+                                for j in 0..4 {
+                                    let xv = xs[kk * BA225_TOKS + tx * 4 + j];
+                                    acc[tid * 12 + i * 4 + j] += wv * xv;
+                                }
+                            }
+                        }
+                    }
+                }
+                for tid in 0..TH {
+                    let (tx, ty) = (tid & 15, tid >> 4);
+                    for i in 0..3 {
+                        for j in 0..4 {
+                            let r = by * BA225_ROWS + ty * 3 + i;
+                            let t = bx * BA225_TOKS + tx * 4 + j;
+                            if r < n && t < nt {
+                                y[t * n + r] = acc[tid * 12 + i * 4 + j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        y
+    }
+
+    /// 端数の出る形 (tile の倍数でない) で参照の内積と一致する。
+    #[test]
+    fn pf225_ba_tile_mirror() {
+        let (nt, k, n) = (70usize, 72usize, 100usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+            .collect();
+        let x: Vec<f32> = (0..nt * k)
+            .map(|i| ((i * 53 % 89) as f32) * 0.02 - 0.9)
+            .collect();
+        let got = ba_mirror(&w, &x, nt, k, n);
+        for t in 0..nt {
+            for r in 0..n {
+                let mut s = 0f64;
+                for kk in 0..k {
+                    s += w[r * k + kk] as f64 * x[t * k + kk] as f64;
+                }
+                let e = got[t * n + r];
+                assert!(
+                    (e as f64 - s).abs() <= 1e-4 + 1e-5 * s.abs(),
+                    "t={t} r={r}: kernel {e} vs ref {s}"
+                );
+            }
+        }
+    }
+
+    /// 強制スイッチ (テスト用) が効く。
+    #[test]
+    fn pf225_force_switch() {
+        set_pf_ba_fast_for_test(Some(true));
+        assert!(pf_ba_fast_on());
+        set_pf_ba_fast_for_test(Some(false));
+        assert!(!pf_ba_fast_on());
+        set_pf_ba_fast_for_test(None);
+        assert!(!pf_ba_fast_on());
+
+        set_pf_router_dev_for_test(Some(true));
+        assert!(pf_router_dev_on());
+        set_pf_router_dev_for_test(Some(false));
+        assert!(!pf_router_dev_on());
+        set_pf_router_dev_for_test(None);
+        assert!(!pf_router_dev_on());
+
+        set_gdn_pf3_for_test(Some(true));
+        assert!(gdn_pf3_on());
+        set_gdn_pf3_for_test(Some(false));
+        assert!(!gdn_pf3_on());
+        set_gdn_pf3_for_test(None);
+        assert!(!gdn_pf3_on());
+    }
+}
+
 /// task 173: レジスタ常駐スキャンを「ホスト入力 → ホスト出力」で 1 回だけ回す
 /// (検算用。prefill の本線は連鎖 [`gdn_pf_chain`] の中から呼ぶ)。
 ///
@@ -39407,9 +40254,11 @@ pub mod gdn_pf_kprof {
     pub const OUT_GEMM: usize = 4;
     pub const OUT_D2H: usize = 5;
     pub const ST_D2H: usize = 6;
-    pub const N: usize = 7;
+    /// task 225: beta/alpha 射影 (デバイス版)。
+    pub const BA_GEMM: usize = 7;
+    pub const N: usize = 8;
     pub const NAMES: [&str; N] = [
-        "x_h2d", "qkv_gemm", "z_gemm", "scan", "out_gemm", "out_d2h", "st_d2h",
+        "x_h2d", "qkv_gemm", "z_gemm", "scan", "out_gemm", "out_d2h", "st_d2h", "ba_gemm",
     ];
 
     static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -40006,7 +40855,7 @@ pub fn gdn_pf_chain(
     if !gpu_gemm_enabled() {
         return Ok(false);
     }
-    let ba_dev_req = beta_alpha.is_some() && pf_ssm_gemm_gpu_on();
+    let ba_dev_req = beta_alpha.is_some() && pf_ba_dev_on();
     if flat.len() != nt * e
         || (ba_dev_req && (!beta.is_empty() || !alpha.is_empty()))
         || (!ba_dev_req && (beta.len() != nt * nv || alpha.len() != nt * nv))
@@ -40180,29 +41029,40 @@ pub fn gdn_pf_chain(
         // task 186: beta/alpha (F32) を同じ x から作る。入力も出力もデバイスに
         // あるので転送は 0。無い/形が違うときは連鎖ごと従来経路へ (状態は未着手)。
         if let Some((wbeta, walpha)) = ba_dev {
-            let Some(f32g) = gemm_f32_mt_fn(ctx) else {
-                return Ok(false);
-            };
-            for (w, o) in [(wbeta, pb), (walpha, pa)] {
-                let (mut pw, mut pxx, mut poo) = (w, px, o);
-                let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, e as c_int, nv as c_int);
-                let mut args = [
-                    &mut pw as *mut _ as *mut c_void,
-                    &mut pxx as *mut _ as *mut c_void,
-                    &mut poo as *mut _ as *mut c_void,
-                    &mut nt_c as *mut _ as *mut c_void,
-                    &mut k_c as *mut _ as *mut c_void,
-                    &mut n_c as *mut _ as *mut c_void,
-                ];
-                let grid = (
-                    ((nv + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
-                    ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
-                    1,
-                );
-                unsafe {
-                    ctx.launch_async(f32g, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+            // task 225: 専用 GEMM (`DENNO_PF_BA_FAST`) が撃てればそちら。
+            // 撃てないときは従来の `dno_gemm_f32_mt` (lab t183a: ホストより遅い)。
+            gdn_pf_kprof::begin(gdn_pf_kprof::BA_GEMM);
+            let mut ba_fast_done = false;
+            if pf_ba_fast_on() {
+                ba_fast_done = pf_ba_gemm_dev_launch(ctx, wbeta, px, pb, nt, e, nv)?
+                    && pf_ba_gemm_dev_launch(ctx, walpha, px, pa, nt, e, nv)?;
+            }
+            if !ba_fast_done {
+                let Some(f32g) = gemm_f32_mt_fn(ctx) else {
+                    return Ok(false);
+                };
+                for (w, o) in [(wbeta, pb), (walpha, pa)] {
+                    let (mut pw, mut pxx, mut poo) = (w, px, o);
+                    let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, e as c_int, nv as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut pxx as *mut _ as *mut c_void,
+                        &mut poo as *mut _ as *mut c_void,
+                        &mut nt_c as *mut _ as *mut c_void,
+                        &mut k_c as *mut _ as *mut c_void,
+                        &mut n_c as *mut _ as *mut c_void,
+                    ];
+                    let grid = (
+                        ((nv + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                        ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                        1,
+                    );
+                    unsafe {
+                        ctx.launch_async(f32g, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+                    }
                 }
             }
+            gdn_pf_kprof::end(gdn_pf_kprof::BA_GEMM);
         }
         // 段ごとの壁時計を意味のある値にするため、ここで 1 回だけ待つ
         // (1 チャンク = 1 段 40 ms 級なので、同期の固定費は無視できる)。
@@ -40218,7 +41078,16 @@ pub fn gdn_pf_chain(
     // fail closed (この時点でモデルの状態は 1 つも進んでいない)。
     // task 186: v2 (ヘッドあたり 2 ブロック + RMS norm の分離)。既定 off。
     // 形が合わない・PTX が無いときは v1 (従来のレジスタ常駐版) → CPU へ fail closed。
-    let pf_scan_fast2 = if gdn_pf2_on() && gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+    // task 225: v3 (1 ヘッド 4 ブロック x 8 レーン) が使えれば最優先。
+    let pf_scan_fast3 = if gdn_pf3_on() && gdn_pf3_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+        gdn_pf3_kernels()
+    } else {
+        None
+    };
+    let pf_scan_fast2 = if pf_scan_fast3.is_none()
+        && gdn_pf2_on()
+        && gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
         gdn_pf2_kernels()
     } else {
         None
@@ -40234,7 +41103,14 @@ pub fn gdn_pf_chain(
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();
-        if let Some(fns) = pf_scan_fast2 {
+        if let Some(fns) = pf_scan_fast3 {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf3_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+            )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else if let Some(fns) = pf_scan_fast2 {
             gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
             gdn_pf2_launch(
                 &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
