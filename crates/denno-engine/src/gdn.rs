@@ -30,6 +30,10 @@ pub mod scan_schedule;
 /// task 228: prefill スキャンの WY (UT) 形式チャンク版の CPU 参照実装。
 pub mod wy;
 
+/// task 228: カーネル `dno_gdn_pf_wy32` の構造の写し (テスト専用)。
+#[cfg(test)]
+pub mod wy_sim;
+
 /// GDN ハイパーパラメータ (Qwen3.5 config の linear_* に対応)
 #[derive(Debug, Clone)]
 pub struct GdnParams {
