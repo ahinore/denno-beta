@@ -3541,6 +3541,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         tokens: TapTokens,
         mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         mut roles: Option<&mut RoleRms>,
+        iv: IvView<'_>,
     ) -> Result<Option<Vec<Vec<f32>>>> {
         let hp = self.hp();
         let e = self.p.n_embd;
@@ -3821,8 +3822,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     self.expert_cache.as_ref(),
                     roles.as_deref_mut(),
                     true,
-                    // task 217: 介入中は resident 経路に入らないので、ここは常に none。
-                    IvView::none(),
+                    iv,
                 )?;
                 q4prof::add(&q4prof::MOE, t_moe);
                 if ffn.len() != nt * e {
@@ -3905,6 +3905,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         _tokens: TapTokens,
         _on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         _roles: Option<&mut RoleRms>,
+        _iv: IvView<'_>,
     ) -> Result<Option<Vec<Vec<f32>>>> {
         Ok(None)
     }
@@ -3967,9 +3968,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 );
             }
         }
-        // task 217: 介入中は常駐連鎖 (mix / combine / attn をデバイスで閉じる) を
-        // 使わない。層 / block を飛ばす判断がホスト側にしか無いため。
-        if pf_mix_dev_on() && pf_hook_ok && !collect_all && !iv.is_active() {
+        // task 217: 常駐連鎖 (mix / combine / attn / PLE をデバイスで閉じる) は、
+        //   そのどれかを切る設定のときだけ使わない。expert / shared の無効化は
+        //   ホスト側の MoE で処理できるので連鎖のまま回す (prefill の速度を保つ)。
+        if pf_mix_dev_on() && pf_hook_ok && !collect_all && iv.resident_safe() {
             // `as_deref_mut` だと外側の寿命に固定されて 2 回目で E0499 になる
             // (`prefill_seq` と同じく短い寿命で借り直す)。
             let hook: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>> = match &mut on_layer {
@@ -3982,6 +3984,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 tokens,
                 hook,
                 roles.as_deref_mut(),
+                iv,
             )? {
                 return Ok(out);
             }

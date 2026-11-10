@@ -197,6 +197,18 @@ impl Config {
     pub fn stream_drop_bits(&self, il: usize) -> u32 {
         self.stream_bits.get(il).copied().unwrap_or(0)
     }
+
+    /// prefill の常駐連鎖 (`DENNO_PF_RESIDENT`) と両立できるか。
+    ///
+    /// 常駐連鎖は attn / mix / combine / PLE をデバイス側で閉じるので、その 3 つを
+    /// 切る設定では使えない (routed / shared expert はホスト側の MoE なので、
+    /// 切っていてもそのまま連鎖に載せられる)。ストリームの無効化も combine が
+    /// デバイス側なので不可。
+    pub fn resident_safe(&self) -> bool {
+        let ng = Block::Attn.bit() | Block::Ple.bit();
+        self.block_bits.iter().all(|&b| b & ng == 0)
+            && self.stream_bits.iter().all(|&s| s == 0)
+    }
 }
 
 /// ホットパス用の参照。`None` は「介入なし」で、全メソッドが従来動作を返す。
@@ -233,6 +245,12 @@ impl<'a> View<'a> {
     #[inline]
     pub fn block_off(&self, il: usize, b: Block) -> bool {
         self.cfg.map(|c| c.block_off(il, b)).unwrap_or(false)
+    }
+
+    /// prefill の常駐連鎖と両立できるか (介入なしも true)。
+    #[inline]
+    pub fn resident_safe(&self) -> bool {
+        self.cfg.map(|c| c.resident_safe()).unwrap_or(true)
     }
 
     /// `hc` 本のストリームのうち更新を残すビット (bit s = 1 で残す)。
@@ -707,6 +725,29 @@ mod tests {
         assert!(!v.block_off(2, Block::Moe));
         assert_eq!(v.stream_keep(0, 4), 0b1111);
         assert!(v.expert_mask(1).is_none());
+    }
+
+    /// task 217: prefill の常駐連鎖と両立できる設定か。
+    /// expert 無効化と routed / shared の skip はホスト側の MoE なので両立する。
+    /// attn / ple / ストリームはデバイス側で閉じるので不可。
+    #[test]
+    fn resident_safe_only_rejects_device_side_blocks() {
+        let s = shape();
+        let ok = |experts, blocks, streams| {
+            build(&s, experts, blocks, streams).resident_safe()
+        };
+        assert!(ok(vec![], vec![], vec![]), "介入なしが不可になっている");
+        assert!(ok(vec![(0, 1), (3, 2)], vec![], vec![]), "expert 無効化が不可");
+        assert!(ok(vec![], vec![(1, Block::Moe)], vec![]), "moe skip が不可");
+        assert!(ok(vec![], vec![(1, Block::Shared)], vec![]), "shared skip が不可");
+        assert!(!ok(vec![], vec![(1, Block::Attn)], vec![]), "attn skip が可になっている");
+        assert!(!ok(vec![], vec![(1, Block::Ple)], vec![]), "ple skip が可になっている");
+        assert!(!ok(vec![], vec![], vec![(0, 1)]), "ストリーム無効化が可になっている");
+        // View 経由も同じ。
+        let cfg = build(&s, vec![(0, 1)], vec![], vec![]);
+        assert!(View::of(&cfg).resident_safe());
+        let none = View::<'_>::none();
+        assert!(none.resident_safe());
     }
 
     #[test]
