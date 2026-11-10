@@ -16934,8 +16934,9 @@ fn sn2_gemm_launch(
 
 /// shared expert 用の GEMM 入口 (task 183)。
 ///
-/// `DENNO_PF_TC_SHARED2` が on で形が合えば BM=64 のカーネル、それ以外は
-/// 従来の [`pf2_gemm`] (sn / v2 / v1 / 従来カーネルの順)。同期はしない。
+/// `DENNO_PF_TC_SHARED3` (task 222) が on なら Q5_K / BF16 も扱える sn3、
+/// 無ければ `DENNO_PF_TC_SHARED2` の sn2、それも無ければ従来の [`pf2_gemm`]。
+/// 同期はしない。
 #[allow(clippy::too_many_arguments)]
 fn pf2_gemm_shared(
     ctx: &CudaCtx,
@@ -16948,6 +16949,11 @@ fn pf2_gemm_shared(
     n_out: usize,
 ) -> Result<()> {
     if let PfWKind::Quant(ty, _, rb, _) = kind {
+        if pf_tc_shared3_on() && pf_tc_sn3_eligible(ty, nt, n_in, n_out, 1) {
+            if let Some(sn3) = tc_sn3_kernels() {
+                return sn3_gemm_launch(ctx, sn3, ty, w, x, y, nt, n_in, n_out, rb);
+            }
+        }
         if pf_tc_shared2_on() && pf_tc_smalln2_eligible(ty, nt, n_in, n_out, 1) {
             if let Some(sn2) = tc_smalln2_kernels() {
                 return sn2_gemm_launch(ctx, sn2, ty, w, x, y, nt, n_in, n_out, rb);
@@ -16956,6 +16962,307 @@ fn pf2_gemm_shared(
     }
     pf2_gemm(ctx, w, kind, x, y, nt, n_in, n_out)
 }
+
+// ---------------------------------------------------------------------------
+// task 222: BM=64 / BN=64 のタイルで Q8_0 / Q4_K / Q5_K / BF16 を受ける版
+// ---------------------------------------------------------------------------
+//
+// sn2 (task 183) は Q8_0 / Q4_K 専用だった。実モデルの shared expert は
+// 層ごとに型が混ざっていて (gate/up が Q8_0 54 本・Q4_K 30 本・Q5_K 12 本)、
+// Q5_K の 12 本は従来の量子 GEMM に落ちていた。hc mix の down / up は BF16 で、
+// こちらは f32 の FMA カーネル (`dno_gemm_bf16_mt`) が担当していた。
+// どちらも同じ sn2 のタイル (lab t183a で検証済み) に載せる。
+//
+// PTX: `bash build_ptx.sh gemm_sn3` (arch = compute_90。bf16 の mma が要る)。
+
+/// 1 ブロックのタイル (`kernels_gemm_sn3.cu` の SN3_BM / BN / BK と一致)。
+pub(crate) const SN3_BM: usize = 64;
+/// 出力行のタイル。
+pub(crate) const SN3_BN: usize = 64;
+/// k の刻み。
+pub(crate) const SN3_BK: usize = 32;
+/// 静的共有メモリの合計 (`SN3_SMEM_BYTES` = sW 2 x 64 x 40 x 2 + sX 2 x 64 x 40 x 2)。
+pub(crate) const SN3_SMEM_BYTES: usize = 20_480;
+/// 1 起動でまとめるトークン数の上限 (sn2 と同じ)。
+pub(crate) const SN3_MAX_TOKENS: usize = 2048;
+
+/// smem の見積りがカーネル側の `SN3_SMEM_BYTES` と一致することのコンパイル時検査。
+const _: [(); SN3_SMEM_BYTES] = [(); 2 * SN3_BN * 40 * 2 + 2 * SN3_BM * 40 * 2];
+
+/// `DENNO_PF_TC_SHARED3` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (lab t222a で採否を決める)。
+pub(crate) fn pf_tc_shared3_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// shared expert の射影を sn3 で回すか (**既定 off**。`1` で on)。
+pub(crate) fn pf_tc_shared3_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC_SN3_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_tc_shared3_from_value(std::env::var("DENNO_PF_TC_SHARED3").ok().as_deref())
+    })
+}
+
+/// `DENNO_PF_MIX_TC` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (lab t222a で採否を決める)。
+pub(crate) fn pf_mix_tc_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// prefill の hc mix (BF16 の down / up) を sn3 のテンソルコア GEMM で回すか
+/// (**既定 off**。`1` で on)。
+pub(crate) fn pf_mix_tc_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_MIX_TC_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_mix_tc_from_value(std::env::var("DENNO_PF_MIX_TC").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_TC_SN3_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static PF_MIX_TC_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc_shared3_for_test(v: Option<bool>) {
+    PF_TC_SN3_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn set_pf_mix_tc_for_test(v: Option<bool>) {
+    PF_MIX_TC_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// sn3 が扱える型か (純関数)。
+pub(crate) fn pf_tc_sn3_type_ok(ty: crate::kquant::GgmlType) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(ty, T::Q8_0 | T::Q4K | T::Q5K | T::Bf16)
+}
+
+/// sn3 の k の前提 (純関数)。BF16 と Q8_0 は 32、K-quant は 256 の倍数。
+pub(crate) fn pf_tc_sn3_k_ok(ty: crate::kquant::GgmlType, n_in: usize) -> bool {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Bf16 | T::Q8_0 => n_in > 0 && n_in % SN3_BK == 0,
+        T::Q4K | T::Q5K => n_in > 0 && n_in % 256 == 0,
+        _ => false,
+    }
+}
+
+/// この形を sn3 で回せるか (純関数。カーネルの前提と同じ)。
+pub(crate) fn pf_tc_sn3_eligible(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    pf_tc_sn3_type_ok(ty)
+        && pf_tc_sn3_k_ok(ty, n_in)
+        && nt >= min_m.max(SN3_BM)
+        && n_out > 0
+        && n_out % SN3_BN == 0
+}
+
+/// BM=64 のカーネル一式 (PTX は実行時読み込み)。
+struct Sn3Gemm {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    q8_0: CUfunction,
+    q4k: CUfunction,
+    q5k: CUfunction,
+    bf16: CUfunction,
+}
+
+unsafe impl Send for Sn3Gemm {}
+unsafe impl Sync for Sn3Gemm {}
+
+static SN3_GEMM: OnceLock<Option<Sn3Gemm>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_PF_SN3_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gemm_sn3.ptx`。
+fn sn3_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SN3_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_sn3.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn tc_sn3_kernels() -> Option<&'static Sn3Gemm> {
+    SN3_GEMM
+        .get_or_init(|| {
+            let path = sn3_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-sn3] PTX が読めない ({}) : {e} → sn2 / 従来の GEMM へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-sn3] cuModuleLoadData 失敗 → sn2 / 従来の GEMM へ");
+                    return None;
+                }
+                let mut q8_0: CUfunction = std::ptr::null_mut();
+                let mut q4k: CUfunction = std::ptr::null_mut();
+                let mut q5k: CUfunction = std::ptr::null_mut();
+                let mut bf16: CUfunction = std::ptr::null_mut();
+                for (dst, name, label) in [
+                    (
+                        &mut q8_0,
+                        b"dno_gemm_sn3_q8_0_w\0".as_ptr(),
+                        "dno_gemm_sn3_q8_0_w",
+                    ),
+                    (
+                        &mut q4k,
+                        b"dno_gemm_sn3_q4k_w\0".as_ptr(),
+                        "dno_gemm_sn3_q4k_w",
+                    ),
+                    (
+                        &mut q5k,
+                        b"dno_gemm_sn3_q5k_w\0".as_ptr(),
+                        "dno_gemm_sn3_q5k_w",
+                    ),
+                    (
+                        &mut bf16,
+                        b"dno_gemm_sn3_bf16_w\0".as_ptr(),
+                        "dno_gemm_sn3_bf16_w",
+                    ),
+                ] {
+                    if (lib.module_get_function)(dst, module, name as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[pf-sn3] PTX に {label} が無い → sn2 / 従来の GEMM へ");
+                        return None;
+                    }
+                }
+                Some(Sn3Gemm {
+                    module,
+                    q8_0,
+                    q4k,
+                    q5k,
+                    bf16,
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// 型ごとのカーネル (純関数)。
+fn sn3_func(fns: &Sn3Gemm, ty: crate::kquant::GgmlType) -> Option<CUfunction> {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Q8_0 => Some(fns.q8_0),
+        T::Q4K => Some(fns.q4k),
+        T::Q5K => Some(fns.q5k),
+        T::Bf16 => Some(fns.bf16),
+        _ => None,
+    }
+}
+
+/// BM=64 のカーネルを `SN3_MAX_TOKENS` 行ずつ起動する (w / x / out はデバイス)。
+#[allow(clippy::too_many_arguments)]
+fn sn3_gemm_launch(
+    ctx: &CudaCtx,
+    fns: &Sn3Gemm,
+    ty: crate::kquant::GgmlType,
+    wptr: CUdeviceptr,
+    xptr: CUdeviceptr,
+    optr: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+) -> Result<()> {
+    if nt == 0 {
+        return Ok(());
+    }
+    let Some(f) = sn3_func(fns, ty) else {
+        bail!("sn3_gemm_launch: 未対応の型 {ty:?}");
+    };
+    let grid_x = (n_out / SN3_BN) as u32;
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let m = (nt - t0).min(SN3_MAX_TOKENS);
+        let grid_y = m.div_ceil(SN3_BM) as u32;
+        let (mut pw, mut px, mut po) = (
+            wptr,
+            xptr + (t0 * n_in * 4) as CUdeviceptr,
+            optr + (t0 * n_out * 4) as CUdeviceptr,
+        );
+        let (mut m_c, mut ni_c, mut no_c, mut rb_c) = (
+            m as c_int,
+            n_in as c_int,
+            n_out as c_int,
+            row_bytes as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut m_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;
+        }
+        t0 += m;
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod pf_tc_tests {
@@ -17016,6 +17323,67 @@ mod pf_tc_tests {
         for (n_in, n_out) in [(2559usize, 1024usize), (2560, 1024 + 1), (2560, 32)] {
             assert!(!pf_tc_gemm_eligible(512, n_in, n_out, 64), "k={n_in} n={n_out}");
         }
+    }
+
+    /// task 222: sn3 のゲートは既定 off で、明示的な真値だけを受ける。
+    #[test]
+    fn pf_sn3_gate_truth_table() {
+        for f in [pf_tc_shared3_from_value, pf_mix_tc_from_value] {
+            assert!(!f(None), "未設定は既定 off");
+            for v in ["0", "off", "false", "no", "", " OFF ", "2"] {
+                assert!(!f(Some(v)), "{v}");
+            }
+            for v in ["1", "on", "true", "yes", " ON ", " 1 "] {
+                assert!(f(Some(v)), "{v}");
+            }
+        }
+        // 強制上書きが効き、戻すと env の解釈に戻ること。
+        let before = (pf_tc_shared3_on(), pf_mix_tc_on());
+        set_pf_tc_shared3_for_test(Some(true));
+        set_pf_mix_tc_for_test(Some(true));
+        assert!(pf_tc_shared3_on() && pf_mix_tc_on());
+        set_pf_tc_shared3_for_test(Some(false));
+        set_pf_mix_tc_for_test(Some(false));
+        assert!(!pf_tc_shared3_on() && !pf_mix_tc_on());
+        set_pf_tc_shared3_for_test(None);
+        set_pf_mix_tc_for_test(None);
+        assert_eq!((pf_tc_shared3_on(), pf_mix_tc_on()), before);
+    }
+
+    /// task 222: sn3 は実モデルの 4 つの型と形 (shared の Q5_K と mix の BF16) を
+    /// 受け、sn2 が落としていた型を取りこぼさないこと。
+    #[test]
+    fn pf_sn3_eligibility_real_shapes() {
+        use crate::kquant::GgmlType as T;
+        // shared expert の実形 (gate/up = 2560→640 / down = 640→2560)。
+        // gate/up は層ごとに Q8_0 / Q4_K / Q5_K。down は実モデルでは Q8_0 だけで、
+        // k=640 は 256 の倍数でないので K-quant は対象外 (正しい fail closed)。
+        for ty in [T::Q8_0, T::Q4K, T::Q5K] {
+            assert!(pf_tc_sn3_eligible(ty, 512, 2560, 640, 1), "{ty:?} gate");
+        }
+        assert!(pf_tc_sn3_eligible(T::Q8_0, 512, 640, 2560, 1), "Q8_0 down");
+        assert!(pf_tc_sn3_eligible(T::Bf16, 512, 640, 2560, 1), "BF16 down");
+        assert!(
+            !pf_tc_sn3_eligible(T::Q4K, 512, 640, 2560, 1),
+            "k=640 は 256 の倍数でないので Q4_K は不可"
+        );
+        // hc mix の実形 (down = 10240→320 / up = 320→10240、重みは BF16)。
+        assert!(pf_tc_sn3_eligible(T::Bf16, 512, 10240, 320, 1));
+        assert!(pf_tc_sn3_eligible(T::Bf16, 512, 320, 10240, 1));
+        // sn2 と同じ型 (Q8_0 / Q4_K) は sn3 でも通る (置き換え可能)。
+        assert!(pf_tc_sn3_eligible(T::Q4K, 512, 2560, 640, 1));
+        // 19 トークンの next turn prefill は従来経路 (64 行の下限)。
+        assert!(!pf_tc_sn3_eligible(T::Bf16, 19, 10240, 320, 1));
+        assert!(pf_tc_sn3_eligible(T::Bf16, 64, 10240, 320, 64));
+        // 64 の倍数でない出力行・未対応の型・k の倍数ずれは fail closed。
+        assert!(!pf_tc_sn3_eligible(T::Bf16, 512, 10240, 4, 1), "inject (n=4)");
+        assert!(!pf_tc_sn3_eligible(T::Q8_0, 512, 2560, 100, 1), "n_out=100");
+        assert!(!pf_tc_sn3_eligible(T::Q6K, 512, 2560, 640, 1), "Q6_K は対象外");
+        assert!(!pf_tc_sn3_eligible(T::Q4K, 512, 2559, 640, 1), "k が 256 の倍数でない");
+        assert!(
+            !pf_tc_sn3_eligible(T::Bf16, 512, 10241, 320, 1),
+            "BF16 の k が 32 の倍数でない"
+        );
     }
 
     /// task 175: テンソルコア経路の選択は **型** も見る。
@@ -21675,6 +22043,19 @@ pub fn pf_mix(
                         .map_err(|e| format!("mix_inj2 gemv launch: {e:#}"))?;
                     }
                     return Ok(());
+                }
+            }
+            // task 222: BF16 の down / up をテンソルコアの GEMM で回す
+            // (`DENNO_PF_MIX_TC`。既定 off)。形は実モデルで
+            // down: k=10240 n=320 / up: k=320 n=10240。
+            if pf_mix_tc_on()
+                && kind == PfWKind::Bf16
+                && pf_tc_sn3_eligible(crate::kquant::GgmlType::Bf16, nt, kk, nn, 1)
+            {
+                if let Some(fns) = tc_sn3_kernels() {
+                    let ty = crate::kquant::GgmlType::Bf16;
+                    return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, kk * 2)
+                        .map_err(|e| format!("mix_tc gemm launch: {e:#}"));
                 }
             }
             // task 195: down / up を n 方向に細かく割るカーネル

@@ -7314,6 +7314,191 @@ fn pf_sn2_gemm_is_bf16_mma_and_q4k() {
 }
 
 // ---------------------------------------------------------------------------
+// task 222: shared expert の Q5_K と hc mix の BF16 を同じタイルに載せる版
+// (`kernels_gemm_sn3.cu`)
+// ---------------------------------------------------------------------------
+
+const SN3_SRC: &str = include_str!("../kernels/kernels_gemm_sn3.cu");
+
+/// タイル定数・共有メモリ・起動形状がホスト (cuda.rs) と一致すること。
+///
+/// タイルは sn2 と同じ (lab t183a で検証済みの並列度) でなければならない。
+#[test]
+fn pf_sn3_gemm_tile_matches_host() {
+    let d = defines(SN3_SRC);
+    let bm = eval_define("SN3_BM", &d);
+    let bn = eval_define("SN3_BN", &d);
+    let bk = eval_define("SN3_BK", &d);
+    let ld = eval_define("SN3_LD", &d);
+    let thr = eval_define("SN3_THREADS", &d);
+    let smem_def = eval_define("SN3_SMEM_BYTES", &d);
+    assert_eq!(bm, 64, "SN3_BM が sn2 と違う (shared の並列度が変わる)");
+    assert_eq!(bn, 64, "SN3_BN が sn2 と違う (N=640 / 320 の並列度の根拠)");
+    assert_eq!(bk, 32, "SN3_BK が 32 でない");
+    assert_eq!(ld, 40, "SN3_LD が 40 でない (32 + 8 の詰め物)");
+    assert_eq!(thr, 256, "SN3_THREADS が 256 でない");
+    assert_eq!(rust_const("SN3_BM"), bm, "cuda.rs の SN3_BM が不一致");
+    assert_eq!(rust_const("SN3_BN"), bn, "cuda.rs の SN3_BN が不一致");
+    assert_eq!(rust_const("SN3_BK"), bk, "cuda.rs の SN3_BK が不一致");
+    assert_eq!(
+        rust_const("SN3_SMEM_BYTES"),
+        smem_def,
+        "cuda.rs の SN3_SMEM_BYTES が不一致"
+    );
+    assert_eq!(
+        rust_const("SN3_MAX_TOKENS"),
+        2048,
+        "まとめ幅が sn2 / tc2 と違う (gemm_try の分割規則が変わる)"
+    );
+    let expect_smem = 2 * bn * ld * 2 + 2 * bm * ld * 2;
+    assert_eq!(expect_smem, smem_def, "SN3_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect_smem <= 48 * 1024,
+        "静的共有メモリ {expect_smem} B が 48 KiB を超える"
+    );
+    assert_eq!(eval_define("SN3_SW_ELEMS", &d), 2 * bn * ld);
+    assert_eq!(eval_define("SN3_SX_ELEMS", &d), 2 * bm * ld);
+    // 起動形状: 1 ブロックの列範囲は BN、行は BM。
+    assert!(
+        SN3_SRC.contains("const int n0 = blockIdx.x * SN3_BN;")
+            && SN3_SRC.contains("const int m0 = blockIdx.y * SN3_BM;"),
+        "1 ブロックのタイル範囲が SN3_BN / SN3_BM でない"
+    );
+    assert!(
+        CUDA_RS.contains("let grid_x = (n_out / SN3_BN) as u32;"),
+        "ホストの grid x が SN3_BN で割っていない"
+    );
+    assert!(
+        CUDA_RS.contains("ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;")
+            && CUDA_RS.contains("let grid_y = m.div_ceil(SN3_BM) as u32;"),
+        "sn3 の起動形状がカーネルの前提と違う"
+    );
+}
+
+/// 4 つの型の入口・BF16 の読み方・Q5_K の 5bit 目の取り方・2 段プリフェッチ。
+#[test]
+fn pf_sn3_gemm_covers_q5k_and_bf16() {
+    for name in [
+        "dno_gemm_sn3_q8_0_w",
+        "dno_gemm_sn3_q4k_w",
+        "dno_gemm_sn3_q5k_w",
+        "dno_gemm_sn3_bf16_w",
+    ] {
+        assert!(
+            SN3_SRC.contains(&format!("extern \"C\" __global__ void {name}(")),
+            "入口 {name} が無い"
+        );
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+    }
+    // BF16 は 1 要素 2 バイトを上位 16 bit に置く (dno_bf16_to_f32 と同じ意味)。
+    assert!(
+        SN3_SRC.contains("const unsigned char* p = row + (size_t)(k0 + j) * 2u;")
+            && SN3_SRC.contains("v[u] = __uint_as_float(h << 16);"),
+        "BF16 の行読みが 2 バイト / 上位 16 bit になっていない"
+    );
+    // Q5_K は Q4_K の nibble + qh の 5bit 目 (tc2 と同じ取り方)。
+    assert!(
+        SN3_SRC.contains("(TY == 1 ? 144u : 176u)")
+            && SN3_SRC.contains("(TY == 1 ? 16u : 48u)")
+            && SN3_SRC.contains("qv += (int)(((unsigned int)blk[16 + j + u] >> sub) & 1u) << 4;"),
+        "Q5_K のブロック配置 / 5bit 目の取り方が tc2 と違う"
+    );
+    assert!(
+        SN3_SRC.contains("wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>")
+            && SN3_SRC
+                .contains("wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>"),
+        "A が row_major / B が col_major の 16x16x16 bf16 でない"
+    );
+    // 2 段プリフェッチ: 読む → mma → 書く の順。
+    let loop_at = SN3_SRC
+        .find("for (int k = 0; k < kb; ++k)")
+        .expect("k ループが無い");
+    let body = &SN3_SRC[loop_at..];
+    let load_w = body
+        .find("dno_sn3_load_w<TY>(")
+        .expect("ループ内に重みの先読みが無い");
+    let mma = body.find("wmma::mma_sync(").expect("ループ内に mma が無い");
+    let store = body
+        .find("dno_sn3_store8(sW + nxt")
+        .expect("ループ内に smem への書き込みが無い");
+    assert!(
+        load_w < mma && mma < store,
+        "プリフェッチの順序が「読む → mma → 書く」でない (レイテンシが隠れない)"
+    );
+    // build_ptx.sh: compute_90 で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("gemm_sn3)     echo \"kernels_gemm_sn3.cu|fmad|compute_90\""),
+        "build_ptx.sh の gemm_sn3 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gemm_sn3"),
+        "build_ptx.sh の targets_all に gemm_sn3 が無い: {targets}"
+    );
+}
+
+/// 2 つのゲートが既定 off で、shared / mix の両方に配線されていること。
+#[test]
+fn pf222_sn3_gates_are_wired_and_default_off() {
+    // 既定 off: 純関数が「明示的な真値だけ on」の形 (None を受ける腕が無い) こと。
+    // 真理値表そのものは lib 側の `pf_sn3_gate_truth_table` が固定する。
+    for (fname, env) in [
+        ("pf_tc_shared3_from_value", "DENNO_PF_TC_SHARED3"),
+        ("pf_mix_tc_from_value", "DENNO_PF_MIX_TC"),
+    ] {
+        let at = CUDA_RS
+            .find(&format!("pub(crate) fn {fname}("))
+            .unwrap_or_else(|| panic!("{fname} が無い"));
+        let body = &CUDA_RS[at..];
+        let end = body.find("\n}").expect("関数の終わりが無い");
+        let body = &body[..end];
+        assert!(
+            body.contains("Some(\"1\" | \"on\" | \"true\" | \"yes\")"),
+            "{fname} が明示的な真値だけを受ける形でない"
+        );
+        assert!(
+            !body.contains("None => true") && !body.contains("_ => true"),
+            "{fname} の既定が on になっている"
+        );
+        // ゲートは env から読む (強制はテスト用の static)。
+        assert!(
+            CUDA_RS.contains(&format!("std::env::var(\"{env}\")")),
+            "{env} を env から読んでいない"
+        );
+    }
+    // shared: sn3 → sn2 → 従来の順で、sn3 が先に来ること。
+    let shared_at = CUDA_RS
+        .find("fn pf2_gemm_shared(")
+        .expect("pf2_gemm_shared が無い");
+    let shared = &CUDA_RS[shared_at..];
+    let sn3_at = shared
+        .find("pf_tc_shared3_on() && pf_tc_sn3_eligible(")
+        .expect("shared に sn3 の分岐が無い");
+    let sn2_at = shared
+        .find("pf_tc_shared2_on() && pf_tc_smalln2_eligible(")
+        .expect("shared に sn2 の分岐が無い");
+    assert!(sn3_at < sn2_at, "sn3 が sn2 より後ろにある (sn2 が先に受ける)");
+    // mix: BF16 の down / up を sn3 に渡していること。
+    assert!(
+        CUDA_RS.contains("if pf_mix_tc_on()")
+            && CUDA_RS.contains("&& kind == PfWKind::Bf16")
+            && CUDA_RS.contains("return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, kk * 2)"),
+        "mix の BF16 経路が sn3 に繋がっていない"
+    );
+    // 入力の下限: 64 行未満 (19 トークンの next turn) は従来経路のまま。
+    assert!(
+        CUDA_RS.contains("&& nt >= min_m.max(SN3_BM)"),
+        "sn3 の行数の下限が SN3_BM でない"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // task 183: 融合 qkv の後処理 (`kernels_pf3.cu`)
 // ---------------------------------------------------------------------------
 
