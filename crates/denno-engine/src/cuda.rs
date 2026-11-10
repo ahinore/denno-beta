@@ -5768,7 +5768,7 @@ fn gdn_dec_gemv_mode_eff() -> GemvKernelMode {
 /// task 179: env 未設定の既定を v4 にした (lab t177c: decode -1.8%・md5 SAME。
 /// 形が合わない単位は v3 へ落ちる)。従来へ戻すのは `DENNO_GDN_DEC_GEMV=v3`
 /// (または `v2` / `fp16` / `default`)。
-fn gdn_dec_gemv_v4_on() -> bool {
+pub(crate) fn gdn_dec_gemv_v4_on() -> bool {
     match gdn_dec_gemv_choice() {
         // task 184: v5 の形が合わない単位は v4 へ落とす (CPU へは落とさない)。
         GdnDecGemv::V4 | GdnDecGemv::V5 | GdnDecGemv::Default => true,
@@ -5777,7 +5777,7 @@ fn gdn_dec_gemv_v4_on() -> bool {
 }
 
 /// task 184: v5 を選んでいるか。
-fn gdn_dec_gemv_v5_on() -> bool {
+pub(crate) fn gdn_dec_gemv_v5_on() -> bool {
     matches!(gdn_dec_gemv_choice(), GdnDecGemv::V5)
 }
 
@@ -5796,7 +5796,7 @@ fn parse_gdn_dec_gemv_q5k(raw: Option<&str>) -> bool {
 ///
 /// A/B 用の細かいゲート。`DENNO_GDN_DEC_GEMV=v4` にすると Q8_0 / Q4_K も
 /// まとめて v4 へ戻るので、Q5_K だけを切り替えるために分けてある。
-fn gdn_dec_gemv_q5k_on() -> bool {
+pub(crate) fn gdn_dec_gemv_q5k_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         parse_gdn_dec_gemv_q5k(std::env::var("DENNO_GDN_DEC_GEMV_Q5K").ok().as_deref())
@@ -7112,6 +7112,8 @@ struct IqScratch {
     /// task 187: 和モードの重み (nseg 本) と和の出力 (e 要素)。
     wt: Option<DevBuffer>,
     psum: Option<DevBuffer>,
+    /// task 204: gate+up 融合 (`DENNO_DEC_EXPGU`) の連結出力 `[g[ng] | u[ng]]`。
+    gu: Option<DevBuffer>,
 }
 
 impl IqScratch {
@@ -7130,6 +7132,7 @@ impl IqScratch {
             hpin: None,
             wt: None,
             psum: None,
+            gu: None,
         }
     }
 }
@@ -7332,6 +7335,10 @@ where
 
     let ng = nseg * ff;
     let nh = nseg * e;
+    // task 204: gate+up 融合 (`DENNO_DEC_EXPGU`) の可否。量子型が同じで行長も
+    // 同じときだけ畳める (違えば従来の 2 起動へ fail closed)。
+    let rb_g_pre = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
+    let rb_u_pre = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
     IQ_SCRATCH.with(|cell| -> Result<()> {
         let mut sc = cell.borrow_mut();
         MoeScratch::ensure_tagged(&mut sc.x, n_in * 4, crate::mem_audit::TAG_GDN_SC)?;
@@ -7362,7 +7369,40 @@ where
         // task 187: 台帳の副区間 (prologue の H2D)。「7 MB の h2d のうち入力はいくらか」。
         let s_pro = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_EXP_PRO);
         let pro = dec_pro_async_enabled();
-        let lay = dec_stage_layout(n_in, nseg, seg_gu.len(), seg_d.len(), if sum_mode { nseg } else { 0 });
+        // task 204: gate+up を 1 起動に畳む (`DENNO_DEC_EXPGU`)。量子型が同じで
+        // 行長も同じときだけ (そうでなければ従来の 2 起動へ)。表は prologue の
+        // 1 本の H2D に載せるので、追加の転送は 0 回。
+        let gu_ok = dec_exp_gu_shape_ok(exp_gu_on(), slot_g == slot_u, rb_g_pre, rb_u_pre);
+        let lay = dec_stage_layout(
+            n_in,
+            nseg,
+            seg_gu.len(),
+            seg_d.len(),
+            if sum_mode { nseg } else { 0 },
+            if gu_ok { 2 * nseg } else { 0 },
+        );
+        // task 204: gate+up 融合の連結出力 (レイアウトにブロックがあるときだけ)。
+        if lay.total > lay.pg2 && sc.gu.as_ref().map(|b| b.bytes()).unwrap_or(0) < 2 * ng * 4 {
+            MoeScratch::ensure_tagged(&mut sc.gu, 2 * ng * 4, crate::mem_audit::TAG_GDN_SC)?;
+        }
+        // task 204: 倍の表 (前半 = gate、後半 = up)。segment 表の後半は出力
+        // オフセットだけ `ng` ずらす (x オフセットと行の並びは同じ)。
+        let (pg2_host, sgu2_host) = if lay.total > lay.pg2 {
+            let mut p: Vec<u64> = Vec::with_capacity(2 * nseg);
+            p.extend_from_slice(pg);
+            p.extend_from_slice(pu);
+            let mut s: Vec<u32> = Vec::with_capacity(2 * nseg * 4);
+            s.extend_from_slice(seg_gu);
+            for i in 0..nseg {
+                let mut e4 = [0u32; 4];
+                e4.copy_from_slice(&seg_gu[i * 4..i * 4 + 4]);
+                e4[3] = e4[3].saturating_add(ng as u32);
+                s.extend_from_slice(&e4);
+            }
+            (p, s)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut stage_addr: Option<u64> = None;
         if pro {
             // 失敗したら従来の同期コピーへ落ちる (リクエストは落とさない)。
@@ -7379,6 +7419,11 @@ where
                     if sum_mode {
                         // task 187: 和の重みも同じ 1 回の H2D に載せる (追加の往復をしない)。
                         dec_stage_put(sb, lay.w, sw.as_ptr() as *const u8, nseg * 4);
+                    }
+                    if lay.total > lay.pg2 {
+                        // task 204: 倍の表も同じ 1 回の H2D に載せる。
+                        dec_stage_put(sb, lay.pg2, pg2_host.as_ptr() as *const u8, 2 * nseg * 8);
+                        dec_stage_put(sb, lay.sgu2, sgu2_host.as_ptr() as *const u8, 2 * nseg * 16);
                     }
                 }
                 dec_stage_issue(lay.total)?;
@@ -7404,30 +7449,44 @@ where
             }
         }
         drop(s_pro);
-        let (x_addr, pg_addr, pu_addr, pd_addr, sgu_addr, sgd_addr, w_addr) = match stage_addr {
-            Some(base) => (
-                base + lay.x as u64,
-                base + lay.pg as u64,
-                base + lay.pu as u64,
-                base + lay.pd as u64,
-                base + lay.sgu as u64,
-                base + lay.sgd as u64,
-                base + lay.w as u64,
-            ),
-            None => (
-                sc.x.as_ref().expect("確保済み").ptr as u64,
-                sc.pg.as_ref().expect("確保済み").ptr as u64,
-                sc.pu.as_ref().expect("確保済み").ptr as u64,
-                sc.pd.as_ref().expect("確保済み").ptr as u64,
-                sc.sgu.as_ref().expect("確保済み").ptr as u64,
-                sc.sgd.as_ref().expect("確保済み").ptr as u64,
-                sc.wt.as_ref().map(|b| b.ptr as u64).unwrap_or(0),
-            ),
-        };
+        let (x_addr, pg_addr, pu_addr, pd_addr, sgu_addr, sgd_addr, w_addr, pg2_addr, sgu2_addr) =
+            match stage_addr {
+                Some(base) => (
+                    base + lay.x as u64,
+                    base + lay.pg as u64,
+                    base + lay.pu as u64,
+                    base + lay.pd as u64,
+                    base + lay.sgu as u64,
+                    base + lay.sgd as u64,
+                    base + lay.w as u64,
+                    base + lay.pg2 as u64,
+                    base + lay.sgu2 as u64,
+                ),
+                None => (
+                    sc.x.as_ref().expect("確保済み").ptr as u64,
+                    sc.pg.as_ref().expect("確保済み").ptr as u64,
+                    sc.pu.as_ref().expect("確保済み").ptr as u64,
+                    sc.pd.as_ref().expect("確保済み").ptr as u64,
+                    sc.sgu.as_ref().expect("確保済み").ptr as u64,
+                    sc.sgd.as_ref().expect("確保済み").ptr as u64,
+                    sc.wt.as_ref().map(|b| b.ptr as u64).unwrap_or(0),
+                    0,
+                    0,
+                ),
+            };
         let g = sc.g.as_ref().expect("確保済み");
         let u = sc.u.as_ref().expect("確保済み");
         let act = sc.act.as_ref().expect("確保済み");
         let h = sc.h.as_ref().expect("確保済み");
+        // task 204: 融合経路 (`DENNO_DEC_EXPGU`) の出力は `[g[ng] | u[ng]]` が
+        // 連続した 1 本。prologue の 1 本の H2D に表が載ったときだけ畳む。
+        let gu_fused = lay.total > lay.pg2 && stage_addr.is_some();
+        let (g_ptr, u_ptr) = if gu_fused {
+            let gb = sc.gu.as_ref().expect("確保済み");
+            (gb.ptr, gb.ptr + (ng * 4) as CUdeviceptr)
+        } else {
+            (g.ptr, u.ptr)
+        };
         unsafe {
             // 1. gate と up (同じ segment 表 = 同じ入力 x)
             // task 187: 層内の GPU 時間をイベントで段ごとに測る (PROFILE のときだけ)。
@@ -7442,47 +7501,88 @@ where
                     * (ff as u64 * (rb_g + rb_u) as u64 + e as u64 * rb_d as u64);
                 dec_exp_kprof::note_kind(slot_g, slot_u, slot_d, nseg, ff, e, bytes);
             }
-            let mut gu = 0usize;
-            for (f, ptrs, buf, rb) in [
-                (kernels.fns[slot_g], pg_addr, g, rb_g),
-                (kernels.fns[slot_u], pu_addr, u, rb_u),
-            ] {
-                let mut pw = ptrs as *mut c_void;
-                let mut px = x_addr as *mut c_void;
-                let mut po = buf.ptr;
-                let mut ps = sgu_addr as *mut c_void;
-                let (mut ns, mut ni, mut no, mut rb) = (
-                    nseg as c_int,
-                    n_in as c_int,
-                    ff as c_int,
-                    rb as c_int,
-                );
-                let mut args = [
-                    &mut pw as *mut _ as *mut c_void,
-                    &mut px as *mut _ as *mut c_void,
-                    &mut po as *mut _ as *mut c_void,
-                    &mut ps as *mut _ as *mut c_void,
-                    &mut ns as *mut _ as *mut c_void,
-                    &mut ni as *mut _ as *mut c_void,
-                    &mut no as *mut _ as *mut c_void,
-                    &mut rb as *mut _ as *mut c_void,
-                ];
-                ctx.launch_async(f, plan_g.grid, plan_g.block, 0, &mut args)?;
-                // 1 本目 = gate、2 本目 = up。
-                dec_exp_kprof::mark(if gu == 0 {
-                    dec_exp_kprof::GATE
-                } else {
-                    dec_exp_kprof::UP
-                });
-                gu += 1;
+            if gu_fused {
+                // task 204: gate と up を **1 起動**に畳む。segment 表の前半が
+                // gate、後半が up (出力オフセットだけ +ng)。1 行の計算は従来の
+                // カーネルと同一 (同じカーネル・同じ x・同じ行長) なので値は
+                // 1 ビットも変わらない。
+                {
+                    let gb = sc.gu.as_ref().expect("確保済み");
+                    let mut pw = pg2_addr as *mut c_void;
+                    let mut px = x_addr as *mut c_void;
+                    let mut po = gb.ptr;
+                    let mut ps = sgu2_addr as *mut c_void;
+                    let (mut ns, mut ni, mut no, mut rb) = (
+                        (2 * nseg) as c_int,
+                        n_in as c_int,
+                        ff as c_int,
+                        rb_g as c_int,
+                    );
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ps as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void,
+                        &mut ni as *mut _ as *mut c_void,
+                        &mut no as *mut _ as *mut c_void,
+                        &mut rb as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(
+                        kernels.fns[slot_g],
+                        (plan_g.grid.0, (2 * nseg) as u32, 1),
+                        plan_g.block,
+                        0,
+                        &mut args,
+                    )?;
+                }
+                dec_exp_kprof::mark(dec_exp_kprof::GATE);
+                dec_exp_kprof::mark(dec_exp_kprof::UP);
+                #[cfg(test)]
+                EXP_GU_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let mut gu = 0usize;
+                for (f, ptrs, buf, rb) in [
+                    (kernels.fns[slot_g], pg_addr, g, rb_g),
+                    (kernels.fns[slot_u], pu_addr, u, rb_u),
+                ] {
+                    let mut pw = ptrs as *mut c_void;
+                    let mut px = x_addr as *mut c_void;
+                    let mut po = buf.ptr;
+                    let mut ps = sgu_addr as *mut c_void;
+                    let (mut ns, mut ni, mut no, mut rb) = (
+                        nseg as c_int,
+                        n_in as c_int,
+                        ff as c_int,
+                        rb as c_int,
+                    );
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ps as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void,
+                        &mut ni as *mut _ as *mut c_void,
+                        &mut no as *mut _ as *mut c_void,
+                        &mut rb as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(f, plan_g.grid, plan_g.block, 0, &mut args)?;
+                    // 1 本目 = gate、2 本目 = up。
+                    dec_exp_kprof::mark(if gu == 0 {
+                        dec_exp_kprof::GATE
+                    } else {
+                        dec_exp_kprof::UP
+                    });
+                    gu += 1;
+                }
             }
             // 2. act = silu(g) * u
             {
                 let n = ng as c_int;
                 let threads = 256usize;
                 let blocks = ng.div_ceil(threads) as u32;
-                let mut pgg = g.ptr;
-                let mut puu = u.ptr;
+                let mut pgg = g_ptr;
+                let mut puu = u_ptr;
                 let mut paa = act.ptr;
                 let mut pn = n;
                 let mut args = [
@@ -7807,6 +7907,11 @@ pub struct DecStageLayout {
     pub sgd: usize,
     /// task 187: 和モードの重み (`nseg` 本の f32)。
     pub w: usize,
+    /// task 204: gate+up 融合の**倍の**ポインタ表 (`DENNO_DEC_EXPGU`)。
+    /// `gu_nseg == 0` のときは `pg2 == sgu2 == total` (0 バイト)。
+    pub pg2: usize,
+    /// task 204: gate+up 融合の倍の segment 表。
+    pub sgu2: usize,
     pub total: usize,
 }
 
@@ -7814,12 +7919,15 @@ pub struct DecStageLayout {
 ///
 /// task 187: 末尾に和モードの重み (`nseg` 本の f32) のブロックを足した。
 /// 使わないときは 0 バイト書くだけなので、従来の経路の転送量は増えない。
+/// task 204: `gu_nseg` は gate+up 融合を使うときの segment 数 (`2 * nseg`)。
+/// 0 なら倍の表のブロックを作らない (従来と同じレイアウト)。
 pub fn dec_stage_layout(
     n_in: usize,
     nseg: usize,
     sgu_len: usize,
     sgd_len: usize,
     w_len: usize,
+    gu_nseg: usize,
 ) -> DecStageLayout {
     let x = 0usize;
     let pg = x + n_in * 4;
@@ -7828,7 +7936,10 @@ pub fn dec_stage_layout(
     let sgu = pd + nseg * 8;
     let sgd = sgu + sgu_len * 4;
     let w = sgd + sgd_len * 4;
-    let total = w + w_len * 4;
+    // task 204: ポインタ表 (u64) は 8 バイト整列が要る (和モードの w は 4*nseg)。
+    let pg2 = (w + w_len * 4 + 7) & !7usize;
+    let sgu2 = pg2 + gu_nseg * 8;
+    let total = sgu2 + gu_nseg * 16;
     DecStageLayout {
         x,
         pg,
@@ -7837,6 +7948,8 @@ pub fn dec_stage_layout(
         sgu,
         sgd,
         w,
+        pg2,
+        sgu2,
         total,
     }
 }
@@ -10755,7 +10868,7 @@ mod iq_overlap_tests {
     /// 重ならないこと。`u64` の表を `u64` として読むので整列が要る。
     #[test]
     fn dec_stage_layout_is_aligned_and_disjoint() {
-        let l = dec_stage_layout(2560, 10, 40, 40, 10);
+        let l = dec_stage_layout(2560, 10, 40, 40, 10, 0);
         assert_eq!(l.x, 0);
         assert_eq!(l.pg, 2560 * 4);
         assert_eq!(l.pu, l.pg + 80);
@@ -10776,7 +10889,7 @@ mod iq_overlap_tests {
     /// task 164: ステージングへの書き込みは指定オフセットにだけ載る。
     #[test]
     fn dec_stage_put_writes_at_offset() {
-        let l = dec_stage_layout(4, 1, 4, 4, 0);
+        let l = dec_stage_layout(4, 1, 4, 4, 0, 0);
         let mut buf = vec![0u8; l.total];
         let x = [1.0f32, 2.0, 3.0, 4.0];
         unsafe {
@@ -23963,15 +24076,56 @@ fn parse_mix_dec_upw(raw: Option<&str>) -> bool {
 }
 
 /// up を 1 warp = 1 行の版で回すか (`DENNO_MIX_DEC_UPW`)。
-fn mix_dec_upw_on() -> bool {
+pub(crate) fn mix_dec_upw_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| parse_mix_dec_upw(std::env::var("DENNO_MIX_DEC_UPW").ok().as_deref()))
 }
 
 /// hc 方向を畳んだ norm+inject を使うか (`DENNO_MIX_DEC_FOLD`)。
-fn mix_dec_fold_on() -> bool {
+pub(crate) fn mix_dec_fold_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| parse_mix_dec_fold(std::env::var("DENNO_MIX_DEC_FOLD").ok().as_deref()))
+}
+
+/// task 204: gate+up 融合の可否 (純関数・テスト用)。
+///
+/// 畳めるのは「ゲートが on」かつ「gate と up の量子型が同じ」かつ「行長が同じで 0 でない」
+/// ときだけ。1 行の計算は同じカーネルなので、畳んでも値は変わらない。
+fn dec_exp_gu_shape_ok(on: bool, same_slot: bool, rb_g: usize, rb_u: usize) -> bool {
+    on && same_slot && rb_g > 0 && rb_g == rb_u
+}
+
+/// task 204: 融合起動が実際に撃たれた回数 (テストと lab の診断用。既定 0)。
+#[cfg(test)]
+static EXP_GU_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `DENNO_DEC_EXPGU` の解釈 (純関数)。既定 off。
+fn parse_dec_exp_gu(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// task 204: expert の gate と up を 1 起動に畳むか (`DENNO_DEC_EXPGU`・既定 off)。
+fn exp_gu_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_dec_exp_gu(std::env::var("DENNO_DEC_EXPGU").ok().as_deref()))
+}
+
+/// `DENNO_DEC_ONEVNT` の解釈 (純関数)。既定 off。
+fn parse_dec_onevnt(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// task 204: mix の D2H 待ちを `cuCtxSynchronize` から null ストリームの
+/// イベント 1 本へ (`DENNO_DEC_ONEVNT`・既定 off)。
+fn mix_onevnt_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_dec_onevnt(std::env::var("DENNO_DEC_ONEVNT").ok().as_deref()))
 }
 
 struct MixFoldKernels {
@@ -24506,7 +24660,14 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
             dec_kprof::op_end(kp_cp);
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
-        ctx.sync()?;
+        // task 204: `DENNO_DEC_ONEVNT=1` では `cuCtxSynchronize` (コンテキスト
+        // 全体 = サイドストリームも待つ) の代わりに null ストリームのイベント
+        // 1 本で待つ。待つ範囲だけが変わり、発行済みの仕事は 1 つも変わらない。
+        if mix_onevnt_on() && sync_default_stream() {
+            // イベントで待てた (台帳には sync 1 回として積まれる)。
+        } else {
+            ctx.sync()?;
+        }
         dec_kprof::step("mix_pack", || {
             let got = ho.as_slice::<f32>();
             mixed.copy_from_slice(&got[..e]);
@@ -27023,7 +27184,7 @@ pub fn set_attn_flashdec_chunk_for_test(n: Option<usize>) {
 }
 
 /// flash decoding を使うか (`DENNO_ATTN_FLASHDEC`)。
-fn attn_flashdec_enabled() -> bool {
+pub(crate) fn attn_flashdec_enabled() -> bool {
     #[cfg(test)]
     {
         let f = ATTN_FDEC_FORCE.load(std::sync::atomic::Ordering::Relaxed);
@@ -44328,7 +44489,7 @@ fn gdn_scan2_from_value(v: Option<&str>, default_on: bool) -> bool {
 /// (128 トークンの生 decode 秒で -1.8..-2.3%)。戻すのは `DENNO_GDN_SCAN2=0`。
 const GDN_SCAN2_DEFAULT: bool = true;
 
-fn gdn_scan2_on() -> bool {
+pub(crate) fn gdn_scan2_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         gdn_scan2_from_value(
@@ -45590,5 +45751,104 @@ mod task184_tests {
             assert_eq!(f, base, "dk={dk} dv={dv} で従来カーネルになっていない");
             assert_eq!(thr, dk as u32);
         }
+    }
+}
+
+#[cfg(test)]
+mod task204_tests {
+    use super::*;
+
+    /// task 204: `DENNO_DEC_EXPGU` の真理値表。既定は off (未設定・空・0)。
+    #[test]
+    fn dec_exp_gu_truth_table() {
+        assert!(!parse_dec_exp_gu(None));
+        assert!(!parse_dec_exp_gu(Some("")));
+        assert!(!parse_dec_exp_gu(Some("0")));
+        assert!(!parse_dec_exp_gu(Some("off")));
+        assert!(!parse_dec_exp_gu(Some("false")));
+        assert!(parse_dec_exp_gu(Some("1")));
+        assert!(parse_dec_exp_gu(Some(" ON ")));
+        assert!(parse_dec_exp_gu(Some("true")));
+        assert!(parse_dec_exp_gu(Some("yes")));
+    }
+
+    /// task 204: 融合の可否は「on + 同じ量子型 + 行長が同じで 0 でない」。
+    #[test]
+    fn dec_exp_gu_shape_gate() {
+        assert!(dec_exp_gu_shape_ok(true, true, 98, 98));
+        assert!(!dec_exp_gu_shape_ok(false, true, 98, 98));
+        assert!(!dec_exp_gu_shape_ok(true, false, 98, 98));
+        assert!(!dec_exp_gu_shape_ok(true, true, 98, 110));
+        assert!(!dec_exp_gu_shape_ok(true, true, 0, 0));
+    }
+
+    /// task 204: `DENNO_DEC_ONEVNT` の真理値表。既定は off。
+    #[test]
+    fn dec_onevnt_truth_table() {
+        assert!(!parse_dec_onevnt(None));
+        assert!(!parse_dec_onevnt(Some("0")));
+        assert!(!parse_dec_onevnt(Some("off")));
+        assert!(parse_dec_onevnt(Some("1")));
+        assert!(parse_dec_onevnt(Some("on")));
+    }
+
+    /// task 204: 融合の倍の表を載せてもレイアウトが 8 バイト整列で重ならない。
+    #[test]
+    fn dec_stage_layout_with_gu_block() {
+        let nseg = 5usize; // 奇数 = w の後ろが 4 バイト境界でも整列させる
+        let l = dec_stage_layout(2560, nseg, 4 * nseg, 4 * nseg, nseg, 2 * nseg);
+        assert_eq!(l.pg2 % 8, 0, "ポインタ表が 8 バイト整列でない");
+        assert_eq!(l.sgu2 % 8, 0, "segment 表が 8 バイト整列でない");
+        assert_eq!(l.sgu2, l.pg2 + 2 * nseg * 8);
+        assert_eq!(l.total, l.sgu2 + 2 * nseg * 16);
+        // 和モードの重みのブロックを潰していない。
+        assert!(l.w + nseg * 4 <= l.pg2);
+        // gu ブロックを使わないときは従来と同じ末尾。
+        let l0 = dec_stage_layout(2560, nseg, 4 * nseg, 4 * nseg, nseg, 0);
+        assert_eq!(l0.pg2, l0.total);
+        assert_eq!(l0.sgu2, l0.total);
+        assert!(l0.total <= l.total);
+    }
+
+    /// task 204: 融合起動は**同じカーネル**を grid.y = 2*segment で撃ち、
+    /// segment 表の後半の出力オフセットだけ `ng` ずらす、という契約。
+    /// GPU 無しでは起動できないので、ソースの契約と倍表の作り方を固定する。
+    #[test]
+    fn exp_gu_contract_in_source() {
+        let src = include_str!("cuda.rs");
+        assert!(
+            src.contains("(plan_g.grid.0, (2 * nseg) as u32, 1)"),
+            "融合起動の grid.y が 2*segment でない"
+        );
+        assert!(
+            src.contains("e4[3] = e4[3].saturating_add(ng as u32);"),
+            "up 側の出力オフセットに ng を足していない"
+        );
+        assert!(
+            src.contains("let gu_fused = lay.total > lay.pg2 && stage_addr.is_some();"),
+            "融合の門番が無い"
+        );
+    }
+
+    /// task 204: task 192 の 2 本の PTX (`mix_dev2` / `mix_up`) が**リポジトリに
+    /// ある**こと。既定 on のゲート (`DENNO_MIX_DEC_FOLD` / `DENNO_MIX_DEC_UPW`) が
+    /// 静かに従来経路へ落ちていた (task 204 で回収した)。引数数の契約も固定する。
+    #[test]
+    fn task192_fold_and_upw_ptx_are_present() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let fold = std::fs::read_to_string(dir.join("kernels_mix_dev2.ptx"))
+            .expect("kernels_mix_dev2.ptx が無い (fold が従来経路へ落ちる)");
+        assert_eq!(
+            ptx_entry_params(&fold, MIX_FOLD_KERNEL_NAME),
+            Some(MIX_FOLD_NARGS),
+            "fold の PTX 引数数が {MIX_FOLD_NARGS} でない"
+        );
+        let up = std::fs::read_to_string(dir.join("kernels_mix_up.ptx"))
+            .expect("kernels_mix_up.ptx が無い (upw が従来経路へ落ちる)");
+        assert_eq!(
+            ptx_entry_params(&up, MIX_UP_KERNEL_NAME),
+            Some(MIX_UP_NARGS),
+            "upw の PTX 引数数が {MIX_UP_NARGS} でない"
+        );
     }
 }

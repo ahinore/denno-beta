@@ -4,6 +4,7 @@
 //! KVキャッシュ、サンプリング、デコードループを持つ。CPUのみ・自前カーネル。
 
 pub mod engine;
+pub mod gate_audit;
 pub mod gguf;
 pub mod gdn;
 pub mod gpu_budget;

@@ -4340,7 +4340,7 @@ static DEC_SHARED_DEV_OVERRIDE: std::sync::atomic::AtomicU8 =
 
 /// [`dec_shared_dev_from_value`] をプロセスで 1 回だけ読む。
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn dec_shared_dev_enabled() -> bool {
+pub(crate) fn dec_shared_dev_enabled() -> bool {
     use std::sync::atomic::Ordering;
     match DEC_SHARED_DEV_OVERRIDE.load(Ordering::Relaxed) {
         1 => return false,
@@ -4411,7 +4411,7 @@ fn dec_exp_sumdev_from_value(v: Option<&str>) -> bool {
 }
 
 /// [`dec_exp_sumdev_from_value`] をプロセスで 1 回だけ読む。
-fn dec_exp_sumdev_enabled() -> bool {
+pub(crate) fn dec_exp_sumdev_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         dec_exp_sumdev_from_value(std::env::var("DENNO_DEC_EXP_SUMDEV").ok().as_deref())
