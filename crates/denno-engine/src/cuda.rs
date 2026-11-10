@@ -10093,36 +10093,94 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
     unsafe {
         std::ptr::copy_nonoverlapping(hp as *const u8, wcp as *mut u8, n);
     }
-    // 1 回の DMA を reps 回測り、(最良 GB/s, 呼び出しの最大 ns) を返す。
-    let one = |bytes: usize, from: *const c_void, stream: CUstream, ev: CUevent| -> (f64, u64) {
+    // 1 回の DMA を 3 回測り、(合計 GB/s, 呼び出しの最大 ns, 完了待ちの最大 ns) を返す。
+    // **合計 = 呼び出し + 待ち** で割る (pageable は呼び出しがブロックするので、
+    // 待ちだけで割ると桁が狂う。lab t227a で実際に踏んだ)。
+    let one = |bytes: usize, from: *const c_void, stream: CUstream, ev: CUevent| -> (f64, u64, u64) {
         let mut best = 0.0f64;
         let mut enq_max = 0u64;
+        let mut wait_max = 0u64;
         for _ in 0..3 {
             let t = std::time::Instant::now();
             let rc = unsafe { (l.memcpy_htod_async)(devp, from, bytes, stream) };
             let enq = t.elapsed().as_nanos() as u64;
             if rc != CUDA_SUCCESS {
-                return (0.0, enq);
+                return (0.0, enq, 0);
             }
             unsafe {
                 let _ = (record)(ev, stream);
             }
             let t2 = std::time::Instant::now();
             if unsafe { (esync)(ev) } != CUDA_SUCCESS {
-                return (0.0, enq);
+                return (0.0, enq, 0);
             }
-            let gbs = bytes as f64 / t2.elapsed().as_nanos().max(1) as f64;
+            let wait = t2.elapsed().as_nanos() as u64;
+            let gbs = bytes as f64 / (enq + wait).max(1) as f64;
             if gbs > best {
                 best = gbs;
             }
             enq_max = enq_max.max(enq);
+            wait_max = wait_max.max(wait);
         }
-        (best, enq_max)
+        (best, enq_max, wait_max)
     };
-
-    // (a) 単独
-    let (wc_alone, wc_enq) = one(n, wcp as *const c_void, up, ev);
-    // (b) GPU を memset で埋める (DMA と GPU の取り合いを見る)
+    // 8 スレッドで `blk` バイトを mmap から wc の `at` へ写してから、その範囲を DMA する。
+    let wcp_u = wcp as usize;
+    let copy_then_dma_at = |at: usize, blk: usize| -> (f64, u64, u64) {
+        std::thread::scope(|s| {
+            let mut hs = Vec::new();
+            for i in 0..8usize {
+                let part = (blk / 8) & !4095;
+                if part == 0 {
+                    continue;
+                }
+                let off = at + i * part;
+                let len = if i == 7 { at + blk - off } else { part };
+                hs.push(s.spawn(move || unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (hp + off) as *const u8,
+                        (wcp_u + off) as *mut u8,
+                        len,
+                    );
+                }));
+            }
+            for h in hs {
+                let _ = h.join();
+            }
+        });
+        one(blk, (wcp as usize + at) as *const c_void, up, ev)
+    };
+    let copy_then_dma = |blk: usize| copy_then_dma_at(0, blk);
+    // 写し (8 スレッド) + DMA を交互に流す = 実経路の再現。
+    // `blk` バイトを 8 スレッドで wc へ写してから DMA するのを `reps` 回。
+    let pipeline = |blk: usize, reps: usize, chunk: usize| -> (f64, u64) {
+        let mut enq_max = 0u64;
+        let mut wait_ns = 0u64;
+        let t_all = std::time::Instant::now();
+        for _ in 0..reps {
+            if chunk == 0 {
+                let (_, e1, w1) = copy_then_dma(blk);
+                enq_max = enq_max.max(e1);
+                wait_ns += w1;
+            } else {
+                let mut at = 0usize;
+                while at < blk {
+                    let b = chunk.min(blk - at);
+                    let (_, e1, w1) = copy_then_dma_at(at, b);
+                    enq_max = enq_max.max(e1);
+                    wait_ns += w1;
+                    at += b;
+                }
+            }
+        }
+        let total = (blk * reps) as f64 / t_all.elapsed().as_nanos().max(1) as f64;
+        (total, enq_max)
+    };
+    // (a) WC pinned 単独 (256 MB)
+    let (wc_alone, wc_enq, wc_wait) = one(n, wcp as *const c_void, up, ev);
+    let small = (56usize << 20).min(n);
+    let (wc_small, wc_small_enq, wc_small_wait) = one(small, wcp as *const c_void, up, ev);
+    // (b) GPU を memset で埋めながら
     let mut memset_rounds = 0usize;
     {
         let ms = l.memset_d32_async;
@@ -10132,12 +10190,12 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
             }
             memset_rounds += 1;
         }
-        let (wc_busy_memset, _) = one(n, wcp as *const c_void, up, ev);
+        let (wc_busy_memset, wm_enq, wm_wait) = one(n, wcp as *const c_void, up, ev);
         let _ = ctx.sync();
-        // (c) ホスト 8 スレッドが別の pinned へ写している間の DMA
+        // (c) ホスト 8 スレッドが別の pinned へ写しながら
         let stop = std::sync::atomic::AtomicBool::new(false);
         let cc_ptr = cc.ptr as usize;
-        let (copied, (wc_busy_copy8, _)) = std::thread::scope(|s| {
+        let (copied, (wc_busy_copy8, c8_enq, c8_wait)) = std::thread::scope(|s| {
             let mut hs = Vec::new();
             for i in 0..8usize {
                 let stop = &stop;
@@ -10166,9 +10224,9 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
             }
             (sum, r)
         });
-        // (d) mmap を pageable のまま積む (写しを消したときの上限)
-        let (page_gbs, page_enq) = one(n, hp as *const c_void, up, ev);
-        // (e) mmap を pin して直接積む
+        // (d) mmap を pageable のまま (256 MB / 56 MB)
+        let (page_gbs, page_enq, page_wait) = one(n, hp as *const c_void, up, ev);
+        // (e) mmap を pin して直接
         let a = hp & !4095usize;
         let b = (hp + n + 4095) & !4095usize;
         let mut reg_ok = false;
@@ -10192,8 +10250,7 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
             }
         }
         let (reg_gbs, map_gbs) = if reg_ok {
-            let (g, _) = one(n, hp as *const c_void, up, ev);
-            // mapped host を device ポインタとして読む (カーネル読みの代用)
+            let (g, _, _) = one(n, hp as *const c_void, up, ev);
             let mut mg = 0.0f64;
             if let Some(gd) = l.mem_host_get_device_ptr {
                 let dtod = l.memcpy_dtod_async;
@@ -10212,7 +10269,8 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
                         if unsafe { (esync)(ev) } != CUDA_SUCCESS {
                             break;
                         }
-                        let g2 = n as f64 / t2.elapsed().as_nanos().max(1) as f64;
+                        let g2 = n as f64
+                            / (t.elapsed().as_nanos() + t2.elapsed().as_nanos()).max(1) as f64;
                         mg = mg.max(g2);
                     }
                 }
@@ -10243,11 +10301,15 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
                 {
                     break;
                 }
-                let g2 = (half * 2) as f64 / t2.elapsed().as_nanos().max(1) as f64;
+                let g2 = (half * 2) as f64
+                    / (t.elapsed().as_nanos() + t2.elapsed().as_nanos()).max(1) as f64;
                 two = two.max(g2);
             }
         }
-        // (g) CPU の写し (mmap → cacheable pinned、1 スレッド)
+        // (g) 実経路の再現: 56 MB を写して DMA を 6 回 / 4 MB ずつ交互に
+        let (pipe_big, pipe_big_enq) = pipeline(small, 6, 0);
+        let (pipe_chunk, pipe_chunk_enq) = pipeline(small, 6, 4 << 20);
+        // (h) CPU の写し (mmap → cacheable pinned、1 スレッド)
         let t = std::time::Instant::now();
         unsafe {
             std::ptr::copy_nonoverlapping(hp as *const u8, cc.ptr as *mut u8, n);
@@ -10255,17 +10317,35 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
         let cpu_gbs = n as f64 / t.elapsed().as_nanos().max(1) as f64;
 
         eprintln!(
-            "[pf-probe] n_MB={} wc_GBs={wc_alone:.1} wc_enq_us={:.1} page_GBs={page_gbs:.1} \
-             page_enq_us={:.1} reg_GBs={reg_gbs:.1} map_GBs={map_gbs:.1} two_GBs={two:.1} \
-             cpu_copy_GBs={cpu_gbs:.1}",
+            "[pf-probe] dma n_MB={} wc_GBs={wc_alone:.1} wc_enq_us={:.1} wc_wait_us={:.1} \
+             small_MB={} wc_small_GBs={wc_small:.1} wc_small_enq_us={:.1} wc_small_wait_us={:.1} \
+             page_GBs={page_gbs:.1} page_enq_us={:.1} page_wait_us={:.1} \
+             two_GBs={two:.1} reg_GBs={reg_gbs:.1} map_GBs={map_gbs:.1} cpu_copy_GBs={cpu_gbs:.1}",
             n >> 20,
             wc_enq as f64 / 1e3,
-            page_enq as f64 / 1e3
+            wc_wait as f64 / 1e3,
+            small >> 20,
+            wc_small_enq as f64 / 1e3,
+            wc_small_wait as f64 / 1e3,
+            page_enq as f64 / 1e3,
+            page_wait as f64 / 1e3
         );
         eprintln!(
-            "[pf-probe] busy wc_memset_GBs={wc_busy_memset:.1} wc_copy8_GBs={wc_busy_copy8:.1} \
-             copy8_GB={:.1} memset_rounds={memset_rounds}",
+            "[pf-probe] busy wc_memset_GBs={wc_busy_memset:.1} wc_memset_enq_us={:.1} \
+             wc_memset_wait_us={:.1} wc_copy8_GBs={wc_busy_copy8:.1} wc_copy8_enq_us={:.1} \
+             wc_copy8_wait_us={:.1} copy8_GB={:.1} memset_rounds={memset_rounds}",
+            wm_enq as f64 / 1e3,
+            wm_wait as f64 / 1e3,
+            c8_enq as f64 / 1e3,
+            c8_wait as f64 / 1e3,
             copied as f64 / 1e9
+        );
+        eprintln!(
+            "[pf-probe] pipeline blk_MB={} big_GBs={pipe_big:.1} big_enq_us={:.1} \
+             chunk4_GBs={pipe_chunk:.1} chunk4_enq_us={:.1}",
+            small >> 20,
+            pipe_big_enq as f64 / 1e3,
+            pipe_chunk_enq as f64 / 1e3
         );
         eprintln!(
             "[pf-probe] reg ok={} flags={reg_flags:#x} reg_ms={:.1} reg_GBs_per_s={:.2}",
@@ -22293,6 +22373,9 @@ struct PfDev {
     inj: Option<DevBuffer>,   // [nt][hc]
     bo: Option<DevBuffer>,    // [nt][e]
     gamma: Option<DevBuffer>, // [hc][e]
+    /// task 227: 層優先のとき、チャンクの残差を層のあいだ退避しておく置き場
+    /// (D2D で出し入れする。ホスト経由より 1 桁速い)。
+    park: Vec<DevBuffer>,
     nt: usize,
     hc: usize,
     e: usize,
@@ -22310,6 +22393,7 @@ impl PfDev {
             inj: None,
             bo: None,
             gamma: None,
+            park: Vec::new(),
             nt: 0,
             hc: 0,
             e: 0,
@@ -22390,6 +22474,90 @@ pub fn pf_begin(nt: usize, hc: usize, e: usize, lr: usize) -> bool {
         Ok(()) => true,
         Err(e) => pf_fail(&format!("作業域の確保に失敗: {e:#}")),
     }
+}
+
+/// task 227: 層優先 prefill 用の残差の退避域を用意する (`rows` 行 × hc × e)。
+///
+/// 層優先では層ループの外側にチャンクを回すので、層 L のあいだ全チャンクの
+/// 残差を同時に持つ必要がある。`PF_DEV.res` は 1 チャンクぶんしかないため、
+/// チャンクごとにここへ **D2D で** 退避する (ホスト経由は 1 桁遅い)。
+pub fn pf_res_park_ensure(slots: usize, rows: usize, hc: usize, e: usize) -> bool {
+    let want = rows.saturating_mul(hc).saturating_mul(e).saturating_mul(4);
+    if slots == 0 || want == 0 {
+        return false;
+    }
+    PF_DEV.with(|cell| -> bool {
+        let mut d = cell.borrow_mut();
+        while d.park.len() < slots {
+            match DevBuffer::alloc_tagged(want, crate::mem_audit::TAG_OTHER) {
+                Ok(b) => d.park.push(b),
+                Err(e) => {
+                    tracing::warn!("pf_res_park_ensure: 確保に失敗: {e:#}");
+                    return false;
+                }
+            }
+            // 既にある枚が小さいときは作り直す (grow-only)。
+            let n = d.park.len();
+            if d.park[n - 1].bytes() < want {
+                d.park.pop();
+                return false;
+            }
+        }
+        for b in d.park.iter() {
+            if b.bytes() < want {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+/// 残差を退避域 `i` へ D2D で写す (`rows` 行ぶん)。
+pub fn pf_res_park_save(i: usize, rows: usize, hc: usize, e: usize) -> bool {
+    let bytes = rows.saturating_mul(hc).saturating_mul(e).saturating_mul(4);
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let (Some(res), Some(dst)) = (d.res.as_ref(), d.park.get(i)) else {
+            return false;
+        };
+        if bytes == 0 || res.bytes() < bytes || dst.bytes() < bytes {
+            return false;
+        }
+        match lib() {
+            Ok(l) => unsafe {
+                check(
+                    (l.memcpy_dtod_async)(dst.ptr(), res.ptr(), bytes, std::ptr::null_mut()),
+                    "cuMemcpyDtoDAsync (res park save)",
+                )
+                .is_ok()
+            },
+            Err(_) => false,
+        }
+    })
+}
+
+/// 退避域 `i` から残差へ D2D で戻す (`rows` 行ぶん)。
+pub fn pf_res_park_load(i: usize, rows: usize, hc: usize, e: usize) -> bool {
+    let bytes = rows.saturating_mul(hc).saturating_mul(e).saturating_mul(4);
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let (Some(res), Some(src)) = (d.res.as_ref(), d.park.get(i)) else {
+            return false;
+        };
+        if bytes == 0 || res.bytes() < bytes || src.bytes() < bytes {
+            return false;
+        }
+        match lib() {
+            Ok(l) => unsafe {
+                check(
+                    (l.memcpy_dtod_async)(res.ptr(), src.ptr(), bytes, std::ptr::null_mut()),
+                    "cuMemcpyDtoDAsync (res park load)",
+                )
+                .is_ok()
+            },
+            Err(_) => false,
+        }
+    })
 }
 
 /// task 154: チャンクの残差 (`[nt][hc][e]`) をデバイスへ置く。

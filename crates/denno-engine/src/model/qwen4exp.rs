@@ -3594,6 +3594,24 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             Self::pf_note_decline("64 トークン未満");
             return Ok(None);
         }
+        // task 227: 層優先 (`DENNO_PF_LM_LAYER=1`)。1 チャンクに収まるプロンプトは
+        // チャンク優先と同じ結果になるので、そのまま下へ落とす。
+        if crate::model::exp_pf::lm_layer_on() && ctx.len() > first_nt {
+            let hook: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>> = match &mut on_layer {
+                Some(f) => Some(&mut **f),
+                None => None,
+            };
+            if let Some(v) = self.forward_prefill_batch_resident_lm(
+                ctx,
+                chunk,
+                tokens,
+                hook,
+                roles.as_deref_mut(),
+                iv,
+            )? {
+                return Ok(Some(v));
+            }
+        }
         if !crate::cuda::pf_begin(first_nt, hc, e, lr) {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
@@ -3941,6 +3959,427 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             steer::merge_device();
         }
         let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
+        let t_mix = headprof::stamp();
+        let t_fin = prekprof::stamp();
+        let cur = hc_mix_quant(
+            &res,
+            &self.head.norm,
+            &self.head.down,
+            &self.head.up,
+            None,
+            &hp,
+        )?
+        .0;
+        headprof::mark(headprof::MIX, t_mix, 0);
+        prekprof::mark(t_fin, prekprof::FINAL_NORM);
+        let mut logits = vec![0.0f32; self.head.output.n()];
+        let t_head = prekprof::stamp();
+        self.head_logits_into(&cur, &mut logits)?;
+        prekprof::mark(t_head, prekprof::HEAD);
+        Ok(Some(vec![logits]))
+    }
+
+    /// task 227: 層優先の常駐 prefill (`DENNO_PF_LM_LAYER=1`)。
+    ///
+    /// 部品はチャンク優先の常駐連鎖と同じで、順序だけが違う。層 L について
+    /// 1. 全チャンクの mix / attn / ssm を回して ffn の入力を集め (`mixed_all`)、
+    /// 2. **MoE を層で 1 回**だけ回し、
+    /// 3. 全チャンクの combine を回す。
+    ///
+    /// これで expert 重みは 1 プロンプトで 1 回しか H2D されない (チャンク優先は
+    /// チャンク数ぶん = 14k で 9 パス、158.5 GB)。MoE の入力は
+    /// `n_tokens x e` がホストに載り、残差は層のあいだデバイスの退避域に置く
+    /// (D2D。ホスト経由だと 14k で 110 GB 往復するので t170a の二の舞になる)。
+    ///
+    /// 前提が足りなければ `Ok(None)` を返し、呼び出し側がチャンク優先へ落ちる。
+    #[cfg(feature = "cuda")]
+    fn forward_prefill_batch_resident_lm(
+        &mut self,
+        ctx: &[u32],
+        chunk: usize,
+        tokens: TapTokens,
+        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        mut roles: Option<&mut RoleRms>,
+        iv: IvView<'_>,
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let hp = self.hp();
+        let e = self.p.n_embd;
+        let hc = hp.hc;
+        let lr = hp.low_rank;
+        let hc_dim = hc * e;
+        let n_layer = self.p.n_layer;
+        let chunk = chunk.max(1);
+        let nt_all = ctx.len();
+        let ranges: Vec<(usize, usize)> = (0..nt_all)
+            .step_by(chunk)
+            .map(|s| (s, (s + chunk).min(nt_all)))
+            .collect();
+        // 1 チャンクならチャンク優先と同じ (層優先にする意味が無い)。
+        if ranges.len() < 2 {
+            return Ok(None);
+        }
+        if !crate::cuda::pf_begin(chunk.min(nt_all), hc, e, lr) {
+            Self::pf_note_decline("作業域/PTX/GPU の前提外");
+            return Ok(None);
+        }
+        // 全チャンクの残差の退避域 (D2D)。
+        if !crate::cuda::pf_res_park_ensure(ranges.len(), chunk, hc, e) {
+            crate::cuda::pf_release();
+            Self::pf_note_decline("残差の退避域を確保できない");
+            return Ok(None);
+        }
+        let steer_state = steer::snapshot();
+        let steer_apply = steer_state.apply.as_ref();
+        let steer_rec = steer::rec_on();
+        let steer_dev_apply = steer_apply
+            .map(|a| a.from < n_layer && a.to > 0)
+            .unwrap_or(false);
+        if steer_rec && !crate::cuda::pf_steer_acc_ensure(n_layer, hc, e) {
+            crate::cuda::pf_release();
+            Self::pf_note_decline("steer の加算域が使えない");
+            return Ok(None);
+        }
+        if steer_dev_apply {
+            let a = steer_apply.expect("steer_dev_apply は apply があるときだけ真");
+            if !crate::cuda::pf_steer_apply_begin(&a.v, n_layer, hc, e) {
+                crate::cuda::pf_release();
+                Self::pf_note_decline("steer の v をデバイスへ置けない");
+                return Ok(None);
+            }
+        }
+        let _mixed_mark = PfMixedMarkGuard;
+        // 層優先では expert の VRAM キャッシュが効かない (同じ expert を 1 プロンプトで
+        // 二度使わない) ので、MoE の作業域 (14k で約 2.7 GB) のぶんだけ先に空ける。
+        // **全部は捨てない** (decode のヒット率を保つ)。
+        {
+            let want = if nt_all >= 8192 { 6usize << 30 } else { 2usize << 30 };
+            let freed = crate::model::expert_vram::emergency_free(want);
+            if freed > 0 {
+                eprintln!(
+                    "[pf-lm] expert を {} MiB 追い出して MoE の作業域を空けた",
+                    freed >> 20
+                );
+            }
+        }
+        let ple_batch = ple_batch_enabled();
+        // 埋め込みと PLE は層ループの外で 1 回だけ (全トークン)。
+        let mut res_all: Vec<f32> = Vec::with_capacity(nt_all * hc_dim);
+        let mut ples_all: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(ranges.len());
+        for &(start, end) in &ranges {
+            let t_emb = prekprof::stamp();
+            for i in start..end {
+                let r = self.forward_embed(&ctx[..=i], &hp)?;
+                res_all.extend_from_slice(&r.data);
+            }
+            prekprof::mark(t_emb, prekprof::EMBED);
+            let t_ple = prekprof::stamp();
+            let ples: Vec<Option<Vec<f32>>> = if ple_batch {
+                self.gather_ple_many(&ctx[..end], start)?
+            } else {
+                let mut v: Vec<Option<Vec<f32>>> = Vec::with_capacity(end - start);
+                for i in start..end {
+                    v.push(self.gather_ple(&ctx[..=i])?);
+                }
+                v
+            };
+            prekprof::mark(t_ple, prekprof::PLE);
+            ples_all.push(ples);
+        }
+        // ffn の入力 (全トークン) と、MoE の出力。
+        let mut mixed_buf = PfHostBuf::new(nt_all * e);
+        let mut ffn_all: Vec<f32> = Vec::new();
+        for il in 0..n_layer {
+            let lw = &self.layers[il];
+            if q4prof::enabled() {
+                q4prof::N_LAYER.fetch_add(nt_all as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(d) = roles.as_deref_mut() {
+                *d = RoleRms::default();
+            }
+            let t_lay = prekprof::stamp();
+            // ---- 1. 全チャンクの mix / attn / ssm ----
+            for (ci, &(start, end)) in ranges.iter().enumerate() {
+                let nt = end - start;
+                // 残差をデバイスへ (層 0 はホストの初期値、それ以降は退避域から)。
+                if il == 0 {
+                    if !crate::cuda::pf_upload_res(&res_all[start * hc_dim..end * hc_dim]) {
+                        Self::pf_bail("res の H2D に失敗")?;
+                    }
+                } else if !crate::cuda::pf_res_park_load(ci, nt, hc, e) {
+                    Self::pf_bail("res の退避域からの復帰に失敗")?;
+                }
+                // task 218: ステアリング (層の入口)。
+                if steer_dev_apply && steer_apply.map(|a| a.covers(il)).unwrap_or(false) {
+                    let a = steer_apply.expect("covers が真なら apply がある");
+                    let mode = if a.mode == steer::Mode::Project { 1u8 } else { 0u8 };
+                    if !crate::cuda::pf_steer_apply(nt, hc, e, il, mode, a.alpha) {
+                        Self::pf_bail("steer の適用に失敗")?;
+                    }
+                }
+                // 1.1 PLE 注入 (層 1 のみ)。ホストで回すので、この層だけ往復する。
+                if let Some(pw) = &lw.ple {
+                    let mut back = vec![0.0f32; nt * hc_dim];
+                    if !crate::cuda::pf_download_res(&mut back) {
+                        Self::pf_bail("PLE 層の res の D2H に失敗")?;
+                    }
+                    let ples = &ples_all[ci];
+                    let mut rows: Vec<&[f32]> = Vec::with_capacity(nt);
+                    for t in 0..nt {
+                        rows.push(
+                            ples[t]
+                                .as_deref()
+                                .ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?,
+                        );
+                    }
+                    let mut contrib = 0.0f32;
+                    let want = roles.is_some();
+                    let hist = self.ple_conv_state[il]
+                        .as_mut()
+                        .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
+                    if pf_ple_fast_on() {
+                        if nt >= PLE_PAR_MIN_TOK {
+                            ple_inject_batch_par(
+                                &self.p,
+                                pw,
+                                &rows,
+                                &mut back,
+                                &hp,
+                                hist,
+                                want.then_some(&mut contrib),
+                            )?;
+                        } else {
+                            ple_inject_batch_flat(
+                                &self.p,
+                                pw,
+                                &rows,
+                                &mut back,
+                                &hp,
+                                hist,
+                                want.then_some(&mut contrib),
+                            )?;
+                        }
+                    } else {
+                        let mut streams: Vec<HyperStreams> = (0..nt)
+                            .map(|t| HyperStreams {
+                                data: back[t * hc_dim..(t + 1) * hc_dim].to_vec(),
+                                hc,
+                                n_embd: e,
+                            })
+                            .collect();
+                        ple_inject_batch(
+                            &self.p,
+                            pw,
+                            &rows,
+                            &mut streams,
+                            &hp,
+                            hist,
+                            want.then_some(&mut contrib),
+                        )?;
+                        for t in 0..nt {
+                            back[t * hc_dim..(t + 1) * hc_dim]
+                                .copy_from_slice(&streams[t].data);
+                        }
+                    }
+                    if want {
+                        if let Some(r) = roles.as_deref_mut() {
+                            r.ple = contrib;
+                        }
+                    }
+                    if !crate::cuda::pf_upload_res(&back) {
+                        Self::pf_bail("PLE 層の res の H2D に失敗")?;
+                    }
+                }
+                // 1.2 attention 入口 (デバイス mix) → attn → combine
+                let t_mix = std::time::Instant::now();
+                {
+                    let _l = q4ledger::enter(q4ledger::MIX);
+                    if !crate::cuda::pf_mix(
+                        &lw.hc_attn_norm,
+                        Self::pf_lin(&lw.hc_attn_down),
+                        Self::pf_lin(&lw.hc_attn_up),
+                        Self::pf_lin(&lw.hc_attn_inject),
+                        nt,
+                        hc,
+                        e,
+                        lr,
+                        hp.eps,
+                    ) {
+                        Self::pf_bail("attn mix の連鎖に失敗")?;
+                    }
+                    let mixed = &mut mixed_buf.as_mut_slice()[..nt * e];
+                    if !crate::cuda::pf_take_mixed(mixed) {
+                        Self::pf_bail("attn mix の mixed D2H に失敗")?;
+                    }
+                    crate::cuda::pf_mixed_mark(mixed.as_ptr(), nt, e);
+                }
+                q4prof::add(&q4prof::MIX, t_mix);
+                let mixed_attn: &[f32] = &mixed_buf.as_mut_slice()[..nt * e];
+                let flat_attn = pf_attn_flat_on();
+                let attn_dev = flat_attn && pf_attn_devres_on() && roles.is_none();
+                let curs: Vec<Vec<f32>> = if flat_attn {
+                    Vec::new()
+                } else {
+                    mixed_attn.chunks_exact(e).map(|c| c.to_vec()).collect()
+                };
+                let t_attn = std::time::Instant::now();
+                crate::cuda::pf_attn_dev_clear();
+                crate::cuda::pf_attn_dev_request(attn_dev);
+                let flat_outs = {
+                    let item = if q4ledger::enabled() {
+                        match self.p.layer_kind(il) {
+                            Ok(LayerKind::FullAttn) => q4ledger::FULL,
+                            _ => q4ledger::SSM,
+                        }
+                    } else {
+                        q4ledger::OTHER
+                    };
+                    let _l = q4ledger::enter(item);
+                    let r = Self::prefill_attn_chunk(
+                        self.attn.as_mut(),
+                        il,
+                        mixed_attn,
+                        &curs,
+                        nt,
+                        e,
+                        flat_attn,
+                        attn_dev,
+                    );
+                    crate::cuda::pf_attn_dev_request(false);
+                    r?
+                };
+                q4prof::add(&q4prof::ATTN, t_attn);
+                let dev_out = flat_outs.is_empty();
+                if let Some(r) = roles.as_deref_mut() {
+                    if !dev_out && end == nt_all {
+                        let t = nt - 1;
+                        let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
+                        if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                            r.attn = v;
+                        } else {
+                            r.gdn = v;
+                        }
+                    }
+                }
+                let combined = if dev_out {
+                    crate::cuda::pf_combine_dev(nt, hc, e)
+                } else {
+                    crate::cuda::pf_combine(&flat_outs, nt, hc, e)
+                };
+                if !combined {
+                    Self::pf_bail("attn の combine に失敗")?;
+                }
+                // 1.3 ffn 入口 (デバイス mix) まで。MoE は層でまとめて回す。
+                let t_mix = std::time::Instant::now();
+                {
+                    let _l = q4ledger::enter(q4ledger::MIX);
+                    if !crate::cuda::pf_mix(
+                        &lw.hc_ffn_norm,
+                        Self::pf_lin(&lw.hc_ffn_down),
+                        Self::pf_lin(&lw.hc_ffn_up),
+                        Self::pf_lin(&lw.hc_ffn_inject),
+                        nt,
+                        hc,
+                        e,
+                        lr,
+                        hp.eps,
+                    ) {
+                        Self::pf_bail("ffn mix の連鎖に失敗")?;
+                    }
+                    let dst = &mut mixed_buf.as_mut_slice()[start * e..end * e];
+                    if !crate::cuda::pf_take_mixed(dst) {
+                        Self::pf_bail("ffn mix の mixed D2H に失敗")?;
+                    }
+                    crate::cuda::pf_mixed_mark(dst.as_ptr(), nt, e);
+                }
+                q4prof::add(&q4prof::MIX, t_mix);
+                // 残差を退避域へ (次のチャンクが res を使う)。
+                if !crate::cuda::pf_res_park_save(ci, nt, hc, e) {
+                    Self::pf_bail("res の退避に失敗")?;
+                }
+            }
+            // ---- 2. 層で 1 回の MoE (expert 重みはここでしか運ばれない) ----
+            let t_moe = std::time::Instant::now();
+            ffn_all = {
+                let mixed_all: &[f32] = &mixed_buf.as_mut_slice()[..nt_all * e];
+                moe_ffn_quant_batch_tapped(
+                    &self.p,
+                    lw,
+                    mixed_all,
+                    nt_all,
+                    self.expert_cache.as_ref(),
+                    None,
+                    true,
+                    iv,
+                )?
+            };
+            q4prof::add(&q4prof::MOE, t_moe);
+            if ffn_all.len() != nt_all * e {
+                return Err(one(format!(
+                    "層 {il}: MoE の出力長 {} が nt {nt_all} * n_embd {e} と違う",
+                    ffn_all.len()
+                )));
+            }
+            // ---- 3. 全チャンクの combine ----
+            for (ci, &(start, end)) in ranges.iter().enumerate() {
+                let nt = end - start;
+                if !crate::cuda::pf_res_park_load(ci, nt, hc, e) {
+                    Self::pf_bail("res の退避域からの復帰に失敗")?;
+                }
+                if !crate::cuda::pf_combine(&ffn_all[start * e..end * e], nt, hc, e) {
+                    Self::pf_bail("ffn の combine に失敗")?;
+                }
+                if steer_rec {
+                    if !crate::cuda::pf_steer_acc(nt, hc, e, il) {
+                        Self::pf_bail("steer の記録に失敗")?;
+                    }
+                    steer::note_dev_tokens(nt as u64);
+                }
+                if end == nt_all {
+                    if let Some(r) = roles.as_deref() {
+                        emit_role_act(il, r);
+                    }
+                    if let Some(h) = on_layer.as_deref_mut() {
+                        let t = nt - 1;
+                        let mut row = vec![0.0f32; hc_dim];
+                        if !crate::cuda::pf_download_res_row(t, hc_dim, &mut row) {
+                            Self::pf_bail("層の出口フック用の res D2H に失敗")?;
+                        }
+                        h(&LayerOut {
+                            il,
+                            t,
+                            nt,
+                            n_embd: e,
+                            res: &row,
+                            roles: roles.as_deref(),
+                        })?;
+                    }
+                }
+                if !crate::cuda::pf_res_park_save(ci, nt, hc, e) {
+                    Self::pf_bail("res の退避に失敗")?;
+                }
+            }
+            prekprof::mark(t_lay, prekprof::LAYER);
+        }
+        // 最終チャンクの残差をホストへ (最終 mixer 用)。
+        let (lstart, lend) = *ranges.last().expect("ranges は空でない");
+        let lnt = lend - lstart;
+        let mut res_flat = vec![0.0f32; lnt * hc_dim];
+        if !crate::cuda::pf_download_res(&mut res_flat) {
+            Self::pf_bail("最終チャンクの res の D2H に失敗")?;
+        }
+        crate::cuda::pf_release();
+        if steer_rec {
+            steer::merge_device();
+        }
+        let mut ress: Vec<HyperStreams> = Vec::with_capacity(lnt);
+        for t in 0..lnt {
+            ress.push(HyperStreams {
+                data: res_flat[t * hc_dim..(t + 1) * hc_dim].to_vec(),
+                hc,
+                n_embd: e,
+            });
+        }
+        let res = ress.pop().ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
         let t_mix = headprof::stamp();
         let t_fin = prekprof::stamp();
         let cur = hc_mix_quant(

@@ -543,6 +543,26 @@ pub fn reg_bytes() -> usize {
     *N.get_or_init(|| env_usize(REG_MB_ENV, DEFAULT_REG_MB).saturating_mul(1 << 20))
 }
 
+/// `DENNO_PF_LM_LAYER=1`: prefill の層ループを層優先にする (task 227、既定 off)。
+///
+/// いまはチャンク優先 (チャンク → 全 48 層) なので、1 つの expert が
+/// **チャンクの数だけ** H2D で運ばれる (14k で 9 パス = 158.5 GB)。層優先にすると
+/// 1 プロンプトで 1 回 (48 層 × 512 本 = 50 GB が上限) になり、VRAM の
+/// expert キャッシュも要らない (同じ expert を二度使わない)。
+/// 代償は、層のあいだ全チャンクの残差を保持すること (n_tokens × n_embd × hc × 4)。
+pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
+
+/// `DENNO_PF_LM_LAYER` の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn lm_layer_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 層優先 prefill を使うか (プロセスで 1 回だけ env を読む)。
+pub fn lm_layer_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lm_layer_from_value(std::env::var(LM_LAYER_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_DMA_PROBE=1`: prefill の先頭で 1 回だけ H2D の素の速度を測る
 /// (診断専用・既定 off)。測るのは `[pf-probe]` の 1 行群で、数値経路は変えない。
 pub const DMA_PROBE_ENV: &str = "DENNO_PF_DMA_PROBE";
@@ -1420,6 +1440,13 @@ mod tests {
         assert!(!dma_probe_from_value(Some("off")));
         assert!(dma_probe_from_value(Some("1")));
         assert!(dma_probe_from_value(Some(" on ")));
+        // task 227: 層優先 prefill も明示的な真値だけ on。
+        assert!(!lm_layer_from_value(None));
+        assert!(!lm_layer_from_value(Some("")));
+        assert!(!lm_layer_from_value(Some("0")));
+        assert!(!lm_layer_from_value(Some("off")));
+        assert!(lm_layer_from_value(Some("1")));
+        assert!(lm_layer_from_value(Some(" yes ")));
         assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
         // task 197: チャンク上書きは「明示した正の数だけ」効く。
         assert_eq!(chunk_override_from_value(None), None);
