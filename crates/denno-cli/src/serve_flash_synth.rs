@@ -16,6 +16,7 @@ use super::{
 };
 use crate::flash_telemetry::Telemetry;
 use denno_engine::model::intervene as iv;
+use denno_engine::model::steer as steer;
 use denno_engine::gguf::GgufFile;
 use denno_engine::tok_gguf::GgufTokenizer;
 use denno_telemetry::Frame;
@@ -664,6 +665,16 @@ fn build_flash(dir: &TempDir) -> Flash {
             context: 64,
             layers: DEFAULT_LAYERS as u32,
         },
+    );
+    // task 218: 本番は `Flash` を組む時に `steer::init` を通る。テストはここで
+    // 直接組むので同じ初期化を 1 回入れる (DENNO_STEER_DIR はテストが先に設定する)。
+    steer::init(
+        steer::Shape {
+            n_layer: DEFAULT_LAYERS,
+            n_hc: 2,
+            n_embd: 256,
+        },
+        "synth",
     );
     Flash {
         parts: vec![path],
@@ -1754,4 +1765,178 @@ fn intervene_epoch_invalidates_both_contexts() {
         "epoch 変更後に古い prefix を再利用した"
     );
     std::env::remove_var("DENNO_FLASH_AUX_CTX");
+}
+
+// ---------------------------------------------------------------------------
+// task 218: 残差の平均の記録 / ステアリングの HTTP
+// ---------------------------------------------------------------------------
+
+#[test]
+fn steer_http_record_stop_apply_delete() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    let sdir = TempDir::new("steer-http-store");
+    std::env::set_var("DENNO_STEER_DIR", sdir.path("steer"));
+    let dir = TempDir::new("flash-steer-http");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+
+    // 空の状態
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/steer", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert!(v["recording"].is_null(), "最初から記録中: {v}");
+    assert_eq!(v["snapshots"], serde_json::json!([]));
+    assert!(v["apply"].is_null(), "最初から適用中: {v}");
+
+    // 記録開始 (2 回目はエラー = 取り違えを防ぐ)
+    let resp = http_roundtrip(
+        &mut flash,
+        &http_req("POST", "/v1/steer/record", r#"{"name":"A"}"#),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert_eq!(http_json(&resp)["recording"]["name"], "A");
+    let resp = http_roundtrip(
+        &mut flash,
+        &http_req("POST", "/v1/steer/record", r#"{"name":"B"}"#),
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 400 Bad Request"),
+        "二重開始が 400 でない: {resp}"
+    );
+
+    // 2 リクエスト回して記録を貯める
+    let req = gen_req(LONG_A);
+    let g0 = flash.generate(&req, no_emit).expect("gen0");
+    flash.generate(&req, no_emit).expect("gen1");
+    let (name, tokens) = steer::rec_status().expect("記録中でない");
+    assert_eq!(name, "A");
+    assert!(tokens > 0, "トークンが 0");
+
+    // 停止 → ディスクへ保存
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/steer/record/stop", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert!(v["recording"].is_null(), "止めたのに記録中: {v}");
+    assert_eq!(v["snapshots"][0]["name"], "A");
+    assert_eq!(v["snapshots"][0]["layers"], 4);
+    assert!(
+        v["snapshots"][0]["tokens"].as_u64().unwrap() > 0,
+        "保存したトークンが 0: {v}"
+    );
+    assert_eq!(v["saved"]["name"], "A");
+    assert!(sdir.path("steer").join("A.dns").exists(), "ファイルが無い");
+
+    // 停止の二重呼び出しは 400 (panic しない)
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/steer/record/stop", ""));
+    assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "{resp}");
+
+    // alpha 0 の適用: 生成が 1 文字も変わらない
+    let e_before = iv::current_epoch();
+    let body =
+        r#"{"terms":[{"snapshot":"A","coef":1.0}],"layers":[0,4],"alpha":0.0,"mode":"subtract"}"#;
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/steer/apply", body));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert_eq!(v["apply"]["mode"], "subtract");
+    assert_eq!(v["apply"]["layers"], serde_json::json!([0, 4]));
+    assert_eq!(v["apply"]["terms"][0]["snapshot"], "A");
+    assert!(iv::current_epoch() > e_before, "適用で epoch が進んでいない");
+    let g1 = flash.generate(&req, no_emit).expect("gen-alpha0");
+    assert_eq!(g1.text, g0.text, "alpha 0 で生成が変わった");
+
+    // 不正な入力は 400 で、適用は変わらない
+    let before = http_json(&http_roundtrip(&mut flash, &http_req("GET", "/v1/steer", "")));
+    let bad = [
+        r#"{"terms":[],"layers":[0,4]}"#,
+        r#"{"terms":[{"snapshot":"nope","coef":1.0}],"layers":[0,4]}"#,
+        r#"{"terms":[{"snapshot":"A","coef":"x"}],"layers":[0,4]}"#,
+        r#"{"terms":[{"snapshot":"A","coef":1.0}],"layers":[0,5]}"#,
+        r#"{"terms":[{"snapshot":"A","coef":1.0}],"layers":[3,1]}"#,
+        r#"{"terms":[{"snapshot":"A","coef":1.0}],"layers":[0,4],"mode":"sigmoid"}"#,
+        r#"{"terms":[{"snapshot":"A","coef":1.0}]}"#,
+        r#"{"terms":[{"snapshot":"A","coef":1.0}],"layers":[0,4],"nope":1}"#,
+        r#"[]"#,
+        r#"not json"#,
+    ];
+    for b in bad {
+        let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/steer/apply", b));
+        assert!(
+            resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "入力 {b} が 400 でない: {resp}"
+        );
+        let v = http_json(&resp);
+        assert!(
+            v["error"]["message"].as_str().map(|m| !m.is_empty()).unwrap_or(false),
+            "エラーメッセージが無い: {v}"
+        );
+    }
+    let after = http_json(&http_roundtrip(&mut flash, &http_req("GET", "/v1/steer", "")));
+    assert_eq!(before["apply"], after["apply"], "400 の入力で適用が変わった");
+
+    // 適用を消す (epoch が進む)
+    let e_mid = iv::current_epoch();
+    let resp = http_roundtrip(&mut flash, &http_req("DELETE", "/v1/steer/apply", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(http_json(&resp)["apply"].is_null());
+    assert!(iv::current_epoch() > e_mid, "解除で epoch が進んでいない");
+
+    // スナップショットを消す
+    let resp = http_roundtrip(
+        &mut flash,
+        &http_req("DELETE", "/v1/steer/snapshots/A", ""),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert_eq!(http_json(&resp)["snapshots"], serde_json::json!([]));
+    assert!(!sdir.path("steer").join("A.dns").exists(), "ファイルが残った");
+    // 無い名前の削除は 400
+    let resp = http_roundtrip(
+        &mut flash,
+        &http_req("DELETE", "/v1/steer/snapshots/A", ""),
+    );
+    assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "{resp}");
+    std::env::remove_var("DENNO_STEER_DIR");
+}
+
+/// task 218: 実際に減算するとテキストが変わる (効いている証拠)。
+#[test]
+fn steer_subtract_changes_the_text() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    let sdir = TempDir::new("steer-sub-store");
+    std::env::set_var("DENNO_STEER_DIR", sdir.path("steer"));
+    let dir = TempDir::new("flash-steer-sub");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let req = gen_req(LONG_A);
+    let g0 = flash.generate(&req, no_emit).expect("base");
+
+    // 記録 → 停止
+    let resp = http_roundtrip(
+        &mut flash,
+        &http_req("POST", "/v1/steer/record", r#"{"name":"A"}"#),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    flash.generate(&req, no_emit).expect("rec");
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/steer/record/stop", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    // 平均が 0 でないこと (係数 1 で引くと必ず変わる大きさ)
+    let snaps = steer::snapshots();
+    let s = &snaps[0];
+    let mx = s.mean.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    assert!(mx > 1e-6, "平均が全部 0");
+
+    // subtract alpha 1
+    let body =
+        r#"{"terms":[{"snapshot":"A","coef":1.0}],"layers":[0,4],"alpha":1.0,"mode":"subtract"}"#;
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/steer/apply", body));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let g1 = flash.generate(&req, no_emit).expect("sub");
+    assert_ne!(g1.text, g0.text, "subtract してもテキストが変わらない");
+    // 消せば戻る
+    let resp = http_roundtrip(&mut flash, &http_req("DELETE", "/v1/steer/apply", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let g2 = flash.generate(&req, no_emit).expect("back");
+    assert_eq!(g2.text, g0.text, "解除してもテキストが戻らない");
+    std::env::remove_var("DENNO_STEER_DIR");
 }

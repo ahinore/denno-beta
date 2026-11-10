@@ -41,6 +41,7 @@ use crate::model::expert_cache::{self, CacheSpec, ExpertCacheSet, ExpertKey, Exp
 use crate::model::expert_vram::{self, Route};
 use crate::model::hyper::{self, HyperParams, HyperStreams};
 use crate::model::intervene::{self, Block as IvBlock, View as IvView};
+use crate::model::steer;
 use crate::model::linear_gguf::GgufLinear;
 use crate::model::moe::{
     select_topk, select_topk_into, select_topk_into_fast, select_topk_into_mask,
@@ -2379,6 +2380,10 @@ impl Qwen4Exp {
             n_expert_used: p.n_expert_used,
             n_hc: p.n_hc,
         });
+        // task 218: 残差の平均の記録 / ステアリングの初期化は **serve_flash が
+        // 起動時に 1 回だけ**行う (`Flash` を組むところ。`cfg.dir` からモデル id を
+        // 決める)。エンジン側では初期化しない — 2 箇所で初期化するとモデル id が
+        // 食い違ってスナップショットを取り違えるため。
 
         let tok_embd = linear(f, "token_embd.weight")?;
         let head = HeadW::load(f)?;
@@ -2656,6 +2661,11 @@ impl Qwen4Exp {
         // 以降の層ループは `&iv` を参照するだけで、ホットパスにロックは無い。
         let iv_cfg = intervene::snapshot();
         let iv = IvView::of(&iv_cfg);
+        // task 218: 残差の平均の記録 / ステアリング。適用の設定も step の先頭で
+        // 1 回だけ読む (層ループの中では Arc を参照するだけ)。
+        let steer_state = steer::snapshot();
+        let steer_apply = steer_state.apply.as_ref();
+        let steer_rec = steer::rec_on();
         // P78: 逐次 prefill の中だけ層の外を区間計測する (decode では false)。
         let prof = prekprof::measuring();
         // task 132: decode の層の外の内訳 (`DENNO_Q4_PROFILE`)。無効なら
@@ -2706,6 +2716,11 @@ impl Qwen4Exp {
             // P56: RouterTopK はこの呼び出しの最終トークンだけ (`t + 1 == nt`)。
             // decode は (0, 1) なので常に真、逐次 prefill は末尾の 1 トークンだけ。
             // P58 の RoleAct も同じ規則。
+            // task 218: ステアリングは層の入口 (層 `il-1` の出口と同じ点) に掛け、
+            // 記録は層の出口で取る。
+            if let Some(a) = steer_apply {
+                a.apply_one(il, &mut res.data);
+            }
             self.run_layer(
                 il,
                 &mut res,
@@ -2718,6 +2733,9 @@ impl Qwen4Exp {
                 t + 1 == nt,
                 iv,
             )?;
+            if steer_rec {
+                steer::acc_host(il, &res.data);
+            }
             if let Some(h) = on_layer.as_deref_mut() {
                 // task 155: 層の出口 (`LayerOut` の組み立てと `on_layer`) を `loop` 行に。
                 let _l = q4ledger::enter(q4ledger::LOOP);
@@ -3575,6 +3593,28 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
         }
+        // task 218: 記録 / ステアリングもデバイスで閉じられるか**層を進める前に**見る。
+        // steer の PTX が無い・確保できないときは常駐連鎖を諦め、呼び出し側が
+        // ホスト経路で記録 / 適用する (値は同じ、速度だけ落ちる)。
+        let steer_state = steer::snapshot();
+        let steer_apply = steer_state.apply.as_ref();
+        let steer_rec = steer::rec_on();
+        let steer_dev_apply = steer_apply
+            .map(|a| a.from < n_layer && a.to > 0)
+            .unwrap_or(false);
+        if steer_rec && !crate::cuda::pf_steer_acc_ensure(n_layer, hc, e) {
+            crate::cuda::pf_release();
+            Self::pf_note_decline("steer の加算域が使えない");
+            return Ok(None);
+        }
+        if steer_dev_apply {
+            let a = steer_apply.expect("steer_dev_apply は apply があるときだけ真");
+            if !crate::cuda::pf_steer_apply_begin(&a.v, n_layer, hc, e) {
+                crate::cuda::pf_release();
+                Self::pf_note_decline("steer の v をデバイスへ置けない");
+                return Ok(None);
+            }
+        }
         // task 209: `DENNO_PF_PIN` のときは mix の出力 (mix の D2H の宛先、
         // router と shared の H2D の元) を pinned ホストメモリに置く。同じ
         // バイト列がページャブル経由より速く動く (値は 1 bit も変わらない)。
@@ -3625,6 +3665,15 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 if let Some(d) = roles.as_deref_mut() {
                     *d = RoleRms::default();
                 }
+                // task 218: ステアリング (層の入口 = 層 `il-1` の出口と同じ点)。
+                if steer_dev_apply && steer_apply.map(|a| a.covers(il)).unwrap_or(false) {
+                    let a = steer_apply.expect("covers が真なら apply がある");
+                    let mode = if a.mode == steer::Mode::Project { 1u8 } else { 0u8 };
+                    if !crate::cuda::pf_steer_apply(nt, hc, e, il, mode, a.alpha) {
+                        Self::pf_bail("steer の適用に失敗")?;
+                    }
+                }
+
                 // 3.1 PLE 注入 (層 1 のみ)。conv 履歴はトークン順に進める。
                 // ホストで回すので、この層だけ res を往復する。
                 if let Some(pw) = &lw.ple {
@@ -3834,6 +3883,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 if !crate::cuda::pf_combine(&ffn, nt, hc, e) {
                     Self::pf_bail("ffn の combine に失敗")?;
                 }
+                // task 218: 層の出口の残差をデバイスで加算する (D2H しない)。
+                if steer_rec && !crate::cuda::pf_steer_acc(nt, hc, e, il) {
+                    Self::pf_bail("steer の記録に失敗")?;
+                }
                 if end == ctx.len() {
                     if let Some(r) = roles.as_deref() {
                         emit_role_act(il, r);
@@ -3856,6 +3909,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     })?;
                 }
             }
+            if steer_rec {
+                steer::note_dev_tokens(nt as u64);
+            }
             prekprof::mark(t_lay, prekprof::LAYER);
             // 最終チャンクだけ、最終 mixer 用に残差をホストへ戻す。
             if end == ctx.len() {
@@ -3875,6 +3931,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             start = end;
         }
         crate::cuda::pf_release();
+        // task 218: デバイスの加算域をホストへ降ろす (加算したスレッドで 1 回)。
+        if steer_rec {
+            steer::merge_device();
+        }
         let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
         let t_mix = headprof::stamp();
         let t_fin = prekprof::stamp();
@@ -3948,6 +4008,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 217: 介入設定は **prefill 1 回の先頭で 1 回だけ**読む。
         let iv_cfg = intervene::snapshot();
         let iv = IvView::of(&iv_cfg);
+        // task 218: 残差の平均の記録 / ステアリング (ホスト経路)。
+        let steer_state = steer::snapshot();
+        let steer_apply = steer_state.apply.as_ref();
+        let steer_rec = steer::rec_on();
         // task 154: hc mix / combine のデバイス常駐 (`DENNO_PF_RESIDENT`)。
         // 観測フック付き (`on_layer`) と全位置 logits (`collect_all`) は
         // 従来経路だけが受ける (常駐経路は層の出口をホストへ出さない)。
@@ -4041,6 +4105,13 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
                 if let Some(d) = roles.as_deref_mut() {
                     *d = RoleRms::default();
+                }
+
+                // task 218: ステアリングは層の入口 (層 `il-1` の出口と同じ点)。
+                if let Some(a) = steer_apply {
+                    for t in 0..nt {
+                        a.apply_one(il, &mut ress[t].data);
+                    }
                 }
 
                 // 3.1 PLE 注入 (層 1 のみ)。conv 履歴はトークン順に進める。
@@ -4189,6 +4260,12 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         iv.stream_keep(il, hp.hc),
                     );
 
+                }
+
+                // task 218: 層の出口 (2 つの combine を終えた後) の残差を記録する。
+                if steer_rec {
+                    let rows: Vec<&[f32]> = (0..nt).map(|t| ress[t].data.as_slice()).collect();
+                    steer::acc_host_rows(il, &rows);
                 }
 
                 // P58: 層の役割別活性 (kind 13)。prefill は**最後のチャンクの末尾**

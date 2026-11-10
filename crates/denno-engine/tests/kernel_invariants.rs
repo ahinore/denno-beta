@@ -8364,10 +8364,11 @@ fn pf_mix_stage_sync_uses_an_event() {
         "upload が非ブロッキングである根拠 (と 0x01 の定義) が消えた"
     );
     // mix と combine の両方がこの同期を通る (片方だけだと待ちが残る)。
+    // task 218: 残差の平均の加算 / ステアリングの 2 本も同じ同期を通る (計 4)。
     assert_eq!(
         CUDA_RS.matches("pf_stage_sync(ctx)").count(),
-        2,
-        "pf_mix / pf_combine の両方が pf_stage_sync を通っていない"
+        4,
+        "pf_mix / pf_combine (+ task 218 の steer 2 本) が pf_stage_sync を通っていない"
     );
     // 計測器 (DENNO_PF_MIX_KPROF) は段の前後にイベントを打っている。
     for k in [

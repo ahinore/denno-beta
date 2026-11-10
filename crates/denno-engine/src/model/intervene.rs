@@ -287,26 +287,55 @@ pub fn snapshot() -> Arc<Config> {
 }
 
 /// 現在の epoch。
+///
+/// task 218: ステアリング (残差の平均の適用) も同じカウンタを進めるので、
+/// ピン中はそのピンした値、そうでなければ**グローバルの最新値**を返す。
+/// prefix cache はこの値が変わったら文脈を捨てる。
 pub fn current_epoch() -> u64 {
-    snapshot().epoch()
+    match pinned_entry() {
+        Some(p) => p.epoch,
+        None => epoch_now(),
+    }
+}
+
+/// グローバルの epoch (ピンを見ない)。ステアリングの変更もこれを進める。
+pub fn epoch_now() -> u64 {
+    EPOCH.load(Ordering::SeqCst)
+}
+
+/// epoch を 1 つ進めて新しい値を返す (task 218 のステアリングが使う)。
+pub(crate) fn bump_epoch() -> u64 {
+    EPOCH.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn pinned_entry() -> Option<PinEntry> {
+    PINS.with(|p| p.borrow().last().cloned())
 }
 
 fn pinned() -> Option<Arc<Config>> {
-    PINS.with(|p| p.borrow().last().cloned())
+    pinned_entry().map(|p| p.cfg)
+}
+
+/// リクエスト中に固定した設定 (epoch も一緒に固定する)。
+#[derive(Clone)]
+struct PinEntry {
+    cfg: Arc<Config>,
+    epoch: u64,
 }
 
 thread_local! {
     /// リクエスト中に固定した設定のスタック ([`pin_request`])。
-    static PINS: RefCell<Vec<Arc<Config>>> = const { RefCell::new(Vec::new()) };
+    static PINS: RefCell<Vec<PinEntry>> = const { RefCell::new(Vec::new()) };
 }
 
 /// リクエスト 1 本の間、いまの設定を固定する。
 ///
 /// 生成の途中で `POST /v1/intervene` が来ても、このガードが生きている間は
 /// [`snapshot`] が固定した設定を返すので、走っている生成の数値は変わらない。
-/// ドロップで解除する (入れ子も可)。
+/// ドロップで解除する (入れ子も可)。task 218 のステアリングも同時に固定する。
 pub struct Pin {
     _priv: (),
+    _steer: crate::model::steer::SteerPin,
 }
 
 impl Drop for Pin {
@@ -319,12 +348,17 @@ impl Drop for Pin {
 
 /// いまの設定を固定する。[`Pin`] をドロップするまで解除されない。
 pub fn pin_request() -> Pin {
-    let c = {
+    let (c, epoch) = {
         let g = cell().read().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(&g)
+        (Arc::clone(&g), EPOCH.load(Ordering::SeqCst))
     };
-    PINS.with(|p| p.borrow_mut().push(c));
-    Pin { _priv: () }
+    PINS.with(|p| {
+        p.borrow_mut().push(PinEntry { cfg: c, epoch })
+    });
+    Pin {
+        _priv: (),
+        _steer: crate::model::steer::pin_request(),
+    }
 }
 
 fn install(build: impl FnOnce(u64) -> Config) -> Arc<Config> {
