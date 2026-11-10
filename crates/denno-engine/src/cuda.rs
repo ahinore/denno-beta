@@ -1615,28 +1615,42 @@ pub(crate) mod dec_kprof {
             assert_eq!(v4_lanes_for(6_144, 20), 16);
         }
 
-        /// task 192: 4 つの新しいゲートはどれも「未設定 = 既定 on、
-        /// 明示的な偽値だけ off」。A/B と切り戻しの土台。
+        /// task 192: 4 つの新しいゲートの既定。q5k と full_dec_fast は「未設定 =
+        /// 既定 on、明示的な偽値だけ off」。fold / upw は task 213 の lab t213b で
+        /// 目標に届かなかったので **既定 off** (明示的な真値だけ on) に戻した。
+        /// A/B と切り戻しの土台。
         #[test]
         fn task192_gates_default_on_and_explicit_off() {
             for raw in [None, Some(""), Some("  "), Some("1"), Some("on"), Some("x")] {
                 assert!(parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
-                assert!(parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
-                assert!(parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
                 assert!(!parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
-                assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
-                assert!(!parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             // 大小文字と前後の空白は無視する。
             for raw in [Some("OFF"), Some(" Off "), Some("NO")] {
                 assert!(!parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
-                assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
+            }
+            // task 213: fold / upw は既定 off。未設定・空・偽値は off、真値だけ on。
+            for raw in [
+                None,
+                Some(""),
+                Some("  "),
+                Some("0"),
+                Some("off"),
+                Some("false"),
+                Some("no"),
+                Some("x"),
+            ] {
+                assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!parse_mix_dec_upw(raw), "upw raw={raw:?}");
+            }
+            for raw in [Some("1"), Some("on"), Some(" ON "), Some("true"), Some("yes")] {
+                assert!(parse_mix_dec_fold(raw), "fold raw={raw:?}");
+                assert!(parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             // task 192: router early は lab t192a で +0.0% だったので **既定 off**。
             for raw in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no"), Some("x")] {
@@ -24056,22 +24070,26 @@ const MIX_FOLD_NARGS: usize = 9;
 
 /// `DENNO_MIX_DEC_FOLD` の解釈 (純関数)。
 ///
-/// 既定 on。**明示的な偽値だけが off** (未設定・空は既定)。
+/// **既定 off** (task 213 の lab t213b で採否 no)。明示的な真値だけ on。
+/// t213b の実測 (base2 比、128 トークンの生秒): 短い点 -1.7% / -2.4%、
+/// 3,965 -2.8% で目標 (3%) に届かず、14k は fold 単独で +6.5% / +8.9%
+/// (cold prefill も +3.2%)。深い点の md5 は常駐の入れ替わりで DIFF し、
+/// 出力テキストも変わる (丸めだけの変更ではない)。PTX は opt-in 用に残す。
 fn parse_mix_dec_fold(raw: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("0") | Some("off") | Some("false") | Some("no")
+        Some("1") | Some("on") | Some("true") | Some("yes")
     )
 }
 
 /// `DENNO_MIX_DEC_UPW` の解釈 (純関数)。
 ///
-/// mix の up 投影を 1 warp = 1 行の版で回すか。既定 on。明示的な偽値だけ off。
+/// mix の up 投影を 1 warp = 1 行の版で回すか。**既定 off** (fold と同じ lab)。
 /// fold (`DENNO_MIX_DEC_FOLD`) とは独立に切れる (別の cond で測るため)。
 fn parse_mix_dec_upw(raw: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("0") | Some("off") | Some("false") | Some("no")
+        Some("1") | Some("on") | Some("true") | Some("yes")
     )
 }
 
@@ -45830,9 +45848,11 @@ mod task204_tests {
         );
     }
 
-    /// task 204: task 192 の 2 本の PTX (`mix_dev2` / `mix_up`) が**リポジトリに
-    /// ある**こと。既定 on のゲート (`DENNO_MIX_DEC_FOLD` / `DENNO_MIX_DEC_UPW`) が
-    /// 静かに従来経路へ落ちていた (task 204 で回収した)。引数数の契約も固定する。
+    /// task 192: task 192 の 2 本の PTX (`mix_dev2` / `mix_up`) が**リポジトリに
+    /// ある**こと。task 204 では既定 on のゲート (`DENNO_MIX_DEC_FOLD` /
+    /// `DENNO_MIX_DEC_UPW`) が静かに従来経路へ落ちていた。task 213 の lab で
+    /// 採否 no になったので既定は off に戻したが、opt-in (=1) で使う PTX は残す。
+    /// 引数数の契約も固定する。
     #[test]
     fn task192_fold_and_upw_ptx_are_present() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");

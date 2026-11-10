@@ -13,9 +13,10 @@
 //!   実在を検査する (cuda feature 無しでも走る)。
 //!
 //! 台帳の各行は**既定で on のゲート**だけを持つ。既定 off のゲート (例:
-//! `DENNO_PF_MIX_INJ`, `DENNO_DEC_EXPGU`) は、明示的に on にしたときだけ PTX が要る
-//! のでここには入れない。`on` は実際のゲート関数を指すので、既定を変えたのに台帳を
-//! 直し忘れると `--lib` の監査テストが落ちる。
+//! `DENNO_MIX_DEC_FOLD` / `DENNO_MIX_DEC_UPW` (task 213 の lab で採否 no)、
+//! `DENNO_PF_MIX_INJ`、`DENNO_DEC_EXPGU`) は、明示的に on にしたときだけ PTX が
+//! 要るのでここには入れない。`on` は実際のゲート関数を指すので、既定を変えたのに
+//! 台帳を直し忘れると `--lib` の監査テストが落ちる。
 
 use std::path::{Path, PathBuf};
 
@@ -58,20 +59,6 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         entries: &["dno_mix_norm", "dno_mix_inj"],
         path_env: "DENNO_MIX_DEV_PTX",
         on: crate::cuda::mix_dec_dev_enabled,
-    },
-    GatePtx {
-        env: "DENNO_MIX_DEC_FOLD",
-        ptx: "kernels_mix_dev2.ptx",
-        entries: &["dno_mix_norm_inj"],
-        path_env: "DENNO_MIX_FOLD_PTX",
-        on: crate::cuda::mix_dec_fold_on,
-    },
-    GatePtx {
-        env: "DENNO_MIX_DEC_UPW",
-        ptx: "kernels_mix_up.ptx",
-        entries: &["dno_mix_up_bf16"],
-        path_env: "DENNO_MIX_UP_PTX",
-        on: crate::cuda::mix_dec_upw_on,
     },
     GatePtx {
         env: "DENNO_ATTN_FLASHDEC",
