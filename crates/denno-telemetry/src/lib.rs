@@ -50,6 +50,9 @@ pub mod kind {
     /// 13..15 は arch_telemetry 側の RoleAct (13) / ExpertResidency (14) /
     /// TierStats (15) が使う。番号を詰めない (kind はブランチを跨いで同じ意味にする)。
     pub const ROUTER_TOPK: u8 = 16;
+
+    /// task 220: ルータが選びたかったが介入で無効化されていた expert (ビューワ用)。
+    pub const EXPERT_SKIP: u8 = 17;
 }
 
 pub const MAGIC: [u8; 4] = *b"DNTL";
@@ -280,6 +283,17 @@ pub enum Frame {
     /// 送出は `DENNO_TELEMETRY_ARCH` が立っているときだけ (既定 off)。
     /// decode は 1 トークンにつき層数ぶん、prefill はチャンク末尾の 1 トークンだけ。
     RouterTopK { layer: u16, experts: Vec<u16>, weights: Vec<u16> },
+    /// 1 層の MoE で**ルータが選びたかったが、介入で無効化されていた** expert。
+    ///
+    /// `experts` は「無効化が無ければ top-k に入っていた expert のうち、実際には
+    /// 使わなかったもの」を index 昇順で並べたもの。介入で expert を切っている層で
+    /// だけ、[`Frame::RouterTopK`] と同じタイミング (decode は毎トークン、prefill は
+    /// チャンク末尾) で送る。
+    ///
+    /// ビューワは「この expert はルータに選ばれていたが切った」をこれで描ける。
+    /// **既定 off**: `DENNO_TELEM_EXPERT_SKIP=1` のときだけ作る (off はフラグ 1 個の
+    /// 分岐だけで、確保も余分な top-k もしない)。`DENNO_TELEMETRY_ARCH` も要る。
+    ExpertSkip { layer: u16, experts: Vec<u16> },
 }
 
 impl Frame {
@@ -301,6 +315,7 @@ impl Frame {
             Frame::ExpertResidency { .. } => kind::EXPERT_RESIDENCY,
             Frame::TierStats { .. } => kind::TIER_STATS,
             Frame::RouterTopK { .. } => kind::ROUTER_TOPK,
+            Frame::ExpertSkip { .. } => kind::EXPERT_SKIP,
         }
     }
 
@@ -424,6 +439,13 @@ impl Frame {
                 // 重みは experts と同じ本数を f16 ビット (2B, LE) で並べる。
                 for &w in weights {
                     b.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+            Frame::ExpertSkip { layer, experts } => {
+                put_varint_u32(&mut b, *layer as u32);
+                put_varint_u32(&mut b, experts.len() as u32);
+                for &e in experts {
+                    put_varint_u32(&mut b, e as u32);
                 }
             }
         }
@@ -629,6 +651,19 @@ impl Frame {
                     weights.push(u16::from_le_bytes(wb));
                 }
                 Frame::RouterTopK { layer, experts, weights }
+            }
+            kind::EXPERT_SKIP => {
+                let layer = u32v(p, &mut i)? as u16;
+                let n = u32v(p, &mut i)? as usize;
+                let mut experts = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let e = u32v(p, &mut i)?;
+                    if e > u16::MAX as u32 {
+                        return Err(format!("expert_skip: expert index {e} が u16 を超える"));
+                    }
+                    experts.push(e as u16);
+                }
+                Frame::ExpertSkip { layer, experts }
             }
             other => return Err(format!("unknown kind: {other}")),
         };
@@ -1101,6 +1136,22 @@ pub fn router_topk_frame(layer: u16, sel: &[usize], weights: &[f32]) -> Frame {
     Frame::RouterTopK { layer, experts, weights: w }
 }
 
+/// task 220: 「ルータが選びたかったが介入で無効化されていた expert」から
+/// [`Frame::ExpertSkip`] を作る。`skipped` は index 昇順 (差分の作り方が昇順) を
+/// 前提にし、`u16` へ飽和させる。空ならビューワに描くものが無いので `None`。
+///
+/// 呼び出し側 (engine) は `DENNO_TELEM_EXPERT_SKIP=1` のときだけこれを呼ぶ。
+pub fn expert_skip_frame(layer: u16, skipped: &[usize]) -> Option<Frame> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let experts: Vec<u16> = skipped
+        .iter()
+        .map(|&e| e.min(u16::MAX as usize) as u16)
+        .collect();
+    Some(Frame::ExpertSkip { layer, experts })
+}
+
 /// 消費側: 1 フレームを受信 (タイムアウト付き)。サーバーの WS 転送タスクが使う。
 pub fn try_recv_timeout(d: Duration) -> Option<Frame> {
     let rx = RX.get()?;
@@ -1324,6 +1375,9 @@ mod tests {
                 experts: (0..10u16).map(|i| 502 + i).collect(),
                 weights: (0..10u16).map(|i| 0x3c00 - i * 13).collect(),
             },
+            // task 220: ExpertSkip (1 本 / 実形の top-k ぶん)
+            Frame::ExpertSkip { layer: 5, experts: vec![0] },
+            Frame::ExpertSkip { layer: 47, experts: (0..10u16).map(|i| 300 + i).collect() },
         ];
         for f in frames {
             let enc = f.encode();
@@ -1338,6 +1392,7 @@ mod tests {
         assert_eq!(kind::EXPERT_RESIDENCY, 14);
         assert_eq!(kind::TIER_STATS, 15);
         assert_eq!(kind::ROUTER_TOPK, 16, "kind 番号は 13..15 (RoleAct 等) の次");
+        assert_eq!(kind::EXPERT_SKIP, 17, "task 220 の ExpertSkip は 16 の次");
     }
 
     /// P54: 役割別活性の正規化 (層内最大で割る) とフレーム化。
@@ -1470,6 +1525,21 @@ mod tests {
                 assert_eq!(weights.len(), 2);
             }
             other => panic!("RouterTopK でない: {other:?}"),
+        }
+    }
+
+    /// task 220: ExpertSkip のフレーム化 (空は送らない / index は u16 に飽和)。
+    #[test]
+    fn expert_skip_frame_is_absent_when_empty() {
+        assert_eq!(expert_skip_frame(3, &[]), None, "空の skip を送っている");
+        assert_eq!(
+            expert_skip_frame(3, &[0, 511]),
+            Some(Frame::ExpertSkip { layer: 3, experts: vec![0, 511] })
+        );
+        // 範囲外の index で panic しない (u16 に飽和)。
+        match expert_skip_frame(1, &[70_000]) {
+            Some(Frame::ExpertSkip { experts, .. }) => assert_eq!(experts, vec![u16::MAX]),
+            other => panic!("ExpertSkip でない: {other:?}"),
         }
     }
 

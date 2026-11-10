@@ -18,12 +18,14 @@
 export const VIEW_SCHEMA = 1;
 
 /// 実モデル (Qwen3.8-Flash-Next) の形。shape が 404 のときの既定値でもある。
+/// `ple_layers` は実サーバーの `GET /v1/model/shape` が返す (task 220。実モデルは層 2)。
 export const DEFAULT_SHAPE_RAW = Object.freeze({
   layers: 48,
   n_expert: 512,
   n_expert_used: 10,
   n_hc: 4,
   n_embd: 2560,
+  ple_layers: [2],
 });
 
 export const BLOCKS = Object.freeze(['attn', 'moe', 'shared', 'ple']);
@@ -390,6 +392,14 @@ export function residencyBits(frame, n_expert) {
   return out;
 }
 
+/// task 220: ExpertSkip → expert ごとの 0/1 (ルータが選びたかったが介入で切った)。
+export function skipBits(frame, n_expert) {
+  const out = new Uint8Array(n_expert);
+  if (!frame || frame.kind !== 'ExpertSkip') return out;
+  for (const e of frame.experts || []) if (e >= 0 && e < n_expert) out[e] = 1;
+  return out;
+}
+
 /// 行のどこが光るか。mixer は層種別で attn / gdn を選ぶ。
 export function roleForBlock(role, block, kind) {
   const r = role || {};
@@ -453,6 +463,7 @@ export function createMapState(shape, opts = {}) {
     token: 0,
     experts: [],
     residency: [],
+    skip: [],
     role: [],
     act: [],
     lastToken: null,
@@ -461,6 +472,7 @@ export function createMapState(shape, opts = {}) {
   for (let l = 0; l < s.layers; l++) {
     st.experts.push(new Float32Array(s.n_expert));
     st.residency.push(new Uint8Array(s.n_expert));
+    st.skip.push(new Uint8Array(s.n_expert));
     st.role.push({ attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 });
     st.act.push(new Float32Array(ACT_BUCKETS));
   }
@@ -479,6 +491,7 @@ export function createMapState(shape, opts = {}) {
     for (let l = 0; l < s.layers; l++) {
       st.experts[l].fill(0);
       st.residency[l].fill(0);
+      st.skip[l].fill(0);
       st.role[l] = { attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 };
       st.act[l].fill(0);
     }
@@ -526,6 +539,13 @@ export function createMapState(shape, opts = {}) {
         st.frames++;
         return true;
       }
+      case 'ExpertSkip': {
+        // task 220: ルータが選びたかったが介入で切った expert。層ごとに置き換える
+        // (RouterTopK と同じ「最後の 1 トークン」の意味)。
+        st.skip[l].set(skipBits(f, s.n_expert));
+        st.frames++;
+        return true;
+      }
       default:
         return false;
     }
@@ -537,7 +557,13 @@ export function createMapState(shape, opts = {}) {
 // ---- ステアリング ---------------------------------------------------------
 
 /// 画面の入力 → POST /v1/steer/apply の本文。不正は例外 (画面は赤字で出す)。
-export function steerApplyBody(spec) {
+///
+/// 実 API (task 218) の規則に合わせる:
+/// - `terms[].coef` は有限なら 0 も負も可 (0 は 1 ビットも変えない)
+/// - `alpha` は有限なら負も可 (実 API は符号を見ない)
+/// - `layers` は `[from, to)`。`to` は層数まで (含まない)。`from == to` は空範囲で可
+/// - `opts.nLayers` を渡すと `to > nLayers` を弾く (実 API は 400)
+export function steerApplyBody(spec, opts = {}) {
   const src = spec || {};
   const terms = src.terms;
   if (!Array.isArray(terms) || terms.length === 0) {
@@ -548,8 +574,8 @@ export function steerApplyBody(spec) {
       throw new Error('terms[' + i + '].snapshot is required');
     }
     const coef = Number(t.coef);
-    if (!Number.isFinite(coef) || coef === 0) {
-      throw new Error('terms[' + i + '].coef must be a non-zero number');
+    if (!Number.isFinite(coef)) {
+      throw new Error('terms[' + i + '].coef must be a finite number');
     }
     return { snapshot: t.snapshot, coef };
   });
@@ -559,8 +585,12 @@ export function steerApplyBody(spec) {
   const to = intOr(layers[1], -1);
   if (from < 0 || to < 0) throw new Error('layers: from/to must be >= 0');
   if (from > to) throw new Error('layers: from must be <= to');
+  const nLayers = intOr(opts.nLayers, 0);
+  if (nLayers > 0 && to > nLayers) {
+    throw new Error('layers: to must be <= ' + nLayers + ' ([from, to) の to は層数まで)');
+  }
   const alpha = src.alpha == null ? 1 : Number(src.alpha);
-  if (!Number.isFinite(alpha) || alpha < 0) throw new Error('alpha: must be a number >= 0');
+  if (!Number.isFinite(alpha)) throw new Error('alpha: must be a finite number');
   const mode = src.mode == null ? 'subtract' : String(src.mode);
   if (STEER_MODES.indexOf(mode) < 0) throw new Error('mode: subtract or project');
   return { terms: outTerms, layers: [from, to], alpha, mode };
@@ -583,12 +613,29 @@ function jsonClone(v) {
   return v == null ? v : JSON.parse(JSON.stringify(v));
 }
 
-/// shape が返らないときの API 代役。handle(method, path, body) -> {status, body}。
-/// 実 API と同じ規則: POST /v1/intervene は全置換、DELETE は全消し、epoch は
-/// 状態を変えるたびに 1 増える。
+/// 実 API (task 217/218) の検証と同じ規則。エラーは 400 で
+/// `{type:'error', error:{type:'invalid_request_error', message}}`。
+function apiError(message) {
+  return { type: 'error', error: { type: 'invalid_request_error', message } };
+}
+
+/// ステアリングの snapshot 名 (engine の `steer::validate_name` と同じ)。
+const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/// shape が 404 のときの API 代役。`handle(method, path, body)` -> `{status, body}`。
+///
+/// **実 API と同じ規則**にしてある (task 220 で差分を全部寄せた):
+/// - `POST /v1/intervene` は 3 配列の全置換。未知フィールド・範囲外・層あたりの
+///   残り expert < n_expert_used は 400。並びは (層, 種別) の昇順・重複なし。
+/// - epoch は介入の set / clear、ステアリングの apply / clear、適用中の snapshot の
+///   削除で 1 増える (記録の開始 / 停止では増えない)。
+/// - ステアリングのエラーは全部 400 (実 API は 404/409 を使わない)。
+/// - 同名 snapshot は上書きできる (engine の `push_snapshot` が名前で置換する)。
+/// - snapshot の `layers` は層数 (数値)。apply の `layers` は `[from, to)` の配列。
 export function createMockStore(shape, opts = {}) {
   const s = normaliseShape(shape || DEFAULT_SHAPE_RAW);
-  const now = typeof opts.now === 'function' ? opts.now : () => new Date().toISOString();
+  // 実 API の `created` は UNIX 秒 (engine の `now_secs`)。ISO 文字列ではない。
+  const now = typeof opts.now === 'function' ? opts.now : () => Math.floor(Date.now() / 1000);
   const st = {
     epoch: 0,
     experts_off: [],
@@ -602,11 +649,16 @@ export function createMockStore(shape, opts = {}) {
   let tick = 0;
 
   function err(status, message) {
-    return { status, body: { error: { message } } };
+    return { status, body: apiError(message) };
   }
 
   function validIntervene(body) {
-    if (!body || typeof body !== 'object') return 'body must be an object';
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return 'body must be an object';
+    for (const k of Object.keys(body)) {
+      if (['experts_off', 'blocks_off', 'streams_off'].indexOf(k) < 0) {
+        return 'unknown field ' + JSON.stringify(k) + ' (experts_off / blocks_off / streams_off only)';
+      }
+    }
     const lists = [['experts_off', 2], ['blocks_off', 2], ['streams_off', 2]];
     for (const [name, arity] of lists) {
       const v = body[name] == null ? [] : body[name];
@@ -616,16 +668,30 @@ export function createMockStore(shape, opts = {}) {
       }
     }
     for (const [l, e] of body.experts_off || []) {
+      if (!Number.isInteger(l) || !Number.isInteger(e)) return 'experts_off: entries must be integers';
       if (!(l >= 0 && l < s.layers)) return 'experts_off: layer out of range: ' + l;
       if (!(e >= 0 && e < s.n_expert)) return 'experts_off: expert out of range: ' + e;
     }
     for (const [l, name] of body.blocks_off || []) {
+      if (!Number.isInteger(l)) return 'blocks_off: layer must be an integer';
       if (!(l >= 0 && l < s.layers)) return 'blocks_off: layer out of range: ' + l;
       if (BLOCKS.indexOf(name) < 0) return 'blocks_off: unknown block: ' + name;
     }
     for (const [l, x] of body.streams_off || []) {
+      if (!Number.isInteger(l) || !Number.isInteger(x)) return 'streams_off: entries must be integers';
       if (!(l >= 0 && l < s.layers)) return 'streams_off: layer out of range: ' + l;
       if (!(x >= 0 && x < s.n_hc)) return 'streams_off: stream out of range: ' + x;
+    }
+    // 層あたり「残る expert」が top-k 未満だとルータが k 個選べない (実 API も 400)。
+    if ((body.experts_off || []).length && s.n_expert_used > 0) {
+      const cnt = new Array(Math.max(1, s.layers)).fill(0);
+      for (const [l] of body.experts_off) cnt[l] += 1;
+      for (let l = 0; l < s.layers; l++) {
+        if (s.n_expert - cnt[l] < s.n_expert_used) {
+          return 'layer ' + l + ': remaining experts ' + (s.n_expert - cnt[l]) +
+            ' < n_expert_used ' + s.n_expert_used;
+        }
+      }
     }
     return null;
   }
@@ -647,15 +713,35 @@ export function createMockStore(shape, opts = {}) {
     };
   }
 
+  function status() {
+    return {
+      epoch: st.epoch,
+      recording: jsonClone(st.recording),
+      snapshots: jsonClone(st.snapshots),
+      apply: jsonClone(st.apply),
+    };
+  }
+
+  function clearApply() {
+    st.apply = null;
+    st.epoch++;
+  }
+
   const store = {
     shape: s,
     state: () => jsonClone(store.snapshot()),
     snapshot: () => ({
-      shape: { layers: s.layers, layer_kinds: [...s.layer_kinds], n_expert: s.n_expert,
-        n_expert_used: s.n_expert_used, n_hc: s.n_hc, n_embd: s.n_embd },
+      shape: {
+        layers: s.layers, layer_kinds: [...s.layer_kinds], n_expert: s.n_expert,
+        n_expert_used: s.n_expert_used, n_hc: s.n_hc, n_embd: s.n_embd,
+        ple_layers: [...s.ple_layers],
+      },
       epoch: st.epoch,
-      intervene: { epoch: st.epoch, experts_off: st.experts_off, blocks_off: st.blocks_off, streams_off: st.streams_off },
-      steer: { recording: st.recording, snapshots: st.snapshots, apply: st.apply },
+      intervene: {
+        epoch: st.epoch, experts_off: st.experts_off,
+        blocks_off: st.blocks_off, streams_off: st.streams_off,
+      },
+      steer: status(),
       tokens: st.tokens,
     }),
 
@@ -675,8 +761,10 @@ export function createMockStore(shape, opts = {}) {
       if (m === 'GET' && p === '/v1/intervene') {
         return {
           status: 200,
-          body: { epoch: st.epoch, experts_off: jsonClone(st.experts_off),
-            blocks_off: jsonClone(st.blocks_off), streams_off: jsonClone(st.streams_off) },
+          body: {
+            epoch: st.epoch, experts_off: jsonClone(st.experts_off),
+            blocks_off: jsonClone(st.blocks_off), streams_off: jsonClone(st.streams_off),
+          },
         };
       }
       if (m === 'POST' && p === '/v1/intervene') {
@@ -687,68 +775,112 @@ export function createMockStore(shape, opts = {}) {
         st.blocks_off = off.blocks_off;
         st.streams_off = off.streams_off;
         st.epoch++;
-        return { status: 200, body: { epoch: st.epoch, ...jsonClone(off) } };
+        return {
+          status: 200,
+          body: {
+            epoch: st.epoch, experts_off: jsonClone(st.experts_off),
+            blocks_off: jsonClone(st.blocks_off), streams_off: jsonClone(st.streams_off),
+          },
+        };
       }
       if (m === 'DELETE' && p === '/v1/intervene') {
         st.experts_off = [];
         st.blocks_off = [];
         st.streams_off = [];
         st.epoch++;
-        return { status: 200, body: { epoch: st.epoch, experts_off: [], blocks_off: [], streams_off: [] } };
-      }
-      if (m === 'GET' && p === '/v1/steer') {
         return {
           status: 200,
-          body: { recording: jsonClone(st.recording), snapshots: jsonClone(st.snapshots), apply: jsonClone(st.apply) },
+          body: { epoch: st.epoch, experts_off: [], blocks_off: [], streams_off: [] },
         };
+      }
+      if (m === 'GET' && p === '/v1/steer') {
+        return { status: 200, body: status() };
       }
       if (m === 'POST' && p === '/v1/steer/record') {
-        if (st.recording) return err(409, 'already recording: ' + st.recording.name);
-        const name = body && typeof body.name === 'string' ? body.name.trim() : '';
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'body must be an object');
+        for (const k of Object.keys(body)) {
+          if (k !== 'name') return err(400, 'unknown field ' + JSON.stringify(k) + ' (name only)');
+        }
+        const name = typeof body.name === 'string' ? body.name : '';
         if (!name) return err(400, 'name is required');
-        if (st.snapshots.some((x) => x.name === name)) return err(409, 'snapshot already exists: ' + name);
+        if (!NAME_RE.test(name)) return err(400, 'name: A-Z a-z 0-9 _ - only, at most 64 chars');
+        if (st.recording) return err(400, 'already recording: ' + st.recording.name);
         st.recording = { name, tokens: 0, created: now() };
-        return { status: 200, body: jsonClone(st.recording) };
+        return { status: 200, body: status() };
       }
       if (m === 'POST' && p === '/v1/steer/record/stop') {
-        if (!st.recording) return err(409, 'not recording');
-        const snap = {
-          name: st.recording.name,
-          tokens: st.recording.tokens,
-          created: now(),
-          layers: [0, s.layers - 1],
-        };
+        if (!st.recording) return err(400, 'not recording');
+        const rec = st.recording;
         st.recording = null;
-        st.snapshots.push(snap);
-        return { status: 200, body: jsonClone(snap) };
+        // engine は 0 トークンの平均を保存しない (エラーにして記録も落とす)。
+        if (!(rec.tokens > 0)) return err(400, 'recorded 0 tokens');
+        const snap = { name: rec.name, tokens: rec.tokens, created: now(), layers: s.layers };
+        const i = st.snapshots.findIndex((x) => x.name === snap.name);
+        if (i >= 0) st.snapshots[i] = snap;
+        else st.snapshots.push(snap);
+        st.snapshots.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        const out = status();
+        out.saved = jsonClone(snap);
+        return { status: 200, body: out };
       }
       if (m === 'DELETE' && p.indexOf('/v1/steer/snapshots/') === 0) {
         const name = decodeURIComponent(p.slice('/v1/steer/snapshots/'.length));
+        if (!NAME_RE.test(name)) return err(400, 'name: A-Z a-z 0-9 _ - only, at most 64 chars');
         const i = st.snapshots.findIndex((x) => x.name === name);
-        if (i < 0) return err(404, 'no such snapshot: ' + name);
+        if (i < 0) return err(400, 'no such snapshot: ' + name);
         st.snapshots.splice(i, 1);
-        return { status: 200, body: { deleted: name } };
+        // 適用中の snapshot を消すと適用は落ちる (engine の `delete` は clear_apply する)。
+        if (st.apply && (st.apply.terms || []).some((t) => t.snapshot === name)) clearApply();
+        return { status: 200, body: status() };
       }
       if (m === 'POST' && p === '/v1/steer/apply') {
-        let spec;
-        try {
-          spec = steerApplyBody(body);
-        } catch (e) {
-          return err(400, (e && e.message) || String(e));
-        }
-        for (const t of spec.terms) {
-          if (!st.snapshots.some((x) => x.name === t.snapshot)) {
-            return err(404, 'no such snapshot: ' + t.snapshot);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'body must be an object');
+        for (const k of Object.keys(body)) {
+          if (['terms', 'layers', 'alpha', 'mode'].indexOf(k) < 0) {
+            return err(400, 'unknown field ' + JSON.stringify(k) + ' (terms / layers / alpha / mode only)');
           }
         }
-        st.apply = { ...spec, applied: now() };
-        return { status: 200, body: jsonClone(st.apply) };
+        if (!Array.isArray(body.terms) || body.terms.length === 0) {
+          return err(400, 'terms must be a non-empty array (use DELETE /v1/steer/apply to clear)');
+        }
+        for (let i = 0; i < body.terms.length; i++) {
+          const t = body.terms[i];
+          if (!t || typeof t !== 'object' || Array.isArray(t)) return err(400, 'terms[' + i + '] must be an object');
+          for (const k of Object.keys(t)) {
+            if (['snapshot', 'coef'].indexOf(k) < 0) return err(400, 'terms[' + i + ']: unknown field ' + JSON.stringify(k));
+          }
+          if (typeof t.snapshot !== 'string' || !t.snapshot) return err(400, 'terms[' + i + '].snapshot must be a string');
+          if (!Number.isFinite(Number(t.coef))) return err(400, 'terms[' + i + '].coef must be a finite number');
+        }
+        if (!Array.isArray(body.layers) || body.layers.length !== 2) return err(400, 'layers must be [from, to]');
+        const from = Number(body.layers[0]);
+        const to = Number(body.layers[1]);
+        if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0) {
+          return err(400, 'layers must be non-negative integers');
+        }
+        if (from > to) return err(400, 'layers: from must be <= to');
+        if (to > s.layers) return err(400, 'layers: to must be <= ' + s.layers);
+        const alpha = body.alpha == null ? 1 : Number(body.alpha);
+        if (!Number.isFinite(alpha)) return err(400, 'alpha must be a finite number');
+        const mode = body.mode == null ? 'subtract' : body.mode;
+        if (STEER_MODES.indexOf(mode) < 0) return err(400, 'mode: subtract or project');
+        for (const t of body.terms) {
+          if (!st.snapshots.some((x) => x.name === t.snapshot)) {
+            return err(400, 'no such snapshot: ' + t.snapshot);
+          }
+        }
+        st.apply = {
+          terms: body.terms.map((t) => ({ snapshot: t.snapshot, coef: Number(t.coef) })),
+          layers: [from, to], alpha, mode,
+        };
+        st.epoch++;
+        return { status: 200, body: status() };
       }
       if (m === 'DELETE' && p === '/v1/steer/apply') {
-        st.apply = null;
-        return { status: 200, body: { apply: null } };
+        clearApply();
+        return { status: 200, body: status() };
       }
-      return err(404, 'not found: ' + m + ' ' + p);
+      return { status: 404, body: apiError('not found: ' + m + ' ' + p) };
     },
   };
   return store;

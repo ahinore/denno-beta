@@ -349,6 +349,8 @@ struct ModelShape {
     n_expert_used: usize,
     n_hc: usize,
     n_embd: usize,
+    /// task 220: PLE を注入する層 (実モデルは 1 層)。ビューワが `ple` を点灯する層。
+    ple_layers: Vec<usize>,
 }
 
 impl ModelShape {
@@ -360,6 +362,7 @@ impl ModelShape {
             "n_expert_used": self.n_expert_used,
             "n_hc": self.n_hc,
             "n_embd": self.n_embd,
+            "ple_layers": self.ple_layers,
         })
     }
 
@@ -2396,6 +2399,8 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             n_expert_used: p.n_expert_used,
             n_hc: p.n_hc,
             n_embd: p.n_embd,
+            // task 220: PLE の層は GGUF のメタデータ (実モデルは 1 層)。
+            ple_layers: p.ple_layers.clone(),
         };
         // task 218: ステアリングの形とモデル id を**モデルを組む前**に決める
         // (記録 / 適用の HTTP は最初の generate より前に来る)。ここで決めないと
