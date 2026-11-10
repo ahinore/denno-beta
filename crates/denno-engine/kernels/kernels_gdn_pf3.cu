@@ -65,6 +65,10 @@ dno_gdn_pf_scan32(
     int n, int nk, int nv, int conv_dim, float eps, float q_scale)
 {
     __shared__ float ring[PF3_RING][PF3_OFF_G + 2];
+    // task 225: o を 4 B ずつ散らして書くと 1 トークンあたり 32 個の部分書きに
+    // なる。列 32 本をここに溜め、バリア後に warp 0 が 128 B で 1 回書く
+    // (値は同じ・決定論。書き方だけ変える)。
+    __shared__ float so[2][PF3_COLS];
 
     const int h = blockIdx.x;              // v-head
     const int half = blockIdx.y;           // 列の 1/4 (0..3)
@@ -220,7 +224,7 @@ dno_gdn_pf_scan32(
         o += __shfl_xor_sync(0xffffffffu, o, 2);
         o += __shfl_xor_sync(0xffffffffu, o, 4);
         if (lane == 0) {
-            o_out[(long long)t * vd + h * PF3_DK + c] = o;
+            so[t & 1][cl] = o;
         }
         // t+3 のリング書き (読みは t の計算と重なる)。
         if (ld) {
@@ -229,8 +233,18 @@ dno_gdn_pf_scan32(
         // 次のトークンは別のリング段を使う。読み終わった段を 3 トークン後に
         // 上書きするので、ここは 1 回で足りる。
         __syncthreads();
+        // 直前のトークンの o を warp 0 が 32 列まとめて書く (128 B 連続)。
+        if (t > 0 && threadIdx.x < PF3_COLS) {
+            o_out[(long long)(t - 1) * vd + h * PF3_DK + half * PF3_COLS + threadIdx.x] =
+                so[(t - 1) & 1][threadIdx.x];
+        }
     }
 #undef PF3_STORE
+    // 最後のトークンの o (ループ末尾のバリアの後なので so は確定している)。
+    if (n > 0 && threadIdx.x < PF3_COLS) {
+        o_out[(long long)(n - 1) * vd + h * PF3_DK + half * PF3_COLS + threadIdx.x] =
+            so[(n - 1) & 1][threadIdx.x];
+    }
 
     // ---- 最終状態の書き戻し -----------------------------------------------
     // 窓は**チャネルの持ち主**が書く。q/k は 4 ブロックが同じ値を計算するので、

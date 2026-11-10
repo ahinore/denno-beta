@@ -22584,6 +22584,406 @@ pub fn pf_reset_for_test() {
     pf_release();
 }
 
+// ---------------------------------------------------------------------------
+// task 218: 残差の平均の記録 / ステアリング (`kernels_steer.cu`)
+// ---------------------------------------------------------------------------
+//
+// 常駐 prefill (`DENNO_PF_RESIDENT`) では残差がデバイスに載ったまま層を回る。
+// 記録 (層の出口の足し込み) と適用 (層の出口の引き算) もデバイスで閉じる。
+// 層ごとに残差を D2H しない。
+//
+// PTX はクレートの `kernels/kernels_steer.ptx` (lab が `bash build_ptx.sh steer`
+// で生成) を**実行時に読む**。無い・読めない・entry が無いときは
+// [`pf_steer_acc_ensure`] / [`pf_steer_apply_begin`] が false を返し、
+// 呼び出し側は常駐連鎖を諦めてホスト経路 (host 側の記録 / 適用) へ落ちる。
+// 値は変わらない (加算順は同じ)。
+
+/// `kernels_steer.cu` の関数一式。
+struct SteerKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    acc: CUfunction,
+    sub: CUfunction,
+    proj: CUfunction,
+}
+
+// 生ハンドル (PfKernels と同じ規約)。
+unsafe impl Send for SteerKernels {}
+unsafe impl Sync for SteerKernels {}
+
+const STEER_NAMES: [&[u8]; 3] = [
+    b"dno_steer_acc\0",
+    b"dno_steer_sub\0",
+    b"dno_steer_proj\0",
+];
+
+/// PTX の置き場所。`DENNO_STEER_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_steer.ptx`。
+///
+/// task 218: 収録した PTX は lab t218b (sha bfb4b2fe1) が `PTX=steer` で
+/// `kernels_steer.cu` から生成したもの (sha256 eae1eca4…、entry 3 本、
+/// `.target sm_75`)。再生成は `bash kernels/build_ptx.sh steer`。
+/// 引数の数は `kernel_invariants::steer_ptx_matches_the_host_launch_abi` が
+/// 固定している (acc 6 / sub 7 / proj 7)。
+fn steer_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_STEER_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_steer.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn steer_kernels() -> Option<&'static SteerKernels> {
+    static K: OnceLock<Option<SteerKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = steer_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    "[steer] PTX が読めない ({}) : {e} → ホスト側で記録/適用",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                tracing::info!("[steer] cuModuleLoadData 失敗 → ホスト側で記録/適用");
+                return None;
+            }
+        }
+        let mut fns: [CUfunction; 3] = [std::ptr::null_mut(); 3];
+        for (i, name) in STEER_NAMES.iter().enumerate() {
+            unsafe {
+                if (lib.module_get_function)(&mut fns[i], module, name.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    tracing::info!(
+                        "[steer] PTX に {} が無い → ホスト側で記録/適用",
+                        String::from_utf8_lossy(&name[..name.len() - 1])
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(SteerKernels {
+            module,
+            acc: fns[0],
+            sub: fns[1],
+            proj: fns[2],
+        })
+    })
+    .as_ref()
+}
+
+/// デバイス側の作業域 (加算域は複数リクエストに跨って残す)。
+struct SteerDev {
+    acc: Option<DevBuffer>, // [n_layer][hc][e]
+    v: Option<DevBuffer>,   // [n_layer][hc][e]
+    n_layer: usize,
+    hc: usize,
+    e: usize,
+}
+
+impl SteerDev {
+    const fn new() -> Self {
+        Self {
+            acc: None,
+            v: None,
+            n_layer: 0,
+            hc: 0,
+            e: 0,
+        }
+    }
+
+    /// 形が変わったら両方捨てる (古い領域を流用しない)。
+    fn fit(&mut self, n_layer: usize, hc: usize, e: usize) -> Result<()> {
+        if self.n_layer != n_layer || self.hc != hc || self.e != e {
+            self.acc = None;
+            self.v = None;
+            self.n_layer = n_layer;
+            self.hc = hc;
+            self.e = e;
+        }
+        Ok(())
+    }
+}
+
+thread_local! {
+    static STEER_DEV: std::cell::RefCell<SteerDev> =
+        const { std::cell::RefCell::new(SteerDev::new()) };
+}
+
+/// 常駐連鎖の記録用の加算域を確保する (無ければ 0 で作る)。
+///
+/// 毎リクエストの入口で呼んでよい (既にあれば何もしない = 前のリクエストの
+/// 続きから足せる)。使えないときは false。
+pub fn pf_steer_acc_ensure(n_layer: usize, hc: usize, e: usize) -> bool {
+    if n_layer == 0 || hc == 0 || e == 0 || n_layer * hc * e > (1 << 26) {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return pf_fail("steer: CUDA context が無い");
+    };
+    if ctx.make_current().is_err() {
+        return pf_fail("steer: cuCtxSetCurrent 失敗");
+    }
+    if steer_kernels().is_none() {
+        return false;
+    }
+    STEER_DEV.with(|cell| -> bool {
+        let mut d = cell.borrow_mut();
+        if let Err(e) = d.fit(n_layer, hc, e) {
+            return pf_fail(&format!("steer: 形の更新に失敗: {e:#}"));
+        }
+        if d.acc.as_ref().map(|b| b.bytes()).unwrap_or(0) < n_layer * hc * e * 4 {
+            match DevBuffer::alloc_tagged(n_layer * hc * e * 4, crate::mem_audit::TAG_OTHER) {
+                Ok(b) => {
+                    if let Err(e) = b.copy_from(&vec![0.0f32; n_layer * hc * e]) {
+                        return pf_fail(&format!("steer: 加算域の初期化に失敗: {e:#}"));
+                    }
+                    d.acc = Some(b);
+                }
+                Err(e) => return pf_fail(&format!("steer: 加算域の確保に失敗: {e:#}")),
+            }
+        }
+        // 記録を始めた直後の 1 回は 0 に戻す (前の記録の残りを引き継がない)。
+        if crate::model::steer::take_dev_reset() {
+            if let Some(b) = d.acc.as_ref() {
+                let n = b.bytes() / 4;
+                if let Err(e) = b.copy_from(&vec![0.0f32; n]) {
+                    return pf_fail(&format!("steer: 加算域の 0 クリアに失敗: {e:#}"));
+                }
+            }
+        }
+        true
+    })
+}
+
+/// 加算域を 0 に戻す (記録を始めるとき)。
+pub fn pf_steer_acc_reset() -> bool {
+    STEER_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let Some(b) = d.acc.as_ref() else {
+            return true;
+        };
+        let n = b.bytes() / 4;
+        match b.copy_from(&vec![0.0f32; n]) {
+            Ok(()) => true,
+            Err(e) => pf_fail(&format!("steer: 加算域の 0 クリアに失敗: {e:#}")),
+        }
+    })
+}
+
+/// task 218: 1 層ぶん加算する (`res` は `[nt][hc][e]` = 直前に pf_combine が
+/// 書いた残差)。
+pub fn pf_steer_acc(nt: usize, hc: usize, e: usize, layer: usize) -> bool {
+    if nt == 0 {
+        return true;
+    }
+    let Some(k) = steer_kernels() else {
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        return pf_fail("steer acc: CUDA context が無い");
+    };
+    if ctx.make_current().is_err() {
+        return pf_fail("steer acc: cuCtxSetCurrent 失敗");
+    }
+    STEER_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let Some(acc) = d.acc.as_ref() else {
+            return pf_fail("steer acc: 加算域が無い");
+        };
+        PF_DEV.with(|pc| -> bool {
+            let pd = pc.borrow();
+            let Some(res) = pd.res.as_ref() else {
+                return pf_fail("steer acc: 残差の作業域が無い");
+            };
+            let stride = hc * e;
+            let (mut pres, mut pacc) = (res.ptr(), acc.ptr());
+            let (mut nt_c, mut hc_c, mut e_c, mut l_c) =
+                (nt as i32, hc as i32, e as i32, layer as i32);
+            let grid = (stride.div_ceil(256) as u32, 1, 1);
+            let mut args = [
+                &mut pres as *mut _ as *mut c_void,
+                &mut pacc as *mut _ as *mut c_void,
+                &mut nt_c as *mut _ as *mut c_void,
+                &mut hc_c as *mut _ as *mut c_void,
+                &mut e_c as *mut _ as *mut c_void,
+                &mut l_c as *mut _ as *mut c_void,
+            ];
+            if let Err(e) = unsafe { ctx.launch_async(k.acc, grid, (256, 1, 1), 0, &mut args) } {
+                return pf_fail(&format!("steer acc launch: {e:#}"));
+            }
+            let t = match pf_stage_sync(ctx) {
+                Ok(t) => t,
+                Err(e) => return pf_fail(&format!("steer acc sync: {e:#}")),
+            };
+            pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t);
+            true
+        })
+    })
+}
+
+/// 加算域をホストへ降ろして 0 に戻す。`out` は `[n_layer][hc][e]`。
+pub fn pf_steer_acc_take(out: &mut [f32]) -> bool {
+    STEER_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let Some(b) = d.acc.as_ref() else {
+            return false;
+        };
+        if out.len() * 4 > b.bytes() {
+            return false;
+        }
+        let ok = match b.to_slice(out) {
+            Ok(()) => true,
+            Err(e) => pf_fail(&format!("steer: 加算域の D2H に失敗: {e:#}")),
+        };
+        if ok {
+            if let Err(e) = b.copy_from(&vec![0.0f32; out.len()]) {
+                return pf_fail(&format!("steer: 加算域の 0 クリアに失敗: {e:#}"));
+            }
+        }
+        ok
+    })
+}
+
+/// デバイスの作業域を捨てる (VRAM を返す)。
+pub fn pf_steer_release() {
+    STEER_DEV.with(|cell| {
+        let mut d = cell.borrow_mut();
+        *d = SteerDev::new();
+    });
+}
+
+/// 適用する合成ベクトル `v` (`[n_layer][hc][e]`) をデバイスへ置く。
+///
+/// `n_layer * hc * e` は記録と同じ上限。使えないときは false。
+pub fn pf_steer_apply_begin(v: &[f32], n_layer: usize, hc: usize, e: usize) -> bool {
+    if n_layer == 0 || hc == 0 || e == 0 || v.len() != n_layer * hc * e {
+        return pf_fail("steer apply: v の形が違う");
+    }
+    let Some(ctx) = shared_ctx() else {
+        return pf_fail("steer apply: CUDA context が無い");
+    };
+    if ctx.make_current().is_err() {
+        return pf_fail("steer apply: cuCtxSetCurrent 失敗");
+    }
+    if steer_kernels().is_none() {
+        return false;
+    }
+    STEER_DEV.with(|cell| -> bool {
+        let mut d = cell.borrow_mut();
+        if let Err(e) = d.fit(n_layer, hc, e) {
+            return pf_fail(&format!("steer apply: 形の更新に失敗: {e:#}"));
+        }
+        if d.v.as_ref().map(|b| b.bytes()).unwrap_or(0) < v.len() * 4 {
+            match DevBuffer::alloc_tagged(v.len() * 4, crate::mem_audit::TAG_OTHER) {
+                Ok(b) => d.v = Some(b),
+                Err(e) => return pf_fail(&format!("steer apply: v の確保に失敗: {e:#}")),
+            }
+        }
+        match d.v.as_ref().map(|b| b.copy_from(v)) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => pf_fail(&format!("steer apply: v の H2D に失敗: {e:#}")),
+            None => pf_fail("steer apply: v が無い"),
+        }
+    })
+}
+
+/// 1 層ぶん適用する。`mode` は 0 = subtract / 1 = project。
+pub fn pf_steer_apply(
+    nt: usize,
+    hc: usize,
+    e: usize,
+    layer: usize,
+    mode: u8,
+    alpha: f32,
+) -> bool {
+    if nt == 0 {
+        return true;
+    }
+    let Some(k) = steer_kernels() else {
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        return pf_fail("steer apply: CUDA context が無い");
+    };
+    if ctx.make_current().is_err() {
+        return pf_fail("steer apply: cuCtxSetCurrent 失敗");
+    }
+    STEER_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let Some(v) = d.v.as_ref() else {
+            return pf_fail("steer apply: v がデバイスに無い");
+        };
+        PF_DEV.with(|pc| -> bool {
+            let pd = pc.borrow();
+            let Some(res) = pd.res.as_ref() else {
+                return pf_fail("steer apply: 残差の作業域が無い");
+            };
+            let stride = hc * e;
+            let (mut pres, mut pv) = (res.ptr(), v.ptr());
+            let (mut nt_c, mut hc_c, mut e_c, mut l_c) =
+                (nt as i32, hc as i32, e as i32, layer as i32);
+            let mut a_c = alpha;
+            let r = unsafe {
+                match mode {
+                    0 => {
+                        let mut args = [
+                            &mut pres as *mut _ as *mut c_void,
+                            &mut pv as *mut _ as *mut c_void,
+                            &mut nt_c as *mut _ as *mut c_void,
+                            &mut hc_c as *mut _ as *mut c_void,
+                            &mut e_c as *mut _ as *mut c_void,
+                            &mut l_c as *mut _ as *mut c_void,
+                            &mut a_c as *mut _ as *mut c_void,
+                        ];
+                        let grid = (stride.div_ceil(256) as u32, 1, 1);
+                        ctx.launch_async(k.sub, grid, (256, 1, 1), 0, &mut args)
+                    }
+                    _ => {
+                        let mut args = [
+                            &mut pres as *mut _ as *mut c_void,
+                            &mut pv as *mut _ as *mut c_void,
+                            &mut nt_c as *mut _ as *mut c_void,
+                            &mut hc_c as *mut _ as *mut c_void,
+                            &mut e_c as *mut _ as *mut c_void,
+                            &mut l_c as *mut _ as *mut c_void,
+                            &mut a_c as *mut _ as *mut c_void,
+                        ];
+                        let grid = ((nt * hc) as u32, 1, 1);
+                        ctx.launch_async(k.proj, grid, (256, 1, 1), 0, &mut args)
+                    }
+                }
+            };
+            if let Err(e) = r {
+                return pf_fail(&format!("steer apply launch: {e:#}"));
+            }
+            let t = match pf_stage_sync(ctx) {
+                Ok(t) => t,
+                Err(e) => return pf_fail(&format!("steer apply sync: {e:#}")),
+            };
+            pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t);
+            true
+        })
+    })
+}
+
+/// task 218: テスト用にデバイス側の作業域を捨てる。
+#[cfg(test)]
+pub fn pf_steer_reset_for_test() {
+    pf_steer_release();
+}
+
 /// task 152: BF16 のまま読む mix カーネルの既定値 (**on**)。
 ///
 /// lab t152b の g22 条件で採否 OK (`REPORT_P152.md`)。`w:mix_f32` 2,425 MiB ->
@@ -38722,12 +39122,14 @@ pub(crate) fn pf_ba_fast_on() -> bool {
 /// (+79%) になった (連鎖が使えず従来経路へ戻る)。既存の入口も同じ落とし穴を
 /// 持っているので、既定 off のまま触らない。
 pub(crate) fn pf_ba_dev_on() -> bool {
-    pf_ssm_gemm_gpu_on()
+    pf_ssm_gemm_gpu_on() || pf_ba_fast_on()
 }
 
 /// 形のゲート (純関数)。n は 1 本あたりの出力行 (実モデルは 48)。
 pub(crate) fn pf_ba_fast_ok(nt: usize, k: usize, n: usize) -> bool {
-    nt >= 1 && k >= 1 && n >= 1 && n <= 256
+    // n は router の logits (512) まで受ける (同じカーネルを n 方向の
+    // ブロック分割で回すだけ。累積順は dno_gemm_f32_mt と同じ k 昇順)。
+    nt >= 1 && k >= 1 && n >= 1 && n <= 512
 }
 
 /// 専用 GEMM を 1 本撃つ (beta と alpha で 2 回)。`false` = 撃てなかった。
@@ -38949,9 +39351,9 @@ pub fn pf_router_dev_topk(
     if ctx.make_current().is_err() {
         return false;
     }
-    let Some(f_gemm) = gemm_f32_mt_fn(ctx) else {
-        return false;
-    };
+    // logits の GEMM は専用カーネル (`dno_gemm_f32_ba`) が使えればそちら。
+    // 使えないときだけ `dno_gemm_f32_mt` を要求する。
+    let f_gemm = gemm_f32_mt_fn(ctx);
     let Some(f_rt) = router_dev_fns(ctx) else {
         return false;
     };
@@ -38994,23 +39396,31 @@ pub fn pf_router_dev_topk(
         );
         let wp = w.buf.ptr();
         unsafe {
-            // 1) logits = W @ x^T (既存の f32 GEMM。デバイスに残す)
-            let (mut pw, mut px, mut po) = (wp, xp, dlogit.ptr());
-            let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k_in as c_int, n as c_int);
-            let mut args = [
-                &mut pw as *mut _ as *mut c_void,
-                &mut px as *mut _ as *mut c_void,
-                &mut po as *mut _ as *mut c_void,
-                &mut nt_c as *mut _ as *mut c_void,
-                &mut k_c as *mut _ as *mut c_void,
-                &mut n_c as *mut _ as *mut c_void,
-            ];
-            let grid = (
-                n.div_ceil(GEMM_MT_ROWS) as u32,
-                nt.div_ceil(GEMM_MT_TOKS) as u32,
-                1,
-            );
-            ctx.launch_async(f_gemm, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+            // 1) logits = W @ x^T (デバイスに残す)。task 225: 専用 GEMM
+            // (`dno_gemm_f32_ba`) が使えればそちら (累積順は同じ k 昇順なので値は
+            // ビット一致)。使えなければ従来の `dno_gemm_f32_mt`。
+            let fast = pf_ba_gemm_dev_launch(ctx, wp, xp, dlogit.ptr(), nt, k_in, n)?;
+            if !fast {
+                let Some(f_gemm) = f_gemm else {
+                    return Ok(());
+                };
+                let (mut pw, mut px, mut po) = (wp, xp, dlogit.ptr());
+                let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k_in as c_int, n as c_int);
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut nt_c as *mut _ as *mut c_void,
+                    &mut k_c as *mut _ as *mut c_void,
+                    &mut n_c as *mut _ as *mut c_void,
+                ];
+                let grid = (
+                    n.div_ceil(GEMM_MT_ROWS) as u32,
+                    nt.div_ceil(GEMM_MT_TOKS) as u32,
+                    1,
+                );
+                ctx.launch_async(f_gemm, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+            }
             // 2) softmax + top-k + 再正規化
             let (mut pl, mut ps, mut pwt, mut prs) =
                 (dlogit.ptr(), dsel.ptr(), dwt.ptr(), drs.ptr());
@@ -39619,12 +40029,15 @@ fn gdn_pf2_launch(
 /// task 186: beta/alpha 射影をデバイスで回すための指定 (連結済みの F32 重み)。
 #[derive(Clone)]
 pub struct PfBetaAlpha<'a> {
-    /// 連結済みの重み (`k = n_embd`, `n = beta 行 + alpha 行`)。
+    /// beta の重み (`k = n_embd`)。連結済みなら beta 行 + alpha 行を持つ。
     pub w: PfChainW<'a>,
     /// beta の行範囲。
     pub beta_rows: std::ops::Range<usize>,
-    /// alpha の行範囲。
+    /// alpha の行範囲 (`w` の中。`alpha_w` が Some なら未使用)。
     pub alpha_rows: std::ops::Range<usize>,
+    /// task 225: alpha が別の行列のとき (`Some` なら `w` は beta 専用で、
+    /// alpha はこの行列の `alpha_rows` 行)。連結されていない実モデル用。
+    pub alpha_w: Option<PfChainW<'a>>,
 }
 
 /// `DENNO_PF_SSM_GEMM_GPU` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
@@ -40023,7 +40436,8 @@ mod pf225_gate_tests {
         assert!(!pf_ba_fast_ok(0, 2560, 48));
         assert!(!pf_ba_fast_ok(1024, 0, 48));
         assert!(!pf_ba_fast_ok(1024, 2560, 0));
-        assert!(!pf_ba_fast_ok(1024, 2560, 257), "n > 256 は受けない");
+        assert!(pf_ba_fast_ok(1024, 2560, 512), "router の logits (512) は受ける");
+        assert!(!pf_ba_fast_ok(1024, 2560, 513), "n > 512 は受けない");
         // router: ne = 512 / k = 8 前後。
         assert!(pf_router_dev_ok(1024, 512, 8));
         assert!(pf_router_dev_ok(1, 32, 1));
@@ -40934,20 +41348,32 @@ pub fn gdn_pf_chain(
     let ba_dev = if ba_dev_req {
         beta_alpha.and_then(|ba| {
             let w = ba.w;
+            // task 225: alpha が別の行列 (未連結) のときは 2 本を別々に常駐する。
+            let wa = match ba.alpha_w {
+                Some(aw) => aw,
+                None => w,
+            };
             let ok = w.ty == crate::kquant::GgmlType::F32
+                && wa.ty == crate::kquant::GgmlType::F32
                 && w.k == e
+                && wa.k == e
                 && ba.beta_rows.len() == nv
                 && ba.alpha_rows.len() == nv
                 && ba.beta_rows.end <= w.n
-                && ba.alpha_rows.end <= w.n;
+                && ba.alpha_rows.end <= wa.n;
             if !ok {
                 return None;
             }
             let p = pf_f32_weight_dev(w.uid, w.blocks, w.k, w.n)?;
+            let pa = if ba.alpha_w.is_some() {
+                pf_f32_weight_dev(wa.uid, wa.blocks, wa.k, wa.n)?
+            } else {
+                p
+            };
             let rb = w.k * std::mem::size_of::<f32>();
             Some((
                 p + (ba.beta_rows.start * rb) as CUdeviceptr,
-                p + (ba.alpha_rows.start * rb) as CUdeviceptr,
+                pa + (ba.alpha_rows.start * rb) as CUdeviceptr,
             ))
         })
     } else {

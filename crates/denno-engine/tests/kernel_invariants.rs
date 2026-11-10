@@ -8364,10 +8364,11 @@ fn pf_mix_stage_sync_uses_an_event() {
         "upload が非ブロッキングである根拠 (と 0x01 の定義) が消えた"
     );
     // mix と combine の両方がこの同期を通る (片方だけだと待ちが残る)。
+    // task 218: 残差の平均の加算 / ステアリングの 2 本も同じ同期を通る (計 4)。
     assert_eq!(
         CUDA_RS.matches("pf_stage_sync(ctx)").count(),
-        2,
-        "pf_mix / pf_combine の両方が pf_stage_sync を通っていない"
+        4,
+        "pf_mix / pf_combine (+ task 218 の steer 2 本) が pf_stage_sync を通っていない"
     );
     // 計測器 (DENNO_PF_MIX_KPROF) は段の前後にイベントを打っている。
     for k in [
@@ -9414,6 +9415,7 @@ fn task213_server_runs_the_gate_audit_at_startup() {
 const GEMM_BA225_SRC: &str = include_str!("../kernels/kernels_gemm_ba225.cu");
 const ROUTER225_SRC: &str = include_str!("../kernels/kernels_router225.cu");
 const GDN_PF3_SRC: &str = include_str!("../kernels/kernels_gdn_pf3.cu");
+const QWEN4EXP_SSM_RS: &str = include_str!("../src/model/qwen4exp_ssm.rs");
 
 /// `.cu` の `extern "C" __global__` 宣言の引数の個数を数える。
 fn cu_kernel_nargs(src: &str, name: &str) -> usize {
@@ -9507,6 +9509,21 @@ fn task225_ba225_kernel_is_wired() {
     assert!(
         GEMM_BA225_SRC.contains("acc[i][j] = __fmaf_rn(wv[i], xv[j], acc[i][j]);"),
         "積和が明示 FMA の k 昇順になっていない"
+    );
+    // task 225: 未連結 (parts 2 本) でもデバイス射影に入れる。型と形は Rust 側で
+    // 確かめてから入口を開ける (開けてから連鎖が諦める経路に落とさない)。
+    assert!(
+        QWEN4EXP_SSM_RS.contains("alpha_w: Some(pw(&parts[1]))"),
+        "parts 2 本の alpha が連鎖に渡っていない"
+    );
+    assert!(
+        QWEN4EXP_SSM_RS.contains("parts[0].ty() == T::F32") && QWEN4EXP_SSM_RS.contains("parts[1].ty() == T::F32"),
+        "parts 経路が F32 を確かめていない"
+    );
+    // router の logits も同じカーネルで回す (累積順が同じなので値はビット一致)。
+    assert!(
+        CUDA_RS.contains("pf_ba_gemm_dev_launch(ctx, wp, xp, dlogit.ptr(), nt, k_in, n)"),
+        "router の logits GEMM が専用カーネルに切り替わっていない"
     );
 }
 
@@ -9635,5 +9652,61 @@ fn task225_gdn_pf3_kernel_is_wired() {
     assert!(
         CUDA_RS.contains("let norm = gdn_pf2_kernels()?.norm;"),
         "v3 が v2 の norm を使っていない"
+    );
+}
+
+// task 218: 残差の平均の記録 / ステアリングのカーネル (kernels_steer.cu)
+// ---------------------------------------------------------------------------
+
+/// コミット済みの `kernels_steer.ptx` がホスト側の起動と ABI で一致すること。
+///
+/// 引数の数がずれたまま古い PTX を読むと、cuLaunchKernel は**足りない引数を
+/// 不定のまま**起動する (エラーも NaN も出ない)。ここで数を固定しておく。
+/// PTX は lab が `bash build_ptx.sh steer` で生成したものをそのまま収録している。
+#[test]
+fn steer_ptx_matches_the_host_launch_abi() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_steer.ptx");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} が読めない: {e}", path.display()));
+    // 期待する引数 (ptr, ptr, nt, hc, e, layer[, alpha]) の数と、最後が alpha か。
+    let want = [
+        ("dno_steer_acc", 6usize, false),
+        ("dno_steer_sub", 7, true),
+        ("dno_steer_proj", 7, true),
+    ];
+    for (name, n, has_alpha) in want {
+        let pat = format!(".entry {name}(");
+        let i = text
+            .find(&pat)
+            .unwrap_or_else(|| panic!("PTX に {name} が無い (再生成が必要)"));
+        let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+        let seg = &text[i..j];
+        let got = seg.matches(".param .").count();
+        assert_eq!(
+            got, n,
+            "{name} の引数が {got} 個 (ホスト側は {n} 個)。PTX を再生成すること \
+             (bash kernels/build_ptx.sh steer)"
+        );
+        // 最後の 1 個が alpha (f32) か、それ以外のスカラは u32 か。
+        if has_alpha {
+            assert!(
+                seg.contains(&format!(".param .f32 {name}_param_{}", n - 1)),
+                "{name} の最後の引数が f32 (alpha) でない: {seg}"
+            );
+        } else {
+            assert!(
+                seg.contains(&format!(".param .u32 {name}_param_{}", n - 1)),
+                "{name} の最後の引数が u32 (layer) でない: {seg}"
+            );
+        }
+    }
+    // ホスト側のゲートがこの 3 本を名前で引いていること。
+    assert!(
+        CUDA_RS.contains("b\"dno_steer_acc\\0\""),
+        "cuda.rs が dno_steer_acc を引いていない"
+    );
+    assert!(
+        CUDA_RS.contains("b\"dno_steer_sub\\0\"") && CUDA_RS.contains("b\"dno_steer_proj\\0\""),
+        "cuda.rs が sub / proj を引いていない"
     );
 }

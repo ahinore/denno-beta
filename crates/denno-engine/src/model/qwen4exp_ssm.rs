@@ -914,22 +914,40 @@ impl SsmLayer {
         // F32 GEMM 2 本で作れる (lab t183a の `beta_pf` は 712 ms = 0.71 ms/回)。
         // 形が合わない (連結でない / F32 でない) ときはホスト経路のまま。
         // task 225: 新しい専用 GEMM (`DENNO_PF_BA_FAST`) でもデバイス経路に入る。
+        // 連結されていない (inner() が None) 実モデルでは、元の 2 本の F32 重みを
+        // そのまま使う (`alpha_w`)。形・型はここで Rust 側で確かめてから入口を
+        // 開ける (入口を開けてから連鎖が諦める経路に落ちると ssm 全体が遅くなる)。
         let ba_desc = if crate::cuda::pf_ba_dev_on() {
-            match self.beta_alpha.inner() {
-                Some(inner) => {
-                    let (r0, r1) = (self.beta_alpha.range(0), self.beta_alpha.range(1));
-                    if r0.len() == nv && r1.len() == nv {
-                        Some(crate::cuda::PfBetaAlpha {
-                            w: pw(inner),
-                            beta_rows: r0,
-                            alpha_rows: r1,
-                        })
-                    } else {
-                        None
-                    }
+            let mut d = None;
+            if let Some(inner) = self.beta_alpha.inner() {
+                let (r0, r1) = (self.beta_alpha.range(0), self.beta_alpha.range(1));
+                if r0.len() == nv && r1.len() == nv {
+                    d = Some(crate::cuda::PfBetaAlpha {
+                        w: pw(inner),
+                        beta_rows: r0,
+                        alpha_rows: r1,
+                        alpha_w: None,
+                    });
                 }
-                None => None,
             }
+            if d.is_none() && crate::cuda::pf_ba_fast_on() {
+                use crate::kquant::GgmlType as T;
+                let parts = self.beta_alpha.parts();
+                if parts.len() == 2
+                    && parts[0].n() == nv
+                    && parts[1].n() == nv
+                    && parts[0].ty() == T::F32
+                    && parts[1].ty() == T::F32
+                {
+                    d = Some(crate::cuda::PfBetaAlpha {
+                        w: pw(&parts[0]),
+                        beta_rows: 0..nv,
+                        alpha_rows: 0..nv,
+                        alpha_w: Some(pw(&parts[1])),
+                    });
+                }
+            }
+            d
         } else {
             None
         };
