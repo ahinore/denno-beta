@@ -41131,15 +41131,26 @@ mod pf225_gate_tests {
         assert!(pf_router_dev_on());
         set_pf_router_dev_for_test(Some(false));
         assert!(!pf_router_dev_on());
+        // task 228: task 225 の実測を受けてこの 2 本は既定 on になった。
+        // `None` は env に戻るので、期待値は env の解釈から取る (テスト環境の
+        // env に依存させない)。
         set_pf_router_dev_for_test(None);
-        assert!(!pf_router_dev_on(), "env 未設定の既定は off (目標未達)");
+        assert_eq!(
+            pf_router_dev_on(),
+            pf_router_dev_from_value(std::env::var("DENNO_PF_ROUTER_DEV").ok().as_deref()),
+            "強制を外したら env に戻る"
+        );
 
         set_gdn_pf3_for_test(Some(true));
         assert!(gdn_pf3_on());
         set_gdn_pf3_for_test(Some(false));
         assert!(!gdn_pf3_on());
         set_gdn_pf3_for_test(None);
-        assert!(!gdn_pf3_on(), "env 未設定の既定は off (目標未達)");
+        assert_eq!(
+            gdn_pf3_on(),
+            gdn_pf3_from_value(std::env::var("DENNO_PF_SCAN3").ok().as_deref()),
+            "強制を外したら env に戻る"
+        );
     }
 }
 
