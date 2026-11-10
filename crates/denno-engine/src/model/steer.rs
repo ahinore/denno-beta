@@ -967,24 +967,30 @@ fn now_secs() -> u64 {
 /// `DENNO_STEER_APPLY` の書式:
 ///
 /// ```text
-/// <name>:<coef>[:<name>:<coef>...]:<from>-<to>:<alpha>:<mode>
+/// <name>/<coef>[/<name>/<coef>...]/<from>-<to>/<alpha>/<mode>
 /// ```
 ///
-/// 例: `A:-1.0:0-48:1.0:subtract`、`A:1.0:B:-1.0:8-40:0.5:project`。
-/// ラボが通す文字 (A-Z a-z 0-9 _ . / - :) だけで書ける。`to` は含まない。
+/// 例: `A/1.0/0-48/1.0/subtract`、`A/1.0/B/-1.0/8-40/0.5/project`。
+///
+/// 区切りは `/` を使う。ラボの COND 検証が `:` を弾いた (t218a が
+/// `COND format` で REJECTED) ため、`:` は使わない。`:` 区切りも受け付ける
+/// (古い書き方との互換。正規化してから分解する)。
+/// `to` は含まない。
 pub fn parse_apply_spec(spec: &str) -> Result<(Vec<Term>, usize, usize, f32, Mode), String> {
     for ch in spec.chars() {
         let ok = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '-' | ':');
         if !ok {
             return Err(format!(
-                "spec に使えない文字 {ch:?} (A-Z a-z 0-9 _ . / - : のみ)"
+                "spec に使えない文字 {ch:?} (A-Z a-z 0-9 _ . / - のみ)"
             ));
         }
     }
-    let parts: Vec<&str> = spec.split(':').collect();
+    // `:` は `/` と同じ区切りとして扱う。
+    let norm = spec.replace(':', "/");
+    let parts: Vec<&str> = norm.split('/').collect();
     if parts.len() < 5 {
         return Err(format!(
-            "spec が短い (name:coef:from-to:alpha:mode): {spec:?}"
+            "spec が短い (name/coef/from-to/alpha/mode): {spec:?}"
         ));
     }
     let n = parts.len();
@@ -1485,7 +1491,7 @@ mod tests {
     /// `DENNO_STEER_APPLY` の spec パーサ。
     #[test]
     fn parse_apply_spec_forms() {
-        let (t, f, to, a, m) = parse_apply_spec("A:-1.0:0-48:1.0:subtract").expect("1 項");
+        let (t, f, to, a, m) = parse_apply_spec("A/-1.0/0-48/1.0/subtract").expect("1 項");
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].snapshot, "A");
         assert_eq!(t[0].coef, -1.0);
@@ -1493,7 +1499,7 @@ mod tests {
         assert_eq!(a, 1.0);
         assert_eq!(m, Mode::Subtract);
 
-        let (t, f, to, a, m) = parse_apply_spec("A:1.0:B:-1.0:8-40:0.5:project").expect("2 項");
+        let (t, f, to, a, m) = parse_apply_spec("A/1.0/B/-1.0/8-40/0.5/project").expect("2 項");
         assert_eq!(t.len(), 2);
         assert_eq!(t[1].snapshot, "B");
         assert_eq!(t[1].coef, -1.0);
@@ -1501,11 +1507,28 @@ mod tests {
         assert_eq!(a, 0.5);
         assert_eq!(m, Mode::Project);
 
+        // `:` 区切りも同じに読める (古い書き方)。
+        let (t, f, to, a, m) = parse_apply_spec("A:-1.0:0-48:1.0:subtract").expect("コロン区切り");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].snapshot, "A");
+        assert_eq!((f, to), (0, 48));
+        assert_eq!(a, 1.0);
+        assert_eq!(m, Mode::Subtract);
+
         // 不正
-        assert!(parse_apply_spec("A:1.0:0-48:1.0").is_err(), "項が無い");
-        assert!(parse_apply_spec("A:1.0:0-48:1.0:sigmoid").is_err());
-        assert!(parse_apply_spec("A:B:0-48:1.0:subtract").is_err(), "coef が数値でない");
-        assert!(parse_apply_spec("A:1.0:0..48:1.0:subtract").is_err());
-        assert!(parse_apply_spec("A:1.0:0-48:1.0:subtract,").is_err(), "使えない文字");
+        assert!(parse_apply_spec("A/1.0/0-48/1.0").is_err(), "項が無い");
+        assert!(parse_apply_spec("A/1.0/0-48/1.0/sigmoid").is_err());
+        assert!(parse_apply_spec("A/B/0-48/1.0/subtract").is_err(), "coef が数値でない");
+        assert!(parse_apply_spec("A/1.0/0..48/1.0/subtract").is_err());
+        assert!(parse_apply_spec("A/1.0/0-48/1.0/subtract,").is_err(), "使えない文字");
+        // ラボの COND が通す文字だけであること (t218a の REJECTED の再発防止)。
+        for s in ["A/1.0/0-48/1.0/subtract", "A/1.0/B/-1.0/8-40/0.5/project"] {
+            for ch in s.chars() {
+                assert!(
+                    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '-'),
+                    "spec {s:?} にラボが弾く文字 {ch:?} が入っている"
+                );
+            }
+        }
     }
 }
