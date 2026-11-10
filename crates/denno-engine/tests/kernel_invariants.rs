@@ -8335,9 +8335,15 @@ fn mix_up_warp_per_row_kernel_is_wired() {
         "up 版の行数ミラーが無い"
     );
     let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    // task 216: up 版の選択は「融合版が選ばれていない」「upw ゲート」「up_reduce」
+    // 「k2 % 8」の 4 条件を全部見る (行の折り返しに依らず条件ごとに固定する)。
     assert!(
-        body.contains("mix_dec_upw_on() && up_reduce && k2 % 8 == 0"),
-        "up 版の門番 (upw / k % 8) が無い"
+        body.contains("mix_dec_upw_on() || dec_mix_upw_on()"),
+        "up 版の門番 (upw) が無い"
+    );
+    assert!(
+        body.contains("upmix.is_none()"),
+        "up 版の選択が融合版を避けていない (2 本撃ちになる)"
     );
     assert!(
         body.contains("n2.div_ceil(MIX_UP_ROWS) as u32"),
@@ -8354,6 +8360,222 @@ fn mix_up_warp_per_row_kernel_is_wired() {
     assert!(
         targets.contains("mix_up"),
         "build_ptx.sh の targets_all に mix_up が無い: {targets}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 216: mix の down (BF16 + silu) を uint4 で読む `kernels_mix_down.cu`
+// ---------------------------------------------------------------------------
+// 「cuda.rs が読んでいる」「build_ptx.sh が mix_down を作る」「引数の並びが
+// 従来カーネルと同じ」「uint4 = 8 BF16 のベクタロード」「silu の epilogue が
+// dno_expf のまま」「ゲートは既定 off」を固定する。
+const MIX_DOWN_SRC: &str = include_str!("../kernels/kernels_mix_down.cu");
+
+#[test]
+fn mix_down_uint4_kernel_is_wired() {
+    let p = kernel_params(MIX_DOWN_SRC, "dno_mix_down_bf16");
+    // 先頭が入力 x、次が重み (既存 dno_matvec_bf16_r_silu と同じ並び)。
+    // ここを入れ替えると重みを入力として読む (lab t192b と同じ E700)。
+    assert_eq!(
+        p,
+        vec!["x", "w", "out", "k", "n", "inv_hc"],
+        "dno_mix_down_bf16 の引数が (x, w, out, k, n, inv_hc) と違う: {p:?}"
+    );
+    // 8 要素 (uint4 = 16 B) のベクタロードと、明示の 2 演算 (1 演算 1 丸め)。
+    assert!(
+        MIX_DOWN_SRC.contains("*reinterpret_cast<const uint4*>(rowp + c)"),
+        "8 要素のベクタロードが無い"
+    );
+    assert!(
+        MIX_DOWN_SRC.contains("for (int c = tid * 8; c < k; c += (int)blockDim.x * 8)"),
+        "1 スレッド 8 要素のループが変わった"
+    );
+    assert!(
+        MIX_DOWN_SRC.contains("acc = __fadd_rn(acc, __fmul_rn("),
+        "積和が明示の 2 演算でない"
+    );
+    // silu は従来カーネルと同一の式 (dno_expf + __fdiv_rn + __fadd_rn + __fmul_rn)。
+    assert!(
+        MIX_DOWN_SRC.contains("out[j] = __fdiv_rn(v, __fadd_rn(1.0f, dno_expf(-v)));"),
+        "silu の epilogue が dno_matvec_bf16_r_silu と違う"
+    );
+    assert!(
+        MIX_DOWN_SRC.contains("__device__ __forceinline__ float dno_expf(float x)"),
+        "dno_expf が無い (glibc expf のビット一致複製)"
+    );
+    // 縮約は 1 warp = 32 レーンの固定木 → blockDim に依らず決定的。
+    assert!(
+        MIX_DOWN_SRC.contains("for (int off = 16; off > 0; off >>= 1)"),
+        "warp 内の固定木が変わった"
+    );
+    // cuda.rs: 別ファイル・6 引数・512 スレッド・ゲート・k % 8 の門番。
+    assert!(
+        CUDA_RS.contains("kernels_mix_down.ptx"),
+        "cuda.rs が kernels_mix_down.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_DOWN_NARGS: usize = 6;"),
+        "down 版の ABI 検査が 6 引数でない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_DOWN_THREADS: usize = 512;"),
+        "down 版のスレッド数のミラーが無い"
+    );
+    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        body.contains("if dec_mix_downw_on() && k1 % 8 == 0 {"),
+        "down 版の門番 (downw / k % 8) が無い"
+    );
+    assert!(
+        body.contains("ctx.launch_async(f_down, (n1 as u32, 1, 1), (down_thr, 1, 1), 0, &mut args)?;"),
+        "down の起動が down_thr でない"
+    );
+    // ゲートは既定 off (PTX を足しただけで既定の挙動が動かないこと)。
+    assert!(
+        CUDA_RS.contains("fn dec_mix_downw_on() -> bool {")
+            && CUDA_RS.contains("parse_dec_mix_downw(std::env::var(\"DENNO_DEC_MIX_DOWNW\")"),
+        "DENNO_DEC_MIX_DOWNW の口が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_down)     echo \"kernels_mix_down.cu|nofmad\" ;;"),
+        "build_ptx.sh の mix_down が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_down"),
+        "build_ptx.sh の targets_all に mix_down が無い: {targets}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 216: mix の up + hc_mixed を 1 本に畳む `kernels_mix_upmix.cu`
+// ---------------------------------------------------------------------------
+// 「cuda.rs が読んでいる」「build_ptx.sh が mix_upmix を作る」「warp = 1 行 +
+// uint4」「hc_mixed と同じ式」「ゲートは既定 off」「融合したら 2 本を撃たない」を
+// 固定する。値がビット一致する根拠 (同じ縮約・同じ式) もここで見る。
+const MIX_UPMIX_SRC: &str = include_str!("../kernels/kernels_mix_upmix.cu");
+
+#[test]
+fn mix_upmix_kernel_is_wired() {
+    let p = kernel_params(MIX_UPMIX_SRC, "dno_mix_upmix_bf16");
+    assert_eq!(
+        p,
+        vec!["lo", "w", "xn", "out", "k", "n", "e", "hc", "inv_hc"],
+        "dno_mix_upmix_bf16 の引数が (lo, w, xn, out, k, n, e, hc, inv_hc) と違う: {p:?}"
+    );
+    // up 側: 1 warp = 1 行 + uint4 = 8 BF16 + 明示の 2 演算 (dno_mix_up_bf16 と同じ鎖)。
+    assert!(
+        MIX_UPMIX_SRC.contains("*reinterpret_cast<const uint4*>(rowp + c)"),
+        "8 要素のベクタロードが無い"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int c = lane * 8; c < k; c += 32 * 8)"),
+        "1 レーン 8 要素のループが変わった (up の縮約が 2 本版と別になる)"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int off = 16; off > 0; off >>= 1)")
+            && MIX_UPMIX_SRC.contains("__shfl_down_sync(0xffffffffu, acc, off)"),
+        "warp 内の固定木が変わった"
+    );
+    // mixed 側: dno_hc_mixed_f32 と同じ式 (s 昇順 + 最後に inv_hc)。
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int ss = 1; ss < DNO_UPMIX_HC; ++ss)")
+            && MIX_UPMIX_SRC.contains("out[d] = __fmul_rn(acc, inv_hc);"),
+        "mixed の縮約順が dno_hc_mixed_f32 と違う"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("#define DNO_UPMIX_HC 4"),
+        "hc = 4 の前提が消えた (ホストの門番と揃える)"
+    );
+    // cuda.rs 側。
+    assert!(
+        CUDA_RS.contains("kernels_mix_upmix.ptx"),
+        "cuda.rs が kernels_mix_upmix.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX_NARGS: usize = 9;"),
+        "upmix 版の ABI 検査が 9 引数でない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX_EPB: usize = 2;")
+            && CUDA_RS.contains("const MIX_UPMIX_HC: usize = 4;"),
+        "upmix 版の形のミラーが無い"
+    );
+    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        body.contains("let upmix_ver = dec_mix_upmix_ver();")
+            && body.contains("if up_reduce && hc == MIX_UPMIX_HC {"),
+        "upmix の門番 (ゲート / hc) が無い"
+    );
+    // task 216: ビット一致版 (`=2`) も同じ口から選ぶ。形は grid = e / block = 256。
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX2_KERNEL_NAME: &str = \"dno_mix_upmix2_bf16\";"),
+        "ビット一致版のカーネル名が無い"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX2_NARGS: usize = 9;"),
+        "ビット一致版の ABI 検査が 9 引数でない"
+    );
+    assert!(
+        body.contains("2 => mix_upmix2_kernels().map(|k| k.f),"),
+        "=2 でビット一致版を選んでいない"
+    );
+    assert!(
+        body.contains("let grid = if upmix_v2 {"),
+        "ビット一致版の grid 分岐が無い"
+    );
+    // ビット一致版のカーネル: 従来 (dno_matvec_bf16_r) と同じスレッド割り当て。
+    let p2 = kernel_params(MIX_UPMIX_SRC, "dno_mix_upmix2_bf16");
+    assert_eq!(
+        p2,
+        vec!["lo", "w", "xn", "out", "k", "n", "e", "hc", "inv_hc"],
+        "dno_mix_upmix2_bf16 の引数が upmix と違う: {p2:?}"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int d = tid; d < k; d += nt) {"),
+        "ビット一致版のスレッド割り当てが従来 (d = tid, tid+nt) と違う"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int i = 1; i < (nt >> 5); ++i) {"),
+        "ビット一致版の 8 warp の和が従来と違う"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("if (tid == 0) {\n            // dno_hc_mixed_f32 と同じ式"),
+        "ビット一致版の mixed の式が hc_mixed と違う"
+    );
+    assert!(
+        body.contains("if let Some(f_upmix) = upmix {"),
+        "upmix の分岐が無い"
+    );
+    // 融合したときは hc_mixed を撃たない (2 本撃つと 2 本版と同じ値になるが、
+    // 融合の意味 (起動 1 本減) が消える)。hc_mixed の起動は融合分岐の else 側に
+    // 1 回だけある、という形で固定する。
+    let at_upmix = body
+        .find("if let Some(f_upmix) = upmix {")
+        .expect("融合分岐が無い");
+    let at_mixed = body.find("ctx.launch_async(f_mixed,").expect("hc_mixed の起動が無い");
+    assert!(
+        body.matches("ctx.launch_async(f_mixed,").count() == 1 && at_mixed > at_upmix,
+        "hc_mixed の起動が融合分岐の中にある (融合経路が 2 本撃っている)"
+    );
+    assert!(
+        body.contains("ctx.launch_async(f_upmix, grid, (256, 1, 1), 0, &mut args4)?;"),
+        "融合カーネルの起動が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_upmix)    echo \"kernels_mix_upmix.cu|nofmad\" ;;"),
+        "build_ptx.sh の mix_upmix が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_upmix"),
+        "build_ptx.sh の targets_all に mix_upmix が無い: {targets}"
     );
 }
 
