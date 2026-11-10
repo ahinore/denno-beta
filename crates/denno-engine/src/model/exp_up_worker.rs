@@ -88,6 +88,30 @@ pub fn max_from_value(v: Option<&str>) -> Option<usize> {
     (n > 0).then_some(n)
 }
 
+/// `DENNO_DEC_UP_STREAM`: 上げ直しの H2D を専用ストリームで出す。**既定 on**。
+///
+/// null ストリーム (メインスレッドのカーネル) と直列にならないので、上げ直しが
+/// GPU の帯を塞がない。ドライバのシンボルが無い / 生成に失敗したら同期経路へ
+/// 落ちる (fail closed)。明示的な偽値だけ切る。
+pub const STREAM_ENV: &str = "DENNO_DEC_UP_STREAM";
+
+/// [`STREAM_ENV`] の解釈 (純関数)。既定 on。
+pub fn stream_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// 専用ストリームを使うか (プロセスで 1 回だけ env を読む)。
+pub fn stream_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| stream_from_value(std::env::var(STREAM_ENV).ok().as_deref()))
+}
+
 /// 1 トークンあたりに積む本数の上限。`None` は「従来の規則を使う」。
 pub fn max_per_token() -> Option<usize> {
     static M: OnceLock<Option<usize>> = OnceLock::new();
@@ -126,6 +150,8 @@ static ERRORS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static JOB_NS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_MAX: AtomicU64 = AtomicU64::new(0);
+/// 専用ストリームが張れたか (診断用)。
+static STREAM_ON: AtomicBool = AtomicBool::new(false);
 
 /// 1 リクエストぶんの 1 行。ゲート off / 実績 0 なら `None`。
 pub fn stats_line() -> Option<String> {
@@ -149,11 +175,12 @@ pub fn stats_line() -> Option<String> {
         .unwrap_or(0);
     Some(format!(
         "[dec-up-w] submitted={sub} done={done} fail={} err={} dropped={} inflight={inflight} \
-         queue_max={} dma={:.2}ms us_per_job={us:.1}",
+         queue_max={} stream={} dma={:.2}ms us_per_job={us:.1}",
         FAILED.load(Ordering::Relaxed),
         ERRORS.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         QUEUE_MAX.load(Ordering::Relaxed),
+        u8::from(STREAM_ON.load(Ordering::Relaxed)),
         ns as f64 / 1e6
     ))
 }
@@ -248,6 +275,10 @@ mod gpu {
             tracing::warn!("task214: ワーカーに CUDA context を張れない → 従来の同期経路のみ");
             return;
         }
+        // 上げ直しの H2D は専用ストリームへ出す (null ストリームのカーネルと
+        // 直列にしない)。失敗しても同期経路で動く。
+        let stream = stream_enabled() && crate::cuda::enable_thread_upload_stream();
+        STREAM_ON.store(stream, Ordering::Relaxed);
         while let Ok(job) = rx.recv() {
             let key = (job.layer, job.expert);
             let t = Instant::now();
@@ -337,6 +368,18 @@ mod tests {
         assert!(on_from_value(Some(" on ")));
         assert!(on_from_value(Some("TRUE")));
         assert!(on_from_value(Some("yes")));
+    }
+
+    /// task 214: `DENNO_DEC_UP_STREAM` は既定 on、明示的な偽値だけ切る。
+    #[test]
+    fn upload_stream_gate_defaults_on() {
+        assert!(stream_from_value(None));
+        assert!(stream_from_value(Some("1")));
+        assert!(stream_from_value(Some(" on ")));
+        assert!(!stream_from_value(Some("0")));
+        assert!(!stream_from_value(Some("off")));
+        assert!(!stream_from_value(Some("false")));
+        assert!(!stream_from_value(Some("no")));
     }
 
     #[test]
