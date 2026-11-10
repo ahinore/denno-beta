@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>denno 2D — layers, chat, intervention</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#04060b; --fg:#cfeeff; --dim:#5b7280; --line:#12283a; --panel:#070d14;
+          --acc:#00eaff; --warn:#ff3b30; --ok:#3fe08a; --sel:#ffffff; --amber:#ffc44d;
+          --attn:#b46bff; --gdn:#00d9a0; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+              font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; }
+  header { height:42px; display:flex; align-items:center; gap:10px; padding:0 12px;
+           border-bottom:1px solid var(--line); background:linear-gradient(#08131c,#050a10); }
+  header .logo { font-weight:700; letter-spacing:.04em; color:var(--acc); }
+  header .logo span { color:#8ef; opacity:.65; margin-left:3px; }
+  header .dim { color:var(--dim); }
+  header .sp { flex:1; }
+  .badge { border:1px solid var(--line); border-radius:3px; padding:1px 6px; font-size:10px; color:var(--dim); }
+  .badge.live { border-color:#1d5f4a; color:var(--ok); }
+  .badge.mock { border-color:#6b4a12; color:var(--amber); }
+  .modes { display:flex; gap:2px; align-items:center; color:var(--dim); font-size:10px; }
+  .modes button { background:#0a1620; color:var(--dim); border:1px solid var(--line); border-radius:3px;
+                  font:inherit; font-size:10px; padding:2px 8px; cursor:pointer; }
+  .modes button.on { background:#0f3a4d; color:#9fefff; border-color:#2f8aa8; }
+  .epoch { font-size:11px; color:var(--dim); }
+  .epoch b { color:var(--fg); font-weight:600; }
+  .banner { font-size:11px; padding:2px 9px; border-radius:3px; border:1px solid #1c3444;
+            color:var(--dim); white-space:nowrap; max-width:46vw; overflow:hidden; text-overflow:ellipsis; }
+  .banner.iv { border-color:#7a1c24; background:rgba(255,59,48,.12); color:#ff8a94; }
+  .banner.st { border-color:#7a5a12; background:rgba(255,196,77,.10); color:#ffcf7a; }
+  .banner.both { border-color:#8a2a4a; background:rgba(255,59,48,.16); color:#ff9db0; }
+
+  main { display:grid; grid-template-columns:340px minmax(500px,1fr) 338px;
+         height:calc(100% - 42px); }
+  section { min-width:0; display:flex; flex-direction:column; padding:8px 10px; }
+  #chatpane { border-right:1px solid var(--line); }
+  #ctrl { border-left:1px solid var(--line); overflow-y:auto; gap:8px; }
+  h2 { font-size:11px; font-weight:400; letter-spacing:.10em; color:var(--dim);
+       margin:0 0 6px; padding-bottom:3px; border-bottom:1px solid var(--line); }
+  h2 .dim { color:#38505f; letter-spacing:0; }
+  .small { font-size:10.5px; }
+  .dim { color:var(--dim); }
+
+  /* ---- chat ---- */
+  #log { flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-word;
+         padding:2px 2px 6px; font-size:12.5px; line-height:1.6; }
+  #log .u { color:#8fe6ff; }
+  #log .a { color:#dff4ff; }
+  #log .s { color:var(--dim); font-size:10.5px; }
+  #log .e { color:#ff6b86; }
+  #log .contbtn { display:block; margin:6px 0 2px; padding:3px 12px; font-size:11px;
+    background:rgba(143,230,255,.08); color:#8fe6ff; border:1px solid rgba(143,230,255,.3);
+    border-radius:4px; cursor:pointer; }
+  #row { display:flex; gap:6px; padding-top:7px; border-top:1px solid var(--line); }
+  #in { flex:1; resize:none; height:56px; background:#08131c; color:var(--fg);
+        border:1px solid #1b4b60; border-radius:3px; font:inherit; font-size:12.5px;
+        padding:6px 8px; outline:none; }
+  #in:focus { border-color:#2f8aa8; }
+  #send { background:#0f3a4d; color:#9fefff; border:1px solid #2f8aa8; border-radius:3px;
+          font:inherit; font-size:11px; padding:0 12px; cursor:pointer; }
+  #send:disabled { opacity:.45; cursor:default; }
+  #cmeta { padding:5px 2px 0; color:var(--dim); font-size:10px; min-height:14px; }
+  #chatpane .hint { color:#38505f; font-size:10px; padding-top:4px; }
+
+  /* ---- map ---- */
+  #maphead { display:flex; align-items:flex-start; gap:12px; }
+  #maphead h2 { flex:1; }
+  #legend { display:flex; flex-wrap:wrap; gap:4px 10px; align-items:center;
+            font-size:10px; color:var(--dim); padding-bottom:4px; }
+  .sw { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:3px;
+        vertical-align:-1px; border:1px solid rgba(255,255,255,.15); }
+  #scale { display:flex; align-items:center; gap:5px; font-size:9.5px; }
+  #scalebar { width:110px; height:8px; border:1px solid #1b2f3d; border-radius:2px; }
+  #mapwrap { flex:1; overflow:auto; border:1px solid var(--line); border-radius:4px;
+             background:#04080d; position:relative; }
+  #colhead { position:sticky; top:0; height:17px; background:#060c13; z-index:3;
+             border-bottom:1px solid #0d1c27; }
+  #colhead span { position:absolute; top:2px; font-size:9px; color:#4f6b7a; letter-spacing:.04em; }
+  #map { display:block; cursor:crosshair; }
+  #tip { position:fixed; display:none; z-index:20; pointer-events:none; background:rgba(4,12,18,.95);
+         border:1px solid #1b3d52; border-radius:3px; padding:3px 7px; font-size:10.5px;
+         color:#cfeaf7; white-space:nowrap; box-shadow:0 2px 10px rgba(0,0,0,.5); }
+  #mapstat { color:#38505f; font-size:10px; padding-top:3px; display:flex; gap:14px; }
+  #mapstat b { color:#7fa4b8; font-weight:400; }
+
+  /* ---- controls ---- */
+  .box { border:1px solid var(--line); border-radius:5px; padding:7px 8px; background:var(--panel); }
+  .box h2 { margin-top:0; }
+  .row2 { display:flex; gap:5px; margin-top:5px; }
+  .row2 > * { flex:1; }
+  button.b { background:#0d2531; color:#8fe6ff; border:1px solid #1b4b60; border-radius:3px;
+             font:inherit; font-size:10.5px; padding:4px 6px; cursor:pointer; }
+  button.b:hover { background:#123546; }
+  button.b.warn { color:#ff9aa2; border-color:#6b2a33; background:#230b10; }
+  button.b.go { color:#9dffcf; border-color:#1d5f4a; background:#08231b; }
+  button.b:disabled { opacity:.4; cursor:default; }
+  input[type=text], input[type=number], select {
+    background:#08131c; color:var(--fg); border:1px solid #1b4b60; border-radius:3px;
+    font:inherit; font-size:11px; padding:3px 5px; min-width:0; width:100%; outline:none; }
+  input[type=number] { width:64px; }
+  label.f { display:flex; align-items:center; gap:5px; font-size:10px; color:var(--dim); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:5px 8px; margin-top:6px; }
+  .kv { display:flex; justify-content:space-between; font-size:10.5px; color:var(--dim); }
+  .kv b { color:var(--fg); font-weight:500; }
+  .snaps { margin-top:6px; display:flex; flex-direction:column; gap:3px; max-height:168px; overflow-y:auto; }
+  .snap { display:flex; align-items:center; gap:5px; border:1px solid #12283a; border-radius:3px;
+          padding:3px 5px; background:#060e15; font-size:10.5px; }
+  .snap input[type=checkbox] { margin:0; accent-color:#2f8aa8; }
+  .snap .nm { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .snap .tk { color:var(--dim); font-size:9.5px; }
+  .snap .cx { width:48px; }
+  .snap button { background:none; border:none; color:#6b2a33; cursor:pointer; font:inherit; }
+  .snap.on { border-color:#2f8aa8; background:#08161f; }
+  .terms { margin-top:6px; font-size:10.5px; color:#8fb4c8; min-height:14px; }
+  .err { color:#ff6b86; font-size:10.5px; white-space:pre-wrap; }
+  .reqlog { font-size:9.5px; color:var(--dim); max-height:150px; overflow-y:auto;
+            display:flex; flex-direction:column; gap:1px; }
+  .reqlog .q { color:#7fa4b8; }
+  .reqlog .ok { color:#3fe08a; }
+  .reqlog .bad { color:#ff6b86; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">denno<span>2D</span></div>
+  <div id="src" class="badge">connecting…</div>
+  <div class="sp"></div>
+  <div class="modes">colour:
+    <button id="m-token" class="on">per token</button>
+    <button id="m-accum">accumulated</button>
+  </div>
+  <div class="epoch">epoch <b id="epoch">0</b></div>
+  <div id="banner" class="banner">no intervention · no steering</div>
+</header>
+
+<main>
+  <section id="chatpane">
+    <h2>chat <span class="dim">POST /chat → 8098 · history kept</span></h2>
+    <div id="log"></div>
+    <div id="row">
+      <textarea id="in" placeholder="prompt… (Enter to send)"></textarea>
+      <button id="send">send</button>
+    </div>
+    <div id="cmeta"></div>
+    <div class="hint">Enter=send · Shift+Enter=newline · 「続きを生成」で継続 · <a href="#" id="clear" style="color:#5b7280">clear</a></div>
+  </section>
+
+  <section id="mappane">
+    <div id="maphead">
+      <h2>layer map <span class="dim" id="shapeline"></span></h2>
+      <div id="legend">
+        <span><i class="sw" style="background:#b46bff"></i>mixer attn</span>
+        <span><i class="sw" style="background:#00d9a0"></i>mixer gdn</span>
+        <span><i class="sw" style="background:#ffe14d"></i>router</span>
+        <span><i class="sw" style="background:#00b8d4"></i>experts</span>
+        <span><i class="sw" style="background:#ff2bd6"></i>shared</span>
+        <span><i class="sw" style="background:#7f8bff"></i>PLE</span>
+        <span><i class="sw" style="background:transparent;border-color:#00eaff"></i>VRAM ring</span>
+        <span><i class="sw" style="background:#2a0a10;border-color:#ff3b30"></i>off</span>
+        <span><i class="sw" style="background:#0a1620;border-color:#ffffff"></i>selected</span>
+        <span id="scale">weak<div id="scalebar"></div>strong</span>
+      </div>
+    </div>
+    <div id="mapwrap">
+      <div id="colhead"></div>
+      <canvas id="map"></canvas>
+    </div>
+    <div id="mapstat">
+      <span>ws <b id="wsstat">-</b></span>
+      <span>frames <b id="fstat">0</b></span>
+      <span>tokens <b id="tokstat">0</b></span>
+      <span>last <b id="laststat">-</b></span>
+      <span>vram <b id="vramstat">-</b></span>
+    </div>
+    <div id="tip"></div>
+  </section>
+
+  <section id="ctrl">
+    <div class="box">
+      <h2>intervention <span class="dim">/api/v1/intervene</span></h2>
+      <div class="kv"><span>experts off</span><b id="n-exp">0</b></div>
+      <div class="kv"><span>blocks off</span><b id="n-blk">0</b></div>
+      <div class="kv"><span>streams off</span><b id="n-str">0</b></div>
+      <div class="kv"><span>selection</span><b id="n-sel">0</b></div>
+      <div class="row2">
+        <button id="btn-off" class="b warn">switch off selected</button>
+        <button id="btn-on" class="b">switch on selected</button>
+      </div>
+      <div class="row2">
+        <button id="btn-selclear" class="b">clear selection</button>
+        <button id="btn-offclear" class="b">clear all off</button>
+      </div>
+      <div id="iverr" class="err"></div>
+    </div>
+
+    <div class="box">
+      <h2>steer <span class="dim">/api/v1/steer</span></h2>
+      <div class="row2">
+        <input id="recname" type="text" value="A" placeholder="snapshot name">
+        <button id="btn-rec" class="b go">record</button>
+        <button id="btn-stop" class="b">stop</button>
+      </div>
+      <div id="recinfo" class="small dim" style="margin-top:4px">recording: -</div>
+      <div id="snaps" class="snaps"></div>
+      <div class="grid2">
+        <label class="f">layers <input id="lfrom" type="number" min="0" value="0"> – <input id="lto" type="number" min="0" value="47"></label>
+        <label class="f">alpha <input id="alpha" type="number" step="0.1" value="1"></label>
+        <label class="f">mode <select id="smode"><option>subtract</option><option>project</option></select></label>
+      </div>
+      <div id="terms" class="terms">terms: (no snapshot selected)</div>
+      <div class="row2">
+        <button id="btn-apply" class="b go">apply</button>
+        <button id="btn-clear-apply" class="b warn">clear apply</button>
+      </div>
+      <div id="steerr" class="err"></div>
+      <div id="applyinfo" class="small dim" style="margin-top:4px"></div>
+    </div>
+
+    <div class="box">
+      <h2>requests <span class="dim">last 14</span></h2>
+      <div id="reqlog" class="reqlog"></div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import { decodeFrame, FrameDecodeError } from '/frames.mjs';
+import {
+  BLOCKS, DEFAULT_SHAPE_RAW, GEOM, actBuckets, createMapState, createMockStore,
+  createSelection, clearSelection as clearSel, hasItem, heat, hitTest, itemsInRect,
+  layoutFromShape, mergeBodies, normaliseShape, rampRGB, roleForBlock, selectionCount,
+  selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
+  toggleItem, addItem, removeItem, selectionItems,
+} from '/view2d.mjs';
+
+const $ = (id) => document.getElementById(id);
+const Q = new URLSearchParams(location.search);
+
+// ---- 状態 ---------------------------------------------------------------
+let mock = null;                       // 非 null ならモック店
+let shape = normaliseShape(DEFAULT_SHAPE_RAW);
+let layout = layoutFromShape(shape);
+let st = createMapState(shape);
+const sel = createSelection();
+let applied = { epoch: 0, experts_off: [], blocks_off: [], streams_off: [] };
+let steer = { recording: null, snapshots: [], apply: null };
+let terms = new Map();                 // snapshot name -> coef
+let hover = null;
+let drag = null;                       // {x0,y0,x1,y1,add,items}
+let offExp = new Map();                // layer -> Set(expert)
+let offBlk = new Set();                // "layer:block"
+let offStr = new Map();                // layer -> Set(stream)
+let dirty = true;
+let requests = [];
+
+// ---- API (live or mock) -------------------------------------------------
+async function api(method, path, body) {
+  if (mock) {
+    const r = mock.handle(method, path, body);
+    logReq(method, path, body, r.status, r.body);
+    return r;
+  }
+  const opt = { method, cache: 'no-store' };
+  if (body !== undefined) {
+    opt.headers = { 'content-type': 'application/json' };
+    opt.body = JSON.stringify(body);
+  }
+  let r;
+  try {
+    r = await fetch('/api' + path, opt);
+  } catch (e) {
+    logReq(method, path, body, 0, { error: String(e) });
+    return { status: 0, body: { error: { message: String(e) } } };
+  }
+  const text = await r.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch (e) { json = text; }
+  logReq(method, path, body, r.status, json);
+  return { status: r.status, body: json };
+}
+
+function logReq(method, path, body, status, res) {
+  const when = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+  requests.push({ method, path, body, status });
+  if (requests.length > 200) requests.shift();
+  const row = document.createElement('div');
+  const cls = status >= 200 && status < 300 ? 'ok' : 'bad';
+  const b = body === undefined ? '' : ' ' + JSON.stringify(body);
+  let extra = '';
+  if (res && res.epoch !== undefined) extra = ' epoch ' + res.epoch;
+  else if (res && res.error) extra = ' ' + (res.error.message || res.error);
+  row.innerHTML = '<span class="q">' + when + '</span> ' + method + ' ' + path +
+    '<span class="q">' + esc(b) + '</span> <span class="' + cls + '">' + status + esc(extra) + '</span>';
+  const log = $('reqlog');
+  log.insertBefore(row, log.firstChild);
+  while (log.children.length > 14) log.removeChild(log.lastChild);
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+// ---- 起動 ---------------------------------------------------------------
+let mockWhy = '';
+async function boot() {
+  let forcedMock = Q.get('mock') === '1';
+  if (forcedMock) mockWhy = 'forced by ?mock=1';
+  if (!forcedMock) {
+    try {
+      const r = await fetch('/api/v1/model/shape', { cache: 'no-store' });
+      if (!r.ok) throw new Error('GET /api/v1/model/shape → HTTP ' + r.status);
+      const j = await r.json();
+      shape = normaliseShape(j);
+      $('src').textContent = 'live /api → 8098';
+      $('src').className = 'badge live';
+    } catch (e) {
+      forcedMock = true;
+      mockWhy = (e && e.message) || String(e);
+    }
+  }
+  if (forcedMock) {
+    mock = createMockStore(DEFAULT_SHAPE_RAW);
+    shape = mock.shape;
+    $('src').textContent = 'mock · ' + mockWhy;
+    $('src').className = 'badge mock';
+  }
+  rebuild(shape);
+  $('lto').value = String(shape.layers - 1);
+  $('lfrom').max = String(shape.layers - 1);
+  $('lto').max = String(shape.layers - 1);
+  await refreshIntervene();
+  await refreshSteer();
+  connectWs();
+  requestAnimationFrame(tick);
+}
+let zoom = 1;
+
+/// 中央カラムの幅に合わせて地図を拡大する (1.0〜1.6 倍)。
+/// 描画は layout 座標のまま、canvas の transform と CSS サイズだけ倍にする。
+function fitCanvas() {
+  const wrap = $('mapwrap');
+  const avail = Math.max(320, wrap.clientWidth - 6);
+  zoom = Math.max(0.85, Math.min(1.6, avail / layout.width));
+  const dpr = Math.min(1.5, window.devicePixelRatio || 1);
+  const c = $('map');
+  c.width = Math.round(layout.width * zoom * dpr);
+  c.height = Math.round(layout.height * zoom * dpr);
+  c.style.width = Math.round(layout.width * zoom) + 'px';
+  c.style.height = Math.round(layout.height * zoom) + 'px';
+  c.getContext('2d').setTransform(dpr * zoom, 0, 0, dpr * zoom, 0, 0);
+  $('colhead').style.width = Math.round(layout.width * zoom) + 'px';
+  for (const el of $('colhead').children) {
+    el.style.left = (Number(el.dataset.x) * zoom) + 'px';
+  }
+}
+
+function rebuild(next) {
+  shape = normaliseShape(next);
+  layout = layoutFromShape(shape);
+  st = createMapState(shape, { mode: st ? st.mode : 'token' });
+  $('shapeline').textContent = shape.layers + ' layers · ' + shape.n_expert +
+    ' experts (top-' + shape.n_expert_used + ') · ' + shape.n_hc + ' hc streams · d' + shape.n_embd;
+  buildColHead();
+  buildScale();
+  fitCanvas();
+  dirty = true;
+}
+
+function buildColHead() {
+  const head = $('colhead');
+  head.style.width = layout.width + 'px';
+  head.innerHTML = '';
+  const r0 = layout.rows[0];
+  const labels = [
+    ['L', r0.label.x], ['mixer', r0.mixer.x], ['router', r0.router.x],
+    ['experts ' + shape.n_expert, r0.experts.x], ['sh', r0.shared.x],
+    ['ple', r0.ple.x], ['streams ×' + shape.n_hc, r0.streams[0].x],
+  ];
+  for (const [text, x] of labels) {
+    const s = document.createElement('span');
+    s.textContent = text;
+    s.dataset.x = String(x);
+    s.style.left = x + 'px';
+    head.appendChild(s);
+  }
+}
+
+function buildScale() {
+  const stops = [0, 0.25, 0.5, 0.75, 1].map((t) =>
+    'rgb(' + rampRGB(t).join(',') + ') ' + (t * 100) + '%').join(',');
+  $('scalebar').style.background = 'linear-gradient(90deg,' + stops + ')';
+}
+
+// ---- サーバー状態 -------------------------------------------------------
+async function refreshIntervene() {
+  const r = await api('GET', '/v1/intervene');
+  if (r.status === 200 && r.body && typeof r.body === 'object') {
+    $('iverr').textContent = '';
+    applied = {
+      epoch: r.body.epoch | 0,
+      experts_off: r.body.experts_off || [],
+      blocks_off: r.body.blocks_off || [],
+      streams_off: r.body.streams_off || [],
+    };
+    rebuildOffSets();
+    renderState();
+  } else if (r.status === 404) {
+    $('iverr').textContent = 'GET /v1/intervene 404 — この版のサーバーには介入 API がまだ無い';
+  }
+}
+
+async function refreshSteer() {
+  const r = await api('GET', '/v1/steer');
+  if (r.status === 200 && r.body && typeof r.body === 'object') {
+    $('steerr').textContent = '';
+    steer = {
+      recording: r.body.recording || null,
+      snapshots: r.body.snapshots || [],
+      apply: r.body.apply || null,
+    };
+    renderSteer();
+    renderState();
+  } else if (r.status === 404) {
+    $('steerr').textContent = 'GET /v1/steer 404 — この版のサーバーにはステアリング API がまだ無い';
+  }
+}
+
+function rebuildOffSets() {
+  offExp = new Map();
+  for (const [l, e] of applied.experts_off) {
+    if (!offExp.has(l)) offExp.set(l, new Set());
+    offExp.get(l).add(e);
+  }
+  offBlk = new Set(applied.blocks_off.map(([l, b]) => l + ':' + b));
+  offStr = new Map();
+  for (const [l, s] of applied.streams_off) {
+    if (!offStr.has(l)) offStr.set(l, new Set());
+    offStr.get(l).add(s);
+  }
+  dirty = true;
+}
+
+function activeCounts() {
+  return {
+    experts: applied.experts_off.length,
+    blocks: applied.blocks_off.length,
+    streams: applied.streams_off.length,
+    steer: steer.apply ? 1 : 0,
+  };
+}
+
+function renderState() {
+  const n = activeCounts();
+  $('epoch').textContent = String(applied.epoch);
+  $('n-exp').textContent = String(n.experts);
+  $('n-blk').textContent = String(n.blocks);
+  $('n-str').textContent = String(n.streams);
+  $('n-sel').textContent = String(selectionCount(sel));
+  const banner = $('banner');
+  const parts = [];
+  if (n.experts + n.blocks + n.streams > 0) {
+    parts.push('INTERVENTION ACTIVE: ' + n.experts + ' experts, ' + n.blocks +
+      ' blocks, ' + n.streams + ' streams off (epoch ' + applied.epoch + ')');
+  }
+  if (steer.apply) parts.push('STEERING ACTIVE: ' + steerSummary(steer.apply));
+  if (!parts.length) {
+    banner.textContent = 'no intervention · no steering (epoch ' + applied.epoch + ')';
+    banner.className = 'banner';
+  } else {
+    banner.textContent = parts.join('  |  ');
+    banner.className = 'banner ' + (n.steer && (n.experts + n.blocks + n.streams) ? 'both'
+      : n.steer ? 'st' : 'iv');
+  }
+  $('applyinfo').textContent = steer.apply ? 'applied: ' + steerSummary(steer.apply) : '';
+}
+
+// ---- 介入の操作 ---------------------------------------------------------
+async function postIntervene(body) {
+  $('iverr').textContent = '';
+  const r = await api('POST', '/v1/intervene', body);
+  if (r.status !== 200) {
+    $('iverr').textContent = 'POST /v1/intervene → ' + r.status + ' ' +
+      ((r.body && r.body.error && r.body.error.message) || '');
+    return false;
+  }
+  await refreshIntervene();
+  return true;
+}
+
+$('btn-off').addEventListener('click', async () => {
+  if (!selectionCount(sel)) { $('iverr').textContent = 'selection is empty (click or drag on the map)'; return; }
+  const body = mergeBodies(
+    { experts_off: applied.experts_off, blocks_off: applied.blocks_off, streams_off: applied.streams_off },
+    selectionToBody(sel),
+  );
+  if (await postIntervene(body)) { clearSel(sel); renderState(); dirty = true; }
+});
+
+$('btn-on').addEventListener('click', async () => {
+  if (!selectionCount(sel)) { $('iverr').textContent = 'selection is empty'; return; }
+  const off = selectionFromBody({
+    experts_off: applied.experts_off, blocks_off: applied.blocks_off, streams_off: applied.streams_off,
+  });
+  for (const it of selectionItems(sel)) removeItem(off, it);
+  if (await postIntervene(selectionToBody(off))) { clearSel(sel); renderState(); dirty = true; }
+});
+
+$('btn-selclear').addEventListener('click', () => { clearSel(sel); renderState(); dirty = true; });
+
+$('btn-offclear').addEventListener('click', async () => {
+  $('iverr').textContent = '';
+  const r = await api('DELETE', '/v1/intervene');
+  if (r.status !== 200) {
+    $('iverr').textContent = 'DELETE /v1/intervene → ' + r.status;
+    return;
+  }
+  await refreshIntervene();
+  clearSel(sel);
+  dirty = true;
+});
+
+// ---- ステアリングの操作 -------------------------------------------------
+$('btn-rec').addEventListener('click', async () => {
+  $('steerr').textContent = '';
+  const name = $('recname').value.trim();
+  if (!name) { $('steerr').textContent = 'name is required'; return; }
+  const r = await api('POST', '/v1/steer/record', { name });
+  if (r.status !== 200) { $('steerr').textContent = 'record → ' + r.status + ' ' + errText(r); return; }
+  await refreshSteer();
+});
+
+$('btn-stop').addEventListener('click', async () => {
+  $('steerr').textContent = '';
+  const r = await api('POST', '/v1/steer/record/stop');
+  if (r.status !== 200) { $('steerr').textContent = 'stop → ' + r.status + ' ' + errText(r); return; }
+  await refreshSteer();
+});
+
+function errText(r) {
+  return (r.body && r.body.error && r.body.error.message) || '';
+}
+
+function renderRecInfo() {
+  const rec = steer.recording;
+  $('recinfo').textContent = rec
+    ? 'recording: ' + rec.name + ' · ' + (rec.tokens | 0) + ' tokens'
+    : 'recording: - (snapshots ' + steer.snapshots.length + ')';
+}
+
+function renderSteer() {
+  const rec = steer.recording;
+  renderRecInfo();
+  $('btn-rec').disabled = !!rec;
+  $('btn-stop').disabled = !rec;
+
+  const box = $('snaps');
+  box.innerHTML = '';
+  if (!steer.snapshots.length) {
+    box.innerHTML = '<div class="small dim">no snapshot yet — record a few tokens with a name</div>';
+  }
+  for (const s of steer.snapshots) {
+    const row = document.createElement('div');
+    row.className = 'snap' + (terms.has(s.name) ? ' on' : '');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = terms.has(s.name);
+    cb.title = 'include in the combination';
+    cb.addEventListener('change', () => {
+      if (cb.checked) terms.set(s.name, Number(terms.get(s.name) ? terms.get(s.name) : 1));
+      else terms.delete(s.name);
+      row.className = 'snap' + (terms.has(s.name) ? ' on' : '');
+      renderTerms();
+    });
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = s.name;
+    nm.title = s.name;
+    const tk = document.createElement('span');
+    tk.className = 'tk';
+    tk.textContent = (s.tokens | 0) + ' tok';
+    const cx = document.createElement('input');
+    cx.type = 'number';
+    cx.step = '0.1';
+    cx.className = 'cx';
+    cx.value = String(terms.has(s.name) ? terms.get(s.name) : 1);
+    cx.title = 'coefficient';
+    cx.addEventListener('input', () => {
+      if (terms.has(s.name)) { terms.set(s.name, Number(cx.value)); renderTerms(); }
+    });
+    const del = document.createElement('button');
+    del.textContent = '×';
+    del.title = 'delete snapshot';
+    del.addEventListener('click', async () => {
+      $('steerr').textContent = '';
+      const r = await api('DELETE', '/v1/steer/snapshots/' + encodeURIComponent(s.name));
+      if (r.status !== 200) { $('steerr').textContent = 'delete → ' + r.status + ' ' + errText(r); return; }
+      terms.delete(s.name);
+      await refreshSteer();
+    });
+    row.append(cb, nm, tk, cx, del);
+    box.appendChild(row);
+  }
+  renderTerms();
+}
+
+function renderTerms() {
+  const list = [];
+  for (const s of steer.snapshots) if (terms.has(s.name)) list.push(s.name);
+  $('terms').textContent = list.length
+    ? 'terms: ' + list.map((n) => n + ' ' + (Number(terms.get(n)) >= 0 ? '+' : '') + terms.get(n)).join(' · ')
+    : 'terms: (no snapshot selected)';
+}
+
+$('btn-apply').addEventListener('click', async () => {
+  $('steerr').textContent = '';
+  let spec;
+  try {
+    const chosen = [];
+    for (const s of steer.snapshots) if (terms.has(s.name)) chosen.push({ snapshot: s.name, coef: terms.get(s.name) });
+    spec = steerApplyBody({
+      terms: chosen,
+      layers: [Number($('lfrom').value), Number($('lto').value)],
+      alpha: Number($('alpha').value),
+      mode: $('smode').value,
+    });
+  } catch (e) {
+    $('steerr').textContent = (e && e.message) || String(e);
+    return;
+  }
+  const r = await api('POST', '/v1/steer/apply', spec);
+  if (r.status !== 200) { $('steerr').textContent = 'apply → ' + r.status + ' ' + errText(r); return; }
+  await refreshSteer();
+});
+
+$('btn-clear-apply').addEventListener('click', async () => {
+  $('steerr').textContent = '';
+  const r = await api('DELETE', '/v1/steer/apply');
+  if (r.status !== 200) { $('steerr').textContent = 'clear apply → ' + r.status + ' ' + errText(r); return; }
+  await refreshSteer();
+});
+
+// ---- 地図の描画 ---------------------------------------------------------
+function tick() {
+  requestAnimationFrame(tick);
+  if (!dirty) return;
+  dirty = false;
+  draw();
+}
+
+function draw() {
+  const c = $('map');
+  const g = c.getContext('2d');
+  const wrap = $('mapwrap');
+  const top = wrap.scrollTop / zoom;
+  const h = wrap.clientHeight / zoom;
+  const y0 = top - 60, y1 = top + h + 60;
+  g.clearRect(0, Math.max(0, y0), layout.width, Math.min(layout.height, y1) - Math.max(0, y0));
+  g.fillStyle = '#04080d';
+  g.fillRect(0, Math.max(0, y0), layout.width, Math.min(layout.height, y1) - Math.max(0, y0));
+
+  const dragItems = drag && drag.items ? new Set(drag.items.map(itemKey)) : null;
+  for (const row of layout.rows) {
+    if (row.y + row.h < y0 || row.y > y1) continue;
+    drawRow(g, row, dragItems);
+  }
+  if (drag && drag.active) {
+    const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
+    const w = Math.abs(drag.x1 - drag.x0), hh = Math.abs(drag.y1 - drag.y0);
+    g.fillStyle = drag.add ? 'rgba(120,220,255,.12)' : 'rgba(255,120,120,.12)';
+    g.fillRect(x, y, w, hh);
+    g.strokeStyle = drag.add ? 'rgba(140,230,255,.7)' : 'rgba(255,140,140,.7)';
+    g.strokeRect(x + .5, y + .5, w, hh);
+  }
+}
+
+function itemKey(it) {
+  if (it.type === 'expert') return 'e:' + it.layer + ':' + it.expert;
+  if (it.type === 'block') return 'b:' + it.layer + ':' + it.block;
+  return 's:' + it.layer + ':' + it.stream;
+}
+
+function drawRow(g, row, dragItems) {
+  const l = row.layer;
+  const role = st.role[l];
+  if (hover && hover.layer === l) {
+    g.fillStyle = 'rgba(88,166,255,.06)';
+    g.fillRect(0, row.y, layout.width, row.h);
+  }
+  // 層番号
+  g.font = '9px ui-monospace, monospace';
+  g.textBaseline = 'middle';
+  g.fillStyle = row.kind === 'attn' ? 'rgba(180,107,255,.9)' : 'rgba(0,217,160,.8)';
+  g.fillText(String(l).padStart(2, '0'), row.label.x, row.label.y + 5);
+
+  // mixer / router / shared / ple
+  drawBlock(g, row.mixer, roleForBlock(role, 'attn', row.kind), row.kind === 'attn' ? 'attn' : 'gdn',
+    offBlk.has(l + ':attn'), hasKey(dragItems, 'b:' + l + ':attn') || isSel('block', l, 'attn'));
+  drawBlock(g, row.router, role.router, 'rt',
+    offBlk.has(l + ':moe'), hasKey(dragItems, 'b:' + l + ':moe') || isSel('block', l, 'moe'));
+  drawBlock(g, row.shared, role.shex, 'sh',
+    offBlk.has(l + ':shared'), hasKey(dragItems, 'b:' + l + ':shared') || isSel('block', l, 'shared'));
+  drawBlock(g, row.ple, row.ple.active ? role.ple : 0, 'ple',
+    offBlk.has(l + ':ple'), hasKey(dragItems, 'b:' + l + ':ple') || isSel('block', l, 'ple'), !row.ple.active);
+
+  // experts
+  const ex = row.experts;
+  const heatArr = st.experts[l];
+  const res = st.residency[l];
+  const offSet = offExp.get(l);
+  const gx = ex.cell + ex.gap;
+  g.fillStyle = '#071019';
+  g.fillRect(ex.x, ex.y, ex.w, ex.h);
+  for (let i = 0; i < ex.n; i++) {
+    const v = heatArr[i];
+    const isOff = offSet ? offSet.has(i) : false;
+    const isDrag = dragItems ? dragItems.has('e:' + l + ':' + i) : false;
+    const isSelNow = isSel('expert', l, i);
+    const resident = res[i] === 1;
+    if (!(v > 0) && !isOff && !resident && !isDrag && !isSelNow) continue;
+    const x = ex.x + (i % ex.cols) * gx;
+    const y = ex.y + Math.floor(i / ex.cols) * gx;
+    if (isOff) {
+      g.fillStyle = '#2a0a10';
+    } else if (v > 0) {
+      g.fillStyle = heat(v);
+    } else {
+      g.fillStyle = '#0b2230';
+    }
+    g.fillRect(x, y, ex.cell, ex.cell);
+    if (resident && !isOff) {
+      g.fillStyle = 'rgba(0,234,255,.85)';
+      g.fillRect(x, y, ex.cell, 1);
+    }
+    if (isDrag || isSelNow) {
+      g.fillStyle = 'rgba(255,255,255,.9)';
+      g.fillRect(x, y, ex.cell, 1);
+      g.fillRect(x, y + ex.cell - 1, ex.cell, 1);
+      g.fillRect(x, y, 1, ex.cell);
+      g.fillRect(x + ex.cell - 1, y, 1, ex.cell);
+    }
+  }
+
+  // LayerAct strip
+  const strip = row.strip;
+  const buckets = st.act[l];
+  const bw = strip.w / buckets.length;
+  for (let i = 0; i < buckets.length; i++) {
+    if (!(buckets[i] > 0)) continue;
+    g.fillStyle = heat(buckets[i]);
+    g.globalAlpha = 0.85;
+    g.fillRect(strip.x + i * bw, strip.y, Math.max(1, bw - 0.5), strip.h);
+  }
+  g.globalAlpha = 1;
+
+  // streams
+  const sv = streamValue(role);
+  for (let i = 0; i < row.streams.length; i++) {
+    const r = row.streams[i];
+    const isOff = offStr.get(l) ? offStr.get(l).has(i) : false;
+    const isDrag = hasKey(dragItems, 's:' + l + ':' + i);
+    const isSelNow = isSel('stream', l, i);
+    g.fillStyle = isOff ? '#2a0a10' : heat(sv);
+    g.fillRect(r.x, r.y, r.w, r.h);
+    g.strokeStyle = isOff ? '#ff3b30'
+      : (isDrag || isSelNow) ? 'rgba(255,255,255,.95)' : 'rgba(120,170,195,.35)';
+    g.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
+  }
+}
+
+function hasKey(set, k) { return set ? set.has(k) : false; }
+
+function isSel(type, l, key) {
+  if (type === 'expert') return sel.experts.has('e:' + l + ':' + key);
+  if (type === 'block') return sel.blocks.has('b:' + l + ':' + key);
+  return sel.streams.has('s:' + l + ':' + key);
+}
+
+function drawBlock(g, r, v, label, isOff, isSelNow, dim) {
+  if (isOff) g.fillStyle = '#2a0a10';
+  else if (dim) g.fillStyle = '#0a1017';
+  else g.fillStyle = heat(v);
+  g.fillRect(r.x, r.y, r.w, r.h);
+  const lum = isOff || dim ? 0 : (rampRGB(v)[0] * 0.30 + rampRGB(v)[1] * 0.59 + rampRGB(v)[2] * 0.11);
+  g.strokeStyle = isOff ? '#ff3b30'
+    : isSelNow ? 'rgba(255,255,255,.95)' : 'rgba(120,170,195,.28)';
+  g.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
+  g.fillStyle = isOff ? '#ff8a94' : (lum > 150 ? '#04121a' : 'rgba(200,232,248,.8)');
+  g.font = '8px ui-monospace, monospace';
+  g.fillText(label, r.x + 3, r.y + r.h / 2 + .5);
+  if (isOff) {
+    g.strokeStyle = 'rgba(255,59,48,.65)';
+    g.beginPath();
+    g.moveTo(r.x + 1, r.y + 1);
+    g.lineTo(r.x + r.w - 1, r.y + r.h - 1);
+    g.stroke();
+  }
+}
+
+// ---- 地図の操作 ---------------------------------------------------------
+const canvas = $('map');
+const tip = $('tip');
+
+function mapPoint(ev) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) / zoom, y: (ev.clientY - r.top) / zoom };
+}
+
+function describe(hit) {
+  if (!hit) return '';
+  if (hit.type === 'expert') {
+    const v = st.experts[hit.layer][hit.expert];
+    const res = st.residency[hit.layer][hit.expert] === 1;
+    const off = offExp.get(hit.layer) && offExp.get(hit.layer).has(hit.expert);
+    return 'layer ' + hit.layer + ' · expert ' + hit.expert + ' · weight ' +
+      (Math.round(v * 100) / 100) + (res ? ' · VRAM' : '') + (off ? ' · OFF' : '');
+  }
+  if (hit.type === 'block') {
+    return 'layer ' + hit.layer + ' · block ' + hit.block +
+      (offBlk.has(hit.layer + ':' + hit.block) ? ' · OFF' : '');
+  }
+  return 'layer ' + hit.layer + ' · stream ' + hit.stream +
+    (offStr.get(hit.layer) && offStr.get(hit.layer).has(hit.stream) ? ' · OFF' : '');
+}
+
+canvas.addEventListener('pointerdown', (ev) => {
+  const p = mapPoint(ev);
+  const hit = hitTest(layout, p.x, p.y);
+  drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, add: !ev.shiftKey, active: false, hit, items: null };
+  canvas.setPointerCapture(ev.pointerId);
+});
+
+canvas.addEventListener('pointermove', (ev) => {
+  const p = mapPoint(ev);
+  if (drag) {
+    drag.x1 = p.x; drag.y1 = p.y;
+    const dx = Math.abs(drag.x1 - drag.x0), dy = Math.abs(drag.y1 - drag.y0);
+    if (!drag.active && (dx > 3 || dy > 3)) drag.active = true;
+    if (drag.active) {
+      drag.items = itemsInRect(layout, drag.x0, drag.y0, drag.x1, drag.y1);
+      $('n-sel').textContent = String(drag.items.length);
+      dirty = true;
+    }
+    return;
+  }
+  const hit = hitTest(layout, p.x, p.y);
+  hover = hit;
+  dirty = true;
+  if (hit) {
+    tip.style.display = 'block';
+    tip.textContent = describe(hit);
+    tip.style.left = (ev.clientX + 14) + 'px';
+    tip.style.top = (ev.clientY + 12) + 'px';
+  } else {
+    tip.style.display = 'none';
+  }
+});
+
+canvas.addEventListener('pointerup', (ev) => {
+  const d = drag;
+  drag = null;
+  if (!d) return;
+  if (d.active) {
+    for (const it of d.items || []) {
+      if (d.add) addItem(sel, it);
+      else removeItem(sel, it);
+    }
+  } else if (d.hit) {
+    toggleItem(sel, d.hit);
+  } else {
+    clearSel(sel);
+  }
+  $('tip').style.display = 'none';
+  renderState();
+  dirty = true;
+});
+
+canvas.addEventListener('pointerleave', () => {
+  hover = null; drag = null; $('tip').style.display = 'none'; dirty = true;
+});
+
+canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+
+$('mapwrap').addEventListener('scroll', () => { dirty = true; });
+let resizeTimer = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { fitCanvas(); dirty = true; }, 120);
+});
+// ホイールはブラウザのスクロールに任せる (canvas は縦に長い)。
+
+// ---- テレメトリ ---------------------------------------------------------
+let wsRetry = 2000;
+let frameCount = 0;
+let lastKind = '-';
+let vram = '-';
+let lastSteerPoll = 0;
+
+function connectWs() {
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  let ws;
+  try { ws = new WebSocket(url); } catch (e) { setTimeout(connectWs, wsRetry); return; }
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { $('wsstat').textContent = 'connected'; };
+  ws.onmessage = (ev) => {
+    const buf = new Uint8Array(ev.data);
+    let off = 0;
+    while (off < buf.length) {
+      let r;
+      try {
+        r = decodeFrame(buf, off);
+      } catch (e) {
+        if (e instanceof FrameDecodeError) $('wsstat').textContent = 'decode error: ' + e.message;
+        break;
+      }
+      off = r.next;
+      handleFrame(r.frame);
+    }
+  };
+  ws.onclose = () => {
+    $('wsstat').textContent = 'disconnected (retry)';
+    setTimeout(connectWs, wsRetry);
+  };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
+function handleFrame(f) {
+  frameCount++;
+  lastKind = f.kind;
+  if (st.onFrame(f)) dirty = true;
+  if (f.kind === 'Token') {
+    $('tokstat').textContent = String(st.token);
+    if (mock) {
+      mock.tick(1);
+      // モックはサーバー側の記録カウンタが無いので、画面側で同じだけ進める
+      if (steer.recording) {
+        steer.recording.tokens = (steer.recording.tokens | 0) + 1;
+        renderRecInfo();
+      }
+    }
+    // 記録中のトークン数: モックは画面側で数える (ここで GET すると
+    // 古い応答が返ってカウンタを巻き戻す)。live はサーバーが数えるので 1 秒毎に読む。
+    const now = performance.now();
+    if (!mock && steer.recording && now - lastSteerPoll > 1000) {
+      lastSteerPoll = now;
+      refreshSteer();
+    }
+  } else if (f.kind === 'ServerInfo') {
+    $('shapeline').textContent = f.model + ' · layers ' + f.layers + ' · ctx ' + f.context;
+  } else if (f.kind === 'TierStats') {
+    vram = f.vramMB + '/' + f.vramTotalMB + ' MB';
+    $('vramstat').textContent = vram;
+  } else if (f.kind === 'Gap') {
+    $('wsstat').textContent = 'gap: ' + f.lost + ' frames lost';
+  }
+  $('fstat').textContent = String(frameCount);
+  $('laststat').textContent = lastKind;
+}
+
+// ---- 描画モード ---------------------------------------------------------
+$('m-token').addEventListener('click', () => setMode('token'));
+$('m-accum').addEventListener('click', () => setMode('accum'));
+function setMode(mode) {
+  st.setMode(mode);
+  $('m-token').className = mode === 'token' ? 'on' : '';
+  $('m-accum').className = mode === 'accum' ? 'on' : '';
+  dirty = true;
+  renderState();
+}
+
+// ---- チャット -----------------------------------------------------------
+const CHAT_URL = '/chat';
+let CHAT_LIMITS = { max_tokens_default: 4096 };
+(async () => {
+  try {
+    const r = await fetch('/v1/limits');
+    if (r.ok) {
+      const j = await r.json();
+      if (j && Number(j.max_tokens_default) > 0) CHAT_LIMITS = j;
+    }
+  } catch (e) { /* 既定値 */ }
+})();
+
+const chatEl = { log: $('log'), inp: $('in'), send: $('send'), meta: $('cmeta') };
+const hist = [];
+let busy = false;
+
+function addLine(cls, text) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.textContent = text;
+  chatEl.log.appendChild(d);
+  chatEl.log.scrollTop = chatEl.log.scrollHeight;
+  return d;
+}
+
+async function runStream(node, baseAcc) {
+  const t0 = performance.now();
+  let acc = baseAcc, usage = null, err = null, stop = null;
+  try {
+    const body = { model: 'denno', max_tokens: CHAT_LIMITS.max_tokens_default || 4096,
+                   stream: true, messages: hist.slice(-12) };
+    if (baseAcc) body.continue = true;
+    const res = await fetch(CHAT_URL, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 200));
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buf += dec.decode(chunk.value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const ev = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        let data = '';
+        for (const L of ev.split('\n')) if (L.startsWith('data: ')) data += L.slice(6);
+        if (!data) continue;
+        let j;
+        try { j = JSON.parse(data); } catch (e) { continue; }
+        if (j.type === 'content_block_delta' && j.delta && j.delta.text) {
+          acc += j.delta.text;
+          node.textContent = acc;
+          chatEl.log.scrollTop = chatEl.log.scrollHeight;
+        } else if (j.type === 'message_delta') {
+          if (j.usage) usage = j.usage;
+          if (j.delta && j.delta.stop_reason) stop = j.delta.stop_reason;
+        } else if (j.type === 'error') {
+          err = (j.error && j.error.message) || 'error';
+        }
+      }
+    }
+  } catch (e) {
+    err = (e && e.message) ? e.message : String(e);
+  }
+  return { acc, usage, err, stop, secs: (performance.now() - t0) / 1000 };
+}
+
+function showMeta(r) {
+  const nOut = r.usage ? r.usage.output_tokens : null;
+  const nIn = r.usage ? r.usage.input_tokens : null;
+  chatEl.meta.textContent = (r.err ? 'error' : 'ok') + ' · ' + r.secs.toFixed(1) + ' s' +
+    (nOut ? ' · ' + nOut + ' tok (' + (nOut / Math.max(0.001, r.secs)).toFixed(1) + ' tok/s)' : '') +
+    (nIn ? ' · in ' + nIn : '') + ' · history ' + hist.length + ' msgs (prefix cache reused)';
+}
+
+function showContinue(node) {
+  const b = document.createElement('button');
+  b.className = 'contbtn';
+  b.textContent = '続きを生成';
+  b.addEventListener('click', () => { b.remove(); continueMsg(node); });
+  chatEl.log.appendChild(b);
+  chatEl.log.scrollTop = chatEl.log.scrollHeight;
+}
+
+async function sendMsg(text) {
+  if (busy || !text.trim()) return;
+  busy = true;
+  chatEl.send.disabled = true;
+  addLine('u', '> ' + text);
+  chatEl.inp.value = '';
+  hist.push({ role: 'user', content: text });
+  const node = addLine('a', '');
+  const r = await runStream(node, '');
+  if (r.err) addLine('e', '[error] ' + r.err);
+  if (!r.acc && !r.err) node.textContent = '(空の応答)';
+  hist.push({ role: 'assistant', content: r.acc || '' });
+  showMeta(r);
+  busy = false;
+  chatEl.send.disabled = false;
+  if (r.stop === 'max_tokens' && r.acc && !r.err) showContinue(node);
+}
+
+async function continueMsg(node) {
+  if (busy) return;
+  busy = true;
+  chatEl.send.disabled = true;
+  const base = node.textContent;
+  const r = await runStream(node, base);
+  if (r.err) addLine('e', '[error] ' + r.err);
+  if (hist.length && hist[hist.length - 1].role === 'assistant') hist[hist.length - 1].content = r.acc;
+  showMeta(r);
+  busy = false;
+  chatEl.send.disabled = false;
+  if (r.stop === 'max_tokens' && r.acc !== base && !r.err) showContinue(node);
+}
+
+chatEl.send.addEventListener('click', () => sendMsg(chatEl.inp.value));
+chatEl.inp.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMsg(chatEl.inp.value);
+  }
+});
+$('clear').addEventListener('click', (e) => {
+  e.preventDefault();
+  hist.length = 0;
+  chatEl.log.innerHTML = '';
+  chatEl.meta.textContent = '';
+});
+
+addEventListener('keydown', (e) => {
+  if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
+  if (e.key === 'Escape') { clearSel(sel); renderState(); dirty = true; }
+});
+
+// ---- 検証用フック (?shot / CDP から叩く) --------------------------------
+window.__view2d = {
+  shape: () => shape,
+  layout: () => layout,
+  state: () => st,
+  applied: () => applied,
+  steer: () => steer,
+  selection: () => selectionToBody(sel),
+  requests: () => requests.slice(),
+  mode: () => st.mode,
+  zoom: () => zoom,
+  mock: () => !!mock,
+  setMode,
+  select: (items) => { for (const it of items) addItem(sel, it); renderState(); dirty = true; },
+  offSelected: () => $('btn-off').click(),
+  onSelected: () => $('btn-on').click(),
+  clearSelection: () => { clearSel(sel); renderState(); dirty = true; },
+  clearOff: () => $('btn-offclear').click(),
+  api,
+  pushFrame: (f) => handleFrame(f),
+  ready: false,
+};
+
+boot().then(() => {
+  window.__view2d.ready = true;
+  document.title = 'denno 2D — ready';
+}).catch((e) => {
+  $('src').textContent = 'boot error: ' + ((e && e.message) || e);
+  $('src').className = 'badge mock';
+  console.error(e);
+});
+</script>
+</body>
+</html>
