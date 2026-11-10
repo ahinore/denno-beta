@@ -8036,6 +8036,61 @@ fn emit_router_topk(layer: usize, sel: &[usize], weights: &[f32]) {
     denno_telemetry::emit(denno_telemetry::router_topk_frame(layer as u16, sel, weights));
 }
 
+/// task 220: `DENNO_TELEM_EXPERT_SKIP` のゲート (既定 off)。
+///
+/// env はプロセスで 1 回だけ読む (AtomicI8: -1 = 未読 / 0 = off / 1 = on)。
+/// **off のときは [`select_topk`] を回さない**ので、余分な計算も確保もしない
+/// (分岐 1 個だけ)。テストは [`set_expert_skip_for_tests`] で上書きする。
+static EXPERT_SKIP_GATE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+fn expert_skip_enabled() -> bool {
+    let cached = EXPERT_SKIP_GATE.load(std::sync::atomic::Ordering::Relaxed);
+    if cached >= 0 {
+        return cached == 1;
+    }
+    let on = match std::env::var("DENNO_TELEM_EXPERT_SKIP").ok().as_deref() {
+        Some("1") | Some("true") | Some("yes") => true,
+        _ => false,
+    };
+    EXPERT_SKIP_GATE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+/// task 220: テストから [`EXPERT_SKIP_GATE`] を上書きする (`None` で env 読みに戻す)。
+#[cfg(test)]
+fn set_expert_skip_for_tests(v: Option<bool>) {
+    let raw = match v {
+        None => -1i8,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    EXPERT_SKIP_GATE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 220: 「ルータが選びたかったが、介入で無効化されていた expert」を送る。
+///
+/// - `probs`: softmax 後の全 expert の確率 (マスク前)。
+/// - `k`: ルータの top-k 数 (無効化が無ければ選ばれていた集合を求める)。
+/// - `sel`: 実際に使った expert (マスク後・index 昇順)。
+/// - `mask`: その層の無効ビット列 ([`IvView::expert_mask`] の戻り値)。
+///
+/// `DENNO_TELEMETRY` / `DENNO_TELEMETRY_ARCH` / `DENNO_TELEM_EXPERT_SKIP` が
+/// すべて立っているときだけ計算する (既定 off)。読むだけなので logits は変わらない。
+fn emit_expert_skip(layer: usize, probs: &[f32], k: usize, sel: &[usize], mask: &[u64]) {
+    if !denno_telemetry::enabled() || !denno_telemetry::arch_enabled() || !expert_skip_enabled() {
+        return;
+    }
+    let want = select_topk(probs, k);
+    let skipped: Vec<usize> = want
+        .into_iter()
+        .filter(|&e| mask.get(e / 64).map(|w| (w >> (e % 64)) & 1 != 0).unwrap_or(false))
+        .filter(|e| !sel.contains(e))
+        .collect();
+    if let Some(fr) = denno_telemetry::expert_skip_frame(layer as u16, &skipped) {
+        denno_telemetry::emit(fr);
+    }
+}
+
 /// P58: 構造テレメトリ (RoleAct / ExpertResidency / TierStats) の送出が有効か。
 ///
 /// RouterTopK と同じく `DENNO_TELEMETRY` と `DENNO_TELEMETRY_ARCH` の両方が要る
@@ -9482,7 +9537,8 @@ fn moe_ffn_quant_impl(
     // task 217: 無効 expert は候補から外す (設定が無ければ従来と 1 ビット同じ)。
     // 残った expert から top-k を選び、下の再正規化は選んだ集合の和で割る
     // = 「残りだけで正規化する」というルータの通常の規則になる。
-    let mut sel = match iv.expert_mask(lw.il) {
+    let expert_mask_il = iv.expert_mask(lw.il);
+    let mut sel = match expert_mask_il {
         Some(m) => select_topk_mask(&probs, k, m),
         None => select_topk(&probs, k),
     };
@@ -9594,6 +9650,11 @@ fn moe_ffn_quant_impl(
     // トークンだけ (`emit_router` は呼び出し側が決める)。
     if emit_router {
         emit_router_topk(lw.il, &sel, &weights);
+        // task 220: 介入で切った expert のうち、無効化が無ければ top-k に入っていたもの
+        // (既定 off。off はゲートの分岐 1 個で、余分な top-k は回さない)。
+        if let Some(m) = expert_mask_il {
+            emit_expert_skip(lw.il, &probs, k, &sel, m);
+        }
     }
 
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
@@ -14710,6 +14771,11 @@ fn moe_ffn_quant_batch_full(
     if emit_router {
         let tail = (nt - 1) * k;
         emit_router_topk(lw.il, &sels[tail..tail + k], &weights[tail..tail + k]);
+        // task 220: チャンク末尾のトークンで、介入に消された expert を送る (既定 off)。
+        if let Some(m) = expert_mask {
+            let row = &probs[(nt - 1) * ne..nt * ne];
+            emit_expert_skip(lw.il, row, k, &sels[tail..tail + k], m);
+        }
     }
 
     // task 217: routed expert を切った層は expert の選択後処理・重み読み・寄与計算を
@@ -17189,6 +17255,105 @@ mod tests {
         );
 
         // env 由来の状態に戻す (他のテストに漏らさない)
+        denno_telemetry::set_arch_for_tests(prev_arch);
+        denno_telemetry::set_enabled_for_tests(prev_on);
+    }
+
+    /// task 220: ExpertSkip の送出 (既定 off / 介入のある層だけ / バッチは末尾)。
+    ///
+    /// ルータは expert 0 と 1 が同点 (上位 2 本)。expert 0 を無効化すると実際に
+    /// 使うのは [1, 2] になり、「無効化が無ければ選ばれていた 0」が skip になる。
+    #[test]
+    fn expert_skip_frames_are_gated_and_list_masked_topk() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("expert_skip");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = p120_router_layer(&f, &p, true);
+        let x = p120_flat_x(p.n_embd);
+        let shape = intervene::Shape {
+            n_layer: p.n_layer,
+            n_expert: p.n_expert,
+            n_expert_used: p.n_expert_used,
+            n_hc: p.n_hc,
+        };
+        let cfg = intervene::config_for_test(&shape, vec![(0, 0)], vec![], vec![]).expect("cfg");
+        let iv = IvView::of(&cfg);
+
+        fn drain() -> Vec<denno_telemetry::Frame> {
+            let mut v = Vec::new();
+            while let Some(fr) = denno_telemetry::try_recv_nowait() {
+                v.push(fr);
+            }
+            v
+        }
+        fn skips(v: &[denno_telemetry::Frame]) -> Vec<(u16, Vec<u16>)> {
+            v.iter()
+                .filter_map(|fr| match fr {
+                    denno_telemetry::Frame::ExpertSkip { layer, experts } => {
+                        Some((*layer, experts.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let prev_on = denno_telemetry::enabled();
+        let prev_arch = denno_telemetry::arch_enabled();
+        denno_telemetry::set_enabled_for_tests(true);
+        denno_telemetry::set_arch_for_tests(true);
+        let run = |iv: IvView<'_>| {
+            moe_ffn_quant_full_opts(&p, &lw, &x, None, false, Route::Cpu, None, true, false, iv)
+                .expect("moe")
+        };
+
+        // (1) 既定 off → 介入があっても 1 枚も出ない (分岐で終わる)。
+        set_expert_skip_for_tests(Some(false));
+        drain();
+        let _ = run(iv);
+        assert!(
+            skips(&drain()).is_empty(),
+            "DENNO_TELEM_EXPERT_SKIP off で ExpertSkip が出た"
+        );
+
+        // (2) ゲート on でも介入が無ければ出ない (描くものが無い)。
+        set_expert_skip_for_tests(Some(true));
+        drain();
+        let _ = run(IvView::none());
+        assert!(
+            skips(&drain()).is_empty(),
+            "介入なしで ExpertSkip が出た (mask が無い層で送っている)"
+        );
+
+        // (3) ゲート on + 介入 → 層 0 に「無効化が無ければ top-k だった expert 0」。
+        drain();
+        let _ = run(iv);
+        assert_eq!(
+            skips(&drain()),
+            vec![(0u16, vec![0u16])],
+            "skip の内容が「マスクされた top-k」でない"
+        );
+
+        // (4) バッチ経路: 末尾の 1 トークンだけ 1 枚。
+        //     どのトークンも同じ入力にして、末尾でも expert 0 が top-k に入るようにする。
+        let xs: Vec<f32> = [1.0f32, 1.0, 1.0]
+            .iter()
+            .flat_map(|&a| p120_flat_x(p.n_embd).iter().map(move |v| v * a).collect::<Vec<_>>())
+            .collect();
+        drain();
+        let out = moe_ffn_quant_batch_tapped(&p, &lw, &xs, 3, None, None, true, iv)
+            .expect("batch");
+        assert_eq!(out.len(), 3 * p.n_embd);
+        assert_eq!(
+            skips(&drain()),
+            vec![(0u16, vec![0u16])],
+            "バッチで skip が 1 枚 (末尾) でない"
+        );
+
+        // 状態を戻す (他のテストに漏らさない)。
+        set_expert_skip_for_tests(None);
         denno_telemetry::set_arch_for_tests(prev_arch);
         denno_telemetry::set_enabled_for_tests(prev_on);
     }

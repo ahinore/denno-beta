@@ -27,6 +27,10 @@
   .modes button.on { background:#0f3a4d; color:#9fefff; border-color:#2f8aa8; }
   .epoch { font-size:11px; color:var(--dim); }
   .epoch b { color:var(--fg); font-weight:600; }
+  .cache { font-size:10px; padding:1px 7px; border-radius:3px; border:1px solid #1c3444; color:var(--dim); }
+  .cache.reset { border-color:#7a5a12; background:rgba(255,196,77,.10); color:#ffcf7a; }
+  #cachenote { font-size:10px; color:#7fa4b8; padding-top:2px; min-height:13px; }
+  #cachenote b { color:#ffcf7a; font-weight:500; }
   .banner { font-size:11px; padding:2px 9px; border-radius:3px; border:1px solid #1c3444;
             color:var(--dim); white-space:nowrap; max-width:46vw; overflow:hidden; text-overflow:ellipsis; }
   .banner.iv { border-color:#7a1c24; background:rgba(255,59,48,.12); color:#ff8a94; }
@@ -133,6 +137,7 @@
     <button id="m-accum">accumulated</button>
   </div>
   <div class="epoch">epoch <b id="epoch">0</b></div>
+  <div id="cache" class="cache">cache: -</div>
   <div id="banner" class="banner">no intervention · no steering</div>
 </header>
 
@@ -159,6 +164,7 @@
         <span><i class="sw" style="background:#ff2bd6"></i>shared</span>
         <span><i class="sw" style="background:#7f8bff"></i>PLE</span>
         <span><i class="sw" style="background:transparent;border-color:#00eaff"></i>VRAM ring</span>
+        <span><i class="sw" style="background:#ffc44d"></i>skipped</span>
         <span><i class="sw" style="background:#2a0a10;border-color:#ff3b30"></i>off</span>
         <span><i class="sw" style="background:#0a1620;border-color:#ffffff"></i>selected</span>
         <span id="scale">weak<div id="scalebar"></div>strong</span>
@@ -174,7 +180,9 @@
       <span>tokens <b id="tokstat">0</b></span>
       <span>last <b id="laststat">-</b></span>
       <span>vram <b id="vramstat">-</b></span>
+      <span>skip <b id="skipstat">-</b></span>
     </div>
+    <div id="cachenote"></div>
     <div id="tip"></div>
   </section>
 
@@ -206,7 +214,7 @@
       <div id="recinfo" class="small dim" style="margin-top:4px">recording: -</div>
       <div id="snaps" class="snaps"></div>
       <div class="grid2">
-        <label class="f">layers <input id="lfrom" type="number" min="0" value="0"> – <input id="lto" type="number" min="0" value="47"></label>
+        <label class="f">layers [from,to) <input id="lfrom" type="number" min="0" value="0"> – <input id="lto" type="number" min="0" value="48"></label>
         <label class="f">alpha <input id="alpha" type="number" step="0.1" value="1"></label>
         <label class="f">mode <select id="smode"><option>subtract</option><option>project</option></select></label>
       </div>
@@ -255,6 +263,7 @@ let offBlk = new Set();                // "layer:block"
 let offStr = new Map();                // layer -> Set(stream)
 let dirty = true;
 let requests = [];
+let ivSig = '';                        // 介入の内容の署名 (skip 表示の取り消し用)
 
 // ---- API (live or mock) -------------------------------------------------
 async function api(method, path, body) {
@@ -304,37 +313,79 @@ function esc(s) {
 }
 
 // ---- 起動 ---------------------------------------------------------------
+// 実 API は `/api` プロキシ経由で使う (task 220)。モックに落ちるのは
+// 「サーバーにその経路が無い (404)」か `?mock=1` のときだけ。502 / 接続不可は
+// 実 API があるはずなので**モックに落とさず**、枠だけ描いて再試行する
+// (偽の状態を実状態として見せない)。
 let mockWhy = '';
-async function boot() {
-  let forcedMock = Q.get('mock') === '1';
-  if (forcedMock) mockWhy = 'forced by ?mock=1';
-  if (!forcedMock) {
-    try {
-      const r = await fetch('/api/v1/model/shape', { cache: 'no-store' });
-      if (!r.ok) throw new Error('GET /api/v1/model/shape → HTTP ' + r.status);
-      const j = await r.json();
-      shape = normaliseShape(j);
-      $('src').textContent = 'live /api → 8098';
-      $('src').className = 'badge live';
-    } catch (e) {
-      forcedMock = true;
-      mockWhy = (e && e.message) || String(e);
-    }
-  }
-  if (forcedMock) {
-    mock = createMockStore(DEFAULT_SHAPE_RAW);
-    shape = mock.shape;
-    $('src').textContent = 'mock · ' + mockWhy;
-    $('src').className = 'badge mock';
-  }
+let live = false;
+let probeTimer = 0;
+
+function setBadge(text, cls) {
+  $('src').textContent = text;
+  $('src').className = cls;
+}
+
+function startMock(why) {
+  live = false;
+  mockWhy = why;
+  mock = createMockStore(DEFAULT_SHAPE_RAW);
+  shape = mock.shape;
+  setBadge('mock · ' + why, 'badge mock');
   rebuild(shape);
-  $('lto').value = String(shape.layers - 1);
-  $('lfrom').max = String(shape.layers - 1);
-  $('lto').max = String(shape.layers - 1);
-  await refreshIntervene();
-  await refreshSteer();
+  refreshAll('mock');
+}
+
+async function probeLive(first) {
+  let status = 0;
+  let body = null;
+  let err = '';
+  try {
+    const r = await fetch('/api/v1/model/shape', { cache: 'no-store' });
+    status = r.status;
+    if (r.ok) body = await r.json();
+  } catch (e) {
+    err = (e && e.message) || String(e);
+  }
+  if (body) {
+    live = true;
+    mock = null;
+    try {
+      shape = normaliseShape(body);
+    } catch (e) {
+      setBadge('live /api → shape が不正: ' + ((e && e.message) || e), 'badge mock');
+      return;
+    }
+    setBadge('live /api → ' + location.host, 'badge live');
+    rebuild(shape);
+    await refreshAll('boot');
+    return;
+  }
+  if (status === 404) {
+    // この版のサーバーには /2d 用の実 API が無い → モックだけが動く。
+    startMock('GET /api/v1/model/shape → HTTP 404');
+    return;
+  }
+  // 404 以外 (502 / 接続不可 / 不正な JSON) はモックに落とさない。
+  live = false;
+  setBadge('live /api → 応答なし (HTTP ' + status + (err ? ' ' + err : '') + ') — 再試行中', 'badge mock');
+  if (first) rebuild(shape);
+  clearTimeout(probeTimer);
+  probeTimer = setTimeout(() => probeLive(false), 2000);
+}
+
+async function boot() {
+  rebuild(shape);                 // 既定の形で枠を描く (live が返ったら差し替え)
+  $('lfrom').max = String(shape.layers);
+  $('lto').max = String(shape.layers);
+  $('lto').value = String(shape.layers);   // 実 API の layers は [from, to)
   connectWs();
   requestAnimationFrame(tick);
+  if (Q.get('mock') === '1') {
+    startMock('forced by ?mock=1');
+    return;
+  }
+  await probeLive(true);
 }
 let zoom = 1;
 
@@ -395,40 +446,112 @@ function buildScale() {
 }
 
 // ---- サーバー状態 -------------------------------------------------------
-async function refreshIntervene() {
+// 実 API は epoch を intervene と steer で共有する (task 217/218)。状態を変えたら
+// **両方**を読み直し (task 220)、epoch が動いたら prefix cache が捨てられたことを
+// 画面に出す。epoch は「そのまま次のリクエストから効く」ことの目印でもある。
+let epochSeen = null;
+let epochResets = 0;
+let lastReset = null;
+
+function noteEpoch(epoch, why) {
+  const e = Number(epoch);
+  if (!Number.isFinite(e)) return;
+  if (epochSeen == null) { epochSeen = e; renderCache(); return; }
+  if (e === epochSeen) { renderCache(); return; }
+  const from = epochSeen;
+  epochSeen = e;
+  if (e > from) {
+    epochResets++;
+    const at = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+    lastReset = { from, to: e, why: why || 'change', at };
+    const row = document.createElement('div');
+    row.className = 'bad';
+    row.textContent = at + ' epoch ' + from + ' → ' + e + ' · prefix cache reset (' + lastReset.why +
+      ') — 次のチャットは prefill し直し';
+    const log = $('reqlog');
+    log.insertBefore(row, log.firstChild);
+    while (log.children.length > 14) log.removeChild(log.lastChild);
+  }
+  renderCache();
+}
+
+function renderCache() {
+  const el = $('cache');
+  if (!lastReset) {
+    el.textContent = 'cache: ok (epoch ' + (epochSeen == null ? '-' : epochSeen) + ')';
+    el.className = 'cache';
+    $('cachenote').textContent = '';
+    return;
+  }
+  el.textContent = 'cache: reset at epoch ' + lastReset.to + ' (' + lastReset.why + ')';
+  el.className = 'cache reset';
+  $('cachenote').innerHTML = '<b>prefix cache reset</b> at epoch ' + lastReset.to + ' (' +
+    esc(lastReset.why) + ', ' + esc(lastReset.at) + ') · main と aux の文脈を捨てた · ' +
+    '次のチャットは prefill し直す · resets ' + epochResets;
+}
+
+function applyIntervene(body, why) {
+  $('iverr').textContent = '';
+  applied = {
+    epoch: body.epoch | 0,
+    experts_off: body.experts_off || [],
+    blocks_off: body.blocks_off || [],
+    streams_off: body.streams_off || [],
+  };
+  rebuildOffSets();
+  noteEpoch(body.epoch, why);
+  renderState();
+}
+
+function applySteer(body, why) {
+  $('steerr').textContent = '';
+  steer = {
+    recording: body.recording || null,
+    snapshots: body.snapshots || [],
+    apply: body.apply || null,
+  };
+  // 消えた snapshot の係数は落とす (同名が別物として復活したときに選ばれたままにしない)。
+  for (const name of [...terms.keys()]) {
+    if (!steer.snapshots.some((s) => s.name === name)) terms.delete(name);
+  }
+  if (body.epoch !== undefined) noteEpoch(body.epoch, why);
+  renderSteer();
+  renderState();
+}
+
+async function refreshIntervene(why) {
   const r = await api('GET', '/v1/intervene');
   if (r.status === 200 && r.body && typeof r.body === 'object') {
-    $('iverr').textContent = '';
-    applied = {
-      epoch: r.body.epoch | 0,
-      experts_off: r.body.experts_off || [],
-      blocks_off: r.body.blocks_off || [],
-      streams_off: r.body.streams_off || [],
-    };
-    rebuildOffSets();
-    renderState();
+    applyIntervene(r.body, why);
   } else if (r.status === 404) {
     $('iverr').textContent = 'GET /v1/intervene 404 — この版のサーバーには介入 API がまだ無い';
   }
 }
 
-async function refreshSteer() {
+async function refreshSteer(why) {
   const r = await api('GET', '/v1/steer');
   if (r.status === 200 && r.body && typeof r.body === 'object') {
-    $('steerr').textContent = '';
-    steer = {
-      recording: r.body.recording || null,
-      snapshots: r.body.snapshots || [],
-      apply: r.body.apply || null,
-    };
-    renderSteer();
-    renderState();
+    applySteer(r.body, why);
   } else if (r.status === 404) {
     $('steerr').textContent = 'GET /v1/steer 404 — この版のサーバーにはステアリング API がまだ無い';
   }
 }
 
+/// 状態を変えたら必ず両方を読み直す (task 220 の 2.)。
+async function refreshAll(why) {
+  await refreshIntervene(why);
+  await refreshSteer(why);
+  renderState();
+}
+
 function rebuildOffSets() {
+  // task 220: 介入の内容が変わったら、前の設定で出た「選びたかった expert」の
+  // amber を捨てる (ExpertSkip は介入がある層でしか来ないので、放っておくと残る)。
+  const sig = JSON.stringify([applied.experts_off, applied.blocks_off, applied.streams_off]);
+  if (sig !== ivSig) {
+    ivSig = sig;
+    for (const a of st.skip) a.fill(0);
+  }
   offExp = new Map();
   for (const [l, e] of applied.experts_off) {
     if (!offExp.has(l)) offExp.set(l, new Set());
@@ -486,7 +609,7 @@ async function postIntervene(body) {
       ((r.body && r.body.error && r.body.error.message) || '');
     return false;
   }
-  await refreshIntervene();
+  await refreshAll('intervention');
   return true;
 }
 
@@ -517,7 +640,7 @@ $('btn-offclear').addEventListener('click', async () => {
     $('iverr').textContent = 'DELETE /v1/intervene → ' + r.status;
     return;
   }
-  await refreshIntervene();
+  await refreshAll('intervention cleared');
   clearSel(sel);
   dirty = true;
 });
@@ -529,14 +652,14 @@ $('btn-rec').addEventListener('click', async () => {
   if (!name) { $('steerr').textContent = 'name is required'; return; }
   const r = await api('POST', '/v1/steer/record', { name });
   if (r.status !== 200) { $('steerr').textContent = 'record → ' + r.status + ' ' + errText(r); return; }
-  await refreshSteer();
+  await refreshAll('record');
 });
 
 $('btn-stop').addEventListener('click', async () => {
   $('steerr').textContent = '';
   const r = await api('POST', '/v1/steer/record/stop');
   if (r.status !== 200) { $('steerr').textContent = 'stop → ' + r.status + ' ' + errText(r); return; }
-  await refreshSteer();
+  await refreshAll('record stop');
 });
 
 function errText(r) {
@@ -550,13 +673,29 @@ function renderRecInfo() {
     : 'recording: - (snapshots ' + steer.snapshots.length + ')';
 }
 
+// snapshot 一覧の DOM は「名前の集合か適用が変わったとき」だけ組み直す。
+// 5 秒ごとのポーリングで係数の入力中に作り直されるのを避ける (トークン数だけ差し替え)。
+let snapSig = null;
+let snapTok = new Map();
+
 function renderSteer() {
   const rec = steer.recording;
   renderRecInfo();
   $('btn-rec').disabled = !!rec;
   $('btn-stop').disabled = !rec;
 
+  const sig = JSON.stringify([steer.snapshots.map((s) => s.name), steer.apply]);
   const box = $('snaps');
+  if (sig === snapSig) {
+    for (const s of steer.snapshots) {
+      const el = snapTok.get(s.name);
+      if (el) el.textContent = (s.tokens | 0) + ' tok';
+    }
+    renderTerms();
+    return;
+  }
+  snapSig = sig;
+  snapTok = new Map();
   box.innerHTML = '';
   if (!steer.snapshots.length) {
     box.innerHTML = '<div class="small dim">no snapshot yet — record a few tokens with a name</div>';
@@ -569,7 +708,7 @@ function renderSteer() {
     cb.checked = terms.has(s.name);
     cb.title = 'include in the combination';
     cb.addEventListener('change', () => {
-      if (cb.checked) terms.set(s.name, Number(terms.get(s.name) ? terms.get(s.name) : 1));
+      if (cb.checked) terms.set(s.name, terms.has(s.name) ? terms.get(s.name) : 1);
       else terms.delete(s.name);
       row.className = 'snap' + (terms.has(s.name) ? ' on' : '');
       renderTerms();
@@ -598,8 +737,9 @@ function renderSteer() {
       const r = await api('DELETE', '/v1/steer/snapshots/' + encodeURIComponent(s.name));
       if (r.status !== 200) { $('steerr').textContent = 'delete → ' + r.status + ' ' + errText(r); return; }
       terms.delete(s.name);
-      await refreshSteer();
+      await refreshAll('snapshot deleted');
     });
+    snapTok.set(s.name, tk);
     row.append(cb, nm, tk, cx, del);
     box.appendChild(row);
   }
@@ -625,21 +765,21 @@ $('btn-apply').addEventListener('click', async () => {
       layers: [Number($('lfrom').value), Number($('lto').value)],
       alpha: Number($('alpha').value),
       mode: $('smode').value,
-    });
+    }, { nLayers: shape.layers });
   } catch (e) {
     $('steerr').textContent = (e && e.message) || String(e);
     return;
   }
   const r = await api('POST', '/v1/steer/apply', spec);
   if (r.status !== 200) { $('steerr').textContent = 'apply → ' + r.status + ' ' + errText(r); return; }
-  await refreshSteer();
+  await refreshAll('steering applied');
 });
 
 $('btn-clear-apply').addEventListener('click', async () => {
   $('steerr').textContent = '';
   const r = await api('DELETE', '/v1/steer/apply');
   if (r.status !== 200) { $('steerr').textContent = 'clear apply → ' + r.status + ' ' + errText(r); return; }
-  await refreshSteer();
+  await refreshAll('steering cleared');
 });
 
 // ---- 地図の描画 ---------------------------------------------------------
@@ -709,6 +849,7 @@ function drawRow(g, row, dragItems) {
   const ex = row.experts;
   const heatArr = st.experts[l];
   const res = st.residency[l];
+  const skips = st.skip[l];
   const offSet = offExp.get(l);
   const gx = ex.cell + ex.gap;
   g.fillStyle = '#071019';
@@ -719,13 +860,17 @@ function drawRow(g, row, dragItems) {
     const isDrag = dragItems ? dragItems.has('e:' + l + ':' + i) : false;
     const isSelNow = isSel('expert', l, i);
     const resident = res[i] === 1;
-    if (!(v > 0) && !isOff && !resident && !isDrag && !isSelNow) continue;
+    // task 220: ルータが選びたかったが介入で切った expert (ExpertSkip)。
+    const isSkipped = skips ? skips[i] === 1 : false;
+    if (!(v > 0) && !isOff && !resident && !isDrag && !isSelNow && !isSkipped) continue;
     const x = ex.x + (i % ex.cols) * gx;
     const y = ex.y + Math.floor(i / ex.cols) * gx;
     if (isOff) {
       g.fillStyle = '#2a0a10';
     } else if (v > 0) {
       g.fillStyle = heat(v);
+    } else if (isSkipped) {
+      g.fillStyle = '#241a06';
     } else {
       g.fillStyle = '#0b2230';
     }
@@ -733,6 +878,11 @@ function drawRow(g, row, dragItems) {
     if (resident && !isOff) {
       g.fillStyle = 'rgba(0,234,255,.85)';
       g.fillRect(x, y, ex.cell, 1);
+    }
+    if (isSkipped) {
+      // 下辺を amber に: 「選ばれていたが切った」(VRAM の上辺リングと区別する)。
+      g.fillStyle = 'rgba(255,196,77,.95)';
+      g.fillRect(x, y + ex.cell - 1, ex.cell, 1);
     }
     if (isDrag || isSelNow) {
       g.fillStyle = 'rgba(255,255,255,.9)';
@@ -814,8 +964,10 @@ function describe(hit) {
     const v = st.experts[hit.layer][hit.expert];
     const res = st.residency[hit.layer][hit.expert] === 1;
     const off = offExp.get(hit.layer) && offExp.get(hit.layer).has(hit.expert);
+    const sk = st.skip[hit.layer] ? st.skip[hit.layer][hit.expert] === 1 : false;
     return 'layer ' + hit.layer + ' · expert ' + hit.expert + ' · weight ' +
-      (Math.round(v * 100) / 100) + (res ? ' · VRAM' : '') + (off ? ' · OFF' : '');
+      (Math.round(v * 100) / 100) + (res ? ' · VRAM' : '') + (off ? ' · OFF' : '') +
+      (sk ? ' · skipped (router wanted)' : '');
   }
   if (hit.type === 'block') {
     return 'layer ' + hit.layer + ' · block ' + hit.block +
@@ -945,7 +1097,7 @@ function handleFrame(f) {
     const now = performance.now();
     if (!mock && steer.recording && now - lastSteerPoll > 1000) {
       lastSteerPoll = now;
-      refreshSteer();
+      refreshSteer('record');
     }
   } else if (f.kind === 'ServerInfo') {
     $('shapeline').textContent = f.model + ' · layers ' + f.layers + ' · ctx ' + f.context;
@@ -954,10 +1106,59 @@ function handleFrame(f) {
     $('vramstat').textContent = vram;
   } else if (f.kind === 'Gap') {
     $('wsstat').textContent = 'gap: ' + f.lost + ' frames lost';
+  } else if (f.kind === 'ExpertSkip') {
+    // task 220: ルータが選びたかったが介入で切った expert (既定 off のテレメトリ)。
+    $('skipstat').textContent = 'L' + f.layer + ' ×' + (f.experts ? f.experts.length : 0) +
+      (f.experts && f.experts.length ? ' [' + f.experts.slice(0, 4).join(',') +
+        (f.experts.length > 4 ? ',…' : '') + ']' : '');
   }
   $('fstat').textContent = String(frameCount);
   $('laststat').textContent = lastKind;
 }
+
+// ---- 状態のポーリング -----------------------------------------------------
+// 他のクライアントの変更や、サーバー側で進んだ epoch を拾う。読み取りだけなので
+// リクエストログには出さない (変更の記録は logReq が担当)。
+async function apiQuiet(path) {
+  try {
+    const r = await fetch('/api' + path, { cache: 'no-store' });
+    const text = await r.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (e) { json = text; }
+    return { status: r.status, body: json };
+  } catch (e) {
+    return { status: 0, body: { error: { message: String(e) } } };
+  }
+}
+
+let polling = false;
+async function pollState() {
+  if (mock || !live || polling || document.hidden || busy || drag) return;
+  polling = true;
+  try {
+    const a = await apiQuiet('/v1/intervene');
+    if (a.status === 200 && a.body && typeof a.body === 'object') {
+      const next = {
+        epoch: a.body.epoch | 0,
+        experts_off: a.body.experts_off || [],
+        blocks_off: a.body.blocks_off || [],
+        streams_off: a.body.streams_off || [],
+      };
+      if (JSON.stringify(next) !== JSON.stringify(applied)) applyIntervene(a.body, 'external change');
+      else noteEpoch(a.body.epoch, 'external change');
+    }
+    const b = await apiQuiet('/v1/steer');
+    if (b.status === 200 && b.body && typeof b.body === 'object') {
+      const sig = JSON.stringify([b.body.recording, b.body.snapshots, b.body.apply]);
+      const cur = JSON.stringify([steer.recording, steer.snapshots, steer.apply]);
+      if (sig !== cur) applySteer(b.body, 'external change');
+      else if (b.body.epoch !== undefined) noteEpoch(b.body.epoch, 'external change');
+    }
+  } finally {
+    polling = false;
+  }
+}
+setInterval(pollState, 5000);
 
 // ---- 描画モード ---------------------------------------------------------
 $('m-token').addEventListener('click', () => setMode('token'));
@@ -1073,6 +1274,7 @@ async function sendMsg(text) {
   showMeta(r);
   busy = false;
   chatEl.send.disabled = false;
+  if (!mock) refreshSteer('chat');
   if (r.stop === 'max_tokens' && r.acc && !r.err) showContinue(node);
 }
 
@@ -1087,6 +1289,7 @@ async function continueMsg(node) {
   showMeta(r);
   busy = false;
   chatEl.send.disabled = false;
+  if (!mock) refreshSteer('chat');
   if (r.stop === 'max_tokens' && r.acc !== base && !r.err) showContinue(node);
 }
 
@@ -1121,6 +1324,9 @@ window.__view2d = {
   mode: () => st.mode,
   zoom: () => zoom,
   mock: () => !!mock,
+  live: () => live,
+  epoch: () => ({ seen: epochSeen, resets: epochResets, last: lastReset }),
+  refreshAll: (why) => refreshAll(why || 'manual'),
   setMode,
   select: (items) => { for (const it of items) addItem(sel, it); renderState(); dirty = true; },
   offSelected: () => $('btn-off').click(),
