@@ -4,16 +4,23 @@
 // 「API のモック店」だけを置く。描画とイベントは index2d.html 側。node --test から
 // 直接 import して検証する (crates/denno-view/tests/view2d.test.mjs)。
 //
-// 契約 (サーバー側 API。実装は task 217/218。まだ無いときはモックに落ちる):
-//   GET    /v1/model/shape -> {layers, layer_kinds, n_expert, n_expert_used, n_hc, n_embd}
+// 契約 (サーバー側 API。実装は task 217/218。404 のときだけモックに落ちる):
+//   GET    /v1/model/shape -> {layers, layer_kinds, n_expert, n_expert_used, n_hc, n_embd,
+//                              ple_layers}
 //   GET    /v1/intervene   -> {epoch, experts_off, blocks_off, streams_off}
 //   POST   /v1/intervene    (上と同じ 3 配列。全置換)
 //   DELETE /v1/intervene    (全消し)
-//   GET    /v1/steer       -> {recording, snapshots, apply}
+//   GET    /v1/steer       -> {epoch, recording, snapshots, apply}
 //   POST   /v1/steer/record {name} / POST /v1/steer/record/stop
 //   DELETE /v1/steer/snapshots/<name>
-//   POST   /v1/steer/apply  {terms:[{snapshot,coef}], layers:[from,to], alpha, mode}
+//   POST   /v1/steer/apply  {terms:[{snapshot,coef}], layers:[from,to), alpha, mode}
 //   DELETE /v1/steer/apply
+//
+// task 220: `/2d` はこの契約を `/api` プロキシ経由でそのまま使う。モック
+// (`createMockStore`) は実 API の**検証規則と status まで写した**もので、shape が
+// 404 のとき (と ?mock=1) だけ使う。実サーバーに対する往復は
+// `crates/denno-view/examples/smoke_2d.sh` が検査する (lab t220a で md5 SAME /
+// decode ±0.2% / prefill ±0.9%)。
 
 export const VIEW_SCHEMA = 1;
 

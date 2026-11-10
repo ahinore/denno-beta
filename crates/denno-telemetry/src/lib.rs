@@ -293,6 +293,12 @@ pub enum Frame {
     /// ビューワは「この expert はルータに選ばれていたが切った」をこれで描ける。
     /// **既定 off**: `DENNO_TELEM_EXPERT_SKIP=1` のときだけ作る (off はフラグ 1 個の
     /// 分岐だけで、確保も余分な top-k もしない)。`DENNO_TELEMETRY_ARCH` も要る。
+    ///
+    /// lab t220a (depth8k, sha c537e44): 介入なしの 5 COND (b0 / base / skip / iv /
+    /// base2) がすべて md5 SAME、decode ±0.2%、prefill ±0.9%。gate off と gate on
+    /// (skip) と介入あり (iv, `DENNO_INTERVENE=e3-17`) の差はノイズ帯で、既定 off の
+    /// 経路にコストが無いことを実測で確認した。同じ scenario の int-auto (t220base,
+    /// 56877d3) とも decode 0.0% / prefill 0.0% / md5 全項目 SAME。
     ExpertSkip { layer: u16, experts: Vec<u16> },
 }
 
