@@ -8364,10 +8364,11 @@ fn pf_mix_stage_sync_uses_an_event() {
         "upload が非ブロッキングである根拠 (と 0x01 の定義) が消えた"
     );
     // mix と combine の両方がこの同期を通る (片方だけだと待ちが残る)。
+    // task 218: 残差の平均の加算 / ステアリングの 2 本も同じ同期を通る (計 4)。
     assert_eq!(
         CUDA_RS.matches("pf_stage_sync(ctx)").count(),
-        2,
-        "pf_mix / pf_combine の両方が pf_stage_sync を通っていない"
+        4,
+        "pf_mix / pf_combine (+ task 218 の steer 2 本) が pf_stage_sync を通っていない"
     );
     // 計測器 (DENNO_PF_MIX_KPROF) は段の前後にイベントを打っている。
     for k in [
@@ -9402,5 +9403,62 @@ fn task213_server_runs_the_gate_audit_at_startup() {
     assert!(
         SERVE_FLASH_SRC.contains("denno_engine::gate_audit::audit_lines()"),
         "serve_flash の run() が起動時の監査を呼んでいない"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 218: 残差の平均の記録 / ステアリングのカーネル (kernels_steer.cu)
+// ---------------------------------------------------------------------------
+
+/// コミット済みの `kernels_steer.ptx` がホスト側の起動と ABI で一致すること。
+///
+/// 引数の数がずれたまま古い PTX を読むと、cuLaunchKernel は**足りない引数を
+/// 不定のまま**起動する (エラーも NaN も出ない)。ここで数を固定しておく。
+/// PTX は lab が `bash build_ptx.sh steer` で生成したものをそのまま収録している。
+#[test]
+fn steer_ptx_matches_the_host_launch_abi() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_steer.ptx");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} が読めない: {e}", path.display()));
+    // 期待する引数 (ptr, ptr, nt, hc, e, layer[, alpha]) の数と、最後が alpha か。
+    let want = [
+        ("dno_steer_acc", 6usize, false),
+        ("dno_steer_sub", 7, true),
+        ("dno_steer_proj", 7, true),
+    ];
+    for (name, n, has_alpha) in want {
+        let pat = format!(".entry {name}(");
+        let i = text
+            .find(&pat)
+            .unwrap_or_else(|| panic!("PTX に {name} が無い (再生成が必要)"));
+        let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+        let seg = &text[i..j];
+        let got = seg.matches(".param .").count();
+        assert_eq!(
+            got, n,
+            "{name} の引数が {got} 個 (ホスト側は {n} 個)。PTX を再生成すること \
+             (bash kernels/build_ptx.sh steer)"
+        );
+        // 最後の 1 個が alpha (f32) か、それ以外のスカラは u32 か。
+        if has_alpha {
+            assert!(
+                seg.contains(&format!(".param .f32 {name}_param_{}", n - 1)),
+                "{name} の最後の引数が f32 (alpha) でない: {seg}"
+            );
+        } else {
+            assert!(
+                seg.contains(&format!(".param .u32 {name}_param_{}", n - 1)),
+                "{name} の最後の引数が u32 (layer) でない: {seg}"
+            );
+        }
+    }
+    // ホスト側のゲートがこの 3 本を名前で引いていること。
+    assert!(
+        CUDA_RS.contains("b\"dno_steer_acc\\0\""),
+        "cuda.rs が dno_steer_acc を引いていない"
+    );
+    assert!(
+        CUDA_RS.contains("b\"dno_steer_sub\\0\"") && CUDA_RS.contains("b\"dno_steer_proj\\0\""),
+        "cuda.rs が sub / proj を引いていない"
     );
 }

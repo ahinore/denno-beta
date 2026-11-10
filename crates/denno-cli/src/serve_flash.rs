@@ -57,6 +57,7 @@ use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
 use denno_engine::model::q4ledger;
 use denno_engine::model::intervene as iv;
+use denno_engine::model::steer;
 use denno_engine::model::qwen4exp::{
     expert_w_stats_request_end, q4prof, LayerKind, Qwen4Exp, Qwen4ExpParams, TapTokens,
 };
@@ -978,6 +979,9 @@ impl Flash {
         // `POST /v1/intervene` が来ても、いま走っている生成の数値は変わらない
         // (次のリクエストから効く)。forward 側はピン留めを読むだけ。
         let _iv_pin = iv::pin_request();
+        // task 218: `DENNO_STEER_RECORD` のときは 1 リクエストごとに平均を保存する
+        // (停止は不要。プロセスが落ちても直前のリクエストまでが残る)。
+        let _steer_flush = SteerFlushGuard;
         let iv_epoch = iv::current_epoch();
         // 別 epoch で計算した文脈は使わない (main / aux の両方)。
         let dropped = self.drop_stale_ctx(iv_epoch);
@@ -1876,6 +1880,163 @@ fn apply_intervene(shape: &ModelShape, body: &Value) -> Result<Value, String> {
     Ok(intervene_to_json(&cfg))
 }
 
+// ---------------------------------------------------------------------------
+// task 218: ステアリング (残差の平均の記録 / 適用) の HTTP
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/steer` の形。
+fn steer_status_to_json() -> Value {
+    let recording = match steer::rec_status() {
+        Some((name, tokens)) => json!({"name": name, "tokens": tokens}),
+        None => Value::Null,
+    };
+    let snaps: Vec<Value> = steer::snapshots()
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "tokens": s.tokens,
+                "created": s.created,
+                "layers": s.layers,
+            })
+        })
+        .collect();
+    let apply = match steer::apply_status() {
+        Some(a) => json!({
+            "terms": a
+                .terms
+                .iter()
+                .map(|t| json!({"snapshot": t.snapshot, "coef": t.coef}))
+                .collect::<Vec<_>>(),
+            "layers": [a.from, a.to],
+            "alpha": a.alpha,
+            "mode": a.mode.name(),
+        }),
+        None => Value::Null,
+    };
+    json!({
+        "epoch": iv::current_epoch(),
+        "recording": recording,
+        "snapshots": snaps,
+        "apply": apply,
+    })
+}
+
+/// 400 の本文 (task 217 と同じ形)。
+fn err_json(msg: &str) -> Value {
+    json!({"type": "error", "error": {"type": "invalid_request_error", "message": msg}})
+}
+
+fn as_f32(v: &Value, what: &str) -> Result<f32, String> {
+    let x = v
+        .as_f64()
+        .ok_or_else(|| format!("{what} は数値 (JSON の数)"))?;
+    if !x.is_finite() || x.abs() > 1e30 {
+        return Err(format!("{what} が有限の範囲に無い"));
+    }
+    Ok(x as f32)
+}
+
+/// `POST /v1/steer/apply` の body を検証して適用する。**panic しない**。
+fn apply_steer(body: &Value) -> Result<Value, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
+    for k in obj.keys() {
+        if !matches!(k.as_str(), "terms" | "layers" | "alpha" | "mode") {
+            return Err(format!(
+                "未知のフィールド {k:?} (terms / layers / alpha / mode のみ)"
+            ));
+        }
+    }
+    let tv = obj
+        .get("terms")
+        .ok_or_else(|| "terms が無い".to_string())?
+        .as_array()
+        .ok_or_else(|| "terms は配列".to_string())?;
+    if tv.is_empty() {
+        return Err("terms が空 (消すなら DELETE /v1/steer/apply)".into());
+    }
+    let mut terms = Vec::with_capacity(tv.len());
+    for (i, t) in tv.iter().enumerate() {
+        let o = t
+            .as_object()
+            .ok_or_else(|| format!("terms[{i}] はオブジェクト"))?;
+        for k in o.keys() {
+            if !matches!(k.as_str(), "snapshot" | "coef") {
+                return Err(format!("terms[{i}]: 未知のフィールド {k:?}"));
+            }
+        }
+        let name = o
+            .get("snapshot")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("terms[{i}].snapshot は文字列"))?;
+        let coef = as_f32(
+            o.get("coef")
+                .ok_or_else(|| format!("terms[{i}].coef が無い"))?,
+            &format!("terms[{i}].coef"),
+        )?;
+        terms.push(steer::Term {
+            snapshot: name.to_string(),
+            coef,
+        });
+    }
+    let lv = obj
+        .get("layers")
+        .ok_or_else(|| "layers が無い".to_string())?
+        .as_array()
+        .filter(|a| a.len() == 2)
+        .ok_or_else(|| "layers は [from, to]".to_string())?;
+    let from = as_index(&lv[0], "layers[0]")?;
+    let to = as_index(&lv[1], "layers[1]")?;
+    let alpha = match obj.get("alpha") {
+        Some(v) => as_f32(v, "alpha")?,
+        None => 1.0,
+    };
+    let mode = match obj.get("mode") {
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| "mode は文字列".to_string())?;
+            steer::Mode::parse(s)
+                .ok_or_else(|| format!("未知の mode {s:?} (subtract / project)"))?
+        }
+        None => steer::Mode::Subtract,
+    };
+    steer::set_apply(terms, from, to, alpha, mode)?;
+    Ok(steer_status_to_json())
+}
+
+/// `POST /v1/steer/record` の body から名前を取る。
+fn record_name(body: &Value) -> Result<String, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
+    for k in obj.keys() {
+        if !matches!(k.as_str(), "name") {
+            return Err(format!("未知のフィールド {k:?} (name のみ)"));
+        }
+    }
+    let name = obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "name は文字列".to_string())?;
+    Ok(name.to_string())
+}
+
+/// task 218: `DENNO_STEER_RECORD` の記録を 1 リクエストごとにディスクへ書く。
+///
+/// 生成の途中で return してもドロップで走る (記録は止めない)。
+struct SteerFlushGuard;
+
+impl Drop for SteerFlushGuard {
+    fn drop(&mut self) {
+        if steer::env_recording() {
+            if let Err(e) = steer::flush() {
+                eprintln!("[steer] 記録の保存に失敗: {e}");
+            }
+        }
+    }
+}
+
 fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut r = BufReader::new(stream.try_clone()?);
@@ -1947,6 +2108,53 @@ fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
     if req.method == "DELETE" && path == "/v1/intervene" {
         let cfg = iv::clear(&flash.shape.engine_shape());
         return send_json(&mut stream, "200 OK", &intervene_to_json(&cfg));
+    }
+    // task 218: 残差の平均の記録 / 適用 (ビューワが使う)。
+    if req.method == "GET" && path == "/v1/steer" {
+        return send_json(&mut stream, "200 OK", &steer_status_to_json());
+    }
+    if req.method == "POST" && path == "/v1/steer/record" {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
+        };
+        return match record_name(&body).and_then(|n| steer::start_record(&n)) {
+            Ok(_) => send_json(&mut stream, "200 OK", &steer_status_to_json()),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    if req.method == "POST" && path == "/v1/steer/record/stop" {
+        return match steer::stop_record() {
+            Ok(s) => {
+                let mut v = steer_status_to_json();
+                v["saved"] = json!({
+                    "name": s.name, "tokens": s.tokens, "created": s.created, "layers": s.layers
+                });
+                send_json(&mut stream, "200 OK", &v)
+            }
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    if req.method == "DELETE" && path.starts_with("/v1/steer/snapshots/") {
+        let name = &path["/v1/steer/snapshots/".len()..];
+        return match steer::delete(name) {
+            Ok(()) => send_json(&mut stream, "200 OK", &steer_status_to_json()),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    if req.method == "POST" && path == "/v1/steer/apply" {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
+        };
+        return match apply_steer(&body) {
+            Ok(v) => send_json(&mut stream, "200 OK", &v),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    if req.method == "DELETE" && path == "/v1/steer/apply" {
+        steer::clear_apply();
+        return send_json(&mut stream, "200 OK", &steer_status_to_json());
     }
     if req.method != "POST" || path != "/v1/messages" {
         return send_json(
@@ -2189,6 +2397,26 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             n_hc: p.n_hc,
             n_embd: p.n_embd,
         };
+        // task 218: ステアリングの形とモデル id を**モデルを組む前**に決める
+        // (記録 / 適用の HTTP は最初の generate より前に来る)。ここで決めないと
+        // `GET /v1/steer` と `POST /v1/steer/record` が「未初期化」になる。
+        // モデル id はテレメトリと同じ `cfg.dir` の末尾。
+        let steer_model = match std::env::var("DENNO_STEER_MODEL") {
+            Ok(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => cfg
+                .dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        };
+        steer::init(
+            steer::Shape {
+                n_layer: p.n_layer,
+                n_hc: p.n_hc,
+                n_embd: p.n_embd,
+            },
+            &steer_model,
+        );
     }
     drop(f);
     let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
