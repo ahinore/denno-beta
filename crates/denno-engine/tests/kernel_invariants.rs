@@ -7506,6 +7506,134 @@ fn pf222_sn3_gates_are_wired_and_default_off() {
 }
 
 // ---------------------------------------------------------------------------
+// task 222: prefill attention v2 (`kernels_attn_pf2.cu`)
+// ---------------------------------------------------------------------------
+
+const ATTN_PF2_SRC: &str = include_str!("../kernels/kernels_attn_pf2.cu");
+
+/// タイル定数・共有メモリ・スレッド配置がホスト (cuda.rs) と一致すること。
+#[test]
+fn pf222_attn_pf2_tile_matches_host() {
+    let d = defines(ATTN_PF2_SRC);
+    let bq = eval_define("A2_BQ", &d);
+    let bk = eval_define("A2_BK", &d);
+    let qd = eval_define("A2_QD", &d);
+    let vd = eval_define("A2_VD", &d);
+    let thr = eval_define("A2_THREADS", &d);
+    let smem = eval_define("A2_SMEM_BYTES", &d);
+    assert_eq!(bq, 64, "A2_BQ が 64 でない");
+    assert_eq!(bk, 32, "A2_BK が 32 でない (8 から 4 倍にして同期を減らす)");
+    assert_eq!(thr, 256, "A2_THREADS が 256 でない");
+    // 行ストライドは bf16 の ldmatrix (8 の倍数) と float4 (4 の倍数) の条件。
+    assert_eq!(qd, 264, "A2_QD が 264 でない (256 + 8 の詰め物)");
+    assert_eq!(vd, 260, "A2_VD が 260 でない (256 + 4 の詰め物)");
+    assert_eq!(qd % 8, 0, "bf16 の ld が 8 の倍数でない");
+    assert_eq!(vd % 4, 0, "f32 の float4 ld が 4 の倍数でない");
+    // smem の合計 = q + k + v + s + corr + mst + lst。
+    let expect = bq * qd * 2 + bk * qd * 2 + bk * vd * 4 + bq * bk * 4 + 3 * bq * 4;
+    assert_eq!(expect, smem, "A2_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect < 99 * 1024,
+        "動的 smem {expect} B が実機の opt-in 上限 (99KB) を超える"
+    );
+    // ホスト側のミラー。
+    assert_eq!(rust_const("ATTN_PF2_SMEM_BYTES"), smem, "cuda.rs と不一致");
+    assert_eq!(rust_const("ATTN_PF2_BQ"), bq, "cuda.rs の ATTN_PF2_BQ が不一致");
+    assert_eq!(rust_const("ATTN_PF2_DH"), 256, "ATTN_PF2_DH が 256 でない");
+    // スレッド配置: 16 行群 x 16 次元群 = 256。
+    assert!(
+        ATTN_PF2_SRC.contains("const int a = tid >> 4;   // 0..15 (行群)")
+            && ATTN_PF2_SRC.contains("const int b = tid & 15;   // 0..15 (次元群)")
+            && ATTN_PF2_SRC.contains("for (int r = 0; r < 4; ++r)"),
+        "4 行 x 16 次元のスレッド配置が変わった"
+    );
+    // スコアは bf16 の wmma、K は col_major (行 = キー) で読む。
+    assert!(
+        ATTN_PF2_SRC.contains(
+            "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;"
+        ),
+        "K を col_major の bf16 で読んでいない"
+    );
+    // PV は明示 fmaf で kk 昇順 (従来カーネルと同じ加算順)。
+    assert!(
+        ATTN_PF2_SRC.contains("acc[r][d] = fmaf(p, vv[d], acc[r][d]);"),
+        "PV が fmaf の昇順累積でない"
+    );
+    // causal マスクの規則 (i >= n は 0、範囲外は -inf)。
+    assert!(
+        ATTN_PF2_SRC.contains("} else if (j < t_total && j <= pos0 + i) {")
+            && ATTN_PF2_SRC.contains("s = -INFINITY;"),
+        "causal マスクの規則が従来カーネルと違う"
+    );
+    // build_ptx.sh: compute_90 (bf16 mma) で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("attn_pf2)     echo \"kernels_attn_pf2.cu|nofmad|compute_90\""),
+        "build_ptx.sh の attn_pf2 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("attn_pf2"),
+        "build_ptx.sh の targets_all に attn_pf2 が無い: {targets}"
+    );
+}
+
+/// ゲートが既定 off で、`pf_full_out` の起動が v2 と従来で切り替わること。
+#[test]
+fn pf222_attn_pf2_gate_is_wired_and_default_off() {
+    let at = CUDA_RS
+        .find("pub(crate) fn pf_attn_tc_from_value(")
+        .expect("pf_attn_tc_from_value が無い");
+    let body = &CUDA_RS[at..];
+    let end = body.find("\n}").expect("関数の終わりが無い");
+    let body = &body[..end];
+    assert!(
+        body.contains("Some(\"1\" | \"on\" | \"true\" | \"yes\")"),
+        "明示的な真値だけを受ける形でない"
+    );
+    assert!(
+        !body.contains("None => true") && !body.contains("_ => true"),
+        "既定が on になっている"
+    );
+    assert!(
+        CUDA_RS.contains("std::env::var(\"DENNO_PF_ATTN_TC\")"),
+        "DENNO_PF_ATTN_TC を env から読んでいない"
+    );
+    // 起動の切り替え: ゲートと形 (dh) を見て、ダメなら従来カーネルへ。
+    assert!(
+        CUDA_RS.contains("pf_attn_tc_on() && dh == ATTN_PF2_DH && qd == heads * dh"),
+        "pf_full_out が v2 の形を検査していない"
+    );
+    assert!(
+        CUDA_RS.contains("_ => (ctx.f_attn_pf, (attn_pf_sh_f(dh) * 4) as u32),"),
+        "v2 が使えないときの従来カーネルへの切り戻しが無い"
+    );
+    // PTX 名と引数 (12 個) の一致。
+    assert!(
+        CUDA_RS.contains("b\"dno_attention_prefill2\\0\""),
+        "cuda.rs が dno_attention_prefill2 を読んでいない"
+    );
+    let sig = ATTN_PF2_SRC
+        .find("extern \"C\" __global__ void dno_attention_prefill2(")
+        .expect("入口が無い");
+    let head = &ATTN_PF2_SRC[sig..];
+    let head = &head[..head.find(')').expect("引数リストが閉じない")];
+    // 行コメントを落としてから , を数える (コメント内の , を拾わない)。
+    let code: String = head
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let nargs = code.matches(',').count();
+    assert_eq!(nargs, 11, "引数の数が従来カーネル (12 個) と違う");
+}
+
+// ---------------------------------------------------------------------------
 // task 183: 融合 qkv の後処理 (`kernels_pf3.cu`)
 // ---------------------------------------------------------------------------
 

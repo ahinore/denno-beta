@@ -17426,6 +17426,21 @@ mod pf_tc_tests {
             (pf_tc_shared3_on(), pf_mix_tc_on(), pf_tc_shared4_on()),
             before
         );
+        // task 222: attention v2 のゲートも同じ規約 (既定 off)。
+        assert!(!pf_attn_tc_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", "2"] {
+            assert!(!pf_attn_tc_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes"] {
+            assert!(pf_attn_tc_from_value(Some(v)), "{v}");
+        }
+        let before_a = pf_attn_tc_on();
+        set_pf_attn_tc_for_test(Some(true));
+        assert!(pf_attn_tc_on());
+        set_pf_attn_tc_for_test(Some(false));
+        assert!(!pf_attn_tc_on());
+        set_pf_attn_tc_for_test(None);
+        assert_eq!(pf_attn_tc_on(), before_a);
     }
 
     /// task 222: sn3 は実モデルの 4 つの型と形 (shared の Q5_K と mix の BF16) を
@@ -23538,6 +23553,128 @@ pub fn pf_full_qkv_fused(
     }
 }
 
+/// task 222: `DENNO_PF_ATTN_TC` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (lab t222b で採否を決める)。
+pub(crate) fn pf_attn_tc_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// prefill の attention を v2 カーネル (bf16 mma + 4x16 の PV) で回すか
+/// (**既定 off**。`1` で on)。
+pub(crate) fn pf_attn_tc_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_ATTN_TC_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_attn_tc_from_value(std::env::var("DENNO_PF_ATTN_TC").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_ATTN_TC_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_attn_tc_for_test(v: Option<bool>) {
+    PF_ATTN_TC_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// v2 カーネルの静的共有メモリ (`kernels_attn_pf2.cu` の A2_SMEM_BYTES と一致)。
+pub(crate) const ATTN_PF2_SMEM_BYTES: usize = 92_928;
+/// v2 カーネルが前提にする head 次元 (`kernels_attn_pf2.cu` のスレッド配置)。
+pub(crate) const ATTN_PF2_DH: usize = 256;
+/// v2 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid x の分母)。
+pub(crate) const ATTN_PF2_BQ: usize = 64;
+
+/// v2 カーネルの関数 (PTX は実行時読み込み)。
+struct AttnPf2 {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for AttnPf2 {}
+unsafe impl Sync for AttnPf2 {}
+
+static ATTN_PF2: OnceLock<Option<AttnPf2>> = OnceLock::new();
+
+fn attn_pf2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_ATTN2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_attn_pf2.ptx"),
+    }
+}
+
+/// v2 カーネルを読む (初回だけ)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。動的 smem は 48KB を超えるので
+/// この関数の中で opt-in する (失敗したら None = 従来カーネルへ)。
+fn attn_pf2_kernel() -> Option<CUfunction> {
+    ATTN_PF2
+        .get_or_init(|| {
+            let path = attn_pf2_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-attn2] PTX が読めない ({}) : {e} → 従来の attention へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-attn2] cuModuleLoadData 失敗 → 従来の attention へ");
+                    return None;
+                }
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(
+                    &mut f,
+                    module,
+                    b"dno_attention_prefill2\0".as_ptr() as *const c_char,
+                ) != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-attn2] PTX に dno_attention_prefill2 が無い → 従来へ");
+                    return None;
+                }
+                // 動的 smem の opt-in (48KB 既定上限を超えるため)。
+                if let Some(fn_attr) = lib.func_set_attribute {
+                    let want = ATTN_PF2_SMEM_BYTES as c_int;
+                    if (fn_attr)(f, CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES, want) != 0 {
+                        eprintln!("[pf-attn2] 動的 smem の opt-in に失敗 → 従来の attention へ");
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+                Some(AttnPf2 { module, f })
+            }
+        })
+        .as_ref()
+        .map(|a| a.f)
+}
+
 /// task 172: full 層 1 チャンクの後半 (attention → 出力ゲート → 出力投影)。
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
@@ -23648,7 +23785,15 @@ pub fn pf_full_out(
             let ob = d.o.as_ref().expect("ensure 済み");
             // 1. attention (K/V はミラー、q はデバイス)
             {
-                let shmem = (attn_pf_sh_f(dh) * 4) as u32;
+                // task 222: v2 カーネル (スコアを bf16 mma) が使える形ならそちら。
+                // 形は dh == 256 固定 (スレッド配置)・PTX があること・ゲート on。
+                let (f_attn, shmem) = match (
+                    pf_attn_tc_on() && dh == ATTN_PF2_DH && qd == heads * dh,
+                    attn_pf2_kernel(),
+                ) {
+                    (true, Some(f)) => (f, ATTN_PF2_SMEM_BYTES as u32),
+                    _ => (ctx.f_attn_pf, (attn_pf_sh_f(dh) * 4) as u32),
+                };
                 let (mut qp, mut kp, mut vp, mut ap) =
                     (qb.ptr(), kptr, vptr, attb.ptr());
                 let (mut heads_c, mut n_c, mut pos0_c) =
@@ -23676,7 +23821,7 @@ pub fn pf_full_out(
                 ];
                 unsafe {
                     ctx.launch_async(
-                        ctx.f_attn_pf,
+                        f_attn,
                         (nt.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
                         (dh as u32, 1, 1),
                         shmem,
