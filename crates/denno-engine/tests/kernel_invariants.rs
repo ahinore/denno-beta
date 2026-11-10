@@ -7584,9 +7584,9 @@ fn pf222_attn_pf2_tile_matches_host() {
     );
 }
 
-/// ゲートが既定 off で、`pf_full_out` の起動が v2 と従来で切り替わること。
+/// ゲートが既定 on (lab t222b で採用) で、`pf_full_out` の起動が v2 と従来で切り替わること。
 #[test]
-fn pf222_attn_pf2_gate_is_wired_and_default_off() {
+fn pf222_attn_pf2_gate_is_wired_and_default_on() {
     let at = CUDA_RS
         .find("pub(crate) fn pf_attn_tc_from_value(")
         .expect("pf_attn_tc_from_value が無い");
