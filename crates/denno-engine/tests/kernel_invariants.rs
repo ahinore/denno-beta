@@ -7451,6 +7451,7 @@ fn pf222_sn3_gates_are_wired_and_default_off() {
     for (fname, env) in [
         ("pf_tc_shared3_from_value", "DENNO_PF_TC_SHARED3"),
         ("pf_mix_tc_from_value", "DENNO_PF_MIX_TC"),
+        ("pf_tc_shared4_from_value", "DENNO_PF_TC_SHARED4"),
     ] {
         let at = CUDA_RS
             .find(&format!("pub(crate) fn {fname}("))
@@ -7472,18 +7473,24 @@ fn pf222_sn3_gates_are_wired_and_default_off() {
             "{env} を env から読んでいない"
         );
     }
-    // shared: sn3 → sn2 → 従来の順で、sn3 が先に来ること。
+    // shared: sh4 (tc2, N>=2048) → sn3 → sn2 → 従来の順で、sn3 が sn2 より先。
     let shared_at = CUDA_RS
         .find("fn pf2_gemm_shared(")
         .expect("pf2_gemm_shared が無い");
     let shared = &CUDA_RS[shared_at..];
+    let sh4_at = shared
+        .find("pf_tc_shared4_on() && pf_tc_shared4_eligible(")
+        .expect("shared に sh4 の分岐が無い");
     let sn3_at = shared
         .find("pf_tc_shared3_on() && pf_tc_sn3_eligible(")
         .expect("shared に sn3 の分岐が無い");
     let sn2_at = shared
         .find("pf_tc_shared2_on() && pf_tc_smalln2_eligible(")
         .expect("shared に sn2 の分岐が無い");
-    assert!(sn3_at < sn2_at, "sn3 が sn2 より後ろにある (sn2 が先に受ける)");
+    assert!(
+        sh4_at < sn3_at && sn3_at < sn2_at,
+        "shared の分岐順が sh4 → sn3 → sn2 でない"
+    );
     // mix: BF16 の down / up を sn3 に渡していること。
     assert!(
         CUDA_RS.contains("if pf_mix_tc_on()")

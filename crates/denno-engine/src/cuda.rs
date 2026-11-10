@@ -16949,6 +16949,13 @@ fn pf2_gemm_shared(
     n_out: usize,
 ) -> Result<()> {
     if let PfWKind::Quant(ty, _, rb, _) = kind {
+        // task 222: N が大きい側 (shared の down 2560) は tc2 の BM=128 タイルへ。
+        // gate/up の 640 は 5 行タイルしか出ないので sn2 / sn3 のまま。
+        if pf_tc_shared4_on() && pf_tc_shared4_eligible(ty, nt, n_in, n_out, 1) {
+            if let Some(tc2) = tc2_gemm_kernels() {
+                return tc2_gemm_launch(ctx, tc2, ty, w, x, y, nt, n_in, n_out, rb);
+            }
+        }
         if pf_tc_shared3_on() && pf_tc_sn3_eligible(ty, nt, n_in, n_out, 1) {
             if let Some(sn3) = tc_sn3_kernels() {
                 return sn3_gemm_launch(ctx, sn3, ty, w, x, y, nt, n_in, n_out, rb);
@@ -16961,6 +16968,67 @@ fn pf2_gemm_shared(
         }
     }
     pf2_gemm(ctx, w, kind, x, y, nt, n_in, n_out)
+}
+
+/// `DENNO_PF_TC_SHARED4` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (lab t222b で採否を決める)。
+pub(crate) fn pf_tc_shared4_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// shared expert の down (N=2560) を tc2 (BM=128 / BN=128) で回すか
+/// (**既定 off**。`1` で on)。
+pub(crate) fn pf_tc_shared4_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC_SN4_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_tc_shared4_from_value(std::env::var("DENNO_PF_TC_SHARED4").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PF_TC_SN4_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc_shared4_for_test(v: Option<bool>) {
+    PF_TC_SN4_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// shared の down を tc2 に任せられる形か (純関数)。
+///
+/// tc2 の前提 (`pf_tc2_eligible`) から **N の下限 4096 だけを外す**。
+/// gate/up の N=640 は BN=128 で 5 行タイルしか出ず並列度が落ちるので対象外
+/// (下限 2048 = down の 2560 だけが入る)。
+pub(crate) fn pf_tc_shared4_eligible(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    pf_tc2_type_ok(ty)
+        && pf_tc2_k_ok(ty, n_in)
+        && nt >= min_m
+        && n_out >= 2048
+        && n_out % TC2_BN == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -17328,7 +17396,11 @@ mod pf_tc_tests {
     /// task 222: sn3 のゲートは既定 off で、明示的な真値だけを受ける。
     #[test]
     fn pf_sn3_gate_truth_table() {
-        for f in [pf_tc_shared3_from_value, pf_mix_tc_from_value] {
+        for f in [
+            pf_tc_shared3_from_value,
+            pf_mix_tc_from_value,
+            pf_tc_shared4_from_value,
+        ] {
             assert!(!f(None), "未設定は既定 off");
             for v in ["0", "off", "false", "no", "", " OFF ", "2"] {
                 assert!(!f(Some(v)), "{v}");
@@ -17338,16 +17410,22 @@ mod pf_tc_tests {
             }
         }
         // 強制上書きが効き、戻すと env の解釈に戻ること。
-        let before = (pf_tc_shared3_on(), pf_mix_tc_on());
+        let before = (pf_tc_shared3_on(), pf_mix_tc_on(), pf_tc_shared4_on());
         set_pf_tc_shared3_for_test(Some(true));
         set_pf_mix_tc_for_test(Some(true));
-        assert!(pf_tc_shared3_on() && pf_mix_tc_on());
+        set_pf_tc_shared4_for_test(Some(true));
+        assert!(pf_tc_shared3_on() && pf_mix_tc_on() && pf_tc_shared4_on());
         set_pf_tc_shared3_for_test(Some(false));
         set_pf_mix_tc_for_test(Some(false));
-        assert!(!pf_tc_shared3_on() && !pf_mix_tc_on());
+        set_pf_tc_shared4_for_test(Some(false));
+        assert!(!pf_tc_shared3_on() && !pf_mix_tc_on() && !pf_tc_shared4_on());
         set_pf_tc_shared3_for_test(None);
         set_pf_mix_tc_for_test(None);
-        assert_eq!((pf_tc_shared3_on(), pf_mix_tc_on()), before);
+        set_pf_tc_shared4_for_test(None);
+        assert_eq!(
+            (pf_tc_shared3_on(), pf_mix_tc_on(), pf_tc_shared4_on()),
+            before
+        );
     }
 
     /// task 222: sn3 は実モデルの 4 つの型と形 (shared の Q5_K と mix の BF16) を
@@ -17383,6 +17461,21 @@ mod pf_tc_tests {
         assert!(
             !pf_tc_sn3_eligible(T::Bf16, 512, 10241, 320, 1),
             "BF16 の k が 32 の倍数でない"
+        );
+        // task 222: shared の down (N=2560) は tc2 (BM=128) の担当。
+        // gate/up (N=640) は対象外 (並列度が落ちる)。
+        assert!(pf_tc_shared4_eligible(T::Q8_0, 512, 640, 2560, 1), "down 2560");
+        assert!(
+            !pf_tc_shared4_eligible(T::Q8_0, 512, 2560, 640, 1),
+            "gate/up の 640 は tc2 にしない"
+        );
+        assert!(
+            !pf_tc_shared4_eligible(T::Q8_0, 512, 10240, 320, 1),
+            "mix の 320 は tc2 にしない"
+        );
+        assert!(
+            !pf_tc_shared4_eligible(T::Bf16, 512, 640, 2560, 1),
+            "BF16 は tc2 の型に無い"
         );
     }
 
