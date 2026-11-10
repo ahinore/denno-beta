@@ -7601,13 +7601,17 @@ fn pf222_attn_pf2_gate_is_wired_and_default_off() {
         CUDA_RS.contains("std::env::var(\"DENNO_PF_ATTN_TC\")"),
         "DENNO_PF_ATTN_TC を env から読んでいない"
     );
-    // 起動の切り替え: ゲートと形 (dh) を見て、ダメなら従来カーネルへ。
+    // 起動の切り替え: ゲートと形 (dh) と PTX の有無を見て、ダメなら従来カーネルへ。
     assert!(
-        CUDA_RS.contains("pf_attn_tc_on() && dh == ATTN_PF2_DH && qd == heads * dh"),
-        "pf_full_out が v2 の形を検査していない"
+        CUDA_RS.contains("let use_v2 = pf_attn_tc_on()")
+            && CUDA_RS.contains("&& dh == ATTN_PF2_DH")
+            && CUDA_RS.contains("&& !ctx.f_attn_pf2.is_null();"),
+        "pf_full_out が v2 の形 (dh / PTX) を検査していない"
     );
+    // 従来カーネルへの切り戻しが else 側に残っていること。
     assert!(
-        CUDA_RS.contains("_ => (ctx.f_attn_pf, (attn_pf_sh_f(dh) * 4) as u32),"),
+        CUDA_RS.contains("ctx.f_attn_pf2,")
+            && CUDA_RS.contains("(attn_pf_sh_f(dh) * 4) as u32,"),
         "v2 が使えないときの従来カーネルへの切り戻しが無い"
     );
     // PTX 名と引数 (12 個) の一致。

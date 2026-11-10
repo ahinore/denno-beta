@@ -3466,6 +3466,10 @@ pub struct CudaCtx {
     f_attn: CUfunction,
     // P17j: prefill attention (flash 風 online softmax・exactness 緩和・ユーザー承認)
     f_attn_pf: CUfunction,
+    /// task 222: prefill attention v2 (スコアを bf16 mma・PV を 4x16 の
+    /// レジスタタイル)。`DENNO_PF_ATTN_TC` が on かつ PTX があるときだけ使う。
+    /// 無いときは null (従来の `f_attn_pf` へ fail closed)。
+    f_attn_pf2: CUfunction,
     /// task 135: t を分割する decode attention (`dno_attention_decode`) と、
     /// 部分和を畳む `dno_attention_decode_combine`。PTX に無ければ None で
     /// 従来の `dno_attention` 経路に落ちる (fail closed・古い PTX でも起動可)。
@@ -3729,6 +3733,61 @@ impl CudaCtx {
                 }
             }
             ATTN_PF_DYN_SMEM.store(attn_pf_dyn_smem, std::sync::atomic::Ordering::Relaxed);
+            // task 222: prefill attention v2 (任意。読めない・入口が無い・
+            // opt-in が通らないときは null のまま = 従来の
+            // dno_attention_prefill で回る。fail closed)。
+            let mut f_attn_pf2: CUfunction = std::ptr::null_mut();
+            {
+                let pf2_path = match std::env::var("DENNO_PF_ATTN2_PTX") {
+                    Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                    _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("kernels")
+                        .join("kernels_attn_pf2.ptx"),
+                };
+                match std::fs::read(&pf2_path) {
+                    Ok(mut image) => {
+                        image.push(0);
+                        unsafe {
+                            let mut module2: CUmodule = std::ptr::null_mut();
+                            let loaded = (lib.module_load_data)(
+                                &mut module2,
+                                image.as_ptr() as *const c_void,
+                            ) == CUDA_SUCCESS;
+                            if loaded
+                                && (lib.module_get_function)(
+                                    &mut f_attn_pf2,
+                                    module2,
+                                    b"dno_attention_prefill2\0".as_ptr() as *const c_char,
+                                ) == CUDA_SUCCESS
+                            {
+                                let ok = match lib.func_set_attribute {
+                                    Some(fn_attr) => (fn_attr)(
+                                        f_attn_pf2,
+                                        CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                        ATTN_PF2_SMEM_BYTES as c_int,
+                                    ) == 0,
+                                    None => false,
+                                };
+                                if !ok {
+                                    eprintln!(
+                                        "[pf-attn2] 動的 smem の opt-in に失敗 → 従来の attention へ"
+                                    );
+                                    f_attn_pf2 = std::ptr::null_mut();
+                                }
+                            } else {
+                                eprintln!("[pf-attn2] PTX を読めない/入口が無い → 従来の attention へ");
+                                f_attn_pf2 = std::ptr::null_mut();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[pf-attn2] PTX が無い ({}) : {e} → 従来の attention へ",
+                            pf2_path.display()
+                        );
+                    }
+                }
+            }
             // s169 (P10): SM 数を 1 回だけ取る (GEMV の launch 形状を n から選ぶ
             // ためだけに使う。取れなければ 0 のまま = 形状選択は従来の固定 C)。
             if let Some(dev_attr) = lib.device_get_attribute {
@@ -3984,6 +4043,7 @@ impl CudaCtx {
                 f_expf,
                 f_attn,
                 f_attn_pf,
+                f_attn_pf2,
                 f_attn_dec: f_attn_dec.map(|(a, _)| a),
                 f_attn_dec_cb: f_attn_dec.map(|(_, b)| b),
                 attn_pf_dyn_smem,
@@ -23600,81 +23660,6 @@ pub(crate) const ATTN_PF2_DH: usize = 256;
 /// v2 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid x の分母)。
 pub(crate) const ATTN_PF2_BQ: usize = 64;
 
-/// v2 カーネルの関数 (PTX は実行時読み込み)。
-struct AttnPf2 {
-    #[allow(dead_code)]
-    module: CUmodule,
-    f: CUfunction,
-}
-
-unsafe impl Send for AttnPf2 {}
-unsafe impl Sync for AttnPf2 {}
-
-static ATTN_PF2: OnceLock<Option<AttnPf2>> = OnceLock::new();
-
-fn attn_pf2_ptx_path() -> std::path::PathBuf {
-    match std::env::var("DENNO_PF_ATTN2_PTX") {
-        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("kernels")
-            .join("kernels_attn_pf2.ptx"),
-    }
-}
-
-/// v2 カーネルを読む (初回だけ)。失敗は None を焼き付ける。
-/// **current context を張った後に呼ぶこと**。動的 smem は 48KB を超えるので
-/// この関数の中で opt-in する (失敗したら None = 従来カーネルへ)。
-fn attn_pf2_kernel() -> Option<CUfunction> {
-    ATTN_PF2
-        .get_or_init(|| {
-            let path = attn_pf2_ptx_path();
-            let mut image = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!(
-                        "[pf-attn2] PTX が読めない ({}) : {e} → 従来の attention へ",
-                        path.display()
-                    );
-                    return None;
-                }
-            };
-            image.push(0);
-            let lib = lib().ok()?;
-            let mut module: CUmodule = std::ptr::null_mut();
-            unsafe {
-                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
-                    != CUDA_SUCCESS
-                {
-                    eprintln!("[pf-attn2] cuModuleLoadData 失敗 → 従来の attention へ");
-                    return None;
-                }
-                let mut f: CUfunction = std::ptr::null_mut();
-                if (lib.module_get_function)(
-                    &mut f,
-                    module,
-                    b"dno_attention_prefill2\0".as_ptr() as *const c_char,
-                ) != CUDA_SUCCESS
-                {
-                    eprintln!("[pf-attn2] PTX に dno_attention_prefill2 が無い → 従来へ");
-                    return None;
-                }
-                // 動的 smem の opt-in (48KB 既定上限を超えるため)。
-                if let Some(fn_attr) = lib.func_set_attribute {
-                    let want = ATTN_PF2_SMEM_BYTES as c_int;
-                    if (fn_attr)(f, CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES, want) != 0 {
-                        eprintln!("[pf-attn2] 動的 smem の opt-in に失敗 → 従来の attention へ");
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-                Some(AttnPf2 { module, f })
-            }
-        })
-        .as_ref()
-        .map(|a| a.f)
-}
-
 /// task 172: full 層 1 チャンクの後半 (attention → 出力ゲート → 出力投影)。
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
@@ -23787,13 +23772,10 @@ pub fn pf_full_out(
             {
                 // task 222: v2 カーネル (スコアを bf16 mma) が使える形ならそちら。
                 // 形は dh == 256 固定 (スレッド配置)・PTX があること・ゲート on。
-                let (f_attn, shmem) = match (
-                    pf_attn_tc_on() && dh == ATTN_PF2_DH && qd == heads * dh,
-                    attn_pf2_kernel(),
-                ) {
-                    (true, Some(f)) => (f, ATTN_PF2_SMEM_BYTES as u32),
-                    _ => (ctx.f_attn_pf, (attn_pf_sh_f(dh) * 4) as u32),
-                };
+                let use_v2 = pf_attn_tc_on()
+                    && dh == ATTN_PF2_DH
+                    && qd == heads * dh
+                    && !ctx.f_attn_pf2.is_null();
                 let (mut qp, mut kp, mut vp, mut ap) =
                     (qb.ptr(), kptr, vptr, attb.ptr());
                 let (mut heads_c, mut n_c, mut pos0_c) =
@@ -23819,14 +23801,26 @@ pub fn pf_full_out(
                     &mut dh_c as *mut _ as *mut c_void,
                     &mut scale_c as *mut _ as *mut c_void,
                 ];
-                unsafe {
-                    ctx.launch_async(
-                        f_attn,
-                        (nt.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
-                        (dh as u32, 1, 1),
-                        shmem,
-                        &mut args,
-                    )?;
+                if use_v2 {
+                    unsafe {
+                        ctx.launch_async(
+                            ctx.f_attn_pf2,
+                            (nt.div_ceil(ATTN_PF2_BQ) as u32, heads as u32, 1),
+                            (dh as u32, 1, 1),
+                            ATTN_PF2_SMEM_BYTES as u32,
+                            &mut args,
+                        )?;
+                    }
+                } else {
+                    unsafe {
+                        ctx.launch_async(
+                            ctx.f_attn_pf,
+                            (nt.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
+                            (dh as u32, 1, 1),
+                            (attn_pf_sh_f(dh) * 4) as u32,
+                            &mut args,
+                        )?;
+                    }
                 }
             }
             // 2. 出力ゲート (att *= sigmoid(gate))
