@@ -22619,6 +22619,12 @@ const STEER_NAMES: [&[u8]; 3] = [
 
 /// PTX の置き場所。`DENNO_STEER_PTX` があればそれ、無ければクレートの
 /// `kernels/kernels_steer.ptx`。
+///
+/// task 218: 収録した PTX は lab t218b (sha bfb4b2fe1) が `PTX=steer` で
+/// `kernels_steer.cu` から生成したもの (sha256 eae1eca4…、entry 3 本、
+/// `.target sm_75`)。再生成は `bash kernels/build_ptx.sh steer`。
+/// 引数の数は `kernel_invariants::steer_ptx_matches_the_host_launch_abi` が
+/// 固定している (acc 6 / sub 7 / proj 7)。
 fn steer_ptx_path() -> std::path::PathBuf {
     match std::env::var("DENNO_STEER_PTX") {
         Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
