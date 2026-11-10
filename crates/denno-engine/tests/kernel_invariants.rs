@@ -8335,9 +8335,15 @@ fn mix_up_warp_per_row_kernel_is_wired() {
         "up 版の行数ミラーが無い"
     );
     let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    // task 216: up 版の選択は「融合版が選ばれていない」「upw ゲート」「up_reduce」
+    // 「k2 % 8」の 4 条件を全部見る (行の折り返しに依らず条件ごとに固定する)。
     assert!(
-        body.contains("(mix_dec_upw_on() || dec_mix_upw_on()) && up_reduce && k2 % 8 == 0"),
-        "up 版の門番 (upw / k % 8) が無い"
+        body.contains("mix_dec_upw_on() || dec_mix_upw_on()"),
+        "up 版の門番 (upw) が無い"
+    );
+    assert!(
+        body.contains("upmix.is_none()"),
+        "up 版の選択が融合版を避けていない (2 本撃ちになる)"
     );
     assert!(
         body.contains("n2.div_ceil(MIX_UP_ROWS) as u32"),
@@ -8441,6 +8447,95 @@ fn mix_down_uint4_kernel_is_wired() {
     assert!(
         targets.contains("mix_down"),
         "build_ptx.sh の targets_all に mix_down が無い: {targets}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 216: mix の up + hc_mixed を 1 本に畳む `kernels_mix_upmix.cu`
+// ---------------------------------------------------------------------------
+// 「cuda.rs が読んでいる」「build_ptx.sh が mix_upmix を作る」「warp = 1 行 +
+// uint4」「hc_mixed と同じ式」「ゲートは既定 off」「融合したら 2 本を撃たない」を
+// 固定する。値がビット一致する根拠 (同じ縮約・同じ式) もここで見る。
+const MIX_UPMIX_SRC: &str = include_str!("../kernels/kernels_mix_upmix.cu");
+
+#[test]
+fn mix_upmix_kernel_is_wired() {
+    let p = kernel_params(MIX_UPMIX_SRC, "dno_mix_upmix_bf16");
+    assert_eq!(
+        p,
+        vec!["lo", "w", "xn", "out", "k", "n", "e", "hc", "inv_hc"],
+        "dno_mix_upmix_bf16 の引数が (lo, w, xn, out, k, n, e, hc, inv_hc) と違う: {p:?}"
+    );
+    // up 側: 1 warp = 1 行 + uint4 = 8 BF16 + 明示の 2 演算 (dno_mix_up_bf16 と同じ鎖)。
+    assert!(
+        MIX_UPMIX_SRC.contains("*reinterpret_cast<const uint4*>(rowp + c)"),
+        "8 要素のベクタロードが無い"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int c = lane * 8; c < k; c += 32 * 8)"),
+        "1 レーン 8 要素のループが変わった (up の縮約が 2 本版と別になる)"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int off = 16; off > 0; off >>= 1)")
+            && MIX_UPMIX_SRC.contains("__shfl_down_sync(0xffffffffu, acc, off)"),
+        "warp 内の固定木が変わった"
+    );
+    // mixed 側: dno_hc_mixed_f32 と同じ式 (s 昇順 + 最後に inv_hc)。
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int ss = 1; ss < DNO_UPMIX_HC; ++ss)")
+            && MIX_UPMIX_SRC.contains("out[d] = __fmul_rn(acc, inv_hc);"),
+        "mixed の縮約順が dno_hc_mixed_f32 と違う"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("#define DNO_UPMIX_HC 4"),
+        "hc = 4 の前提が消えた (ホストの門番と揃える)"
+    );
+    // cuda.rs 側。
+    assert!(
+        CUDA_RS.contains("kernels_mix_upmix.ptx"),
+        "cuda.rs が kernels_mix_upmix.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX_NARGS: usize = 9;"),
+        "upmix 版の ABI 検査が 9 引数でない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX_EPB: usize = 2;")
+            && CUDA_RS.contains("const MIX_UPMIX_HC: usize = 4;"),
+        "upmix 版の形のミラーが無い"
+    );
+    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        body.contains("dec_mix_upmix_on() && up_reduce && k2 % 8 == 0 && hc == MIX_UPMIX_HC"),
+        "upmix の門番 (ゲート / k % 8 / hc) が無い"
+    );
+    assert!(
+        body.contains("if let Some(f_upmix) = upmix {"),
+        "upmix の分岐が無い"
+    );
+    // 融合したときは hc_mixed を撃たない (2 本撃つと 2 本版と同じ値になるが、
+    // 融合の意味 (起動 1 本減) が消える)。
+    let fused = &body[body.find("if let Some(f_upmix) = upmix {").unwrap()..];
+    let fused = &fused[..fused.find("} else {").unwrap()];
+    assert!(
+        !fused.contains("f_mixed"),
+        "融合経路が hc_mixed も撃っている"
+    );
+    assert!(
+        fused.contains("ctx.launch_async(f_upmix, grid, (256, 1, 1), 0, &mut args4)?;"),
+        "融合カーネルの起動が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_upmix)    echo \"kernels_mix_upmix.cu|nofmad\" ;;"),
+        "build_ptx.sh の mix_upmix が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_upmix"),
+        "build_ptx.sh の targets_all に mix_upmix が無い: {targets}"
     );
 }
 

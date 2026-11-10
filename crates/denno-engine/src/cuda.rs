@@ -24036,6 +24036,24 @@ fn dec_mix_dthr() -> usize {
     *THR.get_or_init(|| parse_dec_mix_dthr(std::env::var("DENNO_DEC_MIX_DTHR").ok().as_deref()))
 }
 
+/// task 216: `DENNO_DEC_MIX_UPMIX` の解釈 (純関数)。
+///
+/// decode の mix の up と hc_mixed を 1 本に畳む版 (`kernels_mix_upmix.cu`) で
+/// 回すか。**既定 off** (明示的な真値だけ on)。on のときは up も uint4 版になる
+/// (融合カーネルが up を含むため)。
+fn parse_dec_mix_upmix(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// task 216: up + hc_mixed の融合版で回すか (`DENNO_DEC_MIX_UPMIX`)。
+fn dec_mix_upmix_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_dec_mix_upmix(std::env::var("DENNO_DEC_MIX_UPMIX").ok().as_deref()))
+}
+
 /// hc 方向を畳んだ norm+inject を使うか (`DENNO_MIX_DEC_FOLD`)。
 fn mix_dec_fold_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -24284,6 +24302,95 @@ pub(crate) fn mix_down_loaded() -> bool {
     mix_down_kernels().is_some()
 }
 
+// ---------------------------------------------------------------------------
+// task 216: mix の up と hc_mixed を 1 本に畳む `kernels_mix_upmix.cu`。
+//
+// 従来は up が gate[hc*e] を書いて、その直後の `dno_hc_mixed_f32`
+// (grid = ceil(e/256) = 10 ブロック) が silu して hc 方向に足していた。
+// mixed しか要らないので gate の 40 KB 往復と起動 1 本が無駄。丸め順は 2 本版と
+// 同一なので値はビット一致 (up の縮約は `dno_mix_up_bf16` と同じ、mixed は
+// `dno_hc_mixed_f32` と同じ s 昇順 + inv_hc)。
+// ---------------------------------------------------------------------------
+
+/// upmix 版のカーネル名。
+const MIX_UPMIX_KERNEL_NAME: &str = "dno_mix_upmix_bf16";
+
+/// upmix 版の引数の数 (lo, w, xn, out, k, n, e, hc, inv_hc)。
+const MIX_UPMIX_NARGS: usize = 9;
+
+/// upmix 版が 1 ブロックで受け持つ e の数 (`.cu` の DNO_UPMIX_EPB)。
+const MIX_UPMIX_EPB: usize = 2;
+
+/// upmix 版が前提にする hc (`.cu` の DNO_UPMIX_HC)。
+const MIX_UPMIX_HC: usize = 4;
+
+struct MixUpmixKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixUpmixKernels {}
+unsafe impl Sync for MixUpmixKernels {}
+
+static MIX_UPMIX_KERNELS: OnceLock<Option<MixUpmixKernels>> = OnceLock::new();
+
+fn mix_upmix_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_UPMIX_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_upmix.ptx"),
+    }
+}
+
+/// upmix 版のカーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_upmix_kernels() -> Option<&'static MixUpmixKernels> {
+    MIX_UPMIX_KERNELS
+        .get_or_init(|| {
+            let path = mix_upmix_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_UPMIX_KERNEL_NAME) != Some(MIX_UPMIX_NARGS) {
+                eprintln!(
+                    "[mix-upmix] PTX の引数が {MIX_UPMIX_NARGS} 本でない → 2 本経路へ。\
+                     `bash build_ptx.sh mix_upmix` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_UPMIX_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-upmix] PTX に {MIX_UPMIX_KERNEL_NAME} が無い → 2 本経路へ");
+                    return None;
+                }
+                Some(MixUpmixKernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// upmix 版が載っているか (テスト専用)。
+#[cfg(test)]
+pub(crate) fn mix_upmix_loaded() -> bool {
+    mix_upmix_kernels().is_some()
+}
+
 /// norm 重み (host の `[hc][e]` f32) の常駐。キーは (ポインタ, 長さ) で、
 /// 内容の指紋 (16 点サンプル) が変われば載せ替える。
 ///
@@ -24426,11 +24533,23 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
         },
     };
     let up_reduce = mix_up_reduce_enabled();
+    // task 216: up と hc_mixed を 1 本に畳む版 (`DENNO_DEC_MIX_UPMIX`)。
+    // 前提は hc == 4 と k が 8 の倍数 (カーネルの warp 割り当てと uint4 読み)。
+    // 丸め順は 2 本版と同一 (値はビット一致)。
+    let upmix = if dec_mix_upmix_on() && up_reduce && k2 % 8 == 0 && hc == MIX_UPMIX_HC {
+        mix_upmix_kernels().map(|k| k.f)
+    } else {
+        None
+    };
     // task 192: `DENNO_MIX_DEC_FOLD` では up を 1 warp = 1 行の版で回す
     // (k が 8 の倍数のときだけ。形が違えば従来カーネルへ)。
     // task 216: 同じ版を `DENNO_DEC_MIX_UPW` 単独でも選べるようにした
     // (task 213 は fold と束ねて測っていたので、up だけの効果が分かれていなかった)。
-    let up_fast = if (mix_dec_upw_on() || dec_mix_upw_on()) && up_reduce && k2 % 8 == 0 {
+    let up_fast = if upmix.is_none()
+        && (mix_dec_upw_on() || dec_mix_upw_on())
+        && up_reduce
+        && k2 % 8 == 0
+    {
         mix_up_kernels().map(|k| k.f)
     } else {
         None
@@ -24636,30 +24755,52 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
             // `DENNO_DEC_MIX_DTHR` の値。両カーネルとも blockDim から縮約を組む)。
             ctx.launch_async(f_down, (n1 as u32, 1, 1), (down_thr, 1, 1), 0, &mut args)?;
             // 4. up: 入力は lo_apply 済みの lo。
-            let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());
-            let (mut kc2, mut nc2) = (n1 as c_int, n2 as c_int);
-            let mut args2 = [
-                &mut ph2 as *mut _ as *mut c_void,
-                &mut pw2 as *mut _ as *mut c_void,
-                &mut po2 as *mut _ as *mut c_void,
-                &mut kc2 as *mut _ as *mut c_void,
-                &mut nc2 as *mut _ as *mut c_void,
-            ];
-            ctx.launch_async(f_up, (up_grid, 1, 1), (up_thr, 1, 1), 0, &mut args2)?;
-            // 5. hc_mixed: xn と gate から mixed を作る。
-            let (mut px, mut pg, mut pm) = (dx.ptr(), dout.ptr(), dm.ptr());
-            let (mut ec, mut hcc) = (e as c_int, hc as c_int);
-            let mut invc2 = inv_hc;
-            let mut args3 = [
-                &mut px as *mut _ as *mut c_void,
-                &mut pg as *mut _ as *mut c_void,
-                &mut pm as *mut _ as *mut c_void,
-                &mut ec as *mut _ as *mut c_void,
-                &mut hcc as *mut _ as *mut c_void,
-                &mut invc2 as *mut _ as *mut c_void,
-            ];
-            let grid = (e.div_ceil(256).max(1) as u32, 1, 1);
-            ctx.launch_async(f_mixed, grid, (256, 1, 1), 0, &mut args3)?;
+            // task 216: `DENNO_DEC_MIX_UPMIX` のときは 4 と 5 を 1 本に畳む
+            // (gate[hc*e] の 40 KB 往復と起動 1 本が消える。値はビット一致)。
+            if let Some(f_upmix) = upmix {
+                let (mut pl, mut pwu, mut pxn, mut pm) = (dlo.ptr(), wp2, dx.ptr(), dm.ptr());
+                let (mut kc, mut nc, mut ec, mut hcc) =
+                    (k2 as c_int, n2 as c_int, e as c_int, hc as c_int);
+                let mut invc = inv_hc;
+                let mut args4 = [
+                    &mut pl as *mut _ as *mut c_void,
+                    &mut pwu as *mut _ as *mut c_void,
+                    &mut pxn as *mut _ as *mut c_void,
+                    &mut pm as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                    &mut nc as *mut _ as *mut c_void,
+                    &mut ec as *mut _ as *mut c_void,
+                    &mut hcc as *mut _ as *mut c_void,
+                    &mut invc as *mut _ as *mut c_void,
+                ];
+                let grid = (e.div_ceil(MIX_UPMIX_EPB).max(1) as u32, 1, 1);
+                ctx.launch_async(f_upmix, grid, (256, 1, 1), 0, &mut args4)?;
+            } else {
+                let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());
+                let (mut kc2, mut nc2) = (n1 as c_int, n2 as c_int);
+                let mut args2 = [
+                    &mut ph2 as *mut _ as *mut c_void,
+                    &mut pw2 as *mut _ as *mut c_void,
+                    &mut po2 as *mut _ as *mut c_void,
+                    &mut kc2 as *mut _ as *mut c_void,
+                    &mut nc2 as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(f_up, (up_grid, 1, 1), (up_thr, 1, 1), 0, &mut args2)?;
+                // 5. hc_mixed: xn と gate から mixed を作る。
+                let (mut px, mut pg, mut pm) = (dx.ptr(), dout.ptr(), dm.ptr());
+                let (mut ec, mut hcc) = (e as c_int, hc as c_int);
+                let mut invc2 = inv_hc;
+                let mut args3 = [
+                    &mut px as *mut _ as *mut c_void,
+                    &mut pg as *mut _ as *mut c_void,
+                    &mut pm as *mut _ as *mut c_void,
+                    &mut ec as *mut _ as *mut c_void,
+                    &mut hcc as *mut _ as *mut c_void,
+                    &mut invc2 as *mut _ as *mut c_void,
+                ];
+                let grid = (e.div_ceil(256).max(1) as u32, 1, 1);
+                ctx.launch_async(f_mixed, grid, (256, 1, 1), 0, &mut args3)?;
+            }
             // 6. D2H 1 本 (mixed[e] + inj[hc] は同じバッファに連続で置いてある)。
             let kp_cp = dec_kprof::op_begin(
                 || "D2H@a".to_string(),
@@ -45764,6 +45905,22 @@ mod task184_tests {
             assert_eq!(f, base, "dk={dk} dv={dv} で従来カーネルになっていない");
             assert_eq!(thr, dk as u32);
         }
+    }
+
+    /// task 216: up と hc_mixed を 1 本に畳むゲート (`DENNO_DEC_MIX_UPMIX`)。
+    /// 既定 off。on のときだけ融合カーネルを選ぶ。
+    #[test]
+    fn dec_mix_upmix_truth_table() {
+        for raw in [None, Some(""), Some("  "), Some("x"), Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(!parse_dec_mix_upmix(raw), "raw={raw:?} が on になっている");
+        }
+        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true ")] {
+            assert!(parse_dec_mix_upmix(raw), "raw={raw:?} が off になっている");
+        }
+        assert!(
+            !parse_dec_mix_upmix(None),
+            "DENNO_DEC_MIX_UPMIX の既定が on になっている"
+        );
     }
 
     /// task 216: mix の up を uint4 版にするゲート (`DENNO_DEC_MIX_UPW`)。
