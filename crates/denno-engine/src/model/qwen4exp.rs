@@ -1876,6 +1876,39 @@ impl ExpertW {
         }
     }
 
+    /// task 214: expert `e` のバイト範囲を **mmap のハンドル付き**で返す。
+    ///
+    /// 背景スレッド ([`crate::model::exp_up_worker`]) へ渡すための形。
+    /// `&[u8]` はスレッドを跨げないので、`Arc<Mmap>` + 絶対オフセット + 長さにする。
+    /// `WeightBlocks` がヒープ実体 (テスト経路) のときは `None` を返し、
+    /// 呼び出し側は従来の同期経路を使う。
+    ///
+    /// 範囲は [`ExpertW::slice`] と同じ [`ExpertSlice`] から作る (ずれる余地を作らない)。
+    fn slice_mapped(
+        &self,
+        e: usize,
+    ) -> Result<Option<crate::model::exp_up_worker::Part>> {
+        let Some((map, base, _)) = self.blocks.mapping() else {
+            return Ok(None);
+        };
+        let s = ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, e)
+            .map_err(|err| one(format!("{}: {err}", self.name)))?;
+        if s.end() > self.blocks.as_slice().len() {
+            return Err(one(format!(
+                "{}: expert {e} の範囲 {}..{} がテンソル長 {} を超える",
+                self.name,
+                s.off,
+                s.end(),
+                self.blocks.as_slice().len()
+            )));
+        }
+        Ok(Some(crate::model::exp_up_worker::Part {
+            map: std::sync::Arc::clone(map),
+            off: base + s.off,
+            len: s.end() - s.off,
+        }))
+    }
+
     /// expert `e` の**ファイル内絶対オフセット**とバイト数 (キャッシュ経路用)。
     ///
     /// mmap 経路の [`ExpertW::slice`] と同じ [`ExpertSlice`] を使うので、
@@ -10249,17 +10282,39 @@ fn moe_experts_iq_gpu_batched(
     let mut pos: Vec<usize> = Vec::with_capacity(sel.len());
     // task 187: 台帳の副区間 (VRAM 参照)。`experts` の cpu 列の中身。
     let s_lookup = q4ledger::sub(q4ledger::SUB_EXP_LOOKUP);
-    for (t, &ei) in sel.iter().enumerate() {
-        let key = ExpertKey {
-            layer: lw.il as u16,
-            expert: ei as u16,
-        };
-        let got = expert_vram::lookup(key, shapes)
-            .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 参照: {err:#}", lw.il)))?;
-        if let Some(dev) = got {
-            devs.push(dev);
-            ids.push(ei as u16);
-            pos.push(t);
+    if crate::model::exp_up_worker::enabled() {
+        // task 214: 背景の上げ直しが転送中は LRU のロックが 1 本 0.16 ms 埋まる。
+        // 1 層 10 回のロック取得を 1 回に寄せる (`lookup_many` は `lookup` と
+        // 同じ `get_mut` を順に呼ぶだけ = 触り方も順序も同じ)。
+        let keys: Vec<ExpertKey> = sel
+            .iter()
+            .map(|&ei| ExpertKey {
+                layer: lw.il as u16,
+                expert: ei as u16,
+            })
+            .collect();
+        let got = expert_vram::lookup_many(&keys, shapes)
+            .map_err(|err| one(format!("層 {}: expert VRAM 参照: {err:#}", lw.il)))?;
+        for (t, g) in got.into_iter().enumerate() {
+            if let Some(dev) = g {
+                devs.push(dev);
+                ids.push(sel[t] as u16);
+                pos.push(t);
+            }
+        }
+    } else {
+        for (t, &ei) in sel.iter().enumerate() {
+            let key = ExpertKey {
+                layer: lw.il as u16,
+                expert: ei as u16,
+            };
+            let got = expert_vram::lookup(key, shapes)
+                .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 参照: {err:#}", lw.il)))?;
+            if let Some(dev) = got {
+                devs.push(dev);
+                ids.push(ei as u16);
+                pos.push(t);
+            }
         }
     }
     drop(s_lookup);
@@ -10662,11 +10717,43 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     }
     // LRU に空きがあるうちは詰め込み、埋まったら控えめにする (lab t144d:
     // 埋まってからも 48 本/token 入れると H2D が 7 ms/token かかり、節約を食う)。
-    let budget = match expert_vram::cache_usage() {
-        Some((used, cap)) if cap > 0 && used.saturating_add(32 << 20) >= cap => {
-            crate::model::exp_iq::upload_when_full()
-        }
-        _ => crate::model::exp_iq::upload_per_token(),
+    //
+    // task 214: `DENNO_DEC_UP_WORKER_MAX` が設定されていればその値を優先する
+    // (背景スレッド経路では上げ直しがメインスレッドの外なので、本数の上限だけ
+    // 別に測れるようにしてある)。未設定は従来の規則そのもの。
+    let worker = crate::model::exp_up_worker::enabled();
+    // `DENNO_DEC_UP_WORKER_MAX` が無いときのワーカー経路は、予算を**トークン先頭で
+    // 1 回**だけ決める。`cache_usage()` は LRU のロックを取るので、層ごとに呼ぶと
+    // ワーカーの転送中 (ロック保持 0.16 ms) に当たる (48 回/token)。
+    static TOKEN_BUDGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let budget = match crate::model::exp_up_worker::max_per_token() {
+        Some(n) => n,
+        None => match (worker, lw.il) {
+            (true, 0) => {
+                let b = match expert_vram::cache_usage() {
+                    Some((used, cap)) if cap > 0 && used.saturating_add(32 << 20) >= cap => {
+                        crate::model::exp_iq::upload_when_full()
+                    }
+                    _ => crate::model::exp_iq::upload_per_token(),
+                };
+                TOKEN_BUDGET.store(b, Ordering::Relaxed);
+                b
+            }
+            (true, _) => {
+                let b = TOKEN_BUDGET.load(Ordering::Relaxed);
+                if b == usize::MAX {
+                    crate::model::exp_iq::upload_per_token()
+                } else {
+                    b
+                }
+            }
+            (false, _) => match expert_vram::cache_usage() {
+                Some((used, cap)) if cap > 0 && used.saturating_add(32 << 20) >= cap => {
+                    crate::model::exp_iq::upload_when_full()
+                }
+                _ => crate::model::exp_iq::upload_per_token(),
+            },
+        },
     };
     let nl = n_layer.max(1);
     if lw.il == 0 {
@@ -10704,11 +10791,33 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     // 1. 参照とヒットは**全層**で数える (担当外の層も数えないとヒット率が偏る)。
     let mut hits = 0u32;
     let mut miss: Vec<usize> = Vec::new();
-    for &ei in sel {
-        match expert_vram::lookup(key_of(ei), shapes) {
-            Ok(Some(_)) => hits += 1,
-            Ok(None) => miss.push(ei),
-            Err(_) => break,
+    if worker {
+        // task 214: ワーカーが転送中は LRU のロックが 1 本 0.16 ms 埋まる。
+        // 1 層 10 回のロック取得を 1 回に寄せる (`lookup_many` は `lookup` と
+        // 同じ `get_mut` を順に呼ぶだけ = 触り方も順序も同じ)。
+        let keys: Vec<ExpertKey> = sel.iter().map(|&ei| key_of(ei)).collect();
+        match expert_vram::lookup_many(&keys, shapes) {
+            Ok(got) => {
+                for (i, g) in got.iter().enumerate() {
+                    match g {
+                        Some(_) => hits += 1,
+                        None => miss.push(sel[i]),
+                    }
+                }
+            }
+            Err(_) => {
+                // 形の不一致 = 実装の誤り。参照を数えるだけで上げ直しはしない。
+                crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
+                return;
+            }
+        }
+    } else {
+        for &ei in sel {
+            match expert_vram::lookup(key_of(ei), shapes) {
+                Ok(Some(_)) => hits += 1,
+                Ok(None) => miss.push(ei),
+                Err(_) => break,
+            }
         }
     }
     crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
@@ -10729,6 +10838,19 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     for ei in miss {
         if can == 0 {
             break;
+        }
+        if worker {
+            // task 214: 背景スレッドへ渡す (メインスレッドは待たない)。
+            // 1 本でも積めなければ従来の同期経路へ落ちる。
+            if submit_deferred_upload(lw, ei, shapes) {
+                left -= 1;
+                can -= 1;
+                LEFT.store(left, Ordering::Relaxed);
+                // 本数は「上げ直し」として数える (時間はワーカーの [dec-up-w] が持つ)。
+                crate::model::exp_iq::note_upload();
+                n_up += 1;
+                continue;
+            }
         }
         let t = std::time::Instant::now();
         let got = expert_vram::acquire(key_of(ei), shapes, || {
@@ -10757,6 +10879,32 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     if let Some(t) = t_up {
         crate::model::exp_iq::note_layer_upload(hits, n_up, t.elapsed().as_nanos() as u64);
     }
+}
+
+/// task 214: 1 本を背景スレッドの待ち行列へ積む。
+///
+/// 積めたら true。積めない (ゲート off / 待ち行列が満杯 / ヒープ実体の重み) なら
+/// false を返し、呼び出し側は従来の同期 H2D 経路へ落ちる。
+#[cfg(feature = "cuda")]
+fn submit_deferred_upload(
+    lw: &LayerW,
+    ei: usize,
+    shapes: [crate::model::expert_vram::ExpertShape; 3],
+) -> bool {
+    let part = |w: &ExpertW| w.slice_mapped(ei).ok().flatten();
+    let (Some(g), Some(u), Some(d)) = (
+        part(&lw.gate_exps),
+        part(&lw.up_exps),
+        part(&lw.down_exps),
+    ) else {
+        return false;
+    };
+    crate::model::exp_up_worker::submit(crate::model::exp_up_worker::Job {
+        layer: lw.il as u16,
+        expert: ei as u16,
+        shapes,
+        parts: [g, u, d],
+    })
 }
 
 /// task 146: 全層の expert 3 行列の合計バイト数 (使用回数ファイルのモデル同一性)。
@@ -15010,6 +15158,31 @@ mod tests {
     fn gpu_gemm_off() {
         #[cfg(feature = "cuda")]
         crate::cuda::set_gpu_gemm_enabled(false);
+    }
+
+    /// task 214: ヒープ実体の重みでは mmap のハンドルが無いので `slice_mapped` は
+    /// `None` を返し、呼び出し側 (`submit_deferred_upload`) は従来の同期 H2D へ
+    /// 落ちる。範囲の計算が `slice` と同じことも確かめる。
+    #[test]
+    fn task214_slice_mapped_is_none_for_heap_blocks() {
+        let (n_in, n_out, n_expert) = (8usize, 4usize, 2usize);
+        let per_expert = n_in * n_out * 4; // F32
+        let w = ExpertW {
+            name: "task214".to_string(),
+            blocks: WeightBlocks::from_vec(vec![0u8; per_expert * n_expert]),
+            ty: GgmlType::F32,
+            n_in,
+            n_out,
+            n_expert,
+            file: 0,
+            abs: 0,
+        };
+        assert!(w.slice_mapped(0).expect("範囲は正しい").is_none());
+        assert_eq!(w.slice(0).expect("スライス").len(), per_expert);
+        assert_eq!(w.slice(1).expect("スライス").len(), per_expert);
+        // 範囲外の index でも「ヒープだから None」を先に返す (呼び出し側は
+        // 従来の同期経路へ落ち、そちらが index を弾く)。
+        assert!(w.slice_mapped(n_expert).expect("ヒープは None").is_none());
     }
 
     #[test]

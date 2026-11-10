@@ -3083,11 +3083,15 @@ impl DevBuffer {
     pub(crate) fn alias(&self) -> Self {
         Self::view(self.ptr, self.bytes)
     }
-
-    /// task 152: `offset` の位置へ pinned staging 経由で H2D する。
+    /// task 152 / task 214: `offset` の位置へ pinned staging 経由で H2D する。
     ///
     /// [`from_slice_pinned`] と同じ経路 (ホスト 1 回コピー + `cuMemcpyHtoD`) なので、
     /// slab のスロットへ上げる転送速度は per-expert 確保のときと変わらない。
+    ///
+    /// task 214: このスレッドで [`enable_thread_upload_stream`] が成功していれば
+    /// `cuMemcpyHtoDAsync` を専用ストリームへ出してイベントで待つ。null ストリームの
+    /// カーネルと直列にならないので、別スレッドから上げ直すときに GPU の帯を
+    /// 塞がない (デバイスへ渡るバイト列は同じ)。
     pub(crate) fn upload_pinned_at(&self, offset: usize, data: &[u8]) -> Result<()> {
         let bytes = data.len();
         if bytes == 0 {
@@ -3110,14 +3114,35 @@ impl DevBuffer {
                     pin.ptr as *mut u8,
                     bytes,
                 );
-                check(
-                    (lib()?.memcpy_htod)(
-                        self.ptr + offset as CUdeviceptr,
-                        pin.ptr,
-                        bytes,
-                    ),
-                    "cuMemcpyHtoD (pinned slab)",
-                )?;
+                match thread_up_stream() {
+                    Some((s, ev)) => {
+                        let l = lib()?;
+                        check(
+                            (l.memcpy_htod_async)(
+                                self.ptr + offset as CUdeviceptr,
+                                pin.ptr,
+                                bytes,
+                                s,
+                            ),
+                            "cuMemcpyHtoDAsync (pinned slab)",
+                        )?;
+                        let (Some(rec), Some(es)) = (l.event_record, l.event_sync) else {
+                            bail!("event_record / event_sync が無い (up stream)");
+                        };
+                        check(rec(ev, s), "cuEventRecord (up stream)")?;
+                        check(es(ev), "cuEventSynchronize (up stream)")?;
+                    }
+                    None => {
+                        check(
+                            (lib()?.memcpy_htod)(
+                                self.ptr + offset as CUdeviceptr,
+                                pin.ptr,
+                                bytes,
+                            ),
+                            "cuMemcpyHtoD (pinned slab)",
+                        )?;
+                    }
+                }
             }
             dbg_htod(bytes);
             Ok(())
@@ -13365,6 +13390,64 @@ fn dbg_gemv_shape(n: usize, c: usize) {
     if decode_dbg_on() {
         DECODE_DBG.with(|d| dbg_bump(&mut d.borrow_mut().gemv, (n << 4) | (c & 0xf)));
     }
+}
+
+// ---------------------------------------------------------------------------
+// task 214: 上げ直し専用の H2D ストリーム (スレッド単位)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// このスレッドの H2D を出すストリームと、完了待ち用のイベント。
+    /// [`enable_thread_upload_stream`] が成功したスレッドだけ `Some`。
+    static UP_STREAM: std::cell::RefCell<Option<(CUstream, CUevent)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`UP_STREAM`] の値を返す (未設定なら `None` = 従来の null ストリーム)。
+fn thread_up_stream() -> Option<(CUstream, CUevent)> {
+    UP_STREAM.with(|c| *c.borrow())
+}
+
+/// task 214: このスレッドの H2D を**専用ストリーム**で出し、イベントで待つ。
+///
+/// 背景の上げ直しスレッド ([`crate::model::exp_up_worker`]) の入口で 1 回だけ呼ぶ。
+/// null ストリーム (メインスレッドのカーネル) と直列にならないので、
+/// 上げ直しが GPU の帯を塞がない。**デバイスへ渡るバイト列は同じ**。
+///
+/// 成功したら true。ドライバのシンボルが無い / 生成に失敗したら false で、
+/// そのスレッドは従来の同期 `cuMemcpyHtoD` を使う (fail closed)。
+pub fn enable_thread_upload_stream() -> bool {
+    UP_STREAM.with(|c| {
+        if c.borrow().is_some() {
+            return true;
+        }
+        let Ok(l) = lib() else {
+            return false;
+        };
+        let (Some(create), Some(ec), Some(destroy)) =
+            (l.stream_create, l.event_create, l.stream_destroy)
+        else {
+            return false;
+        };
+        if l.event_record.is_none() || l.event_sync.is_none() {
+            return false;
+        }
+        const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+        const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+        let mut st: CUstream = std::ptr::null_mut();
+        if unsafe { create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+            return false;
+        }
+        let mut ev: CUevent = std::ptr::null_mut();
+        if unsafe { ec(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+            unsafe {
+                let _ = destroy(st);
+            }
+            return false;
+        }
+        *c.borrow_mut() = Some((st, ev));
+        true
+    })
 }
 
 /// H2D 1 回を数える (バイト数で分類)。decode 経路の転送サイトから呼ぶ。
