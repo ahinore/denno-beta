@@ -263,6 +263,7 @@ let offBlk = new Set();                // "layer:block"
 let offStr = new Map();                // layer -> Set(stream)
 let dirty = true;
 let requests = [];
+let ivSig = '';                        // 介入の内容の署名 (skip 表示の取り消し用)
 
 // ---- API (live or mock) -------------------------------------------------
 async function api(method, path, body) {
@@ -544,6 +545,13 @@ async function refreshAll(why) {
 }
 
 function rebuildOffSets() {
+  // task 220: 介入の内容が変わったら、前の設定で出た「選びたかった expert」の
+  // amber を捨てる (ExpertSkip は介入がある層でしか来ないので、放っておくと残る)。
+  const sig = JSON.stringify([applied.experts_off, applied.blocks_off, applied.streams_off]);
+  if (sig !== ivSig) {
+    ivSig = sig;
+    for (const a of st.skip) a.fill(0);
+  }
   offExp = new Map();
   for (const [l, e] of applied.experts_off) {
     if (!offExp.has(l)) offExp.set(l, new Set());

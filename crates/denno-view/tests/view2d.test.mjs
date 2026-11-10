@@ -548,6 +548,11 @@ test('task 220: ExpertSkip は skip ビットだけ立ち、RouterTopK は変え
   st.onFrame({ kind: 'ExpertSkip', layer: 0, experts: [3] });
   assert.deepEqual([...st.skip[0]], [0, 0, 0, 1, 0, 0, 0, 0]);
 
+  // RouterTopK が来たら前のトークンの skip は捨てる (engine は空の ExpertSkip を
+  // 送らないので、これが無いと「選びたくなくなった」トークンでも amber が残る)。
+  st.onFrame({ kind: 'RouterTopK', layer: 0, experts: [1, 2], weights: [0.6, 0.4] });
+  assert.deepEqual([...st.skip[0]], [0, 0, 0, 0, 0, 0, 0, 0], 'RouterTopK で skip が消えていない');
+
   // reset と層の範囲外は落とす。
   st.reset();
   assert.deepEqual([...st.skip[0]], [0, 0, 0, 0, 0, 0, 0, 0]);

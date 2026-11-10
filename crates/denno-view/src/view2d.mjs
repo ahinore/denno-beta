@@ -522,6 +522,10 @@ export function createMapState(shape, opts = {}) {
     switch (f.kind) {
       case 'RouterTopK': {
         const w = routerWeights(f, s.n_expert);
+        // task 220: この層のルーティングが確定したので、前のトークンの
+        // 「選びたかったが切った」は捨てる (ExpertSkip は直後に来る。空なら
+        // そのトークンでは誰も選びたくなかった = amber を消す)。
+        st.skip[l].fill(0);
         if (st.mode === 'accum') {
           const a = st.experts[l];
           for (let i = 0; i < w.length; i++) a[i] += w[i];
