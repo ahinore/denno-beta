@@ -27455,6 +27455,9 @@ pub fn set_attn_mirror_forget_for_test(on: bool) -> bool {
 ///
 /// 存在しない ID でも何もしない (呼び出し側は `Drop` から呼ぶ)。
 pub fn q4_attn_mirror_forget(cache_id: u64) {
+    // 発火テスト用のカウントは「呼ばれたか」なので、ミラーが 1 本も無い
+    // (= static 未初期化) でも積む。
+    Q4_ATTN_MIRROR_FORGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(mirrors) = Q4_ATTN_MIRRORS.get() else {
         return;
     };
