@@ -9511,15 +9511,25 @@ fn task225_ba225_kernel_is_wired() {
         GEMM_BA225_SRC.contains("acc[i][j] = __fmaf_rn(wv[i], xv[j], acc[i][j]);"),
         "積和が明示 FMA の k 昇順になっていない"
     );
-    // task 225: 未連結 (parts 2 本) でもデバイス射影に入れる。型と形は Rust 側で
-    // 確かめてから入口を開ける (開けてから連鎖が諦める経路に落とさない)。
+    // task 225: 未連結 (parts 2 本) でもデバイス射影に入れる。
     assert!(
         QWEN4EXP_SSM_RS.contains("alpha_w: Some(pw(&parts[1]))"),
         "parts 2 本の alpha が連鎖に渡っていない"
     );
+    // task 228: 型の判定は F32 固定ではなく `pf_ba_w_check` (型を問わず f32 へ
+    // 展開できるか) に一本化した。呼び出し側と `gdn_pf_chain` が同じ純関数を
+    // 使うこと (= 片側だけ開いて連鎖が諦める経路に戻っていないこと) を固定する。
     assert!(
-        QWEN4EXP_SSM_RS.contains("parts[0].ty() == T::F32") && QWEN4EXP_SSM_RS.contains("parts[1].ty() == T::F32"),
-        "parts 経路が F32 を確かめていない"
+        QWEN4EXP_SSM_RS.contains("crate::cuda::pf_ba_w_check("),
+        "呼び出し側が pf_ba_w_check で型・形を確かめていない"
+    );
+    assert!(
+        CUDA_RS.contains("pf_ba_w_check(w.ty, w.k, w.n, &ba.beta_rows, nv, e)"),
+        "gdn_pf_chain が同じ判定を使っていない"
+    );
+    assert!(
+        !QWEN4EXP_SSM_RS.contains("parts[0].ty() == T::F32"),
+        "古い F32 固定の判定が残っている"
     );
     // router の logits も同じカーネルで回す (累積順が同じなので値はビット一致)。
     assert!(
