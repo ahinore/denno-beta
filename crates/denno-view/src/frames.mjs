@@ -6,10 +6,10 @@
 //   magic "DNTL" (4B) | version (1B) | kind (1B) | payload...
 //   payload 内の整数は LEB128 (unsigned)、f16 はリトルエンディアンの u16。
 //
-// kind 1..16 は lib.rs の Frame と 1:1。kind 13..15 (RoleAct / ExpertResidency /
-// TierStats) と 16 (RouterTopK) は lib.rs の encode/decode に合わせてある
-// (定義は P54/P56 で入った)。暫定だった 13/14/15 は role id バイトや count を
-// 持たない形式へ直した (P59)。
+// kind 1..17 は lib.rs の Frame と 1:1。kind 13..15 (RoleAct / ExpertResidency /
+// TierStats) と 16 (RouterTopK)、17 (ExpertSkip, task 220) は lib.rs の
+// encode/decode に合わせてある (定義は P54/P56/task 220 で入った)。暫定だった
+// 13/14/15 は role id バイトや count を持たない形式へ直した (P59)。
 
 export const MAGIC = 'DNTL';
 export const VERSION = 1;
@@ -30,7 +30,8 @@ export const KIND = Object.freeze({
   ROLE_ACT: 13,          // lib.rs: Frame::RoleAct
   EXPERT_RESIDENCY: 14,  // lib.rs: Frame::ExpertResidency
   TIER_STATS: 15,        // lib.rs: Frame::TierStats
-  ROUTER_TOPK: 16        // lib.rs: Frame::RouterTopK
+  ROUTER_TOPK: 16,       // lib.rs: Frame::RouterTopK
+  EXPERT_SKIP: 17        // lib.rs: Frame::ExpertSkip (task 220)
 });
 
 const NAME_OF_KIND = Object.create(null);
@@ -267,6 +268,14 @@ function decodePayload(kind, r) {
       for (let i = 0; i < n; i++) weights[i] = f16ToF32(r.f16());
       return { kind: 'RouterTopK', layer, experts, weights };
     }
+    case KIND.EXPERT_SKIP: {
+      // task 220: ルータが選びたかったが介入で無効化されていた expert (index 昇順)。
+      const layer = r.u32();
+      const n = r.u32();
+      const experts = new Array(n);
+      for (let i = 0; i < n; i++) experts[i] = r.u32();
+      return { kind: 'ExpertSkip', layer, experts };
+    }
     case KIND.TIER_STATS:
       // lib.rs の encode に合わせる: varint 4 個 (hit は載っていない)
       return {
@@ -394,6 +403,11 @@ export function encodeFrame(frame) {
       w.u8(KIND.ROUTER_TOPK); w.u32(frame.layer); w.u32(frame.experts.length);
       for (const e of frame.experts) w.u32(e);
       for (let i = 0; i < frame.experts.length; i++) w.f16(frame.weights[i] === undefined ? 0 : frame.weights[i]);
+      break;
+    case 'ExpertSkip':
+      // task 220 / lib.rs: varint layer + varint n + varint × n (重みは無い)
+      w.u8(KIND.EXPERT_SKIP); w.u32(frame.layer); w.u32(frame.experts.length);
+      for (const e of frame.experts) w.u32(e);
       break;
     default:
       throw new Error('encodeFrame: unknown kind ' + frame.kind);

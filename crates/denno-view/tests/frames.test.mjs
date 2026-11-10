@@ -194,6 +194,25 @@ test('kind 16 RouterTopK: 実形 (層 47 / 512 本中 top-10) は 48 B', () => {
   assert.equal(next, b.length);
 });
 
+test('kind 17 ExpertSkip: 実形 (層 47 / top-10 ぶんの skip) を読める', () => {
+  // lib.rs の ExpertSkip と同じ並び: varint layer + varint n + varint × n。
+  const experts = [300, 301, 350, 411, 470, 471, 500, 501, 510, 511];
+  const b = frame(KIND.EXPERT_SKIP, cat(varint(47), varint(experts.length), ...experts.map((e) => varint(e))));
+  const { frame: f, next } = decodeFrame(b);
+  assert.deepEqual(f, { kind: 'ExpertSkip', layer: 47, experts });
+  assert.equal(next, b.length);
+
+  // 0 本も読める (engine は空を送らないが、コーデックは落ちない)。
+  const empty = frame(KIND.EXPERT_SKIP, cat(varint(3), varint(0)));
+  const r = decodeFrame(empty);
+  assert.deepEqual(r.frame, { kind: 'ExpertSkip', layer: 3, experts: [] });
+  assert.equal(r.next, empty.length);
+
+  // 合成 → decode の往復 (encodeFrame 側も lib.rs と同じ形)
+  assert.deepEqual(decodeFrame(encodeFrame({ kind: 'ExpertSkip', layer: 9, experts: [1, 2] })).frame,
+    { kind: 'ExpertSkip', layer: 9, experts: [1, 2] });
+});
+
 // ---- next ポインタ / 連結 ------------------------------------------------
 
 test('decodeFrame の next は次フレームの先頭を指す (2 フレーム連結)', () => {
@@ -497,8 +516,9 @@ test('KIND の番号は lib.rs と一致する', () => {
   assert.deepEqual(KIND, {
     SERVER_INFO: 1, SESSION_ADMIT: 2, SESSION_DONE: 3, PREFILL: 4, TOKEN: 5, STEP: 6,
     OP_SUMMARY: 7, KV_USAGE: 8, GAP: 9, TOP_K: 10, LAYER_RUN: 11, LAYER_ACT: 12,
-    ROLE_ACT: 13, EXPERT_RESIDENCY: 14, TIER_STATS: 15, ROUTER_TOPK: 16
+    ROLE_ACT: 13, EXPERT_RESIDENCY: 14, TIER_STATS: 15, ROUTER_TOPK: 16, EXPERT_SKIP: 17
   });
   assert.equal(kindName(13), 'ROLE_ACT');
   assert.equal(kindName(16), 'ROUTER_TOPK');
+  assert.equal(kindName(17), 'EXPERT_SKIP');
 });

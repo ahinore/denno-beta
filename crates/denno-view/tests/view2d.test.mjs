@@ -16,7 +16,7 @@ import {
   expertCellRect, hasItem, heat, hitTest, itemsInRect, layoutFromShape, mergeBodies,
   mixerKind, normaliseShape, rampRGB, residencyBits, roleForBlock, routerWeights,
   selectionCount, selectionFromBody, selectionItems, selectionToBody, steerApplyBody,
-  steerSummary, streamValue, toggleItem, removeItem,
+  steerSummary, streamValue, toggleItem, removeItem, skipBits,
 } from '../src/view2d.mjs';
 
 // ---- 1. 形 → レイアウト ---------------------------------------------------
@@ -368,10 +368,11 @@ test('steerApplyBody: 契約どおりの本文にする / 不正は例外', () =
 
   assert.throws(() => steerApplyBody({ terms: [] }), /at least one/);
   assert.throws(() => steerApplyBody({ terms: [{ snapshot: '', coef: 1 }] }), /snapshot/);
-  assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 0 }] }), /non-zero/);
+  // task 220: 実 API は coef 0 と負の alpha を通す (0 は 1 ビットも変えない)
+  assert.deepEqual(steerApplyBody({ terms: [{ snapshot: 'A', coef: 0 }] }).terms, [{ snapshot: 'A', coef: 0 }]);
   assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [5, 2] }), /from must be <= to/);
   assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [-1, 2] }), />= 0/);
-  assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 2], alpha: -1 }), /alpha/);
+  assert.equal(steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 2], alpha: -1 }).alpha, -1);
   assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 2], mode: 'add' }), /mode/);
   assert.deepEqual([...STEER_MODES], ['subtract', 'project']);
 
@@ -417,10 +418,12 @@ test('モック店: shape と intervene (POST 全置換 / DELETE 全消し / epo
   for (const bad of [
     { experts_off: [[9, 0]] },                       // layer 範囲外
     { experts_off: [[0, 99]] },                      // expert 範囲外
+    { experts_off: [['0', 1]] },                     // 数値でない (実 API も 400)
     { blocks_off: [[0, 'router']] },                 // 未知のブロック
     { streams_off: [[0, 2]] },                       // stream 範囲外 (n_hc=2)
     { experts_off: [[0]] },                          // 対になっていない
     { experts_off: [[0, 1]], blocks_off: 'x' },      // 配列でない
+    { nope: 1 },                                     // 未知のフィールド (実 API も 400)
   ]) {
     const e = m.handle('POST', '/v1/intervene', bad);
     assert.equal(e.status, 400, JSON.stringify(bad));
@@ -429,23 +432,32 @@ test('モック店: shape と intervene (POST 全置換 / DELETE 全消し / epo
   assert.equal(m.handle('GET', '/v1/intervene').body.epoch, 3, '400 は epoch を進めない');
 });
 
-test('モック店: 記録 → snapshot → 削除 → apply / clear', () => {
-  const m = createMockStore({ layers: 4, n_expert: 8, n_hc: 1, n_embd: 16 }, { now: () => '2026-11-10T00:00:00.000Z' });
+test('モック店: 記録 → snapshot → 削除 → apply / clear (実 API の 400 と epoch)', () => {
+  const m = createMockStore({ layers: 4, n_expert: 8, n_hc: 1, n_embd: 16 }, { now: () => 1762732800 });
 
-  assert.deepEqual(m.handle('GET', '/v1/steer').body, { recording: null, snapshots: [], apply: null });
-  assert.equal(m.handle('POST', '/v1/steer/record/stop').status, 409, '記録していないのに stop');
+  // GET /v1/steer は epoch も返す (実 API。intervene と共有)。
+  assert.deepEqual(m.handle('GET', '/v1/steer').body,
+    { epoch: 0, recording: null, snapshots: [], apply: null });
+  assert.equal(m.handle('POST', '/v1/steer/record/stop').status, 400, '記録していないのに stop (実 API は 400)');
   assert.equal(m.handle('POST', '/v1/steer/record', {}).status, 400, '名前なし');
+  assert.equal(m.handle('POST', '/v1/steer/record', { name: 'a b' }).status, 400, '使えない文字');
   assert.equal(m.handle('POST', '/v1/steer/record', { name: 'A' }).status, 200);
-  assert.equal(m.handle('POST', '/v1/steer/record', { name: 'B' }).status, 409, '二重開始');
+  assert.equal(m.handle('POST', '/v1/steer/record', { name: 'B' }).status, 400, '二重開始は 400');
+  assert.equal(m.handle('POST', '/v1/steer/record', { name: 'A', x: 1 }).status, 400, '未知フィールド');
 
   // トークンが進む
   m.tick(3);
   assert.equal(m.handle('GET', '/v1/steer').body.recording.tokens, 3);
-  assert.deepEqual(m.handle('GET', '/v1/steer').body.recording, { name: 'A', tokens: 3, created: '2026-11-10T00:00:00.000Z' });
+  assert.deepEqual(m.handle('GET', '/v1/steer').body.recording,
+    { name: 'A', tokens: 3, created: 1762732800 });
 
+  // stop の応答は status + saved (実 API と同じ)。snapshot.layers は層数 (数値)。
   const snap = m.handle('POST', '/v1/steer/record/stop');
   assert.equal(snap.status, 200);
-  assert.deepEqual(snap.body, { name: 'A', tokens: 3, created: '2026-11-10T00:00:00.000Z', layers: [0, 3] });
+  assert.deepEqual(snap.body.saved,
+    { name: 'A', tokens: 3, created: 1762732800, layers: 4 });
+  assert.equal(snap.body.recording, null);
+  assert.deepEqual(snap.body.snapshots.map((s) => s.name), ['A']);
   // tick は記録外では tokens を増やさない
   m.tick(2);
   assert.equal(m.handle('GET', '/v1/steer').body.snapshots[0].tokens, 3);
@@ -455,27 +467,55 @@ test('モック店: 記録 → snapshot → 削除 → apply / clear', () => {
   m.tick(1);
   m.handle('POST', '/v1/steer/record/stop');
   assert.deepEqual(m.handle('GET', '/v1/steer').body.snapshots.map((s) => s.name), ['A', 'B']);
-  assert.equal(m.handle('POST', '/v1/steer/record', { name: 'A' }).status, 409, '同名は拒否');
 
-  // apply: 本文をそのまま保存し、未知の snapshot は 404
-  const body = { terms: [{ snapshot: 'A', coef: 1 }, { snapshot: 'B', coef: -1 }], layers: [0, 3], alpha: 0.5, mode: 'subtract' };
-  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, terms: [{ snapshot: 'Z', coef: 1 }] }).status, 404);
+  // 0 トークンの stop は 400 で、記録も落ちる (engine は平均を保存しない)
+  m.handle('POST', '/v1/steer/record', { name: 'C' });
+  assert.equal(m.handle('POST', '/v1/steer/record/stop').status, 400);
+  assert.equal(m.handle('GET', '/v1/steer').body.recording, null);
+  assert.deepEqual(m.handle('GET', '/v1/steer').body.snapshots.map((s) => s.name), ['A', 'B']);
+
+  // 同名の記録は上書きできる (engine の push_snapshot が名前で置換する)
+  m.handle('POST', '/v1/steer/record', { name: 'A' });
+  m.tick(2);
+  const again = m.handle('POST', '/v1/steer/record/stop');
+  assert.equal(again.status, 200);
+  assert.deepEqual(m.handle('GET', '/v1/steer').body.snapshots.map((s) => s.name), ['A', 'B']);
+  assert.equal(m.handle('GET', '/v1/steer').body.snapshots[0].tokens, 2, '同名は置換');
+
+  // apply: 本文をそのまま保存し、epoch が 1 増える。未知の snapshot は 400。
+  const body = { terms: [{ snapshot: 'A', coef: 1 }, { snapshot: 'B', coef: -1 }], layers: [0, 4], alpha: 0.5, mode: 'subtract' };
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, terms: [{ snapshot: 'Z', coef: 1 }] }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, terms: [] }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, layers: [0, 5] }).status, 400, 'to > 層数');
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, layers: [3, 1] }).status, 400, 'from > to');
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, mode: 'add' }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, extra: 1 }).status, 400);
+  const e0 = m.handle('GET', '/v1/steer').body.epoch;
   const ap = m.handle('POST', '/v1/steer/apply', body);
   assert.equal(ap.status, 200);
-  assert.deepEqual(ap.body.terms, body.terms);
-  assert.equal(ap.body.applied, '2026-11-10T00:00:00.000Z');
+  assert.equal(ap.body.epoch, e0 + 1, 'apply で epoch が進む');
+  assert.deepEqual(ap.body.apply.terms, body.terms);
+  assert.deepEqual(ap.body.apply.layers, [0, 4]);
+  assert.equal(ap.body.applied, undefined, '実 API は applied を返さない');
   assert.deepEqual(m.handle('GET', '/v1/steer').body.apply.terms, body.terms);
-  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, mode: 'add' }).status, 400);
 
-  // 削除
-  assert.equal(m.handle('DELETE', '/v1/steer/snapshots/Z').status, 404);
+  // coef 0 と負の alpha は実 API では通る
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, alpha: -0.5, terms: [{ snapshot: 'A', coef: 0 }] }).status, 200);
+
+  // 削除: 無い名前は 400。適用中の snapshot を消すと適用も落ちて epoch が進む。
+  assert.equal(m.handle('DELETE', '/v1/steer/snapshots/Z').status, 400);
+  const before = m.handle('GET', '/v1/steer').body.epoch;
   assert.equal(m.handle('DELETE', '/v1/steer/snapshots/A').status, 200);
   assert.deepEqual(m.handle('GET', '/v1/steer').body.snapshots.map((s) => s.name), ['B']);
-  assert.equal(m.handle('DELETE', '/v1/steer/snapshots/A').status, 404);
+  assert.equal(m.handle('GET', '/v1/steer').body.apply, null, '適用中の snapshot を消したら適用も落ちる');
+  assert.equal(m.handle('GET', '/v1/steer').body.epoch, before + 1);
+  assert.equal(m.handle('DELETE', '/v1/steer/snapshots/A').status, 400);
 
-  // clear
+  // clear (実 API は適用が無くても epoch を進める)
+  const e1 = m.handle('GET', '/v1/steer').body.epoch;
   assert.equal(m.handle('DELETE', '/v1/steer/apply').status, 200);
   assert.equal(m.handle('GET', '/v1/steer').body.apply, null);
+  assert.equal(m.handle('GET', '/v1/steer').body.epoch, e1 + 1);
 
   // 未知の経路
   assert.equal(m.handle('GET', '/v1/nope').status, 404);
@@ -483,7 +523,7 @@ test('モック店: 記録 → snapshot → 削除 → apply / clear', () => {
 });
 
 test('モック店: 返り値を書き換えても内部状態は壊れない (コピーを返す)', () => {
-  const m = createMockStore({ layers: 2, n_expert: 4, n_hc: 1, n_embd: 8 });
+  const m = createMockStore({ layers: 2, n_expert: 4, n_expert_used: 1, n_hc: 1, n_embd: 8 });
   m.handle('POST', '/v1/intervene', { experts_off: [[0, 1]] });
   const got = m.handle('GET', '/v1/intervene');
   got.body.experts_off.push([1, 2]);
@@ -491,6 +531,52 @@ test('モック店: 返り値を書き換えても内部状態は壊れない (�
   const shape = m.handle('GET', '/v1/model/shape');
   shape.body.n_expert = 999;
   assert.equal(m.handle('GET', '/v1/model/shape').body.n_expert, 4);
+});
+
+test('task 220: ExpertSkip は skip ビットだけ立ち、RouterTopK は変えない', () => {
+  const shape = { layers: 2, n_expert: 8, n_expert_used: 2, n_hc: 2, n_embd: 16, ple_layers: [1] };
+  const st = createMapState(shape);
+
+  // 介入で expert 0 が切られ、ルータは 1 と 2 を使った。0 は「選びたかったが切った」。
+  st.onFrame({ kind: 'RouterTopK', layer: 0, experts: [1, 2], weights: [0.6, 0.4] });
+  st.onFrame({ kind: 'ExpertSkip', layer: 0, experts: [0, 7] });
+  assert.equal(st.experts[0][1] > 0, true, 'RouterTopK の重みが入っていない');
+  assert.equal(st.experts[0][0], 0, 'skip が RouterTopK を汚している');
+  assert.deepEqual([...st.skip[0]], [1, 0, 0, 0, 0, 0, 0, 1]);
+
+  // 次のトークンで skip が変われば置き換える (累積しない)。
+  st.onFrame({ kind: 'ExpertSkip', layer: 0, experts: [3] });
+  assert.deepEqual([...st.skip[0]], [0, 0, 0, 1, 0, 0, 0, 0]);
+
+  // RouterTopK が来たら前のトークンの skip は捨てる (engine は空の ExpertSkip を
+  // 送らないので、これが無いと「選びたくなくなった」トークンでも amber が残る)。
+  st.onFrame({ kind: 'RouterTopK', layer: 0, experts: [1, 2], weights: [0.6, 0.4] });
+  assert.deepEqual([...st.skip[0]], [0, 0, 0, 0, 0, 0, 0, 0], 'RouterTopK で skip が消えていない');
+
+  // reset と層の範囲外は落とす。
+  st.reset();
+  assert.deepEqual([...st.skip[0]], [0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(st.onFrame({ kind: 'ExpertSkip', layer: 5, experts: [1] }), false);
+  assert.deepEqual([...skipBits({ kind: 'ExpertSkip', layer: 0, experts: [0, 9] }, 8)], [1, 0, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual([...skipBits({ kind: 'RouterTopK', experts: [0] }, 8)], [0, 0, 0, 0, 0, 0, 0, 0]);
+});
+
+test('task 220: steerApplyBody は実 API の規則 (coef 0 / 負の alpha / layers の上限)', () => {
+  // coef 0 は通る (1 ビットも変えないので実 API も受理する)
+  const b = steerApplyBody({ terms: [{ snapshot: 'A', coef: 0 }], layers: [0, 48], alpha: 0 });
+  assert.deepEqual(b.terms, [{ snapshot: 'A', coef: 0 }]);
+  assert.equal(b.alpha, 0);
+  // 負の alpha も通る (実 API は符号を見ない)
+  assert.equal(steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 4], alpha: -0.5 }).alpha, -0.5);
+  // layers は [from, to)。to は層数まで。from == to は空範囲で可。
+  assert.deepEqual(steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [3, 3] }).layers, [3, 3]);
+  assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 49] }, { nLayers: 48 }),
+    /to must be <= 48/);
+  assert.doesNotThrow(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 48] }, { nLayers: 48 }));
+  // NaN / Infinity は弾く
+  assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: NaN }], layers: [0, 1] }), /finite/);
+  assert.throws(() => steerApplyBody({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 1], alpha: Infinity }), /finite/);
+  assert.throws(() => steerApplyBody({ terms: [], layers: [0, 1] }), /at least one/);
 });
 
 test('BLOCKS と既定形の整合', () => {

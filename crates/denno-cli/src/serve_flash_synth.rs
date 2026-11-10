@@ -690,6 +690,7 @@ fn build_flash(dir: &TempDir) -> Flash {
             n_expert_used: 2,
             n_hc: 2,
             n_embd: 256,
+            ple_layers: vec![2],
         },
         dec: None,
         cache: None,
@@ -1661,6 +1662,8 @@ fn intervene_http_shape_get_set_delete() {
     assert_eq!(v["n_expert_used"], 2);
     assert_eq!(v["n_hc"], 2);
     assert_eq!(v["n_embd"], 256);
+    // task 220: PLE の層 (ビューワの ple の点灯に使う。実モデルは 1 層)。
+    assert_eq!(v["ple_layers"], serde_json::json!([2]));
 
     // GET /v1/intervene (空)
     let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/intervene", ""));
