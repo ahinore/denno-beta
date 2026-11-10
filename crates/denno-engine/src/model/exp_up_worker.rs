@@ -263,7 +263,7 @@ mod gpu {
             expert: job.expert,
         };
         let got =
-            crate::model::expert_vram::acquire_soft(key, job.shapes, || Ok([g, u, d]))?;
+            crate::model::expert_vram::acquire_deferred(key, job.shapes, || Ok([g, u, d]))?;
         Ok(got.map(|_| ()))
     }
 
