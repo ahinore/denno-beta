@@ -9415,6 +9415,7 @@ fn task213_server_runs_the_gate_audit_at_startup() {
 const GEMM_BA225_SRC: &str = include_str!("../kernels/kernels_gemm_ba225.cu");
 const ROUTER225_SRC: &str = include_str!("../kernels/kernels_router225.cu");
 const GDN_PF3_SRC: &str = include_str!("../kernels/kernels_gdn_pf3.cu");
+const GDN_PF_WY_SRC: &str = include_str!("../kernels/kernels_gdn_pf_wy.cu");
 const QWEN4EXP_SSM_RS: &str = include_str!("../src/model/qwen4exp_ssm.rs");
 
 /// `.cu` の `extern "C" __global__` 宣言の引数の個数を数える。
@@ -9709,4 +9710,115 @@ fn steer_ptx_matches_the_host_launch_abi() {
         CUDA_RS.contains("b\"dno_steer_sub\\0\"") && CUDA_RS.contains("b\"dno_steer_proj\\0\""),
         "cuda.rs が sub / proj を引いていない"
     );
+}
+
+// task 228: GDN スキャン WY (UT) 形式チャンク版 (kernels_gdn_pf_wy.cu)
+// ---------------------------------------------------------------------------
+
+/// `.cu` とホスト側の起動・共有メモリ・build_ptx.sh の結線。
+///
+/// 値の一致 (v3 / CPU 参照との差) は GPU 側と `gdn/wy.rs` のテストの担当。
+#[test]
+fn task228_gdn_pf_wy_kernel_is_wired() {
+    assert!(GDN_PF_WY_SRC.contains("dno_gdn_pf_wy32"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_wy32\\0\""),
+        "cuda.rs が dno_gdn_pf_wy32 を読んでいない"
+    );
+    for line in [
+        "#define WY_DK 128",
+        "#define WY_C 32",
+        "#define WY_THREADS 512",
+        "#define WY_WARPS 16",
+        "#define WY_DCONV 4",
+        "#define WY_CS 3",
+    ] {
+        assert!(GDN_PF_WY_SRC.contains(line), "{line} が無い");
+    }
+    // 引数は v2/v3 と同じ 17 個 (並びも同じ)。
+    assert_eq!(
+        cu_kernel_nargs(GDN_PF_WY_SRC, "dno_gdn_pf_wy32"),
+        17,
+        "引数の個数が v2/v3 と違う"
+    );
+    // 共有メモリの並びが重ならないこと (オフセット + 要素数 <= 次のオフセット)。
+    let total: usize = GDN_PF_WY_SRC
+        .lines()
+        .find_map(|l| l.strip_prefix("#define WY_TOTAL "))
+        .and_then(|r| r.trim().parse().ok())
+        .expect("WY_TOTAL が無い");
+    let region = |name: &str, size: usize| -> (usize, usize) {
+        let off: usize = GDN_PF_WY_SRC
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"));
+        (off, off + size)
+    };
+    let regions = [
+        region("WY_S", 128 * 128),
+        region("WY_KC", 32 * 128),
+        region("WY_QC", 32 * 128),
+        region("WY_VC", 32 * 128),
+        region("WY_DC", 32 * 128),
+        region("WY_PC", 32 * 128),
+        region("WY_QPC", 32 * 128),
+        region("WY_RDEC", 32 * 32),
+        region("WY_AC", 32 * 32),
+        region("WY_GC", 32 * 32),
+        region("WY_LAM", 32),
+        region("WY_RL", 32),
+        region("WY_EG", 32),
+        region("WY_BC", 32),
+        region("WY_LL", 1),
+    ];
+    let mut at = 0usize;
+    for (lo, hi) in regions {
+        assert_eq!(lo, at, "共有メモリの並びに隙間/重なりがある ({lo} != {at})");
+        at = hi;
+    }
+    assert_eq!(at, total, "WY_TOTAL が最後の領域の終端と違う");
+    assert_eq!(
+        total,
+        CUDA_RS
+            .lines()
+            .find_map(|l| l
+                .trim()
+                .strip_prefix("pub(crate) const GDN_PF_WY_SMEM_FLOATS: usize = "))
+            .and_then(|r| r.trim_end_matches(';').parse::<usize>().ok())
+            .expect("GDN_PF_WY_SMEM_FLOATS が無い"),
+        "Rust 側の smem 見積りが .cu の WY_TOTAL と違う"
+    );
+    // 1 ブロック = 1 ヘッド (grid の y を使わない) / スレッド数は #define と同じ。
+    assert!(
+        CUDA_RS.contains("(nv as u32, 1, 1),\n                (GDN_PF_WY_THREADS as u32, 1, 1),"),
+        "WY スキャンの grid / block が (nv, 1) / 512 でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF_WY_THREADS: usize = 512;"),
+        "GDN_PF_WY_THREADS が 512 でない"
+    );
+    // 状態は共有メモリ、縮約はワープ (32 レーン)。
+    assert!(
+        GDN_PF_WY_SRC.contains("float* S = sh + WY_S;"),
+        "状態が共有メモリに置かれていない"
+    );
+    assert!(
+        GDN_PF_WY_SRC.contains("for (int off = 16; off > 0; off >>= 1)"),
+        "L2 正規化のワープ縮約が無い"
+    );
+    assert!(
+        GDN_PF_WY_SRC.matches("__syncthreads()").count() <= 10,
+        "バリアが多すぎる (チャンク内は 8 個 + プロローグ 1 のはず)"
+    );
+    // build_ptx.sh は nofmad / compute_90 で作り、targets_all に入っている。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy)   echo \"kernels_gdn_pf_wy.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf_wy が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(targets.contains("gdn_pf_wy"), "targets_all に gdn_pf_wy が無い");
 }

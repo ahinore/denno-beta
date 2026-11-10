@@ -27,6 +27,9 @@
 /// s90 (P1-1): 2 launch スケジュールの帳簿 (ホスト側・GPU 不要)
 pub mod scan_schedule;
 
+/// task 228: prefill スキャンの WY (UT) 形式チャンク版の CPU 参照実装。
+pub mod wy;
+
 /// GDN ハイパーパラメータ (Qwen3.5 config の linear_* に対応)
 #[derive(Debug, Clone)]
 pub struct GdnParams {
