@@ -39170,7 +39170,7 @@ pub(crate) fn pf_ba_gemm_dev_launch(
 
 // ---------------------------------------------------------------------------
 // task 225: prefill の router softmax + top-k をデバイスで回す
-// (`DENNO_PF_ROUTER_DEV`、既定 off)
+// (`DENNO_PF_ROUTER_DEV`、task 228 から既定 on)
 // ---------------------------------------------------------------------------
 //
 // lab t222c: `sub router softmax` 239.9 ms (ホスト)。logits は既に GPU の f32
@@ -39244,9 +39244,10 @@ fn router_dev_fns(ctx: &CudaCtx) -> Option<&'static RouterDevFns> {
 /// `DENNO_PF_ROUTER_DEV` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 pub(crate) fn pf_router_dev_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        // task 225: lab t225c で目標未達 (14k -4.0% / 3,826 -1.5% は base との
-        // 比較。base2 込みの中央値では -3.4% / -1.5%) のため既定 off。
-        None => false,
+        // task 228: task 225 の lab t225c で router -458 ms (14k) / decode・text 無影響
+        // の実測が出たので既定 on (オペレーター判断: 実利があり 1% 超の悪化が無ければ
+        // 部分採用)。切り戻しは `DENNO_PF_ROUTER_DEV=0`。
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -39266,7 +39267,7 @@ pub(crate) fn set_pf_router_dev_for_test(v: Option<bool>) {
     );
 }
 
-/// router の softmax + top-k をデバイスで回すか (既定 off。lab t225c で目標未達)。
+/// router の softmax + top-k をデバイスで回すか (task 228 から既定 on)。
 pub(crate) fn pf_router_dev_on() -> bool {
     #[cfg(test)]
     {
@@ -40172,7 +40173,7 @@ mod gdn_pf2_tests {
 
 // ---------------------------------------------------------------------------
 // task 225: prefill GDN スキャン v3 (ヘッドあたり 4 ブロック x 8 レーン)
-// (`DENNO_PF_SCAN3`、既定 off)
+// (`DENNO_PF_SCAN3`、task 228 から既定 on)
 // ---------------------------------------------------------------------------
 //
 // lab t222c: `ssm scan_pf` は 1,470.3 ms = 2.9 us/トークン。v2
@@ -40261,8 +40262,9 @@ fn gdn_pf3_kernels() -> Option<&'static GdnPf3Kernels> {
 /// `DENNO_PF_SCAN3` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 pub(crate) fn gdn_pf3_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        // task 225: lab t225c で目標未達のため既定 off (上の router と同じ)。
-        None => false,
+        // task 228: task 225 の lab t225c で scan_pf 1,469.8 → 1,310.4 ms (14k) /
+        // decode・text 無影響の実測が出たので既定 on。切り戻しは `DENNO_PF_SCAN3=0`。
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -40283,7 +40285,7 @@ pub(crate) fn set_gdn_pf3_for_test(v: Option<bool>) {
     );
 }
 
-/// v3 スキャンを使うか (既定 off。lab t225c で目標未達)。
+/// v3 スキャンを使うか (task 228 から既定 on)。
 pub(crate) fn gdn_pf3_on() -> bool {
     #[cfg(test)]
     {
@@ -40414,8 +40416,10 @@ mod pf225_gate_tests {
                 pf_ba_fast_from_value as fn(Option<&str>) -> bool,
                 false,
             ),
-            ("DENNO_PF_ROUTER_DEV", pf_router_dev_from_value, false),
-            ("DENNO_PF_SCAN3", gdn_pf3_from_value, false),
+            // task 228: task 225 の実測 (router -458 ms / scan -159 ms、decode と
+            // text は無影響) を受けて、この 2 本だけ既定 on にした。
+            ("DENNO_PF_ROUTER_DEV", pf_router_dev_from_value, true),
+            ("DENNO_PF_SCAN3", gdn_pf3_from_value, true),
         ] {
             assert_eq!(f(None), dflt, "{name}: 未設定の既定が違う");
             for v in ["0", "off", "false", "no", "", " off "] {
