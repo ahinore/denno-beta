@@ -8336,7 +8336,7 @@ fn mix_up_warp_per_row_kernel_is_wired() {
     );
     let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
-        body.contains("mix_dec_upw_on() && up_reduce && k2 % 8 == 0"),
+        body.contains("(mix_dec_upw_on() || dec_mix_upw_on()) && up_reduce && k2 % 8 == 0"),
         "up 版の門番 (upw / k % 8) が無い"
     );
     assert!(
@@ -8354,6 +8354,93 @@ fn mix_up_warp_per_row_kernel_is_wired() {
     assert!(
         targets.contains("mix_up"),
         "build_ptx.sh の targets_all に mix_up が無い: {targets}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 216: mix の down (BF16 + silu) を uint4 で読む `kernels_mix_down.cu`
+// ---------------------------------------------------------------------------
+// 「cuda.rs が読んでいる」「build_ptx.sh が mix_down を作る」「引数の並びが
+// 従来カーネルと同じ」「uint4 = 8 BF16 のベクタロード」「silu の epilogue が
+// dno_expf のまま」「ゲートは既定 off」を固定する。
+const MIX_DOWN_SRC: &str = include_str!("../kernels/kernels_mix_down.cu");
+
+#[test]
+fn mix_down_uint4_kernel_is_wired() {
+    let p = kernel_params(MIX_DOWN_SRC, "dno_mix_down_bf16");
+    // 先頭が入力 x、次が重み (既存 dno_matvec_bf16_r_silu と同じ並び)。
+    // ここを入れ替えると重みを入力として読む (lab t192b と同じ E700)。
+    assert_eq!(
+        p,
+        vec!["x", "w", "out", "k", "n", "inv_hc"],
+        "dno_mix_down_bf16 の引数が (x, w, out, k, n, inv_hc) と違う: {p:?}"
+    );
+    // 8 要素 (uint4 = 16 B) のベクタロードと、明示の 2 演算 (1 演算 1 丸め)。
+    assert!(
+        MIX_DOWN_SRC.contains("*reinterpret_cast<const uint4*>(rowp + c)"),
+        "8 要素のベクタロードが無い"
+    );
+    assert!(
+        MIX_DOWN_SRC.contains("for (int c = tid * 8; c < k; c += (int)blockDim.x * 8)"),
+        "1 スレッド 8 要素のループが変わった"
+    );
+    assert!(
+        MIX_DOWN_SRC.contains("acc = __fadd_rn(acc, __fmul_rn("),
+        "積和が明示の 2 演算でない"
+    );
+    // silu は従来カーネルと同一の式 (dno_expf + __fdiv_rn + __fadd_rn + __fmul_rn)。
+    assert!(
+        MIX_DOWN_SRC.contains("out[j] = __fdiv_rn(v, __fadd_rn(1.0f, dno_expf(-v)));"),
+        "silu の epilogue が dno_matvec_bf16_r_silu と違う"
+    );
+    assert!(
+        MIX_DOWN_SRC.contains("__device__ __forceinline__ float dno_expf(float x)"),
+        "dno_expf が無い (glibc expf のビット一致複製)"
+    );
+    // 縮約は 1 warp = 32 レーンの固定木 → blockDim に依らず決定的。
+    assert!(
+        MIX_DOWN_SRC.contains("for (int off = 16; off > 0; off >>= 1)"),
+        "warp 内の固定木が変わった"
+    );
+    // cuda.rs: 別ファイル・6 引数・512 スレッド・ゲート・k % 8 の門番。
+    assert!(
+        CUDA_RS.contains("kernels_mix_down.ptx"),
+        "cuda.rs が kernels_mix_down.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_DOWN_NARGS: usize = 6;"),
+        "down 版の ABI 検査が 6 引数でない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_DOWN_THREADS: usize = 512;"),
+        "down 版のスレッド数のミラーが無い"
+    );
+    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        body.contains("if dec_mix_downw_on() && k1 % 8 == 0 {"),
+        "down 版の門番 (downw / k % 8) が無い"
+    );
+    assert!(
+        body.contains("ctx.launch_async(f_down, (n1 as u32, 1, 1), (down_thr, 1, 1), 0, &mut args)?;"),
+        "down の起動が down_thr でない"
+    );
+    // ゲートは既定 off (PTX を足しただけで既定の挙動が動かないこと)。
+    assert!(
+        CUDA_RS.contains("fn dec_mix_downw_on() -> bool {")
+            && CUDA_RS.contains("parse_dec_mix_downw(std::env::var(\"DENNO_DEC_MIX_DOWNW\")"),
+        "DENNO_DEC_MIX_DOWNW の口が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_down)     echo \"kernels_mix_down.cu|nofmad\" ;;"),
+        "build_ptx.sh の mix_down が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_down"),
+        "build_ptx.sh の targets_all に mix_down が無い: {targets}"
     );
 }
 

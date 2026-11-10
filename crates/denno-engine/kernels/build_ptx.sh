@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -144,6 +144,10 @@ spec() {
         # task 192: decode の mix up (BF16) を 1 warp = 1 行で回す版。
         # 1 演算 1 丸め (明示 __*_rn) なので -fmad=false。
         mix_up)       echo "kernels_mix_up.cu|nofmad" ;;
+        # task 216: decode の mix down (BF16 + silu) を uint4 読みで回す版。
+        # 1 演算 1 丸め (明示 __*_rn) なので -fmad=false
+        # (silu の epilogue も dno_expf のまま = dno_matvec_bf16_r_silu と同一)。
+        mix_down)     echo "kernels_mix_down.cu|nofmad" ;;
         *)            return 1 ;;
     esac
 }
