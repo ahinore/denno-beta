@@ -3470,6 +3470,10 @@ pub struct CudaCtx {
     /// レジスタタイル)。`DENNO_PF_ATTN_TC` が on かつ PTX があるときだけ使う。
     /// 無いときは null (従来の `f_attn_pf` へ fail closed)。
     f_attn_pf2: CUfunction,
+    /// task 230: prefill attention v3 (PV も bf16 mma・head 優先のグリッド・
+    /// 行最大は最初のタイルで 1 回)。`DENNO_PF_ATTN_V3` が on かつ PTX がある
+    /// ときだけ使う。無いときは v2 / 従来へ fail closed。
+    f_attn_pf3: CUfunction,
     /// task 135: t を分割する decode attention (`dno_attention_decode`) と、
     /// 部分和を畳む `dno_attention_decode_combine`。PTX に無ければ None で
     /// 従来の `dno_attention` 経路に落ちる (fail closed・古い PTX でも起動可)。
@@ -3788,6 +3792,60 @@ impl CudaCtx {
                     }
                 }
             }
+            // task 230: prefill attention v3 (任意。読めない・入口が無い・opt-in が
+            // 通らないときは null のまま = v2 / 従来の経路で回る。fail closed)。
+            let mut f_attn_pf3: CUfunction = std::ptr::null_mut();
+            {
+                let pf3_path = match std::env::var("DENNO_PF_ATTN3_PTX") {
+                    Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                    _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("kernels")
+                        .join("kernels_attn_pf3.ptx"),
+                };
+                match std::fs::read(&pf3_path) {
+                    Ok(mut image) => {
+                        image.push(0);
+                        unsafe {
+                            let mut module3: CUmodule = std::ptr::null_mut();
+                            let loaded = (lib.module_load_data)(
+                                &mut module3,
+                                image.as_ptr() as *const c_void,
+                            ) == CUDA_SUCCESS;
+                            if loaded
+                                && (lib.module_get_function)(
+                                    &mut f_attn_pf3,
+                                    module3,
+                                    b"dno_attention_prefill3\0".as_ptr() as *const c_char,
+                                ) == CUDA_SUCCESS
+                            {
+                                let ok = match lib.func_set_attribute {
+                                    Some(fn_attr) => (fn_attr)(
+                                        f_attn_pf3,
+                                        CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                        ATTN_PF3_SMEM_BYTES as c_int,
+                                    ) == 0,
+                                    None => false,
+                                };
+                                if !ok {
+                                    eprintln!(
+                                        "[pf-attn3] 動的 smem の opt-in に失敗 → v2 / 従来の attention へ"
+                                    );
+                                    f_attn_pf3 = std::ptr::null_mut();
+                                }
+                            } else {
+                                eprintln!("[pf-attn3] PTX を読めない/入口が無い → v2 / 従来へ");
+                                f_attn_pf3 = std::ptr::null_mut();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[pf-attn3] PTX が無い ({}) : {e} → v2 / 従来へ",
+                            pf3_path.display()
+                        );
+                    }
+                }
+            }
             // s169 (P10): SM 数を 1 回だけ取る (GEMV の launch 形状を n から選ぶ
             // ためだけに使う。取れなければ 0 のまま = 形状選択は従来の固定 C)。
             if let Some(dev_attr) = lib.device_get_attribute {
@@ -4044,6 +4102,7 @@ impl CudaCtx {
                 f_attn,
                 f_attn_pf,
                 f_attn_pf2,
+                f_attn_pf3,
                 f_attn_dec: f_attn_dec.map(|(a, _)| a),
                 f_attn_dec_cb: f_attn_dec.map(|(_, b)| b),
                 attn_pf_dyn_smem,
@@ -11552,6 +11611,41 @@ mod pf_pin_tests {
             "未記録 (null) が一致扱いになった"
         );
     }
+
+    /// task 230: `pf_mixed_keep_dev` は「デバイスだけが正」を立て、
+    /// `pf_mixed_mark` / `pf_mixed_mark_clear` がそれを落とすこと。
+    #[test]
+    fn pf230_keep_dev_sets_dev_only() {
+        let a = [0.0f32; 4];
+        // 記録が無ければ dev-only ではない。
+        pf_mixed_mark_clear();
+        assert!(!pf_mixed_dev_only(a.as_ptr(), 2, 2));
+        // keep_dev → dev-only。形が違えば一致しない。
+        pf_mixed_keep_dev(a.as_ptr(), 2, 2);
+        assert!(pf_mixed_dev_only(a.as_ptr(), 2, 2));
+        assert!(!pf_mixed_dev_only(a.as_ptr(), 1, 2), "nt 違いが一致した");
+        assert!(!pf_mixed_dev_only(a.as_ptr(), 2, 4), "e 違いが一致した");
+        // 同一マークを打つと dev-only が落ちる (ホストが正に戻る)。
+        pf_mixed_mark(a.as_ptr(), 2, 2);
+        assert!(!pf_mixed_dev_only(a.as_ptr(), 2, 2));
+        // clear でも落ちる。
+        pf_mixed_keep_dev(a.as_ptr(), 2, 2);
+        pf_mixed_mark_clear();
+        assert!(!pf_mixed_dev_only(a.as_ptr(), 2, 2));
+    }
+
+    /// task 230: ゲートの解釈 (既定 off・明示的な真値だけ on)。
+    #[test]
+    fn pf230_gate_values() {
+        for v in [None, Some("0"), Some("off"), Some(""), Some("no")] {
+            assert!(!pf_attn_v3_from_value(v), "v3 が off でない: {v:?}");
+            assert!(!pf_mix_keep_from_value(v), "mixkeep が off でない: {v:?}");
+        }
+        for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
+            assert!(pf_attn_v3_from_value(v), "v3 が on でない: {v:?}");
+            assert!(pf_mix_keep_from_value(v), "mixkeep が on でない: {v:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11597,21 +11691,103 @@ pub(crate) fn pf_dev_in_on() -> bool {
     *ON.get_or_init(|| pf_dev_in_from_value(std::env::var("DENNO_PF_MIXDEVIN").ok().as_deref()))
 }
 
+/// task 230: `DENNO_PF_MIXKEEP` の解釈 (純関数)。**既定 off**。
+///
+/// on にすると、full attention 層の attn mix は `mixed` を D2H せず、直後の
+/// qkv がデバイスの `mixed` を直接読む (H2D 1 本と D2H 1 本を消す)。
+pub(crate) fn pf_mix_keep_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+static PF_MIX_KEEP_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用: ゲートを強制する (0 = env に戻す)。
+#[cfg(test)]
+pub(crate) fn pf_mix_keep_set_for_test(v: u8) {
+    PF_MIX_KEEP_FORCE.store(v, Ordering::Relaxed);
+}
+
+/// task 230: full 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP`、**既定 off**)。
+pub(crate) fn pf_mix_keep_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_MIX_KEEP_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_mix_keep_from_value(std::env::var("DENNO_PF_MIXKEEP").ok().as_deref()))
+}
+
 thread_local! {
     /// task 209: 「このホスト側ポインタの `mixed` はデバイスの `mixed` と同一」の記録。
     static PF_MIXED_CUR: std::cell::Cell<(*const f32, usize, usize)> =
         const { std::cell::Cell::new((std::ptr::null(), 0, 0)) };
+    /// task 230: 直前の mix を D2H していない (ホスト側のバイト列は古い)。
+    /// デバイスの `mixed` だけが正で、D2H する前にホスト経路へ落ちたら
+    /// [`pf_mixed_restore_host`] で埋め直す。
+    static PF_MIXED_DEV_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// ホスト側の `mixed` がデバイスの `mixed` と同じ内容であることを記録する
 /// (`pf_take_mixed` の直後に呼ぶ)。
 pub fn pf_mixed_mark(host: *const f32, nt: usize, e: usize) {
     PF_MIXED_CUR.with(|c| c.set((host, nt, e)));
+    PF_MIXED_DEV_ONLY.with(|c| c.set(false));
+}
+
+/// task 230: ホストへ降ろさずに「デバイスの `mixed` だけが正」と記録する。
+///
+/// 次の GEMM がデバイスから直接読める層 (full attention の qkv) だけで使う。
+/// ホストのバイト列は古いままなので、ホスト経路に落ちるときは
+/// [`pf_mixed_restore_host`] を必ず通すこと。
+pub fn pf_mixed_keep_dev(host: *const f32, nt: usize, e: usize) {
+    PF_MIXED_CUR.with(|c| c.set((host, nt, e)));
+    PF_MIXED_DEV_ONLY.with(|c| c.set(true));
 }
 
 /// 記録を消す (非常駐経路へ落ちたとき・リクエストの終わり)。
 pub fn pf_mixed_mark_clear() {
     PF_MIXED_CUR.with(|c| c.set((std::ptr::null(), 0, 0)));
+    PF_MIXED_DEV_ONLY.with(|c| c.set(false));
+}
+
+/// このホスト配列が「D2H していない (デバイスだけが正)」か。
+pub(crate) fn pf_mixed_dev_only(host: *const f32, nt: usize, e: usize) -> bool {
+    let m = PF_MIXED_CUR.with(|c| c.get());
+    pf_mixed_mark_matches(m, host, nt, e) && PF_MIXED_DEV_ONLY.with(|c| c.get())
+}
+
+/// D2H していない `mixed` をホストへ降ろし、記録を「同一」に戻す。
+///
+/// ホスト経路 (非常駐の qkv / ssM) へ落ちるときだけ呼ぶ。降ろせなければ false
+/// (そのときは呼び出し側が失敗する = 古いバイト列で計算しない)。
+pub(crate) fn pf_mixed_restore_host(host: *mut f32, nt: usize, e: usize) -> bool {
+    if host.is_null() || nt == 0 || e == 0 {
+        return false;
+    }
+    if !pf_mixed_dev_only(host as *const f32, nt, e) {
+        return false;
+    }
+    let ok = PF_DEV.with(|c| {
+        let d = c.borrow();
+        match d.mixed.as_ref() {
+            Some(b) if b.bytes() >= nt * e * 4 => unsafe {
+                b.to_slice(std::slice::from_raw_parts_mut(host, nt * e)).is_ok()
+            },
+            _ => false,
+        }
+    });
+    if ok {
+        PF_MIXED_DEV_ONLY.with(|c| c.set(false));
+    }
+    ok
 }
 
 /// 記録が (host, nt, e) と一致するか (純関数・テスト用)。
@@ -23486,6 +23662,18 @@ pub(crate) fn set_pf_mirror_delta_for_test(v: Option<bool>) {
     );
 }
 
+/// task 230: qkv の入力 `x` をデバイスから直接読めるならそのポインタ。
+///
+/// `DENNO_PF_MIXKEEP` が on で、直前の `mix` の出力がデバイスに残っている
+/// (`pf_mixed_dev_in_ptr` が一致) ときだけ `Some`。値は同じバイト列なので
+/// H2D を 1 本消せる (D2H していない場合もここで初めてホストを経由しない)。
+fn pf2_dev_x(x: &[f32], nt: usize, e: usize) -> Option<CUdeviceptr> {
+    if !pf_mix_keep_on() {
+        return None;
+    }
+    pf_mixed_dev_in_ptr(x.as_ptr(), nt, e)
+}
+
 /// task 172: full 層 1 チャンクの前半をデバイスで回す。
 ///
 /// 入力行 `x` を 1 回だけ H2D し、`attn_q` / `attn_k` / `attn_v` の 3 射影を
@@ -23570,7 +23758,18 @@ pub fn pf_full_qkv(
     };
     let r = PF2_DEV.with(|cell| -> Result<()> {
         let mut d = cell.borrow_mut();
-        pf2_ensure(&mut d.x, nt * e * 4)?;
+        // task 230: 直前の mix を D2H していなければ (`DENNO_PF_MIXKEEP`)、
+        // デバイスの `mixed` をそのまま GEMM の入力にする (H2D 1 本を消す)。
+        // 値は同じバイト列。使えないときだけ従来どおりホストから上げる。
+        let xptr = match pf2_dev_x(x, nt, e) {
+            Some(p) => p,
+            None => {
+                pf2_ensure(&mut d.x, nt * e * 4)?;
+                let xb = d.x.as_ref().expect("ensure 済み");
+                xb.copy_from(x)?;
+                xb.ptr()
+            }
+        };
         pf2_ensure(&mut d.qg, nt * 2 * qd * 4)?;
         pf2_ensure(&mut d.q, nt * qd * 4)?;
         pf2_ensure(&mut d.kd, nt * kv * 4)?;
@@ -23578,7 +23777,6 @@ pub fn pf_full_qkv(
         pf2_ensure(&mut d.cs, nt * n_rot * 4)?;
         pf2_ensure(&mut d.qn, dh * 4)?;
         pf2_ensure(&mut d.kn, dh * 4)?;
-        let xb = d.x.as_ref().expect("ensure 済み");
         let qgb = d.qg.as_ref().expect("ensure 済み");
         let qb = d.q.as_ref().expect("ensure 済み");
         let kdb = d.kd.as_ref().expect("ensure 済み");
@@ -23586,14 +23784,13 @@ pub fn pf_full_qkv(
         let csb = d.cs.as_ref().expect("ensure 済み");
         let qnb = d.qn.as_ref().expect("ensure 済み");
         let knb = d.kn.as_ref().expect("ensure 済み");
-        xb.copy_from(x)?;
         csb.copy_from(cs)?;
         qnb.copy_from(q_norm)?;
         knb.copy_from(k_norm)?;
         // 1. q / k / v の射影 (デバイス。同期しない)
-        pf2_gemm(ctx, pq, pq_k, xb.ptr(), qgb.ptr(), nt, e, 2 * qd)?;
-        pf2_gemm(ctx, pk, pk_k, xb.ptr(), kdb.ptr(), nt, e, kv)?;
-        pf2_gemm(ctx, pv, pv_k, xb.ptr(), vdb.ptr(), nt, e, kv)?;
+        pf2_gemm(ctx, pq, pq_k, xptr, qgb.ptr(), nt, e, 2 * qd)?;
+        pf2_gemm(ctx, pk, pk_k, xptr, kdb.ptr(), nt, e, kv)?;
+        pf2_gemm(ctx, pv, pv_k, xptr, vdb.ptr(), nt, e, kv)?;
         // 2. q: [q|gate] 融合の生出力 → (norm+rope 済み q) へ詰め替え
         {
             let shmem = (dh * 4) as u32;
@@ -23881,7 +24078,17 @@ pub fn pf_full_qkv_fused(
     };
     let r = PF2_DEV.with(|cell| -> Result<()> {
         let mut d = cell.borrow_mut();
-        pf2_ensure(&mut d.x, nt * e * 4)?;
+        // task 230: 直前の mix を D2H していなければ、デバイスの `mixed` を
+        // そのまま融合 GEMM の入力にする (`pf_full_qkv` と同じ規則)。
+        let xptr = match pf2_dev_x(x, nt, e) {
+            Some(p) => p,
+            None => {
+                pf2_ensure(&mut d.x, nt * e * 4)?;
+                let xb = d.x.as_ref().expect("ensure 済み");
+                xb.copy_from(x)?;
+                xb.ptr()
+            }
+        };
         pf2_ensure(&mut d.qkv, nt * n_all * 4)?;
         pf2_ensure(&mut d.q, nt * qd * 4)?;
         pf2_ensure(&mut d.kd, nt * kv * 4)?;
@@ -23889,7 +24096,6 @@ pub fn pf_full_qkv_fused(
         pf2_ensure(&mut d.cs, nt * n_rot * 4)?;
         pf2_ensure(&mut d.qn, dh * 4)?;
         pf2_ensure(&mut d.kn, dh * 4)?;
-        let xb = d.x.as_ref().expect("ensure 済み");
         let qkvb = d.qkv.as_ref().expect("ensure 済み");
         let qb = d.q.as_ref().expect("ensure 済み");
         let kdb = d.kd.as_ref().expect("ensure 済み");
@@ -23897,12 +24103,11 @@ pub fn pf_full_qkv_fused(
         let csb = d.cs.as_ref().expect("ensure 済み");
         let qnb = d.qn.as_ref().expect("ensure 済み");
         let knb = d.kn.as_ref().expect("ensure 済み");
-        xb.copy_from(x)?;
         csb.copy_from(cs)?;
         qnb.copy_from(q_norm)?;
         knb.copy_from(k_norm)?;
         // 1. 融合 1 本の射影 (**1 回の GEMM**。同期しない)
-        pf2_gemm(ctx, pw, pw_k, xb.ptr(), qkvb.ptr(), nt, e, n_all)?;
+        pf2_gemm(ctx, pw, pw_k, xptr, qkvb.ptr(), nt, e, n_all)?;
         // 2. q: 融合バッファの q_off 行から [q|gate] を読み、norm+rope して q へ
         {
             let shmem = (dh * 4) as u32;
@@ -24070,6 +24275,53 @@ pub(crate) const ATTN_PF2_DH: usize = 256;
 /// v2 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid x の分母)。
 pub(crate) const ATTN_PF2_BQ: usize = 64;
 
+/// task 230: `DENNO_PF_ATTN_V3` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (lab t230b で測ってから決める)。`1` で v3 カーネル
+/// (PV も bf16 mma・head 優先グリッド・行最大は最初のタイルで 1 回)。
+pub(crate) fn pf_attn_v3_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => false,
+    }
+}
+
+/// prefill の attention を v3 カーネルで回すか (**既定 off**)。
+pub(crate) fn pf_attn_v3_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_ATTN_V3_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_attn_v3_from_value(std::env::var("DENNO_PF_ATTN_V3").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_ATTN_V3_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_attn_v3_for_test(v: Option<bool>) {
+    PF_ATTN_V3_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// v3 カーネルの静的共有メモリ (`kernels_attn_pf3.cu` の A3_SMEM_BYTES と一致)。
+pub(crate) const ATTN_PF3_SMEM_BYTES: usize = 89_600;
+/// v3 カーネルが前提にする head 次元 (`kernels_attn_pf3.cu` のスレッド配置)。
+pub(crate) const ATTN_PF3_DH: usize = 256;
+/// v3 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid y の分母)。
+pub(crate) const ATTN_PF3_BQ: usize = 64;
+
 /// task 172: full 層 1 チャンクの後半 (attention → 出力ゲート → 出力投影)。
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
@@ -24182,7 +24434,14 @@ pub fn pf_full_out(
             {
                 // task 222: v2 カーネル (スコアを bf16 mma) が使える形ならそちら。
                 // 形は dh == 256 固定 (スレッド配置)・PTX があること・ゲート on。
-                let use_v2 = pf_attn_tc_on()
+                // task 230: v3 (PV も bf16 mma・head 優先グリッド) が使えるなら
+                // 最優先。どれも使えなければ従来 (v1) へ fail closed。
+                let use_v3 = pf_attn_v3_on()
+                    && dh == ATTN_PF3_DH
+                    && qd == heads * dh
+                    && !ctx.f_attn_pf3.is_null();
+                let use_v2 = !use_v3
+                    && pf_attn_tc_on()
                     && dh == ATTN_PF2_DH
                     && qd == heads * dh
                     && !ctx.f_attn_pf2.is_null();
@@ -24211,7 +24470,17 @@ pub fn pf_full_out(
                     &mut dh_c as *mut _ as *mut c_void,
                     &mut scale_c as *mut _ as *mut c_void,
                 ];
-                if use_v2 {
+                if use_v3 {
+                    unsafe {
+                        ctx.launch_async(
+                            ctx.f_attn_pf3,
+                            (heads as u32, nt.div_ceil(ATTN_PF3_BQ) as u32, 1),
+                            (dh as u32, 1, 1),
+                            ATTN_PF3_SMEM_BYTES as u32,
+                            &mut args,
+                        )?;
+                    }
+                } else if use_v2 {
                     unsafe {
                         ctx.launch_async(
                             ctx.f_attn_pf2,

@@ -1948,6 +1948,18 @@ impl FullAttn {
         if slot.is_none() {
             bail!("FullAttn::forward_batch_flat: 層 {layer} は ssm 層で full attention の担当外");
         }
+        // task 230: 直前の mix を D2H していない (dev-only) のにホスト経路で読むと
+        // 古いバイト列になる。デバイス連鎖を通らない分岐のときだけ先に降ろす
+        // (通る分岐では `forward_batch_dev` が失敗時に自分で降ろす)。
+        #[cfg(feature = "cuda")]
+        {
+            let dev_chain = crate::model::qwen4exp::pf_full_dev_on()
+                || crate::model::qwen4exp::pf_full_fused_on();
+            let host_path = !dev_chain || nt == 1 || matches!(&self.qsa, Some(q) if q.is_qsa(layer));
+            if host_path {
+                crate::cuda::pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, n_embd);
+            }
+        }
         if nt == 1 || matches!(&self.qsa, Some(q) if q.is_qsa(layer)) {
             let mut out = Vec::with_capacity(nt * n_embd);
             for t in 0..nt {
@@ -2063,8 +2075,27 @@ impl FullAttn {
     /// そのまま従来経路を走らせてよい。
     /// task 200: 入力は平坦な配列 (`nt` 行 × `n_embd`) をそのまま受け取り、
     /// 出力も平坦な 1 本で返す (トークンごとの `Vec<f32>` を作らない)。
+    /// task 230: `forward_batch_dev_inner` の入口。入力が「D2H していない
+    /// (デバイスだけが正)」状態でホスト経路へ落ちると古いバイト列を読むので、
+    /// 落ちた (`Ok(None)`) ときだけ 1 回降ろして埋め直す。
     #[cfg(feature = "cuda")]
     fn forward_batch_dev(
+        &mut self,
+        layer: usize,
+        flat: &[f32],
+        nt: usize,
+        base: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let e = self.n_embd;
+        let r = self.forward_batch_dev_inner(layer, flat, nt, base);
+        if matches!(&r, Ok(None)) {
+            crate::cuda::pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, e);
+        }
+        r
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_batch_dev_inner(
         &mut self,
         layer: usize,
         flat: &[f32],

@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -108,6 +108,10 @@ spec() {
         # のレジスタタイル)。bf16 の mma が要るので arch は compute_90。
         # 丸めは要素ごとに読めるように -fmad=false (PV は明示 fmaf)。
         attn_pf2)     echo "kernels_attn_pf2.cu|nofmad|compute_90" ;;
+        # task 230: prefill attention v3 (PV も bf16 の wmma、head 優先のグリッドで
+        # K/V を L2 に乗せる、行最大は最初のタイルで 1 回)。bf16 の mma が要るので
+        # arch は compute_90。丸めは要素ごとに読めるように -fmad=false。
+        attn_pf3)     echo "kernels_attn_pf3.cu|nofmad|compute_90" ;;
         # task 184: decode の GEMV をベクタロード + 複数アキュムレータ +
         # 次ブロック先読みで回す第 5 版 (Q8_0 / Q4_K)。dequant の演算列は
         # v3 / v4 と同じにするため -fmad=false。

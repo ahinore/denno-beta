@@ -3496,6 +3496,27 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     /// 従来経路をそのまま走らせる)。開始後に失敗したら `Err` にする — attention の
     /// KV/GDN 状態は既に進んでいるので、黙って従来経路へ落ちると状態が二重に進む。
 
+    /// task 230: full 層の attn mix を D2H せず、直後の qkv にデバイスの
+    /// `mixed` をそのまま読ませるか。
+    ///
+    /// 条件は「ゲート on・平坦な活性 (トークンごとの Vec を作らない)・full 層・
+    /// qkv のデバイス連鎖が受ける行数」。ssm 層 (GDN がホストを読む) と MoE は
+    /// 従来どおりホストへ降ろす。
+    fn pf_mix_keep_layer(flat_attn: bool, nt: usize, kind: Option<LayerKind>) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::pf_mix_keep_on()
+                && flat_attn
+                && nt >= 64
+                && matches!(kind, Some(LayerKind::FullAttn))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (flat_attn, nt, kind);
+            false
+        }
+    }
+
     /// task 200: 層優先 prefill の 1 層ぶんの attn 呼び出し。
     ///
     /// `flat_attn` が true なら平坦な入口 ([`LayerAttn::forward_batch_flat`]) を
@@ -3756,6 +3777,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
 
                 // 3.2-3.4 attention 入口 (デバイス mix) → attn (CPU) → combine (デバイス)
                 let t_mix = std::time::Instant::now();
+                // task 200: `DENNO_PF_ATTN_FLAT` は活性を平坦なまま attn へ渡し、
+                // 平坦なまま受け取る (トークンごとの Vec を作らない)。
+                let flat_attn = pf_attn_flat_on();
                 {
                     let _l = q4ledger::enter(q4ledger::MIX);
                     if !crate::cuda::pf_mix(
@@ -3771,17 +3795,21 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     ) {
                         Self::pf_bail("attn mix の連鎖に失敗")?;
                     }
-                    if !crate::cuda::pf_take_mixed(mixed_flat) {
-                        Self::pf_bail("attn mix の mixed D2H に失敗")?;
+                    // task 230: full 層は直後の qkv がデバイスの `mixed` を直接
+                    // 読めるので、この mix では D2H しない (`DENNO_PF_MIXKEEP`)。
+                    // ホストが要る経路 (ssm / 非常駐 / 小さい nt) では従来どおり。
+                    if Self::pf_mix_keep_layer(flat_attn, nt, self.p.layer_kind(il).ok()) {
+                        crate::cuda::pf_mixed_keep_dev(mixed_flat.as_ptr(), nt, e);
+                    } else {
+                        if !crate::cuda::pf_take_mixed(mixed_flat) {
+                            Self::pf_bail("attn mix の mixed D2H に失敗")?;
+                        }
+                        // task 209: デバイスの `mixed` とこのホスト配列は同じ内容
+                        // (`DENNO_PF_MIXDEVIN` の router / shared が読む)。
+                        crate::cuda::pf_mixed_mark(mixed_flat.as_ptr(), nt, e);
                     }
-                    // task 209: デバイスの `mixed` とこのホスト配列は同じ内容
-                    // (`DENNO_PF_MIXDEVIN` の router / shared が読む)。
-                    crate::cuda::pf_mixed_mark(mixed_flat.as_ptr(), nt, e);
                 }
                 q4prof::add(&q4prof::MIX, t_mix);
-                // task 200: `DENNO_PF_ATTN_FLAT` は活性を平坦なまま attn へ渡し、
-                // 平坦なまま受け取る (トークンごとの Vec を作らない)。
-                let flat_attn = pf_attn_flat_on();
                 // task 200: `DENNO_PF_ATTN_DEVRES` は ssm 連鎖の層出力をデバイスに
                 // 残し、直後の combine にそのまま読ませる (roles を取るときはホストが要る)。
                 let attn_dev = flat_attn && pf_attn_devres_on() && roles.is_none();

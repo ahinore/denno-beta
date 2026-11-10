@@ -7606,8 +7606,9 @@ fn pf222_attn_pf2_gate_is_wired_and_default_on() {
         "DENNO_PF_ATTN_TC を env から読んでいない"
     );
     // 起動の切り替え: ゲートと形 (dh) と PTX の有無を見て、ダメなら従来カーネルへ。
+    // task 230: v3 (DENNO_PF_ATTN_V3) が優先で、v2 はその次。
     assert!(
-        CUDA_RS.contains("let use_v2 = pf_attn_tc_on()")
+        CUDA_RS.contains("let use_v2 = !use_v3\n                    && pf_attn_tc_on()")
             && CUDA_RS.contains("&& dh == ATTN_PF2_DH")
             && CUDA_RS.contains("&& !ctx.f_attn_pf2.is_null();"),
         "pf_full_out が v2 の形 (dh / PTX) を検査していない"
@@ -7639,6 +7640,191 @@ fn pf222_attn_pf2_gate_is_wired_and_default_on() {
         .join(" ");
     let nargs = code.matches(',').count();
     assert_eq!(nargs, 11, "引数の数が従来カーネル (12 個) と違う");
+}
+
+// ---------------------------------------------------------------------------
+// task 230: prefill attention v3 (`kernels_attn_pf3.cu`)
+// ---------------------------------------------------------------------------
+
+const ATTN_PF3_SRC: &str = include_str!("../kernels/kernels_attn_pf3.cu");
+/// task 230: full attention の入口 (MIXKEEP の埋め戻しを検査する)。
+const QWEN_ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
+
+/// タイル定数・共有メモリ・スレッド配置がホスト (cuda.rs) と一致すること。
+#[test]
+fn pf230_attn_pf3_tile_matches_host() {
+    let d = defines(ATTN_PF3_SRC);
+    let bq = eval_define("A3_BQ", &d);
+    let bk = eval_define("A3_BK", &d);
+    let qd = eval_define("A3_QD", &d);
+    let pd = eval_define("A3_PD", &d);
+    let thr = eval_define("A3_THREADS", &d);
+    let smem = eval_define("A3_SMEM_BYTES", &d);
+    assert_eq!(bq, 64, "A3_BQ が 64 でない");
+    assert_eq!(bk, 32, "A3_BK が 32 でない (K/V のグローバル読みを据え置く)");
+    assert_eq!(thr, 256, "A3_THREADS が 256 でない");
+    // 行ストライドは bf16 の ldmatrix (8 の倍数) の条件。
+    assert_eq!(qd, 264, "A3_QD が 264 でない (256 + 8 の詰め物)");
+    assert_eq!(qd % 8, 0, "bf16 の ld が 8 の倍数でない");
+    assert_eq!(pd, 40, "A3_PD が 40 でない (32 + 8 の詰め物)");
+    assert_eq!(pd % 8, 0, "p の ld が 8 の倍数でない");
+    // smem の合計 = q + k + v + p + s + m0 + lst + stg(8 warp x 16x16 f32)。
+    let expect = bq * qd * 2
+        + bk * qd * 2
+        + bk * qd * 2
+        + bq * pd * 2
+        + bq * bk * 4
+        + 2 * bq * 4
+        + 8 * 16 * 16 * 4;
+    assert_eq!(expect, smem, "A3_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect < 99 * 1024,
+        "動的 smem {expect} B が実機の opt-in 上限 (99KB) を超える"
+    );
+    // ホスト側のミラー。
+    assert_eq!(rust_const("ATTN_PF3_SMEM_BYTES"), smem, "cuda.rs と不一致");
+    assert_eq!(rust_const("ATTN_PF3_BQ"), bq, "cuda.rs の ATTN_PF3_BQ が不一致");
+    assert_eq!(rust_const("ATTN_PF3_DH"), 256, "ATTN_PF3_DH が 256 でない");
+    // スコアは bf16 の wmma (K は col_major = 行がキー)、PV も bf16 の wmma。
+    assert!(
+        ATTN_PF3_SRC.contains(
+            "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;"
+        ),
+        "K を col_major の bf16 で読んでいない"
+    );
+    assert!(
+        ATTN_PF3_SRC.contains(
+            "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf;"
+        ),
+        "V を row_major の bf16 で読んでいない (PV が mma でない)"
+    );
+    assert!(
+        ATTN_PF3_SRC.contains("wmma::mma_sync(acc[t], af, bf, acc[t]);"),
+        "PV が mma のアキュムレートでない"
+    );
+    // V は smem で bf16 にする (f32 のままだと PV の mma に載らない)。
+    assert!(
+        ATTN_PF3_SRC.contains("__nv_bfloat16 *vd = v_sm + jl * A3_QD + dd;")
+            && !ATTN_PF3_SRC.contains("float *vd = v_sm"),
+        "V が bf16 で smem に置かれていない"
+    );
+    // オンライン再スケールをしない (行最大は最初のタイルで 1 回だけ)。
+    assert!(
+        ATTN_PF3_SRC.contains("if (j0 == 0) {") && ATTN_PF3_SRC.contains("m0_sm[tid] = (mx > -INFINITY) ? mx : 0.0f;"),
+        "行最大を最初のタイルで 1 回取る形でない"
+    );
+    assert!(
+        ATTN_PF3_SRC.contains("exp2f((s_sm[idx] - m0_sm[r]) * A3_LOG2E)"),
+        "p の式が exp2((s - m0) * log2e) でない"
+    );
+    // causal マスクの規則 (v2 と同じ)。
+    assert!(
+        ATTN_PF3_SRC.contains("if (i < n && j < t_total && j <= pos0 + i) {")
+            && ATTN_PF3_SRC.contains("s = -INFINITY;"),
+        "causal マスクの規則が従来カーネルと違う"
+    );
+    // グリッドは (head, クエリブロック) で、重いブロックから走らせる。
+    assert!(
+        ATTN_PF3_SRC.contains("const int h = blockIdx.x;")
+            && ATTN_PF3_SRC.contains("const int i0 = (nb - 1 - (int)blockIdx.y) * A3_BQ;"),
+        "グリッドの入れ替え (head 優先・重い順) が無い"
+    );
+    // build_ptx.sh: compute_90 (bf16 mma) で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("attn_pf3)     echo \"kernels_attn_pf3.cu|nofmad|compute_90\""),
+        "build_ptx.sh の attn_pf3 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("attn_pf3"),
+        "build_ptx.sh の targets_all に attn_pf3 が無い: {targets}"
+    );
+    // PTX の入口名と引数 (12 個) の一致。
+    assert!(
+        CUDA_RS.contains("b\"dno_attention_prefill3\\0\""),
+        "cuda.rs が dno_attention_prefill3 を読んでいない"
+    );
+    let sig = ATTN_PF3_SRC
+        .find("extern \"C\" __global__ void dno_attention_prefill3(")
+        .expect("入口が無い");
+    let head = &ATTN_PF3_SRC[sig..];
+    let head = &head[..head.find(')').expect("引数リストが閉じない")];
+    let code: String = head
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let nargs = code.matches(',').count();
+    assert_eq!(nargs, 11, "引数の数が v2 (12 個) と違う");
+}
+
+/// v3 / MIXKEEP のゲートが既定 off で、`pf_full_out` と mix の D2H に配線されて
+/// いること。
+#[test]
+fn pf230_gates_are_wired_and_default_off() {
+    for (fname, var) in [
+        ("pub(crate) fn pf_attn_v3_from_value(", "DENNO_PF_ATTN_V3"),
+        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP"),
+    ] {
+        let at = CUDA_RS.find(fname).unwrap_or_else(|| panic!("{fname} が無い"));
+        let body = &CUDA_RS[at..];
+        let end = body.find("\n}").expect("関数の終わりが無い");
+        let body = &body[..end];
+        assert!(
+            body.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+            "{var}: 明示的な真値を受ける形でない"
+        );
+        assert!(body.contains("None => false"), "{var}: 既定が off でない");
+        assert!(
+            CUDA_RS.contains(&format!("std::env::var(\"{var}\")")),
+            "{var} を env から読んでいない"
+        );
+    }
+    // v3 の起動: ゲートと形 (dh) と PTX の有無を見て、ダメなら v2 / 従来へ。
+    assert!(
+        CUDA_RS.contains("let use_v3 = pf_attn_v3_on()")
+            && CUDA_RS.contains("&& dh == ATTN_PF3_DH")
+            && CUDA_RS.contains("&& !ctx.f_attn_pf3.is_null();"),
+        "pf_full_out が v3 の形 (dh / PTX) を検査していない"
+    );
+    assert!(
+        CUDA_RS.contains("(heads as u32, nt.div_ceil(ATTN_PF3_BQ) as u32, 1),"),
+        "v3 のグリッドが (head, クエリブロック) でない"
+    );
+    assert!(
+        CUDA_RS.contains("let use_v2 = !use_v3"),
+        "v3 が使えないときの v2 への切り戻しが無い"
+    );
+    // MIXKEEP: full 層の attn mix で D2H を飛ばし、qkv がデバイスから読む。
+    assert!(
+        QWEN_SRC.contains("if Self::pf_mix_keep_layer(flat_attn, nt, self.p.layer_kind(il).ok()) {")
+            && QWEN_SRC.contains("crate::cuda::pf_mixed_keep_dev(mixed_flat.as_ptr(), nt, e);"),
+        "mix の D2H を飛ばす分岐が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("&& matches!(kind, Some(LayerKind::FullAttn))"),
+        "MIXKEEP が full 層に限定されていない"
+    );
+    assert!(
+        CUDA_RS.contains("let xptr = match pf2_dev_x(x, nt, e) {")
+            && CUDA_RS.contains("fn pf2_dev_x(x: &[f32], nt: usize, e: usize) -> Option<CUdeviceptr> {"),
+        "qkv がデバイス入力を読む経路が無い"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) fn pf_mixed_restore_host("),
+        "dev-only を降ろす経路が無い (古いバイト列で計算する)"
+    );
+    assert!(
+        QWEN_ATTN_SRC.contains("crate::cuda::pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, e);")
+            && QWEN_ATTN_SRC.contains("crate::cuda::pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, n_embd);"),
+        "attn 側に dev-only の埋め戻しが無い"
+    );
 }
 
 // ---------------------------------------------------------------------------
