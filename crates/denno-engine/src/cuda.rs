@@ -17117,17 +17117,20 @@ pub(crate) const SN3_MAX_TOKENS: usize = 2048;
 /// smem の見積りがカーネル側の `SN3_SMEM_BYTES` と一致することのコンパイル時検査。
 const _: [(); SN3_SMEM_BYTES] = [(); 2 * SN3_BN * 40 * 2 + 2 * SN3_BM * 40 * 2];
 
-/// `DENNO_PF_TC_SHARED3` の値の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_TC_SHARED3` の値の解釈 (純関数)。明示的な偽値だけ off。
 ///
-/// **既定 off** (lab t222a で採否を決める)。
+/// **既定 on** (lab t222b で採用): shared の gpu が 1,101 → 111 ms (14,018)、
+/// 297 → 28 ms (3,826)。本番の既定経路は BM=64 の TC カーネルに入っておらず、
+/// v1 (Q8_0) と従来の量子 GEMM (Q4_K / Q5_K) で回っていた。
+/// md5 は BF16 丸め (と K-quant の TC 化) で変わる。
 pub(crate) fn pf_tc_shared3_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
 }
 
-/// shared expert の射影を sn3 で回すか (**既定 off**。`1` で on)。
+/// shared expert の射影を sn3 で回すか (**既定 on**。`0` で切る)。
 pub(crate) fn pf_tc_shared3_on() -> bool {
     #[cfg(test)]
     {
@@ -17143,18 +17146,20 @@ pub(crate) fn pf_tc_shared3_on() -> bool {
     })
 }
 
-/// `DENNO_PF_MIX_TC` の値の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_MIX_TC` の値の解釈 (純関数)。明示的な偽値だけ off。
 ///
-/// **既定 off** (lab t222a で採否を決める)。
+/// **既定 on** (lab t222b で採用): 14,018 の mix の gpu が 1,061 → 792 ms、
+/// 3,826 で 285 → 214 ms、cold prefill 14,018 が -0.9%、decode と next turn は
+/// 変わらず、errors 0・text sane。md5 は BF16 丸めで変わる。
 pub(crate) fn pf_mix_tc_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
 }
 
 /// prefill の hc mix (BF16 の down / up) を sn3 のテンソルコア GEMM で回すか
-/// (**既定 off**。`1` で on)。
+/// (**既定 on**。`0` で切る)。
 pub(crate) fn pf_mix_tc_on() -> bool {
     #[cfg(test)]
     {
@@ -17453,15 +17458,15 @@ mod pf_tc_tests {
         }
     }
 
-    /// task 222: sn3 のゲートは既定 off で、明示的な真値だけを受ける。
+    /// task 222: 3 本は lab t222b で採用して**既定 on**、sh4 は未測定で既定 off。
     #[test]
     fn pf_sn3_gate_truth_table() {
         for f in [
             pf_tc_shared3_from_value,
             pf_mix_tc_from_value,
-            pf_tc_shared4_from_value,
+            pf_attn_tc_from_value,
         ] {
-            assert!(!f(None), "未設定は既定 off");
+            assert!(f(None), "未設定は既定 on (lab t222b で採用)");
             for v in ["0", "off", "false", "no", "", " OFF ", "2"] {
                 assert!(!f(Some(v)), "{v}");
             }
@@ -17469,8 +17474,17 @@ mod pf_tc_tests {
                 assert!(f(Some(v)), "{v}");
             }
         }
+        // sh4 (shared の down を tc2 へ) は未測定なので既定 off のまま。
+        assert!(!pf_tc_shared4_from_value(None), "sh4 は既定 off");
+        for v in ["0", "off", "false", "no", "", "2"] {
+            assert!(!pf_tc_shared4_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes"] {
+            assert!(pf_tc_shared4_from_value(Some(v)), "{v}");
+        }
         // 強制上書きが効き、戻すと env の解釈に戻ること。
         let before = (pf_tc_shared3_on(), pf_mix_tc_on(), pf_tc_shared4_on());
+        assert!(before.0 && before.1 && !before.2, "既定は sn3/mix_tc on・sh4 off");
         set_pf_tc_shared3_for_test(Some(true));
         set_pf_mix_tc_for_test(Some(true));
         set_pf_tc_shared4_for_test(Some(true));
@@ -17486,14 +17500,7 @@ mod pf_tc_tests {
             (pf_tc_shared3_on(), pf_mix_tc_on(), pf_tc_shared4_on()),
             before
         );
-        // task 222: attention v2 のゲートも同じ規約 (既定 off)。
-        assert!(!pf_attn_tc_from_value(None), "未設定は既定 off");
-        for v in ["0", "off", "false", "no", "", "2"] {
-            assert!(!pf_attn_tc_from_value(Some(v)), "{v}");
-        }
-        for v in ["1", "on", "true", "yes"] {
-            assert!(pf_attn_tc_from_value(Some(v)), "{v}");
-        }
+        // attention v2 のゲートも強制上書きが往復すること。
         let before_a = pf_attn_tc_on();
         set_pf_attn_tc_for_test(Some(true));
         assert!(pf_attn_tc_on());
@@ -23613,18 +23620,21 @@ pub fn pf_full_qkv_fused(
     }
 }
 
-/// task 222: `DENNO_PF_ATTN_TC` の値の解釈 (純関数)。明示的な真値だけ on。
+/// task 222: `DENNO_PF_ATTN_TC` の値の解釈 (純関数)。明示的な偽値だけ off。
 ///
-/// **既定 off** (lab t222b で採否を決める)。
+/// **既定 on** (lab t222b で採用): 14,018 の full の gpu が 2,184 → 1,636 ms、
+/// 3,826 で 236 → 193 ms、cold prefill 14,018 が -1.9%、decode と next turn は
+/// 変わらず、errors 0・text sane。attention は P17g の緩和枠なので md5 は
+/// スコアの BF16 丸めで変わる。
 pub(crate) fn pf_attn_tc_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
 }
 
 /// prefill の attention を v2 カーネル (bf16 mma + 4x16 の PV) で回すか
-/// (**既定 off**。`1` で on)。
+/// (**既定 on**。`0` で切る)。
 pub(crate) fn pf_attn_tc_on() -> bool {
     #[cfg(test)]
     {

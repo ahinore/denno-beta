@@ -196,6 +196,32 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         on: crate::cuda::pf_tc_shared2_on,
     },
     GatePtx {
+        env: "DENNO_PF_TC_SHARED3",
+        ptx: "kernels_gemm_sn3.ptx",
+        entries: &[
+            "dno_gemm_sn3_q8_0_w",
+            "dno_gemm_sn3_q4k_w",
+            "dno_gemm_sn3_q5k_w",
+            "dno_gemm_sn3_bf16_w",
+        ],
+        path_env: "DENNO_PF_SN3_PTX",
+        on: crate::cuda::pf_tc_shared3_on,
+    },
+    GatePtx {
+        env: "DENNO_PF_MIX_TC",
+        ptx: "kernels_gemm_sn3.ptx",
+        entries: &["dno_gemm_sn3_bf16_w"],
+        path_env: "DENNO_PF_SN3_PTX",
+        on: crate::cuda::pf_mix_tc_on,
+    },
+    GatePtx {
+        env: "DENNO_PF_ATTN_TC",
+        ptx: "kernels_attn_pf2.ptx",
+        entries: &["dno_attention_prefill2"],
+        path_env: "DENNO_PF_ATTN2_PTX",
+        on: crate::cuda::pf_attn_tc_on,
+    },
+    GatePtx {
         env: "DENNO_PF_MIX_SPLIT",
         ptx: "kernels_mix_split.ptx",
         entries: &["dno_mix_split_gemm"],

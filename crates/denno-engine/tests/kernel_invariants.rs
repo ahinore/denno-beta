@@ -7443,15 +7443,15 @@ fn pf_sn3_gemm_covers_q5k_and_bf16() {
     );
 }
 
-/// 2 つのゲートが既定 off で、shared / mix の両方に配線されていること。
+/// 3 本は lab t222b で採用して既定 on・sh4 は既定 off。配線も見る。
 #[test]
-fn pf222_sn3_gates_are_wired_and_default_off() {
-    // 既定 off: 純関数が「明示的な真値だけ on」の形 (None を受ける腕が無い) こと。
-    // 真理値表そのものは lib 側の `pf_sn3_gate_truth_table` が固定する。
-    for (fname, env) in [
-        ("pf_tc_shared3_from_value", "DENNO_PF_TC_SHARED3"),
-        ("pf_mix_tc_from_value", "DENNO_PF_MIX_TC"),
-        ("pf_tc_shared4_from_value", "DENNO_PF_TC_SHARED4"),
+fn pf222_sn3_gates_are_wired_and_default_on() {
+    // 純関数の既定は lib 側の `pf_sn3_gate_truth_table` が固定する。
+    // ここでは「明示的な偽値で切れる形」と env 名の実在を見る。
+    for (fname, env, default_on) in [
+        ("pf_tc_shared3_from_value", "DENNO_PF_TC_SHARED3", true),
+        ("pf_mix_tc_from_value", "DENNO_PF_MIX_TC", true),
+        ("pf_tc_shared4_from_value", "DENNO_PF_TC_SHARED4", false),
     ] {
         let at = CUDA_RS
             .find(&format!("pub(crate) fn {fname}("))
@@ -7460,13 +7460,17 @@ fn pf222_sn3_gates_are_wired_and_default_off() {
         let end = body.find("\n}").expect("関数の終わりが無い");
         let body = &body[..end];
         assert!(
-            body.contains("Some(\"1\" | \"on\" | \"true\" | \"yes\")"),
-            "{fname} が明示的な真値だけを受ける形でない"
+            body.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+            "{fname} が明示的な真値を受ける形でない"
         );
-        assert!(
-            !body.contains("None => true") && !body.contains("_ => true"),
-            "{fname} の既定が on になっている"
-        );
+        if default_on {
+            assert!(body.contains("None => true"), "{fname} の既定が on でない");
+        } else {
+            assert!(
+                !body.contains("None => true") && !body.contains("_ => true"),
+                "{fname} の既定が on になっている"
+            );
+        }
         // ゲートは env から読む (強制はテスト用の static)。
         assert!(
             CUDA_RS.contains(&format!("std::env::var(\"{env}\")")),
@@ -7590,12 +7594,12 @@ fn pf222_attn_pf2_gate_is_wired_and_default_off() {
     let end = body.find("\n}").expect("関数の終わりが無い");
     let body = &body[..end];
     assert!(
-        body.contains("Some(\"1\" | \"on\" | \"true\" | \"yes\")"),
-        "明示的な真値だけを受ける形でない"
+        body.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+        "明示的な真値を受ける形でない"
     );
     assert!(
-        !body.contains("None => true") && !body.contains("_ => true"),
-        "既定が on になっている"
+        body.contains("None => true"),
+        "既定が on でない (lab t222b で採用)"
     );
     assert!(
         CUDA_RS.contains("std::env::var(\"DENNO_PF_ATTN_TC\")"),
