@@ -421,6 +421,64 @@ impl AttnCache {
     }
 }
 
+/// task 210: cache が消えたら GPU ミラーも返す。
+///
+/// ミラー (`cuda::q4_attn_decode` / `q4_attn_prefill`) は `id` を鍵にした LRU で、
+/// 上限まで残る。task 206 の文脈の差し替えは空の cache を新しい `id` で作り、
+/// 置き換えのリクエストがそれを使うので、放っておくと死んだ cache のミラーが
+/// リクエストごとに 1 本ずつ溜まる (lab t209a の 14k で 384 MiB)。
+impl Drop for AttnCache {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        if crate::cuda::attn_mirror_forget_on() {
+            crate::cuda::q4_attn_mirror_forget(self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod attn_cache_tests {
+    use super::AttnCache;
+
+    /// この 2 本はプロセス共通のゲートを触るので直列化する (並走で揺らさない)。
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// task 210: cache を捨てたらミラーの解放口を呼ぶ (VRAM が実際に返るかは GPU 実機)。
+    ///
+    /// task 206 の文脈の差し替えは空の cache を新しい ID で作るので、これを
+    /// 忘れると死んだ cache のミラーがリクエストごとに積み上がる。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn drop_forgets_the_mirror_of_that_cache() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = crate::cuda::set_attn_mirror_forget_for_test(true);
+        let before = crate::cuda::q4_attn_mirror_forgets();
+        {
+            let c = AttnCache::new(1, 2, 8, 16).expect("cache");
+            assert!(c.id() > 0);
+        }
+        let after = crate::cuda::q4_attn_mirror_forgets();
+        crate::cuda::set_attn_mirror_forget_for_test(prev);
+        assert!(
+            after > before,
+            "AttnCache の Drop がミラーの解放を呼んでいない"
+        );
+    }
+
+    /// task 210: ゲートを切ったら呼ばない (A/B と切り戻しのため)。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gate_off_keeps_the_mirror() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = crate::cuda::set_attn_mirror_forget_for_test(false);
+        let before = crate::cuda::q4_attn_mirror_forgets();
+        drop(AttnCache::new(1, 2, 8, 16).expect("cache"));
+        let after = crate::cuda::q4_attn_mirror_forgets();
+        crate::cuda::set_attn_mirror_forget_for_test(prev);
+        assert_eq!(after, before, "ゲート off なのに解放を呼んだ");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1 層ぶんの重み
 // ---------------------------------------------------------------------------

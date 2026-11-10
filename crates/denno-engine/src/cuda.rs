@@ -2935,6 +2935,30 @@ pub(crate) mod dec_full_dev {
         }
     }
 }
+
+/// task 210: 確保に失敗したときに expert を追い出す量の階段 (バイト)。
+///
+/// 1 段目は「要求 + 64 MiB」(driver の内部確保ぶんの余裕)、以降は
+/// 512 MiB / 1 GiB / 2 GiB、最後は全部 (`usize::MAX`)。
+///
+/// 以前は 2 段 (要求 + 64 MiB / 全部) だった。slab はチャンクが空にならないと
+/// 実メモリを返さないので小さい段では戻らないことがあり、そのまま全部まで
+/// 進んで 22 GB の expert キャッシュを捨てていた。段を刻めば、戻った時点で
+/// 止まる (lab t209a の 14k は prefill の頭で 32 MiB が 1 本通らないだけで
+/// 全部捨てられ、decode が 21 → 35 ms/tok になった)。
+///
+/// 単調増加で、最後は必ず `usize::MAX`。
+pub fn alloc_retry_wants(bytes: usize) -> Vec<usize> {
+    let mut out = vec![bytes.saturating_add(64 << 20)];
+    for step in [512usize << 20, 1 << 30, 2 << 30] {
+        if step > *out.last().expect("先頭は必ずある") {
+            out.push(step);
+        }
+    }
+    out.push(usize::MAX);
+    out
+}
+
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
 pub struct DevBuffer {
     ptr: CUdeviceptr,
@@ -2969,15 +2993,16 @@ impl DevBuffer {
             Err(e) => {
                 // task 149: 他の常駐 (attention のミラー・重み・prefill の
                 // 一時バッファ) が原因で落ちたときは、expert を追い出して
-                // やり直す。1 回目は要求 + 64 MiB、2 回目は全部追い出す
-                // (driver の内部確保ぶんの余裕を残す)。
+                // やり直す。
+                //
+                // task 210: 追い出す量は**階段**にする。以前は「要求 + 64 MiB」の
+                // 次が「全部」の 2 段で、1 段目で戻らなかった (slab はチャンクが
+                // 空にならないと実メモリを返さない) だけで 22 GB の expert
+                // キャッシュを捨てていた。lab t209a の 14k では prefill の頭で
+                // 32 MiB が 1 本通らないだけで全部追い出され、decode が
+                // 21 → 35 ms/tok になった。
                 let mut last = e;
-                for margin in [64usize << 20, usize::MAX] {
-                    let want = if margin == usize::MAX {
-                        usize::MAX
-                    } else {
-                        bytes.saturating_add(margin)
-                    };
+                for want in alloc_retry_wants(bytes) {
                     let freed = crate::model::expert_vram::emergency_free(want);
                     if freed == 0 {
                         break;
@@ -27375,6 +27400,72 @@ pub fn q4_attn_mirror_stats() -> Option<(usize, usize, usize)> {
     Some((ms.len(), used, q4_attn_mirror_limit_bytes()))
 }
 
+/// task 210: [`q4_attn_mirror_forget`] が呼ばれた回数 (発火テスト用)。
+///
+/// ミラーは VRAM なので CPU では効果を測れないが、「cache を捨てたときに
+/// 解放の口が呼ばれたか」はこれで見える。
+static Q4_ATTN_MIRROR_FORGETS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 210: [`q4_attn_mirror_forget`] の呼び出し回数 (プロセス通算)。
+pub fn q4_attn_mirror_forgets() -> usize {
+    Q4_ATTN_MIRROR_FORGETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 210: `DENNO_ATTN_MIRROR_FORGET` (既定 on)。`0` / `false` / `no` で
+/// 「cache を捨てても GPU ミラーを残す」= task 209 以前の挙動 (A/B と切り戻し用)。
+static ATTN_MIRROR_FORGET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static ATTN_MIRROR_FORGET_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// task 210: env の値からゲートを決める (純関数。真偽表テストが規約を固定する)。
+///
+/// 未設定・空・知らない値は on (既定 on)。
+fn mirror_forget_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("false") | Some("no"))
+}
+
+/// task 210: 捨てた `AttnCache` のミラーを解放するか。
+pub fn attn_mirror_forget_on() -> bool {
+    ATTN_MIRROR_FORGET_INIT.get_or_init(|| {
+        let on = mirror_forget_from_value(
+            std::env::var("DENNO_ATTN_MIRROR_FORGET").ok().as_deref(),
+        );
+        ATTN_MIRROR_FORGET.store(on, std::sync::atomic::Ordering::Relaxed);
+    });
+    ATTN_MIRROR_FORGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// テスト用: ゲートを直接差し替える (戻り値は設定前の値)。
+#[doc(hidden)]
+pub fn set_attn_mirror_forget_for_test(on: bool) -> bool {
+    ATTN_MIRROR_FORGET_INIT.get_or_init(|| {});
+    ATTN_MIRROR_FORGET.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 210: 系列状態 ([`crate::model::qwen4exp_attn::AttnCache`]) が消えたら、
+/// その ID のミラーを VRAM から落とす。
+///
+/// ミラーは `AttnCache::id()` を鍵にした LRU で、**捨てた cache のぶんも上限
+/// (既定 3584 MiB) まで残る**。task 206 の文脈の差し替えは
+/// `take_seq_state` が空の cache を新しい ID で作り、置き換えのリクエストが
+/// それを使うので、リクエストごとに 1 本ずつ増える。lab t209a の 14k では
+/// 死んだ 5 本が 384 MiB を占め、prefill の頭で VRAM が 25 MiB まで詰まって
+/// expert の LRU を全部追い出させた (decode 21 → 35 ms/tok)。
+///
+/// 存在しない ID でも何もしない (呼び出し側は `Drop` から呼ぶ)。
+pub fn q4_attn_mirror_forget(cache_id: u64) {
+    let Some(mirrors) = Q4_ATTN_MIRRORS.get() else {
+        return;
+    };
+    let mut ms = match mirrors.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    Q4_ATTN_MIRROR_FORGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ms.retain(|(k, _, _)| *k != cache_id);
+}
+
 /// cap 成長: **既に使った層だけ**バッファを作り直し、旧バッファの有効行を
 /// D2D で温存する (再シードしない)。まだ使っていない層 (ssm 層) は確保しない
 /// — AttnCache は全 48 層ぶんの枠を持つが、full attention は 12 層だけなので、
@@ -32528,6 +32619,63 @@ mod q4_attn_tests {
 mod tests {
     use super::*;
     use crate::tensor;
+
+    /// task 210: 捨てた cache の ID のミラーは残さない (生きている ID は残す)。
+    /// ミラーは ID を鍵にした LRU で、上限 (3584 MiB) まで残るのが仕様なので、
+    /// 消し忘れると死んだ cache の VRAM が積み上がる (lab t209a の 14k: 384 MiB)。
+    #[test]
+    fn forget_removes_only_that_cache_id() {
+        let mirrors = Q4_ATTN_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        let keep = 0xffff_fff0u64;
+        let gone = 0xffff_fff1u64;
+        {
+            let mut ms = mirrors.lock().unwrap();
+            ms.push((keep, Q4AttnMirror::new(2, 8), std::time::Instant::now()));
+            ms.push((gone, Q4AttnMirror::new(2, 8), std::time::Instant::now()));
+        }
+        q4_attn_mirror_forget(gone);
+        {
+            let ms = mirrors.lock().unwrap();
+            let ids: Vec<u64> = ms.iter().map(|(k, _, _)| *k).collect();
+            assert!(ids.contains(&keep), "生きている cache のミラーまで消えた: {ids:?}");
+            assert!(!ids.contains(&gone), "捨てた cache のミラーが残っている: {ids:?}");
+        }
+        // 存在しない ID でも落ちない (Drop から何度でも呼ばれる)。
+        q4_attn_mirror_forget(gone);
+        q4_attn_mirror_forget(keep);
+    }
+
+    /// task 210: 確保失敗時の追い出し量は階段で、最後は全部。
+    /// 2 段目がいきなり「全部」だと 32 MiB が通らないだけで 22 GB を捨てる。
+    #[test]
+    fn alloc_retry_wants_is_a_rising_ladder() {
+        let w = alloc_retry_wants(32 << 20);
+        assert_eq!(w[0], 96 << 20, "1 段目が要求 + 64 MiB でない: {w:?}");
+        assert!(w.windows(2).all(|p| p[0] < p[1]), "階段が昇順でない: {w:?}");
+        assert_eq!(*w.last().unwrap(), usize::MAX, "最後が全部でない: {w:?}");
+        assert_eq!(w.len(), 5, "段数が変わった: {w:?}");
+        // 要求が大きいときは小さい段を飛ばす (単調増加は保つ)。
+        let big = alloc_retry_wants(3 << 30);
+        assert_eq!(big[0], (3 << 30) + (64 << 20));
+        assert!(big.windows(2).all(|p| p[0] < p[1]), "{big:?}");
+        assert_eq!(*big.last().unwrap(), usize::MAX);
+        // 飽和しても単調 (usize::MAX の手前で止まる)。
+        let sat = alloc_retry_wants(usize::MAX - 1);
+        assert_eq!(sat[0], usize::MAX);
+        assert_eq!(*sat.last().unwrap(), usize::MAX);
+    }
+
+    /// task 210: `DENNO_ATTN_MIRROR_FORGET` の真偽表。既定は on。
+    #[test]
+    fn mirror_forget_env_truth_table() {
+        assert!(mirror_forget_from_value(None), "未設定は on");
+        for off in ["0", "false", "no"] {
+            assert!(!mirror_forget_from_value(Some(off)), "{off} で切れていない");
+        }
+        for on in ["1", "true", "yes", ""] {
+            assert!(mirror_forget_from_value(Some(on)), "{on} で切れている");
+        }
+    }
 
     /// task 167: デバイス連鎖の形の判定 (純関数)。実モデル (e=2560 / nk=8 /
     /// dk=dv=256 / nv=24 → conv_dim 10240, value_dim 6144) を通し、
