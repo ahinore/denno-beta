@@ -8506,23 +8506,63 @@ fn mix_upmix_kernel_is_wired() {
     );
     let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
-        body.contains("dec_mix_upmix_on() && up_reduce && k2 % 8 == 0 && hc == MIX_UPMIX_HC"),
-        "upmix の門番 (ゲート / k % 8 / hc) が無い"
+        body.contains("let upmix_ver = dec_mix_upmix_ver();")
+            && body.contains("if up_reduce && hc == MIX_UPMIX_HC {"),
+        "upmix の門番 (ゲート / hc) が無い"
+    );
+    // task 216: ビット一致版 (`=2`) も同じ口から選ぶ。形は grid = e / block = 256。
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX2_KERNEL_NAME: &str = \"dno_mix_upmix2_bf16\";"),
+        "ビット一致版のカーネル名が無い"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UPMIX2_NARGS: usize = 9;"),
+        "ビット一致版の ABI 検査が 9 引数でない"
+    );
+    assert!(
+        body.contains("2 => mix_upmix2_kernels().map(|k| k.f),"),
+        "=2 でビット一致版を選んでいない"
+    );
+    assert!(
+        body.contains("let grid = if upmix_v2 {"),
+        "ビット一致版の grid 分岐が無い"
+    );
+    // ビット一致版のカーネル: 従来 (dno_matvec_bf16_r) と同じスレッド割り当て。
+    let p2 = kernel_params(MIX_UPMIX_SRC, "dno_mix_upmix2_bf16");
+    assert_eq!(
+        p2,
+        vec!["lo", "w", "xn", "out", "k", "n", "e", "hc", "inv_hc"],
+        "dno_mix_upmix2_bf16 の引数が upmix と違う: {p2:?}"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int d = tid; d < k; d += nt) {"),
+        "ビット一致版のスレッド割り当てが従来 (d = tid, tid+nt) と違う"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("for (int i = 1; i < (nt >> 5); ++i) {"),
+        "ビット一致版の 8 warp の和が従来と違う"
+    );
+    assert!(
+        MIX_UPMIX_SRC.contains("if (tid == 0) {\n            // dno_hc_mixed_f32 と同じ式"),
+        "ビット一致版の mixed の式が hc_mixed と違う"
     );
     assert!(
         body.contains("if let Some(f_upmix) = upmix {"),
         "upmix の分岐が無い"
     );
     // 融合したときは hc_mixed を撃たない (2 本撃つと 2 本版と同じ値になるが、
-    // 融合の意味 (起動 1 本減) が消える)。
-    let fused = &body[body.find("if let Some(f_upmix) = upmix {").unwrap()..];
-    let fused = &fused[..fused.find("} else {").unwrap()];
+    // 融合の意味 (起動 1 本減) が消える)。hc_mixed の起動は融合分岐の else 側に
+    // 1 回だけある、という形で固定する。
+    let at_upmix = body
+        .find("if let Some(f_upmix) = upmix {")
+        .expect("融合分岐が無い");
+    let at_mixed = body.find("ctx.launch_async(f_mixed,").expect("hc_mixed の起動が無い");
     assert!(
-        !fused.contains("f_mixed"),
-        "融合経路が hc_mixed も撃っている"
+        body.matches("ctx.launch_async(f_mixed,").count() == 1 && at_mixed > at_upmix,
+        "hc_mixed の起動が融合分岐の中にある (融合経路が 2 本撃っている)"
     );
     assert!(
-        fused.contains("ctx.launch_async(f_upmix, grid, (256, 1, 1), 0, &mut args4)?;"),
+        body.contains("ctx.launch_async(f_upmix, grid, (256, 1, 1), 0, &mut args4)?;"),
         "融合カーネルの起動が無い"
     );
     assert!(

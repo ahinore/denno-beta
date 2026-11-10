@@ -172,3 +172,78 @@ extern "C" __global__ void dno_mix_upmix_bf16(
         out[d] = __fmul_rn(acc, inv_hc);
     }
 }
+
+// ---------------------------------------------------------------------------
+// task 216 (2): **値がビット一致**する融合版。
+//
+// 上の `dno_mix_upmix_bf16` は uint4 読みの up (1 warp = 1 行) を使うので、
+// 従来の `dno_matvec_bf16_r` (block 256・d = tid, tid+256, ...) とは行内の合計順が
+// 変わる。深い文脈では expert の常駐が入れ替わって decode の当たり外れが出るため
+// (task 213 / 216 の lab)、**丸めを 1 ビットも変えない**融合版も用意する。
+//
+// ここでは 1 ブロック = 1 出力 e・block = 256 で、同じ e の hc 行を **順に**
+// 従来と同一の縮約 (スレッド割り当て・warp 木・共有メモリの 8 和) で計算し、
+// そのまま dno_hc_mixed_f32 の式で mixed[e] を作る。したがって
+// `dno_matvec_bf16_r` (up) + `dno_hc_mixed_f32` と**同じ値**になる。
+// 起動: grid = e、block = 256。
+// ---------------------------------------------------------------------------
+extern "C" __global__ void dno_mix_upmix2_bf16(
+    const float* __restrict__ lo,          // [k]
+    const unsigned char* __restrict__ w,   // [hc*e][k] BF16
+    const float* __restrict__ xn,          // [hc][e]
+    float* __restrict__ out,               // [e]
+    int k, int n, int e, int hc, float inv_hc)
+{
+    const int j = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nt = (int)blockDim.x;
+    __shared__ float sh[32];
+    __shared__ float gsh[DNO_UPMIX_HC];
+    if (j < e) {
+        for (int s = 0; s < DNO_UPMIX_HC; ++s) {
+            if (s >= hc) {
+                break;
+            }
+            const int row = s * e + j;
+            if (row < n) {
+                const unsigned short* rowp =
+                    (const unsigned short*)(w + (size_t)row * (size_t)k * 2u);
+                float acc = 0.0f;
+                // 従来 (dno_matvec_bf16_r) と同じ割り当て: d = tid, tid+nt, ...
+                for (int d = tid; d < k; d += nt) {
+                    acc = __fadd_rn(acc, __fmul_rn(lo[d], dno_mixum_bf16(rowp[d])));
+                }
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    acc = __fadd_rn(acc, __shfl_down_sync(0xffffffffu, acc, off));
+                }
+                if ((tid & 31) == 0) {
+                    sh[tid >> 5] = acc;
+                }
+                __syncthreads();
+                if (tid == 0) {
+                    float t = sh[0];
+                    for (int i = 1; i < (nt >> 5); ++i) {
+                        t = __fadd_rn(t, sh[i]);
+                    }
+                    gsh[s] = t;
+                }
+                __syncthreads();
+            }
+        }
+        if (tid == 0) {
+            // dno_hc_mixed_f32 と同じ式 (s 昇順に 1 要素ずつ、最後に inv_hc)。
+            float acc = __fmul_rn(
+                xn[j], __fdiv_rn(1.0f, __fadd_rn(1.0f, dno_expf(-gsh[0]))));
+            for (int ss = 1; ss < hc; ++ss) {
+                const size_t i = (size_t)ss * (size_t)e + (size_t)j;
+                acc = __fadd_rn(
+                    acc,
+                    __fmul_rn(
+                        xn[i],
+                        __fdiv_rn(1.0f, __fadd_rn(1.0f, dno_expf(-gsh[ss])))));
+            }
+            out[j] = __fmul_rn(acc, inv_hc);
+        }
+    }
+}
