@@ -11,10 +11,11 @@
 
 use super::{
     aux_ctx_enabled, aux_ctx_max_tok, aux_ctx_ratio, echo_matches, model_reuse_enabled, pick_ctx,
-    prefix_miss_line, prefix_splice_enabled, CtxPick, Flash, GenReq, TEST_BUILD_COUNT,
+    prefix_miss_line, prefix_splice_enabled, CtxPick, Flash, GenReq, ModelShape, TEST_BUILD_COUNT,
     TEST_FAIL_STEP, TEST_LAST_PICK, TEST_LAST_REUSE,
 };
 use crate::flash_telemetry::Telemetry;
+use denno_engine::model::intervene as iv;
 use denno_engine::gguf::GgufFile;
 use denno_engine::tok_gguf::GgufTokenizer;
 use denno_telemetry::Frame;
@@ -671,6 +672,14 @@ fn build_flash(dir: &TempDir) -> Flash {
         default_max: 6,
         tok,
         batch: true,
+        shape: ModelShape {
+            layers: DEFAULT_LAYERS,
+            layer_kinds: vec!["gdn"; DEFAULT_LAYERS],
+            n_expert: 4,
+            n_expert_used: 2,
+            n_hc: 2,
+            n_embd: 256,
+        },
         dec: None,
         cache: None,
         aux: None,
@@ -1583,4 +1592,166 @@ fn aux_ctx_evicted_at_memory_limit() {
     assert!(flash.aux.is_none(), "容量超過なのに脇の文脈が残った");
     std::env::remove_var("DENNO_FLASH_AUX_CTX");
     std::env::remove_var("DENNO_FLASH_AUX_TOK");
+}
+
+// ---------------------------------------------------------------------------
+// task 217: 介入の HTTP と epoch による prefix cache の無効化
+// ---------------------------------------------------------------------------
+
+/// グローバル設定 (介入) を触るテストの直列化。generate を回すテストは
+/// REUSE_ENV_LOCK を先に取るので、こちらも同じ順で取って直列にする。
+static IV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 1 リクエストを生の HTTP で流し、応答 (ヘッダ + 本文) を返す。
+fn http_roundtrip(flash: &mut Flash, raw: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    let mut cli = std::net::TcpStream::connect(addr).expect("connect");
+    let (srv, _) = l.accept().expect("accept");
+    cli.write_all(raw.as_bytes()).expect("write");
+    super::handle(flash, srv).expect("handle");
+    let mut out = String::new();
+    let _ = cli.read_to_string(&mut out);
+    out
+}
+
+fn http_json(resp: &str) -> serde_json::Value {
+    let body = resp.split("\r\n\r\n").nth(1).expect("本文が無い");
+    serde_json::from_str(body).expect("JSON でない")
+}
+
+fn http_req(method: &str, path: &str, body: &str) -> String {
+    if body.is_empty() {
+        format!("{method} {path} HTTP/1.1\r\nHost: h\r\n\r\n")
+    } else {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+}
+
+#[test]
+fn intervene_http_shape_get_set_delete() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    let dir = TempDir::new("flash-iv-http");
+    let mut flash = build_flash(&dir);
+    let e0 = iv::current_epoch();
+
+    // GET /v1/model/shape
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/model/shape", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert_eq!(v["layers"], 4);
+    assert_eq!(v["layer_kinds"], serde_json::json!(["gdn", "gdn", "gdn", "gdn"]));
+    assert_eq!(v["n_expert"], 4);
+    assert_eq!(v["n_expert_used"], 2);
+    assert_eq!(v["n_hc"], 2);
+    assert_eq!(v["n_embd"], 256);
+
+    // GET /v1/intervene (空)
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/intervene", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert_eq!(v["epoch"], e0);
+    assert_eq!(v["experts_off"], serde_json::json!([]));
+    assert_eq!(v["blocks_off"], serde_json::json!([]));
+    assert_eq!(v["streams_off"], serde_json::json!([]));
+
+    // POST (置き換え)
+    let body = r#"{"experts_off":[[0,1]],"blocks_off":[[2,"attn"],[1,"moe"]],"streams_off":[[3,1]]}"#;
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/intervene", body));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert_eq!(v["epoch"], e0 + 1, "epoch が 1 つ進んでいない");
+    assert_eq!(v["experts_off"], serde_json::json!([[0, 1]]));
+    // 返す配列は (層, 種別) の昇順
+    assert_eq!(v["blocks_off"], serde_json::json!([[1, "moe"], [2, "attn"]]));
+    assert_eq!(v["streams_off"], serde_json::json!([[3, 1]]));
+
+    // GET が同じ内容を返す
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/intervene", ""));
+    assert_eq!(http_json(&resp), v);
+
+    // 不正な入力は 400 (panic しない)
+    let v_post = v.clone();
+    let bad = [
+        r#"{"experts_off":[[9,0]]}"#,
+        r#"{"experts_off":[[0,99]]}"#,
+        r#"{"experts_off":[[0,0],[0,1],[0,2]]}"#,
+        r#"{"blocks_off":[[0,"head"]]}"#,
+        r#"{"streams_off":[[0,2]]}"#,
+        r#"{"experts_off":[[0]]}"#,
+        r#"{"experts_off":[[0,"x"]]}"#,
+        r#"{"nope":1}"#,
+        r#"[]"#,
+        r#"not json"#,
+    ];
+    for b in bad {
+        let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/intervene", b));
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "入力 {b} が 400 でない: {resp}");
+        let v = http_json(&resp);
+        assert!(
+            v["error"]["message"].as_str().map(|m| !m.is_empty()).unwrap_or(false),
+            "エラーメッセージが無い: {v}"
+        );
+    }
+    // 不正な入力で設定は変わらない (epoch も据え置き)
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/intervene", ""));
+    assert_eq!(http_json(&resp), v_post, "400 の入力で設定が変わった");
+
+    // DELETE で空に戻る
+    let resp = http_roundtrip(&mut flash, &http_req("DELETE", "/v1/intervene", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert_eq!(v["epoch"], e0 + 2);
+    assert_eq!(v["experts_off"], serde_json::json!([]));
+    assert_eq!(v["blocks_off"], serde_json::json!([]));
+    assert_eq!(v["streams_off"], serde_json::json!([]));
+}
+
+/// task 217: epoch が変わったら main / aux の両方の文脈を使わない。
+#[test]
+fn intervene_epoch_invalidates_both_contexts() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+    std::env::remove_var("DENNO_FLASH_AUX_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_RATIO");
+
+    let dir = TempDir::new("flash-iv-epoch");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let e0 = iv::current_epoch();
+
+    // 長い A (主の文脈) → 短い B (脇の文脈)。
+    flash.generate(&gen_req(LONG_A), no_emit).expect("A");
+    flash.generate(&side_b_req(), no_emit).expect("B");
+    assert!(flash.cache.is_some(), "主の文脈が無い");
+    assert!(flash.aux.is_some(), "脇の文脈が無い");
+    // 同じ epoch なら捨てない。
+    assert_eq!(flash.drop_stale_ctx(e0), 0, "同じ epoch で文脈を捨てた");
+
+    // epoch を進める → 両方とも無効。
+    let cfg = iv::clear(&flash.shape.engine_shape());
+    assert!(cfg.epoch() > e0, "epoch が進んでいない");
+    assert_eq!(
+        flash.drop_stale_ctx(cfg.epoch()),
+        2,
+        "main と aux の両方が無効化されていない"
+    );
+    assert!(flash.cache.is_none() && flash.aux.is_none());
+
+    // 実経路: 次のリクエストは前置きを再利用しない (full prefill)。
+    flash.generate(&gen_req(LONG_A), no_emit).expect("A2");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "epoch 変更後に古い prefix を再利用した"
+    );
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
 }

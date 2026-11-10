@@ -15,6 +15,7 @@ pub mod gemm_iq_kprof;
 pub mod gpt2;
 pub mod hyper;
 pub mod indexer;
+pub mod intervene;
 pub mod llama;
 pub mod linear_gguf;
 pub mod moe;
