@@ -263,6 +263,16 @@ static REC_ON: AtomicBool = AtomicBool::new(false);
 /// `DENNO_STEER_RECORD` で始まった記録か (毎リクエスト後に flush する)。
 static REC_ENV: AtomicBool = AtomicBool::new(false);
 
+/// 記録を始めたのでデバイスの加算域を 0 にし直す必要がある、の印。
+/// 加算域は thread_local なので、実際に 0 にするのは次の常駐 prefill の入口
+/// (`pf_steer_acc_ensure`)。ここで立てないと、前の記録の残りを引き継ぐ。
+static REC_DEV_RESET: AtomicBool = AtomicBool::new(false);
+
+/// [`REC_DEV_RESET`] を 1 回だけ消費する。
+pub fn take_dev_reset() -> bool {
+    REC_DEV_RESET.swap(false, Ordering::SeqCst)
+}
+
 thread_local! {
     static PINS: std::cell::RefCell<Vec<Arc<Steer>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -612,6 +622,8 @@ pub fn start_record(name: &str) -> Result<(String, u64), String> {
     }
     *g = Some(Rec::new(name, shape, &model));
     REC_ON.store(true, Ordering::SeqCst);
+    // 次の常駐 prefill の入口でデバイスの加算域を 0 にし直す。
+    REC_DEV_RESET.store(true, Ordering::SeqCst);
     if let Some((n, t)) = rec_status_in(&g) {
         Ok((n, t))
     } else {

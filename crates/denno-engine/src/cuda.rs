@@ -22748,6 +22748,15 @@ pub fn pf_steer_acc_ensure(n_layer: usize, hc: usize, e: usize) -> bool {
                 Err(e) => return pf_fail(&format!("steer: 加算域の確保に失敗: {e:#}")),
             }
         }
+        // 記録を始めた直後の 1 回は 0 に戻す (前の記録の残りを引き継がない)。
+        if crate::model::steer::take_dev_reset() {
+            if let Some(b) = d.acc.as_ref() {
+                let n = b.bytes() / 4;
+                if let Err(e) = b.copy_from(&vec![0.0f32; n]) {
+                    return pf_fail(&format!("steer: 加算域の 0 クリアに失敗: {e:#}"));
+                }
+            }
+        }
         true
     })
 }
