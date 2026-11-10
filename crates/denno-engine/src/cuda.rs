@@ -38712,11 +38712,17 @@ pub(crate) fn pf_ba_fast_on() -> bool {
     *ON.get_or_init(|| pf_ba_fast_from_value(std::env::var("DENNO_PF_BA_FAST").ok().as_deref()))
 }
 
-/// beta/alpha を**デバイスで**作るか (旧 `DENNO_PF_SSM_GEMM_GPU` か新
-/// `DENNO_PF_BA_FAST` のどちらか)。連鎖の入口 (`ba_desc`) と
-/// [`gdn_pf_chain`] の前提検査が同じ判定を見るようにここへ集約する。
+/// beta/alpha を**デバイスで**作るか。
+///
+/// task 225: `DENNO_PF_BA_FAST` を足したが、**単独では on にしない**。
+/// デバイス射影の入口 (`ba_desc`) は既存の `DENNO_PF_SSM_GEMM_GPU` のままで、
+/// こちらは「その入口を通ったときに使うカーネル」を選ぶだけ。理由は lab t225a:
+/// `DENNO_PF_BA_FAST=1` 単独で入口を開けると、`gdn_pf_chain` の
+/// 「ba_dev が作れない → 連鎖ごと諦める」に落ちて ssm が 2.98 → 27.8 s
+/// (+79%) になった (連鎖が使えず従来経路へ戻る)。既存の入口も同じ落とし穴を
+/// 持っているので、既定 off のまま触らない。
 pub(crate) fn pf_ba_dev_on() -> bool {
-    pf_ssm_gemm_gpu_on() || pf_ba_fast_on()
+    pf_ssm_gemm_gpu_on()
 }
 
 /// 形のゲート (純関数)。n は 1 本あたりの出力行 (実モデルは 48)。
@@ -38836,7 +38842,8 @@ fn router_dev_fns(ctx: &CudaCtx) -> Option<&'static RouterDevFns> {
 /// `DENNO_PF_ROUTER_DEV` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 pub(crate) fn pf_router_dev_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        // task 225: lab t225a で採用 (14k cold prefill -7.7%、3,826 -4.8%)。
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -38856,7 +38863,7 @@ pub(crate) fn set_pf_router_dev_for_test(v: Option<bool>) {
     );
 }
 
-/// router の softmax + top-k をデバイスで回すか (既定 off)。
+/// router の softmax + top-k をデバイスで回すか (既定 on。lab t225a で採用)。
 pub(crate) fn pf_router_dev_on() -> bool {
     #[cfg(test)]
     {
@@ -39840,7 +39847,8 @@ fn gdn_pf3_kernels() -> Option<&'static GdnPf3Kernels> {
 /// `DENNO_PF_SCAN3` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 pub(crate) fn gdn_pf3_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        // task 225: lab t225a で採用 (14k cold prefill -7.4%、3,826 -5.0%)。
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -39861,7 +39869,7 @@ pub(crate) fn set_gdn_pf3_for_test(v: Option<bool>) {
     );
 }
 
-/// v3 スキャンを使うか (既定 off。lab の結果で決める)。
+/// v3 スキャンを使うか (既定 on。lab t225a で採用)。
 pub(crate) fn gdn_pf3_on() -> bool {
     #[cfg(test)]
     {
@@ -39983,15 +39991,20 @@ fn gdn_pf3_launch(
 mod pf225_gate_tests {
     use super::*;
 
-    /// 3 本のゲートはどれも既定 off (`0`/`off`/`false`/`no`/空だけが off)。
+    /// 既定: beta/alpha は off (既存の入口が連鎖から落ちるため)、
+    /// router と scan v3 は lab t225a で採用して on。
     #[test]
-    fn pf225_gates_default_off() {
-        for (name, f) in [
-            ("DENNO_PF_BA_FAST", pf_ba_fast_from_value as fn(Option<&str>) -> bool),
-            ("DENNO_PF_ROUTER_DEV", pf_router_dev_from_value),
-            ("DENNO_PF_SCAN3", gdn_pf3_from_value),
+    fn pf225_gates_defaults() {
+        for (name, f, dflt) in [
+            (
+                "DENNO_PF_BA_FAST",
+                pf_ba_fast_from_value as fn(Option<&str>) -> bool,
+                false,
+            ),
+            ("DENNO_PF_ROUTER_DEV", pf_router_dev_from_value, true),
+            ("DENNO_PF_SCAN3", gdn_pf3_from_value, true),
         ] {
-            assert!(!f(None), "{name}: 未設定は既定 off");
+            assert_eq!(f(None), dflt, "{name}: 未設定の既定が違う");
             for v in ["0", "off", "false", "no", "", " off "] {
                 assert!(!f(Some(v)), "{name}: {v:?} が on になった");
             }
@@ -40127,14 +40140,14 @@ mod pf225_gate_tests {
         set_pf_router_dev_for_test(Some(false));
         assert!(!pf_router_dev_on());
         set_pf_router_dev_for_test(None);
-        assert!(!pf_router_dev_on());
+        assert!(pf_router_dev_on(), "env 未設定の既定は on");
 
         set_gdn_pf3_for_test(Some(true));
         assert!(gdn_pf3_on());
         set_gdn_pf3_for_test(Some(false));
         assert!(!gdn_pf3_on());
         set_gdn_pf3_for_test(None);
-        assert!(!gdn_pf3_on());
+        assert!(gdn_pf3_on(), "env 未設定の既定は on");
     }
 }
 
