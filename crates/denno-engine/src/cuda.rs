@@ -3466,6 +3466,10 @@ pub struct CudaCtx {
     f_attn: CUfunction,
     // P17j: prefill attention (flash 風 online softmax・exactness 緩和・ユーザー承認)
     f_attn_pf: CUfunction,
+    /// task 222: prefill attention v2 (スコアを bf16 mma・PV を 4x16 の
+    /// レジスタタイル)。`DENNO_PF_ATTN_TC` が on かつ PTX があるときだけ使う。
+    /// 無いときは null (従来の `f_attn_pf` へ fail closed)。
+    f_attn_pf2: CUfunction,
     /// task 135: t を分割する decode attention (`dno_attention_decode`) と、
     /// 部分和を畳む `dno_attention_decode_combine`。PTX に無ければ None で
     /// 従来の `dno_attention` 経路に落ちる (fail closed・古い PTX でも起動可)。
@@ -3729,6 +3733,61 @@ impl CudaCtx {
                 }
             }
             ATTN_PF_DYN_SMEM.store(attn_pf_dyn_smem, std::sync::atomic::Ordering::Relaxed);
+            // task 222: prefill attention v2 (任意。読めない・入口が無い・
+            // opt-in が通らないときは null のまま = 従来の
+            // dno_attention_prefill で回る。fail closed)。
+            let mut f_attn_pf2: CUfunction = std::ptr::null_mut();
+            {
+                let pf2_path = match std::env::var("DENNO_PF_ATTN2_PTX") {
+                    Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                    _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("kernels")
+                        .join("kernels_attn_pf2.ptx"),
+                };
+                match std::fs::read(&pf2_path) {
+                    Ok(mut image) => {
+                        image.push(0);
+                        unsafe {
+                            let mut module2: CUmodule = std::ptr::null_mut();
+                            let loaded = (lib.module_load_data)(
+                                &mut module2,
+                                image.as_ptr() as *const c_void,
+                            ) == CUDA_SUCCESS;
+                            if loaded
+                                && (lib.module_get_function)(
+                                    &mut f_attn_pf2,
+                                    module2,
+                                    b"dno_attention_prefill2\0".as_ptr() as *const c_char,
+                                ) == CUDA_SUCCESS
+                            {
+                                let ok = match lib.func_set_attribute {
+                                    Some(fn_attr) => (fn_attr)(
+                                        f_attn_pf2,
+                                        CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                        ATTN_PF2_SMEM_BYTES as c_int,
+                                    ) == 0,
+                                    None => false,
+                                };
+                                if !ok {
+                                    eprintln!(
+                                        "[pf-attn2] 動的 smem の opt-in に失敗 → 従来の attention へ"
+                                    );
+                                    f_attn_pf2 = std::ptr::null_mut();
+                                }
+                            } else {
+                                eprintln!("[pf-attn2] PTX を読めない/入口が無い → 従来の attention へ");
+                                f_attn_pf2 = std::ptr::null_mut();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[pf-attn2] PTX が無い ({}) : {e} → 従来の attention へ",
+                            pf2_path.display()
+                        );
+                    }
+                }
+            }
             // s169 (P10): SM 数を 1 回だけ取る (GEMV の launch 形状を n から選ぶ
             // ためだけに使う。取れなければ 0 のまま = 形状選択は従来の固定 C)。
             if let Some(dev_attr) = lib.device_get_attribute {
@@ -3984,6 +4043,7 @@ impl CudaCtx {
                 f_expf,
                 f_attn,
                 f_attn_pf,
+                f_attn_pf2,
                 f_attn_dec: f_attn_dec.map(|(a, _)| a),
                 f_attn_dec_cb: f_attn_dec.map(|(_, b)| b),
                 attn_pf_dyn_smem,
@@ -16934,8 +16994,9 @@ fn sn2_gemm_launch(
 
 /// shared expert 用の GEMM 入口 (task 183)。
 ///
-/// `DENNO_PF_TC_SHARED2` が on で形が合えば BM=64 のカーネル、それ以外は
-/// 従来の [`pf2_gemm`] (sn / v2 / v1 / 従来カーネルの順)。同期はしない。
+/// `DENNO_PF_TC_SHARED3` (task 222) が on なら Q5_K / BF16 も扱える sn3、
+/// 無ければ `DENNO_PF_TC_SHARED2` の sn2、それも無ければ従来の [`pf2_gemm`]。
+/// 同期はしない。
 #[allow(clippy::too_many_arguments)]
 fn pf2_gemm_shared(
     ctx: &CudaCtx,
@@ -16948,6 +17009,18 @@ fn pf2_gemm_shared(
     n_out: usize,
 ) -> Result<()> {
     if let PfWKind::Quant(ty, _, rb, _) = kind {
+        // task 222: N が大きい側 (shared の down 2560) は tc2 の BM=128 タイルへ。
+        // gate/up の 640 は 5 行タイルしか出ないので sn2 / sn3 のまま。
+        if pf_tc_shared4_on() && pf_tc_shared4_eligible(ty, nt, n_in, n_out, 1) {
+            if let Some(tc2) = tc2_gemm_kernels() {
+                return tc2_gemm_launch(ctx, tc2, ty, w, x, y, nt, n_in, n_out, rb);
+            }
+        }
+        if pf_tc_shared3_on() && pf_tc_sn3_eligible(ty, nt, n_in, n_out, 1) {
+            if let Some(sn3) = tc_sn3_kernels() {
+                return sn3_gemm_launch(ctx, sn3, ty, w, x, y, nt, n_in, n_out, rb);
+            }
+        }
         if pf_tc_shared2_on() && pf_tc_smalln2_eligible(ty, nt, n_in, n_out, 1) {
             if let Some(sn2) = tc_smalln2_kernels() {
                 return sn2_gemm_launch(ctx, sn2, ty, w, x, y, nt, n_in, n_out, rb);
@@ -16956,6 +17029,373 @@ fn pf2_gemm_shared(
     }
     pf2_gemm(ctx, w, kind, x, y, nt, n_in, n_out)
 }
+
+/// `DENNO_PF_TC_SHARED4` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (lab t222b で採否を決める)。
+pub(crate) fn pf_tc_shared4_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// shared expert の down (N=2560) を tc2 (BM=128 / BN=128) で回すか
+/// (**既定 off**。`1` で on)。
+pub(crate) fn pf_tc_shared4_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC_SN4_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_tc_shared4_from_value(std::env::var("DENNO_PF_TC_SHARED4").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PF_TC_SN4_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc_shared4_for_test(v: Option<bool>) {
+    PF_TC_SN4_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// shared の down を tc2 に任せられる形か (純関数)。
+///
+/// tc2 の前提 (`pf_tc2_eligible`) から **N の下限 4096 だけを外す**。
+/// gate/up の N=640 は BN=128 で 5 行タイルしか出ず並列度が落ちるので対象外
+/// (下限 2048 = down の 2560 だけが入る)。
+pub(crate) fn pf_tc_shared4_eligible(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    pf_tc2_type_ok(ty)
+        && pf_tc2_k_ok(ty, n_in)
+        && nt >= min_m
+        && n_out >= 2048
+        && n_out % TC2_BN == 0
+}
+
+// ---------------------------------------------------------------------------
+// task 222: BM=64 / BN=64 のタイルで Q8_0 / Q4_K / Q5_K / BF16 を受ける版
+// ---------------------------------------------------------------------------
+//
+// sn2 (task 183) は Q8_0 / Q4_K 専用だった。実モデルの shared expert は
+// 層ごとに型が混ざっていて (gate/up が Q8_0 54 本・Q4_K 30 本・Q5_K 12 本)、
+// Q5_K の 12 本は従来の量子 GEMM に落ちていた。hc mix の down / up は BF16 で、
+// こちらは f32 の FMA カーネル (`dno_gemm_bf16_mt`) が担当していた。
+// どちらも同じ sn2 のタイル (lab t183a で検証済み) に載せる。
+//
+// PTX: `bash build_ptx.sh gemm_sn3` (arch = compute_90。bf16 の mma が要る)。
+
+/// 1 ブロックのタイル (`kernels_gemm_sn3.cu` の SN3_BM / BN / BK と一致)。
+pub(crate) const SN3_BM: usize = 64;
+/// 出力行のタイル。
+pub(crate) const SN3_BN: usize = 64;
+/// k の刻み。
+pub(crate) const SN3_BK: usize = 32;
+/// 静的共有メモリの合計 (`SN3_SMEM_BYTES` = sW 2 x 64 x 40 x 2 + sX 2 x 64 x 40 x 2)。
+pub(crate) const SN3_SMEM_BYTES: usize = 20_480;
+/// 1 起動でまとめるトークン数の上限 (sn2 と同じ)。
+pub(crate) const SN3_MAX_TOKENS: usize = 2048;
+
+/// smem の見積りがカーネル側の `SN3_SMEM_BYTES` と一致することのコンパイル時検査。
+const _: [(); SN3_SMEM_BYTES] = [(); 2 * SN3_BN * 40 * 2 + 2 * SN3_BM * 40 * 2];
+
+/// `DENNO_PF_TC_SHARED3` の値の解釈 (純関数)。明示的な偽値だけ off。
+///
+/// **既定 on** (lab t222b で採用): shared の gpu が 1,101 → 111 ms (14,018)、
+/// 297 → 28 ms (3,826)。本番の既定経路は BM=64 の TC カーネルに入っておらず、
+/// v1 (Q8_0) と従来の量子 GEMM (Q4_K / Q5_K) で回っていた。
+/// md5 は BF16 丸め (と K-quant の TC 化) で変わる。
+pub(crate) fn pf_tc_shared3_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
+}
+
+/// shared expert の射影を sn3 で回すか (**既定 on**。`0` で切る)。
+pub(crate) fn pf_tc_shared3_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC_SN3_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_tc_shared3_from_value(std::env::var("DENNO_PF_TC_SHARED3").ok().as_deref())
+    })
+}
+
+/// `DENNO_PF_MIX_TC` の値の解釈 (純関数)。明示的な偽値だけ off。
+///
+/// **既定 on** (lab t222b で採用): 14,018 の mix の gpu が 1,061 → 792 ms、
+/// 3,826 で 285 → 214 ms、cold prefill 14,018 が -0.9%、decode と next turn は
+/// 変わらず、errors 0・text sane。md5 は BF16 丸めで変わる。
+pub(crate) fn pf_mix_tc_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
+}
+
+/// prefill の hc mix (BF16 の down / up) を sn3 のテンソルコア GEMM で回すか
+/// (**既定 on**。`0` で切る)。
+pub(crate) fn pf_mix_tc_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_MIX_TC_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_mix_tc_from_value(std::env::var("DENNO_PF_MIX_TC").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_TC_SN3_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static PF_MIX_TC_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc_shared3_for_test(v: Option<bool>) {
+    PF_TC_SN3_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn set_pf_mix_tc_for_test(v: Option<bool>) {
+    PF_MIX_TC_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// sn3 が扱える型か (純関数)。
+pub(crate) fn pf_tc_sn3_type_ok(ty: crate::kquant::GgmlType) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(ty, T::Q8_0 | T::Q4K | T::Q5K | T::Bf16)
+}
+
+/// sn3 の k の前提 (純関数)。BF16 と Q8_0 は 32、K-quant は 256 の倍数。
+pub(crate) fn pf_tc_sn3_k_ok(ty: crate::kquant::GgmlType, n_in: usize) -> bool {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Bf16 | T::Q8_0 => n_in > 0 && n_in % SN3_BK == 0,
+        T::Q4K | T::Q5K => n_in > 0 && n_in % 256 == 0,
+        _ => false,
+    }
+}
+
+/// この形を sn3 で回せるか (純関数。カーネルの前提と同じ)。
+pub(crate) fn pf_tc_sn3_eligible(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    pf_tc_sn3_type_ok(ty)
+        && pf_tc_sn3_k_ok(ty, n_in)
+        && nt >= min_m.max(SN3_BM)
+        && n_out > 0
+        && n_out % SN3_BN == 0
+}
+
+/// BM=64 のカーネル一式 (PTX は実行時読み込み)。
+struct Sn3Gemm {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    q8_0: CUfunction,
+    q4k: CUfunction,
+    q5k: CUfunction,
+    bf16: CUfunction,
+}
+
+unsafe impl Send for Sn3Gemm {}
+unsafe impl Sync for Sn3Gemm {}
+
+static SN3_GEMM: OnceLock<Option<Sn3Gemm>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_PF_SN3_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gemm_sn3.ptx`。
+fn sn3_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SN3_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_sn3.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn tc_sn3_kernels() -> Option<&'static Sn3Gemm> {
+    SN3_GEMM
+        .get_or_init(|| {
+            let path = sn3_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-sn3] PTX が読めない ({}) : {e} → sn2 / 従来の GEMM へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-sn3] cuModuleLoadData 失敗 → sn2 / 従来の GEMM へ");
+                    return None;
+                }
+                let mut q8_0: CUfunction = std::ptr::null_mut();
+                let mut q4k: CUfunction = std::ptr::null_mut();
+                let mut q5k: CUfunction = std::ptr::null_mut();
+                let mut bf16: CUfunction = std::ptr::null_mut();
+                for (dst, name, label) in [
+                    (
+                        &mut q8_0,
+                        b"dno_gemm_sn3_q8_0_w\0".as_ptr(),
+                        "dno_gemm_sn3_q8_0_w",
+                    ),
+                    (
+                        &mut q4k,
+                        b"dno_gemm_sn3_q4k_w\0".as_ptr(),
+                        "dno_gemm_sn3_q4k_w",
+                    ),
+                    (
+                        &mut q5k,
+                        b"dno_gemm_sn3_q5k_w\0".as_ptr(),
+                        "dno_gemm_sn3_q5k_w",
+                    ),
+                    (
+                        &mut bf16,
+                        b"dno_gemm_sn3_bf16_w\0".as_ptr(),
+                        "dno_gemm_sn3_bf16_w",
+                    ),
+                ] {
+                    if (lib.module_get_function)(dst, module, name as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[pf-sn3] PTX に {label} が無い → sn2 / 従来の GEMM へ");
+                        return None;
+                    }
+                }
+                Some(Sn3Gemm {
+                    module,
+                    q8_0,
+                    q4k,
+                    q5k,
+                    bf16,
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// 型ごとのカーネル (純関数)。
+fn sn3_func(fns: &Sn3Gemm, ty: crate::kquant::GgmlType) -> Option<CUfunction> {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Q8_0 => Some(fns.q8_0),
+        T::Q4K => Some(fns.q4k),
+        T::Q5K => Some(fns.q5k),
+        T::Bf16 => Some(fns.bf16),
+        _ => None,
+    }
+}
+
+/// BM=64 のカーネルを `SN3_MAX_TOKENS` 行ずつ起動する (w / x / out はデバイス)。
+#[allow(clippy::too_many_arguments)]
+fn sn3_gemm_launch(
+    ctx: &CudaCtx,
+    fns: &Sn3Gemm,
+    ty: crate::kquant::GgmlType,
+    wptr: CUdeviceptr,
+    xptr: CUdeviceptr,
+    optr: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+) -> Result<()> {
+    if nt == 0 {
+        return Ok(());
+    }
+    let Some(f) = sn3_func(fns, ty) else {
+        bail!("sn3_gemm_launch: 未対応の型 {ty:?}");
+    };
+    let grid_x = (n_out / SN3_BN) as u32;
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let m = (nt - t0).min(SN3_MAX_TOKENS);
+        let grid_y = m.div_ceil(SN3_BM) as u32;
+        let (mut pw, mut px, mut po) = (
+            wptr,
+            xptr + (t0 * n_in * 4) as CUdeviceptr,
+            optr + (t0 * n_out * 4) as CUdeviceptr,
+        );
+        let (mut m_c, mut ni_c, mut no_c, mut rb_c) = (
+            m as c_int,
+            n_in as c_int,
+            n_out as c_int,
+            row_bytes as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut m_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;
+        }
+        t0 += m;
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod pf_tc_tests {
@@ -17016,6 +17456,109 @@ mod pf_tc_tests {
         for (n_in, n_out) in [(2559usize, 1024usize), (2560, 1024 + 1), (2560, 32)] {
             assert!(!pf_tc_gemm_eligible(512, n_in, n_out, 64), "k={n_in} n={n_out}");
         }
+    }
+
+    /// task 222: 3 本は lab t222b で採用して**既定 on**、sh4 は未測定で既定 off。
+    #[test]
+    fn pf_sn3_gate_truth_table() {
+        for f in [
+            pf_tc_shared3_from_value,
+            pf_mix_tc_from_value,
+            pf_attn_tc_from_value,
+        ] {
+            assert!(f(None), "未設定は既定 on (lab t222b で採用)");
+            for v in ["0", "off", "false", "no", "", " OFF ", "2"] {
+                assert!(!f(Some(v)), "{v}");
+            }
+            for v in ["1", "on", "true", "yes", " ON ", " 1 "] {
+                assert!(f(Some(v)), "{v}");
+            }
+        }
+        // sh4 (shared の down を tc2 へ) は未測定なので既定 off のまま。
+        assert!(!pf_tc_shared4_from_value(None), "sh4 は既定 off");
+        for v in ["0", "off", "false", "no", "", "2"] {
+            assert!(!pf_tc_shared4_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes"] {
+            assert!(pf_tc_shared4_from_value(Some(v)), "{v}");
+        }
+        // 強制上書きが効き、戻すと env の解釈に戻ること。
+        let before = (pf_tc_shared3_on(), pf_mix_tc_on(), pf_tc_shared4_on());
+        assert!(before.0 && before.1 && !before.2, "既定は sn3/mix_tc on・sh4 off");
+        set_pf_tc_shared3_for_test(Some(true));
+        set_pf_mix_tc_for_test(Some(true));
+        set_pf_tc_shared4_for_test(Some(true));
+        assert!(pf_tc_shared3_on() && pf_mix_tc_on() && pf_tc_shared4_on());
+        set_pf_tc_shared3_for_test(Some(false));
+        set_pf_mix_tc_for_test(Some(false));
+        set_pf_tc_shared4_for_test(Some(false));
+        assert!(!pf_tc_shared3_on() && !pf_mix_tc_on() && !pf_tc_shared4_on());
+        set_pf_tc_shared3_for_test(None);
+        set_pf_mix_tc_for_test(None);
+        set_pf_tc_shared4_for_test(None);
+        assert_eq!(
+            (pf_tc_shared3_on(), pf_mix_tc_on(), pf_tc_shared4_on()),
+            before
+        );
+        // attention v2 のゲートも強制上書きが往復すること。
+        let before_a = pf_attn_tc_on();
+        set_pf_attn_tc_for_test(Some(true));
+        assert!(pf_attn_tc_on());
+        set_pf_attn_tc_for_test(Some(false));
+        assert!(!pf_attn_tc_on());
+        set_pf_attn_tc_for_test(None);
+        assert_eq!(pf_attn_tc_on(), before_a);
+    }
+
+    /// task 222: sn3 は実モデルの 4 つの型と形 (shared の Q5_K と mix の BF16) を
+    /// 受け、sn2 が落としていた型を取りこぼさないこと。
+    #[test]
+    fn pf_sn3_eligibility_real_shapes() {
+        use crate::kquant::GgmlType as T;
+        // shared expert の実形 (gate/up = 2560→640 / down = 640→2560)。
+        // gate/up は層ごとに Q8_0 / Q4_K / Q5_K。down は実モデルでは Q8_0 だけで、
+        // k=640 は 256 の倍数でないので K-quant は対象外 (正しい fail closed)。
+        for ty in [T::Q8_0, T::Q4K, T::Q5K] {
+            assert!(pf_tc_sn3_eligible(ty, 512, 2560, 640, 1), "{ty:?} gate");
+        }
+        assert!(pf_tc_sn3_eligible(T::Q8_0, 512, 640, 2560, 1), "Q8_0 down");
+        assert!(pf_tc_sn3_eligible(T::Bf16, 512, 640, 2560, 1), "BF16 down");
+        assert!(
+            !pf_tc_sn3_eligible(T::Q4K, 512, 640, 2560, 1),
+            "k=640 は 256 の倍数でないので Q4_K は不可"
+        );
+        // hc mix の実形 (down = 10240→320 / up = 320→10240、重みは BF16)。
+        assert!(pf_tc_sn3_eligible(T::Bf16, 512, 10240, 320, 1));
+        assert!(pf_tc_sn3_eligible(T::Bf16, 512, 320, 10240, 1));
+        // sn2 と同じ型 (Q8_0 / Q4_K) は sn3 でも通る (置き換え可能)。
+        assert!(pf_tc_sn3_eligible(T::Q4K, 512, 2560, 640, 1));
+        // 19 トークンの next turn prefill は従来経路 (64 行の下限)。
+        assert!(!pf_tc_sn3_eligible(T::Bf16, 19, 10240, 320, 1));
+        assert!(pf_tc_sn3_eligible(T::Bf16, 64, 10240, 320, 64));
+        // 64 の倍数でない出力行・未対応の型・k の倍数ずれは fail closed。
+        assert!(!pf_tc_sn3_eligible(T::Bf16, 512, 10240, 4, 1), "inject (n=4)");
+        assert!(!pf_tc_sn3_eligible(T::Q8_0, 512, 2560, 100, 1), "n_out=100");
+        assert!(!pf_tc_sn3_eligible(T::Q6K, 512, 2560, 640, 1), "Q6_K は対象外");
+        assert!(!pf_tc_sn3_eligible(T::Q4K, 512, 2559, 640, 1), "k が 256 の倍数でない");
+        assert!(
+            !pf_tc_sn3_eligible(T::Bf16, 512, 10241, 320, 1),
+            "BF16 の k が 32 の倍数でない"
+        );
+        // task 222: shared の down (N=2560) は tc2 (BM=128) の担当。
+        // gate/up (N=640) は対象外 (並列度が落ちる)。
+        assert!(pf_tc_shared4_eligible(T::Q8_0, 512, 640, 2560, 1), "down 2560");
+        assert!(
+            !pf_tc_shared4_eligible(T::Q8_0, 512, 2560, 640, 1),
+            "gate/up の 640 は tc2 にしない"
+        );
+        assert!(
+            !pf_tc_shared4_eligible(T::Q8_0, 512, 10240, 320, 1),
+            "mix の 320 は tc2 にしない"
+        );
+        assert!(
+            !pf_tc_shared4_eligible(T::Bf16, 512, 640, 2560, 1),
+            "BF16 は tc2 の型に無い"
+        );
     }
 
     /// task 175: テンソルコア経路の選択は **型** も見る。
@@ -21677,6 +22220,19 @@ pub fn pf_mix(
                     return Ok(());
                 }
             }
+            // task 222: BF16 の down / up をテンソルコアの GEMM で回す
+            // (`DENNO_PF_MIX_TC`。既定 off)。形は実モデルで
+            // down: k=10240 n=320 / up: k=320 n=10240。
+            if pf_mix_tc_on()
+                && kind == PfWKind::Bf16
+                && pf_tc_sn3_eligible(crate::kquant::GgmlType::Bf16, nt, kk, nn, 1)
+            {
+                if let Some(fns) = tc_sn3_kernels() {
+                    let ty = crate::kquant::GgmlType::Bf16;
+                    return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, kk * 2)
+                        .map_err(|e| format!("mix_tc gemm launch: {e:#}"));
+                }
+            }
             // task 195: down / up を n 方向に細かく割るカーネル
             // (`DENNO_PF_MIX_SPLIT`。値は従来カーネルとビット一致)。
             if mix_split_on() && mix_split_ok(kk, nn, nt, kind == PfWKind::Bf16) {
@@ -23064,6 +23620,56 @@ pub fn pf_full_qkv_fused(
     }
 }
 
+/// task 222: `DENNO_PF_ATTN_TC` の値の解釈 (純関数)。明示的な偽値だけ off。
+///
+/// **既定 on** (lab t222b で採用): 14,018 の full の gpu が 2,184 → 1,636 ms、
+/// 3,826 で 236 → 193 ms、cold prefill 14,018 が -1.9%、decode と next turn は
+/// 変わらず、errors 0・text sane。attention は P17g の緩和枠なので md5 は
+/// スコアの BF16 丸めで変わる。
+pub(crate) fn pf_attn_tc_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
+}
+
+/// prefill の attention を v2 カーネル (bf16 mma + 4x16 の PV) で回すか
+/// (**既定 on**。`0` で切る)。
+pub(crate) fn pf_attn_tc_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_ATTN_TC_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_attn_tc_from_value(std::env::var("DENNO_PF_ATTN_TC").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_ATTN_TC_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_attn_tc_for_test(v: Option<bool>) {
+    PF_ATTN_TC_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// v2 カーネルの静的共有メモリ (`kernels_attn_pf2.cu` の A2_SMEM_BYTES と一致)。
+pub(crate) const ATTN_PF2_SMEM_BYTES: usize = 92_928;
+/// v2 カーネルが前提にする head 次元 (`kernels_attn_pf2.cu` のスレッド配置)。
+pub(crate) const ATTN_PF2_DH: usize = 256;
+/// v2 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid x の分母)。
+pub(crate) const ATTN_PF2_BQ: usize = 64;
+
 /// task 172: full 層 1 チャンクの後半 (attention → 出力ゲート → 出力投影)。
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
@@ -23174,7 +23780,12 @@ pub fn pf_full_out(
             let ob = d.o.as_ref().expect("ensure 済み");
             // 1. attention (K/V はミラー、q はデバイス)
             {
-                let shmem = (attn_pf_sh_f(dh) * 4) as u32;
+                // task 222: v2 カーネル (スコアを bf16 mma) が使える形ならそちら。
+                // 形は dh == 256 固定 (スレッド配置)・PTX があること・ゲート on。
+                let use_v2 = pf_attn_tc_on()
+                    && dh == ATTN_PF2_DH
+                    && qd == heads * dh
+                    && !ctx.f_attn_pf2.is_null();
                 let (mut qp, mut kp, mut vp, mut ap) =
                     (qb.ptr(), kptr, vptr, attb.ptr());
                 let (mut heads_c, mut n_c, mut pos0_c) =
@@ -23200,14 +23811,26 @@ pub fn pf_full_out(
                     &mut dh_c as *mut _ as *mut c_void,
                     &mut scale_c as *mut _ as *mut c_void,
                 ];
-                unsafe {
-                    ctx.launch_async(
-                        ctx.f_attn_pf,
-                        (nt.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
-                        (dh as u32, 1, 1),
-                        shmem,
-                        &mut args,
-                    )?;
+                if use_v2 {
+                    unsafe {
+                        ctx.launch_async(
+                            ctx.f_attn_pf2,
+                            (nt.div_ceil(ATTN_PF2_BQ) as u32, heads as u32, 1),
+                            (dh as u32, 1, 1),
+                            ATTN_PF2_SMEM_BYTES as u32,
+                            &mut args,
+                        )?;
+                    }
+                } else {
+                    unsafe {
+                        ctx.launch_async(
+                            ctx.f_attn_pf,
+                            (nt.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
+                            (dh as u32, 1, 1),
+                            (attn_pf_sh_f(dh) * 4) as u32,
+                            &mut args,
+                        )?;
+                    }
                 }
             }
             // 2. 出力ゲート (att *= sigmoid(gate))

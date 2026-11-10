@@ -7314,6 +7314,334 @@ fn pf_sn2_gemm_is_bf16_mma_and_q4k() {
 }
 
 // ---------------------------------------------------------------------------
+// task 222: shared expert の Q5_K と hc mix の BF16 を同じタイルに載せる版
+// (`kernels_gemm_sn3.cu`)
+// ---------------------------------------------------------------------------
+
+const SN3_SRC: &str = include_str!("../kernels/kernels_gemm_sn3.cu");
+
+/// タイル定数・共有メモリ・起動形状がホスト (cuda.rs) と一致すること。
+///
+/// タイルは sn2 と同じ (lab t183a で検証済みの並列度) でなければならない。
+#[test]
+fn pf_sn3_gemm_tile_matches_host() {
+    let d = defines(SN3_SRC);
+    let bm = eval_define("SN3_BM", &d);
+    let bn = eval_define("SN3_BN", &d);
+    let bk = eval_define("SN3_BK", &d);
+    let ld = eval_define("SN3_LD", &d);
+    let thr = eval_define("SN3_THREADS", &d);
+    let smem_def = eval_define("SN3_SMEM_BYTES", &d);
+    assert_eq!(bm, 64, "SN3_BM が sn2 と違う (shared の並列度が変わる)");
+    assert_eq!(bn, 64, "SN3_BN が sn2 と違う (N=640 / 320 の並列度の根拠)");
+    assert_eq!(bk, 32, "SN3_BK が 32 でない");
+    assert_eq!(ld, 40, "SN3_LD が 40 でない (32 + 8 の詰め物)");
+    assert_eq!(thr, 256, "SN3_THREADS が 256 でない");
+    assert_eq!(rust_const("SN3_BM"), bm, "cuda.rs の SN3_BM が不一致");
+    assert_eq!(rust_const("SN3_BN"), bn, "cuda.rs の SN3_BN が不一致");
+    assert_eq!(rust_const("SN3_BK"), bk, "cuda.rs の SN3_BK が不一致");
+    assert_eq!(
+        rust_const("SN3_SMEM_BYTES"),
+        smem_def,
+        "cuda.rs の SN3_SMEM_BYTES が不一致"
+    );
+    assert_eq!(
+        rust_const("SN3_MAX_TOKENS"),
+        2048,
+        "まとめ幅が sn2 / tc2 と違う (gemm_try の分割規則が変わる)"
+    );
+    let expect_smem = 2 * bn * ld * 2 + 2 * bm * ld * 2;
+    assert_eq!(expect_smem, smem_def, "SN3_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect_smem <= 48 * 1024,
+        "静的共有メモリ {expect_smem} B が 48 KiB を超える"
+    );
+    assert_eq!(eval_define("SN3_SW_ELEMS", &d), 2 * bn * ld);
+    assert_eq!(eval_define("SN3_SX_ELEMS", &d), 2 * bm * ld);
+    // 起動形状: 1 ブロックの列範囲は BN、行は BM。
+    assert!(
+        SN3_SRC.contains("const int n0 = blockIdx.x * SN3_BN;")
+            && SN3_SRC.contains("const int m0 = blockIdx.y * SN3_BM;"),
+        "1 ブロックのタイル範囲が SN3_BN / SN3_BM でない"
+    );
+    assert!(
+        CUDA_RS.contains("let grid_x = (n_out / SN3_BN) as u32;"),
+        "ホストの grid x が SN3_BN で割っていない"
+    );
+    assert!(
+        CUDA_RS.contains("ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;")
+            && CUDA_RS.contains("let grid_y = m.div_ceil(SN3_BM) as u32;"),
+        "sn3 の起動形状がカーネルの前提と違う"
+    );
+}
+
+/// 4 つの型の入口・BF16 の読み方・Q5_K の 5bit 目の取り方・2 段プリフェッチ。
+#[test]
+fn pf_sn3_gemm_covers_q5k_and_bf16() {
+    for name in [
+        "dno_gemm_sn3_q8_0_w",
+        "dno_gemm_sn3_q4k_w",
+        "dno_gemm_sn3_q5k_w",
+        "dno_gemm_sn3_bf16_w",
+    ] {
+        assert!(
+            SN3_SRC.contains(&format!("extern \"C\" __global__ void {name}(")),
+            "入口 {name} が無い"
+        );
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+    }
+    // BF16 は 1 要素 2 バイトを上位 16 bit に置く (dno_bf16_to_f32 と同じ意味)。
+    assert!(
+        SN3_SRC.contains("const unsigned char* p = row + (size_t)(k0 + j) * 2u;")
+            && SN3_SRC.contains("v[u] = __uint_as_float(h << 16);"),
+        "BF16 の行読みが 2 バイト / 上位 16 bit になっていない"
+    );
+    // Q5_K は Q4_K の nibble + qh の 5bit 目 (tc2 と同じ取り方)。
+    assert!(
+        SN3_SRC.contains("(TY == 1 ? 144u : 176u)")
+            && SN3_SRC.contains("(TY == 1 ? 16u : 48u)")
+            && SN3_SRC.contains("qv += (int)(((unsigned int)blk[16 + j + u] >> sub) & 1u) << 4;"),
+        "Q5_K のブロック配置 / 5bit 目の取り方が tc2 と違う"
+    );
+    assert!(
+        SN3_SRC.contains("wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>")
+            && SN3_SRC
+                .contains("wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>"),
+        "A が row_major / B が col_major の 16x16x16 bf16 でない"
+    );
+    // 2 段プリフェッチ: 読む → mma → 書く の順。
+    let loop_at = SN3_SRC
+        .find("for (int k = 0; k < kb; ++k)")
+        .expect("k ループが無い");
+    let body = &SN3_SRC[loop_at..];
+    let load_w = body
+        .find("dno_sn3_load_w<TY>(")
+        .expect("ループ内に重みの先読みが無い");
+    let mma = body.find("wmma::mma_sync(").expect("ループ内に mma が無い");
+    let store = body
+        .find("dno_sn3_store8(sW + nxt")
+        .expect("ループ内に smem への書き込みが無い");
+    assert!(
+        load_w < mma && mma < store,
+        "プリフェッチの順序が「読む → mma → 書く」でない (レイテンシが隠れない)"
+    );
+    // build_ptx.sh: compute_90 で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("gemm_sn3)     echo \"kernels_gemm_sn3.cu|fmad|compute_90\""),
+        "build_ptx.sh の gemm_sn3 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gemm_sn3"),
+        "build_ptx.sh の targets_all に gemm_sn3 が無い: {targets}"
+    );
+}
+
+/// 3 本は lab t222b で採用して既定 on・sh4 は既定 off。配線も見る。
+#[test]
+fn pf222_sn3_gates_are_wired_and_default_on() {
+    // 純関数の既定は lib 側の `pf_sn3_gate_truth_table` が固定する。
+    // ここでは「明示的な偽値で切れる形」と env 名の実在を見る。
+    for (fname, env, default_on) in [
+        ("pf_tc_shared3_from_value", "DENNO_PF_TC_SHARED3", true),
+        ("pf_mix_tc_from_value", "DENNO_PF_MIX_TC", true),
+        ("pf_tc_shared4_from_value", "DENNO_PF_TC_SHARED4", false),
+    ] {
+        let at = CUDA_RS
+            .find(&format!("pub(crate) fn {fname}("))
+            .unwrap_or_else(|| panic!("{fname} が無い"));
+        let body = &CUDA_RS[at..];
+        let end = body.find("\n}").expect("関数の終わりが無い");
+        let body = &body[..end];
+        assert!(
+            body.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+            "{fname} が明示的な真値を受ける形でない"
+        );
+        if default_on {
+            assert!(body.contains("None => true"), "{fname} の既定が on でない");
+        } else {
+            assert!(
+                !body.contains("None => true") && !body.contains("_ => true"),
+                "{fname} の既定が on になっている"
+            );
+        }
+        // ゲートは env から読む (強制はテスト用の static)。
+        assert!(
+            CUDA_RS.contains(&format!("std::env::var(\"{env}\")")),
+            "{env} を env から読んでいない"
+        );
+    }
+    // shared: sh4 (tc2, N>=2048) → sn3 → sn2 → 従来の順で、sn3 が sn2 より先。
+    let shared_at = CUDA_RS
+        .find("fn pf2_gemm_shared(")
+        .expect("pf2_gemm_shared が無い");
+    let shared = &CUDA_RS[shared_at..];
+    let sh4_at = shared
+        .find("pf_tc_shared4_on() && pf_tc_shared4_eligible(")
+        .expect("shared に sh4 の分岐が無い");
+    let sn3_at = shared
+        .find("pf_tc_shared3_on() && pf_tc_sn3_eligible(")
+        .expect("shared に sn3 の分岐が無い");
+    let sn2_at = shared
+        .find("pf_tc_shared2_on() && pf_tc_smalln2_eligible(")
+        .expect("shared に sn2 の分岐が無い");
+    assert!(
+        sh4_at < sn3_at && sn3_at < sn2_at,
+        "shared の分岐順が sh4 → sn3 → sn2 でない"
+    );
+    // mix: BF16 の down / up を sn3 に渡していること。
+    assert!(
+        CUDA_RS.contains("if pf_mix_tc_on()")
+            && CUDA_RS.contains("&& kind == PfWKind::Bf16")
+            && CUDA_RS.contains("return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, kk * 2)"),
+        "mix の BF16 経路が sn3 に繋がっていない"
+    );
+    // 入力の下限: 64 行未満 (19 トークンの next turn) は従来経路のまま。
+    assert!(
+        CUDA_RS.contains("&& nt >= min_m.max(SN3_BM)"),
+        "sn3 の行数の下限が SN3_BM でない"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 222: prefill attention v2 (`kernels_attn_pf2.cu`)
+// ---------------------------------------------------------------------------
+
+const ATTN_PF2_SRC: &str = include_str!("../kernels/kernels_attn_pf2.cu");
+
+/// タイル定数・共有メモリ・スレッド配置がホスト (cuda.rs) と一致すること。
+#[test]
+fn pf222_attn_pf2_tile_matches_host() {
+    let d = defines(ATTN_PF2_SRC);
+    let bq = eval_define("A2_BQ", &d);
+    let bk = eval_define("A2_BK", &d);
+    let qd = eval_define("A2_QD", &d);
+    let vd = eval_define("A2_VD", &d);
+    let thr = eval_define("A2_THREADS", &d);
+    let smem = eval_define("A2_SMEM_BYTES", &d);
+    assert_eq!(bq, 64, "A2_BQ が 64 でない");
+    assert_eq!(bk, 32, "A2_BK が 32 でない (8 から 4 倍にして同期を減らす)");
+    assert_eq!(thr, 256, "A2_THREADS が 256 でない");
+    // 行ストライドは bf16 の ldmatrix (8 の倍数) と float4 (4 の倍数) の条件。
+    assert_eq!(qd, 264, "A2_QD が 264 でない (256 + 8 の詰め物)");
+    assert_eq!(vd, 260, "A2_VD が 260 でない (256 + 4 の詰め物)");
+    assert_eq!(qd % 8, 0, "bf16 の ld が 8 の倍数でない");
+    assert_eq!(vd % 4, 0, "f32 の float4 ld が 4 の倍数でない");
+    // smem の合計 = q + k + v + s + corr + mst + lst。
+    let expect = bq * qd * 2 + bk * qd * 2 + bk * vd * 4 + bq * bk * 4 + 3 * bq * 4;
+    assert_eq!(expect, smem, "A2_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect < 99 * 1024,
+        "動的 smem {expect} B が実機の opt-in 上限 (99KB) を超える"
+    );
+    // ホスト側のミラー。
+    assert_eq!(rust_const("ATTN_PF2_SMEM_BYTES"), smem, "cuda.rs と不一致");
+    assert_eq!(rust_const("ATTN_PF2_BQ"), bq, "cuda.rs の ATTN_PF2_BQ が不一致");
+    assert_eq!(rust_const("ATTN_PF2_DH"), 256, "ATTN_PF2_DH が 256 でない");
+    // スレッド配置: 16 行群 x 16 次元群 = 256。
+    assert!(
+        ATTN_PF2_SRC.contains("const int a = tid >> 4;   // 0..15 (行群)")
+            && ATTN_PF2_SRC.contains("const int b = tid & 15;   // 0..15 (次元群)")
+            && ATTN_PF2_SRC.contains("for (int r = 0; r < 4; ++r)"),
+        "4 行 x 16 次元のスレッド配置が変わった"
+    );
+    // スコアは bf16 の wmma、K は col_major (行 = キー) で読む。
+    assert!(
+        ATTN_PF2_SRC.contains(
+            "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;"
+        ),
+        "K を col_major の bf16 で読んでいない"
+    );
+    // PV は明示 fmaf で kk 昇順 (従来カーネルと同じ加算順)。
+    assert!(
+        ATTN_PF2_SRC.contains("acc[r][d] = fmaf(p, vv[d], acc[r][d]);"),
+        "PV が fmaf の昇順累積でない"
+    );
+    // causal マスクの規則 (i >= n は 0、範囲外は -inf)。
+    assert!(
+        ATTN_PF2_SRC.contains("} else if (j < t_total && j <= pos0 + i) {")
+            && ATTN_PF2_SRC.contains("s = -INFINITY;"),
+        "causal マスクの規則が従来カーネルと違う"
+    );
+    // build_ptx.sh: compute_90 (bf16 mma) で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("attn_pf2)     echo \"kernels_attn_pf2.cu|nofmad|compute_90\""),
+        "build_ptx.sh の attn_pf2 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("attn_pf2"),
+        "build_ptx.sh の targets_all に attn_pf2 が無い: {targets}"
+    );
+}
+
+/// ゲートが既定 on (lab t222b で採用) で、`pf_full_out` の起動が v2 と従来で切り替わること。
+#[test]
+fn pf222_attn_pf2_gate_is_wired_and_default_on() {
+    let at = CUDA_RS
+        .find("pub(crate) fn pf_attn_tc_from_value(")
+        .expect("pf_attn_tc_from_value が無い");
+    let body = &CUDA_RS[at..];
+    let end = body.find("\n}").expect("関数の終わりが無い");
+    let body = &body[..end];
+    assert!(
+        body.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+        "明示的な真値を受ける形でない"
+    );
+    assert!(
+        body.contains("None => true"),
+        "既定が on でない (lab t222b で採用)"
+    );
+    assert!(
+        CUDA_RS.contains("std::env::var(\"DENNO_PF_ATTN_TC\")"),
+        "DENNO_PF_ATTN_TC を env から読んでいない"
+    );
+    // 起動の切り替え: ゲートと形 (dh) と PTX の有無を見て、ダメなら従来カーネルへ。
+    assert!(
+        CUDA_RS.contains("let use_v2 = pf_attn_tc_on()")
+            && CUDA_RS.contains("&& dh == ATTN_PF2_DH")
+            && CUDA_RS.contains("&& !ctx.f_attn_pf2.is_null();"),
+        "pf_full_out が v2 の形 (dh / PTX) を検査していない"
+    );
+    // 従来カーネルへの切り戻しが else 側に残っていること。
+    assert!(
+        CUDA_RS.contains("ctx.f_attn_pf2,")
+            && CUDA_RS.contains("(attn_pf_sh_f(dh) * 4) as u32,"),
+        "v2 が使えないときの従来カーネルへの切り戻しが無い"
+    );
+    // PTX 名と引数 (12 個) の一致。
+    assert!(
+        CUDA_RS.contains("b\"dno_attention_prefill2\\0\""),
+        "cuda.rs が dno_attention_prefill2 を読んでいない"
+    );
+    let sig = ATTN_PF2_SRC
+        .find("extern \"C\" __global__ void dno_attention_prefill2(")
+        .expect("入口が無い");
+    let head = &ATTN_PF2_SRC[sig..];
+    let head = &head[..head.find(')').expect("引数リストが閉じない")];
+    // 行コメントを落としてから , を数える (コメント内の , を拾わない)。
+    let code: String = head
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let nargs = code.matches(',').count();
+    assert_eq!(nargs, 11, "引数の数が従来カーネル (12 個) と違う");
+}
+
+// ---------------------------------------------------------------------------
 // task 183: 融合 qkv の後処理 (`kernels_pf3.cu`)
 // ---------------------------------------------------------------------------
 

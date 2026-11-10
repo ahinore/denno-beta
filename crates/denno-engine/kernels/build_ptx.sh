@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -96,9 +96,18 @@ spec() {
         # (shared expert の 40 ブロック → 80 ブロック)。数値は sn と同じ
         # (k 昇順のアキュムレート) で、タイルの切り方だけが違う。
         gemm_sn2)     echo "kernels_gemm_sn2.cu|fmad|compute_90" ;;
+        # task 222: sn2 のタイルのまま重みの型を Q5_K / BF16 まで広げた版。
+        # shared expert の Q5_K (12 本) と hc mix の BF16 (down / up) を
+        # テンソルコアに載せる。bf16 の mma が要るので arch は compute_90。
+        # 数値契約は無し (prefill の射影 / mix はビット一致契約の外)。
+        gemm_sn3)     echo "kernels_gemm_sn3.cu|fmad|compute_90" ;;
         # task 183: 融合 qkv 1 本の GEMM の後処理 (出力ゲートと行の gather)。
         # CPU 参照と 1 演算 1 丸めを合わせるため -fmad=false (明示 __*_rn のみ)。
         pf3)          echo "kernels_pf3.cu|nofmad" ;;
+        # task 222: prefill attention v2 (スコアを bf16 の wmma、PV を 4 行 x 16 次元
+        # のレジスタタイル)。bf16 の mma が要るので arch は compute_90。
+        # 丸めは要素ごとに読めるように -fmad=false (PV は明示 fmaf)。
+        attn_pf2)     echo "kernels_attn_pf2.cu|nofmad|compute_90" ;;
         # task 184: decode の GEMV をベクタロード + 複数アキュムレータ +
         # 次ブロック先読みで回す第 5 版 (Q8_0 / Q4_K)。dequant の演算列は
         # v3 / v4 と同じにするため -fmad=false。
