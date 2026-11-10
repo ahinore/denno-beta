@@ -642,6 +642,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_miss_up::stats_reset();
+    // task 214: 背景スレッドの上げ直し (`DENNO_DEC_UP_WORKER` のときだけ 1 行)。
+    if let Some(line) = denno_engine::model::exp_up_worker::stats_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_up_worker::stats_reset();
     if !q4prof::enabled() {
         return;
     }
