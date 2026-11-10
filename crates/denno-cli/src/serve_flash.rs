@@ -1929,6 +1929,12 @@ impl Drop for StatsSaveOnExit {
 pub fn run(cfg: FlashConfig) -> Result<()> {
     // task 119b: プールの初回使用 (モデル読み込み) の前に既定スレッド数を決める。
     ensure_rayon_pool();
+    // task 213: 既定 on のゲートが必要とする PTX を起動時に監査する。
+    // PTX が無いとその機能は**静かに**従来経路へ落ちる (REPORT_P204 の fold/upw)。
+    // 起動は止めず、summary 1 行 + 欠落ごとに 1 行を出す。
+    for line in denno_engine::gate_audit::audit_lines() {
+        eprintln!("{line}");
+    }
     let parts = shards(&cfg.dir)?;
     eprintln!(
         "[flash] {} 分割ファイル: {:?}",

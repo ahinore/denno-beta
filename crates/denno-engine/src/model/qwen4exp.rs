@@ -4373,7 +4373,7 @@ static DEC_SHARED_DEV_OVERRIDE: std::sync::atomic::AtomicU8 =
 
 /// [`dec_shared_dev_from_value`] をプロセスで 1 回だけ読む。
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn dec_shared_dev_enabled() -> bool {
+pub(crate) fn dec_shared_dev_enabled() -> bool {
     use std::sync::atomic::Ordering;
     match DEC_SHARED_DEV_OVERRIDE.load(Ordering::Relaxed) {
         1 => return false,
@@ -4444,7 +4444,7 @@ fn dec_exp_sumdev_from_value(v: Option<&str>) -> bool {
 }
 
 /// [`dec_exp_sumdev_from_value`] をプロセスで 1 回だけ読む。
-fn dec_exp_sumdev_enabled() -> bool {
+pub(crate) fn dec_exp_sumdev_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         dec_exp_sumdev_from_value(std::env::var("DENNO_DEC_EXP_SUMDEV").ok().as_deref())
@@ -4933,7 +4933,39 @@ fn hc_mix_quant_fast(
     {
         let mut m = vec![0.0f32; e];
         let mut ij = vec![0.0f32; hp.hc];
-        let inj_arg = inject.map(|w| (w.uid(), w.k(), w.n(), w.blocks().as_slice()));
+        // task 216: inj をホストで先に作る (`DENNO_DEC_MIX_INJHOST`)。
+        // GPU の鎖 (norm → down → up → mixed) が走っている間に CPU で
+        // grouped RMS + inj GEMV を済ませる。GPU の inj カーネル 1 本と、その
+        // 分の待ちが消える (ホストは同期で遊んでいるので重ねられる)。
+        // 値は GPU の inj と 1 ビットも変わらない契約 (同じ xn・同じ k 昇順)。
+        let inj_host: Option<Vec<f32>> = match inject {
+            Some(w)
+                if crate::cuda::dec_mix_injhost_on()
+                    && matches!(
+                        w.ty(),
+                        crate::kquant::GgmlType::F32
+                            | crate::kquant::GgmlType::F16
+                            | crate::kquant::GgmlType::Bf16
+                    ) =>
+            {
+                let mut v = vec![0.0f32; w.n()];
+                MIX_SCRATCH.with(|cell| -> Result<()> {
+                    let mut b = cell.borrow_mut();
+                    let xnb = MixScratch::take(&mut b.xn, hc_dim);
+                    hyper::grouped_rms_norm_batch_into(std::slice::from_ref(res), norm, xnb, hp);
+                    w.gemv_label("hc_inject", xnb, &mut v)
+                        .map_err(|err| one(format!("hc_mix inject (host): {err}")))
+                })?;
+                hyper::hc_inject_apply(&mut v, hp);
+                Some(v)
+            }
+            _ => None,
+        };
+        let inj_arg = if inj_host.is_some() {
+            None
+        } else {
+            inject.map(|w| (w.uid(), w.k(), w.n(), w.blocks().as_slice()))
+        };
         if crate::cuda::maybe_gpu_mix_bf16_chain3_into(
             down.uid(),
             down.blocks().as_slice(),
@@ -4953,7 +4985,11 @@ fn hc_mix_quant_fast(
             &mut m,
             &mut ij,
         ) {
-            hyper::hc_inject_apply(&mut ij, hp);
+            if let Some(v) = inj_host {
+                ij = v;
+            } else {
+                hyper::hc_inject_apply(&mut ij, hp);
+            }
             mix_kprof::mark(t_all, mix_kprof::TOTAL);
             mix_kprof::bump_call();
             return Ok((m, ij));
