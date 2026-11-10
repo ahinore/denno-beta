@@ -469,6 +469,95 @@ pub fn stream_wc() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// task 227: 転送 (写し + DMA) の詰まりを取るための 3 本
+// ---------------------------------------------------------------------------
+//
+// 台帳 (REPORT_P226 §2) では 14k の転送 14.76 s のうち写しが 5.90 s、
+// H2D のブロックが 8.85 s。どちらも同じホストメモリ帯域を食い、しかも
+// **1 グループ = 「全部写す → 1 回 DMA → 待つ」の直列**なので、
+// バイトを減らしても時間が動かなかった。以下は独立に切り替えられる。
+
+/// `DENNO_PF_STREAM_CHUNK_KB`: バウンスと DMA を何 KB ずつ交互に流すか
+/// (0 = 従来どおりグループ全体を 1 回で写して 1 回で DMA)。
+///
+/// 小さく刻むと、DMA が読むバイトが L3 (16 MB) / L2 に残っている間に
+/// 流せる可能性がある (推定。lab で測る)。値は 64 KiB..65536 KiB に丸める。
+pub const STREAM_CHUNK_KB_ENV: &str = "DENNO_PF_STREAM_CHUNK_KB";
+
+/// [`STREAM_CHUNK_KB_ENV`] の既定値 (0 = 従来の直列)。
+pub const DEFAULT_STREAM_CHUNK_KB: usize = 0;
+
+/// 1 回に流すバイト数 (0 = 従来経路)。
+pub fn stream_chunk_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let kb = env_usize(STREAM_CHUNK_KB_ENV, DEFAULT_STREAM_CHUNK_KB);
+        if kb == 0 {
+            return 0;
+        }
+        kb.clamp(64, 65536) << 10
+    })
+}
+
+/// `DENNO_PF_STREAM_SRC`: DMA の転送元。
+///
+/// - `pin` (既定): mmap → WC pinned のバウンスを挟む (task 162 の経路)
+/// - `page`: mmap のページをそのまま pageable として DMA する (写しを消す。
+///   driver が内部でバウンスする。ホスト側は呼び出しの間ブロックする)
+/// - `reg`: mmap のページを `cuMemHostRegister` で pin して直接 DMA する
+///   (写しを消し、DMA も pinned 速度。driver が file backed を拒否したら
+///   スライス単位で `page` へ落ちる)
+pub const STREAM_SRC_ENV: &str = "DENNO_PF_STREAM_SRC";
+
+/// [`STREAM_SRC_ENV`] の既定値 (0 = pin バウンス)。
+pub const DEFAULT_STREAM_SRC: u8 = 0;
+
+/// 転送元の解釈 (純関数)。未知の値は既定 (pin) に落とす。
+pub fn stream_src_from_value(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("page") => 1,
+        Some("reg") => 2,
+        _ => DEFAULT_STREAM_SRC,
+    }
+}
+
+/// 転送元 (`DENNO_PF_STREAM_SRC`、プロセスで 1 回だけ読む)。
+pub fn stream_src() -> u8 {
+    static N: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *N.get_or_init(|| stream_src_from_value(std::env::var(STREAM_SRC_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_REG_MB`: `DENNO_PF_STREAM_SRC=reg` で pin する上限 (MiB、既定 16384)。
+///
+/// pin したページはカーネルが回収できないので、モデル全体 (約 50 GB) を
+/// pin すると RAM が足りなくなる。上限を超えたぶんは pageable で積む。
+pub const REG_MB_ENV: &str = "DENNO_PF_REG_MB";
+
+/// [`REG_MB_ENV`] の既定値 (MiB)。
+pub const DEFAULT_REG_MB: usize = 16384;
+
+/// pin してよいバイト数。
+pub fn reg_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(REG_MB_ENV, DEFAULT_REG_MB).saturating_mul(1 << 20))
+}
+
+/// `DENNO_PF_DMA_PROBE=1`: prefill の先頭で 1 回だけ H2D の素の速度を測る
+/// (診断専用・既定 off)。測るのは `[pf-probe]` の 1 行群で、数値経路は変えない。
+pub const DMA_PROBE_ENV: &str = "DENNO_PF_DMA_PROBE";
+
+/// `DENNO_PF_DMA_PROBE` の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn dma_probe_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 素の H2D を測るか (プロセスで 1 回だけ env を読む)。
+pub fn dma_probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dma_probe_from_value(std::env::var(DMA_PROBE_ENV).ok().as_deref()))
+}
+
 /// 型 → カーネルのスロット (decode の `kernels_exp_iq` と同じ順)。
 pub fn slot(ty: GgmlType) -> Option<usize> {
     crate::model::exp_iq::slot(ty)
@@ -751,6 +840,24 @@ static STREAM_SPILL: AtomicU64 = AtomicU64::new(0);
 static STREAM_CPU_MISS_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 最初のグループで測った実 H2D 速度 (GB/s × 1000、0 = 未測)。
 static STREAM_PROBE_MBPS: AtomicU64 = AtomicU64::new(0);
+/// task 227: `cuMemHostRegister` を試したバイト数 / 通ったバイト数 / 回数 / 時間。
+static REG_BYTES: AtomicU64 = AtomicU64::new(0);
+static REG_OK_BYTES: AtomicU64 = AtomicU64::new(0);
+static REG_CALLS: AtomicU64 = AtomicU64::new(0);
+static REG_NS: AtomicU64 = AtomicU64::new(0);
+/// task 227: 通ったフラグ (u32::MAX = まだ通っていない)。
+static REG_FLAGS: AtomicU64 = AtomicU64::new(u32::MAX as u64);
+
+/// task 227: `cuMemHostRegister` の 1 回ぶんを積む。
+pub fn note_reg(bytes: usize, ok: bool, ns: u64, flags: u32) {
+    REG_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    REG_CALLS.fetch_add(1, Ordering::Relaxed);
+    REG_NS.fetch_add(ns, Ordering::Relaxed);
+    if ok {
+        REG_OK_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        REG_FLAGS.store(flags as u64, Ordering::Relaxed);
+    }
+}
 
 /// 1 層ぶんの参照を積む (`lookups` = 選択 expert 数、`hits` = 載っていた数)。
 pub fn note_lookup(lookups: u32, hits: u32) {
@@ -925,7 +1032,8 @@ pub fn stats_line() -> Option<String> {
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={}",
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={} \
+             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -940,6 +1048,13 @@ pub fn stats_line() -> Option<String> {
             u8::from(stream_ut()),
             stream_group(),
             stream_min_tok(),
+            stream_chunk_bytes() >> 10,
+            stream_src(),
+            REG_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+            REG_OK_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+            REG_CALLS.load(Ordering::Relaxed),
+            REG_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            REG_FLAGS.load(Ordering::Relaxed) as u32,
         ));
     }
     Some(out)
@@ -973,6 +1088,10 @@ pub fn stats_reset() {
         &STREAM_SPILL,
         &STREAM_CPU_MISS_NS,
         &STREAM_PROBE_MBPS,
+        &REG_BYTES,
+        &REG_OK_BYTES,
+        &REG_CALLS,
+        &REG_NS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -1284,6 +1403,23 @@ mod tests {
         );
         assert!(stream_wc_from_value(true, Some(" on ")), "前後の空白は無視する");
         assert!(!stream_wc_from_value(true, Some("no")));
+        // task 227: 転送元の選択 (既定は pin = バウンス) と、素の H2D の探針。
+        assert_eq!(stream_src_from_value(None), DEFAULT_STREAM_SRC);
+        assert_eq!(stream_src_from_value(Some("")), DEFAULT_STREAM_SRC);
+        assert_eq!(stream_src_from_value(Some("pin")), 0);
+        assert_eq!(stream_src_from_value(Some("page")), 1);
+        assert_eq!(stream_src_from_value(Some("reg")), 2);
+        assert_eq!(stream_src_from_value(Some(" reg ")), 2, "前後の空白は無視する");
+        assert_eq!(stream_src_from_value(Some("bogus")), DEFAULT_STREAM_SRC);
+        assert_eq!(DEFAULT_STREAM_SRC, 0, "既定は従来のバウンス");
+        assert_eq!(DEFAULT_STREAM_CHUNK_KB, 0, "既定は従来の直列");
+        // task 227: 探針は明示的な真値だけ on。
+        assert!(!dma_probe_from_value(None));
+        assert!(!dma_probe_from_value(Some("")));
+        assert!(!dma_probe_from_value(Some("0")));
+        assert!(!dma_probe_from_value(Some("off")));
+        assert!(dma_probe_from_value(Some("1")));
+        assert!(dma_probe_from_value(Some(" on ")));
         assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
         // task 197: チャンク上書きは「明示した正の数だけ」効く。
         assert_eq!(chunk_override_from_value(None), None);

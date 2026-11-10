@@ -1846,6 +1846,11 @@ impl ExpertW {
         Ok(w)
     }
 
+    /// task 227: テンソル全体の mmap (診断のプローブが連続した転送元に使う)。
+    fn full(&self) -> &[u8] {
+        self.blocks.as_slice()
+    }
+
     /// expert `e` の 1 本ぶんのバイト範囲。
     fn slice(&self, e: usize) -> Result<&[u8]> {
         let s = ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, e)
@@ -13971,6 +13976,11 @@ fn iq_pf_stream_layer(
     let ne = by_expert.len();
     if ne == 0 || nt == 0 || k == 0 || weights.len() < nt * k {
         return Ok(None);
+    }
+    // task 227: 転送経路の素の速度を 1 回だけ測る (診断。既定 off)。
+    // ここに来るのは streaming が実際に走るときだけなので、GPU 文脈も出来ている。
+    if crate::model::exp_pf::dma_probe_on() {
+        crate::cuda::pf_dma_probe(lw.gate_exps.full());
     }
     // 行のある expert を **expert 昇順**に並べる (plan と同じ順)。
     let mut pick = vec![false; ne];

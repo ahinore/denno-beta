@@ -79,6 +79,13 @@ type FnCuMemcpyHtoDV2 = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) 
 type FnCuMemcpyDtoHV2 = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
 type FnCuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CUresult;
 type FnCuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CUresult;
+// task 227: mmap のページを**写さずに** DMA するための任意シンボル。
+// 古い driver や file backed の写像で失敗しても、呼び出し側がバウンス経路へ
+// 落ちるだけ (fail closed)。
+type FnCuMemHostRegisterV2 = unsafe extern "C" fn(*mut c_void, usize, u32) -> CUresult;
+type FnCuMemHostUnregister = unsafe extern "C" fn(*mut c_void) -> CUresult;
+type FnCuMemHostGetDevicePointerV2 =
+    unsafe extern "C" fn(*mut CUdeviceptr, *mut c_void, u32) -> CUresult;
 type FnCuMemcpyHtoDAsyncV2 =
     unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult;
 type FnCuMemcpyDtoHAsyncV2 =
@@ -138,6 +145,11 @@ struct CudaLib {
     memset_d32_async: FnCuMemsetD32Async,
     mem_host_alloc: FnCuMemHostAlloc,
     mem_host_free: FnCuMemFreeHost,
+    // task 227: mmap のページを直接 DMA する (写しを消す) ための 3 本。
+    // 無い/失敗する driver ではバウンス経路のまま。
+    mem_host_register: Option<FnCuMemHostRegisterV2>,
+    mem_host_unregister: Option<FnCuMemHostUnregister>,
+    mem_host_get_device_ptr: Option<FnCuMemHostGetDevicePointerV2>,
     memcpy_htod_async: FnCuMemcpyHtoDAsyncV2,
     memcpy_dtoh_async: FnCuMemcpyDtoHAsyncV2,
     memcpy_dtod_async: FnCuMemcpyDtoDAsyncV2,
@@ -488,6 +500,14 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         memset_d32_async: std::mem::transmute(sym(handle, "cuMemsetD32Async")?),
         mem_host_alloc: std::mem::transmute(sym(handle, "cuMemHostAlloc")?),
         mem_host_free: std::mem::transmute(sym(handle, "cuMemFreeHost")?),
+        mem_host_register: sym_opt(handle, "cuMemHostRegister_v2")
+            .or_else(|| sym_opt(handle, "cuMemHostRegister"))
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuMemHostRegisterV2>(p) }),
+        mem_host_unregister: sym_opt(handle, "cuMemHostUnregister")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuMemHostUnregister>(p) }),
+        mem_host_get_device_ptr: sym_opt(handle, "cuMemHostGetDevicePointer_v2")
+            .or_else(|| sym_opt(handle, "cuMemHostGetDevicePointer"))
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuMemHostGetDevicePointerV2>(p) }),
         memcpy_htod_async: {
             let p: FnCuMemcpyHtoDAsyncV2 =
                 std::mem::transmute(sym(handle, "cuMemcpyHtoDAsync_v2")?);
@@ -9648,21 +9668,23 @@ fn pf_slot_prepare(
         }
         ptrs.push(p);
     }
-    // 3. pinned のバウンス (grow-only) と、その中の置き場所。
+    // 3. バウンスの置き場所。task 227: 転送元が pin のときだけ確保する
+    //    (page / reg は mmap をそのまま DMA するので写しが要らない)。
+    //    置き場所 (parts) は 3 経路とも要るので常に作る。
     let mut parts: Vec<(usize, PfHostRange)> = Vec::with_capacity(items.len() * 3);
-    if pinned {
+    let mut cursor = 0usize;
+    for (i, (_, b)) in items.iter().enumerate() {
+        for m in 0..3 {
+            if !b[m].is_empty() {
+                parts.push((cursor, PfHostRange::of(b[m])));
+            }
+            cursor += pf_stage_align_up(lens[i][m]);
+        }
+    }
+    if pinned && exp_pf::stream_src() == 0 {
         let cap = st.pin[s].as_ref().map(|p| p.bytes).unwrap_or(0);
         if cap < need {
             st.pin[s] = Some(PinMem::alloc_flags(need.max(1), exp_pf::stream_wc())?);
-        }
-        let mut cursor = 0usize;
-        for (i, (_, b)) in items.iter().enumerate() {
-            for m in 0..3 {
-                if !b[m].is_empty() {
-                    parts.push((cursor, PfHostRange::of(b[m])));
-                }
-                cursor += pf_stage_align_up(lens[i][m]);
-            }
         }
     }
     Ok(PfSlotPlan {
@@ -9677,6 +9699,15 @@ fn pf_slot_prepare(
 /// グループ `g` をスロット `g % 3` へ上げる (計算スレッドが直列に行う経路)。
 ///
 /// **同じスロットを使った 2 つ前のグループの計算完了を待ってから**書き込む。
+///
+/// task 227: 転送元を 3 通りから選べる ([`exp_pf::stream_src`])。
+/// - `pin` (既定): mmap → pinned に写してから積む。`DENNO_PF_STREAM_CHUNK_KB` が
+///   正なら「小さい塊を写す → 積む」を交互に行う (DMA が読む頃にはホストの
+///   キャッシュに残っている、という仮説の検証)。
+/// - `page`: mmap のページをそのまま積む (写しが無い。driver が内部でバウンスし、
+///   呼び出しの間ホストはブロックする)。
+/// - `reg`: mmap のページを `cuMemHostRegister` で pin してから積む (写しが
+///   無く、DMA も pinned 速度。pin できなければ pageable として積む)。
 fn pf_pump_in(
     st: &mut PfStream,
     g: u64,
@@ -9685,7 +9716,6 @@ fn pf_pump_in(
 ) -> Result<PfPump> {
     let plan = pf_slot_prepare(st, g, items, pinned)?;
     let s = plan.slot;
-    let t_copy = std::time::Instant::now();
     let mut probe: Option<(usize, u64)> = None;
     let mut enq_ns = 0u64;
     if pinned {
@@ -9701,26 +9731,86 @@ fn pf_pump_in(
             }
         }
         let up = pf_up_stream(st)? as CUstream;
-        // 2. pinned へ並列に写してから、非同期で H2D を積む。
-        let pin_ptr = st.pin[s].as_ref().expect("確保済み").ptr;
-        pf_copy_into_pin(pin_ptr as usize, &plan.parts);
-        let copy_ns = t_copy.elapsed().as_nanos() as u64;
         let base = st.slot[s].buf.as_ref().expect("確保済み").ptr();
         let l = lib()?;
+        let src = exp_pf::stream_src();
+        let chunk = exp_pf::stream_chunk_bytes();
+        let t_copy = std::time::Instant::now();
         let t_dma = std::time::Instant::now();
         let t_enq = std::time::Instant::now();
-        // 3. **グループ全体を 1 回の非同期コピーで積む**。
-        //    行列ごとに分けると 1 グループ 96 回になり、`cuMemcpyHtoDAsync` の
-        //    呼び出し固定費が DMA の実時間を上回る (lab t162a)。
-        if plan.need > 0 {
-            unsafe {
-                check(
-                    (l.memcpy_htod_async)(base, pin_ptr, plan.need, up),
-                    "cuMemcpyHtoDAsync (stage)",
-                )?;
+        let mut copy_ns = 0u64;
+        let mut sent = 0usize;
+        if src == 0 {
+            let pin_ptr = st.pin[s].as_ref().expect("確保済み").ptr;
+            if chunk == 0 || plan.parts.is_empty() {
+                // 従来: 全部写してから **グループ全体を 1 回の非同期コピーで積む**。
+                // 行列ごとに分けると 1 グループ 96 回になり、`cuMemcpyHtoDAsync` の
+                // 呼び出し固定費が DMA の実時間を上回る (lab t162a)。
+                pf_copy_into_pin(pin_ptr as usize, &plan.parts);
+                copy_ns = t_copy.elapsed().as_nanos() as u64;
+                if plan.need > 0 {
+                    unsafe {
+                        check(
+                            (l.memcpy_htod_async)(base, pin_ptr, plan.need, up),
+                            "cuMemcpyHtoDAsync (stage)",
+                        )?;
+                    }
+                }
+                sent = plan.need;
+            } else {
+                // task 227: 塊ごとに「写す → 積む」。DMA は同じ up ストリームに
+                // 順に積まれるので、ホストの写しと DMA が重なる。
+                let spec: Vec<(usize, usize)> = plan
+                    .parts
+                    .iter()
+                    .map(|&(o, r)| (o, r.len))
+                    .collect();
+                let spans = pf_chunk_spans(&spec, chunk);
+                let mut done = 0usize;
+                for &(a, b) in &spans {
+                    // [a, b) に入る parts を写す (塊は parts の境界で切ってある)。
+                    let mut i = done;
+                    while i < plan.parts.len() && plan.parts[i].0 < b {
+                        i += 1;
+                    }
+                    let t = std::time::Instant::now();
+                    pf_copy_into_pin(pin_ptr as usize, &plan.parts[done..i]);
+                    copy_ns += t.elapsed().as_nanos() as u64;
+                    done = i;
+                    unsafe {
+                        check(
+                            (l.memcpy_htod_async)(
+                                base + a as u64,
+                                (pin_ptr as usize + a) as *const c_void,
+                                b - a,
+                                up,
+                            ),
+                            "cuMemcpyHtoDAsync (chunk)",
+                        )?;
+                    }
+                    sent += b - a;
+                }
             }
+        } else {
+            // task 227: 写さずに、スライスごとに mmap から直接積む。
+            // デバイス側の置き場所は従来と同じ (expert ごとに gate/up/down)。
+            for &(off, r) in &plan.parts {
+                let from = if src == 2 {
+                    pf_reg_ptr(r.ptr, r.len).unwrap_or(r.ptr)
+                } else {
+                    r.ptr
+                };
+                unsafe {
+                    check(
+                        (l.memcpy_htod_async)(base + off as u64, from as *const c_void, r.len, up),
+                        "cuMemcpyHtoDAsync (slice)",
+                    )?;
+                }
+                sent += r.len;
+            }
+            copy_ns = t_copy.elapsed().as_nanos() as u64;
         }
-        dbg_htod(plan.need);
+        dbg_htod(sent);
         // 4. 完了イベントを積む。
         let Some(record) = l.event_record else {
             bail!("cuEventRecord が無い");
@@ -9730,7 +9820,7 @@ fn pf_pump_in(
                 check(record(ev.0, up), "cuEventRecord (stage up)")?;
             }
         }
-        enq_ns = t_enq.elapsed().as_nanos() as u64;
+        enq_ns = (t_enq.elapsed().as_nanos() as u64).saturating_sub(copy_ns);
         // 5. 最初の 1 回だけ実速度を測る (同期して待つ)。
         if !st.probed {
             st.probed = true;
@@ -9754,6 +9844,7 @@ fn pf_pump_in(
         })
     } else {
         // pageable の同期コピー (task 156 と同じ)。重なりは無い。
+        let t_copy = std::time::Instant::now();
         let buf = st.slot[s].buf.as_ref().expect("確保済み");
         let mut cursor = 0usize;
         for (i, (_, b)) in items.iter().enumerate() {
@@ -9775,6 +9866,426 @@ fn pf_pump_in(
             probe: None,
         })
     }
+}
+
+/// ステージングの範囲を「1 回の DMA で流す塊」に切る (純関数)。
+///
+/// `parts` は (ステージング先頭からのオフセット, 長さ) の昇順。
+/// `limit == 0` は「全部で 1 回」。塊は parts の境界で切り、長さが `limit` を
+/// 超えないようにする (1 本だけで `limit` を超えるときはその 1 本)。
+/// 返すのは塊の [先頭, 終端) で、間の整列の隙間も含む (中身は読まれない)。
+fn pf_chunk_spans(parts: &[(usize, usize)], limit: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if parts.is_empty() {
+        return out;
+    }
+    if limit == 0 {
+        let last = parts[parts.len() - 1];
+        out.push((parts[0].0, last.0 + last.1));
+        return out;
+    }
+    let mut start = parts[0].0;
+    let mut end = parts[0].0 + parts[0].1;
+    for &(o, l) in &parts[1..] {
+        let e = o + l;
+        if e - start > limit {
+            out.push((start, end));
+            start = o;
+        }
+        end = e;
+    }
+    out.push((start, end));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// task 227: mmap のページを写さずに DMA する (cuMemHostRegister)
+// ---------------------------------------------------------------------------
+//
+// 台帳では写し (mmap → WC pinned) が 14k で 5.90 s、DMA のブロックが 8.85 s。
+// 写しを消せれば DDR の 2 往復 (158 GB の write + read) が丸ごと消える。
+// ただし pin には代償がある (登録の時間と、ページキャッシュを追い出せなくする
+// こと) ので、**登録できた範囲だけ**使い、失敗したら pageable へ落とす。
+
+/// 登録済みのホスト範囲 (昇順・非重複)。
+static PF_REG: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+/// 登録を諦めたか (driver が file backed を受け付けない場合)。
+static PF_REG_DEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 連続失敗の数 (諦めるまでの猶予)。
+static PF_REG_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 登録済みの合計バイト (上限 [`exp_pf::reg_bytes`] で頭打ちにする)。
+static PF_REG_OK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 登録に使ったフラグ (0 = まだ成功していない)。
+static PF_REG_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `cuMemHostRegister` の候補フラグ。
+/// READ_ONLY (0x08) が file backed の読み取り専用写像向け。0x0a は DEVICEMAP 付き
+/// (`cuMemHostGetDevicePointer` を使うため)、0x00 は素の登録。
+const PF_REG_FLAG_TRIES: [u32; 3] = [0x08, 0x0a, 0x00];
+
+/// mmap の [ptr, ptr+len) を driver に pin させる (登録済みなら何もしない)。
+///
+/// 戻り値は「そのまま DMA してよいホストポインタ」。pin できなければ `None`
+/// (呼び出し側は pageable として積む = 値は同じ、速度だけ落ちる)。
+fn pf_reg_ptr(ptr: usize, len: usize) -> Option<usize> {
+    if len == 0 || PF_REG_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    const PAGE: usize = 4096;
+    let a = ptr & !(PAGE - 1);
+    let b = (ptr + len + PAGE - 1) & !(PAGE - 1);
+    {
+        let Ok(reg) = PF_REG.lock() else {
+            PF_REG_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
+        if let Some(&(_, e)) = reg.iter().rev().find(|&&(s0, _)| s0 <= a) {
+            if e >= b {
+                return Some(ptr);
+            }
+        }
+    }
+    if PF_REG_OK_BYTES.load(std::sync::atomic::Ordering::Relaxed) + (b - a) > exp_pf::reg_bytes()
+    {
+        // 上限に達した → これ以上 pin しない (pageable で積む)。
+        return None;
+    }
+    let Ok(l) = lib() else {
+        return None;
+    };
+    let Some(f) = l.mem_host_register else {
+        PF_REG_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    let t = std::time::Instant::now();
+    let mut ok = false;
+    let mut used = 0u32;
+    for flags in PF_REG_FLAG_TRIES {
+        let rc = unsafe { f(a as *mut c_void, b - a, flags) };
+        if rc == CUDA_SUCCESS {
+            ok = true;
+            used = flags;
+            PF_REG_FLAGS.store(flags, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
+    }
+    let ns = t.elapsed().as_nanos() as u64;
+    exp_pf::note_reg(b - a, ok, ns, used);
+    if !ok {
+        let n = PF_REG_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n >= 4 {
+            PF_REG_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+            static ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[pf-zc] cuMemHostRegister が通らない (file backed の写像) — \
+                     pageable で積む (flags={used:#x})"
+                );
+            }
+        }
+        return None;
+    }
+    PF_REG_OK_BYTES.fetch_add(b - a, std::sync::atomic::Ordering::Relaxed);
+    // 記録して併合する (区間は昇順・非重複に保つ)。
+    if let Ok(mut reg) = PF_REG.lock() {
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(reg.len() + 1);
+        let mut ins = (a, b);
+        for &(s, e) in reg.iter() {
+            if e < ins.0 {
+                out.push((s, e));
+            } else if ins.1 < s {
+                out.push(ins);
+                ins = (s, e);
+            } else {
+                ins = (ins.0.min(s), ins.1.max(e));
+            }
+        }
+        out.push(ins);
+        *reg = out;
+    }
+    Some(ptr)
+}
+
+// ---------------------------------------------------------------------------
+// task 227: 転送経路の素の速度を 1 回だけ測る (`DENNO_PF_DMA_PROBE=1`)
+// ---------------------------------------------------------------------------
+//
+// 台帳は「写し 5.90 s + H2D のブロック 8.85 s」までしか言わない。ここでは
+// **同じホストで、同じ driver で** 素の速度を測り、どこが詰まっているかを
+// 切り分ける。数値経路は変えない (測るだけで、結果は `[pf-probe]` の行)。
+//
+// 測るもの:
+// 1. WC pinned → device の DMA (単独 / GPU が memset で埋まっているとき /
+//    ホスト 8 スレッドが別の pinned へ写しているとき)
+// 2. `cuMemcpyHtoDAsync` の**呼び出し**がホストをブロックするか (呼び出しの ns)
+// 3. mmap を pageable のまま積んだ速度 (写しを消したときの上限)
+// 4. mmap を `cuMemHostRegister` で pin した速度と、その登録の時間
+// 5. 2 本のストリームに分けた速度 (1 本との差)
+pub fn pf_dma_probe(host: &[u8]) -> bool {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let Ok(l) = lib() else {
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return false;
+    }
+    let mb: usize = std::env::var("DENNO_PF_PROBE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(256);
+    let want = mb.clamp(16, 1024) << 20;
+    let n = want.min(host.len());
+    if n < (8 << 20) {
+        eprintln!("[pf-probe] 転送元が小さい ({} B) — 測らない", host.len());
+        return false;
+    }
+    let hp = host.as_ptr() as usize;
+    let Some(dev) = pf_stage_alloc(n) else {
+        eprintln!("[pf-probe] デバイス {} MiB を確保できない — 測らない", n >> 20);
+        return false;
+    };
+    let Some(busy_dev) = pf_stage_alloc(64 << 20) else {
+        return false;
+    };
+    let Ok(wc) = PinMem::alloc_flags(n, true) else {
+        return false;
+    };
+    let Ok(cc) = PinMem::alloc_flags(n, false) else {
+        return false;
+    };
+    let (Some(create), Some(ec), Some(record), Some(esync)) = (
+        l.stream_create,
+        l.event_create,
+        l.event_record,
+        l.event_sync,
+    ) else {
+        return false;
+    };
+    let mut up: CUstream = std::ptr::null_mut();
+    let mut up2: CUstream = std::ptr::null_mut();
+    let mut ev: CUevent = std::ptr::null_mut();
+    let mut ev2: CUevent = std::ptr::null_mut();
+    unsafe {
+        const NONBLOCK: u32 = 0x01;
+        if create(&mut up, NONBLOCK) != CUDA_SUCCESS {
+            return false;
+        }
+        if create(&mut up2, NONBLOCK) != CUDA_SUCCESS {
+            return false;
+        }
+        if ec(&mut ev, 0) != CUDA_SUCCESS || ec(&mut ev2, 0) != CUDA_SUCCESS {
+            return false;
+        }
+    }
+    let devp = dev.ptr();
+    let busy = busy_dev.ptr();
+    let wcp = wc.ptr;
+    // 中身を作る (WC は CPU が書いて DMA が読む)。
+    unsafe {
+        std::ptr::copy_nonoverlapping(hp as *const u8, wcp as *mut u8, n);
+    }
+    // 1 回の DMA を reps 回測り、(最良 GB/s, 呼び出しの最大 ns) を返す。
+    let one = |bytes: usize, from: *const c_void, stream: CUstream, ev: CUevent| -> (f64, u64) {
+        let mut best = 0.0f64;
+        let mut enq_max = 0u64;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let rc = unsafe { (l.memcpy_htod_async)(devp, from, bytes, stream) };
+            let enq = t.elapsed().as_nanos() as u64;
+            if rc != CUDA_SUCCESS {
+                return (0.0, enq);
+            }
+            unsafe {
+                let _ = (record)(ev, stream);
+            }
+            let t2 = std::time::Instant::now();
+            if unsafe { (esync)(ev) } != CUDA_SUCCESS {
+                return (0.0, enq);
+            }
+            let gbs = bytes as f64 / t2.elapsed().as_nanos().max(1) as f64;
+            if gbs > best {
+                best = gbs;
+            }
+            enq_max = enq_max.max(enq);
+        }
+        (best, enq_max)
+    };
+
+    // (a) 単独
+    let (wc_alone, wc_enq) = one(n, wcp as *const c_void, up, ev);
+    // (b) GPU を memset で埋める (DMA と GPU の取り合いを見る)
+    let mut memset_rounds = 0usize;
+    {
+        let ms = l.memset_d32_async;
+        for _ in 0..2000 {
+            if unsafe { ms(busy, 0, (64 << 20) / 4, std::ptr::null_mut()) } != CUDA_SUCCESS {
+                break;
+            }
+            memset_rounds += 1;
+        }
+        let (wc_busy_memset, _) = one(n, wcp as *const c_void, up, ev);
+        let _ = ctx.sync();
+        // (c) ホスト 8 スレッドが別の pinned へ写している間の DMA
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let cc_ptr = cc.ptr as usize;
+        let (copied, (wc_busy_copy8, _)) = std::thread::scope(|s| {
+            let mut hs = Vec::new();
+            for i in 0..8usize {
+                let stop = &stop;
+                hs.push(s.spawn(move || {
+                    let chunk = (n / 8) & !4095;
+                    let off = i * chunk;
+                    let mut total = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                (hp + off) as *const u8,
+                                (cc_ptr + off) as *mut u8,
+                                chunk,
+                            );
+                        }
+                        total += chunk;
+                    }
+                    total
+                }));
+            }
+            let r = one(n, wcp as *const c_void, up, ev);
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut sum = 0usize;
+            for h in hs {
+                sum += h.join().unwrap_or(0);
+            }
+            (sum, r)
+        });
+        // (d) mmap を pageable のまま積む (写しを消したときの上限)
+        let (page_gbs, page_enq) = one(n, hp as *const c_void, up, ev);
+        // (e) mmap を pin して直接積む
+        let a = hp & !4095usize;
+        let b = (hp + n + 4095) & !4095usize;
+        let mut reg_ok = false;
+        let mut reg_flags = 0u32;
+        let mut reg_ns = 0u64;
+        if let Some(f) = l.mem_host_register {
+            for flags in PF_REG_FLAG_TRIES {
+                let t = std::time::Instant::now();
+                let rc = unsafe { f(a as *mut c_void, b - a, flags) };
+                let ns = t.elapsed().as_nanos() as u64;
+                eprintln!(
+                    "[pf-probe] register flags={flags:#x} rc={rc} ms={:.1}",
+                    ns as f64 / 1e6
+                );
+                if rc == CUDA_SUCCESS {
+                    reg_ok = true;
+                    reg_flags = flags;
+                    reg_ns = ns;
+                    break;
+                }
+            }
+        }
+        let (reg_gbs, map_gbs) = if reg_ok {
+            let (g, _) = one(n, hp as *const c_void, up, ev);
+            // mapped host を device ポインタとして読む (カーネル読みの代用)
+            let mut mg = 0.0f64;
+            if let Some(gd) = l.mem_host_get_device_ptr {
+                let dtod = l.memcpy_dtod_async;
+                let mut dptr: CUdeviceptr = 0;
+                if unsafe { gd(&mut dptr, a as *mut c_void, 0) } == CUDA_SUCCESS && dptr != 0 {
+                    for _ in 0..3 {
+                        let t = std::time::Instant::now();
+                        let rc = unsafe { (dtod)(devp, dptr, n, up) };
+                        if rc != CUDA_SUCCESS {
+                            break;
+                        }
+                        unsafe {
+                            let _ = (record)(ev, up);
+                        }
+                        let t2 = std::time::Instant::now();
+                        if unsafe { (esync)(ev) } != CUDA_SUCCESS {
+                            break;
+                        }
+                        let g2 = n as f64 / t2.elapsed().as_nanos().max(1) as f64;
+                        mg = mg.max(g2);
+                    }
+                }
+            }
+            (g, mg)
+        } else {
+            (0.0, 0.0)
+        };
+        // (f) 2 本のストリーム (前半 / 後半)
+        let half = (n / 2) & !4095;
+        let mut two = 0.0f64;
+        if half > 0 {
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let rc1 = unsafe { (l.memcpy_htod_async)(devp, hp as *const c_void, half, up) };
+                let rc2 = unsafe {
+                    (l.memcpy_htod_async)(devp + half as u64, wcp as *const c_void, half, up2)
+                };
+                if rc1 != CUDA_SUCCESS || rc2 != CUDA_SUCCESS {
+                    break;
+                }
+                unsafe {
+                    let _ = (record)(ev, up);
+                    let _ = (record)(ev2, up2);
+                }
+                let t2 = std::time::Instant::now();
+                if unsafe { (esync)(ev) } != CUDA_SUCCESS || unsafe { (esync)(ev2) } != CUDA_SUCCESS
+                {
+                    break;
+                }
+                let g2 = (half * 2) as f64 / t2.elapsed().as_nanos().max(1) as f64;
+                two = two.max(g2);
+            }
+        }
+        // (g) CPU の写し (mmap → cacheable pinned、1 スレッド)
+        let t = std::time::Instant::now();
+        unsafe {
+            std::ptr::copy_nonoverlapping(hp as *const u8, cc.ptr as *mut u8, n);
+        }
+        let cpu_gbs = n as f64 / t.elapsed().as_nanos().max(1) as f64;
+
+        eprintln!(
+            "[pf-probe] n_MB={} wc_GBs={wc_alone:.1} wc_enq_us={:.1} page_GBs={page_gbs:.1} \
+             page_enq_us={:.1} reg_GBs={reg_gbs:.1} map_GBs={map_gbs:.1} two_GBs={two:.1} \
+             cpu_copy_GBs={cpu_gbs:.1}",
+            n >> 20,
+            wc_enq as f64 / 1e3,
+            page_enq as f64 / 1e3
+        );
+        eprintln!(
+            "[pf-probe] busy wc_memset_GBs={wc_busy_memset:.1} wc_copy8_GBs={wc_busy_copy8:.1} \
+             copy8_GB={:.1} memset_rounds={memset_rounds}",
+            copied as f64 / 1e9
+        );
+        eprintln!(
+            "[pf-probe] reg ok={} flags={reg_flags:#x} reg_ms={:.1} reg_GBs_per_s={:.2}",
+            u8::from(reg_ok),
+            reg_ns as f64 / 1e6,
+            if reg_ok && reg_ns > 0 {
+                (b - a) as f64 / reg_ns as f64
+            } else {
+                0.0
+            }
+        );
+        if reg_ok {
+            if let Some(u) = l.mem_host_unregister {
+                unsafe {
+                    let _ = u(a as *mut c_void);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// グループ `g` の H2D 完了を待つ (ホスト)。待ち時間 (ns) を返す。
@@ -10544,7 +11055,9 @@ pub fn moe_experts_iq_pf_layer_stream(
             let pd_tab = sc.pd.as_ref().expect("確保済み");
             // task 165: 上げ (写し + 積み込み) を専用スレッドへ出すか。
             // 出さないときは task 162 と同じく、このスレッドで直列に写して積む。
-            let ut = pinned && exp_pf::stream_ut();
+            // task 227: 転送元を mmap 直接 (page / reg) にするときは、上げ
+            // スレッドの経路が pinned のバウンス前提なので使わない。
+            let ut = pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
             // グループごとのミス (plan 順) と必要バイト。依頼を先に出せるよう先に作る。
             let items_of: Vec<Vec<(u16, [&[u8]; 3])>> = bounds
                 .iter()
@@ -10946,6 +11459,39 @@ mod pf_stream_tests {
         assert_eq!(s.ready, 3, "ready が戻った");
         assert_eq!(s.err.as_deref(), Some("最初のエラー"), "エラーが上書きされた");
         assert_eq!(s.times[2], (12, 22, 32));
+    }
+
+    /// task 227: 「1 回の DMA で流す塊」の切り方 (純関数)。
+    ///
+    /// 塊は parts の境界で切る (途中で切ると写しが半端になる)、長さは limit を
+    /// 超えない、隙間 (整列の詰め物) は塊に含めてよい、1 本が limit より
+    /// 大きければその 1 本だけ、を固定する。
+    #[test]
+    fn chunk_spans_follow_part_boundaries_and_limit() {
+        // 隙間なしの 3 本 (100 B ずつ) → limit 250 は 2 本ずつ。
+        let p = [(0usize, 100usize), (100, 100), (200, 100)];
+        assert_eq!(pf_chunk_spans(&p, 0), vec![(0, 300)], "0 は全部で 1 回");
+        assert_eq!(pf_chunk_spans(&p, 250), vec![(0, 200), (200, 300)]);
+        assert_eq!(pf_chunk_spans(&p, 100), vec![(0, 100), (100, 200), (200, 300)]);
+        // 整列の隙間 (16 B) は塊に含む (中身は読まれない)。
+        let p = [(0usize, 100usize), (116, 100), (232, 100)];
+        assert_eq!(pf_chunk_spans(&p, 250), vec![(0, 216), (232, 332)]);
+        // 1 本が limit より大きいときは、その 1 本だけの塊になる。
+        let p = [(0usize, 1000usize), (1000, 10)];
+        assert_eq!(pf_chunk_spans(&p, 64), vec![(0, 1000), (1000, 1010)]);
+        // 空は空。
+        assert!(pf_chunk_spans(&[], 128).is_empty());
+        // 塊は昇順・非重複で、全 parts を覆う。
+        let p: Vec<(usize, usize)> = (0..40).map(|i| (i * 1000 + 16, 984)).collect();
+        let spans = pf_chunk_spans(&p, 4096);
+        let mut at = 0usize;
+        for &(a, b) in &spans {
+            assert!(a >= at, "塊が戻った");
+            assert!(b > a);
+            assert!(b - a <= 4096 + 984, "塊が大きすぎる {}", b - a);
+            at = b;
+        }
+        assert_eq!(spans.last().map(|s| s.1), Some(39 * 1000 + 16 + 984));
     }
 }
 
