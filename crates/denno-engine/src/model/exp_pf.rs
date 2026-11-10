@@ -550,6 +550,17 @@ pub fn reg_bytes() -> usize {
 /// 1 プロンプトで 1 回 (48 層 × 512 本 = 50 GB が上限) になり、VRAM の
 /// expert キャッシュも要らない (同じ expert を二度使わない)。
 /// 代償は、層のあいだ全チャンクの残差を保持すること (n_tokens × n_embd × hc × 4)。
+///
+/// # 実測 (lab t227b、sha 9de5b3d2b、depth8k)
+///
+/// バイトは狙いどおり減った: 14k の `[exp-pf-stream] up_MB` は 158.5 GB →
+/// **46.7 GB (-70%)**、copy_s 5.90 → 2.40。ところが壁時計は 3.8k +2.3% /
+/// 14k **+21.6%**、14k 後の decode は 18.4 → 36.0 ms/tok で、**採らない**
+/// (`ADOPT: no`)。理由は層でまとめたぶん、全トークンの活性 (14k で 143 MB) を
+/// router / shared / expert 段で 3 回上げ直し (48 層で 20.6 GB)、shared と
+/// expert の出力 13.8 GB を戻すため。加えて MoE の作業域 2.7 GB と事前の
+/// 追い出し 6 GB が decode のヒット率を落とす。
+/// 次に採るなら **活性をデバイスに残したまま** 層優先を回すこと (REPORT_P227 §7)。
 pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
 
 /// `DENNO_PF_LM_LAYER` の解釈 (純関数)。**明示的な真値だけ on**。

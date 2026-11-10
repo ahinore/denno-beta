@@ -9923,6 +9923,14 @@ static PF_REG_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// `cuMemHostRegister` の候補フラグ。
 /// READ_ONLY (0x08) が file backed の読み取り専用写像向け。0x0a は DEVICEMAP 付き
 /// (`cuMemHostGetDevicePointer` を使うため)、0x00 は素の登録。
+///
+/// # 実測 (lab t227a / t227b)
+///
+/// この driver は **file backed (MAP_SHARED のモデル mmap) を pin できない**:
+/// 0x08 → error 801 (NOT_SUPPORTED)、0x0a → 801、0x00 → error 1 (INVALID_VALUE)。
+/// 4 回失敗したら諦めて pageable で積む (`[pf-zc]` の 1 行が出る)。
+/// なお pageable 直送は写しを消すが driver が内部でバウンスするので 21.1 GB/s
+/// 止まり (WC pinned 単体は 56.8 GB/s) — 3 往復は消えない。
 const PF_REG_FLAG_TRIES: [u32; 3] = [0x08, 0x0a, 0x00];
 
 /// mmap の [ptr, ptr+len) を driver に pin させる (登録済みなら何もしない)。
@@ -10024,6 +10032,14 @@ fn pf_reg_ptr(ptr: usize, len: usize) -> Option<usize> {
 // 3. mmap を pageable のまま積んだ速度 (写しを消したときの上限)
 // 4. mmap を `cuMemHostRegister` で pin した速度と、その登録の時間
 // 5. 2 本のストリームに分けた速度 (1 本との差)
+//
+// # 実測 (lab t227b、256 MB。GB/s は **呼び出し + 待ち** で割った値)
+//
+// WC pinned 単体 56.8 / 56 MB でも 56.1 (呼び出しは 1-27 µs で**非ブロック**) /
+// GPU を memset で埋めても 56.6 (**GPU と取り合わない**) / ホスト 8 スレッドが
+// 写していると 27.0 / mmap を pageable で 21.1 (呼び出しが 13 ms ブロック) /
+// 2 ストリーム 24.3 / **実経路の再現 (56 MB を写して DMA、6 回) 11.1** /
+// 4 MB ずつ交互 9.5。実経路の実測 10.7 GB/s と一致する = DDR 3 往復の帯域律速。
 pub fn pf_dma_probe(host: &[u8]) -> bool {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
