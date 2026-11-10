@@ -3505,7 +3505,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     fn pf_mix_keep_layer(flat_attn: bool, nt: usize, kind: Option<LayerKind>) -> bool {
         #[cfg(feature = "cuda")]
         {
+            // `DENNO_PF_MIXDEVIN=0` のときは qkv がデバイスを読まないので、
+            // D2H を飛ばしてはいけない (ホストが古いバイト列になる)。
             crate::cuda::pf_mix_keep_on()
+                && crate::cuda::pf_dev_in_on()
                 && flat_attn
                 && nt >= 64
                 && matches!(kind, Some(LayerKind::FullAttn))

@@ -23667,11 +23667,22 @@ pub(crate) fn set_pf_mirror_delta_for_test(v: Option<bool>) {
 /// `DENNO_PF_MIXKEEP` が on で、直前の `mix` の出力がデバイスに残っている
 /// (`pf_mixed_dev_in_ptr` が一致) ときだけ `Some`。値は同じバイト列なので
 /// H2D を 1 本消せる (D2H していない場合もここで初めてホストを経由しない)。
+///
+/// 渡せないのに「D2H していない」記録が残っている場合は、ホスト経路が古い
+/// バイト列を読まないよう、ここで 1 回だけ降ろして埋め直す。
 fn pf2_dev_x(x: &[f32], nt: usize, e: usize) -> Option<CUdeviceptr> {
     if !pf_mix_keep_on() {
         return None;
     }
-    pf_mixed_dev_in_ptr(x.as_ptr(), nt, e)
+    match pf_mixed_dev_in_ptr(x.as_ptr(), nt, e) {
+        Some(p) => Some(p),
+        None => {
+            if pf_mixed_dev_only(x.as_ptr(), nt, e) {
+                pf_mixed_restore_host(x.as_ptr() as *mut f32, nt, e);
+            }
+            None
+        }
+    }
 }
 
 /// task 172: full 層 1 チャンクの前半をデバイスで回す。

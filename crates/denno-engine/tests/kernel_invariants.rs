@@ -7764,6 +7764,111 @@ fn pf230_attn_pf3_tile_matches_host() {
     assert_eq!(nargs, 11, "引数の数が v2 (12 個) と違う");
 }
 
+/// task 230: v3 の attention (PV の bf16 mma と「最初のタイルの行最大 m0」) の
+/// 数値を CPU で模擬し、誤差の上限を固定する。
+///
+/// 実測 (このテストと同じ入力、64 クエリ x 96 キー x 256 次元、σ=1 の正規乱数):
+///   v2 (q/k だけ bf16、PV は f32) の最大相対誤差 1.1e-7
+///   v3 (p と V も bf16)          の最大相対誤差 2.4e-3
+/// しきい値は 5e-3 (実測の 2 倍)。v3 の誤差は bf16 の丸めだけ由来で、softmax の
+/// 比 (m0 固定) は変えない。ここが崩れたら丸め以外の変更が入っている。
+#[test]
+fn pf230_v3_softmax_stays_within_bf16_rounding() {
+    fn bf16(x: f32) -> f32 {
+        let u = x.to_bits();
+        let lsb = (u >> 16) & 1;
+        let v = u.wrapping_add(0x7fff + lsb);
+        f32::from_bits(v & 0xffff_0000)
+    }
+    struct Sm(u64);
+    impl Sm {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn gauss(&mut self) -> f32 {
+            let mut s = 0.0f32;
+            for _ in 0..12 {
+                s += ((self.next_u64() >> 32) as f32 / u32::MAX as f32) - 0.5;
+            }
+            s
+        }
+    }
+    let (nq, nk, dh) = (64usize, 96usize, 256usize);
+    let mut rng = Sm(12345);
+    let q: Vec<f32> = (0..nq * dh).map(|_| rng.gauss()).collect();
+    let k: Vec<f32> = (0..nk * dh).map(|_| rng.gauss()).collect();
+    let v: Vec<f32> = (0..nk * dh).map(|_| rng.gauss()).collect();
+    let scale = 1.0f32 / (dh as f32).sqrt();
+    let (mut e2, mut e3, mut amax) = (0f64, 0f64, 0f64);
+    for i in 0..nq {
+        let keys = i + 1; // causal
+        let mut s = vec![0f64; keys];
+        for j in 0..keys {
+            let mut acc = 0f64;
+            for d in 0..dh {
+                acc += (bf16(q[i * dh + d]) as f64) * (bf16(k[j * dh + d]) as f64);
+            }
+            s[j] = acc * scale as f64;
+        }
+        let mx = s.iter().cloned().fold(f64::MIN, f64::max);
+        let (mut lr, mut or) = (0f64, vec![0f64; dh]);
+        for j in 0..keys {
+            let p = (s[j] - mx).exp();
+            lr += p;
+            for d in 0..dh {
+                or[d] += p * (v[j * dh + d] as f64);
+            }
+        }
+        for d in 0..dh {
+            or[d] /= lr;
+            amax = amax.max(or[d].abs());
+        }
+        // v2: 32 キーごとの running max、p は f32、V は f32
+        let (mut l2, mut a2, mut m) = (0f32, vec![0f32; dh], f32::NEG_INFINITY);
+        for t0 in (0..keys).step_by(32) {
+            let t1 = (t0 + 32).min(keys);
+            let mxt = (t0..t1).fold(f32::NEG_INFINITY, |a, j| a.max(s[j] as f32));
+            let corr = ((m - mxt) * std::f32::consts::LOG2_E).exp2();
+            m = mxt;
+            l2 *= corr;
+            for d in 0..dh {
+                a2[d] *= corr;
+            }
+            for j in t0..t1 {
+                let p = ((s[j] as f32 - m) * std::f32::consts::LOG2_E).exp2();
+                l2 += p;
+                for d in 0..dh {
+                    a2[d] += p * v[j * dh + d];
+                }
+            }
+        }
+        // v3: m0 は最初のタイルの最大、p も V も bf16 (PV は mma)
+        let m0 = (0..32.min(keys)).fold(f32::NEG_INFINITY, |a, j| a.max(s[j] as f32));
+        let (mut l3, mut a3) = (0f32, vec![0f32; dh]);
+        for j in 0..keys {
+            let p = bf16(((s[j] as f32 - m0) * std::f32::consts::LOG2_E).exp2());
+            l3 += p;
+            for d in 0..dh {
+                a3[d] += p * bf16(v[j * dh + d]);
+            }
+        }
+        for d in 0..dh {
+            let den = amax.max(1e-30);
+            e2 = e2.max(((a2[d] / l2) as f64 - or[d]).abs() / den);
+            e3 = e3.max(((a3[d] / l3) as f64 - or[d]).abs() / den);
+        }
+    }
+    assert!(e2 < 1e-5, "v2 の誤差が想定より大きい: {e2:.3e}");
+    assert!(
+        e3 < 5e-3,
+        "v3 の誤差が bf16 の丸めの範囲を超えた: {e3:.3e} (実測 2.4e-3)"
+    );
+}
+
 /// v3 / MIXKEEP のゲートが既定 off で、`pf_full_out` と mix の D2H に配線されて
 /// いること。
 #[test]

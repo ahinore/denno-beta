@@ -270,17 +270,14 @@ extern "C" __global__ void dno_attention_prefill3(
     __syncthreads();
 
     // ---- 1/l を掛ける (1 スレッドが 1 次元を 64 行ぶん) --------------------
-    {
-        float inv[A3_BQ];
-        for (int r = 0; r < A3_BQ; ++r) {
+    // 行ごとの係数を配列に持つと 64 レジスタを常時生かすことになるので、
+    // 1 行ずつ読んで掛ける (acc のフラグメントと同居させる)。
+    for (int r = 0; r < A3_BQ; ++r) {
+        const int i = i0 + r;
+        if (i < n) {
             const float l = lst_sm[r];
-            inv[r] = (l > 0.0f) ? 1.0f / l : 0.0f;
-        }
-        for (int r = 0; r < A3_BQ; ++r) {
-            const int i = i0 + r;
-            if (i < n) {
-                att[(size_t)i * qd + h * dh + tid] *= inv[r];
-            }
+            const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+            att[(size_t)i * qd + h * dh + tid] *= inv;
         }
     }
 }
