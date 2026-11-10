@@ -46,7 +46,8 @@
 //!
 //! # 既定
 //!
-//! **既定 off**。`DENNO_DEC_UP_WORKER=1` で入る。
+//! **既定 on** (lab t214b で短い点 -4.4〜-10.3%、中央値 24 -> 21 ms/tok、prefill 不変)。
+//! `DENNO_DEC_UP_WORKER=0` / `off` / `false` で切れる。
 //! 上限は `DENNO_DEC_UP_WORKER_MAX` (1 トークンあたりに積む本数)。
 //! 未設定なら従来の規則 (`DENNO_EXPERT_IQ_UPLOAD` 48 / 埋まったら 16) をそのまま使う。
 
@@ -68,11 +69,18 @@ pub const MAX_ENV: &str = "DENNO_DEC_UP_WORKER_MAX";
 /// 次の turn の prefill (0.4 s) を 2% 以上は食わない大きさにしている。
 pub const MAX_QUEUE: usize = 384;
 
-/// [`ENV`] の解釈 (純関数)。`1` / `true` / `on` / `yes` だけが真。
+/// [`ENV`] の解釈 (純関数)。**既定 on**。
+///
+/// task 214 は lab t214b で採否 yes (短 a1 -10.3% / b -9.5% / a2 -4.4%、
+/// 3,965 -3.7%、中央値 24 -> 21 ms/tok、prefill 不変、md5 は深い点だけ DIFF)。
+/// 明示的な偽値 `0` / `off` / `false` / `no` だけ切る。
 pub fn on_from_value(v: Option<&str>) -> bool {
-    match v.map(|s| s.trim().to_ascii_lowercase()) {
-        Some(s) => matches!(s.as_str(), "1" | "true" | "on" | "yes"),
-        None => false,
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
     }
 }
 
@@ -357,17 +365,19 @@ pub use gpu::{inflight, submit, Job};
 mod tests {
     use super::*;
 
+    /// task 214: `DENNO_DEC_UP_WORKER` は既定 on、明示的な偽値だけ切る
+    /// (lab t214b で採否 yes)。
     #[test]
-    fn gate_is_off_by_default_and_only_true_values_turn_it_on() {
-        assert!(!on_from_value(None));
-        assert!(!on_from_value(Some("")));
-        assert!(!on_from_value(Some("0")));
-        assert!(!on_from_value(Some("off")));
-        assert!(!on_from_value(Some("2")));
+    fn gate_defaults_on_and_only_false_values_turn_it_off() {
+        assert!(on_from_value(None));
+        assert!(on_from_value(Some("")));
         assert!(on_from_value(Some("1")));
         assert!(on_from_value(Some(" on ")));
         assert!(on_from_value(Some("TRUE")));
-        assert!(on_from_value(Some("yes")));
+        assert!(!on_from_value(Some("0")));
+        assert!(!on_from_value(Some("off")));
+        assert!(!on_from_value(Some("false")));
+        assert!(!on_from_value(Some("no")));
     }
 
     /// task 214: `DENNO_DEC_UP_STREAM` は既定 on、明示的な偽値だけ切る。
@@ -430,13 +440,11 @@ mod tests {
     }
 
     #[test]
-    fn stats_line_is_silent_when_the_gate_is_off() {
+    fn stats_line_is_silent_when_nothing_happened() {
+        // ゲートの on/off に依らず、実績 0 なら行を出さない。
         stats_reset();
-        if !enabled() {
-            assert!(stats_line().is_none());
-            // ゲート off では積まない。
-            assert_eq!(SUBMITTED.load(Ordering::Relaxed), 0);
-        }
+        assert!(stats_line().is_none());
+        assert_eq!(SUBMITTED.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -462,7 +470,8 @@ mod tests {
     /// task 214: 上限の既定は「従来の規則」(None)。ゲート off でも None。
     #[test]
     fn max_per_token_defaults_to_the_old_rule() {
-        if !enabled() {
+        // `DENNO_DEC_UP_WORKER_MAX` 未設定なら None (= 従来の規則)。
+        if std::env::var(MAX_ENV).is_err() {
             assert_eq!(max_per_token(), None);
         }
     }
