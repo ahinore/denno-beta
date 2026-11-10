@@ -8736,3 +8736,121 @@ fn pf209_pin_and_mixdevin_gates_default_on_and_are_wired() {
         "router の形チェックが無い"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 213: 既定 on のゲートが必要とする PTX の台帳 (src/gate_audit.rs) を検査する。
+//
+// REPORT_P204: `DENNO_MIX_DEC_FOLD` / `DENNO_MIX_DEC_UPW` は既定 on なのに PTX が
+// ツリーに無く、decode が静かに従来経路へ落ちていた。台帳の各行について、
+// 「PTX が実在する」「必要なエントリが PTX に居る」を cuda feature 無しで確かめる。
+// ---------------------------------------------------------------------------
+
+const GATE_AUDIT_SRC: &str = include_str!("../src/gate_audit.rs");
+const SERVE_FLASH_SRC: &str = include_str!("../../denno-cli/src/serve_flash.rs");
+
+/// 台帳 (`GatePtx { .. }` の並び) から (env, ptx, entries) を出現順に取り出す。
+/// 文字列リテラルだけを読む素朴なパーサ (依存クレートを増やさない)。
+fn gate_audit_rows() -> Vec<(String, String, Vec<String>)> {
+    /// `text` の中で `key:` の後に来る最初の "..." を返す。
+    fn field(text: &str, key: &str) -> Option<String> {
+        let mut from = 0;
+        while let Some(i) = text[from..].find(key) {
+            let at = from + i;
+            // `path_env:` の中の `env:` を拾わない (直前が識別子文字なら別のキー)。
+            let prev = text[..at].chars().next_back();
+            if prev.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                from = at + key.len();
+                continue;
+            }
+            let after = &text[at + key.len()..];
+            if let Some(q0) = after.find('"') {
+                if let Some(q1) = after[q0 + 1..].find('"') {
+                    return Some(after[q0 + 1..q0 + 1 + q1].to_string());
+                }
+            }
+            from = at + key.len();
+        }
+        None
+    }
+    /// `&[ "a", "b" ]` の中の "..." を全部返す。
+    fn quoted_list(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(q0) = rest.find('"') {
+            let after = &rest[q0 + 1..];
+            let Some(q1) = after.find('"') else { break };
+            out.push(after[..q1].to_string());
+            rest = &after[q1 + 1..];
+        }
+        out
+    }
+    let table_start = GATE_AUDIT_SRC
+        .find("pub const DEFAULT_ON_GATES")
+        .expect("DEFAULT_ON_GATES が無い");
+    let table = &GATE_AUDIT_SRC[table_start..];
+    // 台帳の終わり (`\n];`) までに切る。テスト側の `GatePtx { .. }` を拾わない。
+    let table_end = table.find("\n];").map(|e| e + 3).unwrap_or(table.len());
+    let table = &table[..table_end];
+    let mut rows = Vec::new();
+    let mut rest = table;
+    while let Some(i) = rest.find("GatePtx {") {
+        let after = &rest[i + "GatePtx {".len()..];
+        let end = after.find('}').expect("GatePtx の閉じ括弧が無い");
+        let block = &after[..end];
+        let env = field(block, "env:").expect("env が無い");
+        let ptx = field(block, "ptx:").expect("ptx が無い");
+        let e0 = block.find("entries:").expect("entries が無い");
+        let arr0 = block[e0..].find('[').expect("entries の [ が無い") + e0;
+        let arr1 = block[arr0..].find(']').expect("entries の ] が無い") + arr0;
+        let entries = quoted_list(&block[arr0 + 1..arr1]);
+        rows.push((env, ptx, entries));
+        rest = &after[end..];
+    }
+    rows
+}
+
+/// 台帳に載っている PTX は全部ツリーに実在し、必要なエントリを持つ。
+#[test]
+fn task213_default_on_gate_ptx_all_exist() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let rows = gate_audit_rows();
+    assert!(rows.len() >= 20, "台帳が {} 行しかない", rows.len());
+    for (env, ptx, entries) in &rows {
+        let path = dir.join(ptx);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{env}: {} が読めない: {e}", path.display()));
+        assert!(!entries.is_empty(), "{env}: entries が空");
+        for k in entries {
+            assert!(
+                text.contains(&format!(".entry {k}")),
+                "{env}: {ptx} に {k} が無い (台帳と PTX が食い違う)"
+            );
+        }
+    }
+}
+
+/// 台帳の env は実在するゲート (cuda.rs / qwen4exp.rs / expert_batch.rs のどれか) で、
+/// 既定 on の解釈を持つ。ここでは「env 名がソースに現れる」ことだけを静的に見る。
+#[test]
+fn task213_gate_envs_are_real() {
+    let rows = gate_audit_rows();
+    let qwen_src = include_str!("../src/model/qwen4exp.rs");
+    let exp_pf_src = include_str!("../src/model/exp_pf.rs");
+    let batch_src = include_str!("../src/model/expert_batch.rs");
+    for (env, ptx, _) in &rows {
+        let found = CUDA_RS.contains(&format!("\"{env}\""))
+            || qwen_src.contains(&format!("\"{env}\""))
+            || exp_pf_src.contains(&format!("\"{env}\""))
+            || batch_src.contains(&format!("\"{env}\""));
+        assert!(found, "{env} ({ptx}) がソースのどこにも無い");
+    }
+}
+
+/// serve の起動時に監査が呼ばれる (「サーバが起動時に言う」の配線)。
+#[test]
+fn task213_server_runs_the_gate_audit_at_startup() {
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::gate_audit::audit_lines()"),
+        "serve_flash の run() が起動時の監査を呼んでいない"
+    );
+}
