@@ -3794,8 +3794,10 @@ impl CudaCtx {
             }
             // task 230: prefill attention v3 (任意。読めない・入口が無い・opt-in が
             // 通らないときは null のまま = v2 / 従来の経路で回る。fail closed)。
+            // ゲートが off のときは読まない (既定 off なので、PTX が無いときの
+            // 警告を出さない)。
             let mut f_attn_pf3: CUfunction = std::ptr::null_mut();
-            {
+            if pf_attn_v3_on() {
                 let pf3_path = match std::env::var("DENNO_PF_ATTN3_PTX") {
                     Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
                     _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
