@@ -153,23 +153,6 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_GDN_PF2_PTX",
         on: crate::cuda::gdn_pf2_on,
     },
-    // task 225: v3 (1 ヘッド 4 ブロック x 8 レーン) と router の softmax/top-k。
-    // v3 は出力の RMS norm を v2 の PTX から取る (その行は上の
-    // `DENNO_PF_SCAN_FAST` が守る)。
-    GatePtx {
-        env: "DENNO_PF_SCAN3",
-        ptx: "kernels_gdn_pf3.ptx",
-        entries: &["dno_gdn_pf_scan32"],
-        path_env: "DENNO_GDN_PF3_PTX",
-        on: crate::cuda::gdn_pf3_on,
-    },
-    GatePtx {
-        env: "DENNO_PF_ROUTER_DEV",
-        ptx: "kernels_router225.ptx",
-        entries: &["dno_router_softmax_topk"],
-        path_env: "DENNO_PF_ROUTER_DEV_PTX",
-        on: crate::cuda::pf_router_dev_on,
-    },
     GatePtx {
         env: "DENNO_PF_FULL_DEV",
         ptx: "kernels_pf2.ptx",

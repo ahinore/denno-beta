@@ -39244,8 +39244,9 @@ fn router_dev_fns(ctx: &CudaCtx) -> Option<&'static RouterDevFns> {
 /// `DENNO_PF_ROUTER_DEV` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 pub(crate) fn pf_router_dev_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        // task 225: lab t225a で採用 (14k cold prefill -7.7%、3,826 -4.8%)。
-        None => true,
+        // task 225: lab t225c で目標未達 (14k -4.0% / 3,826 -1.5% は base との
+        // 比較。base2 込みの中央値では -3.4% / -1.5%) のため既定 off。
+        None => false,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -39265,7 +39266,7 @@ pub(crate) fn set_pf_router_dev_for_test(v: Option<bool>) {
     );
 }
 
-/// router の softmax + top-k をデバイスで回すか (既定 on。lab t225a で採用)。
+/// router の softmax + top-k をデバイスで回すか (既定 off。lab t225c で目標未達)。
 pub(crate) fn pf_router_dev_on() -> bool {
     #[cfg(test)]
     {
@@ -40260,8 +40261,8 @@ fn gdn_pf3_kernels() -> Option<&'static GdnPf3Kernels> {
 /// `DENNO_PF_SCAN3` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 pub(crate) fn gdn_pf3_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        // task 225: lab t225a で採用 (14k cold prefill -7.4%、3,826 -5.0%)。
-        None => true,
+        // task 225: lab t225c で目標未達のため既定 off (上の router と同じ)。
+        None => false,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -40282,7 +40283,7 @@ pub(crate) fn set_gdn_pf3_for_test(v: Option<bool>) {
     );
 }
 
-/// v3 スキャンを使うか (既定 on。lab t225a で採用)。
+/// v3 スキャンを使うか (既定 off。lab t225c で目標未達)。
 pub(crate) fn gdn_pf3_on() -> bool {
     #[cfg(test)]
     {
@@ -40404,8 +40405,7 @@ fn gdn_pf3_launch(
 mod pf225_gate_tests {
     use super::*;
 
-    /// 既定: beta/alpha は off (既存の入口が連鎖から落ちるため)、
-    /// router と scan v3 は lab t225a で採用して on。
+    /// 3 本とも既定 off (lab t225c で目標未達。beta/alpha は入口も壊れている)。
     #[test]
     fn pf225_gates_defaults() {
         for (name, f, dflt) in [
@@ -40414,8 +40414,8 @@ mod pf225_gate_tests {
                 pf_ba_fast_from_value as fn(Option<&str>) -> bool,
                 false,
             ),
-            ("DENNO_PF_ROUTER_DEV", pf_router_dev_from_value, true),
-            ("DENNO_PF_SCAN3", gdn_pf3_from_value, true),
+            ("DENNO_PF_ROUTER_DEV", pf_router_dev_from_value, false),
+            ("DENNO_PF_SCAN3", gdn_pf3_from_value, false),
         ] {
             assert_eq!(f(None), dflt, "{name}: 未設定の既定が違う");
             for v in ["0", "off", "false", "no", "", " off "] {
@@ -40554,14 +40554,14 @@ mod pf225_gate_tests {
         set_pf_router_dev_for_test(Some(false));
         assert!(!pf_router_dev_on());
         set_pf_router_dev_for_test(None);
-        assert!(pf_router_dev_on(), "env 未設定の既定は on");
+        assert!(!pf_router_dev_on(), "env 未設定の既定は off (目標未達)");
 
         set_gdn_pf3_for_test(Some(true));
         assert!(gdn_pf3_on());
         set_gdn_pf3_for_test(Some(false));
         assert!(!gdn_pf3_on());
         set_gdn_pf3_for_test(None);
-        assert!(gdn_pf3_on(), "env 未設定の既定は on");
+        assert!(!gdn_pf3_on(), "env 未設定の既定は off (目標未達)");
     }
 }
 
