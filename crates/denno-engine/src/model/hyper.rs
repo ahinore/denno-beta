@@ -422,6 +422,33 @@ pub fn hc_combine_inplace(
     inject: &[f32],
     p: &HyperParams,
 ) {
+    hc_combine_inplace_masked(residual, block_out, inject, p, all_streams(p.hc));
+}
+
+/// 1..=32 本ぶんの全ビット。
+#[inline]
+pub(crate) fn all_streams(hc: usize) -> u32 {
+    if hc >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << hc) - 1
+    }
+}
+
+/// task 217: [`hc_combine_inplace`] の **更新するストリームを選ぶ**版。
+///
+/// `keep` の bit s が 0 のストリームは、この層の block 出力を足さない
+/// (残差ストリーム無効化)。足さないだけで、mix が読む値としてはそのまま
+/// (前の層までの値が残る) 使われる。1 要素の更新は自分自身の要素と
+/// `block_out` だけで決まるので、`keep` を変えても他のストリームの値は
+/// 1 ビットも変わらない。
+pub fn hc_combine_inplace_masked(
+    residual: &mut HyperStreams,
+    block_out: &[f32],
+    inject: &[f32],
+    p: &HyperParams,
+    keep: u32,
+) {
     let e = p.n_embd;
     let hc = p.hc;
     assert_eq!(residual.hc, hc, "residual.hc が hc と一致しない");
@@ -435,6 +462,9 @@ pub fn hc_combine_inplace(
     assert_eq!(inject.len(), hc, "inject は [hc]");
 
     for s in 0..hc {
+        if keep & (1u32 << s) == 0 {
+            continue;
+        }
         let ws = 2.0f32 * sigmoid(inject[s]);
         let row = &mut residual.data[s * e..(s + 1) * e];
         for d in 0..e {
@@ -671,6 +701,19 @@ pub fn hc_combine_batch(
     inject: &[f32],
     p: &HyperParams,
 ) {
+    hc_combine_batch_masked(res, block_out, inject, p, all_streams(p.hc));
+}
+
+/// task 217: [`hc_combine_batch`] の **更新するストリームを選ぶ**版。
+/// `keep` の bit s が 0 のストリームは、この層の block 出力を足さない
+/// (逐次版 [`hc_combine_inplace_masked`] と同じ規則・同じ式)。
+pub fn hc_combine_batch_masked(
+    res: &mut [HyperStreams],
+    block_out: &[f32],
+    inject: &[f32],
+    p: &HyperParams,
+    keep: u32,
+) {
     let e = p.n_embd;
     let hc = p.hc;
     let hc_dim = hc * e;
@@ -692,6 +735,9 @@ pub fn hc_combine_batch(
     let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_ELEM);
     let fill = |r: &mut HyperStreams, bo: &[f32], inj: &[f32]| {
         for s in 0..hc {
+            if keep & (1u32 << s) == 0 {
+                continue;
+            }
             // 逐次版と同じ式・同じ順序: out = residual + block_out * (2*sigmoid(inject))
             let ws = 2.0f32 * sigmoid(inj[s]);
             let row = &mut r.data[s * e..(s + 1) * e];
@@ -872,6 +918,96 @@ mod tests {
     /// 作業域を使い回しても、1 要素の更新が自分自身と `block_out` だけで閉じる
     /// (読み書きが同じ添字) ので、確保ありの版と同じ値になる。
     #[test]
+    /// task 217: 残差ストリーム無効化。
+    ///
+    /// `keep` の bit が 0 のストリームは 1 ビットも変わらない (足さない)。
+    /// bit が 1 のストリームは従来の combine とビット一致する。
+    /// 逐次版とバッチ版で同じ規則。
+    #[test]
+    fn combine_masked_skips_only_disabled_streams() {
+        let (hc, e, nt) = (4usize, 33usize, 3usize);
+        let hp = HyperParams {
+            hc,
+            n_embd: e,
+            low_rank: 2,
+            eps: 1e-6,
+        };
+        let mk = |seed: usize| -> Vec<f32> {
+            (0..hc * e)
+                .map(|i| (((i * 17 + seed) % 23) as f32 - 11.0) * 0.031)
+                .collect()
+        };
+        let block: Vec<f32> = (0..e)
+            .map(|i| (((i * 5) % 19) as f32 - 9.0) * 0.017)
+            .collect();
+        let inject: Vec<f32> = (0..hc).map(|i| ((i * 3) % 7) as f32 * 0.11 - 0.3).collect();
+
+        // keep = 0b1011 (stream 2 を落とす)
+        let keep = 0b1011u32;
+        let base = mk(1);
+        let mut got = HyperStreams {
+            data: base.clone(),
+            hc,
+            n_embd: e,
+        };
+        hc_combine_inplace_masked(&mut got, &block, &inject, &hp, keep);
+        let want = hc_combine(
+            &HyperStreams {
+                data: base.clone(),
+                hc,
+                n_embd: e,
+            },
+            &block,
+            &inject,
+            &hp,
+        );
+        for s in 0..hc {
+            for d in 0..e {
+                let i = s * e + d;
+                if keep & (1 << s) == 0 {
+                    assert_eq!(got.data[i].to_bits(), base[i].to_bits(), "stream {s} が変わった");
+                } else {
+                    assert_eq!(got.data[i].to_bits(), want.data[i].to_bits(), "stream {s} が従来と違う");
+                }
+            }
+        }
+        // keep = 全ビットは既存の in-place とビット一致。
+        let mut a = HyperStreams { data: base.clone(), hc, n_embd: e };
+        let mut b = HyperStreams { data: base.clone(), hc, n_embd: e };
+        hc_combine_inplace_masked(&mut a, &block, &inject, &hp, all_streams(hc));
+        hc_combine_inplace(&mut b, &block, &inject, &hp);
+        assert_eq!(a.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                   b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+
+        // バッチ版: トークンごとに同じ規則。
+        let mut res: Vec<HyperStreams> = (0..nt)
+            .map(|t| HyperStreams { data: mk(t + 2), hc, n_embd: e })
+            .collect();
+        let mut res_b: Vec<HyperStreams> = (0..nt)
+            .map(|t| HyperStreams { data: mk(t + 2), hc, n_embd: e })
+            .collect();
+        let block_b: Vec<f32> = (0..nt * e)
+            .map(|i| (((i * 7) % 29) as f32 - 14.0) * 0.013)
+            .collect();
+        let inject_b: Vec<f32> = (0..nt * hc).map(|i| ((i * 5) % 9) as f32 * 0.07 - 0.2).collect();
+        hc_combine_batch_masked(&mut res, &block_b, &inject_b, &hp, keep);
+        hc_combine_batch(&mut res_b, &block_b, &inject_b, &hp);
+        for t in 0..nt {
+            for s in 0..hc {
+                for d in 0..e {
+                    let i = s * e + d;
+                    let got = res[t].data[i];
+                    let want = res_b[t].data[i];
+                    if keep & (1 << s) == 0 {
+                        assert_eq!(got.to_bits(), (mk(t + 2))[i].to_bits(), "batch stream {s}");
+                    } else {
+                        assert_eq!(got.to_bits(), want.to_bits(), "batch stream {s} が従来と違う");
+                    }
+                }
+            }
+        }
+    }
+
     fn hc_combine_inplace_matches_bitwise() {
         for &(hc, e) in &[(4usize, 2560usize), (4, 37), (1, 7), (2, 1031)] {
             let hp = HyperParams {

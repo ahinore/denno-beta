@@ -40,8 +40,12 @@ use crate::kquant::GgmlType;
 use crate::model::expert_cache::{self, CacheSpec, ExpertCacheSet, ExpertKey, ExpertMatrix};
 use crate::model::expert_vram::{self, Route};
 use crate::model::hyper::{self, HyperParams, HyperStreams};
+use crate::model::intervene::{self, Block as IvBlock, View as IvView};
 use crate::model::linear_gguf::GgufLinear;
-use crate::model::moe::{select_topk, select_topk_into, select_topk_into_fast};
+use crate::model::moe::{
+    select_topk, select_topk_into, select_topk_into_fast, select_topk_into_mask,
+    select_topk_mask,
+};
 use crate::model::moe_expert::{self, ExpertSlice};
 use crate::model::prekprof;
 use crate::model::q4ledger;
@@ -2368,6 +2372,13 @@ impl Qwen4Exp {
     /// attention / ssm の実装を差し替えて組む (F2 / F3 用)。
     pub fn with_attn(f: &GgufFile, attn: Box<dyn LayerAttn>) -> Result<Self> {
         let p = validate(f)?;
+        // task 217: `DENNO_INTERVENE` の env プリロード (lab 用)。プロセスで 1 回だけ。
+        intervene::init_from_env(&intervene::Shape {
+            n_layer: p.n_layer,
+            n_expert: p.n_expert,
+            n_expert_used: p.n_expert_used,
+            n_hc: p.n_hc,
+        });
 
         let tok_embd = linear(f, "token_embd.weight")?;
         let head = HeadW::load(f)?;
@@ -2641,6 +2652,10 @@ impl Qwen4Exp {
         mut roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         let hp = self.hp();
+        // task 217: 介入設定は **forward step の先頭で 1 回だけ**読む (ロックはここだけ)。
+        // 以降の層ループは `&iv` を参照するだけで、ホットパスにロックは無い。
+        let iv_cfg = intervene::snapshot();
+        let iv = IvView::of(&iv_cfg);
         // P78: 逐次 prefill の中だけ層の外を区間計測する (decode では false)。
         let prof = prekprof::measuring();
         // task 132: decode の層の外の内訳 (`DENNO_Q4_PROFILE`)。無効なら
@@ -2701,6 +2716,7 @@ impl Qwen4Exp {
                 None,
                 rr,
                 t + 1 == nt,
+                iv,
             )?;
             if let Some(h) = on_layer.as_deref_mut() {
                 // task 155: 層の出口 (`LayerOut` の組み立てと `on_layer`) を `loop` 行に。
@@ -2854,6 +2870,7 @@ impl Qwen4Exp {
         hook: Option<&mut dyn FnMut(&str, usize, &[f32]) -> Result<()>>,
         mut roles: Option<&mut RoleRms>,
         emit_router: bool,
+        iv: IvView<'_>,
     ) -> Result<()> {
         let e = self.p.n_embd;
         // task 177: 診断 (`DENNO_GDN_DEC_KPROF`) が mix の表に層番号を出すため。
@@ -2882,135 +2899,160 @@ impl Qwen4Exp {
             q4prof::N_LAYER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 3.1 PLE 注入 (層 1 のみ)。res_hc を置き換える。
+        // task 217: `ple` block を切った層では注入そのものを計算しない
+        // (残差の置き換えもしない)。
         if let Some(pw) = &lw.ple {
-            let pe = ple_emb.ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
-            let hist_buf = match self.ple_conv_state[il].as_mut() {
-                Some(b) => b,
-                None => return Err(one(format!("層 {il}: PLE の conv 履歴が無い"))),
-            };
-            // P54: PLE の寄与 (gated + conv) の RMS を ple_inject の中で 1 パスで取る。
-            let mut contrib = 0.0f32;
-            *res = ple_inject(
-                &self.p,
-                pw,
-                pe,
-                res,
-                hp,
-                hist_buf,
-                roles.is_some().then_some(&mut contrib),
-            )?;
-            if let Some(r) = roles.as_deref_mut() {
-                r.ple = contrib;
+            if !iv.block_off(il, IvBlock::Ple) {
+                let pe = ple_emb.ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
+                let hist_buf = match self.ple_conv_state[il].as_mut() {
+                    Some(b) => b,
+                    None => return Err(one(format!("層 {il}: PLE の conv 履歴が無い"))),
+                };
+                // P54: PLE の寄与 (gated + conv) の RMS を ple_inject の中で 1 パスで取る。
+                let mut contrib = 0.0f32;
+                *res = ple_inject(
+                    &self.p,
+                    pw,
+                    pe,
+                    res,
+                    hp,
+                    hist_buf,
+                    roles.is_some().then_some(&mut contrib),
+                )?;
+                if let Some(r) = roles.as_deref_mut() {
+                    r.ple = contrib;
+                }
+                hook_at!("ple_after");
             }
-            hook_at!("ple_after");
         }
 
-        // 3.2-3.4 attention 入口 → attn → 出口
-        let t_mix = std::time::Instant::now();
-        let (cur, inject) = {
-            // task 138: 台帳の区間 (mix)。off では stamp を取らないだけ。
-            let _l = q4ledger::enter(q4ledger::MIX);
-            hc_mix_quant(
-                res,
-                &lw.hc_attn_norm,
-                &lw.hc_attn_down,
-                &lw.hc_attn_up,
-                Some(&lw.hc_attn_inject),
-                hp,
-            )?
-        };
-        {
-            let _l = q4ledger::enter(q4ledger::QPROF);
-            q4prof::add(&q4prof::MIX, t_mix);
-        }
-        hook_at!("hc_mixed_attn", &cur);
-        hook_at!("hc_inject_attn", &inject);
-        let t_attn = std::time::Instant::now();
-        let cur = {
-            // task 138: 層種別で full / ssm に分ける (台帳 on のときだけ引く)。
-            let item = if q4ledger::enabled() {
-                match self.p.layer_kind(il) {
-                    Ok(LayerKind::FullAttn) => q4ledger::FULL,
-                    _ => q4ledger::SSM,
-                }
-            } else {
-                q4ledger::OTHER
+        // task 217: `attn` block を切った層は mix / attn / combine を丸ごと飛ばす。
+        if !iv.block_off(il, IvBlock::Attn) {
+            let t_mix = std::time::Instant::now();
+            let (cur, inject) = {
+                // task 138: 台帳の区間 (mix)。off では stamp を取らないだけ。
+                let _l = q4ledger::enter(q4ledger::MIX);
+                hc_mix_quant(
+                    res,
+                    &lw.hc_attn_norm,
+                    &lw.hc_attn_down,
+                    &lw.hc_attn_up,
+                    Some(&lw.hc_attn_inject),
+                    hp,
+                )?
             };
-            let _l = q4ledger::enter(item);
-            self.attn.forward(il, &cur)?
-        };
-        {
-            let _l = q4ledger::enter(q4ledger::QPROF);
-            q4prof::add(&q4prof::ATTN, t_attn);
-        }
-        if cur.len() != e {
-            return Err(one(format!(
-                "層 {il}: attention の出力長 {} が n_embd {e} と違う",
-                cur.len()
-            )));
-        }
-        hook_at!("attn_out", &cur);
-        // P54: 層の種別で attn (full attention) と gdn (ssm) のどちらに入れるかが決まる。
-        // task 153: 台帳の区間 (roles)。2560 要素の RMS と役割の詰め直し。
-        if roles.is_some() {
-            let _l = q4ledger::enter(q4ledger::ROLES);
-            if let Some(r) = roles.as_deref_mut() {
-                let v = rms_of(&cur);
-                if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
-                    r.attn = v;
+            {
+                let _l = q4ledger::enter(q4ledger::QPROF);
+                q4prof::add(&q4prof::MIX, t_mix);
+            }
+            hook_at!("hc_mixed_attn", &cur);
+            hook_at!("hc_inject_attn", &inject);
+            let t_attn = std::time::Instant::now();
+            let cur = {
+                // task 138: 層種別で full / ssm に分ける (台帳 on のときだけ引く)。
+                let item = if q4ledger::enabled() {
+                    match self.p.layer_kind(il) {
+                        Ok(LayerKind::FullAttn) => q4ledger::FULL,
+                        _ => q4ledger::SSM,
+                    }
                 } else {
-                    r.gdn = v;
+                    q4ledger::OTHER
+                };
+                let _l = q4ledger::enter(item);
+                self.attn.forward(il, &cur)?
+            };
+            {
+                let _l = q4ledger::enter(q4ledger::QPROF);
+                q4prof::add(&q4prof::ATTN, t_attn);
+            }
+            if cur.len() != e {
+                return Err(one(format!(
+                    "層 {il}: attention の出力長 {} が n_embd {e} と違う",
+                    cur.len()
+                )));
+            }
+            hook_at!("attn_out", &cur);
+            // P54: 層の種別で attn (full attention) と gdn (ssm) のどちらに入れるかが決まる。
+            // task 153: 台帳の区間 (roles)。2560 要素の RMS と役割の詰め直し。
+            if roles.is_some() {
+                let _l = q4ledger::enter(q4ledger::ROLES);
+                if let Some(r) = roles.as_deref_mut() {
+                    let v = rms_of(&cur);
+                    if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                        r.attn = v;
+                    } else {
+                        r.gdn = v;
+                    }
                 }
             }
+            {
+                // task 153: 台帳の区間 (combine)。hyper connection の足し込み。
+                // task 155: 作業域を使い回す (`hc_combine` と同じ式・同じ順)。
+                // task 217: 無効にしたストリームにはこの層の更新を足さない。
+                let _l = q4ledger::enter(q4ledger::COMBINE);
+                hyper::hc_combine_inplace_masked(
+                    res,
+                    &cur,
+                    &inject,
+                    hp,
+                    iv.stream_keep(il, hp.hc),
+                );
+            }
+            hook_at!("res_after_attn");
         }
-        {
-            // task 153: 台帳の区間 (combine)。hyper connection の足し込み。
-            // task 155: 作業域を使い回す (`hc_combine` と同じ式・同じ順)。
-            let _l = q4ledger::enter(q4ledger::COMBINE);
-            hyper::hc_combine_inplace(res, &cur, &inject, hp);
-        }
-        hook_at!("res_after_attn");
 
-        // 3.5-3.7 ffn 入口 → MoE FFN → 出口
-        let t_mix = std::time::Instant::now();
-        let (cur, inject) = {
-            // task 138: 台帳の区間 (mix)。
-            let _l = q4ledger::enter(q4ledger::MIX);
-            hc_mix_quant(
-                res,
-                &lw.hc_ffn_norm,
-                &lw.hc_ffn_down,
-                &lw.hc_ffn_up,
-                Some(&lw.hc_ffn_inject),
-                hp,
-            )?
-        };
-        {
-            let _l = q4ledger::enter(q4ledger::QPROF);
-            q4prof::add(&q4prof::MIX, t_mix);
+        // task 217: routed expert と shared expert の両方を切った層は mix / combine も
+        // 飛ばす。片方だけ切るときは mix が要る (切っていない側の入力になる)。
+        let skip_routed = iv.block_off(il, IvBlock::Moe);
+        let skip_shared = iv.block_off(il, IvBlock::Shared);
+        if !(skip_routed && skip_shared) {
+            let t_mix = std::time::Instant::now();
+            let (cur, inject) = {
+                // task 138: 台帳の区間 (mix)。
+                let _l = q4ledger::enter(q4ledger::MIX);
+                hc_mix_quant(
+                    res,
+                    &lw.hc_ffn_norm,
+                    &lw.hc_ffn_down,
+                    &lw.hc_ffn_up,
+                    Some(&lw.hc_ffn_inject),
+                    hp,
+                )?
+            };
+            {
+                let _l = q4ledger::enter(q4ledger::QPROF);
+                q4prof::add(&q4prof::MIX, t_mix);
+            }
+            hook_at!("hc_mixed_ffn", &cur);
+            let t_moe = std::time::Instant::now();
+            let cur = moe_ffn_quant_tapped(
+                &self.p,
+                lw,
+                &cur,
+                self.expert_cache.as_ref(),
+                roles.as_deref_mut(),
+                emit_router,
+                iv,
+            )?;
+            {
+                let _l = q4ledger::enter(q4ledger::QPROF);
+                q4prof::add(&q4prof::MOE, t_moe);
+            }
+            hook_at!("ffn_out", &cur);
+            {
+                // task 153: 台帳の区間 (combine)。
+                // task 155: 作業域を使い回す (`hc_combine` と同じ式・同じ順)。
+                let _l = q4ledger::enter(q4ledger::COMBINE);
+                hyper::hc_combine_inplace_masked(
+                    res,
+                    &cur,
+                    &inject,
+                    hp,
+                    iv.stream_keep(il, hp.hc),
+                );
+            }
         }
-        hook_at!("hc_mixed_ffn", &cur);
-        let t_moe = std::time::Instant::now();
-        let cur = moe_ffn_quant_tapped(
-            &self.p,
-            lw,
-            &cur,
-            self.expert_cache.as_ref(),
-            roles.as_deref_mut(),
-            emit_router,
-        )?;
-        {
-            let _l = q4ledger::enter(q4ledger::QPROF);
-            q4prof::add(&q4prof::MOE, t_moe);
-        }
-        hook_at!("ffn_out", &cur);
-        {
-            // task 153: 台帳の区間 (combine)。
-            // task 155: 作業域を使い回す (`hc_combine` と同じ式・同じ順)。
-            let _l = q4ledger::enter(q4ledger::COMBINE);
-            hyper::hc_combine_inplace(res, &cur, &inject, hp);
-        }
+
         // P58: 層の役割別活性 (kind 13)。`emit_router` は「このトークンが forward
         // 呼び出しの末尾か」の意味も持つ (decode は常に真、逐次 prefill は末尾の
         // 1 トークンだけ)。読むだけなので数値経路には触れない。
@@ -3035,6 +3077,9 @@ impl Qwen4Exp {
         sink: &mut dyn FnMut(&str, &[f32]),
     ) -> Result<()> {
         let hp = self.hp();
+        // task 217: デバッグ経路も同じ介入設定を通す (数値は本番と同じ、の契約)。
+        let iv_cfg = intervene::snapshot();
+        let iv = IvView::of(&iv_cfg);
         let last = ctx.len().saturating_sub(1);
         for i in 0..ctx.len() {
             let is_last = i == last;
@@ -3047,7 +3092,16 @@ impl Qwen4Exp {
                     }
                     Ok(())
                 };
-                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, Some(&mut hook), None, false)?;
+                self.run_layer(
+                    il,
+                    &mut res,
+                    ple_emb.as_ref(),
+                    &hp,
+                    Some(&mut hook),
+                    None,
+                    false,
+                    iv,
+                )?;
             }
         }
         Ok(())
@@ -3487,6 +3541,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         tokens: TapTokens,
         mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         mut roles: Option<&mut RoleRms>,
+        iv: IvView<'_>,
     ) -> Result<Option<Vec<Vec<f32>>>> {
         let hp = self.hp();
         let e = self.p.n_embd;
@@ -3767,6 +3822,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     self.expert_cache.as_ref(),
                     roles.as_deref_mut(),
                     true,
+                    iv,
                 )?;
                 q4prof::add(&q4prof::MOE, t_moe);
                 if ffn.len() != nt * e {
@@ -3849,6 +3905,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         _tokens: TapTokens,
         _on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         _roles: Option<&mut RoleRms>,
+        _iv: IvView<'_>,
     ) -> Result<Option<Vec<Vec<f32>>>> {
         Ok(None)
     }
@@ -3888,6 +3945,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let e = self.p.n_embd;
         let n_layer = self.p.n_layer;
         let chunk = chunk.max(1);
+        // task 217: 介入設定は **prefill 1 回の先頭で 1 回だけ**読む。
+        let iv_cfg = intervene::snapshot();
+        let iv = IvView::of(&iv_cfg);
         // task 154: hc mix / combine のデバイス常駐 (`DENNO_PF_RESIDENT`)。
         // 観測フック付き (`on_layer`) と全位置 logits (`collect_all`) は
         // 従来経路だけが受ける (常駐経路は層の出口をホストへ出さない)。
@@ -3908,7 +3968,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 );
             }
         }
-        if pf_mix_dev_on() && pf_hook_ok && !collect_all {
+        // task 217: 常駐連鎖 (mix / combine / attn / PLE をデバイスで閉じる) は、
+        //   そのどれかを切る設定のときだけ使わない。expert / shared の無効化は
+        //   ホスト側の MoE で処理できるので連鎖のまま回す (prefill の速度を保つ)。
+        if pf_mix_dev_on() && pf_hook_ok && !collect_all && iv.resident_safe() {
             // `as_deref_mut` だと外側の寿命に固定されて 2 回目で E0499 になる
             // (`prefill_seq` と同じく短い寿命で借り直す)。
             let hook: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>> = match &mut on_layer {
@@ -3921,6 +3984,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 tokens,
                 hook,
                 roles.as_deref_mut(),
+                iv,
             )? {
                 return Ok(out);
             }
@@ -3980,128 +4044,152 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
 
                 // 3.1 PLE 注入 (層 1 のみ)。conv 履歴はトークン順に進める。
+                // task 217: `ple` block を切った層では注入を計算しない。
                 if let Some(pw) = &lw.ple {
-                    for t in 0..nt {
-                        let pe = ples[t]
-                            .as_ref()
-                            .ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
-                        let hist = self.ple_conv_state[il]
-                            .as_mut()
-                            .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
-                        // P54: 寄与の RMS はチャンク末尾のトークンだけ取る。
-                        let mut contrib = 0.0f32;
-                        let want = roles.is_some() && t + 1 == nt;
-                        ress[t] = ple_inject(
-                            &self.p,
-                            pw,
-                            pe,
-                            &ress[t],
-                            &hp,
-                            hist,
-                            want.then_some(&mut contrib),
-                        )?;
-                        if want {
-                            if let Some(r) = roles.as_deref_mut() {
-                                r.ple = contrib;
+                    if !iv.block_off(il, IvBlock::Ple) {
+                        for t in 0..nt {
+                            let pe = ples[t]
+                                .as_ref()
+                                .ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
+                            let hist = self.ple_conv_state[il]
+                                .as_mut()
+                                .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
+                            // P54: 寄与の RMS はチャンク末尾のトークンだけ取る。
+                            let mut contrib = 0.0f32;
+                            let want = roles.is_some() && t + 1 == nt;
+                            ress[t] = ple_inject(
+                                &self.p,
+                                pw,
+                                pe,
+                                &ress[t],
+                                &hp,
+                                hist,
+                                want.then_some(&mut contrib),
+                            )?;
+                            if want {
+                                if let Some(r) = roles.as_deref_mut() {
+                                    r.ple = contrib;
+                                }
                             }
                         }
                     }
                 }
 
-                // 3.2-3.4 attention 入口 (バッチ) → attn (トークン順) → 出口
-                let t_mix = std::time::Instant::now();
-                let (curs, injs) = {
-                    // task 145: 台帳の区間 (mix)。
-                    let _l = q4ledger::enter(q4ledger::MIX);
-                    hc_mix_quant_batch(
-                        &ress,
-                        &lw.hc_attn_norm,
-                        &lw.hc_attn_down,
-                        &lw.hc_attn_up,
-                        Some(&lw.hc_attn_inject),
-                        &hp,
-                        &mut mx,
-                    )?
-                };
-                q4prof::add(&q4prof::MIX, t_mix);
-                let t_attn = std::time::Instant::now();
-                // 投影をチャンクでまとめる実装 (ssm 層) はここで GPU 往復を減らす。
-                let outs = {
-                    // task 145: 台帳の区間。層種別で full / ssm に分ける。
-                    let item = if q4ledger::enabled() {
-                        match self.p.layer_kind(il) {
-                            Ok(LayerKind::FullAttn) => q4ledger::FULL,
-                            _ => q4ledger::SSM,
-                        }
-                    } else {
-                        q4ledger::OTHER
+                // task 217: `attn` block を切った層は mix / attn / combine を飛ばす。
+                if !iv.block_off(il, IvBlock::Attn) {
+                    let t_mix = std::time::Instant::now();
+                    let (curs, injs) = {
+                        // task 145: 台帳の区間 (mix)。
+                        let _l = q4ledger::enter(q4ledger::MIX);
+                        hc_mix_quant_batch(
+                            &ress,
+                            &lw.hc_attn_norm,
+                            &lw.hc_attn_down,
+                            &lw.hc_attn_up,
+                            Some(&lw.hc_attn_inject),
+                            &hp,
+                            &mut mx,
+                        )?
                     };
-                    let _l = q4ledger::enter(item);
-                    self.attn.forward_batch(il, &curs)?
-                };
-                for o in &outs {
-                    if o.len() != e {
+                    q4prof::add(&q4prof::MIX, t_mix);
+                    let t_attn = std::time::Instant::now();
+                    // 投影をチャンクでまとめる実装 (ssm 層) はここで GPU 往復を減らす。
+                    let outs = {
+                        // task 145: 台帳の区間。層種別で full / ssm に分ける。
+                        let item = if q4ledger::enabled() {
+                            match self.p.layer_kind(il) {
+                                Ok(LayerKind::FullAttn) => q4ledger::FULL,
+                                _ => q4ledger::SSM,
+                            }
+                        } else {
+                            q4ledger::OTHER
+                        };
+                        let _l = q4ledger::enter(item);
+                        self.attn.forward_batch(il, &curs)?
+                    };
+                    for o in &outs {
+                        if o.len() != e {
+                            return Err(one(format!(
+                                "層 {il}: attention の出力長 {} が n_embd {e} と違う",
+                                o.len()
+                            )));
+                        }
+                    }
+                    q4prof::add(&q4prof::ATTN, t_attn);
+                    if outs.len() != nt {
                         return Err(one(format!(
-                            "層 {il}: attention の出力長 {} が n_embd {e} と違う",
-                            o.len()
+                            "層 {il}: attention の出力本数 {} が nt {nt} と違う",
+                            outs.len()
                         )));
                     }
-                }
-                q4prof::add(&q4prof::ATTN, t_attn);
-                if outs.len() != nt {
-                    return Err(one(format!(
-                        "層 {il}: attention の出力本数 {} が nt {nt} と違う",
-                        outs.len()
-                    )));
-                }
-                let flat_outs = flatten_rows(&outs, e)?;
-                // P54: attn / gdn の RMS はチャンク末尾のトークンの出力で取る。
-                if let Some(r) = roles.as_deref_mut() {
-                    let t = nt - 1;
-                    let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
-                    if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
-                        r.attn = v;
-                    } else {
-                        r.gdn = v;
+                    let flat_outs = flatten_rows(&outs, e)?;
+                    // P54: attn / gdn の RMS はチャンク末尾のトークンの出力で取る。
+                    if let Some(r) = roles.as_deref_mut() {
+                        let t = nt - 1;
+                        let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
+                        if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                            r.attn = v;
+                        } else {
+                            r.gdn = v;
+                        }
                     }
-                }
-                hyper::hc_combine_batch(&mut ress, &flat_outs, &injs, &hp);
-
-                // 3.5-3.7 ffn 入口 (バッチ) → MoE FFN (バッチ) → 出口
-                let t_mix = std::time::Instant::now();
-                let (curs, injs) = {
-                    // task 145: 台帳の区間 (mix)。
-                    let _l = q4ledger::enter(q4ledger::MIX);
-                    hc_mix_quant_batch(
-                        &ress,
-                        &lw.hc_ffn_norm,
-                        &lw.hc_ffn_down,
-                        &lw.hc_ffn_up,
-                        Some(&lw.hc_ffn_inject),
+                    hyper::hc_combine_batch_masked(
+                        &mut ress,
+                        &flat_outs,
+                        &injs,
                         &hp,
-                        &mut mx,
-                    )?
-                };
-                q4prof::add(&q4prof::MIX, t_mix);
-                let flat = flatten_rows(&curs, e)?;
-                let t_moe = std::time::Instant::now();
-                let ffn = moe_ffn_quant_batch_tapped(
-                    &self.p,
-                    lw,
-                    &flat,
-                    nt,
-                    self.expert_cache.as_ref(),
-                    roles.as_deref_mut(),
-                    true,
-                )?;
-                q4prof::add(&q4prof::MOE, t_moe);
-                if ffn.len() != nt * e {
-                    return Err(one(format!(
-                        "層 {il}: MoE の出力長 {} が nt {nt} * n_embd {e} と違う",
-                        ffn.len()
-                    )));
+                        iv.stream_keep(il, hp.hc),
+                    );
+
                 }
-                hyper::hc_combine_batch(&mut ress, &ffn, &injs, &hp);
+
+                // task 217: routed と shared の両方を切った層は mix / combine も飛ばす。
+                let skip_routed = iv.block_off(il, IvBlock::Moe);
+                let skip_shared = iv.block_off(il, IvBlock::Shared);
+                if !(skip_routed && skip_shared) {
+                    let t_mix = std::time::Instant::now();
+                    let (curs, injs) = {
+                        // task 145: 台帳の区間 (mix)。
+                        let _l = q4ledger::enter(q4ledger::MIX);
+                        hc_mix_quant_batch(
+                            &ress,
+                            &lw.hc_ffn_norm,
+                            &lw.hc_ffn_down,
+                            &lw.hc_ffn_up,
+                            Some(&lw.hc_ffn_inject),
+                            &hp,
+                            &mut mx,
+                        )?
+                    };
+                    q4prof::add(&q4prof::MIX, t_mix);
+                    let flat = flatten_rows(&curs, e)?;
+                    let t_moe = std::time::Instant::now();
+                    let ffn = moe_ffn_quant_batch_tapped(
+                        &self.p,
+                        lw,
+                        &flat,
+                        nt,
+                        self.expert_cache.as_ref(),
+                        roles.as_deref_mut(),
+                        true,
+                        iv,
+                    )?;
+                    q4prof::add(&q4prof::MOE, t_moe);
+                    if ffn.len() != nt * e {
+                        return Err(one(format!(
+                            "層 {il}: MoE の出力長 {} が nt {nt} * n_embd {e} と違う",
+                            ffn.len()
+                        )));
+                    }
+                    hyper::hc_combine_batch_masked(
+                        &mut ress,
+                        &ffn,
+                        &injs,
+                        &hp,
+                        iv.stream_keep(il, hp.hc),
+                    );
+
+                }
 
                 // P58: 層の役割別活性 (kind 13)。prefill は**最後のチャンクの末尾**
                 // トークンだけ送る (チャンクは既定 8 トークンなので、全チャンクで
@@ -7842,7 +7930,17 @@ fn moe_ffn_quant(
     x: &[f32],
     cache: Option<&ExpertCacheSet>,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_full(p, lw, x, cache, moe_par_enabled(), expert_route(), None, true)
+    moe_ffn_quant_full(
+        p,
+        lw,
+        x,
+        cache,
+        moe_par_enabled(),
+        expert_route(),
+        None,
+        true,
+        IvView::none(),
+    )
 }
 
 /// P56: 1 層ぶんのルータ結果を [`denno_telemetry::Frame::RouterTopK`] として送る。
@@ -8053,8 +8151,19 @@ fn moe_ffn_quant_tapped(
     cache: Option<&ExpertCacheSet>,
     roles: Option<&mut RoleRms>,
     emit_router: bool,
+    iv: IvView<'_>,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_full(p, lw, x, cache, moe_par_enabled(), expert_route(), roles, emit_router)
+    moe_ffn_quant_full(
+        p,
+        lw,
+        x,
+        cache,
+        moe_par_enabled(),
+        expert_route(),
+        roles,
+        emit_router,
+        iv,
+    )
 }
 
 /// P39: expert の計算経路 (`DENNO_EXPERT_GPU` + `DENNO_EXPERT_VRAM_MB`)。プロセスで 1 回だけ。
@@ -8848,7 +8957,7 @@ fn moe_ffn_quant_with(
 ) -> Result<Vec<f32>> {
     // 既存のテスト用入口は**従来経路を固定**する (`DENNO_EXPERT_LOOP` に依存させない)。
     // P64 の新経路は [`moe_ffn_quant_full_opts`] を直接呼ぶテストで確かめる。
-    moe_ffn_quant_full_opts(p, lw, x, cache, par, route, None, true, false)
+    moe_ffn_quant_full_opts(p, lw, x, cache, par, route, None, true, false, IvView::none())
 }
 
 /// [`moe_ffn_quant_with`] の本体 (+ P54 の役割別 RMS / P56 の RouterTopK)。
@@ -8865,6 +8974,7 @@ fn moe_ffn_quant_full(
     route: Route,
     roles: Option<&mut RoleRms>,
     emit_router: bool,
+    iv: IvView<'_>,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_full_opts(
         p,
@@ -8876,6 +8986,7 @@ fn moe_ffn_quant_full(
         roles,
         emit_router,
         expert_loop_enabled(),
+        iv,
     )
 }
 
@@ -8894,6 +9005,7 @@ fn moe_ffn_quant_full_opts(
     roles: Option<&mut RoleRms>,
     emit_router: bool,
     loop_on: bool,
+    iv: IvView<'_>,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_impl(
         p,
@@ -8906,6 +9018,7 @@ fn moe_ffn_quant_full_opts(
         emit_router,
         loop_on,
         expert_flat_decode_enabled(),
+        iv,
     )
 }
 
@@ -9215,6 +9328,7 @@ fn moe_ffn_quant_impl(
     emit_router: bool,
     loop_on: bool,
     flat_decode: bool,
+    iv: IvView<'_>,
 ) -> Result<Vec<f32>> {
     let t_router = std::time::Instant::now();
     let e = p.n_embd;
@@ -9244,7 +9358,10 @@ fn moe_ffn_quant_impl(
     // task 124: shared expert の gate/up は `x` だけで決まるので、router と
     // 選択 expert の CPU 仕事を始める前に GPU へ積む (join は下の 5. で 1 回)。
     // task 138: この発行は台帳では shared に数える。
-    let mut shed_ov = {
+    // task 217: shared expert を切った層では gate/up の先積みもしない。
+    let mut shed_ov = if iv.block_off(lw.il, IvBlock::Shared) {
+        SharedExpertOverlap::none()
+    } else {
         let _l = q4ledger::enter(q4ledger::SHARED);
         // task 187: 台帳の副区間 (shared gate/up の enqueue)。
         let _s = q4ledger::sub(q4ledger::SUB_SH_BEGIN);
@@ -9285,7 +9402,13 @@ fn moe_ffn_quant_impl(
     // 2. top-k (index 昇順で返る)
     #[cfg(feature = "cuda")]
     let t_topk = std::time::Instant::now();
-    let mut sel = select_topk(&probs, k);
+    // task 217: 無効 expert は候補から外す (設定が無ければ従来と 1 ビット同じ)。
+    // 残った expert から top-k を選び、下の再正規化は選んだ集合の和で割る
+    // = 「残りだけで正規化する」というルータの通常の規則になる。
+    let mut sel = match iv.expert_mask(lw.il) {
+        Some(m) => select_topk_mask(&probs, k, m),
+        None => select_topk(&probs, k),
+    };
     #[cfg(feature = "cuda")]
     crate::cuda::dec_kprof::note_since("topk", t_topk);
 
@@ -9322,8 +9445,18 @@ fn moe_ffn_quant_impl(
     for &i in &sel {
         sum += probs[i];
     }
-    for (t, &i) in sel.iter().enumerate() {
-        weights[t] = probs[i] / sum;
+    // task 217: 選んだ expert の確率が全部 0 (softmax のアンダーフロー) だと
+    // 0/0 = NaN になる。介入で支配的な expert を切ると起こりうるので、
+    // そのときだけ一様に分ける (通常の経路では和が正なので 1 ビットも変わらない)。
+    if sum.is_finite() && sum > 0.0 {
+        for (t, &i) in sel.iter().enumerate() {
+            weights[t] = probs[i] / sum;
+        }
+    } else {
+        let u = 1.0f32 / k_run as f32;
+        for w in weights.iter_mut() {
+            *w = u;
+        }
     }
     if let Some(x) = min_w_x {
         // 重みが x 未満の expert を落とす (最低 1 個は残す)。kept は昇順走査の
@@ -9402,485 +9535,492 @@ fn moe_ffn_quant_impl(
     // decode 1 トークン = 48 層 x 10 本 = 480 回の `fetch_add` (Relaxed)。
     crate::model::exp_stats::observe_layer(p.n_layer, p.n_expert, lw.il, &sel);
 
-    // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
-    //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
-    //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
-    //     先に起こす意味が無い (`prefetch()` 自体は無効化も変更もしない)。
-    //
-    //     task 67: **先読みは既定で off** (`DENNO_EXPERT_PREFETCH=1` で on)。
-    //     `MADV_WILLNEED` は readahead を呼び出しスレッドで同期的に起こすので、
-    //     8 スレッドがフォルトで並列に読むほうが速い (実測 +6-8 %)。
-    //
-    //     P39: VRAM 常駐経路 (`vram_mode`) では pread キャッシュを**使わない**
-    //     (置き場所を 2 か所に持たない)。ヒットした expert は mmap を触らないので
-    //     prefetch も投げない。ミスした expert は H2D のために同じページを
-    //     順に読むので、先読みの有無で総 I/O は変わらない。
-    //
-    //     P45: `vram_mode` でも、直近のヒット率がしきい値未満のトークンは CPU で
-    //     計算する (`use_gpu == false`)。そのトークンは mmap を直接読むので
-    //     prefetch は投げる (RAM キャッシュは vram_mode では使わない = P39 と同じ)。
-    let vram_mode = route == Route::Vram;
-    let use_gpu = vram_mode && {
-        let per = expert_h2d_bytes_one(lw, e, ff);
-        expert_gate_decide(lw.il, sel.len(), per).uses_gpu()
-    };
-    if vram_mode && cache.is_some() {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            eprintln!(
-                "[flash] DENNO_EXPERT_VRAM_MB を優先: DENNO_EXPERT_CACHE_MB (RAM の pread キャッシュ) は使わない"
-            );
-        });
-    }
-    let cache = if vram_mode { None } else { cache };
-    if cache.is_none() && !use_gpu {
-        prefetch_selected(lw, &sel);
-    }
-
-    // 4. 選択 expert を index 昇順に積む
-    //
-    // P-MOE-G5: 各 expert の寄与 `h_e` は x だけで決まる独立な計算なので並列化できる。
-    // ただし **重み付きの足し込みは index 昇順の逐次** のままにする (並列に足すと
-    // 丸めの順序が変わる)。並列化するのは `h_e` の計算だけ。
-    //
-    // P38: キャッシュ経路も並列化する。`ExpertCacheSet` は `&self` で共有でき、
-    // ヒットは `Arc` を clone するだけ・ミスの pread はロックの外なので、旧実装のように
-    // 「キャッシュを有効にすると 10 expert が逐次になる」ことがない。
+    // task 217: routed expert を切った層は選択後の先読み・寄与計算・GPU 経路を
+    // 丸ごと飛ばす (out は 0 のまま)。
     let mut out = vec![0.0f32; e];
-    #[cfg(feature = "par")]
-    let parallel = par && sel.len() > 1 && !use_gpu;
-    #[cfg(not(feature = "par"))]
-    let parallel = {
-        // par 機能なしでは行並列も expert 並列も無い (従来と同じ逐次経路)。
-        let _ = par;
-        false
-    };
-    // P64: 新経路 (1 層 1 並列領域)。rayon が要るので `par` 機能が無いビルドと、
-    // GPU 経路 (`use_gpu`) では使わない (GPU の層一括・per-expert 経路は従来のまま)。
-    #[cfg(feature = "par")]
-    let loop_new = loop_on && !use_gpu;
-    #[cfg(not(feature = "par"))]
-    let loop_new = {
-        let _ = loop_on;
-        false
-    };
-
-    // P70: expert 寄与の expert 横断平坦化。**mmap 経路だけ**に使う (キャッシュ経路は
-    // expert 単位の pread が前提で、行チャンクに切ると同じ expert を何度も読む)。
-    #[cfg(feature = "par")]
-    let flat_new = flat_decode && !use_gpu && cache.is_none();
-    #[cfg(not(feature = "par"))]
-    let flat_new = {
-        let _ = flat_decode;
-        false
-    };
-
-    // task 155: `loop` 区間はここまで (experts の区間とは重ねない)。
-    drop(_l_loop);
-    moe_sub_add(0, t_router.elapsed());
     let t_experts = std::time::Instant::now();
     // task 145: 台帳の区間 (experts)。選択 expert の寄与計算だけ。
     let _l_experts = q4ledger::enter(q4ledger::EXPERTS);
+    if !iv.block_off(lw.il, IvBlock::Moe) {
+        // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
+        //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
+        //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
+        //     先に起こす意味が無い (`prefetch()` 自体は無効化も変更もしない)。
+        //
+        //     task 67: **先読みは既定で off** (`DENNO_EXPERT_PREFETCH=1` で on)。
+        //     `MADV_WILLNEED` は readahead を呼び出しスレッドで同期的に起こすので、
+        //     8 スレッドがフォルトで並列に読むほうが速い (実測 +6-8 %)。
+        //
+        //     P39: VRAM 常駐経路 (`vram_mode`) では pread キャッシュを**使わない**
+        //     (置き場所を 2 か所に持たない)。ヒットした expert は mmap を触らないので
+        //     prefetch も投げない。ミスした expert は H2D のために同じページを
+        //     順に読むので、先読みの有無で総 I/O は変わらない。
+        //
+        //     P45: `vram_mode` でも、直近のヒット率がしきい値未満のトークンは CPU で
+        //     計算する (`use_gpu == false`)。そのトークンは mmap を直接読むので
+        //     prefetch は投げる (RAM キャッシュは vram_mode では使わない = P39 と同じ)。
+        let vram_mode = route == Route::Vram;
+        let use_gpu = vram_mode && {
+            let per = expert_h2d_bytes_one(lw, e, ff);
+            expert_gate_decide(lw.il, sel.len(), per).uses_gpu()
+        };
+        if vram_mode && cache.is_some() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[flash] DENNO_EXPERT_VRAM_MB を優先: DENNO_EXPERT_CACHE_MB (RAM の pread キャッシュ) は使わない"
+                );
+            });
+        }
+        let cache = if vram_mode { None } else { cache };
+        if cache.is_none() && !use_gpu {
+            prefetch_selected(lw, &sel);
+        }
 
-    if loop_new {
-        // P64: 1 層ぶんの寄与を 1 つの並列領域で計算し、足し込みは index 昇順の
-        // 逐次 (下の `else if parallel` と 1 要素ずつ同じ順序で足す)。
+        // 4. 選択 expert を index 昇順に積む
+        //
+        // P-MOE-G5: 各 expert の寄与 `h_e` は x だけで決まる独立な計算なので並列化できる。
+        // ただし **重み付きの足し込みは index 昇順の逐次** のままにする (並列に足すと
+        // 丸めの順序が変わる)。並列化するのは `h_e` の計算だけ。
+        //
+        // P38: キャッシュ経路も並列化する。`ExpertCacheSet` は `&self` で共有でき、
+        // ヒットは `Arc` を clone するだけ・ミスの pread はロックの外なので、旧実装のように
+        // 「キャッシュを有効にすると 10 expert が逐次になる」ことがない。
         #[cfg(feature = "par")]
-        {
-            let hs = expert_contribs_loop(lw, &sel, x, e, ff, cache)?;
-            for (t, &_ei) in sel.iter().enumerate() {
-                let pe = weights[t];
-                let hh = &hs[t * e..(t + 1) * e];
-                for j in 0..e {
-                    out[j] += pe * hh[j];
+        let parallel = par && sel.len() > 1 && !use_gpu;
+        #[cfg(not(feature = "par"))]
+        let parallel = {
+            // par 機能なしでは行並列も expert 並列も無い (従来と同じ逐次経路)。
+            let _ = par;
+            false
+        };
+        // P64: 新経路 (1 層 1 並列領域)。rayon が要るので `par` 機能が無いビルドと、
+        // GPU 経路 (`use_gpu`) では使わない (GPU の層一括・per-expert 経路は従来のまま)。
+        #[cfg(feature = "par")]
+        let loop_new = loop_on && !use_gpu;
+        #[cfg(not(feature = "par"))]
+        let loop_new = {
+            let _ = loop_on;
+            false
+        };
+
+        // P70: expert 寄与の expert 横断平坦化。**mmap 経路だけ**に使う (キャッシュ経路は
+        // expert 単位の pread が前提で、行チャンクに切ると同じ expert を何度も読む)。
+        #[cfg(feature = "par")]
+        let flat_new = flat_decode && !use_gpu && cache.is_none();
+        #[cfg(not(feature = "par"))]
+        let flat_new = {
+            let _ = flat_decode;
+            false
+        };
+
+        // task 155: `loop` 区間はここまで (experts の区間とは重ねない)。
+        drop(_l_loop);
+        moe_sub_add(0, t_router.elapsed());
+
+        if loop_new {
+            // P64: 1 層ぶんの寄与を 1 つの並列領域で計算し、足し込みは index 昇順の
+            // 逐次 (下の `else if parallel` と 1 要素ずつ同じ順序で足す)。
+            #[cfg(feature = "par")]
+            {
+                let hs = expert_contribs_loop(lw, &sel, x, e, ff, cache)?;
+                for (t, &_ei) in sel.iter().enumerate() {
+                    let pe = weights[t];
+                    let hh = &hs[t * e..(t + 1) * e];
+                    for j in 0..e {
+                        out[j] += pe * hh[j];
+                    }
                 }
             }
-        }
-    } else if parallel {
-        #[cfg(feature = "par")]
-        {
-            // P70: expert 寄与を expert 横断の行タスクに平坦化する経路 (既定 off)。
-            // 足し込みは下の 2 経路と同一の「index 昇順の逐次」なので、
-            // 行分割の有無・タスクの割り当てに依らず出力はビット一致する。
-            if flat_new {
-                let mut hs = vec![0.0f32; sel.len() * e];
-                expert_contribs_flat_decode_into(lw, &sel, x, e, ff, &mut hs, DECODE_FLAT_ROWS)?;
-                let t_scat = crate::model::exp_kprof::stamp();
-                for (t, _) in sel.iter().enumerate() {
-                    let pe = weights[t];
-                    let hh = &hs[t * e..(t + 1) * e];
-                    for j in 0..e {
-                        out[j] += pe * hh[j];
+        } else if parallel {
+            #[cfg(feature = "par")]
+            {
+                // P70: expert 寄与を expert 横断の行タスクに平坦化する経路 (既定 off)。
+                // 足し込みは下の 2 経路と同一の「index 昇順の逐次」なので、
+                // 行分割の有無・タスクの割り当てに依らず出力はビット一致する。
+                if flat_new {
+                    let mut hs = vec![0.0f32; sel.len() * e];
+                    expert_contribs_flat_decode_into(lw, &sel, x, e, ff, &mut hs, DECODE_FLAT_ROWS)?;
+                    let t_scat = crate::model::exp_kprof::stamp();
+                    for (t, _) in sel.iter().enumerate() {
+                        let pe = weights[t];
+                        let hh = &hs[t * e..(t + 1) * e];
+                        for j in 0..e {
+                            out[j] += pe * hh[j];
+                        }
+                    }
+                    crate::model::exp_kprof::mark(t_scat, crate::model::exp_kprof::SCAT);
+                } else if expert_scratch_enabled() {
+                    let mut hs = vec![0.0f32; sel.len() * e];
+                    expert_contribs_par_into(lw, &sel, x, e, ff, cache, &mut hs)?;
+                    for (t, _) in sel.iter().enumerate() {
+                        let pe = weights[t];
+                        let hh = &hs[t * e..(t + 1) * e];
+                        for j in 0..e {
+                            out[j] += pe * hh[j];
+                        }
+                    }
+                } else {
+                    let hs = expert_contribs_par(lw, &sel, x, e, ff, cache)?;
+                    for (t, &_ei) in sel.iter().enumerate() {
+                        let pe = weights[t];
+                        let hh = &hs[t];
+                        for j in 0..e {
+                            out[j] += pe * hh[j];
+                        }
                     }
                 }
-                crate::model::exp_kprof::mark(t_scat, crate::model::exp_kprof::SCAT);
-            } else if expert_scratch_enabled() {
-                let mut hs = vec![0.0f32; sel.len() * e];
-                expert_contribs_par_into(lw, &sel, x, e, ff, cache, &mut hs)?;
-                for (t, _) in sel.iter().enumerate() {
-                    let pe = weights[t];
-                    let hh = &hs[t * e..(t + 1) * e];
-                    for j in 0..e {
-                        out[j] += pe * hh[j];
-                    }
+            }
+        } else {
+            // task 67: 作業域 (act / up / h) はスレッドローカルで使い回す (既定)。
+            // `DENNO_EXPERT_SCRATCH=0` のときは従来どおり呼び出しごとに確保する。
+            // P45: このトークンで VRAM に載っていた expert の本数 (ゲートのサンプル)。
+            let mut gpu_hits = 0u32;
+            // P43: まず層一括経路 (gate 1 + up 1 + down 1 = 3 起動 / 2 同期) を試す。
+            // `Some(hs)` は「選択 expert 全員の寄与が揃った」という意味で、そのときは
+            // per-expert のループを回さない。足し込みは下の per-expert 経路と同一の
+            // 「index 昇順の逐次」なので、丸めの順序は変わらない。
+            // P45: ゲートが CPU と決めたトークンは層一括経路も呼ばない (`use_gpu` が false)。
+            // task 144: IQ 型の層一括経路 (ヒットだけ GPU / ミスは CPU)。ゲートが on で
+            // 3 行列とも IQ カーネルが読める型のときだけこの経路にする。
+            // **旧い層一括経路は呼ばない**: そちらは `acquire` でミスを同期 H2D するので、
+            // 呼ぶと毎層 20 MB を上げてから型不一致で CPU に落ちる (二重の無駄)。
+            #[cfg(feature = "cuda")]
+            let iq_mode = crate::model::exp_iq::iq_gpu_enabled() && iq_expert_mode(lw);
+            #[cfg(not(feature = "cuda"))]
+            let iq_mode = false;
+
+            // task 190 (`DENNO_DEC_MISS_FAST`): ミスの上げ直しを**層の前**に移す。
+            // 上げた本はこの層の lookup でヒットになるので、CPU で計算せず GPU で回せる
+            // (page fault + CPU GEMV の 1 本ぶんが消える)。予算・担当層の回転・
+            // 1 本 2 MB の転送は従来と同じ (`iq_warm_misses` を前へ動かすだけ)。
+            #[cfg(feature = "cuda")]
+            let miss_fast_now = vram_mode && iq_mode && crate::model::exp_miss_up::fast_enabled();
+            #[cfg(not(feature = "cuda"))]
+            let miss_fast_now = false;
+            #[cfg(feature = "cuda")]
+            if miss_fast_now {
+                // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
+                let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
+                iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
+            }
+
+            // task 187: ヒットの寄与をデバイスで和にする (`DENNO_DEC_EXP_SUMDEV`)。
+            // PTX が無い / 形が合わないときは `moe_experts_iq_gpu_batched` が従来経路へ落ちる。
+            #[cfg(feature = "cuda")]
+            let sumdev = dec_exp_sumdev_enabled();
+            #[cfg(not(feature = "cuda"))]
+            let sumdev = {
+                let _ = ();
+                false
+            };
+
+            #[cfg(feature = "cuda")]
+            let iq_batched = if use_gpu && iq_mode {
+                // task 158: ミスを GPU で計算する経路 (`DENNO_DEC_MISS_UP`)。
+                // 不発 (`None`) なら従来の「ヒットだけ GPU / ミスは CPU」へ落ちる。
+                match moe_experts_iq_gpu_miss_up(lw, &sel, x, e, ff)? {
+                    Some(v) => Some(IqBatchOut::Contribs(v.0, v.1)),
+                    None => moe_experts_iq_gpu_batched(lw, &sel, &weights, x, e, ff, sumdev)?,
                 }
             } else {
-                let hs = expert_contribs_par(lw, &sel, x, e, ff, cache)?;
+                None
+            };
+            #[cfg(not(feature = "cuda"))]
+            let iq_batched: Option<IqBatchOut> = None;
+
+            let batched = if use_gpu && !iq_mode {
+                moe_experts_gpu_batched(lw, &sel, x, e, ff)?
+            } else {
+                None
+            };
+            if let Some(IqBatchOut::Sum {
+                sum,
+                miss_pos,
+                miss_h,
+                hits,
+            }) = iq_batched
+            {
+                // task 187: ヒットぶんはデバイスで和にしてある (重み付き・選択順)。
+                // ミスだけホストで足す (ミスの無い層では従来の足し込みとビット一致)。
+                gpu_hits = hits;
+                out.copy_from_slice(&sum[..e]);
+                if !miss_pos.is_empty() {
+                    let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
+                    for (i, &t) in miss_pos.iter().enumerate() {
+                        let pe = weights[t];
+                        let v = &miss_h[i * e..(i + 1) * e];
+                        for j in 0..e {
+                            out[j] += pe * v[j];
+                        }
+                    }
+                }
+            } else if let Some(IqBatchOut::Contribs(hs, hits)) = iq_batched {
+                // GPU で回せた expert はその寄与、回せなかった expert は CPU で 3 行列。
+                // 足し込みは今までと同じ **expert index 昇順の逐次** (同じ位置で同じ重み)。
+                //
+                // `vram_mode` では `parallel` が false になる (P39 の設計) ので、ミスを
+                // そのまま逐次で計算すると base の並列経路より遅い。ミスだけを取り出して
+                // **base と同じ expert 並列** (`expert_contribs_par`) で計算する。
+                gpu_hits = hits;
+                let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| hs[t].is_none()).collect();
+                #[cfg(feature = "par")]
+                let miss_h: Vec<Vec<f32>> = if miss_pos.is_empty() {
+                    Vec::new()
+                } else {
+                    let ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+                    // task 187: 台帳の副区間 (ミスの CPU 計算)。
+                    let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
+                    expert_contribs_par(lw, &ids, x, e, ff, None)?
+                };
+                #[cfg(not(feature = "par"))]
+                let miss_h: Vec<Vec<f32>> = {
+                    let mut v = Vec::with_capacity(miss_pos.len());
+                    let mut act = vec![0.0f32; ff];
+                    let mut up = vec![0.0f32; ff];
+                    let mut h = vec![0.0f32; e];
+                    for &t in &miss_pos {
+                        let ei = sel[t];
+                        lw.gate_exps.gemv(ei, x, &mut act)?;
+                        silu_inplace(&mut act);
+                        lw.up_exps.gemv(ei, x, &mut up)?;
+                        for r in 0..ff {
+                            act[r] *= up[r];
+                        }
+                        lw.down_exps.gemv(ei, &act, &mut h)?;
+                        v.push(h.clone());
+                    }
+                    v
+                };
+                let mut mi = 0usize;
+                // task 187: 台帳の副区間 (host の重み付き足し込み)。
+                let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
                 for (t, &_ei) in sel.iter().enumerate() {
+                    let pe = weights[t];
+                    let v: &[f32] = match hs[t].as_deref() {
+                        Some(v) => {
+                            debug_assert_eq!(v.len(), e, "GPU の寄与長が e と違う");
+                            v
+                        }
+                        None => {
+                            let v = &miss_h[mi];
+                            mi += 1;
+                            v
+                        }
+                    };
+                    for j in 0..e {
+                        out[j] += pe * v[j];
+                    }
+                }
+            } else if let Some((hs, hits)) = batched {
+                // P45: 層一括経路も「何本が載っていたか」を返す (ゲートの 1 サンプル)。
+                gpu_hits = hits;
+                debug_assert_eq!(hs.len(), sel.len(), "寄与の本数が選択 expert と違う");
+                // task 187: 台帳の副区間 (host の重み付き足し込み)。
+                let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
+                for (t, _) in sel.iter().enumerate() {
                     let pe = weights[t];
                     let hh = &hs[t];
                     for j in 0..e {
                         out[j] += pe * hh[j];
                     }
                 }
-            }
-        }
-    } else {
-        // task 67: 作業域 (act / up / h) はスレッドローカルで使い回す (既定)。
-        // `DENNO_EXPERT_SCRATCH=0` のときは従来どおり呼び出しごとに確保する。
-        // P45: このトークンで VRAM に載っていた expert の本数 (ゲートのサンプル)。
-        let mut gpu_hits = 0u32;
-        // P43: まず層一括経路 (gate 1 + up 1 + down 1 = 3 起動 / 2 同期) を試す。
-        // `Some(hs)` は「選択 expert 全員の寄与が揃った」という意味で、そのときは
-        // per-expert のループを回さない。足し込みは下の per-expert 経路と同一の
-        // 「index 昇順の逐次」なので、丸めの順序は変わらない。
-        // P45: ゲートが CPU と決めたトークンは層一括経路も呼ばない (`use_gpu` が false)。
-        // task 144: IQ 型の層一括経路 (ヒットだけ GPU / ミスは CPU)。ゲートが on で
-        // 3 行列とも IQ カーネルが読める型のときだけこの経路にする。
-        // **旧い層一括経路は呼ばない**: そちらは `acquire` でミスを同期 H2D するので、
-        // 呼ぶと毎層 20 MB を上げてから型不一致で CPU に落ちる (二重の無駄)。
-        #[cfg(feature = "cuda")]
-        let iq_mode = crate::model::exp_iq::iq_gpu_enabled() && iq_expert_mode(lw);
-        #[cfg(not(feature = "cuda"))]
-        let iq_mode = false;
-
-        // task 190 (`DENNO_DEC_MISS_FAST`): ミスの上げ直しを**層の前**に移す。
-        // 上げた本はこの層の lookup でヒットになるので、CPU で計算せず GPU で回せる
-        // (page fault + CPU GEMV の 1 本ぶんが消える)。予算・担当層の回転・
-        // 1 本 2 MB の転送は従来と同じ (`iq_warm_misses` を前へ動かすだけ)。
-        #[cfg(feature = "cuda")]
-        let miss_fast_now = vram_mode && iq_mode && crate::model::exp_miss_up::fast_enabled();
-        #[cfg(not(feature = "cuda"))]
-        let miss_fast_now = false;
-        #[cfg(feature = "cuda")]
-        if miss_fast_now {
-            // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
-            let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
-            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
-        }
-
-        // task 187: ヒットの寄与をデバイスで和にする (`DENNO_DEC_EXP_SUMDEV`)。
-        // PTX が無い / 形が合わないときは `moe_experts_iq_gpu_batched` が従来経路へ落ちる。
-        #[cfg(feature = "cuda")]
-        let sumdev = dec_exp_sumdev_enabled();
-        #[cfg(not(feature = "cuda"))]
-        let sumdev = {
-            let _ = ();
-            false
-        };
-
-        #[cfg(feature = "cuda")]
-        let iq_batched = if use_gpu && iq_mode {
-            // task 158: ミスを GPU で計算する経路 (`DENNO_DEC_MISS_UP`)。
-            // 不発 (`None`) なら従来の「ヒットだけ GPU / ミスは CPU」へ落ちる。
-            match moe_experts_iq_gpu_miss_up(lw, &sel, x, e, ff)? {
-                Some(v) => Some(IqBatchOut::Contribs(v.0, v.1)),
-                None => moe_experts_iq_gpu_batched(lw, &sel, &weights, x, e, ff, sumdev)?,
-            }
-        } else {
-            None
-        };
-        #[cfg(not(feature = "cuda"))]
-        let iq_batched: Option<IqBatchOut> = None;
-
-        let batched = if use_gpu && !iq_mode {
-            moe_experts_gpu_batched(lw, &sel, x, e, ff)?
-        } else {
-            None
-        };
-        if let Some(IqBatchOut::Sum {
-            sum,
-            miss_pos,
-            miss_h,
-            hits,
-        }) = iq_batched
-        {
-            // task 187: ヒットぶんはデバイスで和にしてある (重み付き・選択順)。
-            // ミスだけホストで足す (ミスの無い層では従来の足し込みとビット一致)。
-            gpu_hits = hits;
-            out.copy_from_slice(&sum[..e]);
-            if !miss_pos.is_empty() {
-                let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
-                for (i, &t) in miss_pos.iter().enumerate() {
-                    let pe = weights[t];
-                    let v = &miss_h[i * e..(i + 1) * e];
-                    for j in 0..e {
-                        out[j] += pe * v[j];
-                    }
-                }
-            }
-        } else if let Some(IqBatchOut::Contribs(hs, hits)) = iq_batched {
-            // GPU で回せた expert はその寄与、回せなかった expert は CPU で 3 行列。
-            // 足し込みは今までと同じ **expert index 昇順の逐次** (同じ位置で同じ重み)。
-            //
-            // `vram_mode` では `parallel` が false になる (P39 の設計) ので、ミスを
-            // そのまま逐次で計算すると base の並列経路より遅い。ミスだけを取り出して
-            // **base と同じ expert 並列** (`expert_contribs_par`) で計算する。
-            gpu_hits = hits;
-            let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| hs[t].is_none()).collect();
-            #[cfg(feature = "par")]
-            let miss_h: Vec<Vec<f32>> = if miss_pos.is_empty() {
-                Vec::new()
             } else {
-                let ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
-                // task 187: 台帳の副区間 (ミスの CPU 計算)。
-                let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
-                expert_contribs_par(lw, &ids, x, e, ff, None)?
-            };
-            #[cfg(not(feature = "par"))]
-            let miss_h: Vec<Vec<f32>> = {
-                let mut v = Vec::with_capacity(miss_pos.len());
-                let mut act = vec![0.0f32; ff];
-                let mut up = vec![0.0f32; ff];
-                let mut h = vec![0.0f32; e];
-                for &t in &miss_pos {
-                    let ei = sel[t];
-                    lw.gate_exps.gemv(ei, x, &mut act)?;
-                    silu_inplace(&mut act);
-                    lw.up_exps.gemv(ei, x, &mut up)?;
-                    for r in 0..ff {
-                        act[r] *= up[r];
+                with_expert_scratch(ff, e, |s| -> Result<()> {
+                    let act = &mut s.act[..ff];
+                    let up = &mut s.up[..ff];
+                    let h = &mut s.h[..e];
+                    for (t, &ei) in sel.iter().enumerate() {
+                        // P39: VRAM 常駐経路。`None` = 載らない/未対応なので CPU へ落ちる。
+                        // P45: `Some(true)` はヒット (積まずに回せた)、`Some(false)` はミス。
+                        #[cfg(feature = "cuda")]
+                        let gpu = if use_gpu {
+                            moe_expert_gpu(lw, ei, x, act, up, h)?
+                        } else {
+                            None
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let gpu: Option<bool> = None;
+                        if gpu == Some(true) {
+                            gpu_hits += 1;
+                        }
+
+                        if gpu.is_none() {
+                            match cache {
+                                // 従来経路: mmap のスライスを直接 GEMV する。
+                                None => {
+                                    lw.gate_exps.gemv(ei, x, act)?;
+                                    silu_inplace(act);
+                                    lw.up_exps.gemv(ei, x, up)?;
+                                    for r in 0..ff {
+                                        act[r] *= up[r];
+                                    }
+                                    lw.down_exps.gemv(ei, act, h)?;
+                                }
+                                // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
+                                Some(c) => {
+                                    let key = ExpertKey {
+                                        layer: lw.il as u16,
+                                        expert: ei as u16,
+                                    };
+                                    expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, act)?;
+                                    silu_inplace(act);
+                                    expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, up)?;
+                                    for r in 0..ff {
+                                        act[r] *= up[r];
+                                    }
+                                    expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, act, h)?;
+                                }
+                            }
+                        } else {
+                            debug_assert!(use_gpu, "GPU 経路が use_gpu=false で走った");
+                        }
+                        let pe = weights[t];
+                        for j in 0..e {
+                            out[j] += pe * h[j];
+                        }
                     }
-                    lw.down_exps.gemv(ei, &act, &mut h)?;
-                    v.push(h.clone());
-                }
-                v
-            };
-            let mut mi = 0usize;
-            // task 187: 台帳の副区間 (host の重み付き足し込み)。
-            let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
-            for (t, &_ei) in sel.iter().enumerate() {
-                let pe = weights[t];
-                let v: &[f32] = match hs[t].as_deref() {
-                    Some(v) => {
-                        debug_assert_eq!(v.len(), e, "GPU の寄与長が e と違う");
-                        v
-                    }
+                    Ok(())
+                })?;
+            }
+            // P45: 1 トークンぶんの実測をゲートへ積む (CPU のトークンはサンプルにしない)。
+            if use_gpu {
+                expert_gate_record(gpu_hits, sel.len() as u32);
+            }
+            // task 144: ミスした expert を上限つきで VRAM へ戻す (次のトークンのため)。
+            // GPU に倒したトークンだけでなく CPU のトークンでも積む (載せないと
+            // ヒット率が永久に 0 のままになる)。
+            #[cfg(feature = "cuda")]
+            if vram_mode && iq_mode && !miss_fast_now {
+                // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
+                let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
+                iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
+            }
+        }
+
+        // P39: `DENNO_EXPERT_GPU_CHECK=1` の比較結果 (層ごとに 1 行)。
+        #[cfg(feature = "cuda")]
+        if use_gpu {
+            if let Some(c) = expert_vram::take_check() {
+                // P43: 予算は prefill のパック済み重みと共有なので、`pinned` も出す
+                // (`vram=LRU使用+外部予約/上限`)。
+                let (used, pinned, cap) = match expert_vram::budget_usage() {
+                    Some((u, p, c)) => (u, p, c),
                     None => {
-                        let v = &miss_h[mi];
-                        mi += 1;
-                        v
+                        let (u, c) = expert_vram::cache_usage().unwrap_or((0, 0));
+                        (u, 0, c)
                     }
                 };
-                for j in 0..e {
-                    out[j] += pe * v[j];
-                }
+                eprintln!(
+                    "[flash] expert_gpu_check layer={} cmp={} argmax={}/{} max_abs={:.3e} max_rel={:.3e} \
+                     vram={}/{} MiB (pinned={} MiB) cpu_fallback={}",
+                    lw.il,
+                    c.n,
+                    c.argmax,
+                    c.n,
+                    c.max_abs,
+                    c.max_rel,
+                    (used + pinned) >> 20,
+                    cap >> 20,
+                    pinned >> 20,
+                    expert_vram::fallbacks()
+                );
             }
-        } else if let Some((hs, hits)) = batched {
-            // P45: 層一括経路も「何本が載っていたか」を返す (ゲートの 1 サンプル)。
-            gpu_hits = hits;
-            debug_assert_eq!(hs.len(), sel.len(), "寄与の本数が選択 expert と違う");
-            // task 187: 台帳の副区間 (host の重み付き足し込み)。
-            let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
-            for (t, _) in sel.iter().enumerate() {
-                let pe = weights[t];
-                let hh = &hs[t];
-                for j in 0..e {
-                    out[j] += pe * hh[j];
-                }
-            }
-        } else {
-            with_expert_scratch(ff, e, |s| -> Result<()> {
-                let act = &mut s.act[..ff];
-                let up = &mut s.up[..ff];
-                let h = &mut s.h[..e];
-                for (t, &ei) in sel.iter().enumerate() {
-                    // P39: VRAM 常駐経路。`None` = 載らない/未対応なので CPU へ落ちる。
-                    // P45: `Some(true)` はヒット (積まずに回せた)、`Some(false)` はミス。
-                    #[cfg(feature = "cuda")]
-                    let gpu = if use_gpu {
-                        moe_expert_gpu(lw, ei, x, act, up, h)?
-                    } else {
-                        None
-                    };
-                    #[cfg(not(feature = "cuda"))]
-                    let gpu: Option<bool> = None;
-                    if gpu == Some(true) {
-                        gpu_hits += 1;
-                    }
+        }
 
-                    if gpu.is_none() {
-                        match cache {
-                            // 従来経路: mmap のスライスを直接 GEMV する。
-                            None => {
-                                lw.gate_exps.gemv(ei, x, act)?;
-                                silu_inplace(act);
-                                lw.up_exps.gemv(ei, x, up)?;
-                                for r in 0..ff {
-                                    act[r] *= up[r];
-                                }
-                                lw.down_exps.gemv(ei, act, h)?;
-                            }
-                            // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
-                            Some(c) => {
-                                let key = ExpertKey {
-                                    layer: lw.il as u16,
-                                    expert: ei as u16,
-                                };
-                                expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, act)?;
-                                silu_inplace(act);
-                                expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, up)?;
-                                for r in 0..ff {
-                                    act[r] *= up[r];
-                                }
-                                expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, act, h)?;
-                            }
-                        }
-                    } else {
-                        debug_assert!(use_gpu, "GPU 経路が use_gpu=false で走った");
-                    }
-                    let pe = weights[t];
-                    for j in 0..e {
-                        out[j] += pe * h[j];
-                    }
-                }
-                Ok(())
-            })?;
-        }
-        // P45: 1 トークンぶんの実測をゲートへ積む (CPU のトークンはサンプルにしない)。
-        if use_gpu {
-            expert_gate_record(gpu_hits, sel.len() as u32);
-        }
-        // task 144: ミスした expert を上限つきで VRAM へ戻す (次のトークンのため)。
-        // GPU に倒したトークンだけでなく CPU のトークンでも積む (載せないと
-        // ヒット率が永久に 0 のままになる)。
-        #[cfg(feature = "cuda")]
-        if vram_mode && iq_mode && !miss_fast_now {
-            // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
-            let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
-            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
-        }
-    }
-
-    // P39: `DENNO_EXPERT_GPU_CHECK=1` の比較結果 (層ごとに 1 行)。
-    #[cfg(feature = "cuda")]
-    if use_gpu {
-        if let Some(c) = expert_vram::take_check() {
-            // P43: 予算は prefill のパック済み重みと共有なので、`pinned` も出す
-            // (`vram=LRU使用+外部予約/上限`)。
-            let (used, pinned, cap) = match expert_vram::budget_usage() {
-                Some((u, p, c)) => (u, p, c),
-                None => {
-                    let (u, c) = expert_vram::cache_usage().unwrap_or((0, 0));
-                    (u, 0, c)
-                }
-            };
-            eprintln!(
-                "[flash] expert_gpu_check layer={} cmp={} argmax={}/{} max_abs={:.3e} max_rel={:.3e} \
-                 vram={}/{} MiB (pinned={} MiB) cpu_fallback={}",
-                lw.il,
-                c.n,
-                c.argmax,
-                c.n,
-                c.max_abs,
-                c.max_rel,
-                (used + pinned) >> 20,
-                cap >> 20,
-                pinned >> 20,
-                expert_vram::fallbacks()
-            );
-        }
     }
 
     // 5. shared expert (係数は sigmoid(gate_inp_shexp @ x))
     moe_sub_add(1, t_experts.elapsed());
     // 区間を閉じる (shared の時間を experts に二重計上しない)。
     drop(_l_experts);
-    // task 138: 台帳の区間 (shared)。join・down・gate_inp の GEMV を含む。
-    let _l_shared = q4ledger::enter(q4ledger::SHARED);
-    let t_shared = std::time::Instant::now();
-    let sff = lw.gate_shexp.n();
-    let mut sh = vec![0.0f32; e];
-    let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
-    // task 187: `DENNO_DEC_SHARED_DEV` では gate → up → silu*up → down を router の
-    // 時点で 1 本のサイドストリームに積んである。ここでは down の出力を join する
-    // だけ (ホストの silu/mul・down の再発行・待ちが消える)。
-    let dev_shared = if shed_ov.has_down() {
-        let _s = q4ledger::sub(q4ledger::SUB_SH_WAIT);
-        shed_ov.finish_shared(&mut sh)
-    } else {
-        false
-    };
-    if !dev_shared {
-        // 従来 (task 124 / 155): gate/up をホストで受け、silu/mul を回し、
-        // down をサイドストリームへ先に積んでから gate_inp を回す。
-        // task 187: 台帳の副区間 (作業域の確保)。
-        let s_elem = q4ledger::sub(q4ledger::SUB_SH_ELEM);
-        let mut sact = vec![0.0f32; sff];
-        let mut sup = vec![0.0f32; sff];
-        drop(s_elem);
-        // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
-        // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
-        // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
-        let overlapped = shed_ov.finish(&mut sact, &mut sup);
-        if !overlapped {
-            lw.gate_shexp
-                .gemv_label("shared_gate", x, &mut sact)
-                .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
-        }
-        {
-            // task 187: 台帳の副区間 (silu と積)。
-            let _s = q4ledger::sub(q4ledger::SUB_SH_ELEM);
-            silu_inplace(&mut sact);
-            if !overlapped {
-                lw.up_shexp
-                    .gemv_label("shared_up", x, &mut sup)
-                    .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
-            }
-            for r in 0..sff {
-                sact[r] *= sup[r];
-            }
-        }
-        // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
-        // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
-        // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
-        let mut sdown = {
-            let _s = q4ledger::sub(q4ledger::SUB_SH_SDOWN);
-            SharedDownOverlap::begin(lw, &sact, e)
+    if !iv.block_off(lw.il, IvBlock::Shared) {
+        // task 138: 台帳の区間 (shared)。join・down・gate_inp の GEMV を含む。
+        let _l_shared = q4ledger::enter(q4ledger::SHARED);
+        let t_shared = std::time::Instant::now();
+        let sff = lw.gate_shexp.n();
+        let mut sh = vec![0.0f32; e];
+        let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
+        // task 187: `DENNO_DEC_SHARED_DEV` では gate → up → silu*up → down を router の
+        // 時点で 1 本のサイドストリームに積んである。ここでは down の出力を join する
+        // だけ (ホストの silu/mul・down の再発行・待ちが消える)。
+        let dev_shared = if shed_ov.has_down() {
+            let _s = q4ledger::sub(q4ledger::SUB_SH_WAIT);
+            shed_ov.finish_shared(&mut sh)
+        } else {
+            false
         };
-        {
-            // task 187: 台帳の副区間 (F32・1 行の GEMV)。
+        if !dev_shared {
+            // 従来 (task 124 / 155): gate/up をホストで受け、silu/mul を回し、
+            // down をサイドストリームへ先に積んでから gate_inp を回す。
+            // task 187: 台帳の副区間 (作業域の確保)。
+            let s_elem = q4ledger::sub(q4ledger::SUB_SH_ELEM);
+            let mut sact = vec![0.0f32; sff];
+            let mut sup = vec![0.0f32; sff];
+            drop(s_elem);
+            // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
+            // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
+            // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
+            let overlapped = shed_ov.finish(&mut sact, &mut sup);
+            if !overlapped {
+                lw.gate_shexp
+                    .gemv_label("shared_gate", x, &mut sact)
+                    .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
+            }
+            {
+                // task 187: 台帳の副区間 (silu と積)。
+                let _s = q4ledger::sub(q4ledger::SUB_SH_ELEM);
+                silu_inplace(&mut sact);
+                if !overlapped {
+                    lw.up_shexp
+                        .gemv_label("shared_up", x, &mut sup)
+                        .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
+                }
+                for r in 0..sff {
+                    sact[r] *= sup[r];
+                }
+            }
+            // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
+            // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
+            // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
+            let mut sdown = {
+                let _s = q4ledger::sub(q4ledger::SUB_SH_SDOWN);
+                SharedDownOverlap::begin(lw, &sact, e)
+            };
+            {
+                // task 187: 台帳の副区間 (F32・1 行の GEMV)。
+                let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
+                lw.gate_inp_shexp
+                    .gemv_label("shared_gate_inp", x, &mut sg)
+                    .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+            }
+            if !sdown.finish(&mut sh) {
+                lw.down_shexp
+                    .gemv_label("shared_down", &sact, &mut sh)
+                    .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+            }
+        } else {
+            // 係数 `sigmoid(gate_inp_shexp @ x)` はホストで要る (1 行の GEMV)。
             let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
             lw.gate_inp_shexp
                 .gemv_label("shared_gate_inp", x, &mut sg)
                 .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
         }
-        if !sdown.finish(&mut sh) {
-            lw.down_shexp
-                .gemv_label("shared_down", &sact, &mut sh)
-                .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+        let sgw = hyper::sigmoid(sg[0]);
+        {
+            // task 187: 台帳の副区間 (shared 出力の足し込み + RMS)。
+            let _s = q4ledger::sub(q4ledger::SUB_SH_ADD);
+            for j in 0..e {
+                out[j] += sh[j] * sgw;
+            }
+            // P54: shared expert の出力そのもの (`ffn_down_shexp` の出力) の RMS。
+            // 係数 `sgw` は掛ける前の値を見る (expert の寄与の大きさを測るため)。
+            if let Some(r) = roles.as_deref_mut() {
+                r.shex = rms_of(&sh);
+            }
         }
-    } else {
-        // 係数 `sigmoid(gate_inp_shexp @ x)` はホストで要る (1 行の GEMV)。
-        let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
-        lw.gate_inp_shexp
-            .gemv_label("shared_gate_inp", x, &mut sg)
-            .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+        moe_sub_add(2, t_shared.elapsed());
     }
-    let sgw = hyper::sigmoid(sg[0]);
-    {
-        // task 187: 台帳の副区間 (shared 出力の足し込み + RMS)。
-        let _s = q4ledger::sub(q4ledger::SUB_SH_ADD);
-        for j in 0..e {
-            out[j] += sh[j] * sgw;
-        }
-        // P54: shared expert の出力そのもの (`ffn_down_shexp` の出力) の RMS。
-        // 係数 `sgw` は掛ける前の値を見る (expert の寄与の大きさを測るため)。
-        if let Some(r) = roles.as_deref_mut() {
-            r.shex = rms_of(&sh);
-        }
-    }
-    moe_sub_add(2, t_shared.elapsed());
 
     Ok(out)
 }
@@ -14080,6 +14220,7 @@ fn moe_ffn_quant_batch_tapped(
     cache: Option<&ExpertCacheSet>,
     roles: Option<&mut RoleRms>,
     emit_router: bool,
+    iv: IvView<'_>,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_batch_full(
         p,
@@ -14091,6 +14232,7 @@ fn moe_ffn_quant_batch_tapped(
         moe_expert::vnni_enabled(),
         roles,
         emit_router,
+        iv,
     )
 }
 
@@ -14114,8 +14256,17 @@ fn router_renorm(pr: &[f32], sel: &[usize], w: &mut [f32]) {
     for &i in sel {
         sum += pr[i];
     }
-    for (j, &i) in sel.iter().enumerate() {
-        w[j] = pr[i] / sum;
+    // task 217: 介入で支配的な expert を切ると、残りの確率が softmax の
+    // アンダーフローで全部 0 になりうる (0/0 = NaN)。そのときだけ一様に分ける。
+    if sum.is_finite() && sum > 0.0 {
+        for (j, &i) in sel.iter().enumerate() {
+            w[j] = pr[i] / sum;
+        }
+    } else {
+        let u = 1.0f32 / sel.len().max(1) as f32;
+        for x in w.iter_mut() {
+            *x = u;
+        }
     }
 }
 
@@ -14157,6 +14308,7 @@ fn router_topk_rows(
     weights: &mut [f32],
     block: Option<usize>,
     fast: bool,
+    mask: Option<&[u64]>,
 ) {
     let nt = probs.len() / ne.max(1);
     #[cfg(feature = "par")]
@@ -14176,7 +14328,10 @@ fn router_topk_rows(
                             let (sj, wj) =
                                 (&mut s[j * k..(j + 1) * k], &mut w[j * k..(j + 1) * k]);
                             // task 195: `DENNO_PF_ROUTER_FAST` は挿入法 (結果は同一)。
-                            if fast {
+                            // task 217: 無効 expert は候補から外す (mask が None なら従来)。
+                            if mask.is_some() {
+                                select_topk_into_mask(pr, k, mask, buf, sj);
+                            } else if fast {
                                 select_topk_into_fast(pr, k, sj);
                             } else {
                                 select_topk_into(pr, k, buf, sj);
@@ -14191,7 +14346,9 @@ fn router_topk_rows(
                     .enumerate()
                     .for_each_init(Vec::<u32>::new, |buf, (t, (s, w))| {
                         let pr = &probs[t * ne..(t + 1) * ne];
-                        if fast {
+                        if mask.is_some() {
+                            select_topk_into_mask(pr, k, mask, buf, s);
+                        } else if fast {
                             select_topk_into_fast(pr, k, s);
                         } else {
                             select_topk_into(pr, k, buf, s);
@@ -14208,7 +14365,7 @@ fn router_topk_rows(
         let mut buf: Vec<u32> = Vec::new();
         for t in 0..nt {
             let pr = &probs[t * ne..(t + 1) * ne];
-            select_topk_into(pr, k, &mut buf, &mut sels[t * k..(t + 1) * k]);
+            select_topk_into_mask(pr, k, mask, &mut buf, &mut sels[t * k..(t + 1) * k]);
             router_renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
         }
     }
@@ -14245,10 +14402,10 @@ mod router_sm_tests {
 
         let mut s1 = vec![0usize; nt * k];
         let mut w1 = vec![0f32; nt * k];
-        router_topk_rows(&a, ne, k, &mut s1, &mut w1, None, false);
+        router_topk_rows(&a, ne, k, &mut s1, &mut w1, None, false, None);
         let mut s2 = vec![0usize; nt * k];
         let mut w2 = vec![0f32; nt * k];
-        router_topk_rows(&a, ne, k, &mut s2, &mut w2, Some(3), false);
+        router_topk_rows(&a, ne, k, &mut s2, &mut w2, Some(3), false, None);
         assert_eq!(s1, s2, "top-k の選択が割り方で変わった");
         for i in 0..w1.len() {
             assert_eq!(w1[i].to_bits(), w2[i].to_bits(), "重み 要素 {i}");
@@ -14258,7 +14415,7 @@ mod router_sm_tests {
         let flat = vec![1.0f32; ne];
         let mut s3 = vec![0usize; k];
         let mut w3 = vec![0f32; k];
-        router_topk_rows(&flat, ne, k, &mut s3, &mut w3, None, false);
+        router_topk_rows(&flat, ne, k, &mut s3, &mut w3, None, false, None);
         assert_eq!(s3, vec![0, 1, 2], "同値のとき小さい index が先でない");
         for v in w3 {
             assert!((v - 1.0 / 3.0).abs() < 1e-6, "再正規化の重み {v}");
@@ -14316,7 +14473,18 @@ fn moe_ffn_quant_batch_opts(
     sched: MoeSchedule,
     vnni: bool,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_batch_full(p, lw, xs, nt, cache, sched, vnni, None, true)
+    moe_ffn_quant_batch_full(
+        p,
+        lw,
+        xs,
+        nt,
+        cache,
+        sched,
+        vnni,
+        None,
+        true,
+        IvView::none(),
+    )
 }
 
 /// [`moe_ffn_quant_batch_opts`] の本体 (+ P54 の役割別 RMS / P56 の RouterTopK)。
@@ -14334,6 +14502,7 @@ fn moe_ffn_quant_batch_full(
     vnni: bool,
     mut roles: Option<&mut RoleRms>,
     emit_router: bool,
+    iv: IvView<'_>,
 ) -> Result<Vec<f32>> {
     let e = p.n_embd;
     let ne = p.n_expert;
@@ -14367,6 +14536,7 @@ fn moe_ffn_quant_batch_full(
                 expert_route(),
                 rr,
                 er,
+                iv,
             )?);
         }
         return Ok(out);
@@ -14437,6 +14607,8 @@ fn moe_ffn_quant_batch_full(
     //    [`select_topk`] と同じ (同値は小さい index) なので値は変わらない。
     let mut sels: Vec<usize> = vec![0; nt * k];
     let mut weights: Vec<f32> = vec![0.0; nt * k];
+    // task 217: 無効 expert は top-k の候補から外す (層に無効が無ければ None)。
+    let expert_mask = iv.expert_mask(lw.il);
     router_topk_rows(
         &probs,
         ne,
@@ -14445,6 +14617,7 @@ fn moe_ffn_quant_batch_full(
         &mut weights,
         sm_block,
         pf_router_fast_on(),
+        expert_mask,
     );
     drop(_sub_sm);
     moe_sub_add(0, t_router.elapsed());
@@ -14462,172 +14635,190 @@ fn moe_ffn_quant_batch_full(
         emit_router_topk(lw.il, &sels[tail..tail + k], &weights[tail..tail + k]);
     }
 
-    // 4. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
-    //    同じ expert は 1 層で何度も選ばれる。madvise は 1 expert 1 回で足りるので、
-    //    トークン×k 回 (512 × 10 = 5,120 回/層) ではなく distinct な expert の数 (86 回/層)
-    //    だけ呼ぶ。選択順は変わらないので数値には影響しない。
-    {
-        let mut seen = vec![false; ne];
-        for &ei in &sels {
-            if !seen[ei] {
-                seen[ei] = true;
-                lw.gate_exps.prefetch(ei);
-                lw.up_exps.prefetch(ei);
-                lw.down_exps.prefetch(ei);
-            }
-        }
-    }
-
-    // 5. expert ごとのトークン一覧 (`picks`) と件数 `m` を 1 パスで確定する。
-    //    sels は index 昇順の distinct な expert なので、legacy が
-    //    `position()` で作っていた順 (トークン昇順, 同トークン内は j 昇順) と一致する。
-    //    件数を先に数えて容量を確保するので、push のたびの再確保は無い。
-    let t_experts = std::time::Instant::now();
-    // task 145: 台帳の区間 (experts)。選択 expert の寄与計算だけ。
-    let _l_experts = q4ledger::enter(q4ledger::EXPERTS);
+    // task 217: routed expert を切った層は expert の選択後処理・重み読み・寄与計算を
+    // 丸ごと飛ばす (out は 0 のまま = 残差に何も足さない)。router 自体は走らせる
+    // (shared の係数や telemetry が同じ経路で要るため)。
     let mut out = vec![0.0f32; nt * e];
-    let mut counts = vec![0usize; ne];
-    for &ei in &sels {
-        counts[ei] += 1;
-    }
-    let mut by_expert: Vec<Vec<(usize, usize)>> = counts
-        .iter()
-        .map(|&c| Vec::with_capacity(c))
-        .collect();
-    for t in 0..nt {
-        for j in 0..k {
-            by_expert[sels[t * k + j]].push((t, j));
-        }
-    }
-    let m_max = by_expert.iter().map(|p| p.len()).max().unwrap_or(0);
-    let flat = match sched {
-        MoeSchedule::Flat => true,
-        MoeSchedule::Legacy => false,
-        MoeSchedule::Auto => m_max > MOE_FLAT_MIN_M,
-    };
-    if std::env::var_os("DENNO_MOE_M_DEBUG").is_some() {
-        let nonempty = by_expert.iter().filter(|p| !p.is_empty()).count();
-        let sum_m: usize = by_expert.iter().map(|p| p.len()).sum();
-        eprintln!(
-            "[moe-m] nt={nt} ne={ne} k={k} nonempty={nonempty} sum_m={sum_m} mean={:.2} max={m_max} flat={flat}",
-            sum_m as f32 / nonempty.max(1) as f32
-        );
-    }
-    // 5.4 (P40): expert FFN を GPU の grouped GEMM にまとめる。
-    //      `DENNO_MOE_GROUPED_GPU=1` のときだけ入る (既定 off)。off のときは
-    //      この分岐に入らないので、従来の flat / legacy 経路は 1 バイトも変わらない。
-    //      false = GPU が引き受けなかった (env / CUDA / PTX / 形のどれかが欠けた)。
-    let mut experts_done = false;
-    if crate::model::moe_grouped_gpu::enabled() {
-        /// P40: `ExpertW` (mmap のスライス) を grouped GEMM の入力へ。
-        fn src<'a>(w: &'a ExpertW) -> crate::model::moe_grouped_gpu::ExpertSource<'a> {
-            crate::model::moe_grouped_gpu::ExpertSource {
-                blocks: w.blocks.as_slice(),
-                ty: w.ty,
-                n_in: w.n_in,
-                n_out: w.n_out,
-                n_expert: w.n_expert,
+    // task 145: 台帳の区間 (experts)。選択 expert の寄与計算だけ。
+    // task 217: 切っていても区間の開閉は同じ位置で行う (skip 時は 0 秒)。
+    let t_experts = std::time::Instant::now();
+    let _l_experts = q4ledger::enter(q4ledger::EXPERTS);
+    let skip_routed = iv.block_off(lw.il, IvBlock::Moe);
+    let skip_shared = iv.block_off(lw.il, IvBlock::Shared);
+    if !skip_routed {
+        // 4. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
+        //    同じ expert は 1 層で何度も選ばれる。madvise は 1 expert 1 回で足りるので、
+        //    トークン×k 回 (512 × 10 = 5,120 回/層) ではなく distinct な expert の数 (86 回/層)
+        //    だけ呼ぶ。選択順は変わらないので数値には影響しない。
+        {
+            let mut seen = vec![false; ne];
+            for &ei in &sels {
+                if !seen[ei] {
+                    seen[ei] = true;
+                    lw.gate_exps.prefetch(ei);
+                    lw.up_exps.prefetch(ei);
+                    lw.down_exps.prefetch(ei);
+                }
             }
         }
-        // 失敗したら CPU 経路へ落とす (この経路は実験的で、既定 off。
-        // ここで層を落とすと prefill 全体が落ちるため fail closed にする)。
-        match crate::model::moe_grouped_gpu::try_experts(
-            lw.il as u64,
-            src(&lw.gate_exps),
-            src(&lw.up_exps),
-            src(&lw.down_exps),
-            &by_expert,
-            &weights,
-            k,
-            xs,
-            nt,
-            e,
-            ff,
-            &mut out,
-        ) {
-            Ok(v) => experts_done = v,
-            // P42: 層ごとに 1 行出すと実機で 48 行になる。詳細は最初の 1 回だけ
-            // 出し、残りは prefill 末尾の集計 1 行に畳む。
-            Err(err) => crate::model::moe_grouped_gpu::note_failure(lw.il, &err),
+
+        // 5. expert ごとのトークン一覧 (`picks`) と件数 `m` を 1 パスで確定する。
+        //    sels は index 昇順の distinct な expert なので、legacy が
+        //    `position()` で作っていた順 (トークン昇順, 同トークン内は j 昇順) と一致する。
+        //    件数を先に数えて容量を確保するので、push のたびの再確保は無い。
+        let mut counts = vec![0usize; ne];
+        for &ei in &sels {
+            counts[ei] += 1;
         }
-    }
-    // task 148: prefill の選択 expert を m 行カーネルで GPU に回す
-    // (`DENNO_EXPERT_IQ_GPU=1` と `DENNO_EXPERT_IQ_GPU_PF=1` の両方が on のときだけ)。
-    // ヒットだけ GPU、ミスはこの下の flat (CPU)。GPU を使わない/失敗したら `None`
-    // が返り、`out` は触られていないので従来の経路がそのまま走る (fail closed)。
-    #[cfg(feature = "cuda")]
-    if !experts_done {
-        match moe_experts_iq_pf_batch(p, lw, &by_expert, &weights, k, xs, nt, e, ff, &mut out) {
-            Ok(Some(_)) => experts_done = true,
-            Ok(None) => {}
-            Err(err) => return Err(err),
+        let mut by_expert: Vec<Vec<(usize, usize)>> = counts
+            .iter()
+            .map(|&c| Vec::with_capacity(c))
+            .collect();
+        for t in 0..nt {
+            for j in 0..k {
+                by_expert[sels[t * k + j]].push((t, j));
+            }
         }
-    }
-    if !experts_done {
-        if flat {
-            moe_experts_flat(
-                lw,
+        let m_max = by_expert.iter().map(|p| p.len()).max().unwrap_or(0);
+        let flat = match sched {
+            MoeSchedule::Flat => true,
+            MoeSchedule::Legacy => false,
+            MoeSchedule::Auto => m_max > MOE_FLAT_MIN_M,
+        };
+        if std::env::var_os("DENNO_MOE_M_DEBUG").is_some() {
+            let nonempty = by_expert.iter().filter(|p| !p.is_empty()).count();
+            let sum_m: usize = by_expert.iter().map(|p| p.len()).sum();
+            eprintln!(
+                "[moe-m] nt={nt} ne={ne} k={k} nonempty={nonempty} sum_m={sum_m} mean={:.2} max={m_max} flat={flat}",
+                sum_m as f32 / nonempty.max(1) as f32
+            );
+        }
+        // 5.4 (P40): expert FFN を GPU の grouped GEMM にまとめる。
+        //      `DENNO_MOE_GROUPED_GPU=1` のときだけ入る (既定 off)。off のときは
+        //      この分岐に入らないので、従来の flat / legacy 経路は 1 バイトも変わらない。
+        //      false = GPU が引き受けなかった (env / CUDA / PTX / 形のどれかが欠けた)。
+        let mut experts_done = false;
+        if crate::model::moe_grouped_gpu::enabled() {
+            /// P40: `ExpertW` (mmap のスライス) を grouped GEMM の入力へ。
+            fn src<'a>(w: &'a ExpertW) -> crate::model::moe_grouped_gpu::ExpertSource<'a> {
+                crate::model::moe_grouped_gpu::ExpertSource {
+                    blocks: w.blocks.as_slice(),
+                    ty: w.ty,
+                    n_in: w.n_in,
+                    n_out: w.n_out,
+                    n_expert: w.n_expert,
+                }
+            }
+            // 失敗したら CPU 経路へ落とす (この経路は実験的で、既定 off。
+            // ここで層を落とすと prefill 全体が落ちるため fail closed にする)。
+            match crate::model::moe_grouped_gpu::try_experts(
+                lw.il as u64,
+                src(&lw.gate_exps),
+                src(&lw.up_exps),
+                src(&lw.down_exps),
                 &by_expert,
                 &weights,
                 k,
                 xs,
+                nt,
                 e,
                 ff,
-                MOE_FLAT_ROWS,
                 &mut out,
-                vnni,
-                None,
-            )?;
-        } else {
-            moe_experts_legacy(lw, &by_expert, &weights, k, xs, e, ff, &mut out)?;
+            ) {
+                Ok(v) => experts_done = v,
+                // P42: 層ごとに 1 行出すと実機で 48 行になる。詳細は最初の 1 回だけ
+                // 出し、残りは prefill 末尾の集計 1 行に畳む。
+                Err(err) => crate::model::moe_grouped_gpu::note_failure(lw.il, &err),
+            }
         }
+        // task 148: prefill の選択 expert を m 行カーネルで GPU に回す
+        // (`DENNO_EXPERT_IQ_GPU=1` と `DENNO_EXPERT_IQ_GPU_PF=1` の両方が on のときだけ)。
+        // ヒットだけ GPU、ミスはこの下の flat (CPU)。GPU を使わない/失敗したら `None`
+        // が返り、`out` は触られていないので従来の経路がそのまま走る (fail closed)。
+        #[cfg(feature = "cuda")]
+        if !experts_done {
+            match moe_experts_iq_pf_batch(p, lw, &by_expert, &weights, k, xs, nt, e, ff, &mut out) {
+                Ok(Some(_)) => experts_done = true,
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if !experts_done {
+            if flat {
+                moe_experts_flat(
+                    lw,
+                    &by_expert,
+                    &weights,
+                    k,
+                    xs,
+                    e,
+                    ff,
+                    MOE_FLAT_ROWS,
+                    &mut out,
+                    vnni,
+                    None,
+                )?;
+            } else {
+                moe_experts_legacy(lw, &by_expert, &weights, k, xs, e, ff, &mut out)?;
+            }
+        }
+
     }
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
     moe_sub_add(1, t_experts.elapsed());
     // 区間を閉じる (shared の時間を experts に二重計上しない)。
     drop(_l_experts);
-    // task 145: 台帳の区間 (shared)。
-    let _l_shared = q4ledger::enter(q4ledger::SHARED);
-    let t_shared = std::time::Instant::now();
-    let sff = lw.gate_shexp.n();
-    // task 209: shared の出力はデバイスからの D2H の宛先なので pinned に置く
-    // (`DENNO_PF_PIN`)。中身は下のどちらの経路も全要素を書く。
-    let mut sh_buf = PfHostBuf::new(nt * e);
-    let sh = sh_buf.as_mut_slice();
-    // task 172: 3 射影 (gate / up / down) を 1 チャンクぶんデバイスで回す
-    // (活性を GPU に置いたまま。silu と積は elem の swiglu カーネル)。
-    // 使えない形・環境では false が返り、下の従来経路がそのまま走る。
-    let mut shared_dev = false;
-    if pf_shared_dev_on() {
-        shared_dev = Qwen4Exp::pf_shared_dev_run(lw, xs, nt, e, sff, sh);
-    }
-    if !shared_dev {
-        let mut sact = vec![0.0f32; nt * sff];
-        gemv_batch(&lw.gate_shexp, xs, nt, &mut sact)
-            .map_err(|err| one(format!("層 {}: ffn_gate_shexp (batch): {err}", lw.il)))?;
-        silu_inplace(&mut sact);
-        let mut sup = vec![0.0f32; nt * sff];
-        gemv_batch(&lw.up_shexp, xs, nt, &mut sup)
-            .map_err(|err| one(format!("層 {}: ffn_up_shexp (batch): {err}", lw.il)))?;
-        for r in 0..nt * sff {
-            sact[r] *= sup[r];
+    if !skip_shared {
+        // task 145: 台帳の区間 (shared)。
+        let _l_shared = q4ledger::enter(q4ledger::SHARED);
+        let t_shared = std::time::Instant::now();
+        let sff = lw.gate_shexp.n();
+        // task 209: shared の出力はデバイスからの D2H の宛先なので pinned に置く
+        // (`DENNO_PF_PIN`)。中身は下のどちらの経路も全要素を書く。
+        let mut sh_buf = PfHostBuf::new(nt * e);
+        let sh = sh_buf.as_mut_slice();
+        // task 172: 3 射影 (gate / up / down) を 1 チャンクぶんデバイスで回す
+        // (活性を GPU に置いたまま。silu と積は elem の swiglu カーネル)。
+        // 使えない形・環境では false が返り、下の従来経路がそのまま走る。
+        let mut shared_dev = false;
+        if pf_shared_dev_on() {
+            shared_dev = Qwen4Exp::pf_shared_dev_run(lw, xs, nt, e, sff, sh);
         }
-        gemv_batch(&lw.down_shexp, &sact, nt, sh)
-            .map_err(|err| one(format!("層 {}: ffn_down_shexp (batch): {err}", lw.il)))?;
-    }
-    let gn = lw.gate_inp_shexp.n();
-    let mut sg = vec![0.0f32; nt * gn];
-    gemv_batch(&lw.gate_inp_shexp, xs, nt, &mut sg)
-        .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp (batch): {err}", lw.il)))?;
-    for t in 0..nt {
-        let sgw = hyper::sigmoid(sg[t * gn]);
-        for d in 0..e {
-            out[t * e + d] += sh[t * e + d] * sgw;
+        if !shared_dev {
+            let mut sact = vec![0.0f32; nt * sff];
+            gemv_batch(&lw.gate_shexp, xs, nt, &mut sact)
+                .map_err(|err| one(format!("層 {}: ffn_gate_shexp (batch): {err}", lw.il)))?;
+            silu_inplace(&mut sact);
+            let mut sup = vec![0.0f32; nt * sff];
+            gemv_batch(&lw.up_shexp, xs, nt, &mut sup)
+                .map_err(|err| one(format!("層 {}: ffn_up_shexp (batch): {err}", lw.il)))?;
+            for r in 0..nt * sff {
+                sact[r] *= sup[r];
+            }
+            gemv_batch(&lw.down_shexp, &sact, nt, sh)
+                .map_err(|err| one(format!("層 {}: ffn_down_shexp (batch): {err}", lw.il)))?;
         }
+        let gn = lw.gate_inp_shexp.n();
+        let mut sg = vec![0.0f32; nt * gn];
+        gemv_batch(&lw.gate_inp_shexp, xs, nt, &mut sg)
+            .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp (batch): {err}", lw.il)))?;
+        for t in 0..nt {
+            let sgw = hyper::sigmoid(sg[t * gn]);
+            for d in 0..e {
+                out[t * e + d] += sh[t * e + d] * sgw;
+            }
+        }
+        // P54: shared expert の出力そのものの RMS (切っていないときだけ)。
+        if let Some(r) = roles.as_deref_mut() {
+            let t = nt - 1;
+            r.shex = rms_of(&sh[t * e..(t + 1) * e]);
+        }
+        moe_sub_add(2, t_shared.elapsed());
     }
-    // P54: チャンク末尾のトークンの router 確率和 (= 選択 expert の確率の和) と
-    // shared expert の出力の RMS。probs / sh はすでに計算済みなので読むだけ。
+
+    // P54: チャンク末尾のトークンの router 確率和 (= 選択 expert の確率の和)。
+    // shared を切っていても probs / sels は手元にあるので読むだけ。
     if let Some(r) = roles.as_deref_mut() {
         let t = nt - 1;
         let mut s = 0.0f32;
@@ -14635,12 +14826,11 @@ fn moe_ffn_quant_batch_full(
             s += probs[t * ne + sels[t * k + j]];
         }
         r.router = s;
-        r.shex = rms_of(&sh[t * e..(t + 1) * e]);
     }
-    moe_sub_add(2, t_shared.elapsed());
 
     Ok(out)
 }
+
 
 /// テスト用: 並列の寄与計算を何回走らせたか (P-MOE-G5 の分岐が実際に通ったことの証拠)。
 #[cfg(test)]
@@ -16419,6 +16609,162 @@ mod tests {
         vec![0.05; n]
     }
 
+    /// task 217: expert 無効化がルータに効く。
+    ///
+    /// - 無効 expert は選ばれず、残りの上位 k 本が index 昇順で選ばれる
+    /// - 重みは残りだけで再正規化される
+    /// - 出力はマスク無しと変わる (無効 expert が寄与しない)
+    /// - 残りの確率が全部 0 でも NaN にせず一様に分ける
+    /// - 空の設定は従来とビット一致
+    #[test]
+    fn intervene_expert_off_changes_router_and_renormalizes() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("iv_expert_off");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let x = p120_flat_x(p.n_embd);
+        let shape = intervene::Shape {
+            n_layer: p.n_layer,
+            n_expert: p.n_expert,
+            n_expert_used: p.n_expert_used,
+            n_hc: p.n_hc,
+        };
+        let cfg = intervene::config_for_test(&shape, vec![(0, 0)], vec![], vec![]).expect("cfg");
+        let iv = IvView::of(&cfg);
+
+        // (1) 2 本が同点のルータ: expert 0 を切ると 1 と 2 が残る。
+        let lw = p120_router_layer(&f, &p, true);
+        let mut probs = vec![0.0f32; p.n_expert];
+        lw.gate_inp.gemv_label("gate_inp", &x, &mut probs).expect("gate_inp");
+        softmax(&mut probs);
+        assert_eq!(select_topk(&probs, p.n_expert_used), vec![0, 1]);
+        let mask = iv.expert_mask(0).expect("層 0 の mask");
+        let sel = select_topk_mask(&probs, p.n_expert_used, mask);
+        assert_eq!(sel, vec![1, 2], "無効 expert を除いた上位 k が違う: {sel:?}");
+
+        let base = moe_ffn_quant_full_opts(
+            &p, &lw, &x, None, false, Route::Cpu, None, true, false, IvView::none(),
+        )
+        .expect("no intervention");
+        let off = moe_ffn_quant_full_opts(
+            &p, &lw, &x, None, false, Route::Cpu, None, true, false, iv,
+        )
+        .expect("expert 0 off");
+        assert!(
+            base.iter().zip(off.iter()).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "expert を切ったのに出力が同じ"
+        );
+
+        // 重みの記録: 残り 2 本で再正規化 (probs[1] >> probs[2])。
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: None,
+            w_stats: true,
+        }));
+        let _ = moe_ffn_quant_full_opts(
+            &p, &lw, &x, None, false, Route::Cpu, None, true, false, iv,
+        )
+        .expect("expert 0 off (stats)");
+        set_expert_prune_measurement(None);
+        let st = take_expert_w_stats().expect("stats");
+        assert_eq!(st.calls(), 1);
+        assert_eq!(st.mean_experts_per_call(), 2.0, "k 本より少ない");
+        let w1 = st.mean_rank_weight(1).expect("rank1");
+        let w2 = st.mean_rank_weight(2).expect("rank2");
+        assert!((w1 - 1.0).abs() < 1e-4, "rank1 = {w1} (残りの最大に寄るはず)");
+        assert!(w2 > 0.0 && w2 < 1e-3, "rank2 = {w2} (残りの 2 番目はほぼ 0)");
+        assert!(w1.is_finite() && w2.is_finite(), "重みが有限でない");
+
+        // (2) 独占ルータ: 残りの確率は softmax のアンダーフローで 0。
+        //     0/0 にせず一様 0.5 / 0.5 にする。
+        let lw2 = p120_router_layer(&f, &p, false);
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: None,
+            w_stats: true,
+        }));
+        let _ = moe_ffn_quant_full_opts(
+            &p, &lw2, &x, None, false, Route::Cpu, None, true, false, iv,
+        )
+        .expect("exclusive router, expert 0 off");
+        set_expert_prune_measurement(None);
+        let st = take_expert_w_stats().expect("stats");
+        let a = st.mean_rank_weight(1).expect("rank1");
+        let b = st.mean_rank_weight(2).expect("rank2");
+        assert!(a.is_finite() && b.is_finite(), "NaN が出た: rank1={a} rank2={b}");
+        assert!((a - 0.5).abs() < 1e-6 && (b - 0.5).abs() < 1e-6, "一様でない: {a} {b}");
+
+        // 空の設定は従来と 1 ビットも変わらない。
+        let empty = intervene::config_for_test(&shape, vec![], vec![], vec![]).expect("empty");
+        let iv_empty = IvView::of(&empty);
+        assert!(!iv_empty.is_active());
+        let same = moe_ffn_quant_full_opts(
+            &p, &lw, &x, None, false, Route::Cpu, None, true, false, iv_empty,
+        )
+        .expect("empty cfg");
+        for i in 0..base.len() {
+            assert_eq!(same[i].to_bits(), base[i].to_bits(), "空設定でビットが動いた (i={i})");
+        }
+    }
+
+    /// task 217: block skip の意味。
+    ///
+    /// `moe` を切った出力 + `shared` を切った出力 = 切らない出力 (どれも f32 の
+    /// 同じ足し込み順なのでビット一致する)。片方だけ切ると片方の寄与だけが残る。
+    #[test]
+    fn intervene_block_skip_splits_moe_and_shared() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("iv_block_skip");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        let shape = intervene::Shape {
+            n_layer: p.n_layer,
+            n_expert: p.n_expert,
+            n_expert_used: p.n_expert_used,
+            n_hc: p.n_hc,
+        };
+        let run = |iv: IvView<'_>| {
+            moe_ffn_quant_full_opts(&p, &lw, &x, None, false, Route::Cpu, None, true, false, iv)
+                .expect("moe")
+        };
+        let full = run(IvView::none());
+        let moe_off = run(IvView::of(
+            &intervene::config_for_test(&shape, vec![], vec![(0, IvBlock::Moe)], vec![])
+                .expect("moe off"),
+        ));
+        let shared_off = run(IvView::of(
+            &intervene::config_for_test(&shape, vec![], vec![(0, IvBlock::Shared)], vec![])
+                .expect("shared off"),
+        ));
+        let both_off = run(IvView::of(
+            &intervene::config_for_test(
+                &shape,
+                vec![],
+                vec![(0, IvBlock::Moe), (0, IvBlock::Shared)],
+                vec![],
+            )
+            .expect("both off"),
+        ));
+        assert!(both_off.iter().all(|v| *v == 0.0), "両方切ったのに 0 でない");
+        for j in 0..full.len() {
+            assert_eq!(
+                full[j].to_bits(),
+                (moe_off[j] + shared_off[j]).to_bits(),
+                "moe_off + shared_off が full と違う (j={j})"
+            );
+        }
+        assert!(
+            moe_off.iter().zip(&shared_off).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "片方だけ切ったのに寄与が同じ"
+        );
+    }
+
     /// `DENNO_EXPERT_MIN_W` の発火: 閾値の両側で expert 本数が変わり、
     /// 「落とす相手が無い」設定では親経路とビット一致、「1 本に絞る」設定では
     /// `n_expert_used=1` の親経路とビット一致する。
@@ -16507,7 +16853,7 @@ mod tests {
         let mut roles_off = RoleRms::default();
         moe_ffn_quant_full(
             &p, &lw, &x, None, false, Route::Cpu, Some(&mut roles_off), false,
-        )
+        IvView::none())
         .expect("off");
         assert_eq!(roles_off.router.to_bits(), sum_full.to_bits(), "off: 活性 = top-k 確率和");
 
@@ -16520,7 +16866,7 @@ mod tests {
         let mut roles_on = RoleRms::default();
         moe_ffn_quant_full(
             &p, &lw, &x, None, false, Route::Cpu, Some(&mut roles_on), false,
-        )
+        IvView::none())
         .expect("TOPK=1");
         set_expert_prune_measurement(None);
         assert_eq!(
@@ -17312,7 +17658,7 @@ mod tests {
 
             // 1. 新経路: 層あたり 1 領域・内側の行並列なし。
             let (e0, c0, r0) = (load(&EXPERT_LOOP_REGIONS), load(&PAR_CONTRIB_REGIONS), load(&moe_expert::ROW_PAR_REGIONS));
-            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, true, Route::Cpu, None, true, true)
+            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, true, Route::Cpu, None, true, true, IvView::none())
                 .expect("新経路");
             assert_eq!(load(&EXPERT_LOOP_REGIONS) - e0, 1, "層 {il}: 新経路の並列領域が 1 回でない");
             assert_eq!(load(&PAR_CONTRIB_REGIONS) - c0, 0, "層 {il}: 新経路で旧の並列領域が立った");
@@ -17320,7 +17666,7 @@ mod tests {
 
             // 2. 旧経路 (既定 par=1): expert 並列の 1 領域・内側は行並列なし。
             let (e0, c0, r0) = (load(&EXPERT_LOOP_REGIONS), load(&PAR_CONTRIB_REGIONS), load(&moe_expert::ROW_PAR_REGIONS));
-            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, true, Route::Cpu, None, true, false)
+            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, true, Route::Cpu, None, true, false, IvView::none())
                 .expect("旧 par=1");
             assert_eq!(load(&PAR_CONTRIB_REGIONS) - c0, 1, "層 {il}: 旧 par=1 の並列領域が 1 回でない");
             assert_eq!(load(&moe_expert::ROW_PAR_REGIONS) - r0, 0, "層 {il}: 旧 par=1 の内側で行並列が立った");
@@ -17328,7 +17674,7 @@ mod tests {
 
             // 3. 旧経路 (par=0): 行列ごとに立つ (選択 expert 数 x 3)。
             let r0 = load(&moe_expert::ROW_PAR_REGIONS);
-            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, false, Route::Cpu, None, true, false)
+            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, false, Route::Cpu, None, true, false, IvView::none())
                 .expect("旧 par=0");
             assert_eq!(
                 load(&moe_expert::ROW_PAR_REGIONS) - r0,
@@ -17358,7 +17704,7 @@ mod tests {
         let set = ExpertCacheSet::new_with_slots([4, 4, 4], lens, &[path.clone()], 4).expect("cache set");
 
         let run = |lw: &LayerW, x: &[f32], cache: Option<&ExpertCacheSet>, par: bool, lp: bool| {
-            moe_ffn_quant_full_opts(&p, lw, x, cache, par, Route::Cpu, None, true, lp)
+            moe_ffn_quant_full_opts(&p, lw, x, cache, par, Route::Cpu, None, true, lp, IvView::none())
                 .expect("moe_ffn_quant_full_opts")
         };
 
@@ -17480,9 +17826,9 @@ mod tests {
         let x = cache_test_x(p.n_embd);
 
         let before = FLAT_DECODE_REGIONS.load(std::sync::atomic::Ordering::Relaxed);
-        let old = moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, true, false, false)
+        let old = moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, true, false, false, IvView::none())
             .expect("従来 (expert 並列)");
-        let new = moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, true, false, true)
+        let new = moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, true, false, true, IvView::none())
             .expect("新 (expert 横断平坦化)");
         assert!(
             old.iter().any(|v| *v != 0.0),
@@ -17633,10 +17979,12 @@ mod tests {
             pool.install(|| {
                 out_old = moe_ffn_quant_impl(
                     &p, &lw, &x, None, true, Route::Cpu, None, true, false, false,
+                    IvView::none(),
                 )
                 .expect("層 従来");
                 out_new = moe_ffn_quant_impl(
                     &p, &lw, &x, None, true, Route::Cpu, None, true, false, true,
+                    IvView::none(),
                 )
                 .expect("層 平坦化");
             });
@@ -17651,11 +17999,13 @@ mod tests {
                             if vi == 0 {
                                 out_old = moe_ffn_quant_impl(
                                     &p, &lw, &x, None, true, Route::Cpu, None, true, false, false,
+                                    IvView::none(),
                                 )
                                 .expect("層 従来");
                             } else {
                                 out_new = moe_ffn_quant_impl(
                                     &p, &lw, &x, None, true, Route::Cpu, None, true, false, true,
+                                    IvView::none(),
                                 )
                                 .expect("層 平坦化");
                             }
@@ -17724,6 +18074,7 @@ mod tests {
                 .install(|| {
                     moe_ffn_quant_impl(
                         &p, &lw, &x, None, true, Route::Cpu, None, false, false, true,
+                        IvView::none(),
                     )
                 })
                 .expect("層 1 回");
@@ -17774,7 +18125,7 @@ mod tests {
         lw.gate_inp = gate_inp_for(&x, ne);
 
         let run = |flat: bool| {
-            moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, false, false, flat)
+            moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, false, false, flat, IvView::none())
                 .expect("層 1 回")
         };
         // 既定 (prof off) の基準
@@ -17876,19 +18227,19 @@ mod tests {
         // 2. 層 1 回ぶん (ルータ + expert + shared expert)。
         let (layer_old_ms, layer_old_avg, old_out) = pool.install(|| {
             time_min(reps, || {
-                moe_ffn_quant_full_opts(&p, &lw, &x, None, true, Route::Cpu, None, true, false)
+                moe_ffn_quant_full_opts(&p, &lw, &x, None, true, Route::Cpu, None, true, false, IvView::none())
                     .expect("旧 層 par=1")
             })
         });
         let (layer_seq_ms, _, seq_out) = pool.install(|| {
             time_min(reps, || {
-                moe_ffn_quant_full_opts(&p, &lw, &x, None, false, Route::Cpu, None, true, false)
+                moe_ffn_quant_full_opts(&p, &lw, &x, None, false, Route::Cpu, None, true, false, IvView::none())
                     .expect("旧 層 par=0")
             })
         });
         let (layer_new_ms, layer_new_avg, new_out) = pool.install(|| {
             time_min(reps, || {
-                moe_ffn_quant_full_opts(&p, &lw, &x, None, true, Route::Cpu, None, true, true)
+                moe_ffn_quant_full_opts(&p, &lw, &x, None, true, Route::Cpu, None, true, true, IvView::none())
                     .expect("新 層")
             })
         });
@@ -18054,7 +18405,7 @@ mod tests {
 
         let run = |lw: &LayerW| {
             // emit_router=false: テレメトリを出す他のテストにフレームを混ぜない。
-            moe_ffn_quant_full_opts(&p, lw, &x, None, true, Route::Cpu, None, false, false)
+            moe_ffn_quant_full_opts(&p, lw, &x, None, true, Route::Cpu, None, false, false, IvView::none())
                 .expect("moe_ffn_quant")
         };
 
@@ -19396,6 +19747,52 @@ mod tests {
                     st[3] >= 1,
                     "M={n}: shared 連鎖の断念が数えられていない (ゲートが読まれていない): {st:?}"
                 );
+            }
+        }
+
+        /// task 217: 4 つの block を全部切った層は**恒等**になる
+        /// (残差に何も足さず、attn / MoE / shared / PLE を計算しない)。
+        /// PLE を持つ層でも注入だけが飛ぶので、残差は入力のまま。
+        #[test]
+        fn intervene_all_blocks_off_makes_layer_identity() {
+            use crate::model::qwen4exp_attn::FullAttn;
+            use crate::model::qwen4exp_ssm::SsmAttn;
+            let _g = moe_test_guard();
+            let dir = TempDir::new("iv_layer_identity");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("GGUF");
+            let p = Qwen4ExpParams::from_meta(&f).expect("from_meta");
+            let full = FullAttn::from_gguf(&f, &p, 2048).expect("FullAttn");
+            let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+            let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("model");
+            let hp = m.hp();
+            let ctx = [1u32, 2, 3, 1];
+            let shape = intervene::Shape {
+                n_layer: p.n_layer,
+                n_expert: p.n_expert,
+                n_expert_used: p.n_expert_used,
+                n_hc: p.n_hc,
+            };
+            let ple = m.gather_ple(&ctx).expect("PLE");
+            for il in 0..p.n_layer {
+                let blocks = vec![
+                    (il, IvBlock::Attn),
+                    (il, IvBlock::Moe),
+                    (il, IvBlock::Shared),
+                    (il, IvBlock::Ple),
+                ];
+                let cfg = intervene::config_for_test(&shape, vec![], blocks, vec![]).expect("cfg");
+                let mut res = m.forward_embed(&ctx, &hp).expect("embed");
+                let before = res.data.clone();
+                m.run_layer(il, &mut res, ple.as_ref(), &hp, None, None, false, IvView::of(&cfg))
+                    .expect("run_layer");
+                for i in 0..before.len() {
+                    assert_eq!(
+                        res.data[i].to_bits(),
+                        before[i].to_bits(),
+                        "層 {il}: 全 block を切ったのに残差の要素 {i} が変わった"
+                    );
+                }
             }
         }
 

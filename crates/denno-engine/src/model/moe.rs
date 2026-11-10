@@ -91,6 +91,88 @@ pub(crate) fn select_topk(probs: &[f32], k: usize) -> Vec<usize> {
     out
 }
 
+/// task 217: 無効 expert を除いた top-k。`mask` は層あたりのビット列
+/// (1 = 無効)。選択規則は [`select_topk`] と同じ (値の降順・同値は小さい index・
+/// 出力は index 昇順) で、**無効 expert は候補から外す**。
+///
+/// 残りが k 個未満のときだけ、無効化を無視した従来の選択へ落ちる (設定の検証で
+/// 弾いているので通常は起きない。起きてもルータが panic しないための逃げ道)。
+pub(crate) fn select_topk_mask(probs: &[f32], k: usize, mask: &[u64]) -> Vec<usize> {
+    let mut buf: Vec<u32> = Vec::new();
+    let mut out = vec![0usize; k];
+    select_topk_into_mask(probs, k, Some(mask), &mut buf, &mut out);
+    out
+}
+
+/// task 217: [`select_topk_into`] の mask 付き。`mask` の bit i が立っている
+/// expert を候補から外す。`None` は従来と同一。
+pub(crate) fn select_topk_into_mask(
+    probs: &[f32],
+    k: usize,
+    mask: Option<&[u64]>,
+    buf: &mut Vec<u32>,
+    out: &mut [usize],
+) {
+    let n = probs.len();
+    let Some(m) = mask else {
+        return select_topk_into(probs, k, buf, out);
+    };
+    assert!(k >= 1 && k <= n, "k={} は 1..={} の範囲外", k, n);
+    assert_eq!(out.len(), k, "out.len() は k と一致する必要がある");
+    if m.len() * 64 < n {
+        // ビット列が短い (設定と形の取り違え)。安全側で従来の選択に落ちる。
+        return select_topk_into(probs, k, buf, out);
+    }
+    buf.clear();
+    for i in 0..n {
+        if m[i / 64] & (1u64 << (i % 64)) == 0 {
+            buf.push(i as u32);
+        }
+    }
+    if buf.len() < k {
+        return select_topk_into(probs, k, buf, out);
+    }
+    if probs.iter().any(|v| v.is_nan()) {
+        // NaN 入りは比較が全順序にならない (従来の走査規則を許可集合で使う)。
+        let mut sel = Vec::with_capacity(k);
+        let mut used = vec![false; n];
+        for _ in 0..k {
+            let mut best: Option<usize> = None;
+            for &c in buf.iter() {
+                let i = c as usize;
+                if used[i] {
+                    continue;
+                }
+                match best {
+                    None => best = Some(i),
+                    Some(b) => {
+                        if probs[i] > probs[b] {
+                            best = Some(i);
+                        }
+                    }
+                }
+            }
+            let b = best.expect("k <= 許可数なので候補は残る");
+            used[b] = true;
+            sel.push(b);
+        }
+        sel.sort_unstable();
+        out.copy_from_slice(&sel);
+        return;
+    }
+    buf.select_nth_unstable_by(k - 1, |&a, &b| {
+        let (pa, pb) = (probs[a as usize], probs[b as usize]);
+        pb.partial_cmp(&pa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    let sel = &mut buf[..k];
+    sel.sort_unstable();
+    for (o, &v) in out.iter_mut().zip(sel.iter()) {
+        *o = v as usize;
+    }
+}
+
 /// task 195: [`select_topk_into`] と同じ選択 (値の降順・同値は小さい index・
 /// 出力は index 昇順) を**挿入法**で返す。
 ///
@@ -598,6 +680,37 @@ mod tests {
         // 戻り値は常に index 昇順
         let probs2 = [0.05f32, 0.4, 0.15, 0.4];
         assert_eq!(select_topk(&probs2, 3), vec![1, 2, 3]);
+    }
+
+    /// task 217: 無効 expert を候補から外した top-k。
+    ///
+    /// - 無効 expert は絶対に返らない (元の probs で上位でも)
+    /// - 選ばれるのは「残りの上位 k」
+    /// - 出力は index 昇順、同値は小さい index
+    /// - 残りが k 未満なら従来の選択へ落ちる (panic しない)
+    #[test]
+    fn masked_topk_never_returns_disabled_experts() {
+        let probs = [0.40f32, 0.30, 0.20, 0.09, 0.01];
+        // expert 0 と 2 を無効化 (ビット列は 1 ワード)。
+        let mask: [u64; 1] = [(1 << 0) | (1 << 2)];
+        let sel = select_topk_mask(&probs, 2, &mask);
+        assert_eq!(sel, vec![1, 3], "残りの上位 2 本が選ばれていない: {sel:?}");
+        for &e in &sel {
+            assert!(mask[0] & (1u64 << e) == 0, "無効 expert {e} が選ばれた");
+        }
+        // 再正規化は選んだ集合の和で割る (合計 1)。
+        let sum: f32 = sel.iter().map(|&i| probs[i]).sum();
+        let w: Vec<f32> = sel.iter().map(|&i| probs[i] / sum).collect();
+        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-6, "重みの和 {w:?}");
+        // k = 1 でも同様。
+        assert_eq!(select_topk_mask(&probs, 1, &mask), vec![1]);
+        // 残り 1 本しかないのに k = 2 → 従来の選択へ落ちる (mask 無視)。
+        let all_but_one: [u64; 1] = [!0u64 & !(1 << 4)];
+        assert_eq!(select_topk_mask(&probs, 2, &all_but_one), select_topk(&probs, 2));
+        // NaN 入りでも無効 expert は返らない。
+        let nanp = [f32::NAN, 0.3, 0.2, 0.1, 0.05];
+        let sel = select_topk_mask(&nanp, 2, &mask);
+        assert!(!sel.contains(&0) && !sel.contains(&2), "{sel:?}");
     }
 
     /// P33: `select_nth_unstable_by` 版が従来の走査版 ([`select_topk_scan`]) と

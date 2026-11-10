@@ -7,6 +7,8 @@
 //! - `POST /v1/messages` (Anthropic Messages API、`stream` の有無で SSE / JSON)
 //! - `GET /v1/models`
 //! - `GET /health`
+//! - `GET /v1/model/shape` (task 217: ビューワが層と MoE の形を読む)
+//! - `GET|POST|DELETE /v1/intervene` (task 217: expert / block / 残差ストリームの介入)
 //!
 //! 直前のリクエストの状態 (KV / GDN / PLE の窓) を 1 つだけ保持し、次の
 //! プロンプトが**そのトークン列の続き**なら差分だけ食わせる。会話のたびに
@@ -54,8 +56,9 @@ use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
 use denno_engine::model::q4ledger;
+use denno_engine::model::intervene as iv;
 use denno_engine::model::qwen4exp::{
-    expert_w_stats_request_end, q4prof, Qwen4Exp, Qwen4ExpParams, TapTokens,
+    expert_w_stats_request_end, q4prof, LayerKind, Qwen4Exp, Qwen4ExpParams, TapTokens,
 };
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_decode::{
@@ -305,6 +308,9 @@ impl GenReq {
 struct Cached {
     state: DecoderSeqState,
     toks: Vec<u32>,
+    /// task 217: この文脈を計算したときの介入 epoch。epoch が変わったら
+    /// この文脈は使わない (別のモデルと同じなので)。
+    epoch: u64,
     logits: Vec<f32>,
     /// `toks` のうちプロンプト部の長さ (`toks[prompt_len..]` が生成部)。
     /// task 131 の splice が「生成テキスト」を取り出すのに使う。
@@ -330,7 +336,44 @@ struct CachedReq {
     cont: bool,
 }
 
-/// task 206: このリクエストをどの文脈に載せるか。
+/// task 217: `GET /v1/model/shape` が返す形 (ビューワ用)。
+///
+/// `layers` / `layer_kinds` は GGUF のメタデータから起動時に 1 回だけ作る。
+/// `gdn` は GDN (ssm) 層、`full` は full attention 層。
+#[derive(Clone, Debug)]
+struct ModelShape {
+    layers: usize,
+    layer_kinds: Vec<&'static str>,
+    n_expert: usize,
+    n_expert_used: usize,
+    n_hc: usize,
+    n_embd: usize,
+}
+
+impl ModelShape {
+    fn json(&self) -> Value {
+        json!({
+            "layers": self.layers,
+            "layer_kinds": self.layer_kinds,
+            "n_expert": self.n_expert,
+            "n_expert_used": self.n_expert_used,
+            "n_hc": self.n_hc,
+            "n_embd": self.n_embd,
+        })
+    }
+
+    /// エンジン側の検証に渡す形。
+    fn engine_shape(&self) -> iv::Shape {
+        iv::Shape {
+            n_layer: self.layers,
+            n_expert: self.n_expert,
+            n_expert_used: self.n_expert_used,
+            n_hc: self.n_hc,
+        }
+    }
+}
+
+/// task 217: このリクエストをどの文脈に載せるか。
 ///
 /// 決め方は [`pick_ctx`] の doc にある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +547,8 @@ struct Flash {
     tok: GgufTokenizer,
     /// 層優先のバッチ prefill を使うか (`DENNO_PREFILL_BATCH=0` で切れる)
     batch: bool,
+    /// task 217: `/v1/model/shape` と介入の検証に使う形。
+    shape: ModelShape,
     /// P118/task 206: 重みを持つ decoder。リクエストの間は系列状態が空。
     /// `DENNO_FLASH_MODEL_REUSE=0` でも成功したリクエストのあとは残す (今日と同じ)。
     dec: Option<Qwen4ExpDecoder>,
@@ -885,6 +930,7 @@ impl Flash {
         from_render: bool,
         req: CachedReq,
         aux_max_tok: usize,
+        epoch: u64,
     ) {
         let Some(state) = dec.take_seq_state() else {
             dec.reset();
@@ -896,6 +942,7 @@ impl Flash {
         let c = Cached {
             state,
             toks,
+            epoch,
             logits,
             prompt_len: n_prompt,
             from_render,
@@ -908,8 +955,37 @@ impl Flash {
         }
     }
 
+    /// task 217: 介入 epoch が違う文脈を捨てる (main と aux の両方)。
+    ///
+    /// prefix cache の状態は「その設定で計算したモデル」の状態なので、
+    /// 設定が変わったら再利用してはいけない。戻り値は捨てた本数。
+    fn drop_stale_ctx(&mut self, epoch: u64) -> usize {
+        let mut n = 0;
+        if self.cache.as_ref().is_some_and(|c| c.epoch != epoch) {
+            self.cache = None;
+            n += 1;
+        }
+        if self.aux.as_ref().is_some_and(|c| c.epoch != epoch) {
+            self.aux = None;
+            n += 1;
+        }
+        n
+    }
+
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
+        // task 217: このリクエストの間は介入設定を固定する。生成中に
+        // `POST /v1/intervene` が来ても、いま走っている生成の数値は変わらない
+        // (次のリクエストから効く)。forward 側はピン留めを読むだけ。
+        let _iv_pin = iv::pin_request();
+        let iv_epoch = iv::current_epoch();
+        // 別 epoch で計算した文脈は使わない (main / aux の両方)。
+        let dropped = self.drop_stale_ctx(iv_epoch);
+        if dropped > 0 {
+            eprintln!(
+                "[flash] intervene epoch {iv_epoch}: 古い文脈を {dropped} 本捨てた (prefix cache 無効化)"
+            );
+        }
         // task 146: 背景の事前ロードに「いま推論中」を知らせる (ロックを奪い合わない)。
         // ガードは戻るとき (失敗経路も) に下ろす。
         let _busy = denno_engine::model::exp_stats::busy_guard();
@@ -1525,6 +1601,7 @@ impl Flash {
                     prompt_from_render,
                     req_sig.clone(),
                     aux_max_tok,
+                    iv_epoch,
                 );
                 self.dec = Some(dec);
             } else {
@@ -1557,6 +1634,7 @@ impl Flash {
             prompt_from_render,
             req_sig,
             aux_max_tok,
+            iv_epoch,
         );
         self.dec = Some(dec);
         // task 146: リクエスト終端で使用回数を書く (decode の外・原子的)。
@@ -1703,6 +1781,101 @@ fn ws_upgrade_key<'a>(req: &'a HttpReq, path: &str) -> Option<&'a str> {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// task 217: 介入の HTTP (<-> engine::intervene)
+// ---------------------------------------------------------------------------
+
+/// 現在の設定を `GET /v1/intervene` の形にする。
+fn intervene_to_json(cfg: &iv::Config) -> Value {
+    let experts: Vec<Value> = cfg
+        .experts_off()
+        .iter()
+        .map(|&(l, e)| json!([l, e]))
+        .collect();
+    let blocks: Vec<Value> = cfg
+        .blocks_off()
+        .iter()
+        .map(|&(l, b)| json!([l, b.name()]))
+        .collect();
+    let streams: Vec<Value> = cfg
+        .streams_off()
+        .iter()
+        .map(|&(l, s)| json!([l, s]))
+        .collect();
+    json!({
+        "epoch": cfg.epoch(),
+        "experts_off": experts,
+        "blocks_off": blocks,
+        "streams_off": streams,
+    })
+}
+
+fn as_index(v: &Value, what: &str) -> Result<usize, String> {
+    v.as_u64()
+        .map(|n| n as usize)
+        .ok_or_else(|| format!("{what} は 0 以上の整数"))
+}
+
+fn as_pair_array<'a>(v: &'a Value, what: &str) -> Result<&'a Vec<Value>, String> {
+    v.as_array()
+        .ok_or_else(|| format!("{what} は配列 [[layer, x], ...]"))
+}
+
+/// `POST /v1/intervene` の body を検証して設定を置き換える。
+///
+/// 失敗はメッセージ (HTTP 400) にする。**panic しない**のが契約。
+fn apply_intervene(shape: &ModelShape, body: &Value) -> Result<Value, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
+    for k in obj.keys() {
+        if !matches!(k.as_str(), "experts_off" | "blocks_off" | "streams_off") {
+            return Err(format!(
+                "未知のフィールド {k:?} (experts_off / blocks_off / streams_off のみ)"
+            ));
+        }
+    }
+    let mut experts: Vec<(usize, usize)> = Vec::new();
+    if let Some(v) = obj.get("experts_off") {
+        for (i, item) in as_pair_array(v, "experts_off")?.iter().enumerate() {
+            let p = item
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .ok_or_else(|| format!("experts_off[{i}] は [layer, expert]"))?;
+            experts.push((as_index(&p[0], "layer")?, as_index(&p[1], "expert")?));
+        }
+    }
+    let mut blocks: Vec<(usize, iv::Block)> = Vec::new();
+    if let Some(v) = obj.get("blocks_off") {
+        for (i, item) in as_pair_array(v, "blocks_off")?.iter().enumerate() {
+            let p = item
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .ok_or_else(|| format!("blocks_off[{i}] は [layer, \"attn\"|\"moe\"|\"shared\"|\"ple\"]"))?;
+            let name = p[1]
+                .as_str()
+                .ok_or_else(|| format!("blocks_off[{i}][1] は文字列"))?;
+            let b = iv::Block::parse(name).ok_or_else(|| {
+                format!("blocks_off[{i}]: 未知の block {name:?} (attn / moe / shared / ple)")
+            })?;
+            blocks.push((as_index(&p[0], "layer")?, b));
+        }
+    }
+    let mut streams: Vec<(usize, usize)> = Vec::new();
+    if let Some(v) = obj.get("streams_off") {
+        for (i, item) in as_pair_array(v, "streams_off")?.iter().enumerate() {
+            let p = item
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .ok_or_else(|| format!("streams_off[{i}] は [layer, stream]"))?;
+            streams.push((as_index(&p[0], "layer")?, as_index(&p[1], "stream")?));
+        }
+    }
+    let cfg = iv::set_config(&shape.engine_shape(), experts, blocks, streams)?;
+    Ok(intervene_to_json(&cfg))
+}
+
 fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut r = BufReader::new(stream.try_clone()?);
@@ -1743,6 +1916,37 @@ fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
                 "max_context_tokens": flash.max_ctx
             }),
         );
+    }
+    // task 217: ビューワ用の形と介入の get / set / clear。
+    if req.method == "GET" && path == "/v1/model/shape" {
+        return send_json(&mut stream, "200 OK", &flash.shape.json());
+    }
+    if req.method == "GET" && path == "/v1/intervene" {
+        return send_json(&mut stream, "200 OK", &intervene_to_json(&iv::snapshot()));
+    }
+    if req.method == "POST" && path == "/v1/intervene" {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => {
+                return send_json(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e.to_string()}}),
+                )
+            }
+        };
+        return match apply_intervene(&flash.shape, &body) {
+            Ok(v) => send_json(&mut stream, "200 OK", &v),
+            Err(msg) => send_json(
+                &mut stream,
+                "400 Bad Request",
+                &json!({"type": "error", "error": {"type": "invalid_request_error", "message": msg}}),
+            ),
+        };
+    }
+    if req.method == "DELETE" && path == "/v1/intervene" {
+        let cfg = iv::clear(&flash.shape.engine_shape());
+        return send_json(&mut stream, "200 OK", &intervene_to_json(&cfg));
     }
     if req.method != "POST" || path != "/v1/messages" {
         return send_json(
@@ -1954,6 +2158,7 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let n_layer;
     let n_expert;
     let expert_bytes;
+    let shape;
     {
         let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
         // task 152: **全パート**を数える。t149c の `[flash] vram budget` は 2 分割の
@@ -1969,6 +2174,21 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         n_expert = p.n_expert;
         // task 146: 使用回数ファイルのモデル同一性 (全層の expert 3 行列の合計バイト)。
         expert_bytes = denno_engine::model::qwen4exp::expert_identity_bytes(&f, &p);
+        // task 217: ビューワが層を描けるように、層の種別と MoE / hc の形を残す。
+        let layer_kinds = (0..p.n_layer)
+            .map(|il| match p.layer_kind(il) {
+                Ok(LayerKind::FullAttn) => "full",
+                _ => "gdn",
+            })
+            .collect();
+        shape = ModelShape {
+            layers: p.n_layer,
+            layer_kinds,
+            n_expert: p.n_expert,
+            n_expert_used: p.n_expert_used,
+            n_hc: p.n_hc,
+            n_embd: p.n_embd,
+        };
     }
     drop(f);
     let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
@@ -2066,6 +2286,7 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         default_max: cfg.max_tokens,
         tok,
         batch,
+        shape,
         dec: None,
         cache: None,
         aux: None,
