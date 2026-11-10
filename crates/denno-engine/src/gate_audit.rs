@@ -13,10 +13,14 @@
 //!   実在を検査する (cuda feature 無しでも走る)。
 //!
 //! 台帳の各行は**既定で on のゲート**だけを持つ。既定 off のゲート (例:
-//! `DENNO_MIX_DEC_FOLD` / `DENNO_MIX_DEC_UPW` (task 213 の lab で採否 no)、
-//! `DENNO_PF_MIX_INJ`、`DENNO_DEC_EXPGU`) は、明示的に on にしたときだけ PTX が
-//! 要るのでここには入れない。`on` は実際のゲート関数を指すので、既定を変えたのに
-//! 台帳を直し忘れると `--lib` の監査テストが落ちる。
+//! `DENNO_MIX_DEC_UPW` (legacy。task 213 の lab で採否 no)、`DENNO_PF_MIX_INJ`) は、
+//! 明示的に on にしたときだけ PTX が要るのでここには入れない。`on` は実際の
+//! ゲート関数を指すので、既定を変えたのに台帳を直し忘れると `--lib` の監査テストが落ちる。
+//!
+//! task 221 で `DENNO_MIX_DEC_FOLD` と `DENNO_DEC_MIX_UPW` が既定 on になったので
+//! 2 行足した。`DENNO_DEC_EXPGU` も既定 on だが、使うのは `DENNO_EXPERT_BATCH` と
+//! 同じ `kernels_moe_batch.ptx` (同じ 4 エントリ) なので行を分けない — ファイルが
+//! 欠ければ EXPERT_BATCH の行が WARN を出す。
 
 use std::path::{Path, PathBuf};
 
@@ -59,6 +63,20 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         entries: &["dno_mix_norm", "dno_mix_inj"],
         path_env: "DENNO_MIX_DEV_PTX",
         on: crate::cuda::mix_dec_dev_enabled,
+    },
+    GatePtx {
+        env: "DENNO_MIX_DEC_FOLD",
+        ptx: "kernels_mix_dev2.ptx",
+        entries: &["dno_mix_norm_inj"],
+        path_env: "DENNO_MIX_DEV2_PTX",
+        on: crate::cuda::mix_dec_fold_on,
+    },
+    GatePtx {
+        env: "DENNO_DEC_MIX_UPW",
+        ptx: "kernels_mix_up.ptx",
+        entries: &["dno_mix_up_bf16"],
+        path_env: "DENNO_MIX_UP_PTX",
+        on: crate::cuda::dec_mix_upw_on,
     },
     GatePtx {
         env: "DENNO_ATTN_FLASHDEC",

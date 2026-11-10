@@ -1637,7 +1637,25 @@ pub(crate) mod dec_kprof {
                 assert!(!parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
                 assert!(!dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
             }
-            // task 213 / 216: fold / upw は既定 off。未設定・空・偽値は off、真値だけ on。
+            // task 221: fold は既定 on (lab t221c の `all` を採用)。明示的な偽値だけ off。
+            for raw in [
+                None,
+                Some(""),
+                Some("  "),
+                Some("1"),
+                Some("on"),
+                Some("true"),
+                Some("yes"),
+                Some("x"),
+            ] {
+                assert!(parse_mix_dec_fold(raw), "fold raw={raw:?}");
+            }
+            for raw in [Some("0"), Some("off"), Some(" FALSE "), Some("no")] {
+                assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
+            }
+            // task 213 / 216: legacy の `DENNO_MIX_DEC_UPW` は既定 off のまま
+            // (task 221 が既定 on にしたのは別名の `DENNO_DEC_MIX_UPW`)。未設定・空・
+            // 偽値は off、真値だけ on。
             for raw in [
                 None,
                 Some(""),
@@ -1648,11 +1666,9 @@ pub(crate) mod dec_kprof {
                 Some("no"),
                 Some("x"),
             ] {
-                assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             for raw in [Some("1"), Some("on"), Some(" ON "), Some("true"), Some("yes")] {
-                assert!(parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             // task 192: router early は lab t192a で +0.0% だったので **既定 off**。
@@ -24156,15 +24172,15 @@ const MIX_FOLD_NARGS: usize = 9;
 
 /// `DENNO_MIX_DEC_FOLD` の解釈 (純関数)。
 ///
-/// **既定 off** (task 213 の lab t213b で採否 no)。明示的な真値だけ on。
-/// t213b の実測 (base2 比、128 トークンの生秒): 短い点 -1.7% / -2.4%、
-/// 3,965 -2.8% で目標 (3%) に届かず、14k は fold 単独で +6.5% / +8.9%
-/// (cold prefill も +3.2%)。深い点の md5 は常駐の入れ替わりで DIFF し、
-/// 出力テキストも変わる (丸めだけの変更ではない)。PTX は opt-in 用に残す。
+/// **既定 on** (task 221 の lab t221c で `all` の一部として採用)。明示的な偽値だけ off。
+/// 値は 2 本版とビット一致 (norm と inject を 1 本に畳むだけ) なので、lab でも
+/// 単独 cond は md5 SAME だった。t221b の単独は短い点 +1.1% (1 サンプル・
+/// 起動が 1 本減る側なのでノイズと見る)、t221c の `all` は -3.5%。
+/// 切り戻しは `DENNO_MIX_DEC_FOLD=0`。
 fn parse_mix_dec_fold(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -24192,18 +24208,21 @@ pub(crate) fn mix_dec_upw_on() -> bool {
 /// task 216: `DENNO_DEC_MIX_UPW` の解釈 (純関数)。
 ///
 /// decode の mix の up 投影を 1 warp = 1 行 + uint4 読みの版
-/// (`kernels_mix_up.cu`) で回すか。**既定 off** (明示的な真値だけ on)。
+/// (`kernels_mix_up.cu`) で回すか。**既定 on** (task 221 の lab t221c で採用)。
 /// task 192 の `DENNO_MIX_DEC_UPW` とは別名にして、fold と切り離して
 /// 単独で A/B できるようにした (task 213 は fold と束ねて測っていた)。
+/// t221b の単独: 短い点 -2.4% (3 点とも -1.9〜-2.5%)。切り戻しは
+/// `DENNO_DEC_MIX_UPW=0` (legacy の `DENNO_MIX_DEC_UPW` も併せて 0 にする)。
 fn parse_dec_mix_upw(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
 /// task 216: up を uint4 版で回すか (`DENNO_DEC_MIX_UPW`)。
-fn dec_mix_upw_on() -> bool {
+/// task 221 で既定 on。`gate_audit` の台帳から参照するので pub(crate)。
+pub(crate) fn dec_mix_upw_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| parse_dec_mix_upw(std::env::var("DENNO_DEC_MIX_UPW").ok().as_deref()))
 }
@@ -24315,11 +24334,13 @@ fn dec_exp_gu_shape_ok(on: bool, same_slot: bool, rb_g: usize, rb_u: usize) -> b
 #[cfg(test)]
 static EXP_GU_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `DENNO_DEC_EXPGU` の解釈 (純関数)。既定 off。
+/// `DENNO_DEC_EXPGU` の解釈 (純関数)。**既定 on** (task 221 の lab t221c で採用)。
+/// gate と up を 1 起動に畳むだけで、同じカーネル・同じ行なので値はビット不変
+/// (t221b / t221c とも md5 SAME)。切り戻しは `DENNO_DEC_EXPGU=0`。
 fn parse_dec_exp_gu(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -46322,19 +46343,27 @@ mod task184_tests {
     /// 既定は off (未設定・空・でたらめは全部 off)。
     #[test]
     fn dec_mix_upw_truth_table() {
-        for raw in [None, Some(""), Some("  "), Some("x"), Some("0"), Some("off"), Some("false"), Some("no")] {
+        // task 221: 既定 on。明示的な偽値だけ off。
+        for raw in [Some("0"), Some("off"), Some("FALSE"), Some(" No ")] {
             assert!(!parse_dec_mix_upw(raw), "raw={raw:?} が on になっている");
         }
-        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true "), Some("Yes")] {
-            // "yes" は受けない (1/on/true だけ)。大文字小文字と空白は許す。
-            let want = !matches!(raw, Some("Yes"));
-            assert_eq!(parse_dec_mix_upw(raw), want, "raw={raw:?}");
+        for raw in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("1"),
+            Some("on"),
+            Some("TRUE"),
+            Some(" true "),
+            Some("yes"),
+            Some("x"),
+        ] {
+            assert!(parse_dec_mix_upw(raw), "raw={raw:?} が off になっている");
         }
-        // 既定 (env 無し) は off。ここが on に変わると、PTX を足しただけで
-        // 既定の挙動が動く (task 213 の fold/upw と同じ罠)。
+        // 既定 (env 無し) は on。切り戻しは明示的な `=0`。
         assert!(
-            !parse_dec_mix_upw(None),
-            "DENNO_DEC_MIX_UPW の既定が on になっている"
+            parse_dec_mix_upw(None),
+            "DENNO_DEC_MIX_UPW の既定が off に戻っている"
         );
     }
 
@@ -46380,18 +46409,19 @@ mod task184_tests {
 mod task204_tests {
     use super::*;
 
-    /// task 204: `DENNO_DEC_EXPGU` の真理値表。既定は off (未設定・空・0)。
+    /// task 204 / 221: `DENNO_DEC_EXPGU` の真理値表。既定は on (t221c で採用)。
     #[test]
     fn dec_exp_gu_truth_table() {
-        assert!(!parse_dec_exp_gu(None));
-        assert!(!parse_dec_exp_gu(Some("")));
-        assert!(!parse_dec_exp_gu(Some("0")));
-        assert!(!parse_dec_exp_gu(Some("off")));
-        assert!(!parse_dec_exp_gu(Some("false")));
+        assert!(parse_dec_exp_gu(None));
+        assert!(parse_dec_exp_gu(Some("")));
         assert!(parse_dec_exp_gu(Some("1")));
         assert!(parse_dec_exp_gu(Some(" ON ")));
         assert!(parse_dec_exp_gu(Some("true")));
         assert!(parse_dec_exp_gu(Some("yes")));
+        assert!(!parse_dec_exp_gu(Some("0")));
+        assert!(!parse_dec_exp_gu(Some("off")));
+        assert!(!parse_dec_exp_gu(Some("FALSE")));
+        assert!(!parse_dec_exp_gu(Some(" no ")));
     }
 
     /// task 204: 融合の可否は「on + 同じ量子型 + 行長が同じで 0 でない」。
