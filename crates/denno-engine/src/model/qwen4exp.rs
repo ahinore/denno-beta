@@ -2320,8 +2320,8 @@ impl PlePrefetch {
 
     /// 先読みの結果を受け取る。join でホストが止まった時間を `[pre-kprof]` の
     /// `pre wait=` に積む (0 に近いほど層ループの裏に隠れている)。
-    fn join(self) -> Result<Vec<Option<Vec<f32>>>> {
-        match self.h {
+    fn join(mut self) -> Result<Vec<Option<Vec<f32>>>> {
+        match self.h.take() {
             Some(h) => {
                 let t = std::time::Instant::now();
                 let r = h
@@ -2333,6 +2333,17 @@ impl PlePrefetch {
                 r
             }
             None => Ok(Vec::new()),
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl Drop for PlePrefetch {
+    /// 途中で降りた (エラーで `?` を通した) ときにスレッドを残さない。
+    /// 残すと**次のリクエストのカウンタ**に読みが混ざる。
+    fn drop(&mut self) {
+        if let Some(h) = self.h.take() {
+            let _ = h.join();
         }
     }
 }

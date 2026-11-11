@@ -544,19 +544,26 @@ pub(crate) fn pf_ple_par_on() -> bool {
 
 /// task 254: `DENNO_PF_PLE_PRE` の解釈 (純関数)。未設定は [`DEFAULT_PF_PLE_PRE`]。
 ///
-/// `1` / `on` / `true` / `yes` だけ on、`0` / `off` / `false` / `no` / 空は off。
+/// 既定 on のゲートなので、**明示的な偽値だけ off** (`0` / `off` / `false` /
+/// `no` / 空)。`DENNO_PF_PIN` と同じ流儀。
 pub(crate) fn pf_ple_pre_from_value(v: Option<&str>) -> bool {
     match v {
         None => DEFAULT_PF_PLE_PRE,
-        Some(s) => matches!(
+        Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
+            "0" | "off" | "false" | "no" | ""
         ),
     }
 }
 
-/// [`pf_ple_pre_from_value`] の既定値。lab の結果で決める (採用したら true)。
-pub const DEFAULT_PF_PLE_PRE: bool = false;
+/// [`pf_ple_pre_from_value`] の既定値。lab t254c で採用したので **true**。
+///
+/// t254c (depth8k、base と base2 の平均が基準) の 14k cold prefill:
+/// base 27.77 / 26.08 s (ple 2340.6 / 914.9 ms) → pre 25.21 / 25.20 s
+/// (ple 5.2 / 5.3 ms、`pre fires=9 tok=12482 wait=0.0 ms`)。**-6.4%**。
+/// 3,826 は 7.43/7.14 → 7.14/7.22 (-1.4%)、decode は悪化なし、
+/// md5 は 7 リクエストすべて SAME、errors 0。
+pub const DEFAULT_PF_PLE_PRE: bool = true;
 
 /// テストが env を立てずにゲートを強制するための上書き (0 = env / 1 = off / 2 = on)。
 static PF_PLE_PRE_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -1010,12 +1017,12 @@ mod tests {
     }
 
     /// task 254: `DENNO_PF_PLE_PRE` (次チャンクの PLE 先読み) の真理値表。
-    /// 既定は [`DEFAULT_PF_PLE_PRE`] で、lab の結果で決める。
+    /// 既定は [`DEFAULT_PF_PLE_PRE`] (lab t254c で採用して **on**)。
     #[test]
     fn pf_ple_pre_gate_truth_table() {
         assert_eq!(
-            DEFAULT_PF_PLE_PRE, false,
-            "lab の結果で決める (t254c で採用したら true)"
+            DEFAULT_PF_PLE_PRE, true,
+            "lab t254c で採用 (14k -6.4%、md5 SAME)"
         );
         assert_eq!(pf_ple_pre_from_value(None), DEFAULT_PF_PLE_PRE, "未設定");
         for v in ["0", "off", "false", "no", "", " off "] {
