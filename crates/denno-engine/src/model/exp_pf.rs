@@ -298,6 +298,37 @@ pub const DEFAULT_STREAM_UT: bool = false;
 /// probe 27.3 → 53.5 GB/s。t165c でも 95.31 s で再現。
 pub const DEFAULT_STREAM_WC: bool = true;
 
+/// `DENNO_PF_STREAM_SPLIT`: ステージングの写しと H2D を何分割して重ねるか (task 239)。
+///
+/// 従来 (1) は「グループ全体を pinned へ写す → 非同期 H2D を 1 回積む → 完了を待つ」
+/// なので、**写しと DMA が直列**になる。lab t239a の c8869 cold では
+/// up_MB=35,799 に対して copy_s=1.39、probe_GBs=54.6 (DMA 0.66 s) で、
+/// この 2.05 s が prefill 6.02 s の 34% を占めていた。
+///
+/// n 分割すると DMA(i) が写し(i+1) と重なる (DMA は非ブロッキングストリーム上)。
+/// 端数は最後の 1 枚へ寄せるので、デバイスへ渡るバイト列は 1 分割と同一 (数値不変)。
+pub const STREAM_SPLIT_ENV: &str = "DENNO_PF_STREAM_SPLIT";
+
+/// [`STREAM_SPLIT_ENV`] の既定値 (1 = 従来の 1 回写し + 1 回 DMA)。
+pub const DEFAULT_STREAM_SPLIT: usize = 1;
+
+/// [`STREAM_SPLIT_ENV`] の解釈 (純関数)。0・解析不能は既定へ、上限 16。
+pub fn stream_split_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_STREAM_SPLIT;
+    };
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => n.clamp(1, 16),
+        _ => DEFAULT_STREAM_SPLIT,
+    }
+}
+
+/// 写し / H2D の分割数 (プロセスで 1 回だけ env を読む)。
+pub fn stream_split() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| stream_split_from_value(std::env::var(STREAM_SPLIT_ENV).ok().as_deref()))
+}
+
 /// 1 回の起動で受ける行数 (`kernels_exp_iq_pf.cu` の `PF_MR`)。
 pub const ROWS_PER_LAUNCH: usize = 16;
 
@@ -1307,6 +1338,17 @@ mod tests {
         assert!(DEFAULT_STREAM_ON, "lab t165c で採用して既定 on");
         assert!(DEFAULT_STREAM_WC, "write-combined のバウンスが効いた");
         assert_eq!(stream_group(), 64, "グループ 64 が最良");
+        // task 239: 分割は既定 1 (従来の 1 回写し + 1 回 DMA)。
+        assert_eq!(
+            stream_split_from_value(None),
+            DEFAULT_STREAM_SPLIT,
+            "未設定は既定 (1 = 従来)"
+        );
+        assert_eq!(stream_split_from_value(Some("")), 1);
+        assert_eq!(stream_split_from_value(Some("0")), 1, "0 は既定へ");
+        assert_eq!(stream_split_from_value(Some("x")), 1, "解析不能は既定へ");
+        assert_eq!(stream_split_from_value(Some("4")), 4);
+        assert_eq!(stream_split_from_value(Some("64")), 16, "上限 16");
         // 分け合った 1 枚 (cuda 側は 3 枚) に、既定のグループ (64 本、
         // 平均 2.05 MB/本) が載ること。
         assert!(

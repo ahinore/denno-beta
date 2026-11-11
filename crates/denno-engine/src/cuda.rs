@@ -9522,6 +9522,38 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)]) {
     }
 }
 
+/// task 239: pinned の `[start, start + len)` だけを写す (分割 DMA 用)。
+///
+/// 分割しても**デバイスへ渡るバイト列は 1 分割と同一** (区間の切り方が違うだけ)。
+/// `parts` の各区間と交わる部分だけを切り出して、既存の並列写しへ渡す。
+fn pf_copy_into_pin_range(
+    pin_base: usize,
+    parts: &[(usize, PfHostRange)],
+    start: usize,
+    len: usize,
+) {
+    let end = start.saturating_add(len);
+    let mut sub: Vec<(usize, PfHostRange)> = Vec::with_capacity(parts.len());
+    for &(off, r) in parts {
+        let r_end = off.saturating_add(r.len);
+        let s = off.max(start);
+        let e = r_end.min(end);
+        if e <= s {
+            continue;
+        }
+        sub.push((
+            s,
+            PfHostRange {
+                ptr: r.ptr + (s - off),
+                len: e - s,
+            },
+        ));
+    }
+    if !sub.is_empty() {
+        pf_copy_into_pin(pin_base, &sub);
+    }
+}
+
 /// 1 グループぶんのスロット準備 (確保と配置)。
 struct PfSlotPlan {
     slot: usize,
@@ -9703,8 +9735,6 @@ fn pf_pump_in(
         let up = pf_up_stream(st)? as CUstream;
         // 2. pinned へ並列に写してから、非同期で H2D を積む。
         let pin_ptr = st.pin[s].as_ref().expect("確保済み").ptr;
-        pf_copy_into_pin(pin_ptr as usize, &plan.parts);
-        let copy_ns = t_copy.elapsed().as_nanos() as u64;
         let base = st.slot[s].buf.as_ref().expect("確保済み").ptr();
         let l = lib()?;
         let t_dma = std::time::Instant::now();
@@ -9712,14 +9742,46 @@ fn pf_pump_in(
         // 3. **グループ全体を 1 回の非同期コピーで積む**。
         //    行列ごとに分けると 1 グループ 96 回になり、`cuMemcpyHtoDAsync` の
         //    呼び出し固定費が DMA の実時間を上回る (lab t162a)。
+        //
+        //    task 239: `DENNO_PF_STREAM_SPLIT=n` のときは n 分割して、
+        //    **DMA(i) を写し(i+1) と重ねる** (DMA は非ブロッキングストリーム上)。
+        //    従来は「全量を写す → 1 回で積む → 完了を待つ」で写しと DMA が
+        //    直列だった (lab t239a の c8869 cold: copy 1.39 s + DMA 0.66 s)。
+        //    端数は最後の 1 枚へ寄せる。デバイスへ渡るバイト列は 1 分割と同一。
+        let nspl = crate::model::exp_pf::stream_split();
         if plan.need > 0 {
-            unsafe {
-                check(
-                    (l.memcpy_htod_async)(base, pin_ptr, plan.need, up),
-                    "cuMemcpyHtoDAsync (stage)",
-                )?;
+            let mut off = 0usize;
+            let chunk = if nspl <= 1 {
+                plan.need
+            } else {
+                plan.need
+                    .div_ceil(nspl)
+                    .div_ceil(PF_STAGE_ALIGN)
+                    .saturating_mul(PF_STAGE_ALIGN)
+                    .max(PF_STAGE_ALIGN)
+            };
+            while off < plan.need {
+                let len = (plan.need - off).min(chunk);
+                if off == 0 && chunk == plan.need {
+                    pf_copy_into_pin(pin_ptr as usize, &plan.parts);
+                } else {
+                    pf_copy_into_pin_range(pin_ptr as usize, &plan.parts, off, len);
+                }
+                unsafe {
+                    check(
+                        (l.memcpy_htod_async)(
+                            base + off as u64,
+                            (pin_ptr as *const u8).add(off) as *const c_void,
+                            len,
+                            up,
+                        ),
+                        "cuMemcpyHtoDAsync (stage)",
+                    )?;
+                }
+                off += len;
             }
         }
+        let copy_ns = t_copy.elapsed().as_nanos() as u64;
         dbg_htod(plan.need);
         // 4. 完了イベントを積む。
         let Some(record) = l.event_record else {
@@ -10790,6 +10852,62 @@ mod pf_stream_tests {
 
     use super::*;
     use crate::kquant::GgmlType;
+
+    /// task 239: 分割して写しても pinned の中身は 1 回写しと**同一**。
+    ///
+    /// 分割は「DMA(i) を写し(i+1) と重ねる」ためだけのもので、デバイスへ渡る
+    /// バイト列を変えない (数値不変の根拠)。区間は整列の隙間をまたぐ形で切る。
+    #[test]
+    fn split_copy_into_pin_is_byte_identical() {
+        // 96 バイトの転送元を 3 区間に分けて置く (間に整列の隙間がある形)。
+        let src: Vec<u8> = (0..96u8).collect();
+        let parts = vec![
+            (
+                0usize,
+                PfHostRange {
+                    ptr: src.as_ptr() as usize,
+                    len: 16,
+                },
+            ),
+            (
+                32usize,
+                PfHostRange {
+                    ptr: unsafe { src.as_ptr().add(16) } as usize,
+                    len: 20,
+                },
+            ),
+            (
+                64usize,
+                PfHostRange {
+                    ptr: unsafe { src.as_ptr().add(36) } as usize,
+                    len: 12,
+                },
+            ),
+        ];
+        let need = 80usize;
+        // 従来: 1 回で全部写す。
+        let mut one = vec![0xAAu8; need];
+        pf_copy_into_pin(one.as_mut_ptr() as usize, &parts);
+        // 分割: 24 バイトずつ (区間の境界と隙間をまたぐ)。
+        let mut split = vec![0xAAu8; need];
+        let mut off = 0usize;
+        while off < need {
+            let len = (need - off).min(24);
+            pf_copy_into_pin_range(split.as_mut_ptr() as usize, &parts, off, len);
+            off += len;
+        }
+        assert_eq!(one, split, "分割で pinned の中身が変わった");
+        // 隙間は書かれない (0xAA のまま)。
+        for gap in [16usize..32, 52..64] {
+            for &b in &split[gap] {
+                assert_eq!(b, 0xAA, "整列の隙間を書いてしまった");
+            }
+        }
+        // 区間の中身は転送元のとおり。
+        assert_eq!(&split[0..16], &src[0..16]);
+        assert_eq!(&split[32..52], &src[16..36]);
+        assert_eq!(&split[64..76], &src[36..48]);
+    }
 
     /// GPU が無い (このコンテナ) ときは起動前に `Ok(None)` を返し、`out` を
     /// 1 要素も書かない (呼び出し側は従来経路をそのまま回せる)。
