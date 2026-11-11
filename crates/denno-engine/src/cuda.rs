@@ -11002,6 +11002,79 @@ pub struct PfStreamEntry<'a> {
 }
 
 thread_local! {
+    /// task 233: 小さな表 (グループごとのポインタ表) を**非同期で**積むための
+    /// pinned bounce と、層内の書き込みオフセット。
+    ///
+    /// 同期の `cuMemcpyHtoD` (pageable) は null ストリームの前のカーネルと
+    /// ステージング DMA を待つので、グループごとに 3 回呼ぶと層あたり
+    /// 300 ms 失う (lab t233c: `table=` が 14k で 243-410 ms/層)。
+    static PF_TINY: std::cell::RefCell<(Option<PinMem>, usize)> =
+        const { std::cell::RefCell::new((None, 0)) };
+}
+
+/// task 233: 層の先頭で bounce のオフセットを戻す。
+///
+/// 層の終端は加重和のカーネルの `ctx.sync()` なので、前の層のコピーは
+/// 完了している (同じ領域を上書きしても安全)。
+fn pf_tiny_reset() {
+    PF_TINY.with(|c| {
+        if let Ok(mut t) = c.try_borrow_mut() {
+            t.1 = 0;
+        }
+    });
+}
+
+/// task 233: 小さなホスト配列を**非同期で**デバイスへ積む。
+///
+/// 戻り値 `false` = bounce が足りない (呼び出し側は同期コピーへ落ちる)。
+/// 同じ層の中で使う位置は毎回ずらすので、前のコピーが読んでいる領域を
+/// 上書きしない。
+fn pf_tiny_htod(dst: CUdeviceptr, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    const CAP: usize = 1usize << 16;
+    if data.len() > CAP {
+        return false;
+    }
+    let Ok(l) = lib() else {
+        return false;
+    };
+    PF_TINY.with(|c| {
+        let mut t = c.borrow_mut();
+        if t.0.as_ref().map(|p| p.bytes).unwrap_or(0) < CAP {
+            match PinMem::alloc(CAP) {
+                Ok(m) => t.0 = Some(m),
+                Err(_) => return false,
+            }
+        }
+        let off = t.1;
+        if off + data.len() > CAP {
+            return false;
+        }
+        let pin = t.0.as_ref().expect("確保済み");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (pin.ptr as *mut u8).add(off),
+                data.len(),
+            );
+            let r = (l.memcpy_htod_async)(
+                dst,
+                (pin.ptr as *mut u8).add(off) as *mut std::ffi::c_void,
+                data.len(),
+                std::ptr::null_mut(),
+            );
+            if r != CUDA_SUCCESS {
+                return false;
+            }
+        }
+        t.1 = off + data.len();
+        true
+    })
+}
+
+thread_local! {
     /// task 233: 直近のストリーミング層の内訳 (ns)。`[pump, wait, table, launch, accum]`
     /// 診断用 (DENNO_PF_LM_DBG の 1 行に出す)。
     static PF_STREAM_T: std::cell::RefCell<[u64; 5]> = const { std::cell::RefCell::new([0; 5]) };
@@ -11019,6 +11092,11 @@ pub fn pf_stream_times_ms() -> [f64; 5] {
             v[4] as f64 / 1e6,
         ]
     })
+}
+
+/// task 233: `&[u64]` をバイト列として見る (非同期コピー用)。
+fn bytes_of(v: &[u64]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 fn pf_stream_t_add(i: usize, ns: u64) {
@@ -11247,6 +11325,7 @@ fn moe_experts_iq_pf_layer_stream_io(
     let in_elems = ntok * n_in;
 
     PF_STREAM_T.with(|c| *c.borrow_mut() = [0; 5]);
+    pf_tiny_reset();
     let mut work = || -> Result<Option<u32>> {
         PF_SCRATCH.with(|cell| -> Result<Option<u32>> {
             let mut sc = cell.borrow_mut();
@@ -11516,9 +11595,16 @@ fn moe_experts_iq_pf_layer_stream_io(
                             return Ok(None);
                         }
                     }
-                    pg_tab.copy_from_at(a * 8, &vg)?;
-                    pu_tab.copy_from_at(a * 8, &vu)?;
-                    pd_tab.copy_from_at(a * 8, &vd)?;
+                    // task 233: 同期 H2D は前のグループのカーネル / DMA を待つ。
+                    // 小さな表は pinned から非同期で積む (足りなければ同期へ)。
+                    let ok_async = pf_tiny_htod(pg_tab.ptr() + (a * 8) as u64, bytes_of(&vg))
+                        && pf_tiny_htod(pu_tab.ptr() + (a * 8) as u64, bytes_of(&vu))
+                        && pf_tiny_htod(pd_tab.ptr() + (a * 8) as u64, bytes_of(&vd));
+                    if !ok_async {
+                        pg_tab.copy_from_at(a * 8, &vg)?;
+                        pu_tab.copy_from_at(a * 8, &vu)?;
+                        pd_tab.copy_from_at(a * 8, &vd)?;
+                    }
                 }
                 pf_stream_t_add(2, t_tab.elapsed().as_nanos() as u64);
                 let t_wait = std::time::Instant::now();
