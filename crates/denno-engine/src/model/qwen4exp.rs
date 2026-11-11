@@ -4109,6 +4109,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         }
         // task 233: デバイス経路を諦めたときだけ要るホストの控え (普段は確保しない)。
         let mut mixed_buf: Option<PfHostBuf> = None;
+        // 診断: ホスト経路へ落ちた層の数 (`DENNO_PF_LM_DBG=1` で 1 行)。
+        let mut lm_fallback = 0usize;
         // task 233: attention の入口は CPU が読むので、チャンクぶんだけホストへ戻す。
         let mut attn_buf = PfHostBuf::new(chunk * e);
         for il in 0..n_layer {
@@ -4337,6 +4339,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 iv,
             )?;
             if !ffn_dev {
+                lm_fallback += 1;
                 let buf = mixed_buf.get_or_insert_with(|| PfHostBuf::new(nt_all * e));
                 if !crate::cuda::pf_lm_take_mixed(&mut buf.as_mut_slice()[..nt_all * e]) {
                     Self::pf_bail("mixed の D2H に失敗")?;
@@ -4417,6 +4420,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let mut res_flat = vec![0.0f32; lnt * hc_dim];
         if !crate::cuda::pf_download_res(&mut res_flat) {
             Self::pf_bail("最終チャンクの res の D2H に失敗")?;
+        }
+        if std::env::var_os("DENNO_PF_LM_DBG").is_some() {
+            eprintln!("[pf-lm-dbg] layers={n_layer} fallback={lm_fallback}");
         }
         // task 233: 置き場と MoE の作業域 (14k で合計 約 3.5 GB) を decode に返す。
         crate::cuda::pf_lm_release();
@@ -15553,6 +15559,15 @@ fn moe_ffn_quant_batch_lm_dev(
     let ne = p.n_expert;
     let k = p.n_expert_used;
     let ff = p.n_ff_exp;
+    // 診断 (`DENNO_PF_LM_DBG=1`): どの段が時間を使ったかを層ごとに 1 行。
+    let dbg = std::env::var_os("DENNO_PF_LM_DBG").is_some();
+    let t_dbg = std::time::Instant::now();
+    let mut ph = [0f64; 6];
+    let mut mark = |i: usize| {
+        if dbg {
+            ph[i] = t_dbg.elapsed().as_secs_f64() * 1e3;
+        }
+    };
     if !lm_dev_moe_ok(
         nt,
         crate::model::exp_pf::pf_enabled(),
@@ -15590,6 +15605,7 @@ fn moe_ffn_quant_batch_lm_dev(
     ) {
         return Ok(false);
     }
+    mark(0);
     let sm_block = router_sm_block();
     router_softmax_rows(&mut probs, ne, sm_block);
     let mut sels: Vec<usize> = vec![0; nt * k];
@@ -15605,6 +15621,7 @@ fn moe_ffn_quant_batch_lm_dev(
         pf_router_fast_on(),
         expert_mask,
     );
+    mark(1);
     if emit_router {
         let tail = (nt - 1) * k;
         emit_router_topk(lw.il, &sels[tail..tail + k], &weights[tail..tail + k]);
@@ -15633,6 +15650,7 @@ fn moe_ffn_quant_batch_lm_dev(
         return Ok(false);
     }
     let total_rows = plan.total_rows;
+    mark(2);
     // 3. shared expert (入力も出力もデバイス)。出力は加重和の最後の項になる。
     let mut sh_dev = 0u64;
     let mut sh_w: Vec<f32> = Vec::new();
@@ -15673,6 +15691,7 @@ fn moe_ffn_quant_batch_lm_dev(
         }
         sh_dev = tail;
     }
+    mark(3);
     // 4. routed experts (入力も出力もデバイス)。
     {
         // 同じ expert は 1 層で何度も選ばれる。madvise は 1 expert 1 回で足りる。
@@ -15748,6 +15767,7 @@ fn moe_ffn_quant_batch_lm_dev(
         Some(_) => {}
         None => return Ok(false),
     }
+    mark(4);
     // 5. 役割 RMS (チャンク末尾のトークン)。
     if let Some(r) = roles.as_deref_mut() {
         let t = nt - 1;
@@ -15762,6 +15782,22 @@ fn moe_ffn_quant_batch_lm_dev(
                 r.shex = rms_of(&row);
             }
         }
+    }
+    mark(5);
+    if dbg {
+        eprintln!(
+            "[pf-lm-dbg] layer={} nt={} router={:.1} topk={:.1} plan={:.1} shared={:.1} \
+             experts={:.1} roles={:.1} total={:.1} ms",
+            lw.il,
+            nt,
+            ph[0],
+            ph[1] - ph[0],
+            ph[2] - ph[1],
+            ph[3] - ph[2],
+            ph[4] - ph[3],
+            ph[5] - ph[4],
+            t_dbg.elapsed().as_secs_f64() * 1e3
+        );
     }
     // 分岐が実際に発火した証拠を lab のログに 1 回だけ出す。
     {

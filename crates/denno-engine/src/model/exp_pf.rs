@@ -894,6 +894,8 @@ static STREAM_ENQ_NS: AtomicU64 = AtomicU64::new(0);
 static STREAM_READY_NS: AtomicU64 = AtomicU64::new(0);
 /// task 165: ステージングの再利用待ち (前のグループの計算完了待ち)。
 static STREAM_SLOT_NS: AtomicU64 = AtomicU64::new(0);
+/// task 233: スロット再利用前の「計算完了イベント」待ち (診断。今まで台帳に出ていなかった)。
+static STREAM_USE_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
 static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 上げの回数 (グループ数)。
@@ -994,6 +996,11 @@ pub fn note_stream_group(
     STREAM_SLOT_NS.fetch_add(slot_ns, Ordering::Relaxed);
 }
 
+/// task 233: スロット再利用前の計算完了待ちの時間を積む (診断)。
+pub fn note_stream_use_ns(ns: u64) {
+    STREAM_USE_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
 /// task 162: ストリーミングで 1 層を GPU に載せた。
 pub fn note_stream_layer() {
     STREAM_LAYERS.fetch_add(1, Ordering::Relaxed);
@@ -1088,6 +1095,7 @@ pub fn stats_line() -> Option<String> {
         let enq = STREAM_ENQ_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let ready = STREAM_READY_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let slotw = STREAM_SLOT_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let use_s = STREAM_USE_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let exps = STREAM_EXPERTS.load(Ordering::Relaxed);
         let rows = STREAM_ROWS.load(Ordering::Relaxed);
         // 1000 倍して持っている MB/s を GB/s へ。
@@ -1095,7 +1103,7 @@ pub fn stats_line() -> Option<String> {
         out.push_str(&format!(
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
-             ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} \
+             ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
              probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={} \
              chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),

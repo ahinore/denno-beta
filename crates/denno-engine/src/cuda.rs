@@ -9789,9 +9789,12 @@ fn pf_pump_in(
                 let Some(es) = lib()?.event_sync else {
                     bail!("cuEventSynchronize が無い");
                 };
+                // task 233: この待ちは今まで台帳のどこにも出ていなかった (診断で積む)。
+                let t_use = std::time::Instant::now();
                 unsafe {
                     check(es(ev.0), "cuEventSynchronize (stage use)")?;
                 }
+                crate::model::exp_pf::note_stream_use_ns(t_use.elapsed().as_nanos() as u64);
             }
         }
         let up = pf_up_stream(st)? as CUstream;
