@@ -3203,7 +3203,8 @@ impl Qwen4Exp {
         // (エラーで抜けても Drop で戻る)。decode の間は抱えない。
         #[cfg(feature = "cuda")]
         let _pf_stream_guard = PfStreamGuard;
-        let logits = if batch && self.attn.layer_major_safe() {
+        let layer_major = batch && self.attn.layer_major_safe();
+        let logits = if layer_major {
             self.forward_prefill_batch_tapped(ctx, prefill_chunk_for(ctx.len()), tokens, on_layer, roles)?
         } else {
             self.prefill_seq(ctx, tokens, on_layer, roles)?
@@ -3214,9 +3215,51 @@ impl Qwen4Exp {
         if pf_gdn_gpu_on() {
             crate::cuda::gdn_state_release();
         }
+        // task 246: prefill のストリーミング経路は LRU を**読むだけ** (peek) なので、
+        // 末尾チャンクの選択で LRU を触り直して decode の作業集合を先頭へ寄せる
+        // (H2D なし)。層優先バッチのときだけ (逐次 prefill は自分で `acquire` する)。
+        #[cfg(feature = "cuda")]
+        if layer_major {
+            self.pf_reseed_decode_hot();
+        }
         // P58: 1 リクエスト 1 回の階層統計 (prefill 終了時)。arch off なら即座に戻る。
         self.arch_emit_prefill_done();
         Ok(logits)
+    }
+
+    /// task 246: prefill の終端で、末尾トークンが選んだ expert を LRU の先頭へ
+    /// 寄せ直す (H2D なし)。
+    ///
+    /// prefill のストリーミング経路 ([`crate::model::exp_pf::stream_enabled`]) は
+    /// VRAM 常駐を **peek するだけ** で LRU を触らない (lab t148c: 触ると 14k の
+    /// decode ヒット率が 0.966 → 0.866)。その副作用として、チャンクを均等割りに
+    /// すると「末尾の小さいチャンクが従来経路に落ちて LRU を温める」効果まで
+    /// 消え、decode のヒット率が 1.7 pp 落ちる (REPORT_P239 の bal)。
+    ///
+    /// ここで控えておいた選択 (`exp_pf::note_tail_selection`) を、従来経路と
+    /// 同じ順序 (トークン昇順 → 層昇順 → j 昇順) で [`expert_vram::touch_many_count`]
+    /// に渡す。載っていない鍵は飛ばすので **転送は起きない** (LRU の順序だけ)。
+    /// 発火と当たり数は `[pf-reseed]` の 1 行で数える。
+    #[cfg(feature = "cuda")]
+    fn pf_reseed_decode_hot(&self) {
+        let t0 = std::time::Instant::now();
+        let (keys, ntok) = crate::model::exp_pf::take_dec_hot_keys();
+        if keys.is_empty() {
+            return;
+        }
+        let ek: Vec<ExpertKey> = keys
+            .iter()
+            .map(|&(layer, expert)| ExpertKey { layer, expert })
+            .collect();
+        let hit = expert_vram::touch_many_count(&ek);
+        eprintln!(
+            "[pf-reseed] tok={} keys={} resident={} ({:.1}%) in {:.2}ms",
+            ntok,
+            ek.len(),
+            hit,
+            100.0 * hit as f64 / ek.len().max(1) as f64,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     /// 逐次 prefill (= decoder と同じ経路)。既存の [`Qwen4Exp::forward_token_at`] を
@@ -12296,6 +12339,7 @@ fn prefill_chunk_for(n: usize) -> usize {
         base,
         crate::model::exp_pf::CHUNK_BALANCE_CAP,
         crate::model::exp_pf::chunk_balance(),
+        crate::model::exp_pf::chunk_balance_long(),
         crate::model::exp_pf::stream_enabled(),
         explicit,
     )
@@ -14882,6 +14926,9 @@ fn moe_ffn_quant_batch_full(
     moe_sub_add(0, t_router.elapsed());
     // 区間を閉じる (experts の時間を router に二重計上しない)。
     drop(_l_router);
+    // task 246: 末尾トークンの選択を控える (prefill の終端で LRU を温め直すため)。
+    // ゲート off なら `note_tail_selection` が即座に戻る。
+    crate::model::exp_pf::note_tail_selection(lw.il, nt, k, &sels);
     // P56: RouterTopK は**チャンク末尾の 1 トークンだけ**送る。
     //
     // 理由: 全トークンを送ると 1 プロンプトで nt × n_layer 枚 (512 トークン ×

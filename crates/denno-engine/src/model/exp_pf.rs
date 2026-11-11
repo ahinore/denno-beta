@@ -263,12 +263,9 @@ pub fn balanced_chunk(n: usize, base: usize, cap: usize) -> usize {
 /// この prefill のチャンク長 (純関数)。
 ///
 /// 均等割りは「ストリーミング経路」「`DENNO_PF_CHUNK_BALANCE` が on」
-/// 「`DENNO_PF_CHUNK` の**明示**指定が無い」「プロンプトが 2 枚以内に収まる」の
-/// 4 つが揃ったときだけ効く。
-///
-/// 2 枚以内に限る理由: 長いプロンプト (14k など) のチャンクは task 197 が
-/// 実測で決めた 1536 で、枚数を減らすには 2047 まで上げる必要がある。
-/// その領域は tools シナリオの lab で測っていないので触らない。
+/// 「`DENNO_PF_CHUNK` の**明示**指定が無い」の 3 つが揃ったときだけ効く。
+/// 長いプロンプト (2 枚を超える) まで広げるのは `long_on`
+/// ([`CHUNK_BALANCE_LONG_ENV`]) が on のときだけ (task 246 で追加)。
 ///
 /// **`chunk_override()` で判定してはいけない**: あれは未設定のとき
 /// `Some(DEFAULT_PF_CHUNK_STREAM)` を返すので、常に「明示指定あり」に見えて
@@ -279,11 +276,16 @@ pub fn chunk_for_prefill(
     base: usize,
     cap: usize,
     balance_on: bool,
+    long_on: bool,
     stream_on: bool,
     explicit_override: bool,
 ) -> usize {
     let cap = cap.max(1);
-    if !balance_on || !stream_on || explicit_override || n > cap.saturating_mul(2) {
+    if !balance_on || !stream_on || explicit_override {
+        return base.max(1);
+    }
+    // 2 枚以内は task 239 の範囲。それを超える長さは long ゲートが要る。
+    if n > cap.saturating_mul(2) && !long_on {
         return base.max(1);
     }
     balanced_chunk(n, base, cap)
@@ -294,6 +296,193 @@ pub fn chunk_for_prefill(
 pub fn chunk_balance() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| chunk_balance_from_value(std::env::var(CHUNK_BALANCE_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_CHUNK_BALANCE_LONG`: 均等割りを 2 枚を超える長さ (14k など) まで
+/// 広げる (task 246)。
+///
+/// 3,222 トークンは 1,611 × 2 枚で済むが、14,018 は 1,536 固定だと 10 枚
+/// (9 × 1,536 + 194) になり、同じ expert を 10 回上げる。上限
+/// [`CHUNK_BALANCE_CAP`] (2,047) の下で枚数を最小にすると 2,003 × 7 枚になり、
+/// 転送量が約 3 割減る見込み (推定)。
+///
+/// 既定は off (第 1 ラウンドの lab で測ってから決める)。
+pub const CHUNK_BALANCE_LONG_ENV: &str = "DENNO_PF_CHUNK_BALANCE_LONG";
+
+/// [`CHUNK_BALANCE_LONG_ENV`] の既定 (off = 従来の固定 1,536)。
+pub const DEFAULT_CHUNK_BALANCE_LONG: bool = false;
+
+/// [`CHUNK_BALANCE_LONG_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn chunk_balance_long_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_CHUNK_BALANCE_LONG,
+    }
+}
+
+/// 長いプロンプトまで均等割りするか (プロセスで 1 回だけ env を読む)。
+pub fn chunk_balance_long() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        chunk_balance_long_from_value(std::env::var(CHUNK_BALANCE_LONG_ENV).ok().as_deref())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// task 246: prefill 終端で decode の作業集合を LRU の先頭へ寄せる
+// ---------------------------------------------------------------------------
+//
+// 機序 (REPORT_P239): 固定 1,536 で切ると 3,222 トークンの末尾が 150 トークン
+// (< `stream_min_tok` = 512) になり、その 1 枚だけ**従来経路**へ落ちる。従来経路は
+// 1 トークンずつ `moe_ffn_quant` を通るので、ヒットした expert を `acquire` で
+// 触る (= LRU の先頭へ寄せる)。均等割りで 2 枚にすると全チャンクがストリーミング
+// 経路 (peek のみ = **LRU を触らない**) になり、末尾の温めが消える。これが
+// c8869 の decode ヒット率 0.929 → 0.912 / decode +2% の正体。
+//
+// 対策は H2D を伴わない「触り直し」: 最後のチャンクの末尾 `TOK` トークンが選んだ
+// expert を、**トークン順 → 層順 → j 順**に `touch_many` する。これは従来経路が
+// やっていたことと同じ順序で、載っていない鍵は黙って飛ばす (アップロードしない)。
+// `TOK` は従来経路に落ちていた末尾チャンクの長さ (c8869 で 150、14k で 194) を
+// 覆う 256 を既定にする。
+
+/// `DENNO_PF_DEC_RESEED`: prefill の終端で末尾トークンの expert を LRU の先頭へ
+/// 寄せ直す (task 246、H2D なし)。
+pub const DEC_RESEED_ENV: &str = "DENNO_PF_DEC_RESEED";
+
+/// [`DEC_RESEED_ENV`] の既定 (off。第 1 ラウンドの lab で測ってから決める)。
+pub const DEFAULT_DEC_RESEED: bool = false;
+
+/// `DENNO_PF_DEC_RESEED_TOK`: 何トークンぶんを寄せ直すか (既定 256)。
+pub const DEC_RESEED_TOK_ENV: &str = "DENNO_PF_DEC_RESEED_TOK";
+
+/// [`DEC_RESEED_TOK_ENV`] の既定。
+pub const DEFAULT_DEC_RESEED_TOK: usize = 256;
+
+/// [`DEC_RESEED_TOK_ENV`] の上限 (これを超える指定は丸める)。
+pub const DEC_RESEED_TOK_MAX: usize = 4096;
+
+/// [`DEC_RESEED_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn dec_reseed_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_DEC_RESEED,
+    }
+}
+
+/// 寄せ直しを使うか (プロセスで 1 回だけ env を読む)。
+pub fn dec_reseed_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dec_reseed_from_value(std::env::var(DEC_RESEED_ENV).ok().as_deref()))
+}
+
+/// [`DEC_RESEED_TOK_ENV`] の解釈 (純関数)。0 と解析不能は既定。
+pub fn dec_reseed_tok_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n > 0 => n.min(DEC_RESEED_TOK_MAX),
+        _ => DEFAULT_DEC_RESEED_TOK,
+    }
+}
+
+/// 寄せ直すトークン数 (プロセスで 1 回だけ env を読む)。
+pub fn dec_reseed_tok() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| dec_reseed_tok_from_value(std::env::var(DEC_RESEED_TOK_ENV).ok().as_deref()))
+}
+
+/// 末尾トークンの選択を控える器。
+///
+/// `per_layer[layer]` は「層 `layer` の末尾 `tok` トークン × k 本」を
+/// **トークン昇順 → j 昇順**で平らに持つ (先頭が `nt - tok` 番目のトークン)。
+#[derive(Default)]
+struct DecHot {
+    /// 最後に観測したチャンクのトークン数 (層 0 で更新)。
+    nt: usize,
+    /// 1 トークンあたりの選択数 (層で同じ)。
+    k: usize,
+    /// 控えた末尾トークン数。
+    tok: usize,
+    /// 層 → 末尾トークンの選択 (平ら)。
+    per_layer: Vec<Vec<u16>>,
+}
+
+thread_local! {
+    static DEC_HOT: std::cell::RefCell<DecHot> = std::cell::RefCell::new(DecHot::default());
+}
+
+/// 1 層ぶんの選択を控える本体 (純粋・テスト可能)。
+///
+/// 層 0 がチャンクの先頭 (このエンジンは層を 0 から順に回す)。チャンクが
+/// 変わると前のチャンクの内容は捨てるので、prefill が終わった時点では
+/// **最後のチャンク**の末尾トークンだけが残る。
+fn note_tail_into(h: &mut DecHot, layer: usize, nt: usize, k: usize, sels: &[usize], tok: usize) {
+    if nt == 0 || k == 0 || tok == 0 || sels.len() != nt * k {
+        return;
+    }
+    if layer == 0 || h.nt != nt || h.k != k {
+        if layer != 0 {
+            // 層によってチャンク長が違うのは想定外 (控えない方が安全)。
+            return;
+        }
+        h.nt = nt;
+        h.k = k;
+        h.tok = tok.min(nt);
+        h.per_layer.clear();
+    }
+    if h.tok != tok.min(nt) || h.k != k {
+        return;
+    }
+    if h.per_layer.len() <= layer {
+        h.per_layer.resize_with(layer + 1, Vec::new);
+    }
+    let lo = nt - h.tok;
+    let row = &mut h.per_layer[layer];
+    row.clear();
+    row.extend(sels[lo * k..].iter().map(|&e| e as u16));
+}
+
+/// 1 層ぶんの選択を控える (`sels` は `nt * k` の平らな配列、行はトークン昇順)。
+pub fn note_tail_selection(layer: usize, nt: usize, k: usize, sels: &[usize]) {
+    if !dec_reseed_on() {
+        return;
+    }
+    let tok = dec_reseed_tok();
+    DEC_HOT.with(|c| note_tail_into(&mut c.borrow_mut(), layer, nt, k, sels, tok));
+}
+
+/// 控えた選択を「触る順」で取り出す本体 (純粋・テスト可能)。取り出したら消す。
+///
+/// 順序は従来経路 (1 トークンずつ回す経路) と同じ
+/// 「トークン昇順 → 層昇順 → j 昇順」。`touch_many` は渡した順に新しくするので、
+/// 最後のトークンの選択が一番「最近使った」になる。
+fn take_dec_hot_from(h: &mut DecHot, tok: usize) -> (Vec<(u16, u16)>, usize) {
+    let (ntok, k) = (h.tok.min(tok), h.k);
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    if ntok > 0 && k > 0 {
+        out.reserve(ntok * k * h.per_layer.len());
+        for t in 0..ntok {
+            for (layer, row) in h.per_layer.iter().enumerate() {
+                if row.len() != ntok * k {
+                    continue;
+                }
+                for j in 0..k {
+                    out.push((layer as u16, row[t * k + j]));
+                }
+            }
+        }
+    }
+    *h = DecHot::default();
+    (out, ntok)
+}
+
+/// 控えた選択を「触る順」で取り出す (**取り出したら消す**)。ゲート off なら空。
+///
+/// 戻り値は `(keys, 末尾トークン数)`。
+pub fn take_dec_hot_keys() -> (Vec<(u16, u16)>, usize) {
+    if !dec_reseed_on() {
+        return (Vec::new(), 0);
+    }
+    let tok = dec_reseed_tok();
+    DEC_HOT.with(|c| take_dec_hot_from(&mut c.borrow_mut(), tok))
 }
 
 /// [`PF_CHUNK_ENV`] の解釈 (純関数)。0・空・偽値・解析不能は `None` (= 上書きしない)。
@@ -1305,24 +1494,140 @@ mod tests {
     fn chunk_for_prefill_fires_only_on_all_three_conditions() {
         let (n, base, cap) = (3222usize, DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
         // 3 条件が揃ったときだけ均等割り (3,222 → 1,611 × 2 枚)。
-        assert_eq!(chunk_for_prefill(n, base, cap, true, true, false), 1611);
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, true, false), 1611);
         // ゲート off。
-        assert_eq!(chunk_for_prefill(n, base, cap, false, true, false), base);
+        assert_eq!(chunk_for_prefill(n, base, cap, false, false, true, false), base);
         // ストリーミング off (従来経路)。
-        assert_eq!(chunk_for_prefill(n, base, cap, true, false, false), base);
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, false, false), base);
         // `DENNO_PF_CHUNK` の明示指定がある。
-        assert_eq!(chunk_for_prefill(n, base, cap, true, true, true), base);
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, true, true), base);
         // 1 枚で収まる長さはゲート on でもそのまま。
-        assert_eq!(chunk_for_prefill(1000, base, cap, true, true, false), 1000);
-        // 2 枚を超える長さ (14k) は触らない (task 197 の実測領域)。
+        assert_eq!(chunk_for_prefill(1000, base, cap, true, false, true, false), 1000);
+        // 2 枚を超える長さ (14k) は long ゲート off なら触らない (task 197 の実測領域)。
         assert_eq!(
-            chunk_for_prefill(14018, base, cap, true, true, false),
+            chunk_for_prefill(14018, base, cap, true, false, true, false),
             base,
             "長いプロンプトのチャンクを変えてしまった"
         );
-        assert_eq!(chunk_for_prefill(4095, base, cap, true, true, false), base);
+        assert_eq!(chunk_for_prefill(4095, base, cap, true, false, true, false), base);
         // 2 枚ちょうどまでは均等割り。
-        assert_eq!(chunk_for_prefill(4094, base, cap, true, true, false), 2047);
+        assert_eq!(chunk_for_prefill(4094, base, cap, true, false, true, false), 2047);
+    }
+
+    /// task 246: 長いプロンプトの均等割りは専用ゲート (`BALANCE_LONG`) の内側だけ。
+    ///
+    /// 14,018 は固定 1,536 で 10 枚 (9 × 1,536 + 194)、均等割りで 2,003 × 7 枚。
+    /// 枚数が 3 割減るので、ミス expert の上げ直しもそのぶん減る (推定)。
+    #[test]
+    fn chunk_balance_long_extends_to_long_prompts() {
+        let (base, cap) = (DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        assert!(!chunk_balance_long_from_value(None), "既定は off");
+        assert!(!chunk_balance_long_from_value(Some("0")));
+        assert!(chunk_balance_long_from_value(Some("1")));
+        assert!(chunk_balance_long_from_value(Some(" on ")));
+        // long off: 14k は従来の 1,536 のまま (10 枚)。
+        assert_eq!(
+            chunk_for_prefill(14018, base, cap, true, false, true, false),
+            base
+        );
+        // long on: 2,003 × 7 枚。
+        let c = chunk_for_prefill(14018, base, cap, true, true, true, false);
+        assert_eq!(c, 2003);
+        assert_eq!(14018usize.div_ceil(c), 7);
+        // 上限は GDN 連鎖の境界 (2,048) の手前を守る。
+        assert!(c <= cap && c < 2048);
+        // 短いプロンプトの答えは long の有無で変わらない。
+        for n in [1000usize, 3222, 3826, 4094] {
+            assert_eq!(
+                chunk_for_prefill(n, base, cap, true, true, true, false),
+                chunk_for_prefill(n, base, cap, true, false, true, false),
+                "n={n} で long が短い側の答えを変えた"
+            );
+        }
+    }
+
+    /// task 246: 寄せ直しのゲート解釈とトークン数の丸め。
+    #[test]
+    fn dec_reseed_parses_values() {
+        assert!(!DEFAULT_DEC_RESEED, "既定 off でない");
+        assert!(!dec_reseed_from_value(None));
+        assert!(!dec_reseed_from_value(Some("0")));
+        assert!(!dec_reseed_from_value(Some("off")));
+        assert!(dec_reseed_from_value(Some("1")));
+        assert!(dec_reseed_from_value(Some("on")));
+        assert!(dec_reseed_from_value(Some(" true ")));
+        // 既定は 256 (従来経路に落ちていた末尾チャンクの 150 / 194 を覆う)。
+        assert_eq!(DEFAULT_DEC_RESEED_TOK, 256);
+        assert_eq!(dec_reseed_tok_from_value(None), DEFAULT_DEC_RESEED_TOK);
+        assert_eq!(dec_reseed_tok_from_value(Some("0")), DEFAULT_DEC_RESEED_TOK);
+        assert_eq!(dec_reseed_tok_from_value(Some("x")), DEFAULT_DEC_RESEED_TOK);
+        assert_eq!(dec_reseed_tok_from_value(Some("64")), 64);
+        assert_eq!(
+            dec_reseed_tok_from_value(Some("999999")),
+            DEC_RESEED_TOK_MAX,
+            "上限で丸めていない"
+        );
+    }
+
+    /// task 246: 控えるのは**最後のチャンクの末尾トークン**だけで、
+    /// 触る順は「トークン昇順 → 層昇順 → j 昇順」(従来経路と同じ)。
+    #[test]
+    fn dec_hot_keeps_only_the_tail_in_token_major_order() {
+        let (nt, k, tok) = (4usize, 2usize, 2usize);
+        let mut h = DecHot::default();
+        // 1 枚目のチャンク (層 0..1)。トークン t の選択は (10*t + layer) 系。
+        for layer in 0..2usize {
+            let sels: Vec<usize> = (0..nt * k)
+                .map(|i| 100 + layer * 10 + (i / k) * 2 + (i % k))
+                .collect();
+            note_tail_into(&mut h, layer, nt, k, &sels, tok);
+        }
+        // 2 枚目のチャンク (同じ長さ) は前のチャンクを捨てる。
+        for layer in 0..2usize {
+            let sels: Vec<usize> = (0..nt * k)
+                .map(|i| layer * 10 + (i / k) * 2 + (i % k))
+                .collect();
+            note_tail_into(&mut h, layer, nt, k, &sels, tok);
+        }
+        let (keys, ntok) = take_dec_hot_from(&mut h, tok);
+        assert_eq!(ntok, 2, "末尾 2 トークンだけのはず");
+        // t=2: 層 0 の j=0,1 → 4,5 / 層 1 の j=0,1 → 14,15
+        // t=3: 層 0 → 6,7 / 層 1 → 16,17
+        assert_eq!(
+            keys,
+            vec![(0, 4), (0, 5), (1, 14), (1, 15), (0, 6), (0, 7), (1, 16), (1, 17)],
+            "トークン昇順 → 層昇順 → j 昇順になっていない"
+        );
+        // 取り出したら空 (次の prefill のぶんと混ざらない)。
+        let (again, _) = take_dec_hot_from(&mut h, tok);
+        assert!(again.is_empty(), "取り出し後に残っている");
+    }
+
+    /// task 246: `tok` がチャンク長以上なら全トークン、0 相当なら空。
+    #[test]
+    fn dec_hot_tail_window_is_clamped() {
+        let (nt, k) = (3usize, 1usize);
+        let mut h = DecHot::default();
+        for layer in 0..2usize {
+            let sels: Vec<usize> = (0..nt).map(|t| layer * 10 + t).collect();
+            note_tail_into(&mut h, layer, nt, k, &sels, nt * 4);
+        }
+        let (keys, ntok) = take_dec_hot_from(&mut h, nt * 4);
+        assert_eq!(ntok, nt);
+        assert_eq!(keys.len(), 2 * nt);
+        // 先頭のトークンから順に出る。
+        assert_eq!(keys[0], (0, 0));
+        assert_eq!(keys[1], (1, 10));
+    }
+
+    /// task 246: 形が合わない入力は控えない (壊れた配列で層を跨がない)。
+    #[test]
+    fn dec_hot_ignores_malformed_selection() {
+        let mut h = DecHot::default();
+        note_tail_into(&mut h, 0, 4, 2, &[1, 2, 3], 2); // 長さ不足
+        assert!(take_dec_hot_from(&mut h, 2).0.is_empty());
+        note_tail_into(&mut h, 0, 0, 2, &[], 2);
+        assert!(take_dec_hot_from(&mut h, 2).0.is_empty());
     }
 
     /// task 239: 均等割りは「上限の下でチャンク数を最小にする」長さを返す。

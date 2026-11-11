@@ -584,12 +584,23 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
     /// task 146 の事前ロードが、載せ終わったあとに「回数の少ない順」へ並べ直す
     /// ために使う。載っていない key は黙って飛ばす。
     pub fn touch_many(&mut self, keys: &[K]) {
+        let _ = self.touch_many_count(keys);
+    }
+
+    /// [`VramLru::touch_many`] と同じで、載っていて触れた本数を返す (task 246)。
+    ///
+    /// 呼び出し側が「寄せ直しが何本に当たったか」を 1 行で出せるようにする
+    /// (緑 = 発火の証拠ではないので、発火と当たり数を数える)。
+    pub fn touch_many_count(&mut self, keys: &[K]) -> usize {
+        let mut n = 0usize;
         for k in keys {
             if let Some(s) = self.entries.get_mut(k) {
                 self.clock = self.clock.saturating_add(1);
                 s.last_use = self.clock;
+                n += 1;
             }
         }
+        n
     }
 
     /// 登録簿から外す (値は呼び出し側へ返す)。
@@ -1011,8 +1022,8 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 #[cfg(feature = "cuda")]
 pub use gpu::{
     acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup,
-    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many, Acquired,
-    CheckAcc, ExpertDev, ExpertShape,
+    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
+    touch_many_count, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1160,11 +1171,17 @@ mod gpu {
     /// task 146: 事前ロードの最後に、回数の少ない順で呼んで「一番よく使う expert が
     /// 一番追い出されにくい」状態にする。未初期化・ロック破損なら何もしない。
     pub fn touch_many(keys: &[ExpertKey]) {
+        let _ = touch_many_count(keys);
+    }
+
+    /// [`touch_many`] と同じで、載っていて触れた本数を返す (task 246 の診断用)。
+    pub fn touch_many_count(keys: &[ExpertKey]) -> usize {
         let Some(c) = CACHE.get() else {
-            return;
+            return 0;
         };
-        if let Ok(mut g) = c.lock() {
-            g.touch_many(keys);
+        match c.lock() {
+            Ok(mut g) => g.touch_many_count(keys),
+            Err(_) => 0,
         }
     }
 
@@ -1973,6 +1990,12 @@ mod tests {
         // 載っていない key は黙って飛ばす
         c.touch_many(&[99]);
         assert_eq!(c.used_bytes(), used - 100);
+        // task 246: 当たった本数を返す版 (`pf-reseed` の診断がこれで発火を数える)。
+        // この時点で載っているのは 3 と 4 だけ (1 は追い出し済み)。
+        let n = c.touch_many_count(&[4, 99, 1, 3]);
+        assert_eq!(n, 2, "載っている 2 本だけ数える");
+        assert_eq!(c.used_bytes(), used - 100, "触ってもバイト数は変わらない");
+        assert_eq!(c.stats().misses, misses, "H2D は起きない");
     }
 
     /// どの並びで入れても `used_bytes` は上限を超えない。
