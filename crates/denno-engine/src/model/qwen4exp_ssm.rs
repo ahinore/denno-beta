@@ -1253,6 +1253,18 @@ pub struct SsmAttn {
 /// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ従来の挙動
 /// (デバイス正本だった層のホスト状態を古いまま残す) に戻す。A/B と切り戻し用で、
 /// `0` にすると系列を跨いで GDN の再帰状態が化ける (task 252 の症状が戻る)。
+///
+/// lab t252a (a25952367, SCENARIO=repeat) の切り分け: 既定 (この修正なし) は
+/// 12 本の repeat が 11 種の md5 に散らばり、`DENNO_GDN_GPU_SCAN=0` と
+/// `DENNO_FLASH_MODEL_REUSE=0` はどちらも同じ 5 種に収束した
+/// (a:82ab0c06 b:624e0d4d r:2434345f r:8ab36e55 r:ffdedd41)。
+/// `DENNO_GPU_ATTN=0` は既定と完全一致 = KV ミラーは無関係。
+///
+/// lab t252b (45bcbf354, repeat): 既定で 3 プロンプト × 4 ラウンドが 3 種の md5 に
+/// 収束し、a1 = a2 = 82ab0c06。errors 0、decode 18.3 ms/tok、prefill 0.41 s。
+/// lab t252c (00d07b8f3, depth8k): 既定は捨て COND と md5 完全一致
+/// (decode -0.4% / prefill +0.0%)、`=0` は修正前の md5 (a1=c811fe4d /
+/// a2=80723a6d) を再現した。
 fn take_zero_host_from_value(v: Option<&str>) -> bool {
     match v {
         None => true,
