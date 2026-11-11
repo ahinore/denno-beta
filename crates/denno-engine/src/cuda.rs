@@ -3794,8 +3794,8 @@ impl CudaCtx {
             }
             // task 230: prefill attention v3 (任意。読めない・入口が無い・opt-in が
             // 通らないときは null のまま = v2 / 従来の経路で回る。fail closed)。
-            // ゲートが off のときは読まない (既定 off なので、PTX が無いときの
-            // 警告を出さない)。
+            // ゲートが off のときは読まない (PTX は commit 済みだが、切り戻した
+            // ビルドでは読み込みもしない)。
             let mut f_attn_pf3: CUfunction = std::ptr::null_mut();
             if pf_attn_v3_on() {
                 let pf3_path = match std::env::var("DENNO_PF_ATTN3_PTX") {
@@ -11636,15 +11636,22 @@ mod pf_pin_tests {
         assert!(!pf_mixed_dev_only(a.as_ptr(), 2, 2));
     }
 
-    /// task 230: ゲートの解釈 (既定 off・明示的な真値だけ on)。
+    /// task 230: ゲートの解釈。v3 は task 244 で既定 on、MIXKEEP は既定 off。
     #[test]
     fn pf230_gate_values() {
-        for v in [None, Some("0"), Some("off"), Some(""), Some("no")] {
+        // v3: 未指定は on (task 244 t244a で採択)、明示的な偽値で off。
+        assert!(pf_attn_v3_from_value(None), "v3 の既定が on でない");
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some("")] {
             assert!(!pf_attn_v3_from_value(v), "v3 が off でない: {v:?}");
-            assert!(!pf_mix_keep_from_value(v), "mixkeep が off でない: {v:?}");
         }
         for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
             assert!(pf_attn_v3_from_value(v), "v3 が on でない: {v:?}");
+        }
+        // mixkeep: 既定 off のまま (task 232 で不採用)。
+        for v in [None, Some("0"), Some("off"), Some(""), Some("no")] {
+            assert!(!pf_mix_keep_from_value(v), "mixkeep が off でない: {v:?}");
+        }
+        for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
             assert!(pf_mix_keep_from_value(v), "mixkeep が on でない: {v:?}");
         }
     }
@@ -24294,29 +24301,35 @@ pub(crate) const ATTN_PF2_DH: usize = 256;
 /// v2 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid x の分母)。
 pub(crate) const ATTN_PF2_BQ: usize = 64;
 
-/// task 230: `DENNO_PF_ATTN_V3` の値の解釈 (純関数)。明示的な真値だけ on。
+/// task 230: `DENNO_PF_ATTN_V3` の値の解釈 (純関数)。明示的な偽値だけ off。
 ///
-/// **既定 off** (lab t230b で不採用が決まった)。`1` で v3 カーネル
-/// (PV も bf16 mma・head 優先グリッド・行最大は最初のタイルで 1 回)。
+/// **既定 on** (task 244 の lab t244a で採択)。`0` / `off` / `false` / `no` で
+/// 従来 (v2 / v1) の経路に戻せる。`1` で v3 カーネル (`kernels_attn_pf3.cu`、
+/// PV も bf16 mma・head 優先グリッド・行最大は最初のタイルで 1 回)。
 ///
-/// lab t230b (d9f3d10、depth8k、PROFILE=1、PTX=attn_pf3、14,018 cold prefill) の
-/// 台帳では **full 段は 2,036.8 → 1,196.1 ms (-41%、gpu 1,638.5 → 850.2)** と
-/// 狙いどおり速い。しかし全体は b0 27.40 s → 27.93 s (+1.9%、同 env の base2 は
-/// 27.11 s) で、目標の -4% (1.10 s) に届かない。-841 ms を全部足しても -3.1% が
-/// 上限。差の大半はホスト側の "other" 段 (1,711.4 → 3,010.0 ms) で、v3 を
-/// 使わない mixkeep でも 2,950.6 ms に伸びる (共有ホストの負荷揺れ)。
-/// 3,826 は 7.51 → 7.43 s (-1.1%)、decode は v3 を通らない (v3 は prefill の
-/// バッチ経路 `forward_batch_flat` / `forward_batch_dev` だけ) ので
-/// 短いプロンプトの decode は +0.2%。text は sane、errors 0、md5 は c2000_turn2 と
-/// c8000 で DIFF (p と V の bf16 丸め、相対 5e-3 は CPU 模擬で固定済み)。
+/// lab t230b (d9f3d10、depth8k、PROFILE=1、PTX=attn_pf3、14,018 cold prefill) は
+/// **不採用**だった: full 段は 2,036.8 → 1,196.1 ms (-41%、gpu 1,638.5 → 850.2) と
+/// 速いのに全体は 27.40 → 27.93 s (+1.9%)。ただしその run は中央の 3 COND
+/// (attn3 / mixkeep / both) だけホスト側の `other` 残差が 1.4〜1.7 s → 2.95〜3.01 s
+/// に伸びており、v3 を使わない mixkeep でも同じだった (共有ホストの負荷揺れ)。
+///
+/// task 244 の lab t244a (58356ab、同 scenario、PTX=attn_pf3) は 6 COND を
+/// t0/base/attn3/base2/attn3b/base3 と交互に置いて測り直した (14,018 cold prefill、
+/// 実測 s): t0 26.02 / base 26.45 / attn3 25.59 / base2 25.95 / attn3b 25.15 /
+/// base3 25.95。捨て COND を除いた base の平均 26.117 に対して attn3 の平均
+/// 25.37 で **-2.86%**。3,826 は base 7.127 → attn3 7.10 (-0.37%)、decode は
+/// 20.23 → 20.25 ms/tok (+0.08%)。台帳では full 段 1,989 → 1,200 ms
+/// (-789 ms) だけで、他の名前付き段 (mix / router / shared / ssm / experts) は
+/// すべて ±0.3% 以内。md5 は c2000_turn2 と c8000 で DIFF (p と V の bf16 丸め、
+/// 相対 5e-3 は CPU 模擬 `pf230_attn_pf3_tile_matches_host` で固定)。
 pub(crate) fn pf_attn_v3_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
-/// prefill の attention を v3 カーネルで回すか (**既定 off**)。
+/// prefill の attention を v3 カーネルで回すか (**既定 on**、task 244 で採択)。
 pub(crate) fn pf_attn_v3_on() -> bool {
     #[cfg(test)]
     {

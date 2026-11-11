@@ -7869,13 +7869,13 @@ fn pf230_v3_softmax_stays_within_bf16_rounding() {
     );
 }
 
-/// v3 / MIXKEEP のゲートが既定 off で、`pf_full_out` と mix の D2H に配線されて
-/// いること。
+/// v3 が既定 on (task 244)、MIXKEEP が既定 off で、`pf_full_out` と mix の D2H に
+/// 配線されていること。
 #[test]
-fn pf230_gates_are_wired_and_default_off() {
-    for (fname, var) in [
-        ("pub(crate) fn pf_attn_v3_from_value(", "DENNO_PF_ATTN_V3"),
-        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP"),
+fn pf230_gates_are_wired_and_defaults_set() {
+    for (fname, var, default_on) in [
+        ("pub(crate) fn pf_attn_v3_from_value(", "DENNO_PF_ATTN_V3", true),
+        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP", false),
     ] {
         let at = CUDA_RS.find(fname).unwrap_or_else(|| panic!("{fname} が無い"));
         let body = &CUDA_RS[at..];
@@ -7885,7 +7885,13 @@ fn pf230_gates_are_wired_and_default_off() {
             body.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
             "{var}: 明示的な真値を受ける形でない"
         );
-        assert!(body.contains("None => false"), "{var}: 既定が off でない");
+        // task 244: v3 は採択されて既定 on、MIXKEEP は不採用で既定 off。
+        let want = if default_on { "None => true" } else { "None => false" };
+        assert!(
+            body.contains(want),
+            "{var}: 既定が {} でない",
+            if default_on { "on" } else { "off" }
+        );
         assert!(
             CUDA_RS.contains(&format!("std::env::var(\"{var}\")")),
             "{var} を env から読んでいない"
