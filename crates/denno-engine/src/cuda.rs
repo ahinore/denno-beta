@@ -24305,8 +24305,9 @@ pub(crate) const ATTN_PF2_BQ: usize = 64;
 /// 27.11 s) で、目標の -4% (1.10 s) に届かない。-841 ms を全部足しても -3.1% が
 /// 上限。差の大半はホスト側の "other" 段 (1,711.4 → 3,010.0 ms) で、v3 を
 /// 使わない mixkeep でも 2,950.6 ms に伸びる (共有ホストの負荷揺れ)。
-/// 3,826 は 7.51 → 7.43 s (-1.1%)、decode は v3 を通らない (nt < 64) ので
-/// 短いプロンプトで +0.2%。text は sane、errors 0、md5 は c2000_turn2 と
+/// 3,826 は 7.51 → 7.43 s (-1.1%)、decode は v3 を通らない (v3 は prefill の
+/// バッチ経路 `forward_batch_flat` / `forward_batch_dev` だけ) ので
+/// 短いプロンプトの decode は +0.2%。text は sane、errors 0、md5 は c2000_turn2 と
 /// c8000 で DIFF (p と V の bf16 丸め、相対 5e-3 は CPU 模擬で固定済み)。
 pub(crate) fn pf_attn_v3_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
