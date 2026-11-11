@@ -3204,7 +3204,7 @@ impl Qwen4Exp {
         #[cfg(feature = "cuda")]
         let _pf_stream_guard = PfStreamGuard;
         let logits = if batch && self.attn.layer_major_safe() {
-            self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)?
+            self.forward_prefill_batch_tapped(ctx, prefill_chunk_for(ctx.len()), tokens, on_layer, roles)?
         } else {
             self.prefill_seq(ctx, tokens, on_layer, roles)?
         };
@@ -12270,6 +12270,35 @@ fn prefill_batch_chunk() -> usize {
             .map(|n| n.clamp(1, hi))
             .unwrap_or(dflt)
     })
+}
+
+/// task 239: このプロンプトのチャンク長。
+///
+/// `DENNO_PF_CHUNK_BALANCE=1` のとき、ストリーミング経路のチャンクを
+/// 「上限 [`crate::model::exp_pf::CHUNK_BALANCE_CAP`] の下でチャンク数を最小にする」
+/// 均等割りにする。ミス expert は 1 チャンク 1 回上げるので、チャンク数が
+/// そのまま転送量に効く (固定 1536 では 3,222 トークンが 3 枚になり、同じ
+/// 重みを 3 回上げていた)。
+///
+/// `DENNO_PF_CHUNK` の明示指定があるときは均等割りしない (既存の上書きを尊重)。
+fn prefill_chunk_for(n: usize) -> usize {
+    let base = prefill_batch_chunk();
+    // 明示指定の判定は生の env で行う (`chunk_override()` は未設定でも
+    // `Some(既定)` を返すので、それで判定するとゲートが発火しない)。
+    let explicit = crate::model::exp_pf::chunk_override_from_value(
+        std::env::var(crate::model::exp_pf::PF_CHUNK_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .is_some();
+    crate::model::exp_pf::chunk_for_prefill(
+        n,
+        base,
+        crate::model::exp_pf::CHUNK_BALANCE_CAP,
+        crate::model::exp_pf::chunk_balance(),
+        crate::model::exp_pf::stream_enabled(),
+        explicit,
+    )
 }
 
 // ---------------------------------------------------------------------------

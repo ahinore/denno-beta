@@ -207,6 +207,95 @@ pub const PF_CHUNK_ENV: &str = "DENNO_PF_CHUNK";
 /// [`PF_CHUNK_ENV`] の既定 (ストリーミング経路のとき)。lab t197a の最良。
 pub const DEFAULT_PF_CHUNK_STREAM: usize = 1536;
 
+/// `DENNO_PF_CHUNK_BALANCE`: チャンクをプロンプト長の**均等割り**で選ぶ (task 239)。
+///
+/// ミス expert は**チャンクごとに上げ直す**ので、転送量はほぼ
+/// 「チャンク数 × 1 チャンクあたりの distinct expert 数」に比例する。
+/// 既定は固定 1536 なので、3,222 トークンのプロンプトは 3 チャンクになり、
+/// 3 回とも同じ expert を上げる (lab t239b の c8869: 3 チャンクで 17,510 本 /
+/// 35.8 GB、c2000: 3 チャンクで 23,732 本 / 48.6 GB)。
+///
+/// on のとき「上限 [`CHUNK_BALANCE_CAP`] の下でチャンク数を最小にする」長さ
+/// (= プロンプト長 / チャンク数 の切り上げ) を使う。3,222 なら 1,611 × 2 枚。
+/// 1 枚の長さが上限を超えないので、GDN のデバイス連鎖の境界 (2048) は踏まない。
+pub const CHUNK_BALANCE_ENV: &str = "DENNO_PF_CHUNK_BALANCE";
+
+/// [`CHUNK_BALANCE_ENV`] の既定 (off = 従来の固定 1536)。
+///
+/// lab t239d (tools、c8869=3,222 tok / c2000=3,826 tok、base/bal/base2/bal2/bal3):
+///
+/// | cond | c8869 cold | c2000 cold | c8869 decode |
+/// | --- | --- | --- | --- |
+/// | base2 (基準) | 6.07 s | 7.13 s | 18.2 ms/tok |
+/// | bal/bal2/bal3 | **5.53 s** | 6.91 s | 18.5-18.6 ms/tok |
+///
+/// prefill は -8.9% (c8869) / -3.1% (c2000) だが、c8869 の decode が +2%、
+/// その機序は expert のヒット率 0.929 → 0.912 (最後のチャンクが LRU に残す
+/// 集合が変わる)。目標の「decode は 1% 以内」を超えるので**既定 off**。
+pub const DEFAULT_CHUNK_BALANCE: bool = false;
+
+/// 均等割りの 1 チャンク上限 (GDN 連鎖の境界 `GDN_CHUNK_MIN_TOKENS` = 2048 の手前)。
+pub const CHUNK_BALANCE_CAP: usize = 2047;
+
+/// [`CHUNK_BALANCE_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn chunk_balance_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_CHUNK_BALANCE,
+    }
+}
+
+/// 均等割りのチャンクを選ぶ (純関数)。
+///
+/// - `n <= base` なら 1 チャンク (`n`)。
+/// - それ以外は「`cap` で割ったときのチャンク数」を保ったまま均等に割る
+///   (端数の小さい最後の 1 枚を作らない)。
+pub fn balanced_chunk(n: usize, base: usize, cap: usize) -> usize {
+    let base = base.max(1);
+    let cap = cap.max(1);
+    if n == 0 || n <= base {
+        return n.max(1).min(base);
+    }
+    let nch = n.div_ceil(cap);
+    n.div_ceil(nch).clamp(1, cap)
+}
+
+/// この prefill のチャンク長 (純関数)。
+///
+/// 均等割りは「ストリーミング経路」「`DENNO_PF_CHUNK_BALANCE` が on」
+/// 「`DENNO_PF_CHUNK` の**明示**指定が無い」「プロンプトが 2 枚以内に収まる」の
+/// 4 つが揃ったときだけ効く。
+///
+/// 2 枚以内に限る理由: 長いプロンプト (14k など) のチャンクは task 197 が
+/// 実測で決めた 1536 で、枚数を減らすには 2047 まで上げる必要がある。
+/// その領域は tools シナリオの lab で測っていないので触らない。
+///
+/// **`chunk_override()` で判定してはいけない**: あれは未設定のとき
+/// `Some(DEFAULT_PF_CHUNK_STREAM)` を返すので、常に「明示指定あり」に見えて
+/// ゲートが一度も発火しない (lab t239c で実際に踏んだ)。明示判定は
+/// [`chunk_override_from_value`] に生の env を渡して行う。
+pub fn chunk_for_prefill(
+    n: usize,
+    base: usize,
+    cap: usize,
+    balance_on: bool,
+    stream_on: bool,
+    explicit_override: bool,
+) -> usize {
+    let cap = cap.max(1);
+    if !balance_on || !stream_on || explicit_override || n > cap.saturating_mul(2) {
+        return base.max(1);
+    }
+    balanced_chunk(n, base, cap)
+}
+
+
+/// 均等割りを使うか (プロセスで 1 回だけ env を読む)。
+pub fn chunk_balance() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| chunk_balance_from_value(std::env::var(CHUNK_BALANCE_ENV).ok().as_deref()))
+}
+
 /// [`PF_CHUNK_ENV`] の解釈 (純関数)。0・空・偽値・解析不能は `None` (= 上書きしない)。
 pub fn chunk_override_from_value(v: Option<&str>) -> Option<usize> {
     let s = v?.trim();
@@ -297,6 +386,37 @@ pub const DEFAULT_STREAM_UT: bool = false;
 /// lab t165b: グループ 64 で 14k cold が 100.01 s (wc=0) → 95.06 s (wc=1)、
 /// probe 27.3 → 53.5 GB/s。t165c でも 95.31 s で再現。
 pub const DEFAULT_STREAM_WC: bool = true;
+
+/// `DENNO_PF_STREAM_SPLIT`: ステージングの写しと H2D を何分割して重ねるか (task 239)。
+///
+/// 従来 (1) は「グループ全体を pinned へ写す → 非同期 H2D を 1 回積む → 完了を待つ」
+/// なので、**写しと DMA が直列**になる。lab t239a の c8869 cold では
+/// up_MB=35,799 に対して copy_s=1.39、probe_GBs=54.6 (DMA 0.66 s) で、
+/// この 2.05 s が prefill 6.02 s の 34% を占めていた。
+///
+/// n 分割すると DMA(i) が写し(i+1) と重なる (DMA は非ブロッキングストリーム上)。
+/// 端数は最後の 1 枚へ寄せるので、デバイスへ渡るバイト列は 1 分割と同一 (数値不変)。
+pub const STREAM_SPLIT_ENV: &str = "DENNO_PF_STREAM_SPLIT";
+
+/// [`STREAM_SPLIT_ENV`] の既定値 (1 = 従来の 1 回写し + 1 回 DMA)。
+pub const DEFAULT_STREAM_SPLIT: usize = 1;
+
+/// [`STREAM_SPLIT_ENV`] の解釈 (純関数)。0・解析不能は既定へ、上限 16。
+pub fn stream_split_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_STREAM_SPLIT;
+    };
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => n.clamp(1, 16),
+        _ => DEFAULT_STREAM_SPLIT,
+    }
+}
+
+/// 写し / H2D の分割数 (プロセスで 1 回だけ env を読む)。
+pub fn stream_split() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| stream_split_from_value(std::env::var(STREAM_SPLIT_ENV).ok().as_deref()))
+}
 
 /// 1 回の起動で受ける行数 (`kernels_exp_iq_pf.cu` の `PF_MR`)。
 pub const ROWS_PER_LAUNCH: usize = 16;
@@ -1176,6 +1296,63 @@ mod tests {
         assert_eq!(upload_budget_experts(), (upload_mb() << 20) / 2_048_000);
     }
 
+    /// task 239: 均等割りの**発火**条件。
+    ///
+    /// lab t239c では `chunk_override().is_some()` で判定していたため、
+    /// 未設定でも `Some(既定)` が返ってゲートが一度も発火せず、up_MB が
+    /// バイト一致のままだった。ここで 4 条件の全組み合わせを固定する。
+    #[test]
+    fn chunk_for_prefill_fires_only_on_all_three_conditions() {
+        let (n, base, cap) = (3222usize, DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        // 3 条件が揃ったときだけ均等割り (3,222 → 1,611 × 2 枚)。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, true, false), 1611);
+        // ゲート off。
+        assert_eq!(chunk_for_prefill(n, base, cap, false, true, false), base);
+        // ストリーミング off (従来経路)。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, false), base);
+        // `DENNO_PF_CHUNK` の明示指定がある。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, true, true), base);
+        // 1 枚で収まる長さはゲート on でもそのまま。
+        assert_eq!(chunk_for_prefill(1000, base, cap, true, true, false), 1000);
+        // 2 枚を超える長さ (14k) は触らない (task 197 の実測領域)。
+        assert_eq!(
+            chunk_for_prefill(14018, base, cap, true, true, false),
+            base,
+            "長いプロンプトのチャンクを変えてしまった"
+        );
+        assert_eq!(chunk_for_prefill(4095, base, cap, true, true, false), base);
+        // 2 枚ちょうどまでは均等割り。
+        assert_eq!(chunk_for_prefill(4094, base, cap, true, true, false), 2047);
+    }
+
+    /// task 239: 均等割りは「上限の下でチャンク数を最小にする」長さを返す。
+    ///
+    /// 実際のプロンプト長 (lab t239a/t239b の c2000=3,826 / c8869=3,222) で、
+    /// 固定 1536 の 3 枚が 2 枚になること (転送量が 1/3 減る) を固定する。
+    #[test]
+    fn balanced_chunk_minimizes_chunk_count_under_cap() {
+        let (base, cap) = (DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        // 1 枚で収まる長さはそのまま。
+        assert_eq!(balanced_chunk(150, base, cap), 150);
+        assert_eq!(balanced_chunk(1536, base, cap), 1536);
+        // 3,222 → 1,611 × 2 枚 (固定 1536 なら 1,536 + 1,536 + 150 の 3 枚)。
+        let c = balanced_chunk(3222, base, cap);
+        assert_eq!(c, 1611, "c8869 が 2 枚にならない");
+        assert_eq!(3222usize.div_ceil(c), 2);
+        // 3,826 → 1,913 × 2 枚。
+        let c = balanced_chunk(3826, base, cap);
+        assert_eq!(3826usize.div_ceil(c), 2, "c2000 が 2 枚にならない");
+        // 14,018 → 7 枚 (固定 1536 なら 10 枚)。
+        let c = balanced_chunk(14018, base, cap);
+        assert_eq!(14018usize.div_ceil(c), 7);
+        // どの長さでも 1 枚は上限を超えない (GDN 連鎖の境界を踏まない)。
+        for n in [1usize, 512, 1536, 2000, 3222, 3826, 14018, 65536] {
+            let c = balanced_chunk(n, base, cap);
+            assert!(c > 0 && c <= cap.max(base), "n={n} のチャンク {c} が上限外");
+            assert!(n.div_ceil(c) >= 1);
+        }
+    }
+
     /// task 162: 行表は「トークン × j」→ GPU の行番号。載っていない expert の
     /// 位置は穴 (`u32::MAX`) のまま残り、`row_table_zero_slots` で 0 重みになる。
     #[test]
@@ -1307,6 +1484,30 @@ mod tests {
         assert!(DEFAULT_STREAM_ON, "lab t165c で採用して既定 on");
         assert!(DEFAULT_STREAM_WC, "write-combined のバウンスが効いた");
         assert_eq!(stream_group(), 64, "グループ 64 が最良");
+        // task 239: 分割は既定 1 (従来の 1 回写し + 1 回 DMA)。
+        assert_eq!(
+            stream_split_from_value(None),
+            DEFAULT_STREAM_SPLIT,
+            "未設定は既定 (1 = 従来)"
+        );
+        assert_eq!(stream_split_from_value(Some("")), 1);
+        assert_eq!(stream_split_from_value(Some("0")), 1, "0 は既定へ");
+        assert_eq!(stream_split_from_value(Some("x")), 1, "解析不能は既定へ");
+        assert_eq!(stream_split_from_value(Some("4")), 4);
+        assert_eq!(stream_split_from_value(Some("64")), 16, "上限 16");
+        // task 239: 均等割りのゲートと上限。
+        assert!(
+            !chunk_balance_from_value(None),
+            "既定 off (従来の固定チャンク)"
+        );
+        assert!(!chunk_balance_from_value(Some("0")));
+        assert!(chunk_balance_from_value(Some("1")));
+        assert!(chunk_balance_from_value(Some(" on ")));
+        assert_eq!(
+            CHUNK_BALANCE_CAP + 1,
+            crate::cuda::GDN_CHUNK_MIN_TOKENS,
+            "上限は GDN 連鎖の境界の手前 (2048 を踏むと ssm がホスト経路へ落ちる)"
+        );
         // 分け合った 1 枚 (cuda 側は 3 枚) に、既定のグループ (64 本、
         // 平均 2.05 MB/本) が載ること。
         assert!(
