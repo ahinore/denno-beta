@@ -186,6 +186,7 @@ impl Drop for Total {
         if let Some(t) = self.0 {
             PREFILL_WALL_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+        pf_span_end();
     }
 }
 
@@ -196,8 +197,83 @@ pub fn prefill_wall_ns() -> u64 {
 
 /// prefill 全体を 1 本で測る (off では `Instant` を取らないだけ)。
 pub fn total() -> Total {
-    Total(if enabled() { Some(Instant::now()) } else { None })
+    let t = if enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    // task 254: ホスト台帳が on なら、区間の入口/出口と起動ペアにイベントを
+    // 打って GPU の実時間を積む (decode の `DENNO_Q4_TLINE` とは別の窓)。
+    if t.is_some() {
+        pf_span_begin();
+    }
+    Total(t)
 }
+
+// ---- task 254: prefill の GPU 時間 (イベント) -----------------------------
+//
+// ホスト台帳 (`DENNO_PF_HOSTPROF`) のときだけ、prefill の窓で
+// - 区間 (`enter`) の入口/出口に 1 本ずつ
+// - カーネル起動の前後に 1 本ずつ ([`crate::cuda::tline`] の `launch_*`)
+// を打つ。起動ペアの差が **GPU の実時間** (アイドルを含まない) で、区間の
+// `wall` (ホスト) から引いた残りが「露出したホスト時間」になる。
+
+/// prefill の窓が開いているか (イベントを打つかの分岐 1 回)。
+static PF_SPAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// prefill の窓が開いているか。
+#[inline]
+pub fn pf_span_active() -> bool {
+    PF_SPAN.load(Ordering::Relaxed)
+}
+
+/// prefill の窓を開ける (`q4ledger::total` が 1 回)。
+fn pf_span_begin() {
+    if !crate::model::pf_host::on() {
+        return;
+    }
+    PF_SPAN.store(true, Ordering::Relaxed);
+    pf_span_prepare();
+}
+
+/// 窓を閉じる (イベントは [`line_prefill`] が読んでから捨てる)。
+fn pf_span_end() {
+    PF_SPAN.store(false, Ordering::Relaxed);
+}
+
+/// 窓の入口の用意 (cuda 無しは何もしない)。
+#[cfg(feature = "cuda")]
+#[inline]
+fn pf_span_prepare() {
+    crate::cuda::tline::prepare_prefill();
+}
+
+/// 窓の入口の用意 (cuda 無しは何もしない)。
+#[cfg(not(feature = "cuda"))]
+#[inline]
+fn pf_span_prepare() {}
+
+/// task 254: 区間ごとの GPU 実時間 (ms、起動ペアの和)。窓が閉じていれば `None`。
+#[cfg(feature = "cuda")]
+fn pf_busy_ms() -> Option<Vec<f64>> {
+    crate::cuda::tline::item_busy_ms(N)
+}
+
+/// task 254: cuda 無しは常に `None`。
+#[cfg(not(feature = "cuda"))]
+fn pf_busy_ms() -> Option<Vec<f64>> {
+    None
+}
+
+/// task 254: イベントの記録を捨てる (cuda 無しは何もしない)。
+#[cfg(feature = "cuda")]
+fn pf_span_clear() {
+    crate::cuda::tline::reset();
+}
+
+/// task 254: cuda 無しは何もしない。
+#[cfg(not(feature = "cuda"))]
+fn pf_span_clear() {}
 
 thread_local! {
     /// いま開いている区間。ネストはガードが前の値を復元する。
@@ -895,11 +971,21 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
         total_d2h as f64 / 1e6,
         floor_ns as f64 / 1e3,
     )];
-    out.push(
-        "[q4ledger-pf]   item   wall_ms  share  launch_ms/cnt  sync_ms/cnt  gpu_ms  cpu_ms  \
-         h2d_MB/cnt  d2h_MB/cnt"
-            .to_string(),
-    );
+    // task 254: GPU の実時間 (起動ペアのイベント) と、そこから出る露出ホスト時間。
+    let busy = pf_busy_ms();
+    if busy.is_some() {
+        out.push(
+            "[q4ledger-pf]   item   wall_ms  share  launch_ms/cnt  sync_ms/cnt  gpu_ms  cpu_ms  \
+             h2d_MB/cnt  d2h_MB/cnt  busy_ms  exposed_ms"
+                .to_string(),
+        );
+    } else {
+        out.push(
+            "[q4ledger-pf]   item   wall_ms  share  launch_ms/cnt  sync_ms/cnt  gpu_ms  cpu_ms  \
+             h2d_MB/cnt  d2h_MB/cnt"
+                .to_string(),
+        );
+    }
     let ms = |ns: u64| ns as f64 / 1e6;
     let mut push_row = |name: &str, wall_ns: u64, r: Option<&Row>| {
         let zero = Row::default();
@@ -912,7 +998,7 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
         } else {
             wall_ns.saturating_sub(busy_ns)
         };
-        out.push(format!(
+        let mut line = format!(
             "[q4ledger-pf]   {:<7} {:>8.1} {:>5.1}%  {:>8.2}/{:<6} {:>8.2}/{:<6} {:>7.1} {:>7.1}  \
              {:>8.2}/{:<6} {:>8.2}/{:<6}",
             name,
@@ -928,7 +1014,12 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
             r.h2d_calls,
             r.d2h_bytes as f64 / 1e6,
             r.d2h_calls,
-        ));
+        );
+        if let Some(b) = busy.as_ref() {
+            let g = b.get(NAMES.iter().position(|n| *n == name).unwrap_or(0)).copied().unwrap_or(0.0);
+            line.push_str(&format!("  {g:>7.1} {:>10.1}", (ms(wall_ns) - g).max(0.0)));
+        }
+        out.push(line);
     };
     for &i in named.iter() {
         if rows[i].wall_ns == 0 && rows[i].launches == 0 && rows[i].syncs == 0 {
@@ -994,6 +1085,48 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
                 dc,
             ));
         }
+    }
+    // task 254: 突き合わせ。wall = GPU の実時間 + 露出したホスト時間 (+ 層の外)
+    // が 1 s 以内で閉じるか。`gpu_busy` は起動ペアのイベントの和 (アイドルを
+    // 含まない)、`exposed_host` は区間ごとの `max(0, wall - busy)` の和。
+    if let Some(b) = busy.as_ref() {
+        let mut gpu_sum = 0.0f64;
+        let mut exposed = 0.0f64;
+        for &i in named.iter().chain([OTHER].iter()) {
+            let w = if i == OTHER {
+                ms(other_ns)
+            } else {
+                ms(rows[i].wall_ns)
+            };
+            let g = b.get(i).copied().unwrap_or(0.0);
+            gpu_sum += g;
+            exposed += (w - g).max(0.0);
+        }
+        let wall_ms = ms(total_wall);
+        let sum = gpu_sum + exposed;
+        out.push(format!(
+            "[q4ledger-pf] close wall={wall_ms:.1}ms gpu_busy={gpu_sum:.1}ms \
+             exposed_host={exposed:.1}ms sum={sum:.1}ms delta={:.1}ms",
+            wall_ms - sum
+        ));
+        // `other` (残差) の中身: 名前付きでない区間の wall。`qprof` などは
+        // 他の区間の内側にも入るので、和は `other` を超えうる。
+        let mut rest: Vec<(usize, u64)> = (0..N)
+            .filter(|&i| !named.contains(&i) && i != EXPERT && i != OTHER && rows[i].wall_ns > 0)
+            .map(|i| (i, rows[i].wall_ns))
+            .collect();
+        rest.sort_by_key(|&(_, v)| std::cmp::Reverse(v));
+        if !rest.is_empty() {
+            let parts: Vec<String> = rest
+                .iter()
+                .map(|&(i, v)| format!("{}={:.1}", NAMES[i], ms(v)))
+                .collect();
+            out.push(format!(
+                "[q4ledger-pf]   rest (other の中身、qprof 等は入れ子) {}",
+                parts.join(" ")
+            ));
+        }
+        pf_span_clear();
     }
     out
 }

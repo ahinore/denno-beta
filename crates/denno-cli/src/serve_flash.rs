@@ -642,6 +642,10 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         for line in denno_engine::model::q4ledger::line_prefill(tok) {
             eprintln!("{line}");
         }
+        // task 254: 14k cold prefill のホスト台帳 (experts 区間の中の内訳)。
+        for line in denno_engine::model::pf_host::report("prefill", tok) {
+            eprintln!("{line}");
+        }
     }
     // task 187: decode の IQ expert 段の層内 GPU 時間 (PROFILE のときだけ)。
     if tag == "decode" {

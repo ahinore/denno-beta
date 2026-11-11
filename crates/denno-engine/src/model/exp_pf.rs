@@ -941,6 +941,14 @@ pub fn stats_line() -> Option<String> {
             stream_group(),
             stream_min_tok(),
         ));
+        // task 254: 表の非同期 H2D が発火したか (gate on の証拠)。
+        #[cfg(feature = "cuda")]
+        {
+            let (calls, oks) = crate::cuda::pf_tab_counts();
+            if calls > 0 {
+                out.push_str(&format!(" tab_async_calls={calls} tab_async_ok={oks}"));
+            }
+        }
     }
     Some(out)
 }
@@ -980,6 +988,9 @@ pub fn stats_reset() {
     if let Ok(mut g) = CHECK.lock() {
         *g = None;
     }
+    // task 254: 表の非同期 H2D の累計もリクエスト単位にする。
+    #[cfg(feature = "cuda")]
+    crate::cuda::pf_tab_counts_reset();
 }
 
 // ---------------------------------------------------------------------------

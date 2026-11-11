@@ -13819,6 +13819,7 @@ fn moe_experts_iq_pf_batch(
         },
     ];
     // 行のある expert だけ参照する (1 チャンクで全 256 本が普通)。
+    let t_lookup = crate::model::pf_host::stamp();
     let mut keys: Vec<ExpertKey> = Vec::with_capacity(by_expert.len());
     let mut ids: Vec<usize> = Vec::with_capacity(by_expert.len());
     for (ei, picks) in by_expert.iter().enumerate() {
@@ -13852,6 +13853,7 @@ fn moe_experts_iq_pf_batch(
     }
     let hits = devs.len() as u32;
     crate::model::exp_pf::note_lookup(keys.len() as u32, hits);
+    crate::model::pf_host::mark(t_lookup, crate::model::pf_host::LOOKUP);
     // task 162: ミスをステージングへ上げ、行のある expert を**全部** GPU で回す。
     // ヒット数に関係なく試す (ミスを載せられるならヒット 0 でも CPU より速い)。
     // 載せられないときだけ従来の経路へ落ちる (`out` は触られていない)。
@@ -14016,7 +14018,9 @@ fn moe_experts_iq_pf_batch(
     //    この順序は flat の scatter と同じなので、CPU だけの経路とビット一致する。
     let t_add = std::time::Instant::now();
     exp_pf_add_all(out, &order, &hit_h, &miss_h, weights, e);
-    crate::model::exp_pf::note_add_ns(t_add.elapsed().as_nanos() as u64);
+    let add_ns = t_add.elapsed().as_nanos() as u64;
+    crate::model::exp_pf::note_add_ns(add_ns);
+    crate::model::pf_host::add_ns(crate::model::pf_host::ADD, add_ns);
 
     // 3. 診断 (`DENNO_EXPERT_GPU_CHECK=1`): GPU の行を CPU で引き直して比べる。
     if crate::model::expert_vram::check_enabled() && crate::model::exp_pf::claim_check_layer() {
@@ -14064,6 +14068,8 @@ fn iq_pf_stream_layer(
     if ne == 0 || nt == 0 || k == 0 || weights.len() < nt * k {
         return Ok(None);
     }
+    // task 254: entries の組み立て + plan + 行表 (層ごとのホスト仕事)。
+    let t_plan = crate::model::pf_host::stamp();
     // 行のある expert を **expert 昇順**に並べる (plan と同じ順)。
     let mut pick = vec![false; ne];
     let mut entries: Vec<crate::cuda::PfStreamEntry<'_>> = Vec::with_capacity(ne);
@@ -14109,6 +14115,7 @@ fn iq_pf_stream_layer(
     let Some(prow) = crate::model::exp_pf::row_table_full(by_expert, &plan, k, nt) else {
         return Ok(None);
     };
+    crate::model::pf_host::mark(t_plan, crate::model::pf_host::PLAN);
     crate::cuda::moe_experts_iq_pf_layer_stream(
         lw.gate_exps.ty,
         lw.up_exps.ty,
@@ -14878,6 +14885,8 @@ fn moe_ffn_quant_batch_full(
     // task 217: 切っていても区間の開閉は同じ位置で行う (skip 時は 0 秒)。
     let t_experts = std::time::Instant::now();
     let _l_experts = q4ledger::enter(q4ledger::EXPERTS);
+    // task 254: `experts` 区間の中のホスト仕事を項目別に割るための壁時計。
+    let _pf_host_stage = crate::model::pf_host::stage();
     let skip_routed = iv.block_off(lw.il, IvBlock::Moe);
     let skip_shared = iv.block_off(lw.il, IvBlock::Shared);
     if !skip_routed {
@@ -14885,6 +14894,7 @@ fn moe_ffn_quant_batch_full(
         //    同じ expert は 1 層で何度も選ばれる。madvise は 1 expert 1 回で足りるので、
         //    トークン×k 回 (512 × 10 = 5,120 回/層) ではなく distinct な expert の数 (86 回/層)
         //    だけ呼ぶ。選択順は変わらないので数値には影響しない。
+        let t_pref = crate::model::pf_host::stamp();
         {
             let mut seen = vec![false; ne];
             for &ei in &sels {
@@ -14896,6 +14906,7 @@ fn moe_ffn_quant_batch_full(
                 }
             }
         }
+        crate::model::pf_host::mark(t_pref, crate::model::pf_host::PREFETCH);
 
         // 5. expert ごとのトークン一覧 (`picks`) と件数 `m` を 1 パスで確定する。
         //    sels は index 昇順の distinct な expert なので、legacy が
@@ -14905,6 +14916,7 @@ fn moe_ffn_quant_batch_full(
         for &ei in &sels {
             counts[ei] += 1;
         }
+        let t_build = crate::model::pf_host::stamp();
         let mut by_expert: Vec<Vec<(usize, usize)>> = counts
             .iter()
             .map(|&c| Vec::with_capacity(c))
@@ -14914,6 +14926,7 @@ fn moe_ffn_quant_batch_full(
                 by_expert[sels[t * k + j]].push((t, j));
             }
         }
+        crate::model::pf_host::mark(t_build, crate::model::pf_host::PLAN);
         let m_max = by_expert.iter().map(|p| p.len()).max().unwrap_or(0);
         let flat = match sched {
             MoeSchedule::Flat => true,
@@ -15004,6 +15017,8 @@ fn moe_ffn_quant_batch_full(
     moe_sub_add(1, t_experts.elapsed());
     // 区間を閉じる (shared の時間を experts に二重計上しない)。
     drop(_l_experts);
+    // task 254: ホスト台帳の `experts` 壁時計もここで閉じる (shared を含めない)。
+    drop(_pf_host_stage);
     if !skip_shared {
         // task 145: 台帳の区間 (shared)。
         let _l_shared = q4ledger::enter(q4ledger::SHARED);

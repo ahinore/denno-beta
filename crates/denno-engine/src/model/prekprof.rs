@@ -108,7 +108,11 @@ pub fn on() -> bool {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DENNO_PRE_KPROF").is_some())
+    // task 254: ホスト台帳 (`DENNO_PF_HOSTPROF`) が on なら層の外の区間も積む
+    // (tokenize / embed / PLE は prefill の壁時計の外側・内側の分母になる)。
+    *ON.get_or_init(|| {
+        std::env::var_os("DENNO_PRE_KPROF").is_some() || crate::model::pf_host::on()
+    })
 }
 
 /// 計測が要るときだけ `Instant` を取る (既定 off では `None` = 呼び出し側は no-op)。
