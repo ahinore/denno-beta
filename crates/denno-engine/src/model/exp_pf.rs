@@ -947,6 +947,41 @@ pub fn tc_exp_on() -> bool {
 /// **採らない** (`ADOPT: no` t242c)。ゲートは 3 本とも既定 off のまま残す。
 pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
 
+/// `DENNO_PF_LM_TILE`: 層優先 prefill の MoE を **何トークンずつ**回すか
+/// (task 250、既定 0 = 分割しない)。
+///
+/// 層優先は 1 層ぶんの全トークンの expert 出力 `h` を連続領域で取る。
+/// 14k では 1.5 GB になり、lab t250a / t250c では `cuMemAlloc` が
+/// 「要求 1,505 MiB / 空き 1,243 MiB」で失敗し、追い出し階段が LRU を
+/// **全部**捨てた (22 GB → 0、decode のヒット率 0.25)。トークンで割ると
+/// `h` が 1/分割数になり、連続確保が通る。
+///
+/// 代償は expert の H2D が分割数だけ増えること (14k で 1 パス 46 GB、
+/// 写し 2.5 s)。1024 未満は 1024 に丸める。
+pub const LM_TILE_ENV: &str = "DENNO_PF_LM_TILE";
+
+/// [`LM_TILE_ENV`] の解釈 (純関数)。0 / 解析不能は分割しない。
+pub fn lm_tile_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    match s.parse::<usize>() {
+        Ok(n) if n >= 1024 => n,
+        _ => 0,
+    }
+}
+
+/// 1 回の MoE で受けるトークン数 (nt 以下に丸める。0 相当なら分割しない)。
+pub fn lm_tile(nt: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let t = *N.get_or_init(|| lm_tile_from_value(std::env::var(LM_TILE_ENV).ok().as_deref()));
+    if t == 0 || t >= nt {
+        nt
+    } else {
+        t
+    }
+}
+
 /// `DENNO_PF_LM_RESERVE=1`: 層優先 prefill の作業域を **外部予約**として
 /// expert の予算へ計上する (task 250、既定 off)。
 ///

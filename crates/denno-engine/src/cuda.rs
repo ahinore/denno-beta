@@ -12414,6 +12414,33 @@ mod pf_exp_tc_tests {
         assert!(crate::model::exp_pf::tc_exp_from_value(Some("true")));
     }
 
+    /// task 250: 層優先 MoE のトークン分割は「重複なし・取りこぼしなし」。
+    #[test]
+    fn lm_tile_covers_the_prompt_exactly_once() {
+        use crate::model::exp_pf::lm_tile_from_value;
+        assert_eq!(lm_tile_from_value(None), 0, "既定は分割しない");
+        assert_eq!(lm_tile_from_value(Some("")), 0);
+        assert_eq!(lm_tile_from_value(Some("0")), 0);
+        assert_eq!(lm_tile_from_value(Some("1023")), 0, "1024 未満は分割しない");
+        assert_eq!(lm_tile_from_value(Some("7168")), 7168);
+        assert_eq!(lm_tile_from_value(Some("x")), 0);
+        for nt in [3826usize, 14018] {
+            for t in [5120usize, 7168] {
+                let tile = if t >= nt { nt } else { t };
+                let mut cover = vec![0u8; nt];
+                let mut s0 = 0usize;
+                while s0 < nt {
+                    let n = tile.min(nt - s0);
+                    for c in cover[s0..s0 + n].iter_mut() {
+                        *c += 1;
+                    }
+                    s0 += n;
+                }
+                assert!(cover.iter().all(|&c| c == 1), "nt={nt} tile={t} に穴か重複");
+            }
+        }
+    }
+
     /// 作業域の外部予約のゲートも既定 off・明示的な真値だけ on。
     #[test]
     fn lm_reserve_gate_is_strictly_opt_in() {

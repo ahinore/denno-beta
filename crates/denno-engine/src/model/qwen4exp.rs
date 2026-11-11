@@ -4134,15 +4134,6 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         {
             let k = self.p.n_expert_used;
             let ff = self.p.n_ff_exp;
-            let rows = nt_all.saturating_mul(k);
-            // task 242: g/u/act はグループ局所 (最大グループの行数) で足りる。
-            // グループの本数は `DENNO_PF_STREAM_GROUP` (1..=256) で変わるので、
-            // 上振れを見て expert の 1/4 を上限として見積もる (実際は 1/8 前後)。
-            let gl_rows = if crate::model::exp_pf::lm_group_local() {
-                rows.div_ceil(4).max(1)
-            } else {
-                rows
-            };
             // task 250: tensor core 経路は gate/up を融合して act に直接書くので、
             // 作業域は act 1 枚で足りる (g/u は取らない)。見積りも 3 → 1 に落とす
             // (過大に見積もると、要らない expert まで追い出して decode を冷やす)。
@@ -4151,18 +4142,27 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             } else {
                 3
             };
+            // task 250: MoE をトークンで割るときは h / act もその行数で足りる。
+            let tile_rows = crate::model::exp_pf::lm_tile(nt_all).saturating_mul(k);
+            let act_rows = if act_terms == 1 {
+                tile_rows
+            } else if crate::model::exp_pf::lm_group_local() {
+                tile_rows.div_ceil(4).max(1)
+            } else {
+                tile_rows
+            };
             let need = nt_all * e * 8
                 + ranges.len() * chunk * hc * 4
-                + (rows + nt_all) * e * 4
-                + act_terms * gl_rows * ff * 4
+                + (tile_rows + nt_all) * e * 4
+                + act_terms * act_rows * ff * 4
                 + (64usize << 20);
             // lab t242b: この `need` を満たしても、14k では `h` (1,505 MiB) の
             // 確保が「空き 1,243 MiB」で失敗し、`DevBuffer::alloc_tagged` の
             // 追い出し階段が **expert の LRU を全部捨てる** (39,755 MiB)。
             // expert は slab のチャンクが空になるまで実メモリを返さないので、
             // 少しずつ追い出しても 1.5 GB の連続領域は空かない。
-            // 次の課題: `h` をトークンで分割する (タイル) か、作業域を slab の
-            // 外にまとめて取る。どちらもこの経路の前提 (連続した h) を変える。
+            // task 250: `DENNO_PF_LM_TILE` で MoE をトークン分割すると `h` が
+            // 1/分割数になり、この連続確保が通る (下の tile_rows)。
             // task 250: 作業域を expert 予算からの**外部予約**として取る版
             // (`DENNO_PF_LM_RESERVE=1`)。予約は prefill の終端で返すので、LRU の
             // 上限が作業域のぶんだけ下がって戻る (確保のたびに追い出し階段が
@@ -4451,14 +4451,41 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             let t_moe = std::time::Instant::now();
             // task 233: 入力も出力もデバイスの置き場のまま回す。ホストへ戻るのは
             // router の確率だけ。前提が欠けたら置き場をホストへ戻して従来経路へ。
-            let ffn_dev = moe_ffn_quant_batch_lm_dev(
-                &self.p,
-                lw,
-                nt_all,
-                roles.as_deref_mut(),
-                true,
-                iv,
-            )?;
+            // task 250: トークンタイル (`DENNO_PF_LM_TILE`)。MoE の作業域
+            // (h) はタイルの行数で取るので、14k でも 1.5 GB の連続確保が要らない。
+            // 分割しないときは 1 回 (従来と同じ経路)。
+            let tile = crate::model::exp_pf::lm_tile(nt_all);
+            let mut ffn_dev = true;
+            if tile >= nt_all {
+                ffn_dev = moe_ffn_quant_batch_lm_dev(
+                    &self.p,
+                    lw,
+                    nt_all,
+                    roles.as_deref_mut(),
+                    true,
+                    iv,
+                )?;
+            } else {
+                let mut t0 = 0usize;
+                while t0 < nt_all {
+                    let nt = tile.min(nt_all - t0);
+                    let last = t0 + nt == nt_all;
+                    if !moe_ffn_quant_batch_lm_dev_at(
+                        &self.p,
+                        lw,
+                        t0,
+                        nt_all,
+                        nt,
+                        roles.as_deref_mut(),
+                        last,
+                        iv,
+                    )? {
+                        ffn_dev = false;
+                        break;
+                    }
+                    t0 += nt;
+                }
+            }
             if !ffn_dev {
                 lm_fallback += 1;
                 let buf = mixed_buf.get_or_insert_with(|| PfHostBuf::new(nt_all * e));
@@ -15842,8 +15869,27 @@ fn moe_ffn_quant_batch_lm_dev(
     p: &Qwen4ExpParams,
     lw: &LayerW,
     nt: usize,
-    mut roles: Option<&mut RoleRms>,
+    roles: Option<&mut RoleRms>,
     emit_router: bool,
+    iv: IvView<'_>,
+) -> Result<bool> {
+    moe_ffn_quant_batch_lm_dev_at(p, lw, 0, nt, nt, roles, emit_router, iv)
+}
+
+/// task 250: 層優先 MoE の**トークンタイル版**。`tok0` 行目から `nt` 行だけを
+/// 受ける (`nt_all` は置き場の全行数)。`emit_last` は層の末尾トークンの
+/// router 記録 / 役割 RMS を出すか (最後のタイルだけ true)。
+///
+/// `h` などの作業域はタイルの行数で取るので、14k でも 1.5 GB の連続確保が要らない。
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_quant_batch_lm_dev_at(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    tok0: usize,
+    nt_all: usize,
+    nt: usize,
+    mut roles: Option<&mut RoleRms>,
+    emit_last: bool,
     iv: IvView<'_>,
 ) -> Result<bool> {
     use crate::model::expert_cache::ExpertKey;
@@ -15873,12 +15919,14 @@ fn moe_ffn_quant_batch_lm_dev(
     ) {
         return Ok(false);
     }
-    let Some(xs_dev) = crate::cuda::pf_lm_mixed_ptr(0, nt, e) else {
+    let Some(xs_dev) = crate::cuda::pf_lm_mixed_ptr(tok0, nt_all, e) else {
         return Ok(false);
     };
-    let Some(out_dev) = crate::cuda::pf_lm_ffn_ptr(nt, e) else {
+    let Some(out_base) = crate::cuda::pf_lm_ffn_ptr(nt_all, e) else {
         return Ok(false);
     };
+    // 出力もこのタイルの先頭へずらす (`out` は nt_all 行の置き場)。
+    let out_dev = out_base + (tok0 * e * 4) as u64;
     // routed expert を丸ごと切った層はホスト経路へ (共有だけを書く形は作らない)。
     let skip_routed = iv.block_off(lw.il, IvBlock::Moe);
     let skip_shared = iv.block_off(lw.il, IvBlock::Shared);
@@ -15916,7 +15964,7 @@ fn moe_ffn_quant_batch_lm_dev(
         expert_mask,
     );
     mark(1);
-    if emit_router {
+    if emit_last {
         let tail = (nt - 1) * k;
         emit_router_topk(lw.il, &sels[tail..tail + k], &weights[tail..tail + k]);
         if let Some(m) = expert_mask {

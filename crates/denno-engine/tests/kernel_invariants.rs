@@ -10165,10 +10165,14 @@ fn t233_lm_steer_points_match_chunk_path() {
         "inject の退避 / 復帰が無い (task 227 は最後のチャンクの inject を全チャンクに使った)"
     );
     // デバイス MoE の入口と、その入力 / 出力が置き場から来ること。
+    // task 250: トークンタイル (`DENNO_PF_LM_TILE`) で `tok0` 行目から `nt` 行を
+    // 受けるので、mixed の先頭はタイルの先頭、ffn の置き場は全行のまま (出力は
+    // `tok0 * e * 4` だけずらす)。
     for k in [
         "fn moe_ffn_quant_batch_lm_dev(",
-        "crate::cuda::pf_lm_mixed_ptr(0, nt, e)",
-        "crate::cuda::pf_lm_ffn_ptr(nt, e)",
+        "crate::cuda::pf_lm_mixed_ptr(tok0, nt_all, e)",
+        "crate::cuda::pf_lm_ffn_ptr(nt_all, e)",
+        "let out_dev = out_base + (tok0 * e * 4) as u64;",
         "crate::cuda::pf_shared_dev_to(",
         "crate::cuda::moe_experts_iq_pf_layer_stream_dev(",
         "crate::cuda::pf_combine_at(",
