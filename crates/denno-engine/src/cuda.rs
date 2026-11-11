@@ -9073,6 +9073,70 @@ thread_local! {
         std::cell::RefCell::new(PfScratch::new());
 }
 
+/// task 233: 層優先 prefill で、共有 expert の出力を置く「行」を MoE の作業域に足す。
+///
+/// `total_rows` は routed expert の行数。`sc.h` を `(total_rows + ntok)` 行へ広げ、
+/// 末尾 `ntok` 行の先頭を返す。共有 expert の出力をここへ書き、行の加重和
+/// (`dno_exp_pf_accum`) が **最後の 1 項**として読む (ホストへ戻さない)。
+#[cfg(feature = "cuda")]
+pub fn pf_moe_shared_tail(total_rows: usize, ntok: usize, e: usize) -> Option<CUdeviceptr> {
+    let rows = total_rows.checked_add(ntok)?;
+    let bytes = rows.checked_mul(e)?.checked_mul(4)?;
+    let off = total_rows.checked_mul(e)?.checked_mul(4)?;
+    PF_SCRATCH.with(|cell| -> Option<CUdeviceptr> {
+        let mut sc = cell.borrow_mut();
+        MoeScratch::ensure(&mut sc.h, bytes).ok()?;
+        let b = sc.h.as_ref()?;
+        if b.bytes() < bytes {
+            return None;
+        }
+        Some(b.ptr() + off as u64)
+    })
+}
+
+/// task 233: MoE の作業域の `row` 行目 (`[e]`) をホストへ戻す (役割 RMS 用)。
+#[cfg(feature = "cuda")]
+pub fn pf_moe_h_row(row: usize, e: usize, out: &mut [f32]) -> bool {
+    if out.len() != e || e == 0 {
+        return false;
+    }
+    PF_SCRATCH.with(|cell| -> bool {
+        let sc = cell.borrow();
+        let Some(b) = sc.h.as_ref() else {
+            return false;
+        };
+        let off = row.saturating_mul(e).saturating_mul(4);
+        if b.bytes() < off + e * 4 {
+            return false;
+        }
+        match lib() {
+            Ok(l) => unsafe {
+                check(
+                    (l.memcpy_dtoh)(
+                        out.as_mut_ptr() as *mut c_void,
+                        b.ptr() + off as u64,
+                        e * 4,
+                    ),
+                    "cuMemcpyDtoH (moe h row)",
+                )
+                .is_ok()
+            },
+            Err(_) => false,
+        }
+    })
+}
+
+/// task 233: prefill の終端で MoE の作業域 (14k で約 2.5 GB) を返す。
+///
+/// 抱えたままだと decode の expert LRU がその分だけ狭くなる (task 227 の
+/// 14k 後 decode 36 ms/tok の一因)。次の prefill は同じ手順で確保し直す。
+#[cfg(feature = "cuda")]
+pub fn pf_scratch_drop() {
+    PF_SCRATCH.with(|cell| {
+        *cell.borrow_mut() = PfScratch::new();
+    });
+}
+
 /// 1 層ぶんの expert FFN を m 行カーネルで回す。
 ///
 /// `seg` は 4 語 × nseg (m / rows の先頭 / 0 / 0)、`rows_gu` は行 → トークン番号
@@ -10934,6 +10998,27 @@ pub struct PfStreamEntry<'a> {
     pub host: Option<[&'a [u8]; 3]>,
 }
 
+/// task 233: ストリーミング経路の入出力の置き場所。
+///
+/// 層優先 prefill は活性をデバイスへ置いたままにするので、入力も出力も
+/// ホストへ戻さない版が要る (`Dev`)。
+pub enum PfStreamIo<'a> {
+    /// 従来 (ホストの活性)。
+    Host {
+        xs: &'a [f32],
+        out: &'a mut [f32],
+    },
+    /// デバイスの活性。`sh` は共有 expert の出力 (`[ntok][e]`、MoE の作業域の
+    /// 末尾の行)。`0` なら共有 expert 無し。`sh_w` はトークンごとの係数
+    /// (`sigmoid(gate_inp_shexp @ x)`、長さ `ntok`)。
+    Dev {
+        xs: CUdeviceptr,
+        out: CUdeviceptr,
+        sh: CUdeviceptr,
+        sh_w: &'a [f32],
+    },
+}
+
 /// task 162: 1 層ぶんの expert FFN を、ミスをステージングへ上げながら回す。
 ///
 /// - ミスは `DENNO_PF_STREAM_GROUP` 本ずつのグループに切り、2 枚のステージングを
@@ -10963,23 +11048,133 @@ pub fn moe_experts_iq_pf_layer_stream(
     group: usize,
     out: &mut [f32],
 ) -> Result<Option<u32>> {
+    moe_experts_iq_pf_layer_stream_io(
+        ty_g,
+        ty_u,
+        ty_d,
+        entries,
+        seg,
+        rows_gu,
+        n_in,
+        ff,
+        e,
+        ntok,
+        k,
+        prow,
+        wrow,
+        group,
+        PfStreamIo::Host { xs, out },
+    )
+}
+
+/// task 233: 入力も出力もデバイスにある版 (層優先 prefill)。
+///
+/// `sh` (`[ntok][e]`) を渡すと、共有 expert の出力を加重和の**最後の 1 項**として
+/// 足す (`sh_w` が係数)。ホストへ戻るのは `ntok × e` の 1 個も無い。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_pf_layer_stream_dev(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    entries: &[PfStreamEntry<'_>],
+    seg: &[u32],
+    rows_gu: &[u32],
+    xs: CUdeviceptr,
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    ntok: usize,
+    k: usize,
+    prow: &[u32],
+    wrow: &[f32],
+    group: usize,
+    sh: CUdeviceptr,
+    sh_w: &[f32],
+    out: CUdeviceptr,
+) -> Result<Option<u32>> {
+    moe_experts_iq_pf_layer_stream_io(
+        ty_g,
+        ty_u,
+        ty_d,
+        entries,
+        seg,
+        rows_gu,
+        n_in,
+        ff,
+        e,
+        ntok,
+        k,
+        prow,
+        wrow,
+        group,
+        PfStreamIo::Dev {
+            xs,
+            out,
+            sh,
+            sh_w,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_experts_iq_pf_layer_stream_io(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    entries: &[PfStreamEntry<'_>],
+    seg: &[u32],
+    rows_gu: &[u32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    ntok: usize,
+    k: usize,
+    prow: &[u32],
+    wrow: &[f32],
+    group: usize,
+    mut io: PfStreamIo<'_>,
+) -> Result<Option<u32>> {
     if PF_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(None);
     }
     let nseg = entries.len();
     let total_rows = rows_gu.len();
+    // 共有 expert の行を足すか (足すときは加重和を k+1 項にする)。
+    let sh_rows = match &io {
+        PfStreamIo::Dev { sh, .. } if *sh != 0 => ntok,
+        _ => 0,
+    };
+    let kk = k + usize::from(sh_rows > 0);
+    let (dev_in, dev_out, dev_sh, sh_w): (CUdeviceptr, CUdeviceptr, CUdeviceptr, &[f32]) = match &io {
+        PfStreamIo::Host { .. } => (0, 0, 0, &[]),
+        PfStreamIo::Dev { xs, out, sh, sh_w } => (*xs, *out, *sh, *sh_w),
+    };
+    let (host_in, host_out): (Option<&[f32]>, Option<&mut [f32]>) = match &mut io {
+        PfStreamIo::Host { xs, out } => (Some(&**xs), Some(&mut **out)),
+        PfStreamIo::Dev { .. } => (None, None),
+    };
+    let bad_in = match host_in {
+        Some(xs) => xs.len() != ntok * n_in,
+        None => dev_in == 0,
+    };
+    let bad_out = match host_out.as_ref() {
+        Some(out) => out.len() < ntok * e,
+        None => dev_out == 0,
+    };
     if nseg == 0
         || total_rows == 0
         || ntok == 0
         || k == 0
         || seg.len() != nseg * 4
-        || xs.len() != ntok * n_in
+        || bad_in
+        || bad_out
         || prow.len() != ntok * k
         || wrow.len() < ntok * k
-        || out.len() < ntok * e
+        || (sh_rows > 0 && (sh_w.len() < ntok || dev_sh == 0))
     {
         return Ok(None);
     }
+    let mut host_out = host_out;
     if !moe_gemv_iq_pf_ready(ty_g, n_in)
         || !moe_gemv_iq_pf_ready(ty_u, n_in)
         || !moe_gemv_iq_pf_ready(ty_d, ff)
@@ -11015,12 +11210,18 @@ pub fn moe_experts_iq_pf_layer_stream(
     };
     let pinned = exp_pf::stream_pin() == 1;
     let ng = total_rows * ff;
-    let nh = total_rows * e;
+    // task 233: 共有 expert の行 (末尾 `sh_rows` 行) も h に含める。
+    let nh = (total_rows + sh_rows) * e;
+    let host_x = host_in;
+    let in_elems = ntok * n_in;
 
     let mut work = || -> Result<Option<u32>> {
         PF_SCRATCH.with(|cell| -> Result<Option<u32>> {
             let mut sc = cell.borrow_mut();
-            MoeScratch::ensure(&mut sc.x, xs.len() * 4)?;
+            // task 233: デバイス入力のときは `x` の作業域 (と H2D) を丸ごと省く。
+            if host_x.is_some() {
+                MoeScratch::ensure(&mut sc.x, in_elems * 4)?;
+            }
             MoeScratch::ensure(&mut sc.g, ng * 4)?;
             MoeScratch::ensure(&mut sc.u, ng * 4)?;
             MoeScratch::ensure(&mut sc.act, ng * 4)?;
@@ -11031,54 +11232,74 @@ pub fn moe_experts_iq_pf_layer_stream(
             MoeScratch::ensure(&mut sc.seg, nseg * 16)?;
             MoeScratch::ensure(&mut sc.rows_gu, total_rows * 4)?;
             MoeScratch::ensure(&mut sc.rows_id, total_rows * 4)?;
-            MoeScratch::ensure(&mut sc.prow, ntok * k * 4)?;
-            MoeScratch::ensure(&mut sc.wrow, ntok * k * 4)?;
-            MoeScratch::ensure(&mut sc.oacc, ntok * e * 4)?;
+            MoeScratch::ensure(&mut sc.prow, ntok * kk * 4)?;
+            MoeScratch::ensure(&mut sc.wrow, ntok * kk * 4)?;
+            // task 233: デバイス出力のときは oacc も要らない (置き場へ直接書く)。
+            if host_out.is_some() {
+                MoeScratch::ensure(&mut sc.oacc, ntok * e * 4)?;
+            }
             {
-                let xb = sc.x.as_ref().expect("確保済み");
-                // task 162: 活性 (nt x n_in) は層ごとに 20 MB 級なので、pinned に
-                // 写して非同期で積む (pageable の同期コピーは 1 MB あたりが重い)。
-                // null ストリームへ積むので、この後のカーネルは順序どおり待つ。
-                let mut done_pin = false;
-                if let Ok(l) = lib() {
-                    PF_XPIN.with(|cell| {
-                        let mut slot = cell.borrow_mut();
-                        if Scratch::ensure_pin(&mut slot, xs.len() * 4).is_ok() {
-                            let pin = slot.as_ref().expect("確保済み");
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    xs.as_ptr() as *const u8,
-                                    pin.ptr as *mut u8,
-                                    xs.len() * 4,
-                                );
-                                if (l.memcpy_htod_async)(
-                                    xb.ptr(),
-                                    pin.ptr,
-                                    xs.len() * 4,
-                                    std::ptr::null_mut(),
-                                ) == CUDA_SUCCESS
-                                {
-                                    done_pin = true;
+                if let Some(xs) = host_x {
+                    let xb = sc.x.as_ref().expect("確保済み");
+                    // task 162: 活性 (nt x n_in) は層ごとに 20 MB 級なので、pinned に
+                    // 写して非同期で積む (pageable の同期コピーは 1 MB あたりが重い)。
+                    // null ストリームへ積むので、この後のカーネルは順序どおり待つ。
+                    let mut done_pin = false;
+                    if let Ok(l) = lib() {
+                        PF_XPIN.with(|cell| {
+                            let mut slot = cell.borrow_mut();
+                            if Scratch::ensure_pin(&mut slot, xs.len() * 4).is_ok() {
+                                let pin = slot.as_ref().expect("確保済み");
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        xs.as_ptr() as *const u8,
+                                        pin.ptr as *mut u8,
+                                        xs.len() * 4,
+                                    );
+                                    if (l.memcpy_htod_async)(
+                                        xb.ptr(),
+                                        pin.ptr,
+                                        xs.len() * 4,
+                                        std::ptr::null_mut(),
+                                    ) == CUDA_SUCCESS
+                                    {
+                                        done_pin = true;
+                                    }
                                 }
                             }
-                        }
-                    });
-                }
-                if !done_pin {
-                    xb.copy_from(xs)?;
+                        });
+                    }
+                    if !done_pin {
+                        xb.copy_from(xs)?;
+                    }
                 }
                 sc.seg.as_ref().expect("確保済み").copy_from(seg)?;
                 sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
                 let id: Vec<u32> = exp_pf::identity_rows(total_rows);
                 sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
-                sc.prow.as_ref().expect("確保済み").copy_from(prow)?;
-                sc.wrow
-                    .as_ref()
-                    .expect("確保済み")
-                    .copy_from(&wrow[..ntok * k])?;
+                // task 233: 共有 expert を足すときは、行の加重和の表を 1 列増やし、
+                // 末尾に「共有の行 (`total_rows + t`)」と係数を置く。
+                if sh_rows > 0 {
+                    let Some((pr, wr)) = crate::model::exp_pf::row_table_with_shared(
+                        prow, wrow, ntok, k, total_rows, sh_w,
+                    ) else {
+                        return Ok(None);
+                    };
+                    sc.prow.as_ref().expect("確保済み").copy_from(&pr)?;
+                    sc.wrow.as_ref().expect("確保済み").copy_from(&wr)?;
+                } else {
+                    sc.prow.as_ref().expect("確保済み").copy_from(prow)?;
+                    sc.wrow
+                        .as_ref()
+                        .expect("確保済み")
+                        .copy_from(&wrow[..ntok * k])?;
+                }
             }
-            dbg_htod(xs.len() * 4 + nseg * 16 + total_rows * 4 * 2 + ntok * k * 8);
-            let xb = sc.x.as_ref().expect("確保済み").ptr();
+            dbg_htod(in_elems * 4 + nseg * 16 + total_rows * 4 * 2 + ntok * kk * 8);
+            let xb = match host_x {
+                Some(_) => sc.x.as_ref().expect("確保済み").ptr(),
+                None => dev_in,
+            };
             let gb = sc.g.as_ref().expect("確保済み").ptr();
             let ub = sc.u.as_ref().expect("確保済み").ptr();
             let act = sc.act.as_ref().expect("確保済み").ptr();
@@ -11342,19 +11563,23 @@ pub fn moe_experts_iq_pf_layer_stream(
             {
                 let prowb = sc.prow.as_ref().expect("確保済み").ptr();
                 let wb = sc.wrow.as_ref().expect("確保済み").ptr();
-                let oacc = sc.oacc.as_ref().expect("確保済み");
+                // task 233: デバイス出力のときは oacc を使わず、置き場へ直接書く。
+                let oacc = sc.oacc.as_ref();
                 let threads = 256usize;
                 let mut ph = hb;
                 let mut pp = prowb;
                 let mut pw = wb;
-                let mut po = oacc.ptr();
-                let (mut kk, mut ee, mut nn) = (k as c_int, e as c_int, ntok as c_int);
+                let mut po = match (oacc, host_out.as_ref()) {
+                    (Some(b), Some(_)) => b.ptr(),
+                    _ => dev_out,
+                };
+                let (mut k_c, mut ee, mut nn) = (kk as c_int, e as c_int, ntok as c_int);
                 let mut args = [
                     &mut ph as *mut _ as *mut c_void,
                     &mut pp as *mut _ as *mut c_void,
                     &mut pw as *mut _ as *mut c_void,
                     &mut po as *mut _ as *mut c_void,
-                    &mut kk as *mut _ as *mut c_void,
+                    &mut k_c as *mut _ as *mut c_void,
                     &mut ee as *mut _ as *mut c_void,
                     &mut nn as *mut _ as *mut c_void,
                 ];
@@ -11372,10 +11597,12 @@ pub fn moe_experts_iq_pf_layer_stream(
                 let t_sync = std::time::Instant::now();
                 ctx.sync()?;
                 exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
-                let t_d2h = std::time::Instant::now();
-                oacc.to_slice(&mut out[..ntok * e])?;
-                exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
-                dbg_d2h(ntok * e * 4);
+                if let (Some(b), Some(o)) = (oacc, host_out.as_mut()) {
+                    let t_d2h = std::time::Instant::now();
+                    b.to_slice(&mut o[..ntok * e])?;
+                    exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
+                    dbg_d2h(ntok * e * 4);
+                }
             }
             exp_pf::note_stream_layer();
             Ok(Some(nseg as u32))
@@ -22576,6 +22803,243 @@ pub fn pf_res_park_load(i: usize, rows: usize, hc: usize, e: usize) -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// task 233: 層優先 prefill の「全トークンの活性」をデバイスに置いたままにする
+// ---------------------------------------------------------------------------
+//
+// task 227 の層優先は、層ごとに全トークンの活性 (14k で 143 MB) を router /
+// shared / expert の 3 段で上げ直し、shared と expert の出力 (同じく 143 MB) を
+// 毎層ホストへ戻していた (14k で 34 GB)。ここはその往復を消すための置き場。
+//
+// - `mixed`: `pf_mix` (ffn 入口) の出力 `[nt_all][e]`。層のあいだ保持する。
+// - `ffn`: MoE の出力 `[nt_all][e]`。combine がここから直接読む。
+// - `inj`: チャンクごとの inject `[rows][hc]`。combine が読む
+//   (task 227 は最後のチャンクの inject を全チャンクに使っていた)。
+//
+// どれも 1 リクエストで 1 回だけ確保し、prefill の終端で [`pf_lm_release`] が返す。
+
+/// 層優先 prefill の活性の置き場 (スレッドローカル)。
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct PfLmDev {
+    mixed: Option<DevBuffer>,
+    ffn: Option<DevBuffer>,
+    inj: Vec<DevBuffer>,
+    nt: usize,
+    e: usize,
+    hc: usize,
+    chunk: usize,
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static PF_LM: std::cell::RefCell<PfLmDev> = std::cell::RefCell::new(PfLmDev::default());
+}
+
+/// task 233: 層優先 prefill の置き場を用意する。
+///
+/// `nt` はプロンプト全体のトークン数、`chunk` は 1 回の mix のトークン数。
+/// 形が変わったら作り直す。確保できなければ false (呼び出し側はチャンク優先へ)。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_ensure(nt: usize, e: usize, hc: usize, chunk: usize) -> bool {
+    if nt == 0 || e == 0 || hc == 0 || chunk == 0 {
+        return false;
+    }
+    let slots = nt.div_ceil(chunk);
+    PF_LM.with(|cell| -> bool {
+        let mut d = cell.borrow_mut();
+        if d.nt != nt || d.e != e || d.hc != hc || d.chunk != chunk {
+            *d = PfLmDev {
+                nt,
+                e,
+                hc,
+                chunk,
+                ..PfLmDev::default()
+            };
+        }
+        let r = (|| -> anyhow::Result<()> {
+            Scratch::ensure_tagged(&mut d.mixed, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
+            Scratch::ensure_tagged(&mut d.ffn, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
+            while d.inj.len() < slots {
+                let b = DevBuffer::alloc_tagged(chunk * hc * 4, crate::mem_audit::TAG_OTHER)?;
+                d.inj.push(b);
+            }
+            Ok(())
+        })();
+        match r {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("pf_lm_ensure: 確保に失敗: {err:#}");
+                false
+            }
+        }
+    })
+}
+
+/// task 233: 直前の `pf_mix` の出力 (`d.mixed`) を置き場の `start` 行目へ D2D で写す。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_park_mixed(start: usize, nt: usize, e: usize) -> bool {
+    let bytes = nt.saturating_mul(e).saturating_mul(4);
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let Some(src) = d.mixed.as_ref() else {
+            return false;
+        };
+        let ok = PF_LM.with(|lc| -> bool {
+            let l = lc.borrow();
+            let Some(dst) = l.mixed.as_ref() else {
+                return false;
+            };
+            let off = start.saturating_mul(e).saturating_mul(4);
+            if bytes == 0 || src.bytes() < bytes || dst.bytes() < off + bytes {
+                return false;
+            }
+            match lib() {
+                Ok(lib) => unsafe {
+                    check(
+                        (lib.memcpy_dtod_async)(
+                            dst.ptr() + off as u64,
+                            src.ptr(),
+                            bytes,
+                            std::ptr::null_mut(),
+                        ),
+                        "cuMemcpyDtoDAsync (lm mixed park)",
+                    )
+                    .is_ok()
+                },
+                Err(_) => false,
+            }
+        });
+        ok
+    })
+}
+
+/// task 233: 置き場の `start` 行目から `nt` 行ぶんの入力 (`[nt][e]` f32) の先頭。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_mixed_ptr(start: usize, nt: usize, e: usize) -> Option<CUdeviceptr> {
+    PF_LM.with(|cell| -> Option<CUdeviceptr> {
+        let l = cell.borrow();
+        let b = l.mixed.as_ref()?;
+        let off = start.saturating_mul(e).saturating_mul(4);
+        let bytes = nt.saturating_mul(e).saturating_mul(4);
+        if bytes == 0 || b.bytes() < off + bytes {
+            return None;
+        }
+        Some(b.ptr() + off as u64)
+    })
+}
+
+/// task 233: MoE の出力 (`[nt][e]` f32) を置く先頭 (先頭行から)。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_ffn_ptr(nt: usize, e: usize) -> Option<CUdeviceptr> {
+    PF_LM.with(|cell| -> Option<CUdeviceptr> {
+        let l = cell.borrow();
+        let b = l.ffn.as_ref()?;
+        if b.bytes() < nt.saturating_mul(e).saturating_mul(4) {
+            return None;
+        }
+        Some(b.ptr())
+    })
+}
+
+/// task 233: チャンク `i` の inject (`d.inj`) を置き場へ D2D で退避する。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_inj_save(i: usize, rows: usize, hc: usize) -> bool {
+    let bytes = rows.saturating_mul(hc).saturating_mul(4);
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        let Some(src) = d.inj.as_ref() else {
+            return false;
+        };
+        PF_LM.with(|lc| -> bool {
+            let l = lc.borrow();
+            let Some(dst) = l.inj.get(i) else {
+                return false;
+            };
+            if bytes == 0 || src.bytes() < bytes || dst.bytes() < bytes {
+                return false;
+            }
+            match lib() {
+                Ok(lib) => unsafe {
+                    check(
+                        (lib.memcpy_dtod_async)(dst.ptr(), src.ptr(), bytes, std::ptr::null_mut()),
+                        "cuMemcpyDtoDAsync (lm inj park)",
+                    )
+                    .is_ok()
+                },
+                Err(_) => false,
+            }
+        })
+    })
+}
+
+/// task 233: 置き場の inject を `d.inj` へ D2D で戻す (combine の直前)。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_inj_load(i: usize, rows: usize, hc: usize) -> bool {
+    let bytes = rows.saturating_mul(hc).saturating_mul(4);
+    PF_LM.with(|lc| -> bool {
+        let l = lc.borrow();
+        let Some(src) = l.inj.get(i) else {
+            return false;
+        };
+        PF_DEV.with(|cell| -> bool {
+            let d = cell.borrow();
+            let Some(dst) = d.inj.as_ref() else {
+                return false;
+            };
+            if bytes == 0 || src.bytes() < bytes || dst.bytes() < bytes {
+                return false;
+            }
+            match lib() {
+                Ok(lib) => unsafe {
+                    check(
+                        (lib.memcpy_dtod_async)(dst.ptr(), src.ptr(), bytes, std::ptr::null_mut()),
+                        "cuMemcpyDtoDAsync (lm inj load)",
+                    )
+                    .is_ok()
+                },
+                Err(_) => false,
+            }
+        })
+    })
+}
+
+/// task 233: 置き場の mixed を丸ごとホストへ戻す (デバイス経路を諦めたとき用)。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_take_mixed(out: &mut [f32]) -> bool {
+    PF_LM.with(|cell| -> bool {
+        let l = cell.borrow();
+        let Some(b) = l.mixed.as_ref() else {
+            return false;
+        };
+        if b.bytes() < out.len() * 4 {
+            return false;
+        }
+        b.to_slice(out).is_ok()
+    })
+}
+
+/// task 233: ホストで計算した MoE の出力を置き場へ上げる (デバイス経路を諦めたとき用)。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_upload_ffn(src: &[f32]) -> bool {
+    PF_LM.with(|cell| -> bool {
+        let l = cell.borrow();
+        match l.ffn.as_ref() {
+            Some(b) if b.bytes() >= src.len() * 4 => b.copy_from(src).is_ok(),
+            _ => false,
+        }
+    })
+}
+
+/// task 233: 層優先の置き場を返す (prefill の終端で VRAM を decode に戻す)。
+#[cfg(feature = "cuda")]
+pub fn pf_lm_release() {
+    PF_LM.with(|cell| {
+        let mut l = cell.borrow_mut();
+        *l = PfLmDev::default();
+    });
+}
+
 /// task 154: チャンクの残差 (`[nt][hc][e]`) をデバイスへ置く。
 pub fn pf_upload_res(res: &[f32]) -> bool {
     PF_DEV.with(|cell| -> bool {
@@ -23217,6 +23681,15 @@ pub fn pf_combine_dev(nt: usize, hc: usize, e: usize) -> bool {
         return pf_fail("combine (デバイス出力): 形が違う");
     }
     pf_combine_core(None, Some(ptr), nt, hc, e)
+}
+
+/// task 233: 層優先 prefill で、MoE の出力 (デバイスの `[nt][e]`) をそのまま
+/// combine する。`inj` は呼び出し側が [`pf_lm_inj_load`] で戻しておく。
+pub fn pf_combine_at(dev: CUdeviceptr, nt: usize, hc: usize, e: usize) -> bool {
+    if dev == 0 {
+        return pf_fail("combine (デバイス指定): ポインタが 0");
+    }
+    pf_combine_core(None, Some(dev), nt, hc, e)
 }
 
 /// task 200: 直前の層出力がデバイスに残っているかを捨てる (層の入口で呼ぶ)。
@@ -25060,7 +25533,7 @@ pub fn pf_shared(
         pf2_note(3);
         return false;
     }
-    pf_shared_impl(SharedIn::Host(x), nt, e, sff, gate, up, down, out)
+    pf_shared_impl(SharedIn::Host(x), nt, e, sff, gate, up, down, SharedOut::Host(out))
 }
 
 /// task 209: 入力 `x` が既にデバイスにある版 (`[nt][e]` f32)。
@@ -25081,7 +25554,38 @@ pub fn pf_shared_dev(
         pf2_note(3);
         return false;
     }
-    pf_shared_impl(SharedIn::Dev(dev_x), nt, e, sff, gate, up, down, out)
+    pf_shared_impl(SharedIn::Dev(dev_x), nt, e, sff, gate, up, down, SharedOut::Host(out))
+}
+
+/// task 233: 入力も出力もデバイスにある版 (層優先 prefill の shared expert)。
+///
+/// 出力は `[nt][e]` f32。MoE の作業域の「共有 expert の行」へ直接書く
+/// (呼び出し側は [`pf_moe_shared_tail`] のポインタを渡す)。
+#[allow(clippy::too_many_arguments)]
+pub fn pf_shared_dev_to(
+    dev_x: CUdeviceptr,
+    nt: usize,
+    e: usize,
+    sff: usize,
+    gate: PfLin<'_>,
+    up: PfLin<'_>,
+    down: PfLin<'_>,
+    out_dev: CUdeviceptr,
+) -> bool {
+    if dev_x == 0 || out_dev == 0 {
+        pf2_note(3);
+        return false;
+    }
+    pf_shared_impl(
+        SharedIn::Dev(dev_x),
+        nt,
+        e,
+        sff,
+        gate,
+        up,
+        down,
+        SharedOut::Dev(out_dev),
+    )
 }
 
 /// shared 連鎖の入力の置き場所。
@@ -25090,6 +25594,22 @@ enum SharedIn<'a> {
     Dev(CUdeviceptr),
 }
 
+/// shared 連鎖の出力の置き場所。
+enum SharedOut<'a> {
+    Host(&'a mut [f32]),
+    Dev(CUdeviceptr),
+}
+
+impl SharedOut<'_> {
+    fn host_len(&self) -> Option<usize> {
+        match self {
+            SharedOut::Host(o) => Some(o.len()),
+            SharedOut::Dev(_) => None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pf_shared_impl(
     src: SharedIn<'_>,
     nt: usize,
@@ -25098,13 +25618,13 @@ fn pf_shared_impl(
     gate: PfLin<'_>,
     up: PfLin<'_>,
     down: PfLin<'_>,
-    out: &mut [f32],
+    out: SharedOut<'_>,
 ) -> bool {
     pf2_set_nt(nt);
     let ok_shape = nt >= PF2_MIN_ROWS
         && e > 0
         && sff > 0
-        && out.len() == nt * e
+        && out.host_len().map_or(true, |n| n == nt * e)
         && gate.k == e
         && gate.n == sff
         && up.k == e
@@ -25134,13 +25654,15 @@ fn pf_shared_impl(
         pf2_ensure(&mut d.x, nt * e * 4)?;
         pf2_ensure(&mut d.ga, nt * sff * 4)?;
         pf2_ensure(&mut d.gu, nt * sff * 4)?;
-        pf2_ensure(&mut d.sh, nt * e * 4)?;
+        // task 233: デバイス出力のときは `sh` (ホストへ戻すための中間) を確保しない。
+        if matches!(out, SharedOut::Host(_)) {
+            pf2_ensure(&mut d.sh, nt * e * 4)?;
+        }
         // swiglu の出力は x の領域へ (gate/up を撃ったあとの x はもう不要。
         // ga を in-place で上書きすると別名になるので避ける)。
         let xb = d.x.as_ref().expect("ensure 済み");
         let gab = d.ga.as_ref().expect("ensure 済み");
         let gub = d.gu.as_ref().expect("ensure 済み");
-        let shb = d.sh.as_ref().expect("ensure 済み");
         let swb = d.x.as_ref().expect("ensure 済み");
         // task 209: デバイス入力のときは H2D をせず、その領域を直接読む
         // (swiglu の出力は別の `d.x` に書くので入力は壊れない)。
@@ -25169,16 +25691,25 @@ fn pf_shared_impl(
                 ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args)?;
             }
         }
-        pf2_gemm_shared(ctx, pd, pd_k, swb.ptr(), shb.ptr(), nt, sff, e)?;
+        // task 233: デバイス出力のときは down の結果を**そのまま**宛先へ書く
+        // (置き場へ D2D で写し直さない)。ホスト出力は従来どおり `d.sh` 経由。
+        let dst = match &out {
+            SharedOut::Host(_) => d.sh.as_ref().expect("ensure 済み").ptr(),
+            SharedOut::Dev(p) => *p,
+        };
+        pf2_gemm_shared(ctx, pd, pd_k, swb.ptr(), dst, nt, sff, e)?;
         ctx.sync()?;
-        // task 181: ホストへは**呼び出し側のバッファへ直接**戻す
-        // (`DENNO_PF_D2H_DIRECT`)。`to_vec` + `copy_from_slice` は毎層 5 MB の
-        // Vec 確保 (= ページフォルト) と memcpy をもう 1 回する。
-        if pf_d2h_direct_on() {
-            shb.to_slice(&mut out[..nt * e])?;
-        } else {
-            let got: Vec<f32> = shb.to_vec(nt * e)?;
-            out.copy_from_slice(&got);
+        if let SharedOut::Host(o) = out {
+            let shb = d.sh.as_ref().expect("ensure 済み");
+            // task 181: ホストへは**呼び出し側のバッファへ直接**戻す
+            // (`DENNO_PF_D2H_DIRECT`)。`to_vec` + `copy_from_slice` は毎層 5 MB の
+            // Vec 確保 (= ページフォルト) と memcpy をもう 1 回する。
+            if pf_d2h_direct_on() {
+                shb.to_slice(&mut o[..nt * e])?;
+            } else {
+                let got: Vec<f32> = shb.to_vec(nt * e)?;
+                o.copy_from_slice(&got);
+            }
         }
         Ok(())
     });

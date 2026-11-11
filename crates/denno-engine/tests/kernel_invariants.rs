@@ -9462,3 +9462,77 @@ fn steer_ptx_matches_the_host_launch_abi() {
         "cuda.rs が sub / proj を引いていない"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 233: 層優先 prefill のデバイス MoE (活性をホストへ戻さない)
+// ---------------------------------------------------------------------------
+
+const EXP_PF_SRC: &str = include_str!("../src/model/exp_pf.rs");
+
+/// task 233: 層優先 (デバイス) 経路でもステアリングの点がチャンク経路と同じこと。
+///
+/// 層の入口で `pf_steer_apply` → mix → attn → combine → mix → MoE → combine →
+/// `pf_steer_acc`。層優先は ffn の combine が `pf_combine_at` (デバイスの MoE
+/// 出力) になるだけで、点は動かない。
+#[test]
+fn t233_lm_steer_points_match_chunk_path() {
+    let chunk = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident(");
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    for (name, body) in [("chunk", chunk), ("lm", lm)] {
+        let p_apply = body
+            .find("crate::cuda::pf_steer_apply(")
+            .unwrap_or_else(|| panic!("{name}: 層入口の適用が無い"));
+        let p_mix = body
+            .find("crate::cuda::pf_mix(")
+            .unwrap_or_else(|| panic!("{name}: mix が無い"));
+        let p_acc = body
+            .find("crate::cuda::pf_steer_acc(")
+            .unwrap_or_else(|| panic!("{name}: 出口の記録が無い"));
+        assert!(p_apply < p_mix, "{name}: 適用が mix より後ろにある");
+        assert!(p_mix < p_acc, "{name}: 記録が mix より前にある");
+    }
+    // 層優先は MoE の出力 (デバイス) をそのまま combine する。
+    let p_at = lm
+        .find("crate::cuda::pf_combine_at(")
+        .expect("層優先が pf_combine_at を使っていない");
+    let p_acc = lm.find("crate::cuda::pf_steer_acc(").expect("acc が無い");
+    assert!(p_at < p_acc, "層優先: combine が記録より後ろにある");
+    // mixed の D2H は attention の入口 (CPU が読む) の 1 回だけ。ffn の入口は
+    // 置き場へ D2D で写す (MoE の入力はホストへ戻さない)。
+    assert_eq!(
+        lm.matches("crate::cuda::pf_take_mixed(").count(),
+        1,
+        "層優先が mixed を 2 回以上ホストへ戻している"
+    );
+    let p_take = lm
+        .find("crate::cuda::pf_take_mixed(")
+        .expect("attn 入口の D2H が無い");
+    let p_park = lm
+        .find("crate::cuda::pf_lm_park_mixed(")
+        .expect("層優先が mixed を置き場へ写していない");
+    assert!(
+        p_take < p_park,
+        "ffn の入口が置き場へ写していない (attn の D2H だけを許す)"
+    );
+    assert!(
+        lm.contains("crate::cuda::pf_lm_inj_save(") && lm.contains("crate::cuda::pf_lm_inj_load("),
+        "inject の退避 / 復帰が無い (task 227 は最後のチャンクの inject を全チャンクに使った)"
+    );
+    // デバイス MoE の入口と、その入力 / 出力が置き場から来ること。
+    for k in [
+        "fn moe_ffn_quant_batch_lm_dev(",
+        "crate::cuda::pf_lm_mixed_ptr(0, nt, e)",
+        "crate::cuda::pf_lm_ffn_ptr(nt, e)",
+        "crate::cuda::pf_shared_dev_to(",
+        "crate::cuda::moe_experts_iq_pf_layer_stream_dev(",
+        "crate::cuda::pf_combine_at(",
+        "pub fn pf_lm_ensure(",
+        "pub fn pf_scratch_drop(",
+        "pub fn row_table_with_shared(",
+    ] {
+        assert!(
+            QWEN_SRC.contains(k) || CUDA_RS.contains(k) || EXP_PF_SRC.contains(k),
+            "どこにも {k} が無い"
+        );
+    }
+}

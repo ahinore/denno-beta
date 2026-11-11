@@ -782,6 +782,39 @@ pub fn row_table_full(
     Some(prow)
 }
 
+/// task 233: 行の加重和の表に「共有 expert の行」を 1 列足す (純関数)。
+///
+/// `prow` / `wrow` は `ntok * k` (行は expert 昇順、加重和の項の順そのもの)。
+/// 戻り値は `ntok * (k + 1)` で、各トークンの**最後の 1 項**が共有 expert の
+/// 行 (`shared_row0 + t`) と係数 `sh_w[t]` になる。共有 expert の出力を MoE の
+/// 作業域の末尾の行へ書いておけば、加重和のカーネル 1 回で routed と共有が
+/// 同じ出力に載る (ホストへ戻さない)。
+pub fn row_table_with_shared(
+    prow: &[u32],
+    wrow: &[f32],
+    ntok: usize,
+    k: usize,
+    shared_row0: usize,
+    sh_w: &[f32],
+) -> Option<(Vec<u32>, Vec<f32>)> {
+    if k == 0 || ntok == 0 || prow.len() != ntok * k || wrow.len() < ntok * k {
+        return None;
+    }
+    if sh_w.len() < ntok || shared_row0 > u32::MAX as usize {
+        return None;
+    }
+    let kk = k + 1;
+    let mut pr = vec![0u32; ntok * kk];
+    let mut wr = vec![0f32; ntok * kk];
+    for t in 0..ntok {
+        pr[t * kk..t * kk + k].copy_from_slice(&prow[t * k..(t + 1) * k]);
+        wr[t * kk..t * kk + k].copy_from_slice(&wrow[t * k..(t + 1) * k]);
+        pr[t * kk + k] = (shared_row0 + t) as u32;
+        wr[t * kk + k] = sh_w[t];
+    }
+    Some((pr, wr))
+}
+
 /// task 162: 載っていない (t, j) を「重み 0・行 0」にして和から外す。
 ///
 /// `prow` の穴を 0 で埋め、`weights` の同じ位置を 0.0 にする。0 × 有限値 = 0
@@ -1262,6 +1295,34 @@ mod tests {
         seen.sort_unstable();
         want.sort_unstable();
         assert_eq!(seen, want, "行の取りこぼし・重複がある");
+    }
+
+    /// task 233: 行の加重和の表に共有 expert を 1 列足す。行は
+    /// 「routed (expert 昇順) のあと、各トークンの共有行」で、係数は sh_w。
+    #[test]
+    fn row_table_with_shared_appends_one_term_per_token() {
+        let (ntok, k) = (3usize, 2usize);
+        let prow: Vec<u32> = vec![0, 5, 1, 6, 2, 7];
+        let wrow: Vec<f32> = vec![0.5, 0.5, 0.25, 0.75, 1.0, 0.0];
+        let sh: Vec<f32> = vec![0.9, 0.8, 0.7];
+        let (pr, wr) = row_table_with_shared(&prow, &wrow, ntok, k, 6, &sh).expect("足せる");
+        assert_eq!(pr.len(), ntok * (k + 1));
+        assert_eq!(wr.len(), ntok * (k + 1));
+        for t in 0..ntok {
+            assert_eq!(
+                &pr[t * 3..t * 3 + 2],
+                &prow[t * 2..(t + 1) * 2],
+                "routed の行が動いた"
+            );
+            assert_eq!(wr[t * 3], wrow[t * 2], "routed の重みが動いた");
+            assert_eq!(wr[t * 3 + 1], wrow[t * 2 + 1]);
+            assert_eq!(pr[t * 3 + 2], (6 + t) as u32, "共有の行は h の末尾");
+            assert_eq!(wr[t * 3 + 2], sh[t], "共有の係数");
+        }
+        // 形が合わないときは None (黙って詰めない)。
+        assert!(row_table_with_shared(&prow, &wrow, ntok, k, 6, &sh[..2]).is_none());
+        assert!(row_table_with_shared(&prow[..5], &wrow, ntok, k, 6, &sh).is_none());
+        assert!(row_table_with_shared(&prow, &wrow, ntok, 0, 6, &sh).is_none());
     }
 
     /// 全部ヒットなら行数は選択数 (nt x k) と一致する。
