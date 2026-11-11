@@ -47,6 +47,8 @@ pub const TAG_GROUPED_PACKED: &str = "grouped packed";
 pub const TAG_GROUPED: &str = "grouped scratch";
 /// prefill の層一括 GEMV (segment) スクラッチ
 pub const TAG_SEG: &str = "seg scratch";
+/// task 248: prefill のミス expert ストリーミング用ステージング (3 枚)
+pub const TAG_PF_STAGE: &str = "pf staging";
 /// `moe_gemv_dev` の入出力スクラッチ
 pub const TAG_GEMV: &str = "gemv scratch";
 /// GDN スキャンの作業領域
@@ -103,7 +105,7 @@ pub fn audit_on() -> bool {
 
 /// 1 本ぶんの確保を記帳する。
 pub fn note_alloc(tag: &'static str, bytes: usize) {
-    LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    let live = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
     if tag == TAG_EXPERTS {
         LIVE_EXPERTS.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -115,6 +117,9 @@ pub fn note_alloc(tag: &'static str, bytes: usize) {
         e.0 = e.0.saturating_add(1);
         e.1 = e.1.saturating_add(bytes);
     }
+    // task 248: prefill の窓が開いていれば、合計の最大を控える
+    // (窓が閉じているときは atomic 1 回で戻る)。
+    peak_note(live);
 }
 
 /// 1 本ぶんの解放を記帳する (`note_alloc` と対)。
@@ -250,6 +255,157 @@ pub fn print_table(reason: &str, dev: Option<(usize, usize)>) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// task 248: prefill のピーク台帳
+// ---------------------------------------------------------------------------
+// リクエスト終端の表は「decode まで終わった後」なので、prefill の途中で
+// 一時領域 (ステージング・作業域・KV ミラー) が重なった瞬間のピークを見られない。
+// ここでは prefill の入口で窓を開け、`note_alloc` が台帳の合計を更新するたびに
+// 「合計が最大になった瞬間」の内訳と空き VRAM を 1 枚だけ控える。
+//
+// 契約:
+// - 窓が閉じているときの追加コストは atomic 1 回の load だけ (`note_alloc` の
+//   ホットパスに効かせない)。
+// - 表を出すのは窓を閉じたとき 1 回。`DENNO_Q4_PROFILE` が無ければ何もしない。
+// - 数値・確保順には触らない (数えるだけ)。
+
+/// ピークの 1 枚。
+#[derive(Debug, Clone)]
+struct PeakSnap {
+    label: &'static str,
+    live: usize,
+    free_mb: usize,
+    total_mb: usize,
+    rows: Vec<(&'static str, usize, usize)>,
+}
+
+static PEAK: Mutex<Option<PeakSnap>> = Mutex::new(None);
+/// 窓が開いているか (note_alloc のホットパスはこれ 1 個だけ見る)。
+static PEAK_OPEN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "cuda")]
+fn dev_now() -> Option<(usize, usize)> {
+    crate::cuda::dev_mem_mb_cached()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn dev_now() -> Option<(usize, usize)> {
+    None
+}
+
+/// いまの台帳を 1 回出す (デバイスの空きが取れるなら添える)。
+///
+/// task 248: ロード直後と prefill のピークで使う。`DENNO_Q4_PROFILE` が
+/// 無ければ何もしない。
+pub fn print_table_here(reason: &str) {
+    print_table(reason, dev_now());
+}
+
+fn peak_note(live: usize) {
+    if !PEAK_OPEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(mut g) = PEAK.lock() else {
+        return;
+    };
+    let better = match g.as_ref() {
+        Some(p) => live > p.live,
+        None => true,
+    };
+    if !better {
+        return;
+    }
+    let label = g.as_ref().map(|p| p.label).unwrap_or("window");
+    let (free_mb, total_mb) = dev_now().unwrap_or((0, 0));
+    let rows = ledger_rows();
+    *g = Some(PeakSnap {
+        label,
+        live,
+        free_mb,
+        total_mb,
+        rows,
+    });
+}
+
+/// prefill の窓を開ける (戻り値の guard を drop すると表を出す)。
+pub fn peak_window(label: &'static str) -> PeakWindow {
+    if !audit_on() {
+        return PeakWindow { open: false };
+    }
+    {
+        let Ok(mut g) = PEAK.lock() else {
+            return PeakWindow { open: false };
+        };
+        *g = Some(PeakSnap {
+            label,
+            live: 0,
+            free_mb: 0,
+            total_mb: 0,
+            rows: Vec::new(),
+        });
+    }
+    PEAK_OPEN.store(true, Ordering::Relaxed);
+    PeakWindow { open: true }
+}
+
+/// 窓の guard。drop で [`peak_end`] を呼ぶ。
+pub struct PeakWindow {
+    open: bool,
+}
+
+#[cfg(test)]
+fn peak_test_live() -> Option<usize> {
+    PEAK.lock().ok()?.as_ref().map(|p| p.live)
+}
+
+impl Drop for PeakWindow {
+    fn drop(&mut self) {
+        if self.open {
+            peak_end();
+        }
+    }
+}
+
+/// 窓を閉じて、ピークの 1 枚を出す (`peak_window` の guard が呼ぶ)。
+pub fn peak_end() {
+    PEAK_OPEN.store(false, Ordering::Relaxed);
+    if !audit_on() {
+        return;
+    }
+    let snap = PEAK.lock().ok().and_then(|mut g| g.take());
+    let Some(p) = snap else {
+        return;
+    };
+    if p.live == 0 {
+        return;
+    }
+    let dev = if p.total_mb > 0 {
+        Some((p.free_mb, p.total_mb))
+    } else {
+        None
+    };
+    let reason = format!(
+        "{} のピーク (台帳 {} MiB)",
+        p.label,
+        mib(p.live)
+    );
+    print_table(&reason, dev);
+    // task 248: 作業域の「確保」と「実際の使用」の差を出す。ここが大きいほど
+    // expert に回せる VRAM がある (arena は 1 GiB 単位で確保する)。
+    #[cfg(feature = "cuda")]
+    {
+        if let Some((cap, high)) = crate::cuda::arena_usage() {
+            tracing::info!(
+                "[mem-audit]   scratch arena: 確保 {} MiB / 使用ピーク {} MiB",
+                mib(cap),
+                mib(high)
+            );
+        }
+        let (stage, _free) = crate::cuda::pf_stage_usage();
+        tracing::info!("[mem-audit]   pf staging: 確保 {} MiB", mib(stage));
+    }
+}
+
 /// リクエスト境界の後始末 (serve-flash / engine の両方から呼ぶ)。
 ///
 /// 1. その時点の確保の内訳を表に出す ([`request_end`]。1 本目と長い文脈の 1 回だけ)。
@@ -326,6 +482,35 @@ pub fn request_end(ctx_tokens: usize, _long_ctx: usize, dev: Option<(usize, usiz
 /// `DENNO_VRAM_RESERVE_MB` の既定 (MiB)。CUDA context + JIT + 断片の余裕。
 pub const VRAM_RESERVE_MB_DEFAULT: u64 = 1024;
 
+/// task 248: `DENNO_EXPERT_FILL_FREE` の解釈 (純関数)。未設定・読めない値は既定。
+pub fn parse_fill_free(v: Option<&str>, default_on: bool) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
+    }
+}
+
+/// task 248: 既定。round 1 では off (lab の A/B で採否を決める)。
+pub const FILL_FREE_DEFAULT: bool = false;
+
+/// task 248: expert の上限を「カードの空き - 余裕」まで使うか
+/// (`DENNO_EXPERT_FILL_FREE`)。
+///
+/// on では `DENNO_EXPERT_VRAM_MB` を**下限**として扱い、上限はカードの実情
+/// (`experts_live + free - reserve`) にする。slab の空きスロット (チャンクは
+/// 確保済みで実メモリを食っている) を expert で埋められるぶん、env の値より
+/// 大きく取れる。off は従来どおり env とカードの小さい方。
+pub fn fill_free_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_fill_free(
+            std::env::var("DENNO_EXPERT_FILL_FREE").ok().as_deref(),
+            FILL_FREE_DEFAULT,
+        )
+    })
+}
+
 /// `DENNO_VRAM_BUDGET_CARD` の解釈 (未設定 = `default_on`)。
 pub fn parse_card_budget(v: Option<&str>, default_on: bool) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
@@ -399,8 +584,20 @@ pub fn card_expert_cap_from_free(
     free: usize,
     reserve: usize,
 ) -> usize {
+    card_expert_cap_from_free_with(env_cap, experts_live, free, reserve, false)
+}
+
+/// [`card_expert_cap_from_free`] の task 248 版。`fill == true` なら env を
+/// 下限として扱い、上限は常にカードの実情にする。
+pub fn card_expert_cap_from_free_with(
+    env_cap: usize,
+    experts_live: usize,
+    free: usize,
+    reserve: usize,
+    fill: bool,
+) -> usize {
     let card = experts_live.saturating_add(free.saturating_sub(reserve));
-    if env_cap == 0 {
+    if fill || env_cap == 0 {
         card
     } else {
         env_cap.min(card)
@@ -525,6 +722,26 @@ mod tests {
         set_force(Some(false));
         print_table("off", Some((1, 2)));
         request_end(10_000, 4096, Some((1, 2)));
+        let _w = peak_window("off");
+        note_alloc(TAG_WEIGHTS, 1 << 20);
+        set_force(None);
+    }
+
+    /// task 248: ピークの窓は「合計が最大になった瞬間」を 1 枚だけ控える。
+    #[test]
+    fn peak_window_keeps_the_largest_live_total() {
+        let _g = fresh();
+        set_force(Some(true));
+        let w = peak_window("t");
+        note_alloc(TAG_WEIGHTS, 100);
+        note_alloc(TAG_ARENA, 200);
+        note_free(TAG_ARENA, 200);
+        note_alloc(TAG_WEIGHTS, 50);
+        assert_eq!(peak_test_live(), Some(300), "最大は 100 + 200");
+        drop(w);
+        // 窓を閉じた後は控えない。
+        note_alloc(TAG_WEIGHTS, 10_000);
+        assert_eq!(peak_test_live(), None);
         set_force(None);
     }
 
@@ -575,6 +792,47 @@ mod tests {
         );
         // 空きが余裕を割っていても 0 で止まる (アンダーフローしない)。
         assert_eq!(card_expert_cap_from_free(0, 10 << 30, 0, reserve), 10 << 30);
+    }
+
+    /// task 248: fill on では env を下限として扱い、上限はカードの空きから引く。
+    #[test]
+    fn card_cap_fill_free_uses_the_whole_card() {
+        let reserve = 1024usize << 20;
+        let gb = 1usize << 30;
+        // チャンクが 21.5 GiB ぶん確保済み (うち 0.5 GiB は空きスロット) で
+        // 空きが 1.2 GiB。env 22,000 MiB でも 22.7 GiB まで使える。
+        let live = 22 * gb;
+        let free = reserve + gb / 8;
+        let env = 22_000usize << 20;
+        let capped = card_expert_cap_from_free(env, live, free, reserve);
+        assert_eq!(capped, env, "off は従来どおり env が上限");
+        let filled = card_expert_cap_from_free_with(env, live, free, reserve, true);
+        assert_eq!(filled, live + free - reserve, "on は空きの分だけ増える");
+        assert!(filled > capped, "fill で増えていない");
+        // env が 0 のときは on/off とも同じ (カードの実情)。
+        assert_eq!(
+            card_expert_cap_from_free_with(0, live, free, reserve, false),
+            filled
+        );
+        // 空きが余裕を割っていても live より下がらない。
+        assert_eq!(
+            card_expert_cap_from_free_with(env, live, 0, reserve, true),
+            live
+        );
+    }
+
+    /// task 248: `DENNO_EXPERT_FILL_FREE` の真偽表。
+    #[test]
+    fn fill_free_env_truth_table() {
+        assert!(!parse_fill_free(None, false));
+        assert!(parse_fill_free(None, true));
+        for on in ["1", "on", "true", "yes"] {
+            assert!(parse_fill_free(Some(on), false), "{on:?}");
+        }
+        for off in ["0", "off", "false", "no"] {
+            assert!(!parse_fill_free(Some(off), true), "{off:?}");
+        }
+        assert!(parse_fill_free(Some("なにか"), true), "読めない値は既定");
     }
 
     #[test]

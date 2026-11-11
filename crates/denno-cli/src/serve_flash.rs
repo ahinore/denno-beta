@@ -909,6 +909,9 @@ impl Flash {
     /// (`TapTokens::Last` = チャンク末尾の 1 トークンだけ)。無効時は従来の
     /// `prefill_batched` をそのまま呼ぶ (フックを付けないので数値経路は不変)。
     fn prefill_logits(&self, dec: &mut Qwen4ExpDecoder, prompt: &[u32]) -> Result<Vec<f32>> {
+        // task 248: prefill の間だけ確保の台帳のピークを控える
+        // (`DENNO_Q4_PROFILE` が無ければ guard は何もしない)。
+        let _peak = denno_engine::mem_audit::peak_window("prefill");
         if !self.tap_on() {
             return Ok(dec.prefill_batched(prompt, self.batch)?);
         }
@@ -1130,7 +1133,16 @@ impl Flash {
             Some(d) if reuse_model => d,
             other => {
                 drop(other);
-                Qwen4ExpDecoder::new(self.build_model()?, DecoderConfig::new(self.max_ctx))
+                let d =
+                    Qwen4ExpDecoder::new(self.build_model()?, DecoderConfig::new(self.max_ctx));
+                // task 248: ロード直後の VRAM 台帳 (1 回だけ)。dense 重み・
+                // ミラー・KV が載った時点で、何が何 MiB かを残す。
+                static LOAD_TABLE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOAD_TABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    denno_engine::mem_audit::print_table_here("モデルのロード直後");
+                }
+                d
             }
         };
         if !dec.seq_state_supported() {
