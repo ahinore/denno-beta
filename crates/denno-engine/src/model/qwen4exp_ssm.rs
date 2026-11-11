@@ -1248,6 +1248,41 @@ pub struct SsmAttn {
     full: Box<dyn LayerAttn>,
 }
 
+/// task 252: [`SsmAttn::seq_state_take`] の 1 層ぶんの取り出し。
+///
+/// `dev` が `Some` のとき (直前の decode を GPU が処理して**デバイスが正本**)、
+/// ホストの `state` は 1 トークン以上古い。取り出す値はデバイスのものが正しいが、
+/// **decoder に残すホスト状態は 0 に戻さなければならない**:
+///
+/// - ここを戻さないと、次のリクエストの prefill が
+///   [`SsmLayer::forward_batch_flat`] の入口で
+///   `gdn_decode_state_take` から `HostCurrent` (デバイスは既に無効化済み) を
+///   受け取り、**古いホスト状態を「ホストが正」として** CPU スキャンの種にする。
+///   結果、系列を跨いで GDN の再帰状態が化ける (本番の「プロンプトの鸚鵡返し /
+///   空応答 / 2 トークンで終わり」で、`DENNO_GDN_GPU_SCAN=0` にすると消える)。
+///
+/// `dev` が `None` (ホストが正) のときは従来どおり move で取り出し、空の領域を
+/// 置いておく (領域は使い回すので確保は増えない)。
+fn take_layer_state(
+    state: &mut GdnState,
+    dev: Option<(Vec<f32>, Vec<f32>)>,
+) -> (Vec<f32>, Vec<f32>) {
+    match dev {
+        Some(pair) => {
+            state.reset();
+            pair
+        }
+        None => {
+            let n_conv = state.conv.len();
+            let n_ssm = state.ssm.len();
+            (
+                std::mem::replace(&mut state.conv, vec![0.0; n_conv]),
+                std::mem::replace(&mut state.ssm, vec![0.0; n_ssm]),
+            )
+        }
+    }
+}
+
 impl SsmAttn {
     /// `p.layer_kind(il)` を見て ssm 層だけ [`SsmLayer`] を組む。
     /// full attention 層は [`IdentityAttn`] に委譲する。
@@ -1519,17 +1554,7 @@ impl LayerAttn for SsmAttn {
         for (i, l) in self.layers.iter_mut().enumerate() {
             match l.as_mut() {
                 Some(s) => {
-                    let pair = match dev[i].take() {
-                        Some(pair) => pair,
-                        None => {
-                            let n_conv = s.state.conv.len();
-                            let n_ssm = s.state.ssm.len();
-                            (
-                                std::mem::replace(&mut s.state.conv, vec![0.0; n_conv]),
-                                std::mem::replace(&mut s.state.ssm, vec![0.0; n_ssm]),
-                            )
-                        }
-                    };
+                    let pair = take_layer_state(&mut s.state, dev[i].take());
                     bytes += (pair.0.capacity() + pair.1.capacity()) * 4;
                     #[cfg(feature = "cuda")]
                     if crate::cuda::gdn_gpu_scan_on() {
@@ -2102,6 +2127,62 @@ mod tests {
             "ゲート on の reset で無効化が走っていない"
         );
         assert!(layer.state.ssm.iter().all(|&v| v == 0.0), "ssm が 0 でない");
+    }
+
+    /// task 252: `seq_state_take` の 1 層ぶんの取り出しは、**どちらの枝でも**
+    /// decoder に残すホスト状態を 0 に戻すこと。
+    ///
+    /// デバイスが正本の枝 (`dev = Some`) でホストを戻さないと、次のリクエストの
+    /// prefill が「ホストが正」として前の系列の GDN 状態を種にしてしまう。
+    /// 本番の「プロンプトの鸚鵡返し / 空応答」はこれで起きていた
+    /// (lab t252a: `DENNO_GDN_GPU_SCAN=0` で全ラウンドの md5 が揃う)。
+    #[test]
+    fn take_layer_state_zeroes_host_in_both_branches() {
+        let p = GdnParams {
+            n_embd: 16,
+            n_k_heads: 2,
+            n_v_heads: 4,
+            head_k_dim: 8,
+            head_v_dim: 8,
+            d_conv: 4,
+            eps: 1e-6,
+        };
+        // (a) デバイスが正本の枝: 取り出す値はデバイスのもの、ホストは 0。
+        let mut st = GdnState::new(&p);
+        for (i, v) in st.conv.iter_mut().enumerate() {
+            *v = i as f32 + 1.0;
+        }
+        for (i, v) in st.ssm.iter_mut().enumerate() {
+            *v = -(i as f32) - 1.0;
+        }
+        let dev_conv: Vec<f32> = (0..st.conv.len()).map(|i| 100.0 + i as f32).collect();
+        let dev_ssm: Vec<f32> = (0..st.ssm.len()).map(|i| 200.0 + i as f32).collect();
+        let pair = take_layer_state(&mut st, Some((dev_conv.clone(), dev_ssm.clone())));
+        assert_eq!(pair.0, dev_conv, "取り出した conv がデバイスの値でない");
+        assert_eq!(pair.1, dev_ssm, "取り出した ssm がデバイスの値でない");
+        assert!(
+            st.conv.iter().all(|&v| v == 0.0),
+            "デバイス正本の take でホスト conv が 0 に戻っていない"
+        );
+        assert!(
+            st.ssm.iter().all(|&v| v == 0.0),
+            "デバイス正本の take でホスト ssm が 0 に戻っていない"
+        );
+
+        // (b) ホストが正の枝: 従来どおり move で取り出し、0 を置く。
+        for (i, v) in st.conv.iter_mut().enumerate() {
+            *v = i as f32 + 1.0;
+        }
+        for (i, v) in st.ssm.iter_mut().enumerate() {
+            *v = -(i as f32) - 1.0;
+        }
+        let pair = take_layer_state(&mut st, None);
+        assert!(pair.0.iter().all(|&v| v != 0.0), "ホスト conv が空");
+        assert!(pair.1.iter().all(|&v| v != 0.0), "ホスト ssm が空");
+        assert!(st.conv.iter().all(|&v| v == 0.0), "ホスト conv が 0 でない");
+        assert!(st.ssm.iter().all(|&v| v == 0.0), "ホスト ssm が 0 でない");
+        assert_eq!(st.conv.len(), pair.0.len(), "conv の領域長が変わった");
+        assert_eq!(st.ssm.len(), pair.1.len(), "ssm の領域長が変わった");
     }
 
     /// task 128: Req 組み立てが実モデルの寸法と一致すること (qwen4exp 実形:
