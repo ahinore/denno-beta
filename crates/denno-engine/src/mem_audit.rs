@@ -277,6 +277,10 @@ struct PeakSnap {
     free_mb: usize,
     total_mb: usize,
     rows: Vec<(&'static str, usize, usize)>,
+    /// ピーク時の prefill ステージング (確保バイト)。
+    stage_bytes: usize,
+    /// ピーク時の arena (確保バイト, 使用ピーク)。
+    arena: Option<(usize, usize)>,
 }
 
 static PEAK: Mutex<Option<PeakSnap>> = Mutex::new(None);
@@ -301,6 +305,26 @@ pub fn print_table_here(reason: &str) {
     print_table(reason, dev_now());
 }
 
+#[cfg(feature = "cuda")]
+fn stage_now() -> usize {
+    crate::cuda::pf_stage_usage().0
+}
+
+#[cfg(not(feature = "cuda"))]
+fn stage_now() -> usize {
+    0
+}
+
+#[cfg(feature = "cuda")]
+fn arena_now() -> Option<(usize, usize)> {
+    crate::cuda::arena_usage()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn arena_now() -> Option<(usize, usize)> {
+    None
+}
+
 fn peak_note(live: usize) {
     if !PEAK_OPEN.load(Ordering::Relaxed) {
         return;
@@ -316,14 +340,21 @@ fn peak_note(live: usize) {
         return;
     }
     let label = g.as_ref().map(|p| p.label).unwrap_or("window");
-    let (free_mb, total_mb) = dev_now().unwrap_or((0, 0));
+    // 内訳を先に取る (`dev_now` は driver を叩くので、その間に別スレッドが
+    // 解放したぶんと食い違わないように)。
     let rows = ledger_rows();
+    let sum: usize = rows.iter().map(|(_, _, b)| *b).sum();
+    let stage_bytes = stage_now();
+    let arena = arena_now();
+    let (free_mb, total_mb) = dev_now().unwrap_or((0, 0));
     *g = Some(PeakSnap {
         label,
-        live,
+        live: sum,
         free_mb,
         total_mb,
         rows,
+        stage_bytes,
+        arena,
     });
 }
 
@@ -342,6 +373,8 @@ pub fn peak_window(label: &'static str) -> PeakWindow {
             free_mb: 0,
             total_mb: 0,
             rows: Vec::new(),
+            stage_bytes: 0,
+            arena: None,
         });
     }
     PEAK_OPEN.store(true, Ordering::Relaxed);
@@ -390,20 +423,24 @@ pub fn peak_end() {
         mib(p.live)
     );
     print_table(&reason, dev);
-    // task 248: 作業域の「確保」と「実際の使用」の差を出す。ここが大きいほど
-    // expert に回せる VRAM がある (arena は 1 GiB 単位で確保する)。
+    // task 248: ピーク時の作業域の内訳。arena は「確保」と「実際の使用」の差が
+    // 大きいほど expert に回せる VRAM がある (このモデルでは arena は未使用)。
     #[cfg(feature = "cuda")]
     {
-        if let Some((cap, high)) = crate::cuda::arena_usage() {
+        if let Some((cap, high)) = p.arena {
             tracing::info!(
                 "[mem-audit]   scratch arena: 確保 {} MiB / 使用ピーク {} MiB",
                 mib(cap),
                 mib(high)
             );
         }
-        let (stage, _free) = crate::cuda::pf_stage_usage();
-        tracing::info!("[mem-audit]   pf staging: 確保 {} MiB", mib(stage));
+        tracing::info!(
+            "[mem-audit]   pf staging: 確保 {} MiB (ピーク時)",
+            mib(p.stage_bytes)
+        );
     }
+    #[cfg(not(feature = "cuda"))]
+    let _ = &p;
 }
 
 /// リクエスト境界の後始末 (serve-flash / engine の両方から呼ぶ)。

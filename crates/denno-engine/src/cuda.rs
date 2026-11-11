@@ -3023,10 +3023,10 @@ pub fn alloc_keep_experts() -> bool {
 
 /// task 248: 確保 1 本が失敗したときに expert を追い出してよい上限 (バイト)。
 ///
-/// - expert タグ: 要求 + 64 MiB (driver の内部確保ぶん)。
-/// - それ以外で要求がチャンクの半分以上: 要求 + チャンク 1 本
-///   (slab はチャンクが空にならないと実メモリを返さないので、その単位でしか
-///    意味のある解放ができない)。
+/// - expert タグ: 要求 + チャンク 1 本。slab はチャンクが空にならないと実メモリを
+///   返さないので、チャンク 1 本ぶんは動かせる余地を残す (2 MB の expert 1 本でも
+///   1 チャンクは空けないと実際には戻らない)。
+/// - それ以外で要求がチャンクの半分以上: 要求 + チャンク 1 本。
 /// - それ以外: 要求 + 64 MiB。
 ///
 /// `None` は「上限なし = 従来の階段」(gate off)。
@@ -3034,15 +3034,11 @@ pub fn evict_cap_bytes(need: usize, tag: &'static str, chunk: usize, keep: bool)
     if !keep {
         return None;
     }
-    let slack = 64usize << 20;
-    if tag == crate::mem_audit::TAG_EXPERTS {
-        return Some(need.saturating_add(slack));
-    }
     let chunk = chunk.max(1 << 20);
-    if need >= chunk / 2 {
+    if tag == crate::mem_audit::TAG_EXPERTS || need >= chunk / 2 {
         Some(need.saturating_add(chunk))
     } else {
-        Some(need.saturating_add(slack))
+        Some(need.saturating_add(64 << 20))
     }
 }
 
@@ -34840,13 +34836,19 @@ mod tests {
             evict_cap_bytes(2 * mib, crate::mem_audit::TAG_OTHER, chunk, true),
             Some(2 * mib + (64 << 20))
         );
-        // expert タグ (スラブのチャンク確保 256 MiB も含む) は要求 + 64 MiB。
+        // expert タグ (スラブのチャンク確保 256 MiB も含む) は要求 + チャンク。
+        // 2 MB の expert 1 本でも、実メモリを返すには 1 チャンク空ける必要がある。
         assert_eq!(
             evict_cap_bytes(chunk, crate::mem_audit::TAG_EXPERTS, chunk, true),
-            Some(chunk + (64 << 20))
+            Some(chunk + chunk)
         );
         assert_eq!(
             evict_cap_bytes(2 * mib, crate::mem_audit::TAG_EXPERTS, chunk, true),
+            Some(2 * mib + chunk)
+        );
+        // 小さな作業域は要求 + 64 MiB のまま。
+        assert_eq!(
+            evict_cap_bytes(2 * mib, crate::mem_audit::TAG_GROUPED, chunk, true),
             Some(2 * mib + (64 << 20))
         );
         // gate off は従来 (上限なし = 階段の最後まで)。
