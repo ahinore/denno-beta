@@ -221,6 +221,17 @@ pub const DEFAULT_PF_CHUNK_STREAM: usize = 1536;
 pub const CHUNK_BALANCE_ENV: &str = "DENNO_PF_CHUNK_BALANCE";
 
 /// [`CHUNK_BALANCE_ENV`] の既定 (off = 従来の固定 1536)。
+///
+/// lab t239d (tools、c8869=3,222 tok / c2000=3,826 tok、base/bal/base2/bal2/bal3):
+///
+/// | cond | c8869 cold | c2000 cold | c8869 decode |
+/// | --- | --- | --- | --- |
+/// | base2 (基準) | 6.07 s | 7.13 s | 18.2 ms/tok |
+/// | bal/bal2/bal3 | **5.53 s** | 6.91 s | 18.5-18.6 ms/tok |
+///
+/// prefill は -8.9% (c8869) / -3.1% (c2000) だが、c8869 の decode が +2%、
+/// その機序は expert のヒット率 0.929 → 0.912 (最後のチャンクが LRU に残す
+/// 集合が変わる)。目標の「decode は 1% 以内」を超えるので**既定 off**。
 pub const DEFAULT_CHUNK_BALANCE: bool = false;
 
 /// 均等割りの 1 チャンク上限 (GDN 連鎖の境界 `GDN_CHUNK_MIN_TOKENS` = 2048 の手前)。

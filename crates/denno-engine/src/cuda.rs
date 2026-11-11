@@ -9749,8 +9749,11 @@ fn pf_pump_in(
         //    直列だった (lab t239a の c8869 cold: copy 1.39 s + DMA 0.66 s)。
         //    端数は最後の 1 枚へ寄せる。デバイスへ渡るバイト列は 1 分割と同一。
         let nspl = crate::model::exp_pf::stream_split();
+        let mut copy_acc = 0u64;
         if plan.need > 0 {
             let mut off = 0usize;
+            // 写しの時間だけを積む (enq_ns は積み込み全体。t239b で `copy_ns` へ
+            // 積み込みまで含めてしまい enq_s と同値になっていた)。
             let chunk = if nspl <= 1 {
                 plan.need
             } else {
@@ -9762,11 +9765,13 @@ fn pf_pump_in(
             };
             while off < plan.need {
                 let len = (plan.need - off).min(chunk);
+                let t_c = std::time::Instant::now();
                 if off == 0 && chunk == plan.need {
                     pf_copy_into_pin(pin_ptr as usize, &plan.parts);
                 } else {
                     pf_copy_into_pin_range(pin_ptr as usize, &plan.parts, off, len);
                 }
+                copy_acc += t_c.elapsed().as_nanos() as u64;
                 unsafe {
                     check(
                         (l.memcpy_htod_async)(
@@ -9781,7 +9786,7 @@ fn pf_pump_in(
                 off += len;
             }
         }
-        let copy_ns = t_copy.elapsed().as_nanos() as u64;
+        let copy_ns = copy_acc;
         dbg_htod(plan.need);
         // 4. 完了イベントを積む。
         let Some(record) = l.event_record else {
