@@ -196,14 +196,48 @@ __device__ __forceinline__ void dno_tc_w8_iq4xs(const unsigned char* rowp, int k
     }
 }
 
-// 型番号: 0 = IQ2_S / 1 = IQ3_XXS / 2 = IQ3_S / 3 = IQ4_XS
+// IQ4_NL: d(2B) + qs[16] = 18 B / 32 要素 (kernels_exp_iq_pf.cu の
+// dno_exp_pf_iq4nl と同じ読み方。要素 0..15 が下ニブル、16..31 が上ニブル)。
+__device__ __forceinline__ void dno_tc_w8_iq4nl(const unsigned char* rowp, int k0, int j, float* w)
+{
+    const int s = k0 >> 5;
+    const unsigned char* blk = rowp + (size_t)s * 18u;
+    const float d = dno_tcq_f16(blk);
+    const int half = j >> 1;      // 0 = 下ニブル (要素 0..15) / 1 = 上ニブル (16..31)
+    const int b0 = (j & 1) * 8;   // 32 ブロック内のバイト位置
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const unsigned int byte = (unsigned int)blk[2 + b0 + u];
+        const unsigned int q = half ? (byte >> 4) : (byte & 0x0fu);
+        w[u] = d * (float)dno_kvalues_iq4nl[q];
+    }
+}
+
+// Q2_0: d(2B) + qs[16] = 18 B / 64 要素 (値は (q - 1) * d)。
+__device__ __forceinline__ void dno_tc_w8_q2_0(const unsigned char* rowp, int k0, int j, float* w)
+{
+    const int b = k0 >> 6;   // 64 要素ブロック
+    const unsigned char* blk = rowp + (size_t)b * 18u;
+    const float d = dno_tcq_f16(blk);
+    const int ofs = (k0 & 63) + j * 8;
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const int p = ofs + u;
+        const unsigned int q = ((unsigned int)blk[2 + (p >> 2)] >> ((p & 3) * 2)) & 3u;
+        w[u] = (float)((int)q - 1) * d;
+    }
+}
+
+// 型番号: 0 = IQ2_S / 1 = IQ3_XXS / 2 = IQ3_S / 3 = IQ4_XS / 4 = IQ4_NL / 5 = Q2_0
 template <int TY>
 __device__ __forceinline__ void dno_tc_w8(const unsigned char* rowp, int k0, int j, float* w)
 {
     if (TY == 0) dno_tc_w8_iq2s(rowp, k0, j, w);
     else if (TY == 1) dno_tc_w8_iq3xxs(rowp, k0, j, w);
     else if (TY == 2) dno_tc_w8_iq3s(rowp, k0, j, w);
-    else dno_tc_w8_iq4xs(rowp, k0, j, w);
+    else if (TY == 3) dno_tc_w8_iq4xs(rowp, k0, j, w);
+    else if (TY == 4) dno_tc_w8_iq4nl(rowp, k0, j, w);
+    else dno_tc_w8_q2_0(rowp, k0, j, w);
 }
 
 // 8 個の f32 を bf16 に丸めて 16 B で書く (dst は 16 B 整列)。
@@ -554,4 +588,20 @@ extern "C" __global__ void dno_exp_tc_dn_iq4xs(
     const unsigned int* __restrict__ rows, int nseg, int n_in, int n_out, int row_bytes)
 {
     dno_tc_body_dn<3>(wdtab, x, out, seg, rows, nseg, n_in, n_out, row_bytes);
+}
+
+extern "C" __global__ void dno_exp_tc_dn_iq4nl(
+    const unsigned long long* __restrict__ wdtab, const float* __restrict__ x,
+    float* __restrict__ out, const unsigned int* __restrict__ seg,
+    const unsigned int* __restrict__ rows, int nseg, int n_in, int n_out, int row_bytes)
+{
+    dno_tc_body_dn<4>(wdtab, x, out, seg, rows, nseg, n_in, n_out, row_bytes);
+}
+
+extern "C" __global__ void dno_exp_tc_dn_q2_0(
+    const unsigned long long* __restrict__ wdtab, const float* __restrict__ x,
+    float* __restrict__ out, const unsigned int* __restrict__ seg,
+    const unsigned int* __restrict__ rows, int nseg, int n_in, int n_out, int row_bytes)
+{
+    dno_tc_body_dn<5>(wdtab, x, out, seg, rows, nseg, n_in, n_out, row_bytes);
 }

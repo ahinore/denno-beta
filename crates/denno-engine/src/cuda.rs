@@ -11116,11 +11116,13 @@ const TC_GU_NAMES: [&str; 4] = [
     "dno_exp_tc_gu_iq3s",
     "dno_exp_tc_gu_iq4xs",
 ];
-const TC_DN_NAMES: [&str; 4] = [
+const TC_DN_NAMES: [&str; 6] = [
     "dno_exp_tc_dn_iq2s",
     "dno_exp_tc_dn_iq3xxs",
     "dno_exp_tc_dn_iq3s",
     "dno_exp_tc_dn_iq4xs",
+    "dno_exp_tc_dn_iq4nl",
+    "dno_exp_tc_dn_q2_0",
 ];
 
 /// `.cu` の `EXTC_BM` / `EXTC_BN` / `EXTC_THREADS` と一致させること。
@@ -11137,8 +11139,8 @@ struct ExpTcKernels {
     module: CUmodule,
     /// gate/up (silu 込み) の型ごと
     gu: [CUfunction; 4],
-    /// down の型ごと
-    dn: [CUfunction; 4],
+    /// down の型ごと (`exp_iq::slot` の 0..=5)
+    dn: [CUfunction; 6],
 }
 
 unsafe impl Send for ExpTcKernels {}
@@ -11201,8 +11203,8 @@ fn exp_tc_kernels() -> Option<&'static ExpTcKernels> {
                     return None;
                 }
             }
-            let get = |names: &[&str; 4]| -> Option<[CUfunction; 4]> {
-                let mut out: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+            let get = |names: &[&str]| -> Option<Vec<CUfunction>> {
+                let mut out: Vec<CUfunction> = vec![std::ptr::null_mut(); names.len()];
                 for (i, f) in out.iter_mut().enumerate() {
                     let mut cname = names[i].as_bytes().to_vec();
                     cname.push(0);
@@ -11217,8 +11219,8 @@ fn exp_tc_kernels() -> Option<&'static ExpTcKernels> {
                 }
                 Some(out)
             };
-            let gu = get(&TC_GU_NAMES)?;
-            let dn = get(&TC_DN_NAMES)?;
+            let gu: [CUfunction; 4] = get(&TC_GU_NAMES)?.try_into().ok()?;
+            let dn: [CUfunction; 6] = get(&TC_DN_NAMES)?.try_into().ok()?;
             Some(ExpTcKernels { module, gu, dn })
         })
         .as_ref()
@@ -11227,8 +11229,9 @@ fn exp_tc_kernels() -> Option<&'static ExpTcKernels> {
 /// task 250: この形を tensor core の grouped GEMM で回せるか (純関数)。
 ///
 /// - gate と up が同じ型 (1 回の起動で 2 枚を同時にデコードする)
-/// - 4 型 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS) のどれか
-/// - k が 256 の倍数 (IQ の 256 要素ブロック)、n が [`EXTC_BN`] の倍数 (端数タイル無し)
+/// - gate/up は 4 型 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS)、down はそれに
+///   IQ4_NL / Q2_0 を足した 6 型
+/// - k が型のブロックで割り切れる、n が [`EXTC_BN`] の倍数 (端数タイル無し)
 pub fn tc_shapes_ok(
     gu_slot: Option<usize>,
     dn_slot: Option<usize>,
@@ -11238,13 +11241,21 @@ pub fn tc_shapes_ok(
     n_gu: usize,
     n_dn: usize,
 ) -> bool {
+    // gate/up は 256 要素ブロックの 4 型だけ (このモデルの gate/up はこの 4 型)。
+    let gu_ok = matches!(gu_slot, Some(0..=3)) && k_gu % 256 == 0;
+    // down は IQ4_NL (32 要素) / Q2_0 (64 要素) も受ける
+    // (実モデルの down はこの 2 型。P202)。
+    let dn_ok = match dn_slot {
+        Some(0..=3) => k_dn % 256 == 0,
+        Some(4) => k_dn % 32 == 0,
+        Some(5) => k_dn % 64 == 0,
+        _ => false,
+    };
     ty_same
-        && matches!(gu_slot, Some(0..=3))
-        && matches!(dn_slot, Some(0..=3))
+        && gu_ok
+        && dn_ok
         && k_gu > 0
         && k_dn > 0
-        && k_gu % 256 == 0
-        && k_dn % 256 == 0
         && n_gu % EXTC_BN == 0
         && n_dn % EXTC_BN == 0
 }
@@ -12311,7 +12322,23 @@ mod pf_exp_tc_tests {
                 let q = if half != 0 { qs[u] >> 4 } else { qs[u] & 0x0f };
                 dl * KVALUES_IQ4NL[q as usize] as f32
             }
-            _ => unreachable!("4 型だけ"),
+            GgmlType::IQ4Nl => {
+                let blk = &row[(k >> 5) * 18..];
+                let d = f16v(blk);
+                let half = j >> 1;
+                let b0 = (j & 1) * 8;
+                let byte = blk[2 + b0 + u] as u32;
+                let q = if half != 0 { byte >> 4 } else { byte & 0x0f };
+                d * KVALUES_IQ4NL[q as usize] as f32
+            }
+            GgmlType::Q2_0 => {
+                let blk = &row[(k >> 6) * 18..];
+                let d = f16v(blk);
+                let p = k & 63;
+                let q = ((blk[2 + (p >> 2)] as u32) >> ((p & 3) * 2)) & 3;
+                ((q as i32) - 1) as f32 * d
+            }
+            _ => unreachable!("6 型だけ"),
         }
     }
 
@@ -12341,6 +12368,8 @@ mod pf_exp_tc_tests {
             (GgmlType::IQ3Xxs, 12),
             (GgmlType::IQ3S, 13),
             (GgmlType::IQ4Xs, 14),
+            (GgmlType::IQ4Nl, 15),
+            (GgmlType::Q2_0, 16),
         ] {
             let n = 512usize;
             let row = make_row(ty, n, seed);
@@ -12384,9 +12413,12 @@ mod pf_exp_tc_tests {
         assert!(tc_shapes_ok(Some(1), Some(3), true, 2560, 1024, 1024, 2560));
         // gate と up が違う型は不可。
         assert!(!tc_shapes_ok(Some(1), Some(3), false, 2560, 1024, 1024, 2560));
-        // IQ4_NL / Q2_0 (slot 4/5) はこのカーネルの対象外。
+        // down は IQ4_NL (slot 4) / Q2_0 (slot 5) も受ける (実モデルの down)。
+        assert!(tc_shapes_ok(Some(1), Some(4), true, 2560, 1024, 1024, 2560));
+        assert!(tc_shapes_ok(Some(1), Some(5), true, 2560, 1024, 1024, 2560));
+        // gate/up が IQ4_NL / Q2_0 はこのカーネルの対象外。
         assert!(!tc_shapes_ok(Some(4), Some(3), true, 2560, 1024, 1024, 2560));
-        assert!(!tc_shapes_ok(Some(1), Some(5), true, 2560, 1024, 1024, 2560));
+        assert!(!tc_shapes_ok(Some(5), Some(3), true, 2560, 1024, 1024, 2560));
         // k が 256 の倍数でない / n が 64 の倍数でない。
         assert!(!tc_shapes_ok(Some(1), Some(3), true, 2432, 1024, 1024, 2560));
         assert!(!tc_shapes_ok(Some(1), Some(3), true, 2560, 1024, 1000, 2560));
