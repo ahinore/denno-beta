@@ -38,8 +38,8 @@
   .banner.both { border-color:#8a2a4a; background:rgba(255,59,48,.16); color:#ff9db0; }
 
   main { display:grid; grid-template-columns:340px minmax(500px,1fr) 338px;
-         height:calc(100% - 42px); }
-  section { min-width:0; display:flex; flex-direction:column; padding:8px 10px; }
+         grid-template-rows:minmax(0,1fr); height:calc(100% - 42px); }
+  section { min-width:0; min-height:0; display:flex; flex-direction:column; padding:8px 10px; }
   #chatpane { border-right:1px solid var(--line); }
   #ctrl { border-left:1px solid var(--line); overflow-y:auto; gap:8px; }
   h2 { font-size:11px; font-weight:400; letter-spacing:.10em; color:var(--dim);
