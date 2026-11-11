@@ -11697,6 +11697,12 @@ pub(crate) fn pf_dev_in_on() -> bool {
 ///
 /// on にすると、full attention 層の attn mix は `mixed` を D2H せず、直後の
 /// qkv がデバイスの `mixed` を直接読む (H2D 1 本と D2H 1 本を消す)。
+///
+/// lab t230b (d9f3d10、14,018 cold prefill) では 240 回の full 層 mix のうち
+/// 120 回だけ常駐経路に乗り、mix 段 1,103.9 → 1,069.8 ms (-34 ms、D2H
+/// 13,780 → 12,058 MB、full の H2D 480 → 360 本 = -1.72 GB) と小さく、
+/// 全体は b0 27.40 s → 28.54 s (+4.2%)。目標の -4% に届かないので既定 off。
+/// md5 は全条件 SAME (同じバイト列をデバイスから読むだけで値は変えない)。
 pub(crate) fn pf_mix_keep_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
@@ -24290,8 +24296,18 @@ pub(crate) const ATTN_PF2_BQ: usize = 64;
 
 /// task 230: `DENNO_PF_ATTN_V3` の値の解釈 (純関数)。明示的な真値だけ on。
 ///
-/// **既定 off** (lab t230b で測ってから決める)。`1` で v3 カーネル
+/// **既定 off** (lab t230b で不採用が決まった)。`1` で v3 カーネル
 /// (PV も bf16 mma・head 優先グリッド・行最大は最初のタイルで 1 回)。
+///
+/// lab t230b (d9f3d10、depth8k、PROFILE=1、PTX=attn_pf3、14,018 cold prefill) の
+/// 台帳では **full 段は 2,036.8 → 1,196.1 ms (-41%、gpu 1,638.5 → 850.2)** と
+/// 狙いどおり速い。しかし全体は b0 27.40 s → 27.93 s (+1.9%、同 env の base2 は
+/// 27.11 s) で、目標の -4% (1.10 s) に届かない。-841 ms を全部足しても -3.1% が
+/// 上限。差の大半はホスト側の "other" 段 (1,711.4 → 3,010.0 ms) で、v3 を
+/// 使わない mixkeep でも 2,950.6 ms に伸びる (共有ホストの負荷揺れ)。
+/// 3,826 は 7.51 → 7.43 s (-1.1%)、decode は v3 を通らない (nt < 64) ので
+/// 短いプロンプトで +0.2%。text は sane、errors 0、md5 は c2000_turn2 と
+/// c8000 で DIFF (p と V の bf16 丸め、相対 5e-3 は CPU 模擬で固定済み)。
 pub(crate) fn pf_attn_v3_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
