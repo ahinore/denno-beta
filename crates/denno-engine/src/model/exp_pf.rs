@@ -469,6 +469,142 @@ pub fn stream_wc() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// task 227: 転送 (写し + DMA) の詰まりを取るための 3 本
+// ---------------------------------------------------------------------------
+//
+// 台帳 (REPORT_P226 §2) では 14k の転送 14.76 s のうち写しが 5.90 s、
+// H2D のブロックが 8.85 s。どちらも同じホストメモリ帯域を食い、しかも
+// **1 グループ = 「全部写す → 1 回 DMA → 待つ」の直列**なので、
+// バイトを減らしても時間が動かなかった。以下は独立に切り替えられる。
+
+/// `DENNO_PF_STREAM_CHUNK_KB`: バウンスと DMA を何 KB ずつ交互に流すか
+/// (0 = 従来どおりグループ全体を 1 回で写して 1 回で DMA)。
+///
+/// 小さく刻むと、DMA が読むバイトが L3 (16 MB) / L2 に残っている間に
+/// 流せる可能性がある (推定。lab で測る)。値は 64 KiB..65536 KiB に丸める。
+pub const STREAM_CHUNK_KB_ENV: &str = "DENNO_PF_STREAM_CHUNK_KB";
+
+/// [`STREAM_CHUNK_KB_ENV`] の既定値 (0 = 従来の直列)。
+pub const DEFAULT_STREAM_CHUNK_KB: usize = 0;
+
+/// 1 回に流すバイト数 (0 = 従来経路)。
+pub fn stream_chunk_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let kb = env_usize(STREAM_CHUNK_KB_ENV, DEFAULT_STREAM_CHUNK_KB);
+        if kb == 0 {
+            return 0;
+        }
+        kb.clamp(64, 65536) << 10
+    })
+}
+
+/// `DENNO_PF_STREAM_SRC`: DMA の転送元。
+///
+/// - `pin` (既定): mmap → WC pinned のバウンスを挟む (task 162 の経路)
+/// - `page`: mmap のページをそのまま pageable として DMA する (写しを消す。
+///   driver が内部でバウンスする。ホスト側は呼び出しの間ブロックする)
+/// - `reg`: mmap のページを `cuMemHostRegister` で pin して直接 DMA する
+///   (写しを消し、DMA も pinned 速度。driver が file backed を拒否したら
+///   スライス単位で `page` へ落ちる)
+pub const STREAM_SRC_ENV: &str = "DENNO_PF_STREAM_SRC";
+
+/// [`STREAM_SRC_ENV`] の既定値 (0 = pin バウンス)。
+pub const DEFAULT_STREAM_SRC: u8 = 0;
+
+/// 転送元の解釈 (純関数)。未知の値は既定 (pin) に落とす。
+pub fn stream_src_from_value(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("page") => 1,
+        Some("reg") => 2,
+        _ => DEFAULT_STREAM_SRC,
+    }
+}
+
+/// 転送元 (`DENNO_PF_STREAM_SRC`、プロセスで 1 回だけ読む)。
+pub fn stream_src() -> u8 {
+    static N: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *N.get_or_init(|| stream_src_from_value(std::env::var(STREAM_SRC_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_REG_MB`: `DENNO_PF_STREAM_SRC=reg` で pin する上限 (MiB、既定 16384)。
+///
+/// pin したページはカーネルが回収できないので、モデル全体 (約 50 GB) を
+/// pin すると RAM が足りなくなる。上限を超えたぶんは pageable で積む。
+pub const REG_MB_ENV: &str = "DENNO_PF_REG_MB";
+
+/// [`REG_MB_ENV`] の既定値 (MiB)。
+pub const DEFAULT_REG_MB: usize = 16384;
+
+/// pin してよいバイト数。
+pub fn reg_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(REG_MB_ENV, DEFAULT_REG_MB).saturating_mul(1 << 20))
+}
+
+/// `DENNO_PF_LM_LAYER=1`: prefill の層ループを層優先にする (task 227、既定 off)。
+///
+/// いまはチャンク優先 (チャンク → 全 48 層) なので、1 つの expert が
+/// **チャンクの数だけ** H2D で運ばれる (14k で 9 パス = 158.5 GB)。層優先にすると
+/// 1 プロンプトで 1 回 (48 層 × 512 本 = 50 GB が上限) になり、VRAM の
+/// expert キャッシュも要らない (同じ expert を二度使わない)。
+/// 代償は、層のあいだ全チャンクの残差を保持すること (n_tokens × n_embd × hc × 4)。
+///
+/// # 実測 (lab t227b、sha 9de5b3d2b、depth8k)
+///
+/// バイトは狙いどおり減った: 14k の `[exp-pf-stream] up_MB` は 158.5 GB →
+/// **46.7 GB (-70%)**、copy_s 5.90 → 2.40。ところが壁時計は 3.8k +2.3% /
+/// 14k **+21.6%**、14k 後の decode は 18.4 → 36.0 ms/tok で、**採らない**
+/// (`ADOPT: no`)。理由は層でまとめたぶん、全トークンの活性 (14k で 143 MB) を
+/// router / shared / expert 段で 3 回上げ直し (48 層で 20.6 GB)、shared と
+/// expert の出力 13.8 GB を戻すため。加えて MoE の作業域 2.7 GB と事前の
+/// 追い出し 6 GB が decode のヒット率を落とす。
+/// 次に採るなら **活性をデバイスに残したまま** 層優先を回すこと (REPORT_P227 §7)。
+///
+/// # 実測 (task 233 / 242 で活性をデバイスに残した版)
+///
+/// 往復 (14k で 34 GB) は消え、3,826 tok は base 比 -10〜12% まで来た回もある。
+/// しかし 14,018 tok は **+8〜17%** で目標 (-10%) に届かず、14k 後の decode も
+/// base の 1.6 倍 (lab t242c: ヒット率 0.829 対 0.973、decode 23.0 対 18.1 ms/tok)。
+/// 原因は 3 つ:
+/// (1) グループのポインタ表の同期 H2D (層あたり 243-410 ms) は非同期化しても
+///     待ちが「ステージングの再利用待ち」に移っただけで、14k では消えない
+///     (`use_s` 11.2-11.9 s)。層優先は 1 expert あたりの行数が多いので、GEMV が
+///     重みではなく活性の再読みで律速になる。
+/// (2) 14k では `h` (1,505 MiB) の連続確保が失敗し、追い出し階段が expert の
+///     LRU を全部捨てる (slab がチャンク単位でしか返さない)。
+/// (3) 作業域を小さくする `DENNO_PF_LM_GL` と、追い出した expert を戻す
+///     `DENNO_PF_LM_RELOAD` はどちらも壁時計を改善しなかった (下記の各 doc)。
+/// **採らない** (`ADOPT: no` t242c)。ゲートは 3 本とも既定 off のまま残す。
+pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
+
+/// `DENNO_PF_LM_LAYER` の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn lm_layer_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 層優先 prefill を使うか (プロセスで 1 回だけ env を読む)。
+pub fn lm_layer_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lm_layer_from_value(std::env::var(LM_LAYER_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_DMA_PROBE=1`: prefill の先頭で 1 回だけ H2D の素の速度を測る
+/// (診断専用・既定 off)。測るのは `[pf-probe]` の 1 行群で、数値経路は変えない。
+pub const DMA_PROBE_ENV: &str = "DENNO_PF_DMA_PROBE";
+
+/// `DENNO_PF_DMA_PROBE` の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn dma_probe_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 素の H2D を測るか (プロセスで 1 回だけ env を読む)。
+pub fn dma_probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dma_probe_from_value(std::env::var(DMA_PROBE_ENV).ok().as_deref()))
+}
+
 /// 型 → カーネルのスロット (decode の `kernels_exp_iq` と同じ順)。
 pub fn slot(ty: GgmlType) -> Option<usize> {
     crate::model::exp_iq::slot(ty)
@@ -662,6 +798,39 @@ pub fn row_table_full(
     Some(prow)
 }
 
+/// task 233: 行の加重和の表に「共有 expert の行」を 1 列足す (純関数)。
+///
+/// `prow` / `wrow` は `ntok * k` (行は expert 昇順、加重和の項の順そのもの)。
+/// 戻り値は `ntok * (k + 1)` で、各トークンの**最後の 1 項**が共有 expert の
+/// 行 (`shared_row0 + t`) と係数 `sh_w[t]` になる。共有 expert の出力を MoE の
+/// 作業域の末尾の行へ書いておけば、加重和のカーネル 1 回で routed と共有が
+/// 同じ出力に載る (ホストへ戻さない)。
+pub fn row_table_with_shared(
+    prow: &[u32],
+    wrow: &[f32],
+    ntok: usize,
+    k: usize,
+    shared_row0: usize,
+    sh_w: &[f32],
+) -> Option<(Vec<u32>, Vec<f32>)> {
+    if k == 0 || ntok == 0 || prow.len() != ntok * k || wrow.len() < ntok * k {
+        return None;
+    }
+    if sh_w.len() < ntok || shared_row0 > u32::MAX as usize {
+        return None;
+    }
+    let kk = k + 1;
+    let mut pr = vec![0u32; ntok * kk];
+    let mut wr = vec![0f32; ntok * kk];
+    for t in 0..ntok {
+        pr[t * kk..t * kk + k].copy_from_slice(&prow[t * k..(t + 1) * k]);
+        wr[t * kk..t * kk + k].copy_from_slice(&wrow[t * k..(t + 1) * k]);
+        pr[t * kk + k] = (shared_row0 + t) as u32;
+        wr[t * kk + k] = sh_w[t];
+    }
+    Some((pr, wr))
+}
+
 /// task 162: 載っていない (t, j) を「重み 0・行 0」にして和から外す。
 ///
 /// `prow` の穴を 0 で埋め、`weights` の同じ位置を 0.0 にする。0 × 有限値 = 0
@@ -709,6 +878,101 @@ pub fn group_bounds(needs: &[usize], cap: usize, max_group: usize) -> Option<Vec
     Some(out)
 }
 
+/// task 242: グループ局所の g/u/act に要る行数 (グループの最大行数)。
+///
+/// `seg` は 4 語 × segment (`[行数, 行の先頭, 0, 0]`)、`bounds` は
+/// [`group_bounds`] の結果 (segment の index 範囲)。層優先 prefill は
+/// カーネルの出力ポインタを `先頭 - グループ先頭行 * n_out * 4` で渡すので、
+/// g/u/act は**この行数**だけ持てばよい (14k で 0.86 GB → 0.11 GB)。
+///
+/// 範囲外・空なら `None` (呼び出し側は従来の全体サイズへ落ちる)。
+pub fn max_group_rows(seg: &[u32], bounds: &[(usize, usize)]) -> Option<usize> {
+    if seg.len() % 4 != 0 || bounds.is_empty() {
+        return None;
+    }
+    let nseg = seg.len() / 4;
+    let mut mx = 0usize;
+    for &(a, b) in bounds {
+        if a >= b || b > nseg {
+            return None;
+        }
+        let last = b - 1;
+        let start = seg[a * 4 + 1] as usize;
+        let end = (seg[last * 4 + 1] as usize).checked_add(seg[last * 4] as usize)?;
+        if end < start {
+            return None;
+        }
+        mx = mx.max(end - start);
+    }
+    if mx == 0 {
+        return None;
+    }
+    Some(mx)
+}
+
+/// task 242: グループ局所用に、各 segment の行の先頭を**グループの先頭から**の
+/// 相対番号へ直した `seg` を返す (`[行数, 行の先頭, 0, 0]` × segment)。
+///
+/// カーネルは出力を `obase + (s.ro + r)*n_out` に書き、入力を
+/// `rows[s.ro + r]` から読む。グループ局所では `obase` をグループのバッファの
+/// 先頭にしたいので `s.ro` を 0 起点にし、行表 (`rows_gu` / `rows_id`) の
+/// ポインタをグループ先頭行だけ足して渡す (呼び出し側)。
+///
+/// 行の先頭がグループの先頭より小さければ `None` (plan の並びが壊れている)。
+pub fn seg_group_local(seg: &[u32], bounds: &[(usize, usize)]) -> Option<Vec<u32>> {
+    if seg.len() % 4 != 0 || bounds.is_empty() {
+        return None;
+    }
+    let nseg = seg.len() / 4;
+    let mut out = seg.to_vec();
+    for &(a, b) in bounds {
+        if a >= b || b > nseg {
+            return None;
+        }
+        let base = seg[a * 4 + 1];
+        for i in a..b {
+            let off = out[i * 4 + 1];
+            out[i * 4 + 1] = off.checked_sub(base)?;
+        }
+    }
+    Some(out)
+}
+
+/// task 242: グループ局所の g/u/act を使うか (`DENNO_PF_LM_GL`)。
+/// **既定 off**。`1` / `on` / `true` で有効。
+///
+/// 効くのは層優先 prefill の**デバイス出力**のときだけ (チャンク経路の
+/// ホスト出力は従来どおり全体サイズ)。
+///
+/// lab t242b の実測では狙いどおり作業域が 2,870 → 2,100 MiB、追い出しが
+/// 2,371 → 1,603 MiB、14k のストリーミングが 46.1 → 35.0 GB になった。
+/// しかし lab t242c (GL のみ) の壁時計は 3,826 tok -1% / 14,018 tok **+17%** で、
+/// GL を切った t242b の lmno (+7.6%) より悪い (別 run なので断定はできない)。
+/// 採否 no なので既定 off。
+pub fn lm_group_local() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("DENNO_PF_LM_GL").ok() {
+        Some(s) => matches!(s.trim(), "1" | "on" | "true"),
+        None => false,
+    })
+}
+
+/// task 242: 層優先 prefill が追い出した expert を終端で戻すか
+/// (`DENNO_PF_LM_RELOAD`)。**既定 off**。`1` / `on` / `true` で有効。
+///
+/// lab t242b の実測: 戻すのに 809 本 / 1,603 MiB で +0.8-1.5 秒かかり、
+/// しかも 14k 後の decode のヒット率は 0.837 のまま (base は 0.973) だった。
+/// 理由は prefill の途中で 1,505 MiB の `h` を確保できず、`DevBuffer` の
+/// 追い出し階段が expert の LRU を全部捨てるため (戻した分も一緒に消える)。
+/// つまり戻す相手が残っていない。ゲートは残すが既定 off。
+pub fn lm_reload_evicted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("DENNO_PF_LM_RELOAD").ok() {
+        Some(s) => matches!(s.trim(), "1" | "on" | "true"),
+        None => false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 1 リクエストぶんの観測 (REPORT 用)
 // ---------------------------------------------------------------------------
@@ -741,6 +1005,8 @@ static STREAM_ENQ_NS: AtomicU64 = AtomicU64::new(0);
 static STREAM_READY_NS: AtomicU64 = AtomicU64::new(0);
 /// task 165: ステージングの再利用待ち (前のグループの計算完了待ち)。
 static STREAM_SLOT_NS: AtomicU64 = AtomicU64::new(0);
+/// task 233: スロット再利用前の「計算完了イベント」待ち (診断。今まで台帳に出ていなかった)。
+static STREAM_USE_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
 static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 上げの回数 (グループ数)。
@@ -751,6 +1017,24 @@ static STREAM_SPILL: AtomicU64 = AtomicU64::new(0);
 static STREAM_CPU_MISS_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 最初のグループで測った実 H2D 速度 (GB/s × 1000、0 = 未測)。
 static STREAM_PROBE_MBPS: AtomicU64 = AtomicU64::new(0);
+/// task 227: `cuMemHostRegister` を試したバイト数 / 通ったバイト数 / 回数 / 時間。
+static REG_BYTES: AtomicU64 = AtomicU64::new(0);
+static REG_OK_BYTES: AtomicU64 = AtomicU64::new(0);
+static REG_CALLS: AtomicU64 = AtomicU64::new(0);
+static REG_NS: AtomicU64 = AtomicU64::new(0);
+/// task 227: 通ったフラグ (u32::MAX = まだ通っていない)。
+static REG_FLAGS: AtomicU64 = AtomicU64::new(u32::MAX as u64);
+
+/// task 227: `cuMemHostRegister` の 1 回ぶんを積む。
+pub fn note_reg(bytes: usize, ok: bool, ns: u64, flags: u32) {
+    REG_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    REG_CALLS.fetch_add(1, Ordering::Relaxed);
+    REG_NS.fetch_add(ns, Ordering::Relaxed);
+    if ok {
+        REG_OK_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        REG_FLAGS.store(flags as u64, Ordering::Relaxed);
+    }
+}
 
 /// 1 層ぶんの参照を積む (`lookups` = 選択 expert 数、`hits` = 載っていた数)。
 pub fn note_lookup(lookups: u32, hits: u32) {
@@ -821,6 +1105,11 @@ pub fn note_stream_group(
     STREAM_READY_NS.fetch_add(ready_ns, Ordering::Relaxed);
     STREAM_WAIT_NS.fetch_add(wait_ns, Ordering::Relaxed);
     STREAM_SLOT_NS.fetch_add(slot_ns, Ordering::Relaxed);
+}
+
+/// task 233: スロット再利用前の計算完了待ちの時間を積む (診断)。
+pub fn note_stream_use_ns(ns: u64) {
+    STREAM_USE_NS.fetch_add(ns, Ordering::Relaxed);
 }
 
 /// task 162: ストリーミングで 1 層を GPU に載せた。
@@ -917,6 +1206,7 @@ pub fn stats_line() -> Option<String> {
         let enq = STREAM_ENQ_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let ready = STREAM_READY_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let slotw = STREAM_SLOT_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let use_s = STREAM_USE_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let exps = STREAM_EXPERTS.load(Ordering::Relaxed);
         let rows = STREAM_ROWS.load(Ordering::Relaxed);
         // 1000 倍して持っている MB/s を GB/s へ。
@@ -924,8 +1214,9 @@ pub fn stats_line() -> Option<String> {
         out.push_str(&format!(
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
-             ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={}",
+             ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={} \
+             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -940,6 +1231,13 @@ pub fn stats_line() -> Option<String> {
             u8::from(stream_ut()),
             stream_group(),
             stream_min_tok(),
+            stream_chunk_bytes() >> 10,
+            stream_src(),
+            REG_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+            REG_OK_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+            REG_CALLS.load(Ordering::Relaxed),
+            REG_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            REG_FLAGS.load(Ordering::Relaxed) as u32,
         ));
     }
     Some(out)
@@ -973,6 +1271,10 @@ pub fn stats_reset() {
         &STREAM_SPILL,
         &STREAM_CPU_MISS_NS,
         &STREAM_PROBE_MBPS,
+        &REG_BYTES,
+        &REG_OK_BYTES,
+        &REG_CALLS,
+        &REG_NS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -1112,6 +1414,166 @@ mod tests {
         seen.sort_unstable();
         want.sort_unstable();
         assert_eq!(seen, want, "行の取りこぼし・重複がある");
+    }
+
+    /// task 242: グループ局所の g/u/act に要る行数は「グループの最大行数」。
+    ///
+    /// カーネルは行の添字が絶対なので、呼び出し側は
+    /// `ポインタ - グループ先頭行 * n_out * 4` で渡す。この行数だけ持てば、
+    /// どのグループも自分の範囲しか触らない。
+    #[test]
+    fn max_group_rows_is_the_largest_group_span() {
+        // 6 expert / 行数 3,1,2,4,1,2 (合計 13)。
+        let seg: Vec<u32> = vec![
+            3, 0, 0, 0, // rows 0..3
+            1, 3, 0, 0, // rows 3..4
+            2, 4, 0, 0, // rows 4..6
+            4, 6, 0, 0, // rows 6..10
+            1, 10, 0, 0, // rows 10..11
+            2, 11, 0, 0, // rows 11..13
+        ];
+        // 2 グループ: 0..6 は 6 行、6..13 は 7 行。
+        assert_eq!(max_group_rows(&seg, &[(0, 3), (3, 6)]), Some(7));
+        // 1 グループなら全体 (13 行)。
+        assert_eq!(max_group_rows(&seg, &[(0, 6)]), Some(13));
+        // 3 グループ: 6 / 4 / 2 行。
+        assert_eq!(max_group_rows(&seg, &[(0, 3), (3, 4), (4, 6)]), Some(6));
+        // 壊れた入力は None (呼び出し側は従来の全体サイズへ落ちる)。
+        assert_eq!(max_group_rows(&seg, &[]), None);
+        assert_eq!(max_group_rows(&seg[..11], &[(0, 3)]), None);
+        assert_eq!(max_group_rows(&seg, &[(0, 9)]), None);
+        assert_eq!(max_group_rows(&seg, &[(2, 2)]), None);
+        // group_bounds の結果と組み合わせても一致する。
+        let needs = vec![100usize, 100, 100, 100, 100, 100];
+        let bounds = group_bounds(&needs, 350, 64).expect("3 本ずつ 2 グループ");
+        assert_eq!(bounds, vec![(0, 3), (3, 6)]);
+        assert_eq!(max_group_rows(&seg, &bounds), Some(7));
+    }
+
+    /// task 242: グループ局所の `seg` は各行の先頭がグループ先頭から 0 起点に
+    /// なり、行表をグループ先頭行だけ足して渡せば元の行に対応する。
+    #[test]
+    fn seg_group_local_rebases_each_group_to_zero() {
+        let seg: Vec<u32> = vec![
+            3, 0, 0, 0, // rows 0..3
+            1, 3, 0, 0, // rows 3..4
+            2, 4, 0, 0, // rows 4..6
+            4, 6, 0, 0, // rows 6..10
+            1, 10, 0, 0, // rows 10..11
+            2, 11, 0, 0, // rows 11..13
+        ];
+        let bounds = vec![(0usize, 3usize), (3, 6)];
+        let gl = seg_group_local(&seg, &bounds).expect("直せる");
+        assert_eq!(gl.len(), seg.len());
+        // 行数は変えない。
+        for i in 0..6 {
+            assert_eq!(gl[i * 4], seg[i * 4], "segment {i} の行数が変わった");
+        }
+        // グループ 0 は元のまま (先頭が 0)、グループ 1 は 6 を引く。
+        assert_eq!(&gl[0..12], &seg[0..12]);
+        assert_eq!(&gl[12..24], &[4, 0, 0, 0, 1, 4, 0, 0, 2, 5, 0, 0]);
+        // 相対化しても「グループの最大行数」は同じ。
+        assert_eq!(max_group_rows(&gl, &bounds), max_group_rows(&seg, &bounds));
+        // 1 グループなら全体が 0 起点 (先頭は元から 0 なので不変)。
+        assert_eq!(seg_group_local(&seg, &[(0, 6)]).as_deref(), Some(&seg[..]));
+        // 壊れた入力は None。
+        assert_eq!(seg_group_local(&seg, &[]), None);
+        assert_eq!(seg_group_local(&seg[..11], &[(0, 3)]), None);
+        assert_eq!(seg_group_local(&seg, &[(0, 9)]), None);
+        // 先頭より小さい行番号が来たら None (plan の並びが壊れている)。
+        // segment 4 はグループ 1 (先頭 6) の中なので、0 は先頭より小さい。
+        let mut bad = seg.clone();
+        bad[4 * 4 + 1] = 0;
+        assert_eq!(seg_group_local(&bad, &[(0, 3), (3, 6)]), None);
+    }
+
+    /// task 242: グループ局所の添字をカーネルと同じ式で辿り、どの領域も
+    /// はみ出さないこと (lab t242a は down の行表を足して error 700 になった)。
+    ///
+    /// - gate/up: 出力 = `(rel + r) * ff + row0` → `rows_cap * ff` 未満
+    /// - gate/up: 入力 = `x[rows_gu[abs_start + rel + r]]` → `ntok` 未満
+    /// - down: 入力 = `act[rows_id[rel + r]]` = `act[rel + r]` → グループ局所
+    ///   (`abs_start` を足したら act の範囲外になる)
+    #[test]
+    fn group_local_indices_stay_inside_the_group_scratch() {
+        // 5 expert / 行数 40,10,80,25,5 (= 160 行) / トークンは 7 個を巡回。
+        let rows_per = [40usize, 10, 80, 25, 5];
+        let ntok = 7usize;
+        let (ff, e) = (4usize, 3usize);
+        let mut by_expert: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut t = 0usize;
+        for &m in rows_per.iter() {
+            let mut v = Vec::new();
+            for _ in 0..m {
+                v.push((t % ntok, 0));
+                t += 1;
+            }
+            by_expert.push(v);
+        }
+        let pick = vec![true; 5];
+        let plan = build_plan(&by_expert, &pick);
+        let total_rows = plan.total_rows;
+        assert_eq!(total_rows, 160);
+        let needs = vec![100usize; 5];
+        let bounds = group_bounds(&needs, 250, 64).expect("2 本ずつ + 端数");
+        let gl = seg_group_local(&plan.seg, &bounds).expect("直せる");
+        let cap = max_group_rows(&plan.seg, &bounds).expect("行数");
+        let mut seen = 0usize;
+        for &(a, b) in &bounds {
+            let abs_start = plan.seg[a * 4 + 1] as usize;
+            for i in a..b {
+                let m = gl[i * 4] as usize;
+                let rel0 = gl[i * 4 + 1] as usize;
+                for r in 0..m {
+                    let rel = rel0 + r;
+                    // gate/up の出力はグループの作業域に収まる。
+                    assert!(rel < cap, "g/u の行 {rel} が cap {cap} を超えた");
+                    assert!(rel * ff < cap * ff);
+                    // gate/up の入力は絶対の行表 (abs_start を足したもの) で引く。
+                    let abs_row = abs_start + rel;
+                    assert_eq!(
+                        plan.rows[abs_row], plan.rows[abs_start + rel0 + r],
+                        "行表の対応がずれた"
+                    );
+                    assert!((plan.rows[abs_row] as usize) < ntok);
+                    // down の入力はグループ局所の act (identity のまま)。
+                    assert_eq!(rel, abs_row - abs_start);
+                    assert!(rel * e < cap * e, "act の行 {rel} が範囲外");
+                    // down の出力は全体の h (絶対)。
+                    assert!((abs_row) * e < (total_rows + ntok) * e);
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, total_rows, "全ての行を 1 回ずつ辿る");
+    }
+
+    /// task 233: 行の加重和の表に共有 expert を 1 列足す。行は
+    /// 「routed (expert 昇順) のあと、各トークンの共有行」で、係数は sh_w。
+    #[test]
+    fn row_table_with_shared_appends_one_term_per_token() {
+        let (ntok, k) = (3usize, 2usize);
+        let prow: Vec<u32> = vec![0, 5, 1, 6, 2, 7];
+        let wrow: Vec<f32> = vec![0.5, 0.5, 0.25, 0.75, 1.0, 0.0];
+        let sh: Vec<f32> = vec![0.9, 0.8, 0.7];
+        let (pr, wr) = row_table_with_shared(&prow, &wrow, ntok, k, 6, &sh).expect("足せる");
+        assert_eq!(pr.len(), ntok * (k + 1));
+        assert_eq!(wr.len(), ntok * (k + 1));
+        for t in 0..ntok {
+            assert_eq!(
+                &pr[t * 3..t * 3 + 2],
+                &prow[t * 2..(t + 1) * 2],
+                "routed の行が動いた"
+            );
+            assert_eq!(wr[t * 3], wrow[t * 2], "routed の重みが動いた");
+            assert_eq!(wr[t * 3 + 1], wrow[t * 2 + 1]);
+            assert_eq!(pr[t * 3 + 2], (6 + t) as u32, "共有の行は h の末尾");
+            assert_eq!(wr[t * 3 + 2], sh[t], "共有の係数");
+        }
+        // 形が合わないときは None (黙って詰めない)。
+        assert!(row_table_with_shared(&prow, &wrow, ntok, k, 6, &sh[..2]).is_none());
+        assert!(row_table_with_shared(&prow[..5], &wrow, ntok, k, 6, &sh).is_none());
+        assert!(row_table_with_shared(&prow, &wrow, ntok, 0, 6, &sh).is_none());
     }
 
     /// 全部ヒットなら行数は選択数 (nt x k) と一致する。
@@ -1284,6 +1746,30 @@ mod tests {
         );
         assert!(stream_wc_from_value(true, Some(" on ")), "前後の空白は無視する");
         assert!(!stream_wc_from_value(true, Some("no")));
+        // task 227: 転送元の選択 (既定は pin = バウンス) と、素の H2D の探針。
+        assert_eq!(stream_src_from_value(None), DEFAULT_STREAM_SRC);
+        assert_eq!(stream_src_from_value(Some("")), DEFAULT_STREAM_SRC);
+        assert_eq!(stream_src_from_value(Some("pin")), 0);
+        assert_eq!(stream_src_from_value(Some("page")), 1);
+        assert_eq!(stream_src_from_value(Some("reg")), 2);
+        assert_eq!(stream_src_from_value(Some(" reg ")), 2, "前後の空白は無視する");
+        assert_eq!(stream_src_from_value(Some("bogus")), DEFAULT_STREAM_SRC);
+        assert_eq!(DEFAULT_STREAM_SRC, 0, "既定は従来のバウンス");
+        assert_eq!(DEFAULT_STREAM_CHUNK_KB, 0, "既定は従来の直列");
+        // task 227: 探針は明示的な真値だけ on。
+        assert!(!dma_probe_from_value(None));
+        assert!(!dma_probe_from_value(Some("")));
+        assert!(!dma_probe_from_value(Some("0")));
+        assert!(!dma_probe_from_value(Some("off")));
+        assert!(dma_probe_from_value(Some("1")));
+        assert!(dma_probe_from_value(Some(" on ")));
+        // task 227: 層優先 prefill も明示的な真値だけ on。
+        assert!(!lm_layer_from_value(None));
+        assert!(!lm_layer_from_value(Some("")));
+        assert!(!lm_layer_from_value(Some("0")));
+        assert!(!lm_layer_from_value(Some("off")));
+        assert!(lm_layer_from_value(Some("1")));
+        assert!(lm_layer_from_value(Some(" yes ")));
         assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
         // task 197: チャンク上書きは「明示した正の数だけ」効く。
         assert_eq!(chunk_override_from_value(None), None);
