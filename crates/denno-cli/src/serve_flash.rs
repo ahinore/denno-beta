@@ -2396,13 +2396,24 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             );
         }
         if denno_engine::model::start_warm::enabled() {
-            let ranges = denno_engine::model::start_warm::expert_ranges(
+            let mut ranges = denno_engine::model::start_warm::expert_ranges(
                 f.tensor_order.iter().map(|s| s.as_str()),
                 |name| {
                     f.tensor_mapping_parts(name)
                         .map(|(file, off, len)| (file, off as u64, len as u64))
                 },
             );
+            // expert のあとに PLE の表とホスト型の重み (lab t243b の残差)。
+            // 後に読むほど page cache の LRU で残りやすい。
+            ranges.extend(denno_engine::model::start_warm::extra_ranges(
+                f.tensor_order.iter().map(|s| s.as_str()),
+                |name| f.tensors.get(name).map(|t| (t.ty, t.nbytes)),
+                |name| {
+                    f.tensor_mapping_parts(name)
+                        .map(|(file, off, len)| (file, off as u64, len as u64))
+                },
+                denno_engine::model::start_warm::extra_budget(),
+            ));
             let rep = denno_engine::model::start_warm::warm(
                 &parts,
                 &ranges,

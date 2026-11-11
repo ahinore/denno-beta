@@ -21,6 +21,8 @@
 //! - `DENNO_START_PREFETCH_SECS` (既定 [`DEFAULT_SECS`] 秒)。時間で打ち切る
 //!   (起動の延びを 30 s 以内に収めるため)。
 //! - `DENNO_START_PREFETCH_THREADS` (既定 [`DEFAULT_THREADS`])。
+//! - `DENNO_START_PREFETCH_EXTRA_MB` (既定 4096): expert 以外に温める上限。
+//!   0 で expert だけ。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +35,8 @@ pub const ENV_ON: &str = "DENNO_START_PREFETCH";
 pub const ENV_SECS: &str = "DENNO_START_PREFETCH_SECS";
 /// 読みスレッド数の env 名。
 pub const ENV_THREADS: &str = "DENNO_START_PREFETCH_THREADS";
+/// expert 以外に温める上限 (MiB) の env 名。0 で expert だけ。
+pub const ENV_EXTRA_MB: &str = "DENNO_START_PREFETCH_EXTRA_MB";
 /// **診断用**: 起動時にモデルの page cache を落とす env 名 (既定 off)。
 ///
 /// 冷えた機械を lab で再現するためのもの。`posix_fadvise(POSIX_FADV_DONTNEED)`
@@ -42,11 +46,14 @@ pub const ENV_DROP: &str = "DENNO_START_DROP_CACHE";
 /// 未設定時の既定 (lab t243b の結果で切り替える)。
 pub const DEFAULT_ON: bool = false;
 /// 打ち切り時間の既定 (秒)。「起動は最大 30 s 増」の枠に収める。
-pub const DEFAULT_SECS: f64 = 25.0;
-/// 読みスレッド数の既定。NVMe は 4〜8 本で頭打ちになる。
-pub const DEFAULT_THREADS: usize = 6;
+pub const DEFAULT_SECS: f64 = 27.0;
+/// 読みスレッド数の既定。lab t243b は 6 本で 2.2 GB/s しか出なかった (同じ機械で
+/// エンジンの prefill は 14 本で 4.1 GB/s)。同時に飛ぶ I/O を増やす。
+pub const DEFAULT_THREADS: usize = 12;
 /// 1 回の `pread` の長さ。
 pub const PIECE: u64 = 4 << 20;
+/// expert 以外に温める上限の既定 (バイト)。
+pub const DEFAULT_EXTRA_BUDGET: u64 = 4 << 30;
 
 /// gate の文字列解釈 (純関数)。未設定は [`DEFAULT_ON`]。
 pub fn enabled_from(v: Option<&str>) -> bool {
@@ -89,6 +96,22 @@ pub fn budget_secs() -> f64 {
 pub fn read_threads() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| threads_from(std::env::var(ENV_THREADS).ok().as_deref()))
+}
+
+/// expert 以外に温める上限バイト (env を 1 回だけ読む)。0 で expert だけ。
+pub fn extra_budget() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var(ENV_EXTRA_MB)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(mb) => mb.saturating_mul(1 << 20),
+            None => DEFAULT_EXTRA_BUDGET,
+        }
+    })
 }
 
 /// `DENNO_START_DROP_CACHE` (診断用)。既定 off。
@@ -174,6 +197,67 @@ where
                 out.push(r);
             }
         }
+    }
+    out
+}
+
+/// expert 以外で **リクエスト中に mmap から読まれる** テンソルの範囲。
+///
+/// lab t243b の実測: expert だけ温めても、最初の short decode の `ple` が
+/// 334.7 ms (base は 2.8 ms)、`c2000_cold` の prefill の `other` (残差 = 待ち) が
+/// 1296 ms (base 458 ms) 残った。中身は PLE の表と、ホスト側で読む F32/F16/BF16 の
+/// 重み (vram budget の `host_weights=1587 MiB`)。
+///
+/// 選び方: expert でなく、かつ
+/// - ホスト型 (F32 / F16 / BF16。`is_requantized_to_q8` でも `is_device_weight`
+///   でもない) のテンソル、または
+/// - 名前が `ple` を含む / `token_embd.weight` / `output.weight` (語彙表)
+///
+/// を `budget` バイトまで **小さい順** に取る (大きい未使用テンソルで予算を
+/// 食わないため)。`meta` はテンソル名 → (型, バイト数)。
+pub fn extra_ranges<'a, I, M, F>(
+    tensor_order: I,
+    mut meta: M,
+    mut lookup: F,
+    budget: u64,
+) -> Vec<Range>
+where
+    I: IntoIterator<Item = &'a str>,
+    M: FnMut(&str) -> Option<(crate::kquant::GgmlType, u64)>,
+    F: FnMut(&str) -> Option<Range>,
+{
+    let mut cand: Vec<(u64, usize, String, Range)> = Vec::new();
+    for (i, name) in tensor_order.into_iter().enumerate() {
+        if name.ends_with("_exps.weight") {
+            continue;
+        }
+        let Some((ty, nbytes)) = meta(name) else {
+            continue;
+        };
+        let host = !crate::gpu_budget::is_device_weight(ty)
+            && !crate::gpu_budget::is_requantized_to_q8(ty);
+        let named = name.contains("ple")
+            || name == "token_embd.weight"
+            || name == "output.weight"
+            || name == "output_norm.weight";
+        if !host && !named {
+            continue;
+        }
+        if let Some(r) = lookup(name) {
+            if r.2 > 0 {
+                cand.push((nbytes, i, name.to_string(), r));
+            }
+        }
+    }
+    cand.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut out = Vec::new();
+    let mut used = 0u64;
+    for (n, _, _, r) in cand {
+        if used + n > budget {
+            continue;
+        }
+        used += n;
+        out.push(r);
     }
     out
 }
@@ -334,11 +418,11 @@ fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize
 }
 
 #[cfg(not(unix))]
-fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = f;
-    f.seek(SeekFrom::Start(off))?;
-    f.read(buf)
+fn read_at(_f: &std::fs::File, _buf: &mut [u8], _off: u64) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "pread は unix のみ",
+    ))
 }
 
 #[cfg(test)]
@@ -429,6 +513,40 @@ mod tests {
         let rep = warm(&[], &[], 30.0, 2);
         assert_eq!(rep.bytes, 0);
         assert_eq!(rep.pieces, 0);
+    }
+
+    /// expert 以外はホスト型 (F32/BF16) と名前付きの表だけを、小さい順に予算まで。
+    #[test]
+    fn extra_ranges_take_host_types_and_tables() {
+        use crate::kquant::GgmlType;
+        let order = [
+            "blk.0.ffn_gate_exps.weight", // expert: 除外
+            "blk.0.attn_q.weight",        // Q8_0: デバイス型で名前も違う → 除外
+            "ple_key.weight",             // BF16 + 名前一致
+            "blk.0.attn_norm.weight",     // F32
+            "token_embd.weight",          // 名前一致
+            "blk.0.other_iq.weight",      // IQ3_S: ホスト型でない・名前も違う → 除外
+        ];
+        let meta = |n: &str| -> Option<(GgmlType, u64)> {
+            Some(match n {
+                "blk.0.ffn_gate_exps.weight" => (GgmlType::Q4K, 100),
+                "blk.0.attn_q.weight" => (GgmlType::Q8_0, 200),
+                "ple_key.weight" => (GgmlType::Bf16, 300),
+                "blk.0.attn_norm.weight" => (GgmlType::F32, 20),
+                "token_embd.weight" => (GgmlType::Q8_0, 400),
+                _ => (GgmlType::IQ3S, 500),
+            })
+        };
+        let lookup = |n: &str| -> Option<Range> { Some((0, n.len() as u64, 8)) };
+        let all = extra_ranges(order.iter().copied(), meta, lookup, 10_000);
+        // 小さい順: attn_norm(20), ple_key(300), token_embd(400)
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].1, "blk.0.attn_norm.weight".len() as u64);
+        // 予算 350 なら attn_norm と ple_key だけ
+        let some = extra_ranges(order.iter().copied(), meta, lookup, 350);
+        assert_eq!(some.len(), 2);
+        // 予算 0 なら空
+        assert!(extra_ranges(order.iter().copied(), meta, lookup, 0).is_empty());
     }
 
     /// 診断用の drop は実ファイルで成功し、無いパスは err に数える。
