@@ -11012,18 +11012,6 @@ thread_local! {
         const { std::cell::RefCell::new((None, 0)) };
 }
 
-/// task 233: 層の先頭で bounce のオフセットを戻す。
-///
-/// 層の終端は加重和のカーネルの `ctx.sync()` なので、前の層のコピーは
-/// 完了している (同じ領域を上書きしても安全)。
-fn pf_tiny_reset() {
-    PF_TINY.with(|c| {
-        if let Ok(mut t) = c.try_borrow_mut() {
-            t.1 = 0;
-        }
-    });
-}
-
 /// task 233: 小さなホスト配列を**非同期で**デバイスへ積む。
 ///
 /// 戻り値 `false` = bounce が足りない (呼び出し側は同期コピーへ落ちる)。
@@ -11033,7 +11021,7 @@ fn pf_tiny_htod(dst: CUdeviceptr, data: &[u8]) -> bool {
     if data.is_empty() {
         return true;
     }
-    const CAP: usize = 1usize << 16;
+    const CAP: usize = 1usize << 20;
     if data.len() > CAP {
         return false;
     }
@@ -11047,6 +11035,14 @@ fn pf_tiny_htod(dst: CUdeviceptr, data: &[u8]) -> bool {
                 Ok(m) => t.0 = Some(m),
                 Err(_) => return false,
             }
+        }
+        // 使い切ったら 1 回だけ GPU を止めて先頭へ戻す。ここで止めないと、
+        // まだ読まれている bounce を上書きしうる (層をまたいだ再入の保険)。
+        if t.1 + data.len() > CAP {
+            if let Some(ctx) = shared_ctx() {
+                let _ = ctx.sync();
+            }
+            t.1 = 0;
         }
         let off = t.1;
         if off + data.len() > CAP {
@@ -11325,7 +11321,6 @@ fn moe_experts_iq_pf_layer_stream_io(
     let in_elems = ntok * n_in;
 
     PF_STREAM_T.with(|c| *c.borrow_mut() = [0; 5]);
-    pf_tiny_reset();
     let mut work = || -> Result<Option<u32>> {
         PF_SCRATCH.with(|cell| -> Result<Option<u32>> {
             let mut sc = cell.borrow_mut();
