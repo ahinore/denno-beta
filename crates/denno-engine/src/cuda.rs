@@ -9597,8 +9597,12 @@ pub fn pf_stage_usage() -> (usize, usize) {
 ///
 /// 差が大きいほど「過大な作業域」= expert に回せる VRAM (台帳の
 /// `scratch arena` 行は確保バイトしか出さないので、ここで内訳を出す)。
+///
+/// `try_lock` なのは、`arena_alloc` (arena のロック保持中) から
+/// `DevBuffer::alloc_tagged` → `mem_audit::note_alloc` のピーク記録で
+/// 呼ばれうるため (通常の Mutex だと自己デッドロックする)。
 pub fn arena_usage() -> Option<(usize, usize)> {
-    let g = arena_state().lock().ok()?;
+    let g = arena_state().try_lock().ok()?;
     Some((g.plan.capacity(), g.plan.high_water))
 }
 
@@ -11047,6 +11051,24 @@ mod pf_stream_tests {
     #[test]
     fn stage_alloc_is_a_noop_for_zero() {
         assert!(pf_stage_alloc(0).is_none());
+    }
+
+    /// task 248: ピーク記録 (`mem_audit::note_alloc` → `peak_note`) は prefill
+    /// ステージングの確保中にも呼ばれる。ここで thread_local (PF_STREAM の
+    /// RefCell) を読むと**二重借用で panic する** (lab t248b で踏んだ)。
+    /// ピーク記録が thread_local を触らないことを、借用を持ったまま固定する。
+    #[test]
+    fn peak_note_runs_while_the_staging_refcell_is_borrowed() {
+        crate::mem_audit::force_audit_for_test(Some(true));
+        {
+            let _w = crate::mem_audit::peak_window("t");
+            PF_STREAM.with(|cell| {
+                let _st = cell.borrow_mut();
+                crate::mem_audit::note_alloc(crate::mem_audit::TAG_PF_STAGE, 1 << 20);
+                crate::mem_audit::note_free(crate::mem_audit::TAG_PF_STAGE, 1 << 20);
+            });
+        }
+        crate::mem_audit::force_audit_for_test(None);
     }
 
     /// task 165: グループ番号は層をまたいで単調 (連番) に増える。

@@ -1133,16 +1133,7 @@ impl Flash {
             Some(d) if reuse_model => d,
             other => {
                 drop(other);
-                let d =
-                    Qwen4ExpDecoder::new(self.build_model()?, DecoderConfig::new(self.max_ctx));
-                // task 248: ロード直後の VRAM 台帳 (1 回だけ)。dense 重み・
-                // ミラー・KV が載った時点で、何が何 MiB かを残す。
-                static LOAD_TABLE: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !LOAD_TABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    denno_engine::mem_audit::print_table_here("モデルのロード直後");
-                }
-                d
+                Qwen4ExpDecoder::new(self.build_model()?, DecoderConfig::new(self.max_ctx))
             }
         };
         if !dec.seq_state_supported() {

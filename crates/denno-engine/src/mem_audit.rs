@@ -277,8 +277,6 @@ struct PeakSnap {
     free_mb: usize,
     total_mb: usize,
     rows: Vec<(&'static str, usize, usize)>,
-    /// ピーク時の prefill ステージング (確保バイト)。
-    stage_bytes: usize,
     /// ピーク時の arena (確保バイト, 使用ピーク)。
     arena: Option<(usize, usize)>,
 }
@@ -297,22 +295,11 @@ fn dev_now() -> Option<(usize, usize)> {
     None
 }
 
-/// いまの台帳を 1 回出す (デバイスの空きが取れるなら添える)。
-///
-/// task 248: ロード直後と prefill のピークで使う。`DENNO_Q4_PROFILE` が
-/// 無ければ何もしない。
-pub fn print_table_here(reason: &str) {
-    print_table(reason, dev_now());
-}
-
-#[cfg(feature = "cuda")]
-fn stage_now() -> usize {
-    crate::cuda::pf_stage_usage().0
-}
-
-#[cfg(not(feature = "cuda"))]
-fn stage_now() -> usize {
-    0
+/// task 248: 他のモジュールのテストから計測を強制的に on/off する
+/// (`--test-threads=1` 前提。env を書き換えずに `audit_on()` を差し替える)。
+#[cfg(test)]
+pub(crate) fn force_audit_for_test(v: Option<bool>) {
+    tests::set_force_for_test(v);
 }
 
 #[cfg(feature = "cuda")]
@@ -342,9 +329,13 @@ fn peak_note(live: usize) {
     let label = g.as_ref().map(|p| p.label).unwrap_or("window");
     // 内訳を先に取る (`dev_now` は driver を叩くので、その間に別スレッドが
     // 解放したぶんと食い違わないように)。
+    //
+    // **ここで thread_local (RefCell) を触らないこと**。`note_alloc` は
+    // prefill ステージングの確保 (PF_STREAM を borrow_mut 中) からも呼ばれるので、
+    // `PF_STREAM.with(..)` を読むと RefCell の二重借用で panic する (t248b)。
+    // ステージングのバイト数は台帳の `pf staging` 行が出す。
     let rows = ledger_rows();
     let sum: usize = rows.iter().map(|(_, _, b)| *b).sum();
-    let stage_bytes = stage_now();
     let arena = arena_now();
     let (free_mb, total_mb) = dev_now().unwrap_or((0, 0));
     *g = Some(PeakSnap {
@@ -353,7 +344,6 @@ fn peak_note(live: usize) {
         free_mb,
         total_mb,
         rows,
-        stage_bytes,
         arena,
     });
 }
@@ -373,7 +363,6 @@ pub fn peak_window(label: &'static str) -> PeakWindow {
             free_mb: 0,
             total_mb: 0,
             rows: Vec::new(),
-            stage_bytes: 0,
             arena: None,
         });
     }
@@ -425,18 +414,13 @@ pub fn peak_end() {
     print_table(&reason, dev);
     // task 248: ピーク時の作業域の内訳。arena は「確保」と「実際の使用」の差が
     // 大きいほど expert に回せる VRAM がある (このモデルでは arena は未使用)。
+    // ステージングは台帳の `pf staging` 行に出る。
     #[cfg(feature = "cuda")]
-    {
-        if let Some((cap, high)) = p.arena {
-            tracing::info!(
-                "[mem-audit]   scratch arena: 確保 {} MiB / 使用ピーク {} MiB",
-                mib(cap),
-                mib(high)
-            );
-        }
+    if let Some((cap, high)) = p.arena {
         tracing::info!(
-            "[mem-audit]   pf staging: 確保 {} MiB (ピーク時)",
-            mib(p.stage_bytes)
+            "[mem-audit]   scratch arena: 確保 {} MiB / 使用ピーク {} MiB",
+            mib(cap),
+            mib(high)
         );
     }
     #[cfg(not(feature = "cuda"))]
@@ -492,9 +476,17 @@ pub fn print_decision(n: usize, ctx: usize, done_4k: bool, done_12k: bool) -> Op
     None
 }
 
-/// リクエスト完了時に呼ぶ。1 本目の後と、長い文脈の段ごとに 1 回だけ表を出す。
+/// リクエスト完了時に呼ぶ。最初の中身のあるリクエストの後と、長い文脈の段ごとに
+/// 1 回だけ表を出す。
+///
+/// task 248: 起動時の空リクエスト (ctx=0) は数えない。サーバはモデルを最初の
+/// リクエストで遅延ロードするので、ctx>0 の 1 本目の後 = 重みが載り切った直後が
+/// 「ロード直後の台帳」になる。
 pub fn request_end(ctx_tokens: usize, _long_ctx: usize, dev: Option<(usize, usize)>) {
     if !audit_on() {
+        return;
+    }
+    if ctx_tokens == 0 {
         return;
     }
     let n = REQ_N.fetch_add(1, Ordering::Relaxed) + 1;
@@ -509,7 +501,12 @@ pub fn request_end(ctx_tokens: usize, _long_ctx: usize, dev: Option<(usize, usiz
     if ctx_tokens >= CTX_STAGE_2 || is_stage2 {
         DONE_12K.store(true, Ordering::Relaxed);
     }
-    print_table(&format!("request #{n} の後 (ctx={ctx_tokens})"), dev);
+    let reason = if n == 1 {
+        format!("モデルのロード直後 (最初のリクエスト ctx={ctx_tokens})")
+    } else {
+        format!("request #{n} の後 (ctx={ctx_tokens})")
+    };
+    print_table(&reason, dev);
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +525,17 @@ pub fn parse_fill_free(v: Option<&str>, default_on: bool) -> bool {
     }
 }
 
-/// task 248: 既定。round 1 では off (lab の A/B で採否を決める)。
+/// task 248: 既定 (**off**)。
+///
+/// lab t248a の実測: `DENNO_EXPERT_FILL_FREE=1` (env 22,000 のまま) と
+/// `DENNO_EXPERT_VRAM_MB=24000/26000` は、どれも 14k cold prefill で
+/// **カードの空きを 17 MiB まで使い切り**、1〜3 MiB の確保が error 2 で
+/// 失敗し続けた (prefill のステージングが取れず PF_DEAD → CPU 経路 →
+/// 14k はテキスト空)。理由は `effective_expert_cap` が
+/// `experts_live` (= slab の**確保済みチャンク** bytes) を使っていて、
+/// チャンクを足すと上限も同じだけ上がる帰還ループになるため。22,000 の
+/// env 上限があるからこそ 14k のピーク (空き 399 MiB) が保てている。
+/// 既定 off のまま (採否は REPORT_P248)。
 pub const FILL_FREE_DEFAULT: bool = false;
 
 /// task 248: expert の上限を「カードの空き - 余裕」まで使うか
@@ -652,6 +659,13 @@ mod tests {
     /// `audit_on()` を env を触らずに差し替えるためのフック
     /// (env を書き換えると並走テストの解釈を揺らすため)。
     static FORCE: AtomicI8 = AtomicI8::new(-1);
+
+    /// task 248: 他のモジュールのテスト (cuda の PF_STREAM 回帰) から
+    /// 計測を強制的に on/off する。`--test-threads=1` 前提。
+    #[cfg(test)]
+    pub(super) fn set_force_for_test(v: Option<bool>) {
+        set_force(v);
+    }
 
     pub(super) fn force_enabled() -> Option<bool> {
         match FORCE.load(Ordering::Relaxed) {
