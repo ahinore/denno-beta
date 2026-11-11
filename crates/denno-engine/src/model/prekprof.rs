@@ -85,6 +85,11 @@ static PLE_ROWS: AtomicU64 = AtomicU64::new(0);
 static PLE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// task 182: RAM 常駐から読んだバイト数 (0 なら pread 経路)。
 static PLE_RAM_BYTES: AtomicU64 = AtomicU64::new(0);
+/// task 254: 次チャンクの PLE 先読み (`DENNO_PF_PLE_PRE`) の起動回数・トークン数・
+/// join で待った ns。起動したのに待ちが 0 なら、層ループの裏に完全に隠れている。
+static PLE_PRE_FIRES: AtomicU64 = AtomicU64::new(0);
+static PLE_PRE_TOKS: AtomicU64 = AtomicU64::new(0);
+static PLE_PRE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 /// PLE 区間のページフォルト差分 (`/proc/self/stat`)。
 static MINFLT: AtomicU64 = AtomicU64::new(0);
 static MAJFLT: AtomicU64 = AtomicU64::new(0);
@@ -108,7 +113,11 @@ pub fn on() -> bool {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DENNO_PRE_KPROF").is_some())
+    // task 254: ホスト台帳 (`DENNO_PF_HOSTPROF`) が on なら層の外の区間も積む
+    // (tokenize / embed / PLE は prefill の壁時計の外側・内側の分母になる)。
+    *ON.get_or_init(|| {
+        std::env::var_os("DENNO_PRE_KPROF").is_some() || crate::model::pf_host::on()
+    })
 }
 
 /// 計測が要るときだけ `Instant` を取る (既定 off では `None` = 呼び出し側は no-op)。
@@ -174,6 +183,28 @@ pub fn note_ple_pread(rows: usize, bytes: usize) {
 #[inline]
 pub fn note_ple_ram(bytes: usize) {
     PLE_RAM_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// task 254: 次チャンクの PLE 先読みを 1 本起動した (分岐が発火した証拠)。
+#[inline]
+pub fn note_ple_pre_spawn() {
+    PLE_PRE_FIRES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// task 254: 先読みを join した (待ち ns と、受け取ったトークン数)。
+#[inline]
+pub fn note_ple_pre_join(wait_ns: u64, toks: usize) {
+    PLE_PRE_WAIT_NS.fetch_add(wait_ns, Ordering::Relaxed);
+    PLE_PRE_TOKS.fetch_add(toks as u64, Ordering::Relaxed);
+}
+
+/// task 254: 先読みの起動回数・トークン数・待ち (テストとレポート用)。
+pub fn ple_pre_counts() -> (u64, u64, u64) {
+    (
+        PLE_PRE_FIRES.load(Ordering::Relaxed),
+        PLE_PRE_TOKS.load(Ordering::Relaxed),
+        PLE_PRE_WAIT_NS.load(Ordering::Relaxed),
+    )
 }
 
 /// `/proc/self/stat` の `(minflt, majflt)`。読めない環境では `None`。
@@ -293,7 +324,7 @@ pub fn report(tag: &str, tok: usize, wall_ns: u64) -> Vec<String> {
     } else {
         0.0
     };
-    let l2 = format!(
+    let mut l2 = format!(
         "[pre-kprof] {tag} outside-wall tokenize {:.1} | sample {:.1} ms ({per:.3} ms/tok x{samples}) | \
          ple rows={rows} reads={reads} bytes={bytes} avg_read={per_read:.0}B ram={}B \
          read={:.1} deq={:.1} sort={:.1} dist={:.1} ms \
@@ -308,6 +339,15 @@ pub fn report(tag: &str, tok: usize, wall_ns: u64) -> Vec<String> {
         MINFLT.load(Ordering::Relaxed),
         MAJFLT.load(Ordering::Relaxed)
     );
+    // task 254: 次チャンクの PLE 先読み (`DENNO_PF_PLE_PRE`) が発火したときだけ出す。
+    // `wait` が小さいほど層ループの裏に隠れている (0 なら完全に隠れた)。
+    let (pre_fires, pre_toks, pre_wait) = ple_pre_counts();
+    if pre_fires > 0 {
+        l2.push_str(&format!(
+            " | pre fires={pre_fires} tok={pre_toks} wait={:.1} ms",
+            pre_wait as f64 / 1e6
+        ));
+    }
     reset();
     vec![l1, l2]
 }
@@ -324,6 +364,9 @@ pub fn reset() {
     PLE_ROWS.store(0, Ordering::Relaxed);
     PLE_BYTES.store(0, Ordering::Relaxed);
     PLE_RAM_BYTES.store(0, Ordering::Relaxed);
+    PLE_PRE_FIRES.store(0, Ordering::Relaxed);
+    PLE_PRE_TOKS.store(0, Ordering::Relaxed);
+    PLE_PRE_WAIT_NS.store(0, Ordering::Relaxed);
     MINFLT.store(0, Ordering::Relaxed);
     MAJFLT.store(0, Ordering::Relaxed);
 }

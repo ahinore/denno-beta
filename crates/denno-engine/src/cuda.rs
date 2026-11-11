@@ -304,10 +304,14 @@ pub(crate) mod tline {
         pub launches: u64,
     }
 
-    /// 起動ごとのイベントを打つか (`DENNO_Q4_TLINE_K=1`)。
+    /// 起動ごとのイベントを打つか (`DENNO_Q4_TLINE_K=1`、または prefill の
+    /// ホスト台帳が開いているとき = task 254 の GPU 実時間)。
     pub(super) fn k_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("DENNO_Q4_TLINE_K").is_some())
+        if *ON.get_or_init(|| std::env::var_os("DENNO_Q4_TLINE_K").is_some()) {
+            return true;
+        }
+        crate::model::q4ledger::pf_span_active()
     }
 
     fn grow(p: &mut Pool, want: usize) -> bool {
@@ -360,10 +364,31 @@ pub(crate) mod tline {
 
     /// 区間の入口イベント。時系列が off なら `None` (分岐 1 回)。
     pub fn span_begin() -> Option<u32> {
-        if !crate::model::q4ledger::tline_active() {
+        if !span_on() {
             return None;
         }
         mark()
+    }
+
+    /// イベントを打つ窓が開いているか (decode の時系列 or prefill のホスト台帳)。
+    #[inline]
+    fn span_on() -> bool {
+        crate::model::q4ledger::tline_active() || crate::model::q4ledger::pf_span_active()
+    }
+
+    /// task 254: prefill のホスト台帳の窓を開ける (`q4ledger::total` が 1 回)。
+    ///
+    /// decode の [`prepare`] と同じ用意をするが、窓のフラグは q4ledger 側が持つ。
+    pub fn prepare_prefill() {
+        if !crate::model::q4ledger::pf_span_active() {
+            return;
+        }
+        if let Some(ctx) = shared_ctx() {
+            let _ = ctx.make_current();
+        }
+        // 1 本だけ打って捨てる (作れない構成なら以後の記録を止める)。
+        let _ = mark();
+        reset();
     }
 
     /// 窓の入口で 1 回だけ呼ぶ。イベントは**このスレッドの** current context に
@@ -390,7 +415,7 @@ pub(crate) mod tline {
 
     /// 起動の直前イベント (K ゲートのときだけ)。
     pub fn launch_begin() -> Option<u32> {
-        if !crate::model::q4ledger::tline_active() || !k_on() {
+        if !k_on() || !span_on() {
             return None;
         }
         mark()
@@ -441,6 +466,15 @@ pub(crate) mod tline {
             }
             Some(out)
         })
+    }
+
+    /// task 254: 区間ごとの **GPU 実時間** (起動ペアの差の和、ms)。
+    ///
+    /// `span` と違ってアイドル (ホスト待ちで GPU が空いていた時間) を含まない。
+    /// 1 本も打っていなければ `None`。
+    pub fn item_busy_ms(n: usize) -> Option<Vec<f64>> {
+        let items = items(n)?;
+        Some(items.into_iter().map(|it| it.busy_ms).collect())
     }
 
     /// 窓の記録を捨てる (イベント自体は次の窓で使い回す)。
@@ -9068,6 +9102,7 @@ pub fn moe_gemv_iq_pf_ready(ty: crate::kquant::GgmlType, k: usize) -> bool {
 }
 
 use crate::model::exp_pf;
+use crate::model::pf_host;
 
 /// 1 層ぶんの作業域 (grow-only。スレッドローカル)。
 struct PfScratch {
@@ -9838,8 +9873,210 @@ fn pf_pump_in(
     }
 }
 
+/// task 254: 表の非同期 H2D (`DENNO_PF_TAB_ASYNC`) の転送元とイベント。
+///
+/// # なぜ要るか
+///
+/// 表 (`seg` / 行表 / デバイスポインタ表) は `DevBuffer::copy_from` /
+/// `copy_from_at` = **pageable の同期 `cuMemcpyHtoD`** で積んでいた。この API は
+/// null ストリームに積まれたカーネルの完了までホストを止めるので、14k の cold
+/// prefill ではグループ 1 つごとに「GPU が空くまで待つ」が入り、台帳の `h2d` が
+/// experts 区間 18.3 s のうち 8.8 s を占めていた (PROFILE=1 の実測は REPORT_P254)。
+///
+/// ここでは転送元を pinned に置き、null ストリームへ**非同期**で積む。順序は
+/// ストリームが保証するので、カーネルは自分の表が書けた後に走る。転送元は
+/// 数枚を回し、使い回す前にその枚の完了イベントだけ待つ (ホストが先に走り
+/// すぎたときだけ止まる)。
+///
+/// 数値には触れない (同じバイト列を同じ順に積むだけ)。
+mod pf_tab {
+    use super::*;
+
+    /// 回転させる転送元の枚数 (ホストが先に走れるグループ数の上限)。
+    const SLOTS: usize = 4;
+
+    struct Slot {
+        pin: PinMem,
+        ev: CopyEvent,
+        used: bool,
+    }
+
+    struct State {
+        slots: Vec<Slot>,
+        /// 作り直した古い転送元 (飛んでいるコピーが掴んでいる可能性があるので
+        /// 解放しない。prefill 1 回で増えるのは高々数枚)。
+        retired: Vec<PinMem>,
+        next: usize,
+    }
+
+    thread_local! {
+        static ST: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// `DENNO_PF_TAB_ASYNC` の値の解釈 (`0` / `false` / `no` だけ off)。
+    ///
+    /// 既定は off (A/B と切り戻しのため)。env は `OnceLock` なので、値の解釈は
+    /// ここに閉じてテストから直接叩けるようにする。
+    pub fn value_on(v: Option<&str>) -> bool {
+        !matches!(v, Some("0") | Some("false") | Some("no"))
+    }
+
+    /// `DENNO_PF_TAB_ASYNC` が on か (既定 off)。
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("DENNO_PF_TAB_ASYNC") {
+            Ok(v) => value_on(Some(v.as_str())),
+            Err(_) => false,
+        })
+    }
+
+    /// 呼び出し回数と成功回数 (分岐が発火したかの証拠)。
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static OKS: AtomicU64 = AtomicU64::new(0);
+
+    /// `(呼び出し, 非同期で積めた)` の累計。テストと実機のログ用。
+    pub fn counts() -> (u64, u64) {
+        (
+            CALLS.load(Ordering::Relaxed),
+            OKS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 累計を 0 に戻す (リクエスト境界)。
+    pub fn reset_counts() {
+        CALLS.store(0, Ordering::Relaxed);
+        OKS.store(0, Ordering::Relaxed);
+    }
+
+    /// 空きスロットを 1 枚返す (前の使用が飛んでいれば完了を待つ)。
+    fn take(bytes: usize) -> Result<usize> {
+        let l = lib()?;
+        let (Some(ec), Some(rec), Some(es)) = (l.event_create, l.event_record, l.event_sync)
+        else {
+            bail!("cuEventCreate / cuEventRecord / cuEventSynchronize が無い");
+        };
+        ST.with(|cell| {
+            let mut g = cell.borrow_mut();
+            let st = g.get_or_insert_with(|| State {
+                slots: Vec::new(),
+                retired: Vec::new(),
+                next: 0,
+            });
+            if st.slots.is_empty() {
+                for _ in 0..SLOTS {
+                    let mut ev: CUevent = std::ptr::null_mut();
+                    unsafe {
+                        if ec(&mut ev, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS {
+                            bail!("cuEventCreate (pf_tab) が失敗");
+                        }
+                    }
+                    st.slots.push(Slot {
+                        pin: PinMem::alloc(bytes)?,
+                        ev: CopyEvent(ev),
+                        used: false,
+                    });
+                }
+            }
+            let i = st.next % SLOTS;
+            st.next = st.next.wrapping_add(1);
+            // 容量が足りなければ作り直す (古いものは解放しない)。
+            if st.slots[i].pin.bytes < bytes {
+                let new = PinMem::alloc(bytes)?;
+                let old = std::mem::replace(&mut st.slots[i].pin, new);
+                st.retired.push(old);
+            }
+            // 前回のコピーがまだ飛んでいるなら待つ (通常は即返る)。
+            if st.slots[i].used {
+                unsafe {
+                    check(es(st.slots[i].ev.0), "cuEventSynchronize (pf_tab)")?;
+                }
+            }
+            st.slots[i].used = true;
+            // 呼び出し側が pinned のアドレスを要るので、イベントはここで記録せず
+            // [`upload`] の最後に記録する。
+            let _ = (rec, i);
+            Ok(i)
+        })
+    }
+
+    /// pinned のベースアドレス (スロット `i`)。
+    fn base(i: usize) -> usize {
+        ST.with(|cell| {
+            let g = cell.borrow();
+            g.as_ref().expect("確保済み").slots[i].pin.ptr as usize
+        })
+    }
+
+    /// スロット `i` の完了イベントを null ストリームへ記録する。
+    fn record(i: usize) -> Result<()> {
+        let l = lib()?;
+        let Some(rec) = l.event_record else {
+            bail!("cuEventRecord が無い");
+        };
+        ST.with(|cell| {
+            let g = cell.borrow();
+            let ev = g.as_ref().expect("確保済み").slots[i].ev.0;
+            unsafe { check(rec(ev, std::ptr::null_mut()), "cuEventRecord (pf_tab)") }
+        })
+    }
+
+    /// `parts` を pinned に写して null ストリームへ非同期で積む。
+    ///
+    /// 戻り値 `false` = 使えなかった (呼び出し側は同期版へ落ちる)。
+    pub fn upload(parts: &[(u64, usize, &[u8])]) -> bool {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        let total: usize = parts.iter().map(|(_, _, b)| b.len()).sum();
+        if total == 0 {
+            return true;
+        }
+        let Ok(i) = take(total) else {
+            return false;
+        };
+        let Ok(l) = lib() else { return false };
+        let base = base(i);
+        let mut off = 0usize;
+        let mut jobs: Vec<(CUdeviceptr, usize, usize)> = Vec::with_capacity(parts.len());
+        for (dev, dev_off, data) in parts {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (base + off) as *mut u8,
+                    data.len(),
+                );
+            }
+            jobs.push((*dev + *dev_off as CUdeviceptr, base + off, data.len()));
+            off += data.len();
+        }
+        for (d, s, n) in jobs {
+            unsafe {
+                if (l.memcpy_htod_async)(d, s as *const c_void, n, std::ptr::null_mut()) != CUDA_SUCCESS
+                {
+                    return false;
+                }
+            }
+        }
+        if record(i).is_err() {
+            return false;
+        }
+        OKS.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// task 254: 表の非同期 H2D の (呼び出し, 成功) 累計。実機ログ用。
+pub fn pf_tab_counts() -> (u64, u64) {
+    pf_tab::counts()
+}
+
+/// task 254: 累計を 0 に戻す (テストとリクエスト境界)。
+#[cfg(feature = "cuda")]
+pub fn pf_tab_counts_reset() {
+    pf_tab::reset_counts()
+}
+
 /// グループ `g` の H2D 完了を待つ (ホスト)。待ち時間 (ns) を返す。
 fn pf_wait_up_in(st: &mut PfStream, g: u64, pinned: bool) -> Result<u64> {
+
     if !pinned {
         return Ok(0);
     }
@@ -10474,6 +10711,8 @@ pub fn moe_experts_iq_pf_layer_stream(
     let mut work = || -> Result<Option<u32>> {
         PF_SCRATCH.with(|cell| -> Result<Option<u32>> {
             let mut sc = cell.borrow_mut();
+            // task 254: 作業域の確保と活性・表の H2D (1 層 1 回)。
+            let t_scratch = pf_host::stamp();
             MoeScratch::ensure(&mut sc.x, xs.len() * 4)?;
             MoeScratch::ensure(&mut sc.g, ng * 4)?;
             MoeScratch::ensure(&mut sc.u, ng * 4)?;
@@ -10521,15 +10760,43 @@ pub fn moe_experts_iq_pf_layer_stream(
                 if !done_pin {
                     xb.copy_from(xs)?;
                 }
-                sc.seg.as_ref().expect("確保済み").copy_from(seg)?;
-                sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
+                // task 254: 表は同期の `cuMemcpyHtoD` だと null ストリームの
+                // 前の仕事 (前の層のカーネル) の完了までホストを止める。
+                // `DENNO_PF_TAB_ASYNC=1` では pinned から非同期で積む。
                 let id: Vec<u32> = exp_pf::identity_rows(total_rows);
-                sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
-                sc.prow.as_ref().expect("確保済み").copy_from(prow)?;
-                sc.wrow
-                    .as_ref()
-                    .expect("確保済み")
-                    .copy_from(&wrow[..ntok * k])?;
+                let wr = &wrow[..ntok * k];
+                let bytes_u32 =
+                    |v: &[u32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+                let bytes_f32 = |v: &[f32]| unsafe {
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+                };
+                let async_ok = pf_tab::enabled()
+                    && pf_tab::upload(&[
+                        (sc.seg.as_ref().expect("確保済み").ptr(), 0, bytes_u32(seg)),
+                        (
+                            sc.rows_gu.as_ref().expect("確保済み").ptr(),
+                            0,
+                            bytes_u32(rows_gu),
+                        ),
+                        (
+                            sc.rows_id.as_ref().expect("確保済み").ptr(),
+                            0,
+                            bytes_u32(&id),
+                        ),
+                        (sc.prow.as_ref().expect("確保済み").ptr(), 0, bytes_u32(prow)),
+                        (
+                            sc.wrow.as_ref().expect("確保済み").ptr(),
+                            0,
+                            bytes_f32(wr),
+                        ),
+                    ]);
+                if !async_ok {
+                    sc.seg.as_ref().expect("確保済み").copy_from(seg)?;
+                    sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
+                    sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
+                    sc.prow.as_ref().expect("確保済み").copy_from(prow)?;
+                    sc.wrow.as_ref().expect("確保済み").copy_from(wr)?;
+                }
             }
             dbg_htod(xs.len() * 4 + nseg * 16 + total_rows * 4 * 2 + ntok * k * 8);
             let xb = sc.x.as_ref().expect("確保済み").ptr();
@@ -10540,10 +10807,12 @@ pub fn moe_experts_iq_pf_layer_stream(
             let segb = sc.seg.as_ref().expect("確保済み").ptr();
             let rg = sc.rows_gu.as_ref().expect("確保済み").ptr();
             let rid = sc.rows_id.as_ref().expect("確保済み").ptr();
+            pf_host::mark(t_scratch, pf_host::SCRATCH);
 
             // 1. ミスの本数を数え、グループ分けを決める。
             //    容量は「2 枚に分けたステージング 1 枚ぶん」。実際に確保できる
             //    サイズで切るので、載せられない expert は出ない (spill 0)。
+            let t_plan = pf_host::stamp();
             let mut needs = vec![0usize; nseg];
             let mut miss_total = 0usize;
             for (i, en) in entries.iter().enumerate() {
@@ -10598,6 +10867,7 @@ pub fn moe_experts_iq_pf_layer_stream(
             let Some(bounds) = exp_pf::group_bounds(&needs, slot_cap, group) else {
                 return Ok(None);
             };
+            pf_host::mark(t_plan, pf_host::PLAN);
             // 2. グループごとに上げて計算する。`pg/pu/pd` の表は全体を 1 本で持ち、
             //    グループの先頭を指して起動する。
             let pg_tab = sc.pg.as_ref().expect("確保済み");
@@ -10686,12 +10956,16 @@ pub fn moe_experts_iq_pf_layer_stream(
                     })?;
                     copy_ns = pump.copy_ns;
                     enq_ns = pump.enq_ns;
+                    // task 254: バウンスコピーと積み込みを項目別に積む。
+                    pf_host::add_ns(pf_host::STAGE_COPY, copy_ns);
+                    pf_host::add_ns(pf_host::STAGE_ENQ, enq_ns);
                     if let Some((pb, pn)) = pump.probe {
                         exp_pf::note_stream_probe(pb, pn);
                     }
                     (pump.ptrs, pump.bytes)
                 };
                 // (b) デバイスポインタの表を書く (ミスはステージング、ヒットは常駐)。
+                let t_ptr = pf_host::stamp();
                 let mut ip = 0usize;
                 {
                     let mut vg = vec![0u64; b - a];
@@ -10712,11 +10986,26 @@ pub fn moe_experts_iq_pf_layer_stream(
                             return Ok(None);
                         }
                     }
-                    pg_tab.copy_from_at(a * 8, &vg)?;
-                    pu_tab.copy_from_at(a * 8, &vu)?;
-                    pd_tab.copy_from_at(a * 8, &vd)?;
+                    // task 254: ポインタ表も同期コピーだと null ストリームの
+                    // 前のグループのカーネルを待つ (ホストが止まる)。
+                    let bytes_u64 = |v: &[u64]| unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
+                    };
+                    let ok = pf_tab::enabled()
+                        && pf_tab::upload(&[
+                            (pg_tab.ptr(), a * 8, bytes_u64(&vg)),
+                            (pu_tab.ptr(), a * 8, bytes_u64(&vu)),
+                            (pd_tab.ptr(), a * 8, bytes_u64(&vd)),
+                        ]);
+                    if !ok {
+                        pg_tab.copy_from_at(a * 8, &vg)?;
+                        pu_tab.copy_from_at(a * 8, &vu)?;
+                        pd_tab.copy_from_at(a * 8, &vd)?;
+                    }
                 }
+                pf_host::mark(t_ptr, pf_host::PTR_TAB);
                 // (c) **自分のグループの H2D 完了だけ**を待つ (ホスト)。
+                let t_wait = pf_host::stamp();
                 if ut {
                     if !items.is_empty() {
                         let (c, e, r, w, sl) = pf_wait_group(g)?;
@@ -10737,6 +11026,7 @@ pub fn moe_experts_iq_pf_layer_stream(
                         pf_wait_up_in(&mut st, g, pinned)
                     })?;
                 }
+                pf_host::mark(t_wait, pf_host::UP_WAIT);
                 // (d) カーネルを積む。
                 let ro_start = seg[a * 4 + 1] as usize;
                 let ro_end = if b > a {
@@ -10821,12 +11111,15 @@ pub fn moe_experts_iq_pf_layer_stream(
                     )?;
                 }
                 exp_pf::note_kernel_ns(t_k.elapsed().as_nanos() as u64);
+                // task 254: 累積カーネルの完了待ちと D2H を項目別に積む。
                 let t_sync = std::time::Instant::now();
                 ctx.sync()?;
                 exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
+                pf_host::add_ns(pf_host::SYNC, t_sync.elapsed().as_nanos() as u64);
                 let t_d2h = std::time::Instant::now();
                 oacc.to_slice(&mut out[..ntok * e])?;
                 exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
+                pf_host::add_ns(pf_host::D2H, t_d2h.elapsed().as_nanos() as u64);
                 dbg_d2h(ntok * e * 4);
             }
             exp_pf::note_stream_layer();
@@ -10944,6 +11237,41 @@ mod pf_stream_tests {
     #[test]
     fn stage_alloc_is_a_noop_for_zero() {
         assert!(pf_stage_alloc(0).is_none());
+    }
+
+    /// task 254: 表の非同期 H2D のゲートは他のゲートと同じ解釈で、GPU が無い
+    /// 環境では必ず `false` を返して同期版へ落ちる (fail closed)。
+    #[test]
+    fn tab_async_gate_parses_and_falls_back_without_gpu() {
+        assert!(pf_tab::value_on(None));
+        assert!(pf_tab::value_on(Some("1")));
+        assert!(!pf_tab::value_on(Some("0")));
+        assert!(!pf_tab::value_on(Some("false")));
+        assert!(!pf_tab::value_on(Some("no")));
+        // 分岐が呼ばれたことは数える (GPU 無し = false で同期版)。
+        let before = pf_tab::counts();
+        let data = [1u64, 2, 3];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(&data))
+        };
+        let ok = pf_tab::upload(&[(0u64, 0, bytes)]);
+        let after = pf_tab::counts();
+        if cuda_enabled() {
+            // GPU のある環境では成功してよい (このコンテナでは起きない)。
+            assert!(ok || after.0 > before.0, "呼び出しが数えられていない");
+        } else {
+            assert!(!ok, "GPU が無いのに非同期で積めた");
+            assert_eq!(after.0, before.0 + 1, "呼び出しが数えられていない");
+            assert_eq!(after.1, before.1, "成功数を増やしてしまった");
+        }
+    }
+
+    /// task 254: 空の表は何もせず成功扱い (呼び出し側が同期版を選ばない)。
+    #[test]
+    fn tab_async_empty_upload_is_ok() {
+        assert!(pf_tab::upload(&[]));
+        let data: [u8; 0] = [];
+        assert!(pf_tab::upload(&[(0u64, 0, &data)]));
     }
 
     /// task 165: グループ番号は層をまたいで単調 (連番) に増える。
@@ -22100,6 +22428,8 @@ pub fn pf_download_res_row(t: usize, hc_dim: usize, out: &mut [f32]) -> bool {
 
 /// task 154: デバイスの `mixed` (`[nt][n_embd]`) をホストへ戻す。
 pub fn pf_take_mixed(out: &mut [f32]) -> bool {
+    // task 254: `other` の中身 (`[q4ledger-pf] sub other`) に積む。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_MIXD2H);
     // task 189: mix 1 呼び出しの D2H (mixed の 5.1 MB) も段として積む。
     let t_d2h = pf_mix_kprof::on().then(std::time::Instant::now);
     let r = PF_DEV.with(|cell| -> bool {
@@ -22697,6 +23027,8 @@ fn pf_combine_core(
     hc: usize,
     e: usize,
 ) -> bool {
+    // task 254: `other` の中身 (`[q4ledger-pf] sub other`) に積む。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_COMBINE);
     if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
