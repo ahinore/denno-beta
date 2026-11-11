@@ -2385,6 +2385,30 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         n_expert = p.n_expert;
         // task 146: 使用回数ファイルのモデル同一性 (全層の expert 3 行列の合計バイト)。
         expert_bytes = denno_engine::model::qwen4exp::expert_identity_bytes(&f, &p);
+        // task 243: 冷えた page cache を起動時に温める (expert 行列だけ)。
+        // 最初のリクエストが SSD から読み直すぶん (lab 実測で約 14 s) を
+        // `listening` の前に前払いする。数値経路には触らない。
+        if denno_engine::model::start_warm::enabled() {
+            let ranges = denno_engine::model::start_warm::expert_ranges(
+                f.tensor_order.iter().map(|s| s.as_str()),
+                |name| {
+                    f.tensor_mapping_parts(name)
+                        .map(|(file, off, len)| (file, off as u64, len as u64))
+                },
+            );
+            let rep = denno_engine::model::start_warm::warm(
+                &parts,
+                &ranges,
+                denno_engine::model::start_warm::budget_secs(),
+                denno_engine::model::start_warm::read_threads(),
+            );
+            eprintln!("{}", rep.line());
+        } else {
+            eprintln!(
+                "[start-prefetch] off ({}=0 で明示 off)",
+                denno_engine::model::start_warm::ENV_ON
+            );
+        }
         // task 217: ビューワが層を描けるように、層の種別と MoE / hc の形を残す。
         let layer_kinds = (0..p.n_layer)
             .map(|il| match p.layer_kind(il) {
