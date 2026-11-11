@@ -542,6 +542,59 @@ pub(crate) fn pf_ple_par_on() -> bool {
     *ON.get_or_init(|| pf_ple_par_from_value(std::env::var("DENNO_PF_PLE_PAR").ok().as_deref()))
 }
 
+/// task 254: `DENNO_PF_PLE_PRE` の解釈 (純関数)。未設定は [`DEFAULT_PF_PLE_PRE`]。
+///
+/// `1` / `on` / `true` / `yes` だけ on、`0` / `off` / `false` / `no` / 空は off。
+pub(crate) fn pf_ple_pre_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => DEFAULT_PF_PLE_PRE,
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// [`pf_ple_pre_from_value`] の既定値。lab の結果で決める (採用したら true)。
+pub const DEFAULT_PF_PLE_PRE: bool = false;
+
+/// テストが env を立てずにゲートを強制するための上書き (0 = env / 1 = off / 2 = on)。
+static PF_PLE_PRE_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: ゲートの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_ple_pre_for_test(v: Option<bool>) {
+    PF_PLE_PRE_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// task 254: prefill の**次チャンク**の PLE 行 gather を、いまのチャンクの層ループ
+/// (GPU) の裏で走らせるか。
+///
+/// 14k cold prefill の `[pre-kprof]` は `ple` が 1.36〜1.59 s (page cache が
+/// 冷えているとき) / 50 ms (温かいとき) と二峰性で、**層ループの前に丸ごと
+/// 露出する**。172k 行の 90 B ランダム pread はデバイスの IOPS 律速
+/// (≈126k IOPS) なので短くはできないが、チャンクの層ループ (14k で約 2.5 s)
+/// の裏には隠せる。1 チャンク目だけは隠せない。
+///
+/// 行の読みとデコードは [`crate::ple::PleTable::gather_rows_par`] のままで、
+/// 値はビット一致 (読む順序とスレッドだけが変わる)。
+pub(crate) fn pf_ple_pre_on() -> bool {
+    match PF_PLE_PRE_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_ple_pre_from_value(std::env::var("DENNO_PF_PLE_PRE").ok().as_deref()))
+}
+
 /// まとめ引き (`PleNgram::gather_many`) の並列度 (`DENNO_PLE_PAR`)。
 ///
 /// 既定 8。`0` / `1` で逐次 (1 行 1 pread を順に出す)。行数が
@@ -954,5 +1007,29 @@ mod tests {
         PleTable::set_ram_for_test(Some(false));
         assert!(!PleTable::ram_enabled(), "テスト上書き (off) が効いていない");
         PleTable::set_ram_for_test(None);
+    }
+
+    /// task 254: `DENNO_PF_PLE_PRE` (次チャンクの PLE 先読み) の真理値表。
+    /// 既定は [`DEFAULT_PF_PLE_PRE`] で、lab の結果で決める。
+    #[test]
+    fn pf_ple_pre_gate_truth_table() {
+        assert_eq!(
+            DEFAULT_PF_PLE_PRE, false,
+            "lab の結果で決める (t254c で採用したら true)"
+        );
+        assert_eq!(pf_ple_pre_from_value(None), DEFAULT_PF_PLE_PRE, "未設定");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!pf_ple_pre_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_ple_pre_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        // テスト上書きが env より優先される (A/B 用)。
+        set_pf_ple_pre_for_test(Some(true));
+        assert!(pf_ple_pre_on());
+        set_pf_ple_pre_for_test(Some(false));
+        assert!(!pf_ple_pre_on());
+        set_pf_ple_pre_for_test(None);
+        assert_eq!(pf_ple_pre_on(), DEFAULT_PF_PLE_PRE);
     }
 }

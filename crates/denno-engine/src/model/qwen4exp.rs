@@ -2216,13 +2216,135 @@ pub struct PleRuntime {
     pub ngram: PleNgram,
 }
 
+/// task 254: チャンクぶんの PLE 行 gather の本体。
+///
+/// [`Qwen4Exp::gather_ple_many`] と先読みスレッドの両方がこれを呼ぶので、
+/// 先読みの有無で値は変わらない (変わるのは pread を出す順序とスレッドだけ)。
+fn gather_ple_many_rt(
+    rt: Option<&PleRuntime>,
+    ctx: &[u32],
+    start: usize,
+) -> Result<Vec<Option<Vec<f32>>>> {
+    let nt = ctx.len().saturating_sub(start);
+    let rt = match rt {
+        Some(rt) => rt,
+        None => return Ok(vec![None; nt]),
+    };
+    #[cfg(test)]
+    PLE_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n_gram = rt.ngram.n_gram();
+    let mut wins: Vec<Vec<u32>> = Vec::with_capacity(nt);
+    for i in start..ctx.len() {
+        wins.push(ple_window(&ctx[..=i], n_gram));
+    }
+    let refs: Vec<&[u32]> = wins.iter().map(|w| w.as_slice()).collect();
+    let flat = rt
+        .ngram
+        .gather_many(&rt.table, &refs)
+        .map_err(|err| one(format!("PLE 索引: {err}")))?;
+    let stride = rt
+        .ngram
+        .n_heads()
+        .checked_mul(rt.table.n_dim())
+        .ok_or_else(|| one("PLE 索引: n_heads * n_dim がオーバーフロー"))?;
+    if flat.len() != nt * stride {
+        return Err(one(format!(
+            "PLE 索引: まとめ引きの長さ {} が nt {nt} * {stride} と違う",
+            flat.len()
+        )));
+    }
+    Ok(flat
+        .chunks_exact(stride)
+        .map(|c| Some(c.to_vec()))
+        .collect())
+}
+
+/// task 254: 次チャンクの PLE 行 gather を 1 本のスレッドで先に走らせる
+/// (`DENNO_PF_PLE_PRE`、既定 off)。
+///
+/// 14k cold prefill では PLE の行読みが層ループの前に丸ごと露出する
+/// (1.36〜1.59 s、page cache が冷えているとき)。172k 行の 90 B ランダム pread は
+/// デバイスの IOPS 律速なので短くはできないが、チャンクの層ループ (14k で
+/// 約 2.5 s) の裏には隠せる。値は [`gather_ple_many_rt`] をそのまま呼ぶので
+/// ビット一致し、失敗も join でそのまま返る。
+#[cfg(any(feature = "cuda", test))]
+struct PlePrefetch {
+    h: Option<std::thread::JoinHandle<Result<Vec<Option<Vec<f32>>>>>>,
+}
+
+/// 先読み専用プールのスレッド数 (8 コア 16 スレッドの実機で、層ループ側の
+/// 写しと発行を邪魔しない本数)。
+#[cfg(any(feature = "cuda", test))]
+const PLE_PRE_THREADS: usize = 6;
+
+#[cfg(any(feature = "cuda", test))]
+impl PlePrefetch {
+    fn none() -> Self {
+        PlePrefetch { h: None }
+    }
+
+    /// `start..end` のトークンの窓を先読みする。PLE を持たないモデル・
+    /// 空の範囲・範囲外では何もしない ([`PlePrefetch::none`])。
+    fn spawn(
+        rt: Option<std::sync::Arc<PleRuntime>>,
+        ctx: &[u32],
+        start: usize,
+        end: usize,
+    ) -> Self {
+        let rt = match rt {
+            Some(rt) if end > start && end <= ctx.len() => rt,
+            _ => return Self::none(),
+        };
+        let c: Vec<u32> = ctx[..end].to_vec();
+        prekprof::note_ple_pre_spawn();
+        Self {
+            h: Some(std::thread::spawn(move || {
+                // グローバルの rayon プールは層ループ側 (PLE 注入の par_iter) も
+                // 使うので、先読みは専用のプールで読む。8 コア 16 スレッドのうち
+                // 6 本だけ使い、写し (stage_copy) とカーネル発行の邪魔をしない。
+                // プールを作れないときは逐次 (遅いが値は同じ)。
+                match rayon::ThreadPoolBuilder::new()
+                    .num_threads(PLE_PRE_THREADS)
+                    .build()
+                {
+                    Ok(p) => p.install(|| gather_ple_many_rt(Some(&rt), &c, start)),
+                    Err(_) => gather_ple_many_rt(Some(&rt), &c, start),
+                }
+            })),
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        self.h.is_some()
+    }
+
+    /// 先読みの結果を受け取る。join でホストが止まった時間を `[pre-kprof]` の
+    /// `pre wait=` に積む (0 に近いほど層ループの裏に隠れている)。
+    fn join(self) -> Result<Vec<Option<Vec<f32>>>> {
+        match self.h {
+            Some(h) => {
+                let t = std::time::Instant::now();
+                let r = h
+                    .join()
+                    .map_err(|_| one("PLE の先読みスレッドが panic した"))?;
+                if let Ok(v) = &r {
+                    prekprof::note_ple_pre_join(t.elapsed().as_nanos() as u64, v.len());
+                }
+                r
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
 /// 1 トークン decode の骨格。
 pub struct Qwen4Exp {
     pub p: Qwen4ExpParams,
     layers: Vec<LayerW>,
     head: HeadW,
     tok_embd: GgufLinear,
-    ple: Option<PleRuntime>,
+    /// task 254: 先読みスレッドへ渡せるように `Arc` で持つ (gather は read-only)。
+    ple: Option<std::sync::Arc<PleRuntime>>,
     /// PLE の conv 履歴 (層ごと)。`(kern-1) * ngram_size` トークン分の
     /// `grouped_rms_norm(gated)` を古い順に保持する。層に PLE が無ければ `None`。
     ple_conv_state: Vec<Option<Vec<f32>>>,
@@ -2398,7 +2520,7 @@ impl Qwen4Exp {
                 .ok_or_else(|| one(format!("{PLE_TABLE_NAME}: テンソルが無い")))?;
             let table = PleTable::open(&tr, f).map_err(|e| one(format!("{PLE_TABLE_NAME}: {e}")))?;
             let ngram = PleNgram::from_meta(f).map_err(|e| one(format!("PLE 索引: {e}")))?;
-            Some(PleRuntime { table, ngram })
+            Some(std::sync::Arc::new(PleRuntime { table, ngram }))
         } else {
             None
         };
@@ -2836,35 +2958,7 @@ impl Qwen4Exp {
     /// `トークン数 × 16` 本のランダムな 90 B pread をまとめて出すので、
     /// 1 トークンずつ待つよりキューを深く使える。
     fn gather_ple_many(&self, ctx: &[u32], start: usize) -> Result<Vec<Option<Vec<f32>>>> {
-        let nt = ctx.len().saturating_sub(start);
-        let rt = match &self.ple {
-            Some(rt) => rt,
-            None => return Ok(vec![None; nt]),
-        };
-        #[cfg(test)]
-        PLE_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let n_gram = rt.ngram.n_gram();
-        let mut wins: Vec<Vec<u32>> = Vec::with_capacity(nt);
-        for i in start..ctx.len() {
-            wins.push(ple_window(&ctx[..=i], n_gram));
-        }
-        let refs: Vec<&[u32]> = wins.iter().map(|w| w.as_slice()).collect();
-        let flat = rt
-            .ngram
-            .gather_many(&rt.table, &refs)
-            .map_err(|err| one(format!("PLE 索引: {err}")))?;
-        let stride = rt
-            .ngram
-            .n_heads()
-            .checked_mul(rt.table.n_dim())
-            .ok_or_else(|| one("PLE 索引: n_heads * n_dim がオーバーフロー"))?;
-        if flat.len() != nt * stride {
-            return Err(one(format!(
-                "PLE 索引: まとめ引きの長さ {} が nt {nt} * {stride} と違う",
-                flat.len()
-            )));
-        }
-        Ok(flat.chunks_exact(stride).map(|c| Some(c.to_vec())).collect())
+        gather_ple_many_rt(self.ple.as_deref(), ctx, start)
     }
 
     /// 1 層ぶんの本体 (PLE 注入 → attention → MoE FFN)。
@@ -3649,6 +3743,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let _mixed_mark = PfMixedMarkGuard;
         // P78: チャンクぶんの PLE は行単位でまとめて引く (従来と同じ)。
         let ple_batch = ple_batch_enabled();
+        // task 254: 次チャンクの PLE 行を、このチャンクの層ループの裏で読む。
+        let ple_pre = ple_batch && crate::ple::pf_ple_pre_on();
+        // 先読みの結果 (次チャンクぶん)。1 チャンク目は先読みできない。
+        let mut ples_next: Option<Vec<Option<Vec<f32>>>> = None;
         let mut last: Option<HyperStreams> = None;
         let mut start = 0usize;
         while start < ctx.len() {
@@ -3662,7 +3760,11 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             prekprof::mark(t_emb, prekprof::EMBED);
             let t_ple = prekprof::stamp();
             let ples: Vec<Option<Vec<f32>>> = if ple_batch {
-                self.gather_ple_many(&ctx[..end], start)?
+                match ples_next.take() {
+                    // 前のチャンクの層ループの裏で読み終わっている。
+                    Some(v) => v,
+                    None => self.gather_ple_many(&ctx[..end], start)?,
+                }
             } else {
                 let mut v: Vec<Option<Vec<f32>>> = Vec::with_capacity(nt);
                 for i in start..end {
@@ -3680,6 +3782,18 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 Self::pf_bail("res の H2D に失敗")?;
             }
             let mixed_flat: &mut [f32] = &mut mixed_buf.as_mut_slice()[..nt * e];
+            // task 254: 次チャンクの PLE 行 gather を、このチャンクの層ループ
+            // (GPU) の裏で走らせる。最終チャンクでは起動しない。
+            let pre = if ple_pre && end < ctx.len() {
+                PlePrefetch::spawn(
+                    self.ple.as_ref().map(std::sync::Arc::clone),
+                    ctx,
+                    end,
+                    (end + chunk).min(ctx.len()),
+                )
+            } else {
+                PlePrefetch::none()
+            };
             let t_lay = prekprof::stamp();
             for il in 0..n_layer {
                 let lw = &self.layers[il];
@@ -3958,6 +4072,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     });
                 }
                 last = ress.pop();
+            }
+            // task 254: 先読みを回収する (ここまでで層ループの裏に隠れている)。
+            if pre.is_some() {
+                ples_next = Some(pre.join()?);
             }
             start = end;
         }
@@ -23948,6 +24066,79 @@ mod tests {
             assert!(
                 on.iter().any(|&v| v != on[0]),
                 "logits が全要素同値 (経路の生死が分からない)"
+            );
+            moe_expert::set_vnni_for_test(None);
+        }
+
+        /// PLE の行を `Option` 込みでビット比較する (task 254 の先読み用)。
+        fn assert_ple_bitwise(a: &[Option<Vec<f32>>], b: &[Option<Vec<f32>>], what: &str) {
+            assert_eq!(a.len(), b.len(), "{what}: 本数が違う");
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                match (x, y) {
+                    (Some(x), Some(y)) => {
+                        assert_eq!(x.len(), y.len(), "{what}: 行 {i} の長さが違う");
+                        for k in 0..x.len() {
+                            assert_eq!(
+                                x[k].to_bits(),
+                                y[k].to_bits(),
+                                "{what}: 行 {i} 要素 {k} がビット一致しない"
+                            );
+                        }
+                    }
+                    (None, None) => {}
+                    _ => panic!("{what}: 行 {i} の Some/None が違う"),
+                }
+            }
+        }
+
+        /// task 254: 次チャンクの PLE 先読み ([`PlePrefetch`]) が、直接引いた値と
+        /// ビット一致すること + 分岐が起動すること (カウンタで確認)。
+        ///
+        /// 常駐経路 (`forward_prefill_batch_resident`) は cuda が要るので、ここでは
+        /// スレッドの起動・join と値の同一性だけを確かめる。
+        #[test]
+        fn ple_prefetch_matches_direct_gather() {
+            let _g = moe_test_guard();
+            moe_expert::set_vnni_for_test(Some(false));
+            let dir = TempDir::new("h2plepre");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            assert!(m.ple.is_some(), "合成モデルに PLE が無い");
+
+            // 直接引く (2 チャンクに割る)。
+            let d0 = m.gather_ple_many(&ctx[..4], 0).expect("direct 0");
+            let d1 = m.gather_ple_many(&ctx[..8], 4).expect("direct 1");
+            assert!(
+                d0.iter().flatten().any(|r| r.iter().any(|&v| v != 0.0)),
+                "PLE の行が全部 0 (経路が死んでいる)"
+            );
+
+            // 先読みスレッドで同じ範囲を引く。
+            let (fires0, _, _) = prekprof::ple_pre_counts();
+            let p0 = PlePrefetch::spawn(m.ple.as_ref().map(std::sync::Arc::clone), &ctx, 0, 4)
+                .join()
+                .expect("prefetch 0");
+            let p1 = PlePrefetch::spawn(m.ple.as_ref().map(std::sync::Arc::clone), &ctx, 4, 8)
+                .join()
+                .expect("prefetch 1");
+            let (fires1, toks1, _) = prekprof::ple_pre_counts();
+            assert_eq!(fires1 - fires0, 2, "先読みの起動回数が合わない");
+            assert!(toks1 > 0, "先読みのトークン数が 0");
+
+            assert_ple_bitwise(&d0, &p0, "先読み 0");
+            assert_ple_bitwise(&d1, &p1, "先読み 1");
+
+            // PLE を持たない・空の範囲・範囲外では起動しない (fail closed)。
+            assert!(!PlePrefetch::spawn(None, &ctx, 0, 4).is_some(), "PLE 無しで起動");
+            assert!(
+                !PlePrefetch::spawn(m.ple.as_ref().map(std::sync::Arc::clone), &ctx, 8, 8).is_some(),
+                "空の範囲で起動"
+            );
+            assert!(
+                !PlePrefetch::spawn(m.ple.as_ref().map(std::sync::Arc::clone), &ctx, 0, 9).is_some(),
+                "範囲外で起動"
             );
             moe_expert::set_vnni_for_test(None);
         }
