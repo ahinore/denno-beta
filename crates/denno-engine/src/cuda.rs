@@ -12427,6 +12427,32 @@ mod pf_exp_tc_tests {
         assert!(!tc_shapes_ok(Some(1), Some(3), true, 0, 1024, 1024, 2560));
     }
 
+    /// `.cu` のタイル定数とホストの定数が一致すること (片方だけ直す事故を落とす)。
+    #[test]
+    fn tc_tile_constants_match_the_cu() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_tc.cu");
+        let src = std::fs::read_to_string(&p).expect("kernels_exp_iq_tc.cu が読める");
+        let get = |name: &str| -> usize {
+            let key = format!("#define {name} ");
+            let line = src
+                .lines()
+                .find(|l| l.trim_start().starts_with(&key))
+                .unwrap_or_else(|| panic!("{name} が .cu に無い"));
+            line.trim_start()[key.len()..]
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} の値が数値でない"))
+        };
+        assert_eq!(get("TC_BM"), EXTC_BM, "TC_BM");
+        assert_eq!(get("TC_BN"), EXTC_BN, "TC_BN");
+        assert_eq!(get("TC_THREADS"), EXTC_THREADS, "TC_THREADS");
+        // 1 出力行は 16 列ずつ 4 warp で覆い、トークンは 32 本ずつ 2 段 + 16 本 × 2。
+        assert_eq!(EXTC_BN, 4 * 16, "行タイルは wn 4 段 × 16 行");
+        assert_eq!(EXTC_BM, 2 * 2 * 16, "トークンタイルは wm 2 段 × 2 断片 × 16");
+    }
+
     /// PTX の引数の数え方がコミット済みの PTX (nvcc の実出力) で 9 になること。
     /// 合成文字列ではなく実物で確かめる (task 68 の ABI ゲートと同じ)。
     #[test]
