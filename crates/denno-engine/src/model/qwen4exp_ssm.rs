@@ -1248,6 +1248,28 @@ pub struct SsmAttn {
     full: Box<dyn LayerAttn>,
 }
 
+/// task 252: `DENNO_GDN_TAKE_ZERO` の解釈 (純関数)。**既定 on**。
+///
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ従来の挙動
+/// (デバイス正本だった層のホスト状態を古いまま残す) に戻す。A/B と切り戻し用で、
+/// `0` にすると系列を跨いで GDN の再帰状態が化ける (task 252 の症状が戻る)。
+fn take_zero_host_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
+}
+
+/// task 252: [`take_layer_state`] がデバイス正本の枝でもホストを 0 に戻すか
+/// (`DENNO_GDN_TAKE_ZERO`、既定 on)。プロセスで 1 回だけ読む。
+fn take_zero_host_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| take_zero_host_from_value(std::env::var("DENNO_GDN_TAKE_ZERO").ok().as_deref()))
+}
+
 /// task 252: [`SsmAttn::seq_state_take`] の 1 層ぶんの取り出し。
 ///
 /// `dev` が `Some` のとき (直前の decode を GPU が処理して**デバイスが正本**)、
@@ -1261,15 +1283,19 @@ pub struct SsmAttn {
 ///   結果、系列を跨いで GDN の再帰状態が化ける (本番の「プロンプトの鸚鵡返し /
 ///   空応答 / 2 トークンで終わり」で、`DENNO_GDN_GPU_SCAN=0` にすると消える)。
 ///
+/// `zero_host` は切り戻し用 (`DENNO_GDN_TAKE_ZERO=0` で `false`)。
 /// `dev` が `None` (ホストが正) のときは従来どおり move で取り出し、空の領域を
 /// 置いておく (領域は使い回すので確保は増えない)。
 fn take_layer_state(
     state: &mut GdnState,
     dev: Option<(Vec<f32>, Vec<f32>)>,
+    zero_host: bool,
 ) -> (Vec<f32>, Vec<f32>) {
     match dev {
         Some(pair) => {
-            state.reset();
+            if zero_host {
+                state.reset();
+            }
             pair
         }
         None => {
@@ -1554,7 +1580,7 @@ impl LayerAttn for SsmAttn {
         for (i, l) in self.layers.iter_mut().enumerate() {
             match l.as_mut() {
                 Some(s) => {
-                    let pair = take_layer_state(&mut s.state, dev[i].take());
+                    let pair = take_layer_state(&mut s.state, dev[i].take(), take_zero_host_on());
                     bytes += (pair.0.capacity() + pair.1.capacity()) * 4;
                     #[cfg(feature = "cuda")]
                     if crate::cuda::gdn_gpu_scan_on() {
@@ -2157,7 +2183,7 @@ mod tests {
         }
         let dev_conv: Vec<f32> = (0..st.conv.len()).map(|i| 100.0 + i as f32).collect();
         let dev_ssm: Vec<f32> = (0..st.ssm.len()).map(|i| 200.0 + i as f32).collect();
-        let pair = take_layer_state(&mut st, Some((dev_conv.clone(), dev_ssm.clone())));
+        let pair = take_layer_state(&mut st, Some((dev_conv.clone(), dev_ssm.clone())), true);
         assert_eq!(pair.0, dev_conv, "取り出した conv がデバイスの値でない");
         assert_eq!(pair.1, dev_ssm, "取り出した ssm がデバイスの値でない");
         assert!(
@@ -2176,13 +2202,36 @@ mod tests {
         for (i, v) in st.ssm.iter_mut().enumerate() {
             *v = -(i as f32) - 1.0;
         }
-        let pair = take_layer_state(&mut st, None);
+        let pair = take_layer_state(&mut st, None, true);
         assert!(pair.0.iter().all(|&v| v != 0.0), "ホスト conv が空");
         assert!(pair.1.iter().all(|&v| v != 0.0), "ホスト ssm が空");
         assert!(st.conv.iter().all(|&v| v == 0.0), "ホスト conv が 0 でない");
         assert!(st.ssm.iter().all(|&v| v == 0.0), "ホスト ssm が 0 でない");
         assert_eq!(st.conv.len(), pair.0.len(), "conv の領域長が変わった");
         assert_eq!(st.ssm.len(), pair.1.len(), "ssm の領域長が変わった");
+
+        // (c) 切り戻し (`zero_host = false`) は従来どおりホストを残す。
+        for (i, v) in st.conv.iter_mut().enumerate() {
+            *v = i as f32 + 1.0;
+        }
+        let pair = take_layer_state(&mut st, Some((dev_conv.clone(), dev_ssm.clone())), false);
+        assert_eq!(pair.0, dev_conv);
+        assert!(
+            st.conv.iter().all(|&v| v != 0.0),
+            "切り戻しでホスト conv が 0 になった"
+        );
+    }
+
+    /// task 252: `DENNO_GDN_TAKE_ZERO` の真偽表 (未設定 = on、明示的な偽値だけ off)。
+    #[test]
+    fn take_zero_host_truth_table() {
+        assert!(take_zero_host_from_value(None));
+        for on in ["1", "on", "true", "yes", "", " x "] {
+            assert!(take_zero_host_from_value(Some(on)), "{on:?} を off と読んだ");
+        }
+        for off in ["0", "off", "false", "no", " OFF ", "False"] {
+            assert!(!take_zero_host_from_value(Some(off)), "{off:?} を on と読んだ");
+        }
     }
 
     /// task 128: Req 組み立てが実モデルの寸法と一致すること (qwen4exp 実形:
