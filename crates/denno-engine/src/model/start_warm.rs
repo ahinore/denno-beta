@@ -237,6 +237,7 @@ where
         let host = !crate::gpu_budget::is_device_weight(ty)
             && !crate::gpu_budget::is_requantized_to_q8(ty);
         let named = name.contains("ple")
+            || name == "per_layer_token_embd.weight"
             || name == "token_embd.weight"
             || name == "output.weight"
             || name == "output_norm.weight";
@@ -520,12 +521,13 @@ mod tests {
     fn extra_ranges_take_host_types_and_tables() {
         use crate::kquant::GgmlType;
         let order = [
-            "blk.0.ffn_gate_exps.weight", // expert: 除外
-            "blk.0.attn_q.weight",        // Q8_0: デバイス型で名前も違う → 除外
-            "ple_key.weight",             // BF16 + 名前一致
-            "blk.0.attn_norm.weight",     // F32
-            "token_embd.weight",          // 名前一致
-            "blk.0.other_iq.weight",      // IQ3_S: ホスト型でない・名前も違う → 除外
+            "blk.0.ffn_gate_exps.weight",  // expert: 除外
+            "blk.0.attn_q.weight",         // Q8_0: デバイス型で名前も違う → 除外
+            "ple_key.weight",              // BF16 + 名前一致
+            "blk.0.attn_norm.weight",      // F32
+            "token_embd.weight",           // 名前一致
+            "per_layer_token_embd.weight", // PLE 表 (IQ4_NL) 名前一致
+            "blk.0.other_iq.weight",       // IQ3_S: ホスト型でない・名前も違う → 除外
         ];
         let meta = |n: &str| -> Option<(GgmlType, u64)> {
             Some(match n {
@@ -534,15 +536,17 @@ mod tests {
                 "ple_key.weight" => (GgmlType::Bf16, 300),
                 "blk.0.attn_norm.weight" => (GgmlType::F32, 20),
                 "token_embd.weight" => (GgmlType::Q8_0, 400),
+                "per_layer_token_embd.weight" => (GgmlType::IQ4Nl, 250),
                 _ => (GgmlType::IQ3S, 500),
             })
         };
         let lookup = |n: &str| -> Option<Range> { Some((0, n.len() as u64, 8)) };
         let all = extra_ranges(order.iter().copied(), meta, lookup, 10_000);
-        // 小さい順: attn_norm(20), ple_key(300), token_embd(400)
-        assert_eq!(all.len(), 3);
+        // 小さい順: attn_norm(20), per_layer_token_embd(250), ple_key(300), token_embd(400)
+        assert_eq!(all.len(), 4);
         assert_eq!(all[0].1, "blk.0.attn_norm.weight".len() as u64);
-        // 予算 350 なら attn_norm と ple_key だけ
+        assert_eq!(all[1].1, "per_layer_token_embd.weight".len() as u64);
+        // 予算 350 なら attn_norm と per_layer_token_embd だけ
         let some = extra_ranges(order.iter().copied(), meta, lookup, 350);
         assert_eq!(some.len(), 2);
         // 予算 0 なら空
