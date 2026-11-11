@@ -33,6 +33,11 @@ pub const ENV_ON: &str = "DENNO_START_PREFETCH";
 pub const ENV_SECS: &str = "DENNO_START_PREFETCH_SECS";
 /// 読みスレッド数の env 名。
 pub const ENV_THREADS: &str = "DENNO_START_PREFETCH_THREADS";
+/// **診断用**: 起動時にモデルの page cache を落とす env 名 (既定 off)。
+///
+/// 冷えた機械を lab で再現するためのもの。`posix_fadvise(POSIX_FADV_DONTNEED)`
+/// は root を要さない (自分のファイルの clean page を落とすだけ)。
+pub const ENV_DROP: &str = "DENNO_START_DROP_CACHE";
 
 /// 未設定時の既定 (lab t243b の結果で切り替える)。
 pub const DEFAULT_ON: bool = false;
@@ -84,6 +89,67 @@ pub fn budget_secs() -> f64 {
 pub fn read_threads() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| threads_from(std::env::var(ENV_THREADS).ok().as_deref()))
+}
+
+/// `DENNO_START_DROP_CACHE` (診断用)。既定 off。
+pub fn drop_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| enabled_from_env(ENV_DROP))
+}
+
+/// 指定した env が真か (未設定は偽)。
+fn enabled_from_env(k: &str) -> bool {
+    matches!(
+        std::env::var(k).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("on") | Some("ON")
+    )
+}
+
+/// モデルの全パートの page cache を落とす (診断用)。1 行のログを返す。
+///
+/// `mmap` は残したまま、clean な page だけを落とす。まだ触っていないテンソルは
+/// PTE が無いので落ちる。落としたあとの最初のリクエストは SSD から読む
+/// (= 冷えた機械と同じ)。
+pub fn drop_cache(parts: &[PathBuf]) -> String {
+    let mut ok = 0usize;
+    let mut err = 0usize;
+    for p in parts {
+        match fadvise_dontneed(p) {
+            Ok(()) => ok += 1,
+            Err(_) => err += 1,
+        }
+    }
+    format!("[start-prefetch] drop cache: ok={ok} err={err} (診断用 / {ENV_DROP}=1)")
+}
+
+#[cfg(unix)]
+fn fadvise_dontneed(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn posix_fadvise(
+            fd: std::os::raw::c_int,
+            off: i64,
+            len: i64,
+            advice: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+    const POSIX_FADV_DONTNEED: std::os::raw::c_int = 4;
+    let f = std::fs::File::open(path)?;
+    // 戻り値は errno そのもの (0 が成功)。len=0 は「ファイル末尾まで」。
+    let rc = unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(not(unix))]
+fn fadvise_dontneed(_path: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "posix_fadvise は unix のみ",
+    ))
 }
 
 /// 1 つのバイト範囲: (パート番号, ファイル内オフセット, 長さ)。
@@ -363,5 +429,18 @@ mod tests {
         let rep = warm(&[], &[], 30.0, 2);
         assert_eq!(rep.bytes, 0);
         assert_eq!(rep.pieces, 0);
+    }
+
+    /// 診断用の drop は実ファイルで成功し、無いパスは err に数える。
+    #[test]
+    fn drop_cache_reports_ok_and_err() {
+        let dir = std::env::temp_dir();
+        let ok_path = dir.join(format!("denno_start_drop_{}.bin", std::process::id()));
+        std::fs::write(&ok_path, b"hello").unwrap();
+        let missing = dir.join("denno_start_drop_missing_243.bin");
+        let line = drop_cache(&[ok_path.clone(), missing]);
+        assert!(line.contains("ok=1 err=1"), "{line}");
+        assert!(line.starts_with("[start-prefetch] drop cache: "), "{line}");
+        let _ = std::fs::remove_file(&ok_path);
     }
 }

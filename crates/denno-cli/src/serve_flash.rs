@@ -2388,6 +2388,13 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         // task 243: 冷えた page cache を起動時に温める (expert 行列だけ)。
         // 最初のリクエストが SSD から読み直すぶん (lab 実測で約 14 s) を
         // `listening` の前に前払いする。数値経路には触らない。
+        // `DENNO_START_DROP_CACHE=1` は診断用 (冷えた機械を再現する)。
+        if denno_engine::model::start_warm::drop_enabled() {
+            eprintln!(
+                "{}",
+                denno_engine::model::start_warm::drop_cache(&parts)
+            );
+        }
         if denno_engine::model::start_warm::enabled() {
             let ranges = denno_engine::model::start_warm::expert_ranges(
                 f.tensor_order.iter().map(|s| s.as_str()),
