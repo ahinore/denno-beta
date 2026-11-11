@@ -249,6 +249,36 @@ pub fn balanced_chunk(n: usize, base: usize, cap: usize) -> usize {
     n.div_ceil(nch).clamp(1, cap)
 }
 
+/// この prefill のチャンク長 (純関数)。
+///
+/// 均等割りは「ストリーミング経路」「`DENNO_PF_CHUNK_BALANCE` が on」
+/// 「`DENNO_PF_CHUNK` の**明示**指定が無い」「プロンプトが 2 枚以内に収まる」の
+/// 4 つが揃ったときだけ効く。
+///
+/// 2 枚以内に限る理由: 長いプロンプト (14k など) のチャンクは task 197 が
+/// 実測で決めた 1536 で、枚数を減らすには 2047 まで上げる必要がある。
+/// その領域は tools シナリオの lab で測っていないので触らない。
+///
+/// **`chunk_override()` で判定してはいけない**: あれは未設定のとき
+/// `Some(DEFAULT_PF_CHUNK_STREAM)` を返すので、常に「明示指定あり」に見えて
+/// ゲートが一度も発火しない (lab t239c で実際に踏んだ)。明示判定は
+/// [`chunk_override_from_value`] に生の env を渡して行う。
+pub fn chunk_for_prefill(
+    n: usize,
+    base: usize,
+    cap: usize,
+    balance_on: bool,
+    stream_on: bool,
+    explicit_override: bool,
+) -> usize {
+    let cap = cap.max(1);
+    if !balance_on || !stream_on || explicit_override || n > cap.saturating_mul(2) {
+        return base.max(1);
+    }
+    balanced_chunk(n, base, cap)
+}
+
+
 /// 均等割りを使うか (プロセスで 1 回だけ env を読む)。
 pub fn chunk_balance() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1253,6 +1283,35 @@ mod tests {
     #[test]
     fn upload_budget_is_bytes_over_expert_size() {
         assert_eq!(upload_budget_experts(), (upload_mb() << 20) / 2_048_000);
+    }
+
+    /// task 239: 均等割りの**発火**条件。
+    ///
+    /// lab t239c では `chunk_override().is_some()` で判定していたため、
+    /// 未設定でも `Some(既定)` が返ってゲートが一度も発火せず、up_MB が
+    /// バイト一致のままだった。ここで 4 条件の全組み合わせを固定する。
+    #[test]
+    fn chunk_for_prefill_fires_only_on_all_three_conditions() {
+        let (n, base, cap) = (3222usize, DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        // 3 条件が揃ったときだけ均等割り (3,222 → 1,611 × 2 枚)。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, true, false), 1611);
+        // ゲート off。
+        assert_eq!(chunk_for_prefill(n, base, cap, false, true, false), base);
+        // ストリーミング off (従来経路)。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, false), base);
+        // `DENNO_PF_CHUNK` の明示指定がある。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, true, true), base);
+        // 1 枚で収まる長さはゲート on でもそのまま。
+        assert_eq!(chunk_for_prefill(1000, base, cap, true, true, false), 1000);
+        // 2 枚を超える長さ (14k) は触らない (task 197 の実測領域)。
+        assert_eq!(
+            chunk_for_prefill(14018, base, cap, true, true, false),
+            base,
+            "長いプロンプトのチャンクを変えてしまった"
+        );
+        assert_eq!(chunk_for_prefill(4095, base, cap, true, true, false), base);
+        // 2 枚ちょうどまでは均等割り。
+        assert_eq!(chunk_for_prefill(4094, base, cap, true, true, false), 2047);
     }
 
     /// task 239: 均等割りは「上限の下でチャンク数を最小にする」長さを返す。

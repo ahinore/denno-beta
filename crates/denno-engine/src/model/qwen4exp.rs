@@ -12249,20 +12249,24 @@ fn prefill_batch_chunk() -> usize {
 /// そのまま転送量に効く (固定 1536 では 3,222 トークンが 3 枚になり、同じ
 /// 重みを 3 回上げていた)。
 ///
-/// `DENNO_PF_CHUNK` / `DENNO_PREFILL_BATCH_CHUNK` の明示指定はそのまま尊重する
-/// (上書きがあるときは均等割りしない)。
+/// `DENNO_PF_CHUNK` の明示指定があるときは均等割りしない (既存の上書きを尊重)。
 fn prefill_chunk_for(n: usize) -> usize {
     let base = prefill_batch_chunk();
-    if !crate::model::exp_pf::chunk_balance()
-        || !crate::model::exp_pf::stream_enabled()
-        || crate::model::exp_pf::chunk_override().is_some()
-    {
-        return base;
-    }
-    crate::model::exp_pf::balanced_chunk(
+    // 明示指定の判定は生の env で行う (`chunk_override()` は未設定でも
+    // `Some(既定)` を返すので、それで判定するとゲートが発火しない)。
+    let explicit = crate::model::exp_pf::chunk_override_from_value(
+        std::env::var(crate::model::exp_pf::PF_CHUNK_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .is_some();
+    crate::model::exp_pf::chunk_for_prefill(
         n,
         base,
         crate::model::exp_pf::CHUNK_BALANCE_CAP,
+        crate::model::exp_pf::chunk_balance(),
+        crate::model::exp_pf::stream_enabled(),
+        explicit,
     )
 }
 
