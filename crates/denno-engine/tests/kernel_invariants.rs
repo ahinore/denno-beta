@@ -9407,6 +9407,265 @@ fn task213_server_runs_the_gate_audit_at_startup() {
 }
 
 // ---------------------------------------------------------------------------
+// task 225: prefill の beta/alpha GEMM / router softmax+top-k / GDN スキャン v3
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「build_ptx.sh が正しい -fmad / arch で作る」
+// 「起動形状が #define と一致する」を固定する。値の一致は GPU 側の担当。
+const GEMM_BA225_SRC: &str = include_str!("../kernels/kernels_gemm_ba225.cu");
+const ROUTER225_SRC: &str = include_str!("../kernels/kernels_router225.cu");
+const GDN_PF3_SRC: &str = include_str!("../kernels/kernels_gdn_pf3.cu");
+const GDN_PF_WY_SRC: &str = include_str!("../kernels/kernels_gdn_pf_wy.cu");
+const QWEN4EXP_SSM_RS: &str = include_str!("../src/model/qwen4exp_ssm.rs");
+
+/// `.cu` の `extern "C" __global__` 宣言の引数の個数を数える。
+fn cu_kernel_nargs(src: &str, name: &str) -> usize {
+    let at = src
+        .find(&format!("{name}("))
+        .unwrap_or_else(|| panic!("{name} が無い"));
+    let rest = &src[at + name.len()..];
+    let open = rest.find('(').expect("( が無い");
+    // コメント (`// ...`) を落としてから数える (引数コメントの `[nv, dk, dv]` を
+    // 引数の区切りと数えないため)。
+    let mut body = String::new();
+    let mut in_line = false;
+    for ch in rest[open..].chars() {
+        if in_line {
+            if ch == '\n' {
+                in_line = false;
+            }
+            continue;
+        }
+        if ch == '/' && body.ends_with('/') {
+            body.pop();
+            in_line = true;
+            continue;
+        }
+        body.push(ch);
+    }
+    let mut depth = 0usize;
+    let mut n = 0usize;
+    for ch in body.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            ',' if depth == 1 => n += 1,
+            _ => {}
+        }
+    }
+    n + 1
+}
+
+#[test]
+fn task225_ba225_kernel_is_wired() {
+    assert!(GEMM_BA225_SRC.contains("dno_gemm_f32_ba"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gemm_f32_ba\\0\""),
+        "cuda.rs が dno_gemm_f32_ba を読んでいない"
+    );
+    for line in [
+        "#define BA225_ROWS 48",
+        "#define BA225_TOKS 64",
+        "#define BA225_KTILE 32",
+        "#define BA225_THREADS 256",
+    ] {
+        assert!(GEMM_BA225_SRC.contains(line), "{line} が無い");
+    }
+    assert_eq!(
+        cu_kernel_nargs(GEMM_BA225_SRC, "dno_gemm_f32_ba"),
+        6,
+        "引数の個数がホストの起動と違う"
+    );
+    // ホスト側の定数がカーネルのタイルと一致する (起動形状の食い違い防止)。
+    assert!(
+        CUDA_RS.contains("pub(crate) const BA225_ROWS: usize = 48;"),
+        "BA225_ROWS が .cu の BA225_ROWS と違う"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) const BA225_TOKS: usize = 64;"),
+        "BA225_TOKS が .cu の BA225_TOKS と違う"
+    );
+    assert!(
+        CUDA_RS.contains("ctx.launch_async(fns.ba_gemm, grid, (256, 1, 1), 0, &mut args)"),
+        "beta/alpha GEMM の block が 256 でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gemm_ba225)   echo \"kernels_gemm_ba225.cu|nofmad\""),
+        "build_ptx.sh の gemm_ba225 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gemm_ba225"),
+        "targets_all に gemm_ba225 が無い"
+    );
+    // 出力 1 要素 1 アキュムレータ・k 昇順の FMA (決定論)。
+    assert!(
+        GEMM_BA225_SRC.contains("acc[i][j] = __fmaf_rn(wv[i], xv[j], acc[i][j]);"),
+        "積和が明示 FMA の k 昇順になっていない"
+    );
+    // task 225: 未連結 (parts 2 本) でもデバイス射影に入れる。
+    assert!(
+        QWEN4EXP_SSM_RS.contains("alpha_w: Some(pw(&parts[1]))"),
+        "parts 2 本の alpha が連鎖に渡っていない"
+    );
+    // task 228: 型の判定は F32 固定ではなく `pf_ba_w_check` (型を問わず f32 へ
+    // 展開できるか) に一本化した。呼び出し側と `gdn_pf_chain` が同じ純関数を
+    // 使うこと (= 片側だけ開いて連鎖が諦める経路に戻っていないこと) を固定する。
+    assert!(
+        QWEN4EXP_SSM_RS.contains("crate::cuda::pf_ba_w_check("),
+        "呼び出し側が pf_ba_w_check で型・形を確かめていない"
+    );
+    assert!(
+        CUDA_RS.contains("pf_ba_w_check(w.ty, w.k, w.n, &ba.beta_rows, nv, e)"),
+        "gdn_pf_chain が同じ判定を使っていない"
+    );
+    assert!(
+        !QWEN4EXP_SSM_RS.contains("parts[0].ty() == T::F32"),
+        "古い F32 固定の判定が残っている"
+    );
+    // router の logits も同じカーネルで回す (累積順が同じなので値はビット一致)。
+    assert!(
+        CUDA_RS.contains("pf_ba_gemm_dev_launch(ctx, wp, xp, dlogit.ptr(), nt, k_in, n)"),
+        "router の logits GEMM が専用カーネルに切り替わっていない"
+    );
+}
+
+#[test]
+fn task225_router225_kernel_is_wired() {
+    assert!(ROUTER225_SRC.contains("dno_router_softmax_topk"));
+    assert!(
+        CUDA_RS.contains("b\"dno_router_softmax_topk\\0\""),
+        "cuda.rs が dno_router_softmax_topk を読んでいない"
+    );
+    for line in [
+        "#define RT_MAX_PER 32",
+        "#define RT_MAX_K 32",
+        "#define RT_WARPS 4",
+        "#define RT_THREADS (RT_WARPS * 32)",
+    ] {
+        assert!(ROUTER225_SRC.contains(line), "{line} が無い");
+    }
+    assert_eq!(
+        cu_kernel_nargs(ROUTER225_SRC, "dno_router_softmax_topk"),
+        7,
+        "引数の個数がホストの起動と違う (logits/sels/wts/rowsum/nt/ne/k)"
+    );
+    assert!(
+        ROUTER225_SRC.contains("const int t = blockIdx.x * RT_WARPS + wid;"),
+        "1 ブロック 4 ワープ = 4 トークンの割り方が変わっている"
+    );
+    assert!(
+        CUDA_RS.contains("let grid = (nt.div_ceil(4) as u32, 1, 1);"),
+        "router カーネルの grid が ceil(nt/4) でない"
+    );
+    assert!(
+        CUDA_RS.contains("ctx.launch_async(f_rt, grid, (128, 1, 1), 0, &mut args)"),
+        "router カーネルの block が 128 でない"
+    );
+    // ゲートは qwen4exp の router 経路に配線されている (mask 有りはホストへ)。
+    assert!(
+        QWEN4EXP_RS.contains("crate::cuda::pf_router_dev_on()"),
+        "router のデバイス経路が qwen4exp に配線されていない"
+    );
+    assert!(
+        QWEN4EXP_RS.contains("&& expert_mask.is_none()"),
+        "mask 有り (介入中) でデバイス経路に入ってしまう"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("router225)    echo \"kernels_router225.cu|nofmad\""),
+        "build_ptx.sh の router225 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("router225"),
+        "targets_all に router225 が無い"
+    );
+}
+
+#[test]
+fn task225_gdn_pf3_kernel_is_wired() {
+    assert!(GDN_PF3_SRC.contains("dno_gdn_pf_scan32"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_scan32\\0\""),
+        "cuda.rs が dno_gdn_pf_scan32 を読んでいない"
+    );
+    for line in [
+        "#define PF3_DK 128",
+        "#define PF3_LANES 8",
+        "#define PF3_NR 16",
+        "#define PF3_COLS 32",
+        "#define PF3_THREADS 256",
+        "#define PF3_DCONV 4",
+        "#define PF3_CS 3",
+        "#define PF3_RING 4",
+    ] {
+        assert!(GDN_PF3_SRC.contains(line), "{line} が無い");
+    }
+    // 8 レーン x 16 行 = 128 行、block = 32 列 x 8 レーン = 256 スレッド。
+    assert_eq!(8 * 16, 128, "レーン x 行が dk でない");
+    assert_eq!(32 * 8, 256, "列 x レーンがスレッド数でない");
+    assert_eq!(
+        cu_kernel_nargs(GDN_PF3_SRC, "dno_gdn_pf_scan32"),
+        17,
+        "引数の個数が v2 (gdn_pf2_launch) と違う"
+    );
+    // 縮約は 8 レーン (xor 1 -> 2 -> 4)。
+    for what in ["sq", "sk2", "skv", "o"] {
+        for off in [1, 2, 4] {
+            assert!(
+                GDN_PF3_SRC.contains(&format!("__shfl_xor_sync(0xffffffffu, {what}, {off})")),
+                "{what} の xor {off} 縮約が無い"
+            );
+        }
+    }
+    assert!(
+        GDN_PF3_SRC.contains("float S[PF3_NR];"),
+        "状態配列がレジスタ常駐の形になっていない"
+    );
+    // barrier は「プロローグ 1 + ループ末尾 1」の 2 個。
+    assert_eq!(
+        GDN_PF3_SRC.matches("__syncthreads()").count(),
+        2,
+        "barrier が 2 個でない"
+    );
+    assert!(
+        CUDA_RS.contains("(nv as u32, GDN_PF3_BLOCKS, 1)"),
+        "v3 スキャンの grid が (nv, 4) でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF3_BLOCKS: u32 = 4;"),
+        "GDN_PF3_BLOCKS が 4 でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf3)      echo \"kernels_gdn_pf3.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf3 が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gdn_pf3"),
+        "targets_all に gdn_pf3 が無い"
+    );
+    // v2 の norm を再利用する (演算列を増やさない)。
+    assert!(
+        CUDA_RS.contains("let norm = gdn_pf2_kernels()?.norm;"),
+        "v3 が v2 の norm を使っていない"
+    );
+}
+
 // task 218: 残差の平均の記録 / ステアリングのカーネル (kernels_steer.cu)
 // ---------------------------------------------------------------------------
 
@@ -9461,4 +9720,134 @@ fn steer_ptx_matches_the_host_launch_abi() {
         CUDA_RS.contains("b\"dno_steer_sub\\0\"") && CUDA_RS.contains("b\"dno_steer_proj\\0\""),
         "cuda.rs が sub / proj を引いていない"
     );
+}
+
+// task 228: GDN スキャン WY (UT) 形式チャンク版 (kernels_gdn_pf_wy.cu)
+// ---------------------------------------------------------------------------
+
+/// `.cu` とホスト側の起動・共有メモリ・build_ptx.sh の結線。
+///
+/// 値の一致 (v3 / CPU 参照との差) は GPU 側と `gdn/wy.rs` のテストの担当。
+#[test]
+fn task228_gdn_pf_wy_kernel_is_wired() {
+    assert!(GDN_PF_WY_SRC.contains("dno_gdn_pf_wy32"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_wy32\\0\""),
+        "cuda.rs が dno_gdn_pf_wy32 を読んでいない"
+    );
+    for line in [
+        "#define WY_DK 128",
+        "#define WY_C 8",
+        "#define WY_THREADS 512",
+        "#define WY_WARPS 16",
+        "#define WY_DCONV 4",
+        "#define WY_CS 3",
+    ] {
+        assert!(GDN_PF_WY_SRC.contains(line), "{line} が無い");
+    }
+    // チャンク長とヘッド次元はソースから読む (C を変えたときに領域の
+    // 期待値を手で直さなくて済むようにする)。
+    let define = |name: &str| -> usize {
+        GDN_PF_WY_SRC
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"))
+    };
+    let wy_c = define("WY_C");
+    let wy_dk = define("WY_DK");
+    assert!(wy_c >= 1 && wy_dk >= 1);
+    // 引数は v2/v3 と同じ 17 個 (並びも同じ)。
+    assert_eq!(
+        cu_kernel_nargs(GDN_PF_WY_SRC, "dno_gdn_pf_wy32"),
+        17,
+        "引数の個数が v2/v3 と違う"
+    );
+    // 共有メモリの並びが重ならないこと (オフセット + 要素数 <= 次のオフセット)。
+    let total: usize = GDN_PF_WY_SRC
+        .lines()
+        .find_map(|l| l.strip_prefix("#define WY_TOTAL "))
+        .and_then(|r| r.trim().parse().ok())
+        .expect("WY_TOTAL が無い");
+    let region = |name: &str, size: usize| -> (usize, usize) {
+        let off: usize = GDN_PF_WY_SRC
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"));
+        (off, off + size)
+    };
+    let regions = [
+        region("WY_S", wy_dk * wy_dk),
+        region("WY_KC", wy_c * wy_dk),
+        region("WY_QC", wy_c * wy_dk),
+        region("WY_VC", wy_c * wy_dk),
+        region("WY_DC", wy_c * wy_dk),
+        region("WY_PC", wy_c * wy_dk),
+        region("WY_QPC", wy_c * wy_dk),
+        region("WY_RDEC", wy_c * wy_c),
+        region("WY_AC", wy_c * wy_c),
+        region("WY_GC", wy_c * wy_c),
+        region("WY_LAM", wy_c),
+        region("WY_RL", wy_c),
+        region("WY_EG", wy_c),
+        region("WY_BC", wy_c),
+        region("WY_LL", 1),
+    ];
+    let mut at = 0usize;
+    for (lo, hi) in regions {
+        assert_eq!(lo, at, "共有メモリの並びに隙間/重なりがある ({lo} != {at})");
+        at = hi;
+    }
+    assert_eq!(at, total, "WY_TOTAL が最後の領域の終端と違う");
+    // lab t228a: 実機 (RTX 5090, sm_120) の opt-in 上限は 99 KB。C = 32 の
+    // 176,644 B は起動できず v3 へ落ちたので、上限に収まっていることを固定する。
+    assert!(
+        total * 4 <= 99 * 1024,
+        "共有メモリ {} B がデバイスの opt-in 上限 (99 KB) を超える",
+        total * 4
+    );
+    assert_eq!(
+        total,
+        CUDA_RS
+            .lines()
+            .find_map(|l| l
+                .trim()
+                .strip_prefix("pub(crate) const GDN_PF_WY_SMEM_FLOATS: usize = "))
+            .and_then(|r| r.trim_end_matches(';').parse::<usize>().ok())
+            .expect("GDN_PF_WY_SMEM_FLOATS が無い"),
+        "Rust 側の smem 見積りが .cu の WY_TOTAL と違う"
+    );
+    // 1 ブロック = 1 ヘッド (grid の y を使わない) / スレッド数は #define と同じ。
+    assert!(
+        CUDA_RS.contains("(nv as u32, 1, 1),\n                (GDN_PF_WY_THREADS as u32, 1, 1),"),
+        "WY スキャンの grid / block が (nv, 1) / 512 でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF_WY_THREADS: usize = 512;"),
+        "GDN_PF_WY_THREADS が 512 でない"
+    );
+    // 状態は共有メモリ、縮約はワープ (32 レーン)。
+    assert!(
+        GDN_PF_WY_SRC.contains("float* S = sh + WY_S;"),
+        "状態が共有メモリに置かれていない"
+    );
+    assert!(
+        GDN_PF_WY_SRC.contains("for (int off = 16; off > 0; off >>= 1)"),
+        "L2 正規化のワープ縮約が無い"
+    );
+    assert!(
+        GDN_PF_WY_SRC.matches("__syncthreads()").count() <= 10,
+        "バリアが多すぎる (チャンク内は 8 個 + プロローグ 1 のはず)"
+    );
+    // build_ptx.sh は nofmad / compute_90 で作り、targets_all に入っている。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy)   echo \"kernels_gdn_pf_wy.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf_wy が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(targets.contains("gdn_pf_wy"), "targets_all に gdn_pf_wy が無い");
 }

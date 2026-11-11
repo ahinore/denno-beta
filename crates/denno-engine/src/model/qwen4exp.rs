@@ -14684,79 +14684,140 @@ fn moe_ffn_quant_batch_full(
     // task 145: 台帳の区間 (router)。gate_inp の GEMV から top-k の確定まで。
     let _l_router = q4ledger::enter(q4ledger::ROUTER);
     let t_router = std::time::Instant::now();
-    let mut probs = vec![0.0f32; nt * ne];
-    // task 182: router (`ffn_gate_inp`、F32) を GPU の f32 GEMM で回す
-    // (`DENNO_PF_ROUTER_GPU=1` のときだけ。失敗・前提外は CPU バッチへ)。
-    #[cfg(feature = "cuda")]
-    let dev_router_in = if lw.gate_inp.k() == e {
-        crate::cuda::pf_mixed_dev_in_ptr(xs.as_ptr(), nt, e)
-    } else {
-        None
-    };
-    #[cfg(feature = "cuda")]
-    let gpu_router = pf_router_gpu_on()
-        && nt >= PF_ROUTER_GPU_MIN_TOK
-        && match dev_router_in {
-            // task 209: 入力が直近の mix の出力なら、デバイスの `mixed` を直接読む
-            // (`DENNO_PF_MIXDEVIN`)。値はホストから上げるのと同じバイト列。
-            Some(dp) => crate::cuda::maybe_gpu_f32_gemm_batch_dev_into(
-                lw.gate_inp.uid(),
-                lw.gate_inp.blocks().as_slice(),
-                lw.gate_inp.k(),
-                lw.gate_inp.n(),
-                dp,
-                nt,
-                &mut probs,
-                GgmlType::F32,
-            ),
-            None => crate::cuda::maybe_gpu_f32_gemm_batch_into(
-                lw.gate_inp.uid(),
-                lw.gate_inp.blocks().as_slice(),
-                lw.gate_inp.k(),
-                lw.gate_inp.n(),
-                xs,
-                nt,
-                &mut probs,
-                GgmlType::F32,
-            ),
-        };
-    #[cfg(not(feature = "cuda"))]
-    let gpu_router = false;
-    if gpu_router {
-        PF182_LOG_ROUTER.call_once(|| {
-            eprintln!("[pf182] prefill router: GPU f32 GEMM (DENNO_PF_ROUTER_GPU)")
-        });
-    }
-    if !gpu_router {
-        gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
-            .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
-    }
-
-    // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
-    // task 154: 台帳の副区間 (softmax + top-k)。
-    let _sub_sm = q4ledger::sub(q4ledger::SUB_SOFTMAX);
-    // task 189: `DENNO_PF_ROUTER_SM` のときは行ごとのタスク生成をやめる。
-    let sm_block = router_sm_block();
-    router_softmax_rows(&mut probs, ne, sm_block);
-
-    // 3. top-k (index 昇順) + 再正規化 (選択 index 昇順に逐次加算した和で割る)。
-    //    P33: トークンごとの `Vec` を作らず、平らな配列へ直接書く (1 層あたり
-    //    1,024 回の確保が 2 回になる)。選択規則は [`select_topk_into`] が
-    //    [`select_topk`] と同じ (同値は小さい index) なので値は変わらない。
-    let mut sels: Vec<usize> = vec![0; nt * k];
-    let mut weights: Vec<f32> = vec![0.0; nt * k];
     // task 217: 無効 expert は top-k の候補から外す (層に無効が無ければ None)。
     let expert_mask = iv.expert_mask(lw.il);
-    router_topk_rows(
-        &probs,
-        ne,
-        k,
-        &mut sels,
-        &mut weights,
-        sm_block,
-        pf_router_fast_on(),
-        expert_mask,
-    );
+    // ホスト経路のときだけ確保する (デバイス経路では logits を降ろさない)。
+    let mut probs: Vec<f32> = Vec::new();
+    let mut sels: Vec<usize> = vec![0; nt * k];
+    let mut weights: Vec<f32> = vec![0.0; nt * k];
+    // task 154: 台帳の副区間 (softmax + top-k)。
+    let _sub_sm = q4ledger::sub(q4ledger::SUB_SOFTMAX);
+    // task 225: router の softmax と top-k をデバイスで回す (`DENNO_PF_ROUTER_DEV`)。
+    // logits もデバイスで作り、選んだ k 個の index と重みだけを受け取る。
+    // 使えないときは下の従来経路 (ホスト) がそのまま走る。
+    #[cfg(feature = "cuda")]
+    let mut router_tail_sum: Option<f32> = None;
+    #[cfg(feature = "cuda")]
+    {
+        let dev_ok = crate::cuda::pf_router_dev_on()
+            && lw.gate_inp.k() == e
+            && expert_mask.is_none()
+            && nt >= PF_ROUTER_GPU_MIN_TOK
+            && crate::cuda::pf_router_dev_ok(nt, ne, k);
+        if dev_ok {
+            let mut sel32 = vec![0u32; nt * k];
+            let mut rowsum = vec![0.0f32; nt];
+            let ok = match crate::cuda::pf_mixed_dev_in_ptr(xs.as_ptr(), nt, e) {
+                Some(dp) => crate::cuda::pf_router_dev_topk(
+                    lw.gate_inp.uid(),
+                    lw.gate_inp.blocks().as_slice(),
+                    lw.gate_inp.k(),
+                    lw.gate_inp.n(),
+                    Some(dp),
+                    None,
+                    nt,
+                    k,
+                    &mut sel32,
+                    &mut weights,
+                    &mut rowsum,
+                    GgmlType::F32,
+                ),
+                None => crate::cuda::pf_router_dev_topk(
+                    lw.gate_inp.uid(),
+                    lw.gate_inp.blocks().as_slice(),
+                    lw.gate_inp.k(),
+                    lw.gate_inp.n(),
+                    None,
+                    Some(xs),
+                    nt,
+                    k,
+                    &mut sel32,
+                    &mut weights,
+                    &mut rowsum,
+                    GgmlType::F32,
+                ),
+            };
+            if ok {
+                for (i, v) in sel32.iter().enumerate() {
+                    sels[i] = *v as usize;
+                }
+                router_tail_sum = rowsum.last().copied();
+            }
+        }
+    }
+    #[cfg(feature = "cuda")]
+    let router_dev_done = router_tail_sum.is_some();
+    #[cfg(not(feature = "cuda"))]
+    let router_dev_done = false;
+    if !router_dev_done {
+        probs = vec![0.0f32; nt * ne];
+        // task 182: router (`ffn_gate_inp`、F32) を GPU の f32 GEMM で回す
+        // (`DENNO_PF_ROUTER_GPU=1` のときだけ。失敗・前提外は CPU バッチへ)。
+        #[cfg(feature = "cuda")]
+        let dev_router_in = if lw.gate_inp.k() == e {
+            crate::cuda::pf_mixed_dev_in_ptr(xs.as_ptr(), nt, e)
+        } else {
+            None
+        };
+        #[cfg(feature = "cuda")]
+        let gpu_router = pf_router_gpu_on()
+            && nt >= PF_ROUTER_GPU_MIN_TOK
+            && match dev_router_in {
+                // task 209: 入力が直近の mix の出力なら、デバイスの `mixed` を直接読む
+                // (`DENNO_PF_MIXDEVIN`)。値はホストから上げるのと同じバイト列。
+                Some(dp) => crate::cuda::maybe_gpu_f32_gemm_batch_dev_into(
+                    lw.gate_inp.uid(),
+                    lw.gate_inp.blocks().as_slice(),
+                    lw.gate_inp.k(),
+                    lw.gate_inp.n(),
+                    dp,
+                    nt,
+                    &mut probs,
+                    GgmlType::F32,
+                ),
+                None => crate::cuda::maybe_gpu_f32_gemm_batch_into(
+                    lw.gate_inp.uid(),
+                    lw.gate_inp.blocks().as_slice(),
+                    lw.gate_inp.k(),
+                    lw.gate_inp.n(),
+                    xs,
+                    nt,
+                    &mut probs,
+                    GgmlType::F32,
+                ),
+            };
+        #[cfg(not(feature = "cuda"))]
+        let gpu_router = false;
+        if gpu_router {
+            PF182_LOG_ROUTER.call_once(|| {
+                eprintln!("[pf182] prefill router: GPU f32 GEMM (DENNO_PF_ROUTER_GPU)")
+            });
+        }
+        if !gpu_router {
+            gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
+                .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
+        }
+
+        // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
+        // task 189: `DENNO_PF_ROUTER_SM` のときは行ごとのタスク生成をやめる。
+        let sm_block = router_sm_block();
+        router_softmax_rows(&mut probs, ne, sm_block);
+
+        // 3. top-k (index 昇順) + 再正規化 (選択 index 昇順に逐次加算した和で割る)。
+        //    P33: トークンごとの `Vec` を作らず、平らな配列へ直接書く (1 層あたり
+        //    1,024 回の確保が 2 回になる)。選択規則は [`select_topk_into`] が
+        //    [`select_topk`] と同じ (同値は小さい index) なので値は変わらない。
+        router_topk_rows(
+            &probs,
+            ne,
+            k,
+            &mut sels,
+            &mut weights,
+            sm_block,
+            pf_router_fast_on(),
+            expert_mask,
+        );
+    }
     drop(_sub_sm);
     moe_sub_add(0, t_router.elapsed());
     // 区間を閉じる (experts の時間を router に二重計上しない)。
@@ -14962,12 +15023,23 @@ fn moe_ffn_quant_batch_full(
 
     // P54: チャンク末尾のトークンの router 確率和 (= 選択 expert の確率の和)。
     // shared を切っていても probs / sels は手元にあるので読むだけ。
+    // task 225: デバイス経路ではカーネルが同じ和 (index 昇順の逐次和) を返す。
     if let Some(r) = roles.as_deref_mut() {
         let t = nt - 1;
-        let mut s = 0.0f32;
-        for j in 0..k {
-            s += probs[t * ne + sels[t * k + j]];
-        }
+        #[cfg(feature = "cuda")]
+        let dev_sum = router_tail_sum;
+        #[cfg(not(feature = "cuda"))]
+        let dev_sum: Option<f32> = None;
+        let s = match dev_sum {
+            Some(v) => v,
+            None => {
+                let mut s = 0.0f32;
+                for j in 0..k {
+                    s += probs[t * ne + sels[t * k + j]];
+                }
+                s
+            }
+        };
         r.router = s;
     }
 
@@ -24715,6 +24787,177 @@ mod tests {
             mix_kprof::reset();
             mix_kprof::set_for_test(false);
             set_prefill_mix_seq_for_test(None);
+        }
+    }
+}
+
+/// task 225: `dno_router_softmax_topk` (kernels_router225.cu) の**アルゴリズムの
+/// 写し**。CUDA をこのコンテナで走らせられないので、選択規則 (値の降順・同値は
+/// 小さい index・出力は index 昇順) と再正規化の加算順がホストの
+/// [`router_softmax_rows`] + [`router_topk_rows`] と同じ結果になることを、
+/// 丸めの木だけを写して確かめる。
+///
+/// - レーン l は index l, l+32, l+64, ... を持つ (CUDA と同じ昇順)
+/// - 和は「レーン内の昇順部分和 → xor 1,2,4,8,16 の木」(CUDA と同じ結合順)
+/// - レーンごとの上位 k は挿入法、全体の上位 k は k 回の最大
+#[cfg(test)]
+mod task225_router_dev_mirror {
+    use super::{router_softmax_rows, router_topk_rows};
+
+    fn mirror(logits: &[f32], ne: usize, k: usize) -> (Vec<usize>, Vec<f32>) {
+        let nt = logits.len() / ne;
+        let mut sels = vec![0usize; nt * k];
+        let mut wts = vec![0f32; nt * k];
+        for t in 0..nt {
+            let row = &logits[t * ne..(t + 1) * ne];
+            // --- max (全レーンの max の max) ---
+            let mut m = f32::NEG_INFINITY;
+            for l in 0..32 {
+                let mut j = 0;
+                while l + j * 32 < ne {
+                    let v = row[l + j * 32];
+                    if v > m {
+                        m = v;
+                    }
+                    j += 1;
+                }
+            }
+            // --- exp とレーン内の昇順部分和 ---
+            let mut e = vec![0f32; ne];
+            let mut lane = [0f32; 32];
+            for l in 0..32 {
+                let mut s = 0.0f32;
+                let mut j = 0;
+                while l + j * 32 < ne {
+                    let i = l + j * 32;
+                    let ev = (row[i] - m).exp();
+                    e[i] = ev;
+                    s += ev;
+                    j += 1;
+                }
+                lane[l] = s;
+            }
+            // --- xor 木 (CUDA の s += shfl_xor(s, off) と同じ) ---
+            for off in [1usize, 2, 4, 8, 16] {
+                let prev = lane;
+                for l in 0..32 {
+                    lane[l] = prev[l] + prev[l ^ off];
+                }
+            }
+            let s_total = lane[0];
+            let divide = s_total > 0.0 && s_total == s_total;
+            let p = |i: usize| if divide { e[i] / s_total } else { e[i] };
+            // --- レーンごとの上位 k (挿入法。i は昇順) ---
+            let mut lv = vec![vec![0f32; k]; 32];
+            let mut li = vec![vec![0usize; k]; 32];
+            let mut cnt = vec![0usize; 32];
+            for l in 0..32 {
+                let mut j = 0;
+                while l + j * 32 < ne {
+                    let i = l + j * 32;
+                    let pv = p(i);
+                    let full = cnt[l] == k;
+                    if full && !(pv > lv[l][k - 1]) {
+                        j += 1;
+                        continue;
+                    }
+                    let mut pos = if cnt[l] < k { cnt[l] } else { k - 1 };
+                    while pos > 0
+                        && (pv > lv[l][pos - 1] || (pv == lv[l][pos - 1] && i < li[l][pos - 1]))
+                    {
+                        lv[l][pos] = lv[l][pos - 1];
+                        li[l][pos] = li[l][pos - 1];
+                        pos -= 1;
+                    }
+                    lv[l][pos] = pv;
+                    li[l][pos] = i;
+                    if cnt[l] < k {
+                        cnt[l] += 1;
+                    }
+                    j += 1;
+                }
+            }
+            // --- k 回の最大 (値の降順 → index 昇順) ---
+            let mut cur = vec![0usize; 32];
+            let mut sv = Vec::with_capacity(k);
+            let mut si = Vec::with_capacity(k);
+            for _ in 0..k {
+                let mut bv = f32::NEG_INFINITY;
+                let mut bi = usize::MAX;
+                for l in 0..32 {
+                    if cur[l] < cnt[l] {
+                        let (v, i) = (lv[l][cur[l]], li[l][cur[l]]);
+                        if v > bv || (v == bv && i < bi) {
+                            bv = v;
+                            bi = i;
+                        }
+                    }
+                }
+                for l in 0..32 {
+                    if cur[l] < cnt[l] && li[l][cur[l]] == bi {
+                        cur[l] += 1;
+                    }
+                }
+                sv.push(bv);
+                si.push(bi);
+            }
+            // --- index 昇順へ (挿入法) ---
+            for a in 1..k {
+                let (v, i) = (sv[a], si[a]);
+                let mut b = a;
+                while b > 0 && si[b - 1] > i {
+                    sv[b] = sv[b - 1];
+                    si[b] = si[b - 1];
+                    b -= 1;
+                }
+                sv[b] = v;
+                si[b] = i;
+            }
+            // --- 再正規化 (index 昇順の逐次和) ---
+            let mut sum = 0.0f32;
+            for j in 0..k {
+                sum += sv[j];
+            }
+            let ok = sum == sum && sum > 0.0 && sum < f32::INFINITY;
+            for j in 0..k {
+                sels[t * k + j] = si[j];
+                wts[t * k + j] = if ok { sv[j] / sum } else { 1.0 / k as f32 };
+            }
+        }
+        (sels, wts)
+    }
+
+    /// 選択 (index) はホストと完全一致し、重みは丸めの差だけ。
+    #[test]
+    fn mirror_matches_host_selection() {
+        let (ne, k, nt) = (512usize, 8usize, 37usize);
+        // 同値を含む入力を混ぜる (index の刻みを粗くして衝突を作る)。
+        let mut xs = vec![0f32; nt * ne];
+        for t in 0..nt {
+            for i in 0..ne {
+                let v = (((t * 7 + i * 13) % 97) as f32) * 0.01 - 0.4;
+                xs[t * ne + i] = if i % 5 == 0 { (v * 4.0).round() * 0.25 } else { v };
+            }
+        }
+        let (ds, dw) = mirror(&xs, ne, k);
+        let mut probs = xs.clone();
+        router_softmax_rows(&mut probs, ne, None);
+        let mut hs = vec![0usize; nt * k];
+        let mut hw = vec![0f32; nt * k];
+        router_topk_rows(&probs, ne, k, &mut hs, &mut hw, None, true, None);
+        assert_eq!(ds, hs, "選択 index がホストと違う");
+        for i in 0..nt * k {
+            let a = dw[i];
+            let b = hw[i];
+            assert!(
+                (a - b).abs() <= 1e-6 + 1e-5 * b.abs(),
+                "重み {i}: device {a} vs host {b}"
+            );
+        }
+        // 各行の重みの和は 1。
+        for t in 0..nt {
+            let s: f32 = dw[t * k..(t + 1) * k].iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "行 {t} の和 {s}");
         }
     }
 }
