@@ -12414,6 +12414,19 @@ mod pf_exp_tc_tests {
         assert!(crate::model::exp_pf::tc_exp_from_value(Some("true")));
     }
 
+    /// 作業域の外部予約のゲートも既定 off・明示的な真値だけ on。
+    #[test]
+    fn lm_reserve_gate_is_strictly_opt_in() {
+        use crate::model::exp_pf::{lm_reserve_from_value, tc_exp_from_value};
+        for v in [None, Some(""), Some("0"), Some("off"), Some("false")] {
+            assert!(!lm_reserve_from_value(v), "lm_reserve({v:?})");
+            assert!(!tc_exp_from_value(v), "tc_exp({v:?})");
+        }
+        for v in [Some("1"), Some("on"), Some("true"), Some(" yes ")] {
+            assert!(lm_reserve_from_value(v), "lm_reserve({v:?})");
+        }
+    }
+
     /// 形の契約: gate と up が同じ型・4 型・k が 256 の倍数・n が 64 の倍数。
     #[test]
     fn tc_shapes_ok_pins_the_contract() {

@@ -4129,6 +4129,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 242: 追い出した鍵を控えておき、prefill の終端で戻す
         // (戻さないと次の decode のヒット率が 0.75 → 0.25 に落ちる)。
         let mut evicted: Vec<crate::model::expert_cache::ExpertKey> = Vec::new();
+        // task 250: 作業域の外部予約 (`DENNO_PF_LM_RESERVE=1`)。層ループの間だけ持つ。
+        let mut reserve_guard: Option<crate::model::expert_vram::ExternalReserve> = None;
         {
             let k = self.p.n_expert_used;
             let ff = self.p.n_ff_exp;
@@ -4141,10 +4143,18 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             } else {
                 rows
             };
+            // task 250: tensor core 経路は gate/up を融合して act に直接書くので、
+            // 作業域は act 1 枚で足りる (g/u は取らない)。見積りも 3 → 1 に落とす
+            // (過大に見積もると、要らない expert まで追い出して decode を冷やす)。
+            let act_terms = if crate::model::exp_pf::tc_exp_on() {
+                1
+            } else {
+                3
+            };
             let need = nt_all * e * 8
                 + ranges.len() * chunk * hc * 4
                 + (rows + nt_all) * e * 4
-                + 3 * gl_rows * ff * 4
+                + act_terms * gl_rows * ff * 4
                 + (64usize << 20);
             // lab t242b: この `need` を満たしても、14k では `h` (1,505 MiB) の
             // 確保が「空き 1,243 MiB」で失敗し、`DevBuffer::alloc_tagged` の
@@ -4153,22 +4163,40 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             // 少しずつ追い出しても 1.5 GB の連続領域は空かない。
             // 次の課題: `h` をトークンで分割する (タイル) か、作業域を slab の
             // 外にまとめて取る。どちらもこの経路の前提 (連続した h) を変える。
-            let reserve = 1024usize << 20;
-            let short = match crate::cuda::dev_mem_mb_cached() {
-                Some((free_mb, _)) => need.saturating_sub((free_mb << 20).saturating_sub(reserve)),
-                None => need,
-            };
-            let want = short.min(6usize << 30);
-            if want > (64 << 20) {
-                let (freed, keys) = crate::model::expert_vram::emergency_free_keys(want);
-                if freed > 0 {
+            // task 250: 作業域を expert 予算からの**外部予約**として取る版
+            // (`DENNO_PF_LM_RESERVE=1`)。予約は prefill の終端で返すので、LRU の
+            // 上限が作業域のぶんだけ下がって戻る (確保のたびに追い出し階段が
+            // 走って上限が縮んだままになるのを避ける)。
+            if crate::model::exp_pf::lm_reserve_on() {
+                if let Some(r) = crate::model::expert_vram::reserve_external(need) {
                     eprintln!(
-                        "[pf-lm] expert を {} MiB 追い出して活性と作業域を空けた (必要 {} MiB)",
-                        freed >> 20,
-                        need >> 20
+                        "[pf-lm] 作業域 {} MiB を予算から予約した (会計={})",
+                        need >> 20,
+                        r.is_guarded()
                     );
+                    reserve_guard = Some(r);
                 }
-                evicted = keys;
+            }
+            if reserve_guard.is_none() {
+                let reserve = 1024usize << 20;
+                let short = match crate::cuda::dev_mem_mb_cached() {
+                    Some((free_mb, _)) => {
+                        need.saturating_sub((free_mb << 20).saturating_sub(reserve))
+                    }
+                    None => need,
+                };
+                let want = short.min(6usize << 30);
+                if want > (64 << 20) {
+                    let (freed, keys) = crate::model::expert_vram::emergency_free_keys(want);
+                    if freed > 0 {
+                        eprintln!(
+                            "[pf-lm] expert を {} MiB 追い出して活性と作業域を空けた (必要 {} MiB)",
+                            freed >> 20,
+                            need >> 20
+                        );
+                    }
+                    evicted = keys;
+                }
             }
         }
         if !crate::cuda::pf_lm_ensure(nt_all, e, hc, chunk) {
@@ -4521,6 +4549,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         crate::cuda::pf_lm_release();
         crate::cuda::pf_scratch_drop();
         crate::cuda::pf_release();
+        // task 250: 作業域の外部予約を返す (LRU の上限がここで戻る)。
+        drop(reserve_guard);
         // task 242: 作業域のために追い出した expert を戻す (prefill の終端)。
         // ここまで decode の LRU は 2 GB 以上痩せていて、次の decode のヒット率が
         // 0.75 → 0.25 に落ちる (lab t233a)。追い出した順 (古い順) に戻すので、

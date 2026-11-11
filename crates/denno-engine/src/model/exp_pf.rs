@@ -947,6 +947,27 @@ pub fn tc_exp_on() -> bool {
 /// **採らない** (`ADOPT: no` t242c)。ゲートは 3 本とも既定 off のまま残す。
 pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
 
+/// `DENNO_PF_LM_RESERVE=1`: 層優先 prefill の作業域を **外部予約**として
+/// expert の予算へ計上する (task 250、既定 off)。
+///
+/// いまは作業域 (14k で約 2 GB) を `DevBuffer::alloc_tagged` で取るので、
+/// 確保のたびに LRU の追い出し階段が走り、確保したまま解放しない作業域のぶん
+/// LRU の上限が縮んだままになる (lab t250a: 22 GB → 8.2 GB、decode の
+/// ヒット率 0.247)。予約にすると上限が作業域のぶんだけ下がり、prefill の
+/// 終端で返るので、次の decode で上限が戻る。
+pub const LM_RESERVE_ENV: &str = "DENNO_PF_LM_RESERVE";
+
+/// [`LM_RESERVE_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn lm_reserve_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 作業域を外部予約するか (プロセスで 1 回だけ env を読む)。
+pub fn lm_reserve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lm_reserve_from_value(std::env::var(LM_RESERVE_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_LM_LAYER` の解釈 (純関数)。**明示的な真値だけ on**。
 pub fn lm_layer_from_value(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
