@@ -13,7 +13,10 @@
 //! 持ち回り)」の間違いを、GPU 無しで見つけられる。
 
 pub const WY_DK: usize = 128;
-pub const WY_C: usize = 32;
+/// カーネルと同じチャンク長。lab t228a で C = 32 の共有メモリ 176,644 B が
+/// デバイスの opt-in 上限 99 KB を超えて v3 へ落ちたため C = 8 にした
+/// (作業域が C に比例する。91,012 B)。
+pub const WY_C: usize = 8;
 pub const WY_THREADS: usize = 512;
 pub const WY_WARPS: usize = 16;
 pub const WY_DCONV: usize = 4;
@@ -21,20 +24,20 @@ pub const WY_CS: usize = 3;
 
 pub const OFF_S: usize = 0;
 pub const OFF_KC: usize = 16384;
-pub const OFF_QC: usize = 20480;
-pub const OFF_VC: usize = 24576;
-pub const OFF_DC: usize = 28672;
-pub const OFF_PC: usize = 32768;
-pub const OFF_QPC: usize = 36864;
-pub const OFF_RDEC: usize = 40960;
-pub const OFF_AC: usize = 41984;
-pub const OFF_GC: usize = 43008;
-pub const OFF_LAM: usize = 44032;
-pub const OFF_RL: usize = 44064;
-pub const OFF_EG: usize = 44096;
-pub const OFF_BC: usize = 44128;
-pub const OFF_LL: usize = 44160;
-pub const TOTAL: usize = 44161;
+pub const OFF_QC: usize = 17408;
+pub const OFF_VC: usize = 18432;
+pub const OFF_DC: usize = 19456;
+pub const OFF_PC: usize = 20480;
+pub const OFF_QPC: usize = 21504;
+pub const OFF_RDEC: usize = 22528;
+pub const OFF_AC: usize = 22592;
+pub const OFF_GC: usize = 22656;
+pub const OFF_LAM: usize = 22720;
+pub const OFF_RL: usize = 22728;
+pub const OFF_EG: usize = 22736;
+pub const OFF_BC: usize = 22744;
+pub const OFF_LL: usize = 22752;
+pub const TOTAL: usize = 22753;
 
 /// カーネル 1 回ぶんの入力 (引数の並びと同じ)。
 pub struct SimInput<'a> {

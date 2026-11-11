@@ -33,10 +33,18 @@
 // 1 ブロック = 1 ヘッド。状態 64 KB を共有メモリに置き、系列をチャンク順に
 // 走査する (48 ブロック = 48 SM。SM あたり 1 ブロック)。
 //
+// 共有メモリは 91,012 B (状態 64 KB + 作業域) で、デバイスの opt-in 上限に収める。
+// lab t228a の実機 (RTX 5090, sm_120) は上限が 99 KB で、C = 32 のときの
+// 176,644 B は opt-in に失敗して v3 へ落ちた (測定が v3 になっていた)。
+// 作業域は C に比例するので C = 8 にすると 91,012 B になる
+// (`pf228_scan_wy_smem_matches_source` が上限との比を固定している)。
+// チャンク長を変えるときは WY_C と下のオフセット、Rust 側の
+// GDN_PF_WY_SMEM_FLOATS を一緒に直すこと。
+//
 // 値の行にコメントを付けないこと (kernel_invariants が `#define` の行末までを
 // 値として読む)。
 #define WY_DK 128
-#define WY_C 32
+#define WY_C 8
 #define WY_THREADS 512
 #define WY_WARPS 16
 #define WY_DCONV 4
@@ -45,20 +53,20 @@
 // 動的共有メモリの並び (float 単位)
 #define WY_S 0
 #define WY_KC 16384
-#define WY_QC 20480
-#define WY_VC 24576
-#define WY_DC 28672
-#define WY_PC 32768
-#define WY_QPC 36864
-#define WY_RDEC 40960
-#define WY_AC 41984
-#define WY_GC 43008
-#define WY_LAM 44032
-#define WY_RL 44064
-#define WY_EG 44096
-#define WY_BC 44128
-#define WY_LL 44160
-#define WY_TOTAL 44161
+#define WY_QC 17408
+#define WY_VC 18432
+#define WY_DC 19456
+#define WY_PC 20480
+#define WY_QPC 21504
+#define WY_RDEC 22528
+#define WY_AC 22592
+#define WY_GC 22656
+#define WY_LAM 22720
+#define WY_RL 22728
+#define WY_EG 22736
+#define WY_BC 22744
+#define WY_LL 22752
+#define WY_TOTAL 22753
 
 extern "C" __global__ void __launch_bounds__(WY_THREADS, 1)
 dno_gdn_pf_wy32(

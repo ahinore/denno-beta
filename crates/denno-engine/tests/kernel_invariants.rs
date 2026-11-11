@@ -9737,7 +9737,7 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
     );
     for line in [
         "#define WY_DK 128",
-        "#define WY_C 32",
+        "#define WY_C 8",
         "#define WY_THREADS 512",
         "#define WY_WARPS 16",
         "#define WY_DCONV 4",
@@ -9745,6 +9745,18 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
     ] {
         assert!(GDN_PF_WY_SRC.contains(line), "{line} が無い");
     }
+    // チャンク長とヘッド次元はソースから読む (C を変えたときに領域の
+    // 期待値を手で直さなくて済むようにする)。
+    let define = |name: &str| -> usize {
+        GDN_PF_WY_SRC
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"))
+    };
+    let wy_c = define("WY_C");
+    let wy_dk = define("WY_DK");
+    assert!(wy_c >= 1 && wy_dk >= 1);
     // 引数は v2/v3 と同じ 17 個 (並びも同じ)。
     assert_eq!(
         cu_kernel_nargs(GDN_PF_WY_SRC, "dno_gdn_pf_wy32"),
@@ -9766,20 +9778,20 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
         (off, off + size)
     };
     let regions = [
-        region("WY_S", 128 * 128),
-        region("WY_KC", 32 * 128),
-        region("WY_QC", 32 * 128),
-        region("WY_VC", 32 * 128),
-        region("WY_DC", 32 * 128),
-        region("WY_PC", 32 * 128),
-        region("WY_QPC", 32 * 128),
-        region("WY_RDEC", 32 * 32),
-        region("WY_AC", 32 * 32),
-        region("WY_GC", 32 * 32),
-        region("WY_LAM", 32),
-        region("WY_RL", 32),
-        region("WY_EG", 32),
-        region("WY_BC", 32),
+        region("WY_S", wy_dk * wy_dk),
+        region("WY_KC", wy_c * wy_dk),
+        region("WY_QC", wy_c * wy_dk),
+        region("WY_VC", wy_c * wy_dk),
+        region("WY_DC", wy_c * wy_dk),
+        region("WY_PC", wy_c * wy_dk),
+        region("WY_QPC", wy_c * wy_dk),
+        region("WY_RDEC", wy_c * wy_c),
+        region("WY_AC", wy_c * wy_c),
+        region("WY_GC", wy_c * wy_c),
+        region("WY_LAM", wy_c),
+        region("WY_RL", wy_c),
+        region("WY_EG", wy_c),
+        region("WY_BC", wy_c),
         region("WY_LL", 1),
     ];
     let mut at = 0usize;
@@ -9788,6 +9800,13 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
         at = hi;
     }
     assert_eq!(at, total, "WY_TOTAL が最後の領域の終端と違う");
+    // lab t228a: 実機 (RTX 5090, sm_120) の opt-in 上限は 99 KB。C = 32 の
+    // 176,644 B は起動できず v3 へ落ちたので、上限に収まっていることを固定する。
+    assert!(
+        total * 4 <= 99 * 1024,
+        "共有メモリ {} B がデバイスの opt-in 上限 (99 KB) を超える",
+        total * 4
+    );
     assert_eq!(
         total,
         CUDA_RS

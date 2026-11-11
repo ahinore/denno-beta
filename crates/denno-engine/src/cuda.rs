@@ -38991,7 +38991,7 @@ fn gguf_gemm_dev_launch(
 
 // ---------------------------------------------------------------------------
 // task 225: prefill の ssm beta/alpha 射影 (F32、n <= 256) を専用 GEMM で回す
-// (`DENNO_PF_BA_FAST`、既定 off)
+// (`DENNO_PF_BA_FAST`、task 231 から既定 on)
 // ---------------------------------------------------------------------------
 //
 // lab t222c (14,018 トークン、PROFILE=1) の `sub ssm beta_pf` は 612.7 ms。
@@ -39077,7 +39077,12 @@ fn ba_gemm_fns(ctx: &CudaCtx) -> Option<&'static BaGemmFns> {
 /// `DENNO_PF_BA_FAST` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 pub(crate) fn pf_ba_fast_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        // task 231: lab t228a の ba COND (base + このゲート) が
+        // 3826 cold prefill 7.13 s (同じ既定の base/base0/base2 は 7.29〜7.50)、
+        // 14018 cold 26.05 s (同じ既定は 26.30〜29.15) で、decode・errors・text は
+        // 無影響だった。beta/alpha の射影をデバイスで作るだけ (md5 DIFF は f32 fma の
+        // 丸め) なので既定 on。切り戻しは env = 0。
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -39098,7 +39103,7 @@ pub(crate) fn set_pf_ba_fast_for_test(v: Option<bool>) {
     );
 }
 
-/// beta/alpha を専用 GEMM で回すか (既定 off。lab の結果で決める)。
+/// beta/alpha を専用 GEMM で回すか (task 231 から既定 on。t228a の ba COND)。
 pub(crate) fn pf_ba_fast_on() -> bool {
     #[cfg(test)]
     {
@@ -39114,13 +39119,12 @@ pub(crate) fn pf_ba_fast_on() -> bool {
 
 /// beta/alpha を**デバイスで**作るか。
 ///
-/// task 225: `DENNO_PF_BA_FAST` を足したが、**単独では on にしない**。
-/// デバイス射影の入口 (`ba_desc`) は既存の `DENNO_PF_SSM_GEMM_GPU` のままで、
-/// こちらは「その入口を通ったときに使うカーネル」を選ぶだけ。理由は lab t225a:
-/// `DENNO_PF_BA_FAST=1` 単独で入口を開けると、`gdn_pf_chain` の
-/// 「ba_dev が作れない → 連鎖ごと諦める」に落ちて ssm が 2.98 → 27.8 s
-/// (+79%) になった (連鎖が使えず従来経路へ戻る)。既存の入口も同じ落とし穴を
-/// 持っているので、既定 off のまま触らない。
+/// task 225: `DENNO_PF_BA_FAST` を足したときは**単独で on にしなかった**。
+/// lab t225a では `ba_dev` が作れず (`ssm_beta` が BF16 で F32 前提の入口が
+/// 閉じた)、`gdn_pf_chain` が連鎖ごと諦めて ssm が 2.98 → 27.8 s (+79%) に
+/// なったため。task 228 が入口を型非依存に直し (`pf_ba_weight_dev` が非 F32 を
+/// ホストで 1 回 f32 へ展開)、判定を `pf_ba_w_check` に一本化したので、この
+/// 落とし穴は無い (t228a の ba COND: errors 0、text sane、prefill だけ改善)。
 pub(crate) fn pf_ba_dev_on() -> bool {
     pf_ssm_gemm_gpu_on() || pf_ba_fast_on()
 }
@@ -40693,14 +40697,19 @@ fn gdn_pf3_launch(
 // の行列積 + 前進代入で回す (直列なのはチャンク間だけ)。
 // CPU 参照は `crate::gdn::wy::wy_head_scan`、値の裏付けはそこのテスト。
 //
-// 共有メモリは 176,644 B (状態 64 KB + 作業域) なので、cuFuncSetAttribute で
-// opt-in してから起動する。opt-in できないときはカーネルを掴まない
-// (v3 → v2 → v1 → CPU へ fail closed)。
+// 共有メモリは 91,012 B (状態 64 KB + 作業域 C = 8 本ぶん) なので、
+// cuFuncSetAttribute で opt-in してから起動する。lab t228a の実機 (RTX 5090,
+// sm_120) の opt-in 上限は 99 KB で、C = 32 のときの 176,644 B は通らず
+// v3 へ落ちていた (t228a の wy COND は v3 を測っていた)。上限は
+// `attn_pf_dynamic_smem_limit()` (CudaCtx 生成時のデバイス問い合わせ) を使い、
+// 足りないときはカーネルを掴まない (v3 → v2 → v1 → CPU へ fail closed)。
 
 pub(crate) const GDN_PF_WY_THREADS: usize = 512;
 /// カーネルの動的共有メモリ (float 数。`kernels_gdn_pf_wy.cu` の WY_TOTAL)。
-pub(crate) const GDN_PF_WY_SMEM_FLOATS: usize = 44161;
+pub(crate) const GDN_PF_WY_SMEM_FLOATS: usize = 22753;
 pub(crate) const GDN_PF_WY_SMEM_BYTES: usize = GDN_PF_WY_SMEM_FLOATS * 4;
+/// lab t228a の実機が許した opt-in 上限 (99 KB)。これ以上は起動できない。
+pub(crate) const GDN_PF_WY_SMEM_LIMIT: usize = 99 * 1024;
 
 struct GdnPfWyKernels {
     #[allow(dead_code)]
@@ -40753,7 +40762,18 @@ fn gdn_pf_wy_kernels() -> Option<&'static GdnPfWyKernels> {
                 eprintln!("[gdn-pf-wy] PTX に dno_gdn_pf_wy32 が無い → v3 のスキャンへ");
                 return None;
             }
-            // 動的 smem の opt-in (48 KB 既定を超えるため必須)。
+            // 動的 smem の opt-in (48 KB 既定を超えるため必須)。デバイスの
+            // opt-in 上限 (CudaCtx 生成時に問い合わせ済み) を先に見て、
+            // 足りないときは理由を出して掴まない (t228a: 176,644 B が 99 KB の
+            // 上限に弾かれて、黙って v3 が測られていた)。
+            let limit = attn_pf_dynamic_smem_limit().min(GDN_PF_WY_SMEM_LIMIT);
+            if GDN_PF_WY_SMEM_BYTES > limit {
+                eprintln!(
+                    "[gdn-pf-wy] 動的 smem {} B がデバイスの上限 {limit} B を超える → v3 のスキャンへ",
+                    GDN_PF_WY_SMEM_BYTES
+                );
+                return None;
+            }
             let ok = match lib.func_set_attribute {
                 Some(fn_attr) => {
                     (fn_attr)(
@@ -40971,9 +40991,18 @@ mod pf228_wy_tests {
             total, GDN_PF_WY_SMEM_FLOATS,
             "WY_TOTAL と GDN_PF_WY_SMEM_FLOATS が違う"
         );
-        assert_eq!(GDN_PF_WY_SMEM_BYTES, 176_644, "共有メモリのバイト数");
-        // 1 ブロックで 227 KB を超えない (Blackwell の opt-in 上限)。
-        assert!(GDN_PF_WY_SMEM_BYTES < 227 * 1024, "共有メモリが上限を超える");
+        assert_eq!(GDN_PF_WY_SMEM_BYTES, 91_012, "共有メモリのバイト数");
+        // lab t228a の実機 (RTX 5090, sm_120) の opt-in 上限は 99 KB。C = 32 の
+        // 176,644 B は opt-in に失敗して v3 へ落ちたので、上限に収める。
+        assert!(
+            GDN_PF_WY_SMEM_BYTES <= GDN_PF_WY_SMEM_LIMIT,
+            "共有メモリがデバイスの opt-in 上限を超える"
+        );
+        // 余裕を残す (上限ぎりぎりだと将来の作業域追加でまた落ちる)。
+        assert!(
+            GDN_PF_WY_SMEM_BYTES < 96 * 1024,
+            "共有メモリの余裕が 3 KB 未満"
+        );
     }
 }
 
@@ -40981,14 +41010,14 @@ mod pf228_wy_tests {
 mod pf225_gate_tests {
     use super::*;
 
-    /// 3 本とも既定 off (lab t225c で目標未達。beta/alpha は入口も壊れている)。
+    /// task 231: BA_FAST も既定 on (t228a の ba COND)。router / scan3 は task 228。
     #[test]
     fn pf225_gates_defaults() {
         for (name, f, dflt) in [
             (
                 "DENNO_PF_BA_FAST",
                 pf_ba_fast_from_value as fn(Option<&str>) -> bool,
-                false,
+                true,
             ),
             // task 228: task 225 の実測 (router -458 ms / scan -159 ms、decode と
             // text は無影響) を受けて、この 2 本だけ既定 on にした。
@@ -41124,8 +41153,14 @@ mod pf225_gate_tests {
         assert!(pf_ba_fast_on());
         set_pf_ba_fast_for_test(Some(false));
         assert!(!pf_ba_fast_on());
+        // task 231: `None` は env に戻る。既定は on だが、テスト環境の env に
+        // 依存させないため期待値は env の解釈から取る。
         set_pf_ba_fast_for_test(None);
-        assert!(!pf_ba_fast_on());
+        assert_eq!(
+            pf_ba_fast_on(),
+            pf_ba_fast_from_value(std::env::var("DENNO_PF_BA_FAST").ok().as_deref()),
+            "強制を外したら env に戻る"
+        );
 
         set_pf_router_dev_for_test(Some(true));
         assert!(pf_router_dev_on());
