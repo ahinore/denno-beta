@@ -24322,6 +24322,14 @@ pub(crate) const ATTN_PF2_BQ: usize = 64;
 /// (-789 ms) だけで、他の名前付き段 (mix / router / shared / ssm / experts) は
 /// すべて ±0.3% 以内。md5 は c2000_turn2 と c8000 で DIFF (p と V の bf16 丸め、
 /// 相対 5e-3 は CPU 模擬 `pf230_attn_pf3_tile_matches_host` で固定)。
+///
+/// 2 回目 (lab t244b、4a997d4、生成 PTX を commit して `PTX=` 無し・既定 on、
+/// COND=t0(on)/off/on/off2/on2/off3、load_before 7.23 の混んだ状態) でも
+/// 14,018 cold prefill は off の平均 25.907 s に対し on 25.13 s で **-3.00%**、
+/// 3,826 は 7.11 → 7.06 s (-0.70%)、decode は 20.27 → 20.25 ms/tok。
+/// 台帳の差は full 段 -790 ms だけで、`other` 残差は全 COND で 1.39 s に揃った
+/// (round 1 の揺れはホスト負荷)。md5 は round 1 の attn3 と一致した
+/// (commit した PTX が lab の生成物と同じ挙動)。
 pub(crate) fn pf_attn_v3_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
