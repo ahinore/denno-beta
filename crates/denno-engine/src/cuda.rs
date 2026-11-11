@@ -3008,6 +3008,13 @@ pub fn parse_keep_experts(v: Option<&str>, default_on: bool) -> bool {
 /// 1 本の確保のために expert の LRU を丸ごと捨てる経路を塞ぐ
 /// (REPORT_P242 の 14k 層優先: 1,505 MiB の連続確保が通らず 39,755 MiB を全捨て)。
 /// `DENNO_ALLOC_KEEP_EXPERTS=0` で従来の階段 (task 210) に戻せる。
+///
+/// lab t248c (`4cc5129`) の実測: base (on) と `DENNO_ALLOC_KEEP_EXPERTS=0` は
+/// 14k cold prefill 25.13 / 25.15 s、3,826 7.08 / 7.08 s、14k decode 18.4 /
+/// 18.4 ms/tok、md5 も全リクエストで SAME。**正常経路では 1 回も発火しない**
+/// (task248 の警告 0 回)。発火するのは確保に失敗したときだけで、そのときは
+/// 追い出しが「要求 + チャンク 1 本」で止まり、足りなければ Err (= 呼び出し側が
+/// CPU 経路へ) になる。
 pub const ALLOC_KEEP_EXPERTS_DEFAULT: bool = true;
 
 /// task 248: 確保失敗時に expert を全捨てしない方針か。
