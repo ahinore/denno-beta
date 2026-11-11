@@ -30,6 +30,7 @@ pub mod qwen4exp_attn;
 pub mod qwen4exp_decode;
 pub mod qwen4exp_qsa;
 pub mod qwen4exp_ssm;
+pub mod start_warm;
 pub mod steer;
 
 use anyhow::{bail, Result};
