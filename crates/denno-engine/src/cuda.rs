@@ -22428,6 +22428,8 @@ pub fn pf_download_res_row(t: usize, hc_dim: usize, out: &mut [f32]) -> bool {
 
 /// task 154: デバイスの `mixed` (`[nt][n_embd]`) をホストへ戻す。
 pub fn pf_take_mixed(out: &mut [f32]) -> bool {
+    // task 254: `other` の中身 (`[q4ledger-pf] sub other`) に積む。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_MIXD2H);
     // task 189: mix 1 呼び出しの D2H (mixed の 5.1 MB) も段として積む。
     let t_d2h = pf_mix_kprof::on().then(std::time::Instant::now);
     let r = PF_DEV.with(|cell| -> bool {
@@ -23025,6 +23027,8 @@ fn pf_combine_core(
     hc: usize,
     e: usize,
 ) -> bool {
+    // task 254: `other` の中身 (`[q4ledger-pf] sub other`) に積む。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_COMBINE);
     if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }

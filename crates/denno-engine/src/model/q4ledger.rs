@@ -656,8 +656,12 @@ pub const SUB_SH_SG: usize = 25;
 pub const SUB_SH_ADD: usize = 26;
 /// task 187: decode の IQ expert 段の prologue (x / ポインタ表 / segment 表の H2D)。
 pub const SUB_EXP_PRO: usize = 27;
+/// task 254: `other` の中の combine (`pf_combine` の H2D + カーネル + 同期)。
+pub const SUB_COMBINE: usize = 28;
+/// task 254: `other` の中の mix の D2H (`pf_take_mixed`。層ごとに 14 MB)。
+pub const SUB_MIXD2H: usize = 29;
 /// 副区間の数。
-pub const SUB_N: usize = 28;
+pub const SUB_N: usize = 30;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -688,6 +692,8 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "sh_sg",
     "sh_add",
     "exp_pro",
+    "combine",
+    "mixd2h",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
