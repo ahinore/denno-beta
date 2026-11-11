@@ -15785,6 +15785,11 @@ fn moe_ffn_quant_batch_lm_dev(
     }
     mark(5);
     if dbg {
+        let st = crate::cuda::pf_stream_times_ms();
+        eprintln!(
+            "[pf-lm-dbg] stream pump={:.1} wait={:.1} table={:.1} launch={:.1} accum={:.1} ms",
+            st[0], st[1], st[2], st[3], st[4]
+        );
         eprintln!(
             "[pf-lm-dbg] layer={} nt={} router={:.1} topk={:.1} plan={:.1} shared={:.1} \
              experts={:.1} roles={:.1} total={:.1} ms",

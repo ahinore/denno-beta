@@ -11001,6 +11001,34 @@ pub struct PfStreamEntry<'a> {
     pub host: Option<[&'a [u8]; 3]>,
 }
 
+thread_local! {
+    /// task 233: 直近のストリーミング層の内訳 (ns)。`[pump, wait, table, launch, accum]`
+    /// 診断用 (DENNO_PF_LM_DBG の 1 行に出す)。
+    static PF_STREAM_T: std::cell::RefCell<[u64; 5]> = const { std::cell::RefCell::new([0; 5]) };
+}
+
+/// task 233: 直近のストリーミング層の内訳 (ms)。`[pump, wait, table, launch, accum]`
+pub fn pf_stream_times_ms() -> [f64; 5] {
+    PF_STREAM_T.with(|c| {
+        let v = *c.borrow();
+        [
+            v[0] as f64 / 1e6,
+            v[1] as f64 / 1e6,
+            v[2] as f64 / 1e6,
+            v[3] as f64 / 1e6,
+            v[4] as f64 / 1e6,
+        ]
+    })
+}
+
+fn pf_stream_t_add(i: usize, ns: u64) {
+    PF_STREAM_T.with(|c| {
+        if let Ok(mut v) = c.try_borrow_mut() {
+            v[i] = v[i].saturating_add(ns);
+        }
+    });
+}
+
 /// task 233: ストリーミング経路の入出力の置き場所。
 ///
 /// 層優先 prefill は活性をデバイスへ置いたままにするので、入力も出力も
@@ -11218,6 +11246,7 @@ fn moe_experts_iq_pf_layer_stream_io(
     let host_x = host_in;
     let in_elems = ntok * n_in;
 
+    PF_STREAM_T.with(|c| *c.borrow_mut() = [0; 5]);
     let mut work = || -> Result<Option<u32>> {
         PF_SCRATCH.with(|cell| -> Result<Option<u32>> {
             let mut sc = cell.borrow_mut();
@@ -11447,6 +11476,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                 let mut ready_ns = 0u64;
                 let mut wait_ns = 0u64;
                 let mut slot_ns = 0u64;
+                let t_pump = std::time::Instant::now();
                 let (ptrs, bytes) = if ut {
                     (ready_ptrs[gi].take().unwrap_or_default(), need_of[gi])
                 } else if items.is_empty() {
@@ -11463,7 +11493,9 @@ fn moe_experts_iq_pf_layer_stream_io(
                     }
                     (pump.ptrs, pump.bytes)
                 };
+                pf_stream_t_add(0, t_pump.elapsed().as_nanos() as u64);
                 // (b) デバイスポインタの表を書く (ミスはステージング、ヒットは常駐)。
+                let t_tab = std::time::Instant::now();
                 let mut ip = 0usize;
                 {
                     let mut vg = vec![0u64; b - a];
@@ -11488,6 +11520,8 @@ fn moe_experts_iq_pf_layer_stream_io(
                     pu_tab.copy_from_at(a * 8, &vu)?;
                     pd_tab.copy_from_at(a * 8, &vd)?;
                 }
+                pf_stream_t_add(2, t_tab.elapsed().as_nanos() as u64);
+                let t_wait = std::time::Instant::now();
                 // (c) **自分のグループの H2D 完了だけ**を待つ (ホスト)。
                 if ut {
                     if !items.is_empty() {
@@ -11509,7 +11543,9 @@ fn moe_experts_iq_pf_layer_stream_io(
                         pf_wait_up_in(&mut st, g, pinned)
                     })?;
                 }
+                pf_stream_t_add(1, t_wait.elapsed().as_nanos() as u64);
                 // (d) カーネルを積む。
+                let t_l = std::time::Instant::now();
                 let ro_start = seg[a * 4 + 1] as usize;
                 let ro_end = if b > a {
                     let last = b - 1;
@@ -11550,6 +11586,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                     let mut st = cell.borrow_mut();
                     pf_mark_used_in(&mut st, g, pinned);
                 });
+                pf_stream_t_add(3, t_l.elapsed().as_nanos() as u64);
                 let rows_here = ro_end.saturating_sub(ro_start);
                 exp_pf::note_stream_group(
                     bytes,
@@ -11563,6 +11600,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                 );
             }
             // 3. 行の加重和を GPU で閉じる。
+            let t_acc = std::time::Instant::now();
             {
                 let prowb = sc.prow.as_ref().expect("確保済み").ptr();
                 let wb = sc.wrow.as_ref().expect("確保済み").ptr();
@@ -11607,6 +11645,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                     dbg_d2h(ntok * e * 4);
                 }
             }
+            pf_stream_t_add(4, t_acc.elapsed().as_nanos() as u64);
             exp_pf::note_stream_layer();
             Ok(Some(nseg as u32))
         })
