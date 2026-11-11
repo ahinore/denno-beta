@@ -11869,11 +11869,19 @@ fn moe_experts_iq_pf_layer_stream_io(
             } else {
                 total_rows
             };
-            MoeScratch::ensure(&mut sc.g, rows_cap * ff * 4)?;
-            MoeScratch::ensure(&mut sc.u, rows_cap * ff * 4)?;
+            // task 250: tensor core 経路は gate/up を融合して act へ直接書くので、
+            // g / u の作業域は要らない (14k で 0.92 GB 減る)。既存経路のときだけ取る。
+            let (gb, ub) = if tc_kernels.is_some() {
+                (0u64, 0u64)
+            } else {
+                MoeScratch::ensure(&mut sc.g, rows_cap * ff * 4)?;
+                MoeScratch::ensure(&mut sc.u, rows_cap * ff * 4)?;
+                (
+                    sc.g.as_ref().expect("確保済み").ptr(),
+                    sc.u.as_ref().expect("確保済み").ptr(),
+                )
+            };
             MoeScratch::ensure(&mut sc.act, rows_cap * ff * 4)?;
-            let gb = sc.g.as_ref().expect("確保済み").ptr();
-            let ub = sc.u.as_ref().expect("確保済み").ptr();
             let act = sc.act.as_ref().expect("確保済み").ptr();
             // グループ局所のときは、行の先頭を**グループの先頭から**の相対番号へ
             // 直した `seg` を積む (カーネルは `obase + (s.ro + r)*n_out` に書く)。
