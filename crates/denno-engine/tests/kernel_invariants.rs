@@ -7606,8 +7606,9 @@ fn pf222_attn_pf2_gate_is_wired_and_default_on() {
         "DENNO_PF_ATTN_TC を env から読んでいない"
     );
     // 起動の切り替え: ゲートと形 (dh) と PTX の有無を見て、ダメなら従来カーネルへ。
+    // task 230: v3 (DENNO_PF_ATTN_V3) が優先で、v2 はその次。
     assert!(
-        CUDA_RS.contains("let use_v2 = pf_attn_tc_on()")
+        CUDA_RS.contains("let use_v2 = !use_v3\n                    && pf_attn_tc_on()")
             && CUDA_RS.contains("&& dh == ATTN_PF2_DH")
             && CUDA_RS.contains("&& !ctx.f_attn_pf2.is_null();"),
         "pf_full_out が v2 の形 (dh / PTX) を検査していない"
@@ -7639,6 +7640,302 @@ fn pf222_attn_pf2_gate_is_wired_and_default_on() {
         .join(" ");
     let nargs = code.matches(',').count();
     assert_eq!(nargs, 11, "引数の数が従来カーネル (12 個) と違う");
+}
+
+// ---------------------------------------------------------------------------
+// task 230: prefill attention v3 (`kernels_attn_pf3.cu`)
+// ---------------------------------------------------------------------------
+
+const ATTN_PF3_SRC: &str = include_str!("../kernels/kernels_attn_pf3.cu");
+/// task 230: full attention の入口 (MIXKEEP の埋め戻しを検査する)。
+const QWEN_ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
+
+/// タイル定数・共有メモリ・スレッド配置がホスト (cuda.rs) と一致すること。
+#[test]
+fn pf230_attn_pf3_tile_matches_host() {
+    let d = defines(ATTN_PF3_SRC);
+    let bq = eval_define("A3_BQ", &d);
+    let bk = eval_define("A3_BK", &d);
+    let qd = eval_define("A3_QD", &d);
+    let pd = eval_define("A3_PD", &d);
+    let thr = eval_define("A3_THREADS", &d);
+    let smem = eval_define("A3_SMEM_BYTES", &d);
+    assert_eq!(bq, 64, "A3_BQ が 64 でない");
+    assert_eq!(bk, 32, "A3_BK が 32 でない (K/V のグローバル読みを据え置く)");
+    assert_eq!(thr, 256, "A3_THREADS が 256 でない");
+    // 行ストライドは bf16 の ldmatrix (8 の倍数) の条件。
+    assert_eq!(qd, 264, "A3_QD が 264 でない (256 + 8 の詰め物)");
+    assert_eq!(qd % 8, 0, "bf16 の ld が 8 の倍数でない");
+    assert_eq!(pd, 40, "A3_PD が 40 でない (32 + 8 の詰め物)");
+    assert_eq!(pd % 8, 0, "p の ld が 8 の倍数でない");
+    // smem の合計 = q + k + v + p + s + m0 + lst + stg(8 warp x 16x16 f32)。
+    let expect = bq * qd * 2
+        + bk * qd * 2
+        + bk * qd * 2
+        + bq * pd * 2
+        + bq * bk * 4
+        + 2 * bq * 4
+        + 8 * 16 * 16 * 4;
+    assert_eq!(expect, smem, "A3_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect < 99 * 1024,
+        "動的 smem {expect} B が実機の opt-in 上限 (99KB) を超える"
+    );
+    // ホスト側のミラー。
+    assert_eq!(rust_const("ATTN_PF3_SMEM_BYTES"), smem, "cuda.rs と不一致");
+    assert_eq!(rust_const("ATTN_PF3_BQ"), bq, "cuda.rs の ATTN_PF3_BQ が不一致");
+    assert_eq!(rust_const("ATTN_PF3_DH"), 256, "ATTN_PF3_DH が 256 でない");
+    // スコアは bf16 の wmma (K は col_major = 行がキー)、PV も bf16 の wmma。
+    assert!(
+        ATTN_PF3_SRC.contains(
+            "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;"
+        ),
+        "K を col_major の bf16 で読んでいない"
+    );
+    assert!(
+        ATTN_PF3_SRC.contains(
+            "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf;"
+        ),
+        "V を row_major の bf16 で読んでいない (PV が mma でない)"
+    );
+    assert!(
+        ATTN_PF3_SRC.contains("wmma::mma_sync(acc[t], af, bf, acc[t]);"),
+        "PV が mma のアキュムレートでない"
+    );
+    // V は smem で bf16 にする (f32 のままだと PV の mma に載らない)。
+    assert!(
+        ATTN_PF3_SRC.contains("__nv_bfloat16 *vd = v_sm + jl * A3_QD + dd;")
+            && !ATTN_PF3_SRC.contains("float *vd = v_sm"),
+        "V が bf16 で smem に置かれていない"
+    );
+    // オンライン再スケールをしない (行最大は最初のタイルで 1 回だけ)。
+    assert!(
+        ATTN_PF3_SRC.contains("if (j0 == 0) {") && ATTN_PF3_SRC.contains("m0_sm[tid] = (mx > -INFINITY) ? mx : 0.0f;"),
+        "行最大を最初のタイルで 1 回取る形でない"
+    );
+    assert!(
+        ATTN_PF3_SRC.contains("exp2f((s_sm[idx] - m0_sm[r]) * A3_LOG2E)"),
+        "p の式が exp2((s - m0) * log2e) でない"
+    );
+    // causal マスクの規則 (v2 と同じ)。
+    assert!(
+        ATTN_PF3_SRC.contains("if (i < n && j < t_total && j <= pos0 + i) {")
+            && ATTN_PF3_SRC.contains("s = -INFINITY;"),
+        "causal マスクの規則が従来カーネルと違う"
+    );
+    // グリッドは (head, クエリブロック) で、重いブロックから走らせる。
+    assert!(
+        ATTN_PF3_SRC.contains("const int h = blockIdx.x;")
+            && ATTN_PF3_SRC.contains("const int i0 = (nb - 1 - (int)blockIdx.y) * A3_BQ;"),
+        "グリッドの入れ替え (head 優先・重い順) が無い"
+    );
+    // build_ptx.sh: compute_90 (bf16 mma) で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("attn_pf3)     echo \"kernels_attn_pf3.cu|nofmad|compute_90\""),
+        "build_ptx.sh の attn_pf3 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("attn_pf3"),
+        "build_ptx.sh の targets_all に attn_pf3 が無い: {targets}"
+    );
+    // PTX の入口名と引数 (12 個) の一致。
+    assert!(
+        CUDA_RS.contains("b\"dno_attention_prefill3\\0\""),
+        "cuda.rs が dno_attention_prefill3 を読んでいない"
+    );
+    let sig = ATTN_PF3_SRC
+        .find("extern \"C\" __global__ void dno_attention_prefill3(")
+        .expect("入口が無い");
+    let head = &ATTN_PF3_SRC[sig..];
+    let head = &head[..head.find(')').expect("引数リストが閉じない")];
+    let code: String = head
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let nargs = code.matches(',').count();
+    assert_eq!(nargs, 11, "引数の数が v2 (12 個) と違う");
+}
+
+/// task 230: v3 の attention (PV の bf16 mma と「最初のタイルの行最大 m0」) の
+/// 数値を CPU で模擬し、誤差の上限を固定する。
+///
+/// 実測 (このテストと同じ入力、64 クエリ x 96 キー x 256 次元、σ=1 の正規乱数):
+///   v2 (q/k だけ bf16、PV は f32) の最大相対誤差 1.1e-7
+///   v3 (p と V も bf16)          の最大相対誤差 2.4e-3
+/// しきい値は 5e-3 (実測の 2 倍)。v3 の誤差は bf16 の丸めだけ由来で、softmax の
+/// 比 (m0 固定) は変えない。ここが崩れたら丸め以外の変更が入っている。
+#[test]
+fn pf230_v3_softmax_stays_within_bf16_rounding() {
+    fn bf16(x: f32) -> f32 {
+        let u = x.to_bits();
+        let lsb = (u >> 16) & 1;
+        let v = u.wrapping_add(0x7fff + lsb);
+        f32::from_bits(v & 0xffff_0000)
+    }
+    struct Sm(u64);
+    impl Sm {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn gauss(&mut self) -> f32 {
+            let mut s = 0.0f32;
+            for _ in 0..12 {
+                s += ((self.next_u64() >> 32) as f32 / u32::MAX as f32) - 0.5;
+            }
+            s
+        }
+    }
+    let (nq, nk, dh) = (64usize, 96usize, 256usize);
+    let mut rng = Sm(12345);
+    let q: Vec<f32> = (0..nq * dh).map(|_| rng.gauss()).collect();
+    let k: Vec<f32> = (0..nk * dh).map(|_| rng.gauss()).collect();
+    let v: Vec<f32> = (0..nk * dh).map(|_| rng.gauss()).collect();
+    let scale = 1.0f32 / (dh as f32).sqrt();
+    let (mut e2, mut e3, mut amax) = (0f64, 0f64, 0f64);
+    for i in 0..nq {
+        let keys = i + 1; // causal
+        let mut s = vec![0f64; keys];
+        for j in 0..keys {
+            let mut acc = 0f64;
+            for d in 0..dh {
+                acc += (bf16(q[i * dh + d]) as f64) * (bf16(k[j * dh + d]) as f64);
+            }
+            s[j] = acc * scale as f64;
+        }
+        let mx = s.iter().cloned().fold(f64::MIN, f64::max);
+        let (mut lr, mut or) = (0f64, vec![0f64; dh]);
+        for j in 0..keys {
+            let p = (s[j] - mx).exp();
+            lr += p;
+            for d in 0..dh {
+                or[d] += p * (v[j * dh + d] as f64);
+            }
+        }
+        for d in 0..dh {
+            or[d] /= lr;
+            amax = amax.max(or[d].abs());
+        }
+        // v2: 32 キーごとの running max、p は f32、V は f32
+        let (mut l2, mut a2, mut m) = (0f32, vec![0f32; dh], f32::NEG_INFINITY);
+        for t0 in (0..keys).step_by(32) {
+            let t1 = (t0 + 32).min(keys);
+            let mxt = (t0..t1).fold(f32::NEG_INFINITY, |a, j| a.max(s[j] as f32));
+            let corr = ((m - mxt) * std::f32::consts::LOG2_E).exp2();
+            m = mxt;
+            l2 *= corr;
+            for d in 0..dh {
+                a2[d] *= corr;
+            }
+            for j in t0..t1 {
+                let p = ((s[j] as f32 - m) * std::f32::consts::LOG2_E).exp2();
+                l2 += p;
+                for d in 0..dh {
+                    a2[d] += p * v[j * dh + d];
+                }
+            }
+        }
+        // v3: m0 は最初のタイルの最大、p も V も bf16 (PV は mma)
+        let m0 = (0..32.min(keys)).fold(f32::NEG_INFINITY, |a, j| a.max(s[j] as f32));
+        let (mut l3, mut a3) = (0f32, vec![0f32; dh]);
+        for j in 0..keys {
+            let p = bf16(((s[j] as f32 - m0) * std::f32::consts::LOG2_E).exp2());
+            l3 += p;
+            for d in 0..dh {
+                a3[d] += p * bf16(v[j * dh + d]);
+            }
+        }
+        for d in 0..dh {
+            let den = amax.max(1e-30);
+            e2 = e2.max(((a2[d] / l2) as f64 - or[d]).abs() / den);
+            e3 = e3.max(((a3[d] / l3) as f64 - or[d]).abs() / den);
+        }
+    }
+    assert!(e2 < 1e-5, "v2 の誤差が想定より大きい: {e2:.3e}");
+    assert!(
+        e3 < 5e-3,
+        "v3 の誤差が bf16 の丸めの範囲を超えた: {e3:.3e} (実測 2.4e-3)"
+    );
+}
+
+/// v3 が既定 on (task 244)、MIXKEEP が既定 off で、`pf_full_out` と mix の D2H に
+/// 配線されていること。
+#[test]
+fn pf230_gates_are_wired_and_defaults_set() {
+    for (fname, var, default_on) in [
+        ("pub(crate) fn pf_attn_v3_from_value(", "DENNO_PF_ATTN_V3", true),
+        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP", false),
+    ] {
+        let at = CUDA_RS.find(fname).unwrap_or_else(|| panic!("{fname} が無い"));
+        let body = &CUDA_RS[at..];
+        let end = body.find("\n}").expect("関数の終わりが無い");
+        let body = &body[..end];
+        assert!(
+            body.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+            "{var}: 明示的な真値を受ける形でない"
+        );
+        // task 244: v3 は採択されて既定 on、MIXKEEP は不採用で既定 off。
+        let want = if default_on { "None => true" } else { "None => false" };
+        assert!(
+            body.contains(want),
+            "{var}: 既定が {} でない",
+            if default_on { "on" } else { "off" }
+        );
+        assert!(
+            CUDA_RS.contains(&format!("std::env::var(\"{var}\")")),
+            "{var} を env から読んでいない"
+        );
+    }
+    // v3 の起動: ゲートと形 (dh) と PTX の有無を見て、ダメなら v2 / 従来へ。
+    assert!(
+        CUDA_RS.contains("let use_v3 = pf_attn_v3_on()")
+            && CUDA_RS.contains("&& dh == ATTN_PF3_DH")
+            && CUDA_RS.contains("&& !ctx.f_attn_pf3.is_null();"),
+        "pf_full_out が v3 の形 (dh / PTX) を検査していない"
+    );
+    assert!(
+        CUDA_RS.contains("(heads as u32, nt.div_ceil(ATTN_PF3_BQ) as u32, 1),"),
+        "v3 のグリッドが (head, クエリブロック) でない"
+    );
+    assert!(
+        CUDA_RS.contains("let use_v2 = !use_v3"),
+        "v3 が使えないときの v2 への切り戻しが無い"
+    );
+    // MIXKEEP: full 層の attn mix で D2H を飛ばし、qkv がデバイスから読む。
+    assert!(
+        QWEN_SRC.contains("if Self::pf_mix_keep_layer(flat_attn, nt, self.p.layer_kind(il).ok()) {")
+            && QWEN_SRC.contains("crate::cuda::pf_mixed_keep_dev(mixed_flat.as_ptr(), nt, e);"),
+        "mix の D2H を飛ばす分岐が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("&& matches!(kind, Some(LayerKind::FullAttn))"),
+        "MIXKEEP が full 層に限定されていない"
+    );
+    assert!(
+        CUDA_RS.contains("let xptr = match pf2_dev_x(x, nt, e) {")
+            && CUDA_RS.contains("fn pf2_dev_x(x: &[f32], nt: usize, e: usize) -> Option<CUdeviceptr> {"),
+        "qkv がデバイス入力を読む経路が無い"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) fn pf_mixed_restore_host("),
+        "dev-only を降ろす経路が無い (古いバイト列で計算する)"
+    );
+    assert!(
+        QWEN_ATTN_SRC.contains("crate::cuda::pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, e);")
+            && QWEN_ATTN_SRC.contains("crate::cuda::pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, n_embd);"),
+        "attn 側に dev-only の埋め戻しが無い"
+    );
 }
 
 // ---------------------------------------------------------------------------
