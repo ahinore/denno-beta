@@ -888,6 +888,29 @@ pub fn reg_bytes() -> usize {
     *N.get_or_init(|| env_usize(REG_MB_ENV, DEFAULT_REG_MB).saturating_mul(1 << 20))
 }
 
+/// `DENNO_PF_TC_EXP=1`: prefill の expert グループを tensor core の grouped GEMM
+/// (`kernels_exp_iq_tc.cu`) で回す (task 250、既定 off)。
+///
+/// 現行の m 行 GEMV は 1 block = 8 出力行なので、1 expert あたりの活性読みが
+/// `n_out/8 × m × n_in × 4 B` になる。1 expert の重みは約 2 MB なので、
+/// 行数が多い (m = 300 前後) layer major では活性の再読みが重みを上回る
+/// (REPORT_P242)。新カーネルは 64 トークン × 64 行のタイルで受けるので、
+/// 活性の読みが 8 分の 1 になり、積は bf16 の mma (FP32 アキュムレート) で行う。
+///
+/// 数値は変わる (重みと活性を bf16 に丸める。丸めだけの差)。
+pub const TC_EXP_ENV: &str = "DENNO_PF_TC_EXP";
+
+/// [`TC_EXP_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn tc_exp_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// グループ GEMM を tensor core で回すか (プロセスで 1 回だけ env を読む)。
+pub fn tc_exp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| tc_exp_from_value(std::env::var(TC_EXP_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_LM_LAYER=1`: prefill の層ループを層優先にする (task 227、既定 off)。
 ///
 /// いまはチャンク優先 (チャンク → 全 48 層) なので、1 つの expert が

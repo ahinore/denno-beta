@@ -11099,6 +11099,257 @@ unsafe fn pf_launch_group(
     Ok(())
 }
 
+// ===========================================================================
+// task 250: tensor core の grouped expert GEMM (`kernels_exp_iq_tc.cu`)
+// ===========================================================================
+//
+// ストリーミング 1 グループぶんの gate/up と down を、**1 起動ずつ** で回す。
+// 現行の m 行 GEMV は 1 block = 8 出力行で活性を読み直すため、行数が多い
+// (m = 300 前後) 層優先 prefill では活性律速になる (REPORT_P242)。
+// ここは 64 トークン × 64 行のタイルで受け、bf16 の mma (FP32 アキュムレート)
+// で積む。数値は変わる (丸めだけ。`DENNO_PF_TC_EXP` で切り戻せる)。
+
+/// カーネル名 (PTX の `.visible .entry`)。slot は `exp_iq::slot` の 0..=3。
+const TC_GU_NAMES: [&str; 4] = [
+    "dno_exp_tc_gu_iq2s",
+    "dno_exp_tc_gu_iq3xxs",
+    "dno_exp_tc_gu_iq3s",
+    "dno_exp_tc_gu_iq4xs",
+];
+const TC_DN_NAMES: [&str; 4] = [
+    "dno_exp_tc_dn_iq2s",
+    "dno_exp_tc_dn_iq3xxs",
+    "dno_exp_tc_dn_iq3s",
+    "dno_exp_tc_dn_iq4xs",
+];
+
+/// `.cu` の `EXTC_BM` / `EXTC_BN` / `EXTC_THREADS` と一致させること。
+const EXTC_BM: usize = 64;
+const EXTC_BN: usize = 64;
+const EXTC_THREADS: usize = 256;
+/// `.cu` のカーネル引数の数 (ABI ゲート)。gu は 10、down は 9。
+const TC_GU_NARGS: usize = 10;
+const TC_DN_NARGS: usize = 9;
+
+/// カーネル一式 (PTX を起動時に 1 回だけ読む)。
+struct ExpTcKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// gate/up (silu 込み) の型ごと
+    gu: [CUfunction; 4],
+    /// down の型ごと
+    dn: [CUfunction; 4],
+}
+
+unsafe impl Send for ExpTcKernels {}
+unsafe impl Sync for ExpTcKernels {}
+
+static EXP_TC_KERNELS: OnceLock<Option<ExpTcKernels>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_EXP_TC_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_exp_iq_tc.ptx`。
+fn exp_tc_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_TC_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_tc.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
+/// (以後このプロセスでは tensor core 経路を使わず、既存の GEMV へ落ちる)。
+fn exp_tc_kernels() -> Option<&'static ExpTcKernels> {
+    EXP_TC_KERNELS
+        .get_or_init(|| {
+            let path = exp_tc_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-tc] PTX が読めない ({}) : {e} → 既存の GEMV へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            // task 250: PTX の引数の数がホストの起動と一致するか先に見る
+            // (旧い PTX を読むと余分な引数は黙って無視され、値が壊れる)。
+            {
+                let text = String::from_utf8_lossy(&image[..image.len() - 1]).into_owned();
+                for name in TC_GU_NAMES.iter() {
+                    if ptx_entry_params(&text, name) != Some(TC_GU_NARGS) {
+                        eprintln!("[pf-tc] {name} の引数が {TC_GU_NARGS} 個でない → 既存の GEMV へ");
+                        return None;
+                    }
+                }
+                for name in TC_DN_NAMES.iter() {
+                    if ptx_entry_params(&text, name) != Some(TC_DN_NARGS) {
+                        eprintln!("[pf-tc] {name} の引数が {TC_DN_NARGS} 個でない → 既存の GEMV へ");
+                        return None;
+                    }
+                }
+            }
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-tc] cuModuleLoadData 失敗 → 既存の GEMV へ");
+                    return None;
+                }
+            }
+            let get = |names: &[&str; 4]| -> Option<[CUfunction; 4]> {
+                let mut out: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+                for (i, f) in out.iter_mut().enumerate() {
+                    let mut cname = names[i].as_bytes().to_vec();
+                    cname.push(0);
+                    unsafe {
+                        if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
+                            != CUDA_SUCCESS
+                        {
+                            eprintln!("[pf-tc] PTX に {} が無い → 既存の GEMV へ", names[i]);
+                            return None;
+                        }
+                    }
+                }
+                Some(out)
+            };
+            let gu = get(&TC_GU_NAMES)?;
+            let dn = get(&TC_DN_NAMES)?;
+            Some(ExpTcKernels { module, gu, dn })
+        })
+        .as_ref()
+}
+
+/// task 250: この形を tensor core の grouped GEMM で回せるか (純関数)。
+///
+/// - gate と up が同じ型 (1 回の起動で 2 枚を同時にデコードする)
+/// - 4 型 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS) のどれか
+/// - k が 256 の倍数 (IQ の 256 要素ブロック)、n が [`EXTC_BN`] の倍数 (端数タイル無し)
+pub fn tc_shapes_ok(
+    gu_slot: Option<usize>,
+    dn_slot: Option<usize>,
+    ty_same: bool,
+    k_gu: usize,
+    k_dn: usize,
+    n_gu: usize,
+    n_dn: usize,
+) -> bool {
+    ty_same
+        && matches!(gu_slot, Some(0..=3))
+        && matches!(dn_slot, Some(0..=3))
+        && k_gu > 0
+        && k_dn > 0
+        && k_gu % 256 == 0
+        && k_dn % 256 == 0
+        && n_gu % EXTC_BN == 0
+        && n_dn % EXTC_BN == 0
+}
+
+/// グループ 1 個ぶんの gate/up と down を tensor core で積む。
+///
+/// `seg` は**相対化していない**表 (`gl` は使わない)、`rows_gu` は行 → トークン、
+/// `rows_id` は down 用の恒等行表。`max_m` はグループ内の最大行数。
+#[allow(clippy::too_many_arguments)]
+unsafe fn pf_launch_group_tc(
+    ctx: &CudaCtx,
+    tc: &ExpTcKernels,
+    slot_gu: usize,
+    slot_d: usize,
+    pg: CUdeviceptr,
+    pu: CUdeviceptr,
+    pd: CUdeviceptr,
+    xb: CUdeviceptr,
+    act: CUdeviceptr,
+    hb: CUdeviceptr,
+    seg: CUdeviceptr,
+    rows_gu: CUdeviceptr,
+    rows_id: CUdeviceptr,
+    nseg: usize,
+    max_m: usize,
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    rb_g: usize,
+    rb_d: usize,
+) -> Result<()> {
+    if nseg == 0 || max_m == 0 {
+        return Ok(());
+    }
+    let tiles = max_m.div_ceil(EXTC_BM) as u32;
+    let threads = EXTC_THREADS as u32;
+    // gate/up: 入力 e、出力 ff。
+    {
+        let mut pw_g = pg;
+        let mut pw_u = pu;
+        let mut px = xb;
+        let mut po = act;
+        let mut ps = seg;
+        let mut pr = rows_gu;
+        let (mut ns, mut ni, mut no, mut rbg) = (
+            nseg as c_int,
+            n_in as c_int,
+            ff as c_int,
+            rb_g as c_int,
+        );
+        let mut args = [
+            &mut pw_g as *mut _ as *mut c_void,
+            &mut pw_u as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut pr as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut no as *mut _ as *mut c_void,
+            &mut rbg as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(
+            tc.gu[slot_gu],
+            ((ff / EXTC_BN) as u32, tiles, nseg as u32),
+            (threads, 1, 1),
+            0,
+            &mut args,
+        )?;
+    }
+    // down: 入力 ff、出力 e。入力の行は act が詰まっている (恒等行表)。
+    {
+        let mut pw = pd;
+        let mut px = act;
+        let mut po = hb;
+        let mut ps = seg;
+        let mut pr = rows_id;
+        let (mut ns, mut ni, mut no, mut rbd) = (
+            nseg as c_int,
+            ff as c_int,
+            e as c_int,
+            rb_d as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut pr as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut no as *mut _ as *mut c_void,
+            &mut rbd as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(
+            tc.dn[slot_d],
+            ((e / EXTC_BN) as u32, tiles, nseg as u32),
+            (threads, 1, 1),
+            0,
+            &mut args,
+        )?;
+    }
+    Ok(())
+}
+
 /// 1 層ぶんのストリーミング入力 (plan 順)。
 ///
 /// `dev` は VRAM 常駐 (ヒット) のポインタ、`host` はミスのホストバイト列。
@@ -11580,6 +11831,25 @@ fn moe_experts_iq_pf_layer_stream_io(
             // グループ先頭行だけ足して渡す (下)。これで 14k の g/u/act が
             // 0.86 GB → グループ 1 個ぶん (実測 約 0.04 GB) になる。
             let gl = is_dev && exp_pf::lm_group_local();
+            // task 250: tensor core の grouped GEMM で回せるか (層で 1 回だけ判定)。
+            // `gl` (相対化した seg) は行の先頭がグループ基準になるので使わない
+            // (カーネルは絶対行番号で act / h を書く)。
+            let tc_kernels = if crate::model::exp_pf::tc_exp_on()
+                && !gl
+                && tc_shapes_ok(
+                    exp_pf::slot(ty_g),
+                    exp_pf::slot(ty_d),
+                    ty_g == ty_u,
+                    n_in,
+                    ff,
+                    ff,
+                    e,
+                )
+            {
+                exp_tc_kernels()
+            } else {
+                None
+            };
             let rows_cap = if gl {
                 match exp_pf::max_group_rows(seg, &bounds) {
                     Some(r) => r,
@@ -11788,33 +12058,60 @@ fn moe_experts_iq_pf_layer_stream_io(
                     rg
                 };
                 unsafe {
-                    pf_launch_group(
-                        ctx,
-                        kernels,
-                        slot_g,
-                        slot_u,
-                        slot_d,
-                        pg_tab.ptr() + (a * 8) as u64,
-                        pu_tab.ptr() + (a * 8) as u64,
-                        pd_tab.ptr() + (a * 8) as u64,
-                        xb,
-                        gb,
-                        ub,
-                        act,
-                        hb,
-                        segb + (a * 16) as u64,
-                        rg_g,
-                        rid,
-                        b - a,
-                        ro_start,
-                        ro_end,
-                        n_in,
-                        ff,
-                        e,
-                        rb_g,
-                        rb_u,
-                        rb_d,
-                    )?;
+                    if let Some(tc) = tc_kernels {
+                        // task 250: グループ内の最大行数でトークンタイル数を決める。
+                        let max_m = (a..b).map(|i| seg[i * 4] as usize).max().unwrap_or(0);
+                        pf_launch_group_tc(
+                            ctx,
+                            tc,
+                            slot_g,
+                            slot_d,
+                            pg_tab.ptr() + (a * 8) as u64,
+                            pu_tab.ptr() + (a * 8) as u64,
+                            pd_tab.ptr() + (a * 8) as u64,
+                            xb,
+                            act,
+                            hb,
+                            segb + (a * 16) as u64,
+                            rg,
+                            rid,
+                            b - a,
+                            max_m,
+                            n_in,
+                            ff,
+                            e,
+                            rb_g,
+                            rb_d,
+                        )?;
+                    } else {
+                        pf_launch_group(
+                            ctx,
+                            kernels,
+                            slot_g,
+                            slot_u,
+                            slot_d,
+                            pg_tab.ptr() + (a * 8) as u64,
+                            pu_tab.ptr() + (a * 8) as u64,
+                            pd_tab.ptr() + (a * 8) as u64,
+                            xb,
+                            gb,
+                            ub,
+                            act,
+                            hb,
+                            segb + (a * 16) as u64,
+                            rg_g,
+                            rid,
+                            b - a,
+                            ro_start,
+                            ro_end,
+                            n_in,
+                            ff,
+                            e,
+                            rb_g,
+                            rb_u,
+                            rb_d,
+                        )?;
+                    }
                 }
                 PF_STREAM.with(|cell| {
                     let mut st = cell.borrow_mut();
@@ -11892,6 +12189,229 @@ fn moe_experts_iq_pf_layer_stream_io(
                 tracing::error!("[exp-pf-stream] 使えないので以後 CPU 経路: {e:#}");
             }
             Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod pf_exp_tc_tests {
+    //! task 250: tensor core グループ GEMM (`kernels_exp_iq_tc.cu`) の**索引**を
+    //! GPU 無しで固定する。
+    //!
+    //! カーネルは 32 要素ぶんの重みを 8 個ずつ (j = 0..3) デコードする。その
+    //! 索引算術を .cu の行から 1 対 1 で写し、CPU の参照
+    //! (`kquant::dequant_row_into`) と要素ごとに比べる。丸め順の一致ではなく
+    //! **索引の取り違え**を落とすためのテスト (型ごとに 1 行 512 要素)。
+
+    use super::*;
+    use crate::kquant::{dequant_row_into, GgmlType};
+    use crate::kquant_tables::{IQ2S_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL, KSIGNS_IQ2XS};
+
+    /// .cu の `dno_tcq_f16` と同じ式 (IEEE の f16 → f32)。
+    fn f16v(b: &[u8]) -> f32 {
+        let h = b[0] as u32 | ((b[1] as u32) << 8);
+        let sign = (h & 0x8000) << 16;
+        let exp = (h >> 10) & 0x1f;
+        let mut man = h & 0x3ff;
+        let bits = if exp == 0 {
+            if man == 0 {
+                sign
+            } else {
+                let mut e: i32 = -14;
+                while man & 0x400 == 0 {
+                    man <<= 1;
+                    e -= 1;
+                }
+                man &= 0x3ff;
+                sign | (((e + 127) as u32) << 23) | (man << 13)
+            }
+        } else if exp == 31 {
+            sign | 0x7f80_0000 | (man << 13)
+        } else {
+            sign | ((exp + 112) << 23) | (man << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    fn u32le(b: &[u8]) -> u32 {
+        b[0] as u32 | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
+    }
+
+    fn sgn(signs: u32, u: usize) -> f32 {
+        if signs & (1 << u) != 0 {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
+    /// カーネルの 1 要素ぶんのデコード (.cu の `dno_tc_w8_*` を k で引く形)。
+    fn mirror(ty: GgmlType, row: &[u8], k: usize) -> f32 {
+        let s = k >> 5;
+        let sb = s >> 3;
+        let sub = s & 7;
+        let j = (k & 31) >> 3;
+        let u = k & 7;
+        match ty {
+            GgmlType::IQ2S => {
+                let blk = &row[sb * 82..];
+                let d = f16v(blk);
+                let qh = blk[66 + sub] as u32;
+                let idx = (blk[2 + sub * 4 + j] as u32 | ((qh << (8 - 2 * j)) & 0x300)) as usize;
+                let sg = blk[34 + sub * 4 + j] as u32;
+                let sc = blk[74 + sub] as u32;
+                let nib = if j & 2 != 0 { sc >> 4 } else { sc & 0x0f };
+                let db = d * (0.5 + nib as f32) * 0.25;
+                let grid = IQ2S_GRID[idx];
+                let gv = ((grid >> (8 * u)) & 0xff) as f32;
+                db * gv * sgn(sg, u)
+            }
+            GgmlType::IQ3Xxs => {
+                let blk = &row[sb * 98..];
+                let d = f16v(blk);
+                let aux = u32le(&blk[66 + sub * 4..]);
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+                let signs = KSIGNS_IQ2XS[((aux >> (7 * j)) & 127) as usize] as u32;
+                let g1 = IQ3XXS_GRID[blk[2 + sub * 8 + 2 * j] as usize];
+                let g2 = IQ3XXS_GRID[blk[2 + sub * 8 + 2 * j + 1] as usize];
+                if u < 4 {
+                    db * ((g1 >> (8 * u)) & 0xff) as f32 * sgn(signs, u)
+                } else {
+                    db * ((g2 >> (8 * (u - 4))) & 0xff) as f32 * sgn(signs, u)
+                }
+            }
+            GgmlType::IQ3S => {
+                let blk = &row[sb * 110..];
+                let d = f16v(blk);
+                let sc = blk[106 + (sub >> 1)] as u32;
+                let nib = if sub & 1 != 0 { sc >> 4 } else { sc & 0x0f };
+                let db = d * (1.0 + 2.0 * nib as f32);
+                let qh = blk[66 + sub] as u32;
+                let idx1 = (blk[2 + sub * 8 + 2 * j] as u32 | ((qh << (8 - 2 * j)) & 256)) as usize;
+                let idx2 = (blk[2 + sub * 8 + 2 * j + 1] as u32 | ((qh << (7 - 2 * j)) & 256)) as usize;
+                let signs = blk[74 + sub * 4 + j] as u32;
+                let g1 = IQ3S_GRID[idx1];
+                let g2 = IQ3S_GRID[idx2];
+                if u < 4 {
+                    db * ((g1 >> (8 * u)) & 0xff) as f32 * sgn(signs, u)
+                } else {
+                    db * ((g2 >> (8 * (u - 4))) & 0xff) as f32 * sgn(signs, u)
+                }
+            }
+            GgmlType::IQ4Xs => {
+                let blk = &row[sb * 136..];
+                let d = f16v(blk);
+                let half = j >> 1;
+                let jbase = (j & 1) * 8;
+                let sh = blk[2] as u32 | ((blk[3] as u32) << 8);
+                let sl = blk[4 + (sub >> 1)] as u32;
+                let ls = ((sl >> (4 * (sub & 1))) & 0x0f) | (((sh >> (2 * sub)) & 3) << 4);
+                let dl = d * (ls as f32 - 32.0);
+                let qs = &blk[8 + sub * 16 + jbase..];
+                let q = if half != 0 { qs[u] >> 4 } else { qs[u] & 0x0f };
+                dl * KVALUES_IQ4NL[q as usize] as f32
+            }
+            _ => unreachable!("4 型だけ"),
+        }
+    }
+
+    /// 決定的な擬似乱数で 1 行ぶんのバイト列を作る。d (f16) だけは 1.0 に固定する
+    /// (NaN/Inf を避ける。他の欄は全ビット模様が有効なので任意でよい)。
+    fn make_row(ty: GgmlType, n: usize, seed: u64) -> Vec<u8> {
+        let ts = ty.type_size();
+        let bs = ty.blck_size();
+        let mut v = vec![0u8; (n / bs) * ts];
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        for b in v.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        for i in 0..(n / bs) {
+            v[i * ts] = 0x00;
+            v[i * ts + 1] = 0x3C; // f16 の 1.0
+        }
+        v
+    }
+
+    /// 索引が参照と一致する (型ごとに 1 行 512 要素 = 2 ブロック)。
+    #[test]
+    fn tc_kernel_index_mirror_matches_cpu_reference() {
+        for (ty, seed) in [
+            (GgmlType::IQ2S, 11u64),
+            (GgmlType::IQ3Xxs, 12),
+            (GgmlType::IQ3S, 13),
+            (GgmlType::IQ4Xs, 14),
+        ] {
+            let n = 512usize;
+            let row = make_row(ty, n, seed);
+            let mut r = vec![0.0f32; n];
+            dequant_row_into(ty, &row, &mut r);
+            let mut worst = 0.0f32;
+            let mut bad = 0usize;
+            for k in 0..n {
+                let g = mirror(ty, &row, k);
+                let d = (g - r[k]).abs();
+                let rel = d / r[k].abs().max(1e-6);
+                if !(rel <= 1e-5) {
+                    bad += 1;
+                    if bad <= 4 {
+                        eprintln!("[pf-tc-test] {ty:?} k={k} mirror={g} ref={} rel={rel}", r[k]);
+                    }
+                }
+                worst = worst.max(rel);
+            }
+            assert_eq!(bad, 0, "{ty:?}: 索引が参照と違う要素 {bad} 個 (worst rel {worst})");
+        }
+    }
+
+    /// ゲートの真理値表 (既定 off・明示的な真値だけ on)。
+    #[test]
+    fn tc_exp_gate_is_strictly_opt_in() {
+        assert!(!crate::model::exp_pf::tc_exp_from_value(None));
+        assert!(!crate::model::exp_pf::tc_exp_from_value(Some("")));
+        assert!(!crate::model::exp_pf::tc_exp_from_value(Some("0")));
+        assert!(!crate::model::exp_pf::tc_exp_from_value(Some("off")));
+        assert!(!crate::model::exp_pf::tc_exp_from_value(Some(" false ")));
+        assert!(crate::model::exp_pf::tc_exp_from_value(Some("1")));
+        assert!(crate::model::exp_pf::tc_exp_from_value(Some("on")));
+        assert!(crate::model::exp_pf::tc_exp_from_value(Some("true")));
+    }
+
+    /// 形の契約: gate と up が同じ型・4 型・k が 256 の倍数・n が 64 の倍数。
+    #[test]
+    fn tc_shapes_ok_pins_the_contract() {
+        // 実モデルの形 (e = 2560 / ff = 1024)。
+        assert!(tc_shapes_ok(Some(1), Some(3), true, 2560, 1024, 1024, 2560));
+        // gate と up が違う型は不可。
+        assert!(!tc_shapes_ok(Some(1), Some(3), false, 2560, 1024, 1024, 2560));
+        // IQ4_NL / Q2_0 (slot 4/5) はこのカーネルの対象外。
+        assert!(!tc_shapes_ok(Some(4), Some(3), true, 2560, 1024, 1024, 2560));
+        assert!(!tc_shapes_ok(Some(1), Some(5), true, 2560, 1024, 1024, 2560));
+        // k が 256 の倍数でない / n が 64 の倍数でない。
+        assert!(!tc_shapes_ok(Some(1), Some(3), true, 2432, 1024, 1024, 2560));
+        assert!(!tc_shapes_ok(Some(1), Some(3), true, 2560, 1024, 1000, 2560));
+        assert!(!tc_shapes_ok(Some(1), Some(3), true, 2560, 1024, 1024, 2540));
+        // 0 は不可。
+        assert!(!tc_shapes_ok(Some(1), Some(3), true, 0, 1024, 1024, 2560));
+    }
+
+    /// PTX の引数の数え方がコミット済みの PTX (nvcc の実出力) で 9 になること。
+    /// 合成文字列ではなく実物で確かめる (task 68 の ABI ゲートと同じ)。
+    #[test]
+    fn ptx_entry_params_counts_the_committed_pf_ptx() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_pf.ptx");
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            eprintln!("PTX が無いので省略: {}", p.display());
+            return;
+        };
+        for name in ["dno_exp_pf_iq2s", "dno_exp_pf_iq3xxs", "dno_exp_pf_iq3s", "dno_exp_pf_iq4xs"] {
+            assert_eq!(
+                ptx_entry_params(&text, name),
+                Some(9),
+                "{name} の引数の数 (ptx パーサの前提)"
+            );
         }
     }
 }
