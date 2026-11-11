@@ -913,22 +913,68 @@ impl SsmLayer {
         // 連鎖の入力 x も出力 beta/alpha もデバイスにあるので、転送を挟まずに
         // F32 GEMM 2 本で作れる (lab t183a の `beta_pf` は 712 ms = 0.71 ms/回)。
         // 形が合わない (連結でない / F32 でない) ときはホスト経路のまま。
-        let ba_desc = if crate::cuda::pf_ssm_gemm_gpu_on() {
-            match self.beta_alpha.inner() {
-                Some(inner) => {
-                    let (r0, r1) = (self.beta_alpha.range(0), self.beta_alpha.range(1));
-                    if r0.len() == nv && r1.len() == nv {
-                        Some(crate::cuda::PfBetaAlpha {
-                            w: pw(inner),
-                            beta_rows: r0,
-                            alpha_rows: r1,
-                        })
-                    } else {
-                        None
+        // task 225: 新しい専用 GEMM (`DENNO_PF_BA_FAST`) でもデバイス経路に入る。
+        // 連結されていない (inner() が None) 実モデルでは、元の 2 本の重みを
+        // そのまま使う (`alpha_w`)。
+        // task 228: 入口の判定を `pf_ba_w_ok` に一本化した (元の型は F32 に限らず
+        // f32 へ展開できればよい)。ここで開けたのに `gdn_pf_chain` 側で閉じると
+        // 連鎖が層ごと従来経路へ落ちる (lab t225a: ssm +79%) ので、両側が同じ
+        // 純関数を使う。閉じた理由は 1 回だけ warn に出す。
+        let ba_desc = if crate::cuda::pf_ba_dev_on() {
+            let mut d = None;
+            let mut why = String::new();
+            if let Some(inner) = self.beta_alpha.inner() {
+                let (r0, r1) = (self.beta_alpha.range(0), self.beta_alpha.range(1));
+                match crate::cuda::pf_ba_w_check(inner.ty(), inner.k(), inner.n(), &r0, nv, e) {
+                    Some(w) => why = w,
+                    None => {
+                        match crate::cuda::pf_ba_w_check(
+                            inner.ty(),
+                            inner.k(),
+                            inner.n(),
+                            &r1,
+                            nv,
+                            e,
+                        ) {
+                            Some(w) => why = w,
+                            None => {
+                                d = Some(crate::cuda::PfBetaAlpha {
+                                    w: pw(inner),
+                                    beta_rows: r0,
+                                    alpha_rows: r1,
+                                    alpha_w: None,
+                                })
+                            }
+                        }
                     }
                 }
-                None => None,
             }
+            if d.is_none() && crate::cuda::pf_ba_fast_on() {
+                let parts = self.beta_alpha.parts();
+                if parts.len() == 2 {
+                    let b0 = 0..parts[0].n();
+                    let b1 = 0..parts[1].n();
+                    let c0 = crate::cuda::pf_ba_w_check(parts[0].ty(), parts[0].k(), parts[0].n(), &b0, nv, e);
+                    let c1 = crate::cuda::pf_ba_w_check(parts[1].ty(), parts[1].k(), parts[1].n(), &b1, nv, e);
+                    match (c0, c1) {
+                        (None, None) => {
+                            d = Some(crate::cuda::PfBetaAlpha {
+                                w: pw(&parts[0]),
+                                beta_rows: b0,
+                                alpha_rows: b1,
+                                alpha_w: Some(pw(&parts[1])),
+                            })
+                        }
+                        (Some(w), _) | (_, Some(w)) => why = w,
+                    }
+                } else {
+                    why = format!("beta/alpha が {} 本に分かれている", parts.len());
+                }
+            }
+            if d.is_none() {
+                crate::cuda::pf_ba_diag_warn(&why);
+            }
+            d
         } else {
             None
         };
