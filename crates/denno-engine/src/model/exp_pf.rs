@@ -232,6 +232,22 @@ pub const CHUNK_BALANCE_ENV: &str = "DENNO_PF_CHUNK_BALANCE";
 /// prefill は -8.9% (c8869) / -3.1% (c2000) だが、c8869 の decode が +2%、
 /// その機序は expert のヒット率 0.929 → 0.912 (最後のチャンクが LRU に残す
 /// 集合が変わる)。目標の「decode は 1% 以内」を超えるので**既定 off**。
+///
+/// task 246 で 2 回測り直した (br239 を int-auto 1d36583f6 に載せ、ゲートは既定 off)。
+/// t246a (5 COND: x0/base/bal/reseed/base2) と t246c (3 COND: x0/reseed/base2):
+///
+/// | cond | c8869 cold prefill | c2000 cold | c8869 cold decode | c8869 turn2 decode |
+/// | --- | --- | --- | --- | --- |
+/// | base / base2 | 6.35 / 6.01 s | 7.06 / 7.08 s | 18.8 / 18.7 | 19.6 / 19.5 |
+/// | bal (balance のみ) | **5.46 s** | 6.87 s | 20.0 | 19.0 |
+/// | reseed (balance + DEC_RESEED) | **5.47 / 5.48 s** | 6.84 / 6.82 s | 19.8 / 19.8 | 19.2 / 19.1 |
+///
+/// prefill は -9.0% (c8869) / -3.3% (c2000) で目標を満たすが、**c8869 cold の直後の
+/// decode だけ +5.8%** が 2 run で再現する (turn2 の decode は -3% と逆)。
+/// 機序は t239d のヒット率ではない: 同じ run の `[exp-iq]` は base も bal も
+/// `lookups=46560 hits=42349 hit_rate=0.910 uploads=876` で**完全に一致**する。
+/// 候補は生成列が変わることによる page cache (PLE 表で 1 回 216 ms の跳ねを観測)。
+/// 目標 (decode +1% 以内) を満たさないので既定 off のまま。
 pub const DEFAULT_CHUNK_BALANCE: bool = false;
 
 /// 均等割りの 1 チャンク上限 (GDN 連鎖の境界 `GDN_CHUNK_MIN_TOKENS` = 2048 の手前)。
@@ -310,6 +326,19 @@ pub fn chunk_balance() -> bool {
 pub const CHUNK_BALANCE_LONG_ENV: &str = "DENNO_PF_CHUNK_BALANCE_LONG";
 
 /// [`CHUNK_BALANCE_LONG_ENV`] の既定 (off = 従来の固定 1,536)。
+///
+/// lab t246b (depth8k、int-auto 1d36583f6 + br239、x0/base/lbal/lbal2/base2):
+///
+/// | cond | c8000 cold (14,018 tok) | 転送 up_MB | copy_s | c8000 cold decode | c2000 cold |
+/// | --- | --- | --- | --- | --- | --- |
+/// | base / base2 | 25.11 / 25.11 s | 151,898 | 5.89 | 18.4 / 18.4 | 7.07 / 7.09 s |
+/// | lbal | 24.41 s | 122,068 | 4.80 | 18.9 | 6.80 s |
+/// | lbal2 | 24.33 s | 122,068 | 4.74 | 18.3 | 6.80 s |
+///
+/// チャンクは 10 枚 (9 枚ストリーム + 194 トークンの従来経路) から 2,003 × 7 枚へ。
+/// 転送は -20%、copy は -1.1 s だが**壁時計は -2.9%** にとどまる (14k の prefill は
+/// 転送よりホスト側の計算が支配的で、7 枚が上限 = GDN 連鎖の境界 2,048 の手前)。
+/// 目標の -5% に届かないので**既定 off**。
 pub const DEFAULT_CHUNK_BALANCE_LONG: bool = false;
 
 /// [`CHUNK_BALANCE_LONG_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
@@ -349,7 +378,14 @@ pub fn chunk_balance_long() -> bool {
 /// 寄せ直す (task 246、H2D なし)。
 pub const DEC_RESEED_ENV: &str = "DENNO_PF_DEC_RESEED";
 
-/// [`DEC_RESEED_ENV`] の既定 (off。第 1 ラウンドの lab で測ってから決める)。
+/// [`DEC_RESEED_ENV`] の既定 (off)。
+///
+/// lab t246a / t246c (tools) の実測: 発火はする (`[pf-reseed] tok=256 keys=122880
+/// resident=89844 (73.1%) in 1.84ms`、`[pf-reseed] tok=19 ... in 0.25ms` = 短い
+/// prefill でも末尾 19 トークンぶん)。decode のヒット率は 0.910 → 0.913 (+0.3 pp)
+/// で、COND 全体の decode 中央値は 20.3 → 20.3 (変化なし)。
+/// **c8869 cold の直後の decode +5.8% は消えない** (bal 20.0 / reseed 19.8 /
+/// base 18.8) ので、目標 (decode +1% 以内) は満たさない。既定 off。
 pub const DEFAULT_DEC_RESEED: bool = false;
 
 /// `DENNO_PF_DEC_RESEED_TOK`: 何トークンぶんを寄せ直すか (既定 256)。
