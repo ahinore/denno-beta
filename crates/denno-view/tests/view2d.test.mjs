@@ -217,9 +217,10 @@ test('residencyBits / roleForBlock / streamValue', () => {
   assert.equal(streamValue({}), 0);
 });
 
-test('heat / rampRGB: 0 は暗色、1 は赤、範囲外は端に張り付く', () => {
+test('heat / rampRGB: 0 は暗色、1 は明るい白、範囲外は端に張り付く', () => {
   assert.deepEqual(rampRGB(0), [8, 19, 28]);
-  assert.deepEqual(rampRGB(1), [255, 59, 48]);
+  // task 235: 赤は off 専用。活動の尺度は暗い → 明るい (ほぼ白) の 1 本。
+  assert.deepEqual(rampRGB(1), [214, 250, 255]);
   assert.deepEqual(rampRGB(-3), rampRGB(0));
   assert.deepEqual(rampRGB(7), rampRGB(1));
   const mid = rampRGB(0.5);
@@ -227,6 +228,16 @@ test('heat / rampRGB: 0 は暗色、1 は赤、範囲外は端に張り付く', 
   assert.equal(heat(0.5), 'rgb(' + mid.join(',') + ')');
   assert.equal(heat(2, 2), heat(1));
   assert.equal(heat(1, 0), heat(1), 'scale 0 は 1 とみなす');
+
+  // 明るさが単調に増える / 高い側が赤くならない (赤は off だけ)
+  let last = -1;
+  for (let i = 0; i <= 10; i++) {
+    const c = rampRGB(i / 10);
+    const lum = 0.30 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+    assert.ok(lum > last + 1, 'luminance must rise at ' + i / 10 + ': ' + lum);
+    last = lum;
+    assert.ok(c[0] <= c[1], 'activity must not be red at ' + i / 10 + ': ' + c.join(','));
+  }
 });
 
 test('createMapState: token モードは置換、accum は加算 + decay', () => {

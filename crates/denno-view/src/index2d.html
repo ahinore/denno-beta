@@ -29,7 +29,8 @@
   .epoch b { color:var(--fg); font-weight:600; }
   .cache { font-size:10px; padding:1px 7px; border-radius:3px; border:1px solid #1c3444; color:var(--dim); }
   .cache.reset { border-color:#7a5a12; background:rgba(255,196,77,.10); color:#ffcf7a; }
-  #cachenote { font-size:10px; color:#7fa4b8; padding-top:2px; min-height:13px; }
+  #cachenote { font-size:10px; color:#7fa4b8; padding-top:2px; height:14px; overflow:hidden;
+               white-space:nowrap; text-overflow:ellipsis; }
   #cachenote b { color:#ffcf7a; font-weight:500; }
   .banner { font-size:11px; padding:2px 9px; border-radius:3px; border:1px solid #1c3444;
             color:var(--dim); white-space:nowrap; max-width:46vw; overflow:hidden; text-overflow:ellipsis; }
@@ -38,10 +39,11 @@
   .banner.both { border-color:#8a2a4a; background:rgba(255,59,48,.16); color:#ff9db0; }
 
   main { display:grid; grid-template-columns:340px minmax(500px,1fr) 338px;
-         height:calc(100% - 42px); }
-  section { min-width:0; display:flex; flex-direction:column; padding:8px 10px; }
-  #chatpane { border-right:1px solid var(--line); }
-  #ctrl { border-left:1px solid var(--line); overflow-y:auto; gap:8px; }
+         grid-template-rows:minmax(0,1fr); height:calc(100% - 42px); }
+  section { min-width:0; min-height:0; display:flex; flex-direction:column; padding:8px 10px; }
+  #chatpane { border-right:1px solid var(--line); grid-column:1; grid-row:1; }
+  #mappane { grid-column:2; grid-row:1; }
+  #ctrl { border-left:1px solid var(--line); overflow-y:auto; gap:8px; grid-column:3; grid-row:1; }
   h2 { font-size:11px; font-weight:400; letter-spacing:.10em; color:var(--dim);
        margin:0 0 6px; padding-bottom:3px; border-bottom:1px solid var(--line); }
   h2 .dim { color:#38505f; letter-spacing:0; }
@@ -69,26 +71,33 @@
   #cmeta { padding:5px 2px 0; color:var(--dim); font-size:10px; min-height:14px; }
   #chatpane .hint { color:#38505f; font-size:10px; padding-top:4px; }
 
-  /* ---- map ---- */
-  #maphead { display:flex; align-items:flex-start; gap:12px; }
-  #maphead h2 { flex:1; }
-  #legend { display:flex; flex-wrap:wrap; gap:4px 10px; align-items:center;
-            font-size:10px; color:var(--dim); padding-bottom:4px; }
+  /* ---- map (task 235: 層の壁) ---- */
+  #maphead { height:26px; display:flex; align-items:center; gap:10px; overflow:hidden; }
+  #maphead h2 { flex:none; margin:0; padding:0; border:none; white-space:nowrap; }
+  #legend { display:flex; gap:6px; align-items:center; font-size:9px; color:var(--dim);
+            white-space:nowrap; overflow:hidden; flex:1; min-width:0; }
   .sw { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:3px;
         vertical-align:-1px; border:1px solid rgba(255,255,255,.15); }
-  #scale { display:flex; align-items:center; gap:5px; font-size:9.5px; }
-  #scalebar { width:110px; height:8px; border:1px solid #1b2f3d; border-radius:2px; }
-  #mapwrap { flex:1; overflow:auto; border:1px solid var(--line); border-radius:4px;
+  #scale { display:flex; align-items:center; gap:4px; font-size:9px; }
+  #scalebar { width:74px; height:7px; border:1px solid #1b2f3d; border-radius:2px; }
+  #legend label { display:flex; align-items:center; gap:3px; cursor:pointer; }
+  #legend input[type=checkbox] { margin:0; accent-color:#2f8aa8; }
+  #mapwrap { flex:1; min-height:0; overflow:hidden; border:1px solid var(--line); border-radius:4px;
              background:#04080d; position:relative; }
-  #colhead { position:sticky; top:0; height:17px; background:#060c13; z-index:3;
-             border-bottom:1px solid #0d1c27; }
-  #colhead span { position:absolute; top:2px; font-size:9px; color:#4f6b7a; letter-spacing:.04em; }
   #map { display:block; cursor:crosshair; }
   #tip { position:fixed; display:none; z-index:20; pointer-events:none; background:rgba(4,12,18,.95);
          border:1px solid #1b3d52; border-radius:3px; padding:3px 7px; font-size:10.5px;
          color:#cfeaf7; white-space:nowrap; box-shadow:0 2px 10px rgba(0,0,0,.5); }
-  #mapstat { color:#38505f; font-size:10px; padding-top:3px; display:flex; gap:14px; }
+  #mapstat { height:15px; color:#38505f; font-size:10px; padding-top:2px; display:flex; gap:12px;
+             overflow:hidden; white-space:nowrap; }
   #mapstat b { color:#7fa4b8; font-weight:400; }
+
+  /* task 235: チャット / 操作列を 1 クリックで畳む (地図に場所を渡す) */
+  main.hide-chat { grid-template-columns:0 minmax(500px,1fr) 338px; }
+  main.hide-chat #chatpane { display:none; }
+  main.hide-ctrl { grid-template-columns:340px minmax(500px,1fr) 0; }
+  main.hide-ctrl #ctrl { display:none; }
+  main.hide-chat.hide-ctrl { grid-template-columns:0 minmax(500px,1fr) 0; }
 
   /* ---- controls ---- */
   .box { border:1px solid var(--line); border-radius:5px; padding:7px 8px; background:var(--panel); }
@@ -132,6 +141,10 @@
   <div class="logo">denno<span>2D</span></div>
   <div id="src" class="badge">connecting…</div>
   <div class="sp"></div>
+  <div class="modes">panes:
+    <button id="t-chat" class="on">chat</button>
+    <button id="t-ctrl" class="on">ctrl</button>
+  </div>
   <div class="modes">colour:
     <button id="m-token" class="on">per token</button>
     <button id="m-accum">accumulated</button>
@@ -155,26 +168,21 @@
 
   <section id="mappane">
     <div id="maphead">
-      <h2>layer map <span class="dim" id="shapeline"></span></h2>
+      <h2>layer wall <span class="dim" id="shapeline"></span></h2>
       <div id="legend">
-        <span><i class="sw" style="background:#b46bff"></i>mixer attn</span>
-        <span><i class="sw" style="background:#00d9a0"></i>mixer gdn</span>
-        <span><i class="sw" style="background:#ffe14d"></i>router</span>
-        <span><i class="sw" style="background:#00b8d4"></i>experts</span>
-        <span><i class="sw" style="background:#ff2bd6"></i>shared</span>
-        <span><i class="sw" style="background:#7f8bff"></i>PLE</span>
-        <span><i class="sw" style="background:transparent;border-color:#00eaff"></i>VRAM ring</span>
+        <span><i class="sw" style="background:#b46bff"></i>full</span>
+        <span><i class="sw" style="background:#00d9a0"></i>gdn</span>
+        <span id="scale">act<div id="scalebar"></div></span>
+        <span><i class="sw" style="background:#ff3b30"></i>off</span>
         <span><i class="sw" style="background:#ffc44d"></i>skipped</span>
-        <span><i class="sw" style="background:#2a0a10;border-color:#ff3b30"></i>off</span>
-        <span><i class="sw" style="background:#0a1620;border-color:#ffffff"></i>selected</span>
-        <span id="scale">weak<div id="scalebar"></div>strong</span>
+        <span><i class="sw" style="background:#08131c;border-color:#fff"></i>sel / top-k</span>
+        <label title="thin dot = expert stays in VRAM"><input id="cb-vram" type="checkbox">vram</label>
       </div>
     </div>
-    <div id="mapwrap">
-      <div id="colhead"></div>
-      <canvas id="map"></canvas>
-    </div>
+    <div id="mapwrap"><canvas id="map"></canvas></div>
     <div id="mapstat">
+      <span>grid <b id="gridstat">-</b></span>
+      <span>cell <b id="cellstat">-</b></span>
       <span>ws <b id="wsstat">-</b></span>
       <span>frames <b id="fstat">0</b></span>
       <span>tokens <b id="tokstat">0</b></span>
@@ -237,11 +245,12 @@
 <script type="module">
 import { decodeFrame, FrameDecodeError } from '/frames.mjs';
 import {
-  BLOCKS, DEFAULT_SHAPE_RAW, GEOM, actBuckets, createMapState, createMockStore,
-  createSelection, clearSelection as clearSel, hasItem, heat, hitTest, itemsInRect,
-  layoutFromShape, mergeBodies, normaliseShape, rampRGB, roleForBlock, selectionCount,
+  DEFAULT_SHAPE_RAW, WALL_COLORS, createMapState, createMockStore,
+  createSelection, clearSelection as clearSel, depthValue, heat, mergeBodies,
+  mockTokenFrames, normaliseShape, rampRGB, roleForBlock, selectionCount,
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
-  toggleItem, addItem, removeItem, selectionItems,
+  toggleItem, addItem, removeItem, selectionItems, wallHitTest,
+  wallItemsInRect, wallLayout,
 } from '/view2d.mjs';
 
 const $ = (id) => document.getElementById(id);
@@ -250,7 +259,7 @@ const Q = new URLSearchParams(location.search);
 // ---- 状態 ---------------------------------------------------------------
 let mock = null;                       // 非 null ならモック店
 let shape = normaliseShape(DEFAULT_SHAPE_RAW);
-let layout = layoutFromShape(shape);
+let wall = null;                       // task 235: wallLayout(shape, pane)
 let st = createMapState(shape);
 const sel = createSelection();
 let applied = { epoch: 0, experts_off: [], blocks_off: [], streams_off: [] };
@@ -334,6 +343,27 @@ function startMock(why) {
   setBadge('mock · ' + why, 'badge mock');
   rebuild(shape);
   refreshAll('mock');
+  startMockFrames();
+}
+
+// task 235: モックは API だけだったので地図が空だった。合成テレメトリを
+// 1.5 秒ごとに 1 トークン流して、サーバー無しでも壁を目で確認できるようにする。
+let mockTimer = 0;
+let mockTok = 0;
+
+function pushMockToken() {
+  if (!mock) return;
+  mockTok++;
+  for (const f of mockTokenFrames(shape, mockTok, { off: applied.experts_off })) handleFrame(f);
+}
+
+function startMockFrames() {
+  clearInterval(mockTimer);
+  mockTok = 0;
+  pushMockToken();
+  mockTimer = setInterval(() => {
+    if (!document.hidden) pushMockToken();
+  }, 1500);
 }
 
 async function probeLive(first) {
@@ -381,62 +411,63 @@ async function boot() {
   $('lto').value = String(shape.layers);   // 実 API の layers は [from, to)
   connectWs();
   requestAnimationFrame(tick);
+  // 目視確認用: ?panes=map でチャット / 操作列を畳んだ状態から始める
+  if (Q.get('panes') === 'map') { togglePane('chat'); togglePane('ctrl'); }
   if (Q.get('mock') === '1') {
     startMock('forced by ?mock=1');
     return;
   }
   await probeLive(true);
 }
-let zoom = 1;
+// ---- 壁のレイアウト (task 235) -------------------------------------------
+// 列数とセル寸法は地図の実面積から決める。窓の resize と列の畳み (
+// ResizeObserver) の両方で組み直す。
+let vramOn = false;                    // VRAM 常駐の点を出すトグル
+let lastPaneKey = '';
 
-/// 中央カラムの幅に合わせて地図を拡大する (1.0〜1.6 倍)。
-/// 描画は layout 座標のまま、canvas の transform と CSS サイズだけ倍にする。
-function fitCanvas() {
-  const wrap = $('mapwrap');
-  const avail = Math.max(320, wrap.clientWidth - 6);
-  zoom = Math.max(0.85, Math.min(1.6, avail / layout.width));
-  const dpr = Math.min(1.5, window.devicePixelRatio || 1);
-  const c = $('map');
-  c.width = Math.round(layout.width * zoom * dpr);
-  c.height = Math.round(layout.height * zoom * dpr);
-  c.style.width = Math.round(layout.width * zoom) + 'px';
-  c.style.height = Math.round(layout.height * zoom) + 'px';
-  c.getContext('2d').setTransform(dpr * zoom, 0, 0, dpr * zoom, 0, 0);
-  $('colhead').style.width = Math.round(layout.width * zoom) + 'px';
-  for (const el of $('colhead').children) {
-    el.style.left = (Number(el.dataset.x) * zoom) + 'px';
-  }
+function paneSize() {
+  const w = $('mapwrap');
+  return { w: Math.max(1, w.clientWidth), h: Math.max(1, w.clientHeight) };
 }
 
-function rebuild(next) {
-  shape = normaliseShape(next);
-  layout = layoutFromShape(shape);
-  st = createMapState(shape, { mode: st ? st.mode : 'token' });
-  $('shapeline').textContent = shape.layers + ' layers · ' + shape.n_expert +
-    ' experts (top-' + shape.n_expert_used + ') · ' + shape.n_hc + ' hc streams · d' + shape.n_embd;
-  buildColHead();
-  buildScale();
+function relayout(force) {
+  const p = paneSize();
+  const key = p.w + 'x' + p.h;
+  if (!force && wall && key === lastPaneKey) return;
+  lastPaneKey = key;
+  wall = wallLayout(shape, p);
   fitCanvas();
   dirty = true;
 }
 
-function buildColHead() {
-  const head = $('colhead');
-  head.style.width = layout.width + 'px';
-  head.innerHTML = '';
-  const r0 = layout.rows[0];
-  const labels = [
-    ['L', r0.label.x], ['mixer', r0.mixer.x], ['router', r0.router.x],
-    ['experts ' + shape.n_expert, r0.experts.x], ['sh', r0.shared.x],
-    ['ple', r0.ple.x], ['streams ×' + shape.n_hc, r0.streams[0].x],
-  ];
-  for (const [text, x] of labels) {
-    const s = document.createElement('span');
-    s.textContent = text;
-    s.dataset.x = String(x);
-    s.style.left = x + 'px';
-    head.appendChild(s);
-  }
+/// canvas を地図の実面積に合わせる (倍率は持たない。1 CSS px = 1 座標)。
+function fitCanvas() {
+  const c = $('map');
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  c.width = Math.max(1, Math.round(wall.width * dpr));
+  c.height = Math.max(1, Math.round(wall.height * dpr));
+  c.style.width = wall.width + 'px';
+  c.style.height = wall.height + 'px';
+  c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+  // 収まるときはスクロールバーを出さない (出ると幅が減って組み直しになる)。
+  $('mapwrap').style.overflow = wall.fits ? 'hidden' : 'auto';
+  $('gridstat').textContent = wall.cols + 'x' + wall.rows + (wall.fits ? '' : ' (scroll)');
+  $('cellstat').textContent = wall.cellW.toFixed(1) + 'x' + wall.cellH.toFixed(1);
+  // 目視検証用: DOM から実寸を読めるようにする (?shot / CDP)
+  document.body.dataset.map = wall.cols + 'x' + wall.rows +
+    ' cell=' + wall.cellW.toFixed(2) + 'x' + wall.cellH.toFixed(2) +
+    ' tile=' + wall.tileW.toFixed(1) + 'x' + wall.tileH.toFixed(1) +
+    ' fit=' + (wall.fits ? 1 : 0) + ' pane=' + wall.pane.w + 'x' + wall.pane.h;
+}
+
+function rebuild(next) {
+  shape = normaliseShape(next);
+  st = createMapState(shape, { mode: st ? st.mode : 'token' });
+  $('shapeline').textContent = shape.layers + 'L · ' + shape.n_expert + 'e top-' +
+    shape.n_expert_used + ' · ' + shape.n_hc + 'hc';
+  buildScale();
+  relayout(true);
+  dirty = true;
 }
 
 function buildScale() {
@@ -782,38 +813,12 @@ $('btn-clear-apply').addEventListener('click', async () => {
   await refreshAll('steering cleared');
 });
 
-// ---- 地図の描画 ---------------------------------------------------------
+// ---- 地図の描画 (task 235: 層の壁) ---------------------------------------
 function tick() {
   requestAnimationFrame(tick);
-  if (!dirty) return;
+  if (!dirty || !wall) return;
   dirty = false;
   draw();
-}
-
-function draw() {
-  const c = $('map');
-  const g = c.getContext('2d');
-  const wrap = $('mapwrap');
-  const top = wrap.scrollTop / zoom;
-  const h = wrap.clientHeight / zoom;
-  const y0 = top - 60, y1 = top + h + 60;
-  g.clearRect(0, Math.max(0, y0), layout.width, Math.min(layout.height, y1) - Math.max(0, y0));
-  g.fillStyle = '#04080d';
-  g.fillRect(0, Math.max(0, y0), layout.width, Math.min(layout.height, y1) - Math.max(0, y0));
-
-  const dragItems = drag && drag.items ? new Set(drag.items.map(itemKey)) : null;
-  for (const row of layout.rows) {
-    if (row.y + row.h < y0 || row.y > y1) continue;
-    drawRow(g, row, dragItems);
-  }
-  if (drag && drag.active) {
-    const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
-    const w = Math.abs(drag.x1 - drag.x0), hh = Math.abs(drag.y1 - drag.y0);
-    g.fillStyle = drag.add ? 'rgba(120,220,255,.12)' : 'rgba(255,120,120,.12)';
-    g.fillRect(x, y, w, hh);
-    g.strokeStyle = drag.add ? 'rgba(140,230,255,.7)' : 'rgba(255,140,140,.7)';
-    g.strokeRect(x + .5, y + .5, w, hh);
-  }
 }
 
 function itemKey(it) {
@@ -822,130 +827,177 @@ function itemKey(it) {
   return 's:' + it.layer + ':' + it.stream;
 }
 
-function drawRow(g, row, dragItems) {
-  const l = row.layer;
-  const role = st.role[l];
-  if (hover && hover.layer === l) {
-    g.fillStyle = 'rgba(88,166,255,.06)';
-    g.fillRect(0, row.y, layout.width, row.h);
-  }
-  // 層番号
-  g.font = '9px ui-monospace, monospace';
-  g.textBaseline = 'middle';
-  g.fillStyle = row.kind === 'attn' ? 'rgba(180,107,255,.9)' : 'rgba(0,217,160,.8)';
-  g.fillText(String(l).padStart(2, '0'), row.label.x, row.label.y + 5);
-
-  // mixer / router / shared / ple
-  drawBlock(g, row.mixer, roleForBlock(role, 'attn', row.kind), row.kind === 'attn' ? 'attn' : 'gdn',
-    offBlk.has(l + ':attn'), hasKey(dragItems, 'b:' + l + ':attn') || isSel('block', l, 'attn'));
-  drawBlock(g, row.router, role.router, 'rt',
-    offBlk.has(l + ':moe'), hasKey(dragItems, 'b:' + l + ':moe') || isSel('block', l, 'moe'));
-  drawBlock(g, row.shared, role.shex, 'sh',
-    offBlk.has(l + ':shared'), hasKey(dragItems, 'b:' + l + ':shared') || isSel('block', l, 'shared'));
-  drawBlock(g, row.ple, row.ple.active ? role.ple : 0, 'ple',
-    offBlk.has(l + ':ple'), hasKey(dragItems, 'b:' + l + ':ple') || isSel('block', l, 'ple'), !row.ple.active);
-
-  // experts
-  const ex = row.experts;
-  const heatArr = st.experts[l];
-  const res = st.residency[l];
-  const skips = st.skip[l];
-  const offSet = offExp.get(l);
-  const gx = ex.cell + ex.gap;
-  g.fillStyle = '#071019';
-  g.fillRect(ex.x, ex.y, ex.w, ex.h);
-  for (let i = 0; i < ex.n; i++) {
-    const v = heatArr[i];
-    const isOff = offSet ? offSet.has(i) : false;
-    const isDrag = dragItems ? dragItems.has('e:' + l + ':' + i) : false;
-    const isSelNow = isSel('expert', l, i);
-    const resident = res[i] === 1;
-    // task 220: ルータが選びたかったが介入で切った expert (ExpertSkip)。
-    const isSkipped = skips ? skips[i] === 1 : false;
-    if (!(v > 0) && !isOff && !resident && !isDrag && !isSelNow && !isSkipped) continue;
-    const x = ex.x + (i % ex.cols) * gx;
-    const y = ex.y + Math.floor(i / ex.cols) * gx;
-    if (isOff) {
-      g.fillStyle = '#2a0a10';
-    } else if (v > 0) {
-      g.fillStyle = heat(v);
-    } else if (isSkipped) {
-      g.fillStyle = '#241a06';
-    } else {
-      g.fillStyle = '#0b2230';
-    }
-    g.fillRect(x, y, ex.cell, ex.cell);
-    if (resident && !isOff) {
-      g.fillStyle = 'rgba(0,234,255,.85)';
-      g.fillRect(x, y, ex.cell, 1);
-    }
-    if (isSkipped) {
-      // 下辺を amber に: 「選ばれていたが切った」(VRAM の上辺リングと区別する)。
-      g.fillStyle = 'rgba(255,196,77,.95)';
-      g.fillRect(x, y + ex.cell - 1, ex.cell, 1);
-    }
-    if (isDrag || isSelNow) {
-      g.fillStyle = 'rgba(255,255,255,.9)';
-      g.fillRect(x, y, ex.cell, 1);
-      g.fillRect(x, y + ex.cell - 1, ex.cell, 1);
-      g.fillRect(x, y, 1, ex.cell);
-      g.fillRect(x + ex.cell - 1, y, 1, ex.cell);
-    }
-  }
-
-  // LayerAct strip
-  const strip = row.strip;
-  const buckets = st.act[l];
-  const bw = strip.w / buckets.length;
-  for (let i = 0; i < buckets.length; i++) {
-    if (!(buckets[i] > 0)) continue;
-    g.fillStyle = heat(buckets[i]);
-    g.globalAlpha = 0.85;
-    g.fillRect(strip.x + i * bw, strip.y, Math.max(1, bw - 0.5), strip.h);
-  }
-  g.globalAlpha = 1;
-
-  // streams
-  const sv = streamValue(role);
-  for (let i = 0; i < row.streams.length; i++) {
-    const r = row.streams[i];
-    const isOff = offStr.get(l) ? offStr.get(l).has(i) : false;
-    const isDrag = hasKey(dragItems, 's:' + l + ':' + i);
-    const isSelNow = isSel('stream', l, i);
-    g.fillStyle = isOff ? '#2a0a10' : heat(sv);
-    g.fillRect(r.x, r.y, r.w, r.h);
-    g.strokeStyle = isOff ? '#ff3b30'
-      : (isDrag || isSelNow) ? 'rgba(255,255,255,.95)' : 'rgba(120,170,195,.35)';
-    g.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
-  }
-}
-
-function hasKey(set, k) { return set ? set.has(k) : false; }
-
 function isSel(type, l, key) {
   if (type === 'expert') return sel.experts.has('e:' + l + ':' + key);
   if (type === 'block') return sel.blocks.has('b:' + l + ':' + key);
   return sel.streams.has('s:' + l + ':' + key);
 }
 
-function drawBlock(g, r, v, label, isOff, isSelNow, dim) {
-  if (isOff) g.fillStyle = '#2a0a10';
-  else if (dim) g.fillStyle = '#0a1017';
-  else g.fillStyle = heat(v);
-  g.fillRect(r.x, r.y, r.w, r.h);
-  const lum = isOff || dim ? 0 : (rampRGB(v)[0] * 0.30 + rampRGB(v)[1] * 0.59 + rampRGB(v)[2] * 0.11);
-  g.strokeStyle = isOff ? '#ff3b30'
-    : isSelNow ? 'rgba(255,255,255,.95)' : 'rgba(120,170,195,.28)';
-  g.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
-  g.fillStyle = isOff ? '#ff8a94' : (lum > 150 ? '#04121a' : 'rgba(200,232,248,.8)');
+function maxOf(arr, n) {
+  let m = 0;
+  for (let i = 0; i < n; i++) if (arr[i] > m) m = arr[i];
+  return m;
+}
+
+function draw() {
+  const c = $('map');
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, wall.width, wall.height);
+  g.fillStyle = '#04080d';
+  g.fillRect(0, 0, wall.width, wall.height);
+  drawDepth(g);
+  const dragItems = drag && drag.items ? new Set(drag.items.map(itemKey)) : null;
+  for (const t of wall.tiles) drawTile(g, t, dragItems);
+  if (drag && drag.active) {
+    const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
+    const w = Math.abs(drag.x1 - drag.x0), h = Math.abs(drag.y1 - drag.y0);
+    g.fillStyle = drag.add ? 'rgba(120,220,255,.12)' : 'rgba(255,120,120,.12)';
+    g.fillRect(x, y, w, h);
+    g.strokeStyle = drag.add ? 'rgba(140,230,255,.7)' : 'rgba(255,140,140,.7)';
+    g.strokeRect(x + .5, y + .5, w, h);
+  }
+}
+
+/// 壁の上の深さ方向の帯 (mixer / shared / PLE / LayerAct)。
+/// マウスの下の層に白い縦線を引く (タイルの上でも同じ層を指す)。
+function drawDepth(g) {
+  const d = wall.depth;
   g.font = '8px ui-monospace, monospace';
-  g.fillText(label, r.x + 3, r.y + r.h / 2 + .5);
-  if (isOff) {
-    g.strokeStyle = 'rgba(255,59,48,.65)';
+  g.textBaseline = 'middle';
+  for (const row of d.rows) {
+    g.fillStyle = 'rgba(91,114,128,.85)';
+    g.fillText(row.label, 2, row.y + row.h / 2 + 0.5);
+    for (let l = 0; l < wall.shape.layers; l++) {
+      const v = depthValue(st, l, row.key);
+      const x = d.x + l * d.cellW;
+      g.fillStyle = v > 0 ? heat(v) : WALL_COLORS.none;
+      g.fillRect(x, row.y, Math.max(1, d.cellW - 0.4), row.h);
+    }
+  }
+  if (hover && hover.layer != null && hover.layer < wall.shape.layers) {
+    const x = Math.round(d.x + (hover.layer + 0.5) * d.cellW) + 0.5;
+    g.strokeStyle = 'rgba(255,255,255,.9)';
+    g.lineWidth = 1;
     g.beginPath();
-    g.moveTo(r.x + 1, r.y + 1);
-    g.lineTo(r.x + r.w - 1, r.y + r.h - 1);
+    g.moveTo(x, 0);
+    g.lineTo(x, d.h);
     g.stroke();
+  }
+}
+
+/// 1 枚のタイル = 1 層。
+function drawTile(g, t, dragItems) {
+  const l = t.layer;
+  const role = st.role[l] || {};
+  const arr = st.experts[l];
+  const res = st.residency[l];
+  const skips = st.skip[l];
+  const topk = st.topk[l];
+  const offSet = offExp.get(l);
+  const hov = hover && hover.layer === l;
+
+  g.fillStyle = hov ? '#0a1a26' : WALL_COLORS.tile;
+  g.fillRect(t.x, t.y, t.w, t.h);
+  g.strokeStyle = hov ? 'rgba(140,230,255,.55)' : WALL_COLORS.tileLine;
+  g.lineWidth = 1;
+  g.strokeRect(t.x + 0.5, t.y + 0.5, t.w - 1, t.h - 1);
+
+  // ヘッダ: 層番号 + 種別バッジ (バッジを押すと mixer ブロックを選ぶ)
+  g.font = '9px ui-monospace, monospace';
+  g.textBaseline = 'middle';
+  g.fillStyle = 'rgba(207,238,255,.9)';
+  g.fillText(String(l).padStart(2, '0'), t.head.x, t.head.y + t.head.h / 2 + 0.5);
+  g.fillStyle = t.kind === 'attn' ? 'rgba(180,107,255,.92)' : 'rgba(0,217,160,.92)';
+  g.fillRect(t.badge.x, t.badge.y, t.badge.w, t.badge.h);
+  g.fillStyle = '#06121a';
+  g.font = '7px ui-monospace, monospace';
+  const full = t.kind === 'attn';
+  g.fillText(full ? (t.badge.w >= 21 ? 'FULL' : 'F') : (t.badge.w >= 19 ? 'GDN' : 'G'),
+    t.badge.x + 2, t.badge.y + t.badge.h / 2 + 0.5);
+
+  // expert のヒートマップ (32x16)。色は 1 本の尺度 (暗い → 明るい)。
+  const ex = t.heat;
+  const scale = st.mode === 'accum' ? Math.max(1, maxOf(arr, ex.n)) : 1;
+  for (let i = 0; i < ex.n; i++) {
+    const x = ex.x + (i % ex.cols) * ex.cellW;
+    const y = ex.y + Math.floor(i / ex.cols) * ex.cellH;
+    const v = arr[i];
+    const isOff = offSet ? offSet.has(i) : false;
+    // amber は「ルータが選びたかったが介入で切った」なので off より優先して見せる。
+    if (skips[i] === 1) {
+      g.fillStyle = WALL_COLORS.skip;
+    } else if (isOff) {
+      g.fillStyle = WALL_COLORS.off;
+    } else if (v > 0) {
+      g.fillStyle = heat(v / scale);
+    } else {
+      g.fillStyle = WALL_COLORS.none;
+    }
+    g.fillRect(x, y, ex.cellW, ex.cellH);
+    if (vramOn && res[i] === 1 && !isOff) {
+      g.fillStyle = WALL_COLORS.resident;
+      g.fillRect(x, y, 1, 1);
+    }
+  }
+  // 輪郭は最後にまとめて描く (隣のセルの塗りに消されないように)。
+  // 2px セルでも塗りを隠さないよう、セルの**外側**に 1px の白い枠を置く。
+  const selN = sel.experts.size;
+  const dragN = dragItems ? dragItems.size : 0;
+  for (let i = 0; i < ex.n; i++) {
+    const top = topk[i] === 1;
+    const isSelNow = selN ? sel.experts.has('e:' + l + ':' + i) : false;
+    const isDragNow = dragN ? dragItems.has('e:' + l + ':' + i) : false;
+    if (!top && !isSelNow && !isDragNow) continue;
+    const rx = Math.round(ex.x + (i % ex.cols) * ex.cellW);
+    const ry = Math.round(ex.y + Math.floor(i / ex.cols) * ex.cellH);
+    const rw = Math.max(1, Math.round(ex.cellW)), rh = Math.max(1, Math.round(ex.cellH));
+    g.strokeStyle = WALL_COLORS.sel;
+    g.lineWidth = (isSelNow || isDragNow) ? 2 : 1;
+    g.strokeRect(rx - 0.5, ry - 0.5, rw + 1, rh + 1);
+  }
+
+  // RoleAct のバー (mixer / router / shared / PLE)。同じ色の尺度。
+  for (const b of t.bars) {
+    let v;
+    if (b.key === 'mixer') v = roleForBlock(role, 'attn', t.kind);
+    else if (b.key === 'router') v = role.router || 0;
+    else if (b.key === 'shared') v = role.shex || 0;
+    else v = t.pleActive ? (role.ple || 0) : 0;
+    const isOff = offBlk.has(l + ':' + b.block);
+    const isSelNow = isSel('block', l, b.block);
+    const vv = Math.max(0, Math.min(1, v));
+    const c = rampRGB(vv);
+    g.fillStyle = '#070f16';
+    g.fillRect(b.x, b.y, b.w, b.h);
+    if (isOff) {
+      g.fillStyle = WALL_COLORS.off;
+      g.fillRect(b.x, b.y, b.w, b.h);
+    } else if (vv > 0) {
+      g.fillStyle = heat(vv);
+      g.fillRect(b.x, b.y, Math.max(1, b.w * vv), b.h);
+    }
+    g.strokeStyle = isOff ? WALL_COLORS.off : isSelNow ? WALL_COLORS.sel : 'rgba(120,170,195,.30)';
+    g.lineWidth = 1;
+    g.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
+    const lum = isOff ? 0 : (c[0] * 0.30 + c[1] * 0.59 + c[2] * 0.11);
+    g.fillStyle = isOff ? '#ffd7da' : lum > 150 ? 'rgba(4,18,26,.85)' : 'rgba(170,200,215,.65)';
+    g.font = '6px ui-monospace, monospace';
+    g.fillText(b.label, b.x + 1, b.y + b.h / 2 + 0.5);
+  }
+
+  // 残差 stream (n_hc 本)。off は赤、選択は白枠。
+  const sv = streamValue(role);
+  for (let i = 0; i < t.streams.length; i++) {
+    const r = t.streams[i];
+    const isOff = offStr.get(l) ? offStr.get(l).has(i) : false;
+    const isSelNow = isSel('stream', l, i);
+    const isDrag = dragItems ? dragItems.has('s:' + l + ':' + i) : false;
+    g.fillStyle = isOff ? WALL_COLORS.off : heat(sv);
+    g.fillRect(r.x, r.y, r.w, r.h);
+    g.strokeStyle = isOff ? WALL_COLORS.off
+      : (isSelNow || isDrag) ? WALL_COLORS.sel : 'rgba(120,170,195,.35)';
+    g.lineWidth = 1;
+    g.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
   }
 }
 
@@ -955,31 +1007,44 @@ const tip = $('tip');
 
 function mapPoint(ev) {
   const r = canvas.getBoundingClientRect();
-  return { x: (ev.clientX - r.left) / zoom, y: (ev.clientY - r.top) / zoom };
+  return { x: ev.clientX - r.left, y: ev.clientY - r.top };
 }
 
 function describe(hit) {
   if (!hit) return '';
+  if (hit.type === 'depth') return 'layer ' + hit.layer + ' · depth ' + hit.row;
   if (hit.type === 'expert') {
-    const v = st.experts[hit.layer][hit.expert];
-    const res = st.residency[hit.layer][hit.expert] === 1;
-    const off = offExp.get(hit.layer) && offExp.get(hit.layer).has(hit.expert);
-    const sk = st.skip[hit.layer] ? st.skip[hit.layer][hit.expert] === 1 : false;
-    return 'layer ' + hit.layer + ' · expert ' + hit.expert + ' · weight ' +
-      (Math.round(v * 100) / 100) + (res ? ' · VRAM' : '') + (off ? ' · OFF' : '') +
-      (sk ? ' · skipped (router wanted)' : '');
+    const l = hit.layer, e = hit.expert;
+    const w = st.last[l] ? st.last[l][e] : 0;
+    const acc = st.accum[l] ? st.accum[l][e] : 0;
+    const parts = ['layer ' + l, 'expert ' + e,
+      'w ' + (Math.round(w * 1000) / 1000),
+      'count ' + (Math.round(acc * 100) / 100)];
+    if (st.residency[l] && st.residency[l][e] === 1) parts.push('VRAM');
+    if (offExp.get(l) && offExp.get(l).has(e)) parts.push('OFF');
+    if (st.skip[l] && st.skip[l][e] === 1) parts.push('skipped (router wanted)');
+    return parts.join(' · ');
   }
   if (hit.type === 'block') {
+    const role = st.role[hit.layer] || {};
+    const t = wall.tiles[hit.layer];
+    let v;
+    if (hit.block === 'attn') v = roleForBlock(role, 'attn', t ? t.kind : 'gdn');
+    else if (hit.block === 'moe') v = role.router || 0;
+    else if (hit.block === 'shared') v = role.shex || 0;
+    else v = role.ple || 0;
     return 'layer ' + hit.layer + ' · block ' + hit.block +
+      ' · act ' + (Math.round(v * 100) / 100) +
       (offBlk.has(hit.layer + ':' + hit.block) ? ' · OFF' : '');
   }
   return 'layer ' + hit.layer + ' · stream ' + hit.stream +
+    ' · act ' + (Math.round(streamValue(st.role[hit.layer] || {}) * 100) / 100) +
     (offStr.get(hit.layer) && offStr.get(hit.layer).has(hit.stream) ? ' · OFF' : '');
 }
 
 canvas.addEventListener('pointerdown', (ev) => {
   const p = mapPoint(ev);
-  const hit = hitTest(layout, p.x, p.y);
+  const hit = wallHitTest(wall, p.x, p.y);
   drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, add: !ev.shiftKey, active: false, hit, items: null };
   canvas.setPointerCapture(ev.pointerId);
 });
@@ -991,13 +1056,13 @@ canvas.addEventListener('pointermove', (ev) => {
     const dx = Math.abs(drag.x1 - drag.x0), dy = Math.abs(drag.y1 - drag.y0);
     if (!drag.active && (dx > 3 || dy > 3)) drag.active = true;
     if (drag.active) {
-      drag.items = itemsInRect(layout, drag.x0, drag.y0, drag.x1, drag.y1);
+      drag.items = wallItemsInRect(wall, drag.x0, drag.y0, drag.x1, drag.y1);
       $('n-sel').textContent = String(drag.items.length);
       dirty = true;
     }
     return;
   }
-  const hit = hitTest(layout, p.x, p.y);
+  const hit = wallHitTest(wall, p.x, p.y);
   hover = hit;
   dirty = true;
   if (hit) {
@@ -1010,18 +1075,19 @@ canvas.addEventListener('pointermove', (ev) => {
   }
 });
 
-canvas.addEventListener('pointerup', (ev) => {
+canvas.addEventListener('pointerup', () => {
   const d = drag;
   drag = null;
   if (!d) return;
   if (d.active) {
-    for (const it of d.items || []) {
-      if (d.add) addItem(sel, it);
-      else removeItem(sel, it);
-    }
-  } else if (d.hit) {
+    // task 235: ドラッグは「選ぶ」。shift 以外は今の選択を置き換える
+    // (昔は shift なしが remove で、範囲を選べなかった)。
+    if (d.add) clearSel(sel);
+    for (const it of d.items || []) addItem(sel, it);
+  } else if (d.hit && d.hit.type !== 'depth') {
+    // クリック: expert / ブロック / stream を選択 (深さの帯は選択しない)
     toggleItem(sel, d.hit);
-  } else {
+  } else if (!d.hit) {
     clearSel(sel);
   }
   $('tip').style.display = 'none';
@@ -1035,13 +1101,38 @@ canvas.addEventListener('pointerleave', () => {
 
 canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
 
+// 収まらないときだけスクロールする (収まるときは overflow:hidden)。
 $('mapwrap').addEventListener('scroll', () => { dirty = true; });
-let resizeTimer = 0;
-addEventListener('resize', () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { fitCanvas(); dirty = true; }, 120);
+
+// 地図の実面積が変わったら組み直す (列の畳み・窓の resize の両方)。
+if (typeof ResizeObserver === 'function') {
+  new ResizeObserver(() => relayout(false)).observe($('mapwrap'));
+} else {
+  let resizeTimer = 0;
+  addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => relayout(true), 120);
+  });
+}
+
+// VRAM 常駐の点はトグルが on のときだけ描く
+$('cb-vram').addEventListener('change', () => {
+  vramOn = !!$('cb-vram').checked;
+  dirty = true;
 });
-// ホイールはブラウザのスクロールに任せる (canvas は縦に長い)。
+
+// チャット / 操作列の畳み (1 クリック)。地図に場所を渡す。
+function togglePane(which) {
+  const main = document.querySelector('main');
+  const cls = which === 'chat' ? 'hide-chat' : 'hide-ctrl';
+  const on = !main.classList.contains(cls);
+  main.classList.toggle(cls, on);
+  $(which === 'chat' ? 't-chat' : 't-ctrl').classList.toggle('on', !on);
+  lastPaneKey = '';
+  requestAnimationFrame(() => relayout(true));
+}
+$('t-chat').addEventListener('click', () => togglePane('chat'));
+$('t-ctrl').addEventListener('click', () => togglePane('ctrl'));
 
 // ---- テレメトリ ---------------------------------------------------------
 let wsRetry = 2000;
@@ -1315,14 +1406,19 @@ addEventListener('keydown', (e) => {
 // ---- 検証用フック (?shot / CDP から叩く) --------------------------------
 window.__view2d = {
   shape: () => shape,
-  layout: () => layout,
+  layout: () => wall,
+  wall: () => wall,
+  pane: () => paneSize(),
+  fit: () => (wall ? wall.fits : false),
+  relayout: () => relayout(true),
+  setVram: (on) => { $('cb-vram').checked = !!on; vramOn = !!on; dirty = true; },
+  pushMockToken: () => pushMockToken(),
   state: () => st,
   applied: () => applied,
   steer: () => steer,
   selection: () => selectionToBody(sel),
   requests: () => requests.slice(),
   mode: () => st.mode,
-  zoom: () => zoom,
   mock: () => !!mock,
   live: () => live,
   epoch: () => ({ seen: epochSeen, resets: epochResets, last: lastReset }),

@@ -257,6 +257,317 @@ export function itemsInRect(layout, x0, y0, x1, y1) {
   return out;
 }
 
+// ---- 層の壁 (task 235) ----------------------------------------------------
+// 1 枚のタイル = 1 層。48 層を reading order (左上が層 0) に並べる。
+// 列数とセル寸法は**地図の実面積**から決める (ページは ResizeObserver で pane を
+// 渡す) ので、窓の大きさやチャット / 操作列の開閉に追従する。単位は CSS px。
+//
+// 1 枚の中身:
+//   [層番号 + 種別バッジ]
+//   [n_expert の 32x16 ヒートマップ][RoleAct のバー 4 本]
+//   [n_hc 本の残差 stream の四角]
+// 壁の上に深さ方向の帯 (mixer / shared / PLE / LayerAct) を置く。
+
+export const WALL_GEOM = Object.freeze({
+  tileGap: 2,      // タイル同士の隙間
+  pad: 2,          // タイルの内側の余白
+  headH: 11,       // 層番号 + 種別バッジの行
+  gapY: 2,         // ヘッダ / ヒートマップ / stream の間
+  barsW: 9,        // 右側の RoleAct バーの幅
+  barsGap: 2,      // ヒートマップとバーの間
+  barH: 3,         // バー 1 本の高さ
+  barGap: 1,       // バー同士の隙間
+  streamH: 7,      // 残差 stream の四角の一辺
+  streamGap: 2,
+  heatCols: 32,    // expert のヒートマップ (512 = 32x16)
+  heatRows: 16,
+  minCell: 2,      // expert セルの最小辺 (これ未満にはしない)
+  prefCols: 8,     // 広い画面での列数 (8 x 6)
+  minCols: 1,
+  maxCols: 16,
+  depth: Object.freeze({ labelW: 26, rowH: 6, rowGap: 2, gapBelow: 5, rows: 4 }),
+});
+
+/// ページの chrome (index2d.html の CSS と同じ値。テストの見積り用)。
+export const MAP_CHROME = Object.freeze({
+  headerH: 42, padY: 16, padX: 20, wrapBorder: 2,
+  headH: 26, statH: 15, noteH: 14,
+  chatW: 340, ctrlW: 338, mapMinW: 500,
+});
+
+/// ビューポート → 地図 (canvas) の実面積。列を畳んだら opts.chat / opts.ctrl を false。
+export function mapPaneSize(viewport, opts = {}) {
+  const C = MAP_CHROME;
+  const vw = Math.max(1, Math.floor(Number((viewport && viewport.w) || 0)));
+  const vh = Math.max(1, Math.floor(Number((viewport && viewport.h) || 0)));
+  const chat = opts.chat !== false;
+  const ctrl = opts.ctrl !== false;
+  const colW = Math.max(C.mapMinW, vw - (chat ? C.chatW : 0) - (ctrl ? C.ctrlW : 0));
+  const w = Math.max(1, colW - C.padX - C.wrapBorder);
+  const h = Math.max(1, vh - C.headerH - C.padY - C.headH - C.statH - C.noteH - C.wrapBorder);
+  return { w: Math.floor(w), h: Math.floor(h), colW };
+}
+
+/// 候補の列数ごとの寸法。fits は「両方向のセルが minCell 以上」の意味。
+function wallGrid(area, layers, heatCols, heatRows, G) {
+  const out = [];
+  const hi = Math.min(G.maxCols, Math.max(1, layers));
+  for (let cols = G.minCols; cols <= hi; cols++) {
+    const rows = Math.ceil(layers / cols);
+    const tileW = (area.w - (cols - 1) * G.tileGap) / cols;
+    const tileH = (area.h - (rows - 1) * G.tileGap) / rows;
+    const innerW = tileW - 2 * G.pad - G.barsW - G.barsGap;
+    const innerH = tileH - 2 * G.pad - G.headH - 2 * G.gapY - G.streamH;
+    const cellW = innerW / heatCols;
+    const cellH = innerH / heatRows;
+    out.push({
+      cols, rows, tileW, tileH, cellW, cellH,
+      fits: tileW > 8 && tileH > 12 && cellW >= G.minCell && cellH >= G.minCell,
+    });
+  }
+  return out;
+}
+
+const WALL_BARS = Object.freeze([
+  Object.freeze({ key: 'mixer', block: 'attn', label: 'm' }),
+  Object.freeze({ key: 'router', block: 'moe', label: 'rt' }),
+  Object.freeze({ key: 'shared', block: 'shared', label: 'sh' }),
+  Object.freeze({ key: 'ple', block: 'ple', label: 'pl' }),
+]);
+
+/// 形 + 地図の実面積 → 壁の配置。fits=false のときは width/height が pane より
+/// 大きくなる (ページは mapwrap をスクロールさせる)。それでもセルは minCell 以上。
+export function wallLayout(shape, pane, opts = {}) {
+  const s = normaliseShape(shape);
+  const G = WALL_GEOM;
+  const W = Math.max(1, Math.floor(Number((pane && pane.w) || 0)));
+  const H = Math.max(1, Math.floor(Number((pane && pane.h) || 0)));
+  const L = s.layers;
+  const heatCols = Math.max(1, Math.min(G.heatCols, s.n_expert));
+  const heatRows = Math.ceil(s.n_expert / heatCols);
+  const D = G.depth;
+  const depthH = D.rows * D.rowH + (D.rows - 1) * D.rowGap;
+  const wallY = depthH + D.gapBelow;
+  const area = { x: 0, y: wallY, w: W, h: Math.max(1, H - wallY) };
+  const pref = Math.max(G.minCols, Math.min(G.maxCols, intOr(opts.prefCols, G.prefCols)));
+
+  const cands = wallGrid(area, L, heatCols, heatRows, G);
+  let pick = null;
+  for (const c of cands) {
+    if (!c.fits) continue;
+    if (!pick || Math.abs(c.cols - pref) < Math.abs(pick.cols - pref)) pick = c;
+  }
+  const fits = !!pick;
+  if (!pick) {
+    // 収まらない: セルが最大になる列数を選び、あとは minCell で床止めしてスクロール。
+    pick = cands[0];
+    for (const c of cands) {
+      const a = Math.min(c.cellW, c.cellH);
+      const b = Math.min(pick.cellW, pick.cellH);
+      if (a > b + 1e-9 ||
+          (Math.abs(a - b) <= 1e-9 && Math.abs(c.cols - pref) < Math.abs(pick.cols - pref))) pick = c;
+    }
+  }
+
+  const cellW = Math.max(G.minCell, pick.cellW);
+  const cellH = Math.max(G.minCell, pick.cellH);
+  const heatW = cellW * heatCols;
+  const heatH = cellH * heatRows;
+  const tileW = 2 * G.pad + heatW + G.barsGap + G.barsW;
+  const tileH = 2 * G.pad + G.headH + 2 * G.gapY + heatH + G.streamH;
+  const needW = pick.cols * tileW + (pick.cols - 1) * G.tileGap;
+  const needH = wallY + pick.rows * tileH + (pick.rows - 1) * G.tileGap;
+  const width = fits ? W : Math.max(W, Math.ceil(needW));
+  const height = fits ? H : Math.max(H, Math.ceil(needH));
+
+  // バーの縦位置: ヒートマップの高さの中央に 4 本
+  const barsH = WALL_BARS.length * G.barH + (WALL_BARS.length - 1) * G.barGap;
+  const barTop = G.pad + G.headH + G.gapY + Math.max(0, (heatH - barsH) / 2);
+  // stream の四角は幅が足りなければ縮める (下限 2px)
+  const streamSize = Math.max(2, Math.min(G.streamH,
+    (tileW - 2 * G.pad - (s.n_hc - 1) * G.streamGap) / s.n_hc));
+  const badgeW = Math.max(14, Math.min(26, Math.round(tileW * 0.30)));
+  const badgeH = G.headH - 2;
+
+  const tiles = [];
+  for (let l = 0; l < L; l++) {
+    const ci = l % pick.cols;
+    const ri = Math.floor(l / pick.cols);
+    const x = area.x + ci * (tileW + G.tileGap);
+    const y = area.y + ri * (tileH + G.tileGap);
+    const head = { x: x + G.pad, y: y + G.pad, w: tileW - 2 * G.pad, h: G.headH };
+    const heat = {
+      x: head.x, y: head.y + G.headH + G.gapY, w: heatW, h: heatH,
+      cols: heatCols, rows: heatRows, cellW, cellH, n: s.n_expert,
+    };
+    const badges = { x: x + tileW - G.pad - badgeW, y: y + G.pad + 1, w: badgeW, h: badgeH };
+    const bars = WALL_BARS.map((b, i) => ({
+      key: b.key, block: b.block, label: b.label,
+      x: heat.x + heatW + G.barsGap, y: y + barTop + i * (G.barH + G.barGap),
+      w: G.barsW, h: G.barH,
+    }));
+    const streams = [];
+    for (let i = 0; i < s.n_hc; i++) {
+      streams.push({
+        x: heat.x + i * (streamSize + G.streamGap),
+        y: y + tileH - G.pad - streamSize,
+        w: streamSize, h: streamSize,
+      });
+    }
+    tiles.push({
+      layer: l, kind: s.layer_kinds[l], x, y, w: tileW, h: tileH,
+      head, badge: badges, heat, bars, streams,
+      pleActive: s.ple_layers.indexOf(l) >= 0,
+    });
+  }
+
+  const depthW = Math.max(1, width - D.labelW - 2);
+  const depth = {
+    x: D.labelW, y: 0, w: depthW, h: depthH,
+    cellW: depthW / L,
+    rows: [
+      { key: 'mixer', label: 'mix', y: 0, h: D.rowH },
+      { key: 'shared', label: 'shr', y: D.rowH + D.rowGap, h: D.rowH },
+      { key: 'ple', label: 'ple', y: 2 * (D.rowH + D.rowGap), h: D.rowH },
+      { key: 'act', label: 'act', y: 3 * (D.rowH + D.rowGap), h: D.rowH },
+    ],
+  };
+
+  return {
+    shape: s, pane: { w: W, h: H }, width, height, fits,
+    cols: pick.cols, rows: pick.rows, cellW, cellH, tileW, tileH,
+    heatCols, heatRows, geom: G, area,
+    wall: { x: 0, y: wallY, w: width, h: Math.max(1, height - wallY) },
+    depth, tiles,
+  };
+}
+
+/// 層 l の expert e のセル矩形 (タイル座標)。
+export function wallExpertRect(layout, layer, e) {
+  const t = layout.tiles[layer];
+  if (!t) throw new Error('layer out of range: ' + layer);
+  if (!(e >= 0 && e < t.heat.n)) throw new Error('expert out of range: ' + e);
+  const ex = t.heat;
+  return {
+    x: ex.x + (e % ex.cols) * ex.cellW,
+    y: ex.y + Math.floor(e / ex.cols) * ex.cellH,
+    w: ex.cellW, h: ex.cellH,
+  };
+}
+
+/// 点 → 選択できるもの。深さの帯は {type:'depth', layer, row}。
+/// 何も無ければ null。
+export function wallHitTest(layout, x, y) {
+  const d = layout.depth;
+  if (x >= d.x && x < d.x + d.w && y >= d.y && y < d.y + d.h) {
+    const layer = Math.floor((x - d.x) / d.cellW);
+    let row = null;
+    for (const r of d.rows) if (y >= d.y + r.y && y < d.y + r.y + r.h) row = r;
+    if (layer >= 0 && layer < layout.shape.layers && row) {
+      return { type: 'depth', layer, row: row.key };
+    }
+    return null;
+  }
+  for (const t of layout.tiles) {
+    if (x < t.x || x >= t.x + t.w || y < t.y || y >= t.y + t.h) continue;
+    if (inRect(t.badge, x, y)) return { type: 'block', layer: t.layer, block: 'attn' };
+    const ex = t.heat;
+    if (inRect(ex, x, y)) {
+      const ci = Math.floor((x - ex.x) / ex.cellW);
+      const ri = Math.floor((y - ex.y) / ex.cellH);
+      if (ci >= 0 && ci < ex.cols && ri >= 0 && ri < ex.rows) {
+        const idx = ri * ex.cols + ci;
+        if (idx >= 0 && idx < ex.n) return { type: 'expert', layer: t.layer, expert: idx };
+      }
+      return null;
+    }
+    for (const b of t.bars) {
+      if (inRect(b, x, y)) return { type: 'block', layer: t.layer, block: b.block };
+    }
+    for (let i = 0; i < t.streams.length; i++) {
+      if (inRect(t.streams[i], x, y)) return { type: 'stream', layer: t.layer, stream: i };
+    }
+    return null;  // ヘッダ / 余白は選ばない
+  }
+  return null;
+}
+
+/// 矩形 (ドラッグ) → 中の選択項目。重複は落とす。
+export function wallItemsInRect(layout, x0, y0, x1, y1) {
+  const ax = Math.min(x0, x1), bx = Math.max(x0, x1);
+  const ay = Math.min(y0, y1), by = Math.max(y0, y1);
+  const out = [];
+  const seen = new Set();
+  const push = (item) => {
+    const k = itemKey(item);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(item);
+  };
+  const hits = (r) => r.x < bx && r.x + r.w > ax && r.y < by && r.y + r.h > ay;
+  for (const t of layout.tiles) {
+    if (t.x + t.w <= ax || t.x >= bx || t.y + t.h <= ay || t.y >= by) continue;
+    const ex = t.heat;
+    if (hits(ex)) {
+      const c0 = Math.max(0, Math.floor((ax - ex.x) / ex.cellW));
+      const c1 = Math.min(ex.cols - 1, Math.floor((bx - ex.x) / ex.cellW));
+      const r0 = Math.max(0, Math.floor((ay - ex.y) / ex.cellH));
+      const r1 = Math.min(ex.rows - 1, Math.floor((by - ex.y) / ex.cellH));
+      for (let ri = r0; ri <= r1; ri++) {
+        for (let ci = c0; ci <= c1; ci++) {
+          const idx = ri * ex.cols + ci;
+          if (idx >= ex.n) continue;
+          const cell = {
+            x: ex.x + ci * ex.cellW, y: ex.y + ri * ex.cellH,
+            w: ex.cellW, h: ex.cellH,
+          };
+          if (hits(cell)) push({ type: 'expert', layer: t.layer, expert: idx });
+        }
+      }
+    }
+    if (hits(t.badge)) push({ type: 'block', layer: t.layer, block: 'attn' });
+    for (const b of t.bars) {
+      if (hits(b)) push({ type: 'block', layer: t.layer, block: b.block });
+    }
+    for (let i = 0; i < t.streams.length; i++) {
+      if (hits(t.streams[i])) push({ type: 'stream', layer: t.layer, stream: i });
+    }
+  }
+  return out;
+}
+
+/// 深さ方向の帯の値。mixer は層種別で attn / gdn を選ぶ。
+export function actLevel(act) {
+  if (!act) return 0;
+  let sum = 0, n = 0;
+  for (let i = 0; i < act.length; i++) {
+    if (act[i] > 0) { sum += act[i]; n++; }
+  }
+  return n ? sum / n : 0;
+}
+
+export function depthValue(st, layer, key) {
+  const role = (st && st.role && st.role[layer]) || {};
+  const kind = st && st.shape && st.shape.layer_kinds ? st.shape.layer_kinds[layer] : 'gdn';
+  if (key === 'mixer') return roleForBlock(role, 'attn', kind);
+  if (key === 'shared') return role.shex || 0;
+  if (key === 'ple') return role.ple || 0;
+  if (key === 'act') return actLevel(st && st.act && st.act[layer]);
+  return 0;
+}
+
+/// /2d の固定色。赤は off、琥珀は skipped、白は選択 / top-k、シアンは VRAM だけ。
+export const WALL_COLORS = Object.freeze({
+  off: '#ff3b30',
+  offFill: '#4a0d14',
+  skip: '#ffc44d',
+  sel: '#ffffff',
+  resident: '#00eaff',
+  tile: '#08131c',
+  tileLine: '#12283a',
+  none: '#071019',
+});
+
 // ---- 選択 → /v1/intervene の本文 ------------------------------------------
 
 const SEL_FIELD = { expert: 'experts', block: 'blocks', stream: 'streams' };
@@ -423,13 +734,15 @@ export function streamValue(role) {
   return Math.max(r.attn || 0, r.gdn || 0, r.router || 0, r.shex || 0, r.ple || 0);
 }
 
-/// 0..1 を色に。ramp: 暗い青 → 青緑 → シアン → 黄 → 赤。
+/// 0..1 を色に。task 235: /2d は「暗い → 明るい」の 1 本の尺度にする
+/// (赤は off、琥珀は skipped だけに使うので、活動の上限はほぼ白)。
+/// 明るさは単調増加 (0.0 約 17 → 1.0 約 240)。
 const RAMP = [
   [8, 19, 28],
-  [18, 80, 107],
-  [0, 184, 212],
-  [255, 225, 77],
-  [255, 59, 48],
+  [12, 58, 78],
+  [0, 150, 178],
+  [0, 214, 240],
+  [214, 250, 255],
 ];
 
 export function rampRGB(t) {
@@ -460,6 +773,12 @@ export function heat(v, scale = 1) {
 /// mode:
 ///   'token' — 最後の 1 トークンの重みで置き換える (アニメーション)
 ///   'accum' — 会話全体の和。Token ごとに decay を掛けて古いものを薄くする。
+///
+/// task 235: ツールチップと top-k の輪郭のために 3 本の配列を足した。
+///   st.last[l]   — 最後のトークンの正規化重み (mode に依らない)
+///   st.accum[l]  — decay 付きの選択回数 (mode に依らない。accum モードでは
+///                  st.experts[l] がこの配列そのものを指す)
+///   st.topk[l]   — 最後のトークンでルータが選んだ expert のビット
 export function createMapState(shape, opts = {}) {
   const s = normaliseShape(shape);
   const decay = Number.isFinite(opts.decay) ? opts.decay : 0.9;
@@ -469,6 +788,9 @@ export function createMapState(shape, opts = {}) {
     decay,
     token: 0,
     experts: [],
+    accum: [],
+    last: [],
+    topk: [],
     residency: [],
     skip: [],
     role: [],
@@ -477,7 +799,11 @@ export function createMapState(shape, opts = {}) {
     frames: 0,
   };
   for (let l = 0; l < s.layers; l++) {
-    st.experts.push(new Float32Array(s.n_expert));
+    st.accum.push(new Float32Array(s.n_expert));
+    // accum モードでは表示用の配列を累積そのものにして、2 重に持たない。
+    st.experts.push(st.mode === 'accum' ? st.accum[l] : new Float32Array(s.n_expert));
+    st.last.push(new Float32Array(s.n_expert));
+    st.topk.push(new Uint8Array(s.n_expert));
     st.residency.push(new Uint8Array(s.n_expert));
     st.skip.push(new Uint8Array(s.n_expert));
     st.role.push({ attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 });
@@ -488,7 +814,10 @@ export function createMapState(shape, opts = {}) {
     const m = mode === 'accum' ? 'accum' : 'token';
     if (m === st.mode) return;
     st.mode = m;
-    for (let l = 0; l < s.layers; l++) st.experts[l].fill(0);
+    for (let l = 0; l < s.layers; l++) {
+      // accum → token は表示だけ空にする (累積はツールチップ用に残す)
+      st.experts[l] = m === 'accum' ? st.accum[l] : new Float32Array(s.n_expert);
+    }
   };
 
   st.reset = () => {
@@ -496,7 +825,10 @@ export function createMapState(shape, opts = {}) {
     st.frames = 0;
     st.lastToken = null;
     for (let l = 0; l < s.layers; l++) {
-      st.experts[l].fill(0);
+      st.accum[l].fill(0);
+      if (st.experts[l] !== st.accum[l]) st.experts[l].fill(0);
+      st.last[l].fill(0);
+      st.topk[l].fill(0);
       st.residency[l].fill(0);
       st.skip[l].fill(0);
       st.role[l] = { attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 };
@@ -509,11 +841,10 @@ export function createMapState(shape, opts = {}) {
     if (f.kind === 'Token') {
       st.token++;
       st.lastToken = f;
-      if (st.mode === 'accum') {
-        for (let i = 0; i < s.layers; i++) {
-          const a = st.experts[i];
-          for (let j = 0; j < a.length; j++) if (a[j] !== 0) a[j] *= decay;
-        }
+      // task 235: 累積は mode に依らず常に decay する (ツールチップの count 用)。
+      for (let i = 0; i < s.layers; i++) {
+        const a = st.accum[i];
+        for (let j = 0; j < a.length; j++) if (a[j] !== 0) a[j] *= decay;
       }
       return true;
     }
@@ -526,12 +857,17 @@ export function createMapState(shape, opts = {}) {
         // 「選びたかったが切った」は捨てる (ExpertSkip は直後に来る。空なら
         // そのトークンでは誰も選びたくなかった = amber を消す)。
         st.skip[l].fill(0);
-        if (st.mode === 'accum') {
-          const a = st.experts[l];
-          for (let i = 0; i < w.length; i++) a[i] += w[i];
-        } else {
-          st.experts[l].set(w);
+        st.last[l].set(w);
+        const top = st.topk[l];
+        top.fill(0);
+        const acc = st.accum[l];
+        for (let i = 0; i < w.length; i++) {
+          if (w[i] > 0) {
+            top[i] = 1;
+            acc[i] += w[i];
+          }
         }
+        if (st.mode === 'token') st.experts[l].set(w);
         st.frames++;
         return true;
       }
@@ -619,6 +955,71 @@ export function steerSummary(apply) {
 }
 
 // ---- モック店 (shape が 404 のとき) ---------------------------------------
+
+/// モックモードの合成テレメトリ (task 235)。サーバー無しでも壁を動かして
+/// 目で確認できるように、1 トークン分のフレームを決定的に作る。
+/// opts.off に [[layer, expert], ...] を渡すと、その expert を ExpertSkip として
+/// 送る (介入の amber をモックでも再現する)。
+export function mockTokenFrames(shape, n, opts = {}) {
+  const s = normaliseShape(shape);
+  const seed0 = (intOr(opts.seed, 0) >>> 0) ^ Math.imul((n | 0) + 1, 2654435761);
+  let x = seed0 >>> 0 || 1;
+  const rnd = () => {
+    x ^= x << 13; x >>>= 0;
+    x ^= x >>> 17;
+    x ^= x << 5; x >>>= 0;
+    return x / 4294967296;
+  };
+  const off = new Set((opts.off || []).map((p) => (p[0] | 0) + ':' + (p[1] | 0)));
+  const k = Math.max(1, Math.min(s.n_expert, s.n_expert_used));
+  const frames = [{ kind: 'Token', session: 1, token: n | 0, pos: n | 0 }];
+
+  for (let l = 0; l < s.layers; l++) {
+    const kind = s.layer_kinds[l];
+    const mix = 0.35 + rnd() * 0.65;
+    frames.push({
+      kind: 'RoleAct', layer: l,
+      roles: {
+        attn: kind === 'attn' ? mix : 0,
+        gdn: kind === 'gdn' ? mix : 0,
+        router: 0.3 + rnd() * 0.7,
+        shex: 0.2 + rnd() * 0.8,
+        ple: s.ple_layers.indexOf(l) >= 0 ? 0.4 + rnd() * 0.6 : 0,
+      },
+    });
+    // 512 から重複なしで top-k を選ぶ
+    const chosen = new Set();
+    while (chosen.size < k) chosen.add(Math.floor(rnd() * s.n_expert));
+    const experts = [...chosen].sort((a, b) => a - b);
+    const weights = experts.map(() => 0.2 + rnd() * 0.8);
+    const keepE = [], keepW = [], skipE = [];
+    for (let i = 0; i < experts.length; i++) {
+      if (off.has(l + ':' + experts[i])) skipE.push(experts[i]);
+      else { keepE.push(experts[i]); keepW.push(weights[i]); }
+    }
+    frames.push({ kind: 'RouterTopK', layer: l, experts: keepE, weights: keepW });
+    if (skipE.length) frames.push({ kind: 'ExpertSkip', layer: l, experts: skipE });
+    const idx = [], val = [];
+    for (let i = 0; i < 96; i++) {
+      idx.push(Math.floor(rnd() * s.n_embd));
+      val.push(rnd() * rnd());
+    }
+    frames.push({ kind: 'LayerAct', layer: l, idx, val });
+  }
+
+  // VRAM 常駐は形だけで決まる (トークンで変わらない)。
+  let y = ((Math.imul(s.n_expert, 2246822519) ^ Math.imul(s.layers, 3266489917)) >>> 0) || 1;
+  const rnd2 = () => {
+    y ^= y << 13; y >>>= 0;
+    y ^= y >>> 17;
+    y ^= y << 5; y >>>= 0;
+    return y / 4294967296;
+  };
+  const vram = [];
+  for (let e = 0; e < s.n_expert; e++) if (rnd2() < 0.35) vram.push(e);
+  for (let l = 0; l < s.layers; l++) frames.push({ kind: 'ExpertResidency', layer: l, vram });
+  return frames;
+}
 
 function jsonClone(v) {
   return v == null ? v : JSON.parse(JSON.stringify(v));
