@@ -1590,6 +1590,92 @@ fn reset_matches_fresh_decoder_bitexact() {
     }
 }
 
+/// task 252: 同じ文脈で別プロンプトを挟んでから元のプロンプトを食い直した
+/// logits は、新規構築で同じプロンプトを食った logits とビット一致する。
+///
+/// serve は 1 つのモデル (重み) を使い回し、リクエストの切れ目で系列状態を
+/// `take_seq_state` で取り出す (前置きが一致しなければ捨てる)。つまり
+/// 「別プロンプト → 元のプロンプト」は、状態を空に戻してから食い直す経路を
+/// 通る。ここが新規構築と 1 ビットでも違うと、greedy の列が変わり
+/// (最悪はプロンプトの繰り返し)、同じプロンプトの答えがリクエスト順で
+/// 変わってしまう (task 252 の本番症状)。
+///
+/// 逐次 prefill と層優先バッチ prefill の両方で見る (serve は batch=true)。
+#[test]
+fn same_prompt_after_others_matches_fresh_context_bitexact() {
+    let dir = TempDir::new("reuse-b");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    // A = 基準にするプロンプト、B = 間に挟む別プロンプト (id は語彙 < 8)。
+    let a: [u32; 5] = [1, 2, 3, 4, 5];
+    let b: [u32; 5] = [6, 5, 4, 7, 0];
+
+    for batch in [false, true] {
+        let tag = if batch { "batch" } else { "seq" };
+        // 基準: 新規構築で A を prefill し 5 ステップ。
+        let want = {
+            let mut fresh = make_decoder_full(&f, 64);
+            let mut out = Vec::new();
+            let mut logits = fresh.prefill_batched(&a, batch).expect("prefill A");
+            out.push(logits.clone());
+            for _ in 0..5 {
+                let id = greedy(&logits);
+                logits = fresh.step(id).expect("step");
+                out.push(logits.clone());
+            }
+            out
+        };
+
+        // 1 つの decoder で A → (状態を捨てる) → B → (捨てる) → A。
+        let mut d = make_decoder_full(&f, 64);
+        let mut got = Vec::new();
+        for (i, prompt) in [a, b, a].iter().enumerate() {
+            let n_steps = if i == 2 { 5 } else { 3 };
+            let mut logits = d.prefill_batched(prompt, batch).expect("prefill");
+            if i == 2 {
+                got.push(logits.clone());
+            }
+            for _ in 0..n_steps {
+                let id = greedy(&logits);
+                logits = d.step(id).expect("step");
+            }
+            // serve の `save_ctx` と同じ: 系列状態を取り出して捨てる
+            // (前置きが一致しないので次のリクエストは full prefill)。
+            let st = d.take_seq_state().expect("take_seq_state 非対応");
+            assert!(
+                st.tokens().len() >= prompt.len(),
+                "{tag}: 取り出した状態のトークン列が短い"
+            );
+            assert_eq!(d.tokens().len(), 0, "{tag}: take のあと tokens が残っている");
+            drop(st);
+        }
+        assert_eq!(got.len(), 1, "{tag}: A の logits が取れていない");
+        assert_eq!(
+            bits(&got[0]),
+            bits(&want[0]),
+            "{tag}: A を食い直した prefill の logits が新規構築と違う"
+        );
+        // 続く 5 ステップも (step の内部状態まで) 一致すること。
+        let mut d = make_decoder_full(&f, 64);
+        let mut got2 = Vec::new();
+        for (i, prompt) in [a, b, a].iter().enumerate() {
+            let mut logits = d.prefill_batched(prompt, batch).expect("prefill");
+            let n_steps = if i == 2 { 5 } else { 3 };
+            if i == 2 {
+                got2.push(logits.clone());
+            }
+            for _ in 0..n_steps {
+                let id = greedy(&logits);
+                logits = d.step(id).expect("step");
+                if i == 2 {
+                    got2.push(logits.clone());
+                }
+            }
+            drop(d.take_seq_state().expect("take_seq_state"));
+        }
+        assert_same_logits(&got2, &want, &format!("{tag}: A を食い直した列"));
+    }
+}
+
 /// task 206: `take_seq_state` / `put_seq_state` で文脈を入れ替えても、
 /// どの文脈の続きもビット一致する。
 ///
