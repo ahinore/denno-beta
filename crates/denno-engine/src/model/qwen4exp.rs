@@ -4052,15 +4052,33 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // (mixed + ffn + inject) と MoE の作業域 (h / g / u / act) のぶんだけ
         // 先に空ける。**足りない分だけ**追い出す (task 227 の 6 GB 固定は
         // 14k 後の decode を 36 ms/tok まで落とした)。
+        // task 242: 追い出した鍵を控えておき、prefill の終端で戻す
+        // (戻さないと次の decode のヒット率が 0.75 → 0.25 に落ちる)。
+        let mut evicted: Vec<crate::model::expert_cache::ExpertKey> = Vec::new();
         {
             let k = self.p.n_expert_used;
             let ff = self.p.n_ff_exp;
             let rows = nt_all.saturating_mul(k);
+            // task 242: g/u/act はグループ局所 (最大グループの行数) で足りる。
+            // グループの本数は `DENNO_PF_STREAM_GROUP` (1..=256) で変わるので、
+            // 上振れを見て expert の 1/4 を上限として見積もる (実際は 1/8 前後)。
+            let gl_rows = if crate::model::exp_pf::lm_group_local() {
+                rows.div_ceil(4).max(1)
+            } else {
+                rows
+            };
             let need = nt_all * e * 8
                 + ranges.len() * chunk * hc * 4
                 + (rows + nt_all) * e * 4
-                + 3 * rows * ff * 4
+                + 3 * gl_rows * ff * 4
                 + (64usize << 20);
+            // lab t242b: この `need` を満たしても、14k では `h` (1,505 MiB) の
+            // 確保が「空き 1,243 MiB」で失敗し、`DevBuffer::alloc_tagged` の
+            // 追い出し階段が **expert の LRU を全部捨てる** (39,755 MiB)。
+            // expert は slab のチャンクが空になるまで実メモリを返さないので、
+            // 少しずつ追い出しても 1.5 GB の連続領域は空かない。
+            // 次の課題: `h` をトークンで分割する (タイル) か、作業域を slab の
+            // 外にまとめて取る。どちらもこの経路の前提 (連続した h) を変える。
             let reserve = 1024usize << 20;
             let short = match crate::cuda::dev_mem_mb_cached() {
                 Some((free_mb, _)) => need.saturating_sub((free_mb << 20).saturating_sub(reserve)),
@@ -4068,7 +4086,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             };
             let want = short.min(6usize << 30);
             if want > (64 << 20) {
-                let freed = crate::model::expert_vram::emergency_free(want);
+                let (freed, keys) = crate::model::expert_vram::emergency_free_keys(want);
                 if freed > 0 {
                     eprintln!(
                         "[pf-lm] expert を {} MiB 追い出して活性と作業域を空けた (必要 {} MiB)",
@@ -4076,6 +4094,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         need >> 20
                     );
                 }
+                evicted = keys;
             }
         }
         if !crate::cuda::pf_lm_ensure(nt_all, e, hc, chunk) {
@@ -4428,6 +4447,21 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         crate::cuda::pf_lm_release();
         crate::cuda::pf_scratch_drop();
         crate::cuda::pf_release();
+        // task 242: 作業域のために追い出した expert を戻す (prefill の終端)。
+        // ここまで decode の LRU は 2 GB 以上痩せていて、次の decode のヒット率が
+        // 0.75 → 0.25 に落ちる (lab t233a)。追い出した順 (古い順) に戻すので、
+        // 相対的な新しさも元に近づく。1 本 2 MB × 約 1,100 本で 0.1 秒程度。
+        if !evicted.is_empty() && crate::model::exp_pf::lm_reload_evicted() {
+            let (n, bytes) = pf_restore_experts(&self.layers, &evicted);
+            if n > 0 {
+                eprintln!(
+                    "[pf-lm] 追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
+                    n,
+                    bytes >> 20,
+                    evicted.len().saturating_sub(n)
+                );
+            }
+        }
         if steer_rec {
             steer::merge_device();
         }
@@ -15602,6 +15636,57 @@ fn moe_ffn_quant_batch_full(
     }
 
     Ok(out)
+}
+
+/// task 242: 層優先 prefill が作業域のために追い出した expert を VRAM へ戻す。
+///
+/// `keys` は `expert_vram::emergency_free_keys` が返した**古い順**。同じ順に
+/// `acquire_soft` で入れ直すと、相対的な新しさ (LRU の並び) も元に近づく。
+/// 失敗しても致命的ではない (次の decode が `acquire` で上げ直す) ので、
+/// `acquire_soft` (ラッチしない方) を使う。
+#[cfg(feature = "cuda")]
+fn pf_restore_experts(
+    layers: &[LayerW],
+    keys: &[crate::model::expert_cache::ExpertKey],
+) -> (usize, usize) {
+    use crate::model::expert_vram::{self, ExpertShape};
+    let mut n = 0usize;
+    let mut bytes = 0usize;
+    for key in keys {
+        let Some(lw) = layers.get(key.layer as usize) else {
+            continue;
+        };
+        let ei = key.expert as usize;
+        let (g, u, d) = (&lw.gate_exps, &lw.up_exps, &lw.down_exps);
+        let shapes = [
+            ExpertShape {
+                ty: g.ty,
+                k: g.n_in,
+                n: g.n_out,
+            },
+            ExpertShape {
+                ty: u.ty,
+                k: u.n_in,
+                n: u.n_out,
+            },
+            ExpertShape {
+                ty: d.ty,
+                k: d.n_in,
+                n: d.n_out,
+            },
+        ];
+        let Ok(want) = shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) else {
+            continue;
+        };
+        let got = expert_vram::acquire_soft(*key, shapes, || {
+            Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
+        });
+        if matches!(got, Ok(Some(_))) {
+            n += 1;
+            bytes += want;
+        }
+    }
+    (n, bytes)
 }
 
 /// task 233: 層優先 prefill の MoE (活性はデバイスに置いたまま)。

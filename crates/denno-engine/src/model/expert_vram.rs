@@ -736,6 +736,22 @@ pub fn emergency_free(need: usize) -> usize {
     }
 }
 
+/// task 242: [`emergency_free`] の「追い出した鍵も返す」版 (古い順)。
+///
+/// 層優先 prefill が作業域を空けるために追い出した expert を、prefill の終端で
+/// 戻すために使う。GPU 無しのビルドは `(0, [])`。
+pub fn emergency_free_keys(need: usize) -> (usize, Vec<ExpertKey>) {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::emergency_free_keys(need)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = need;
+        (0, Vec::new())
+    }
+}
+
 /// task 149: 確保に失敗したあと「LRU を追い出して再試行」するかの判定 (純関数)。
 ///
 /// - 再試行は **1 回だけ** (`attempt == 0`)。
@@ -1191,20 +1207,30 @@ mod gpu {
     /// `try_lock` なので、expert の確保が LRU のロック保持中に走っている場合は
     /// 何もしない (呼び出し側 = [`acquire_opts`] が自分で追い出して再試行する)。
     pub fn emergency_free(need: usize) -> usize {
+        emergency_free_keys(need).0
+    }
+
+    /// task 242: [`emergency_free`] の「追い出した鍵も返す」版。
+    ///
+    /// 戻り値は `(空けたバイト数, 追い出した鍵)`。鍵は**古い順** (LRU の先頭から)。
+    /// 層優先 prefill は、作業域を空けるために追い出した expert を prefill の
+    /// 終端で戻す (戻さないと次の decode のヒット率が 0.75 → 0.25 に落ちる)。
+    pub fn emergency_free_keys(need: usize) -> (usize, Vec<ExpertKey>) {
         let Some(c) = CACHE.get() else {
-            return 0;
+            return (0, Vec::new());
         };
         let Ok(mut g) = c.try_lock() else {
-            return 0;
+            return (0, Vec::new());
         };
         let evicted = g.evict_until_free(need);
         let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
+        let keys: Vec<ExpertKey> = evicted.iter().map(|(k, _)| *k).collect();
         drop(evicted); // DevBuffer が落ちて VRAM が空く
         // task 152: slab ではスロットを返してもデバイスメモリは戻らない。空に
         // なったチャンクを落として**実メモリ**を返す (lab t152a の g24 は
         // これが無くて 14k で q4 attention が CPU に落ちた)。
         let released = crate::model::expert_slab::release_empty(need);
-        freed.saturating_add(released)
+        (freed.saturating_add(released), keys)
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。

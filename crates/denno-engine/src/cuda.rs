@@ -11254,6 +11254,8 @@ fn moe_experts_iq_pf_layer_stream_io(
         PfStreamIo::Host { .. } => (0, 0, 0, &[]),
         PfStreamIo::Dev { xs, out, sh, sh_w } => (*xs, *out, *sh, *sh_w),
     };
+    // task 242: 出力が置き場 (デバイス) のときだけ g/u/act をグループ局所にする。
+    let is_dev = matches!(io, PfStreamIo::Dev { .. });
     let (host_in, host_out): (Option<&[f32]>, Option<&mut [f32]>) = match &mut io {
         PfStreamIo::Host { xs, out } => (Some(&**xs), Some(&mut **out)),
         PfStreamIo::Dev { .. } => (None, None),
@@ -11314,7 +11316,6 @@ fn moe_experts_iq_pf_layer_stream_io(
         _ => return Ok(None),
     };
     let pinned = exp_pf::stream_pin() == 1;
-    let ng = total_rows * ff;
     // task 233: 共有 expert の行 (末尾 `sh_rows` 行) も h に含める。
     let nh = (total_rows + sh_rows) * e;
     let host_x = host_in;
@@ -11328,9 +11329,6 @@ fn moe_experts_iq_pf_layer_stream_io(
             if host_x.is_some() {
                 MoeScratch::ensure(&mut sc.x, in_elems * 4)?;
             }
-            MoeScratch::ensure(&mut sc.g, ng * 4)?;
-            MoeScratch::ensure(&mut sc.u, ng * 4)?;
-            MoeScratch::ensure(&mut sc.act, ng * 4)?;
             MoeScratch::ensure(&mut sc.h, nh * 4)?;
             MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
             MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
@@ -11379,7 +11377,8 @@ fn moe_experts_iq_pf_layer_stream_io(
                         xb.copy_from(xs)?;
                     }
                 }
-                sc.seg.as_ref().expect("確保済み").copy_from(seg)?;
+                // task 242: seg と rows_id は bounds が決まってから積む
+                // (グループ局所のときは行の先頭を 0 起点に直した表を積む)。
                 sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
                 let id: Vec<u32> = exp_pf::identity_rows(total_rows);
                 sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
@@ -11406,11 +11405,8 @@ fn moe_experts_iq_pf_layer_stream_io(
                 Some(_) => sc.x.as_ref().expect("確保済み").ptr(),
                 None => dev_in,
             };
-            let gb = sc.g.as_ref().expect("確保済み").ptr();
-            let ub = sc.u.as_ref().expect("確保済み").ptr();
-            let act = sc.act.as_ref().expect("確保済み").ptr();
+            // task 242: g/u/act は bounds が決まってから確保する (下)。
             let hb = sc.h.as_ref().expect("確保済み").ptr();
-            let segb = sc.seg.as_ref().expect("確保済み").ptr();
             let rg = sc.rows_gu.as_ref().expect("確保済み").ptr();
             let rid = sc.rows_id.as_ref().expect("確保済み").ptr();
 
@@ -11471,6 +11467,40 @@ fn moe_experts_iq_pf_layer_stream_io(
             let Some(bounds) = exp_pf::group_bounds(&needs, slot_cap, group) else {
                 return Ok(None);
             };
+            // task 242: デバイス出力のときは g/u/act を**グループ局所**にする。
+            // `seg` の行の先頭をグループ基準の相対番号へ直し、行表のポインタを
+            // グループ先頭行だけ足して渡す (下)。これで 14k の g/u/act が
+            // 0.86 GB → グループ 1 個ぶん (実測 約 0.04 GB) になる。
+            let gl = is_dev && exp_pf::lm_group_local();
+            let rows_cap = if gl {
+                match exp_pf::max_group_rows(seg, &bounds) {
+                    Some(r) => r,
+                    None => return Ok(None),
+                }
+            } else {
+                total_rows
+            };
+            MoeScratch::ensure(&mut sc.g, rows_cap * ff * 4)?;
+            MoeScratch::ensure(&mut sc.u, rows_cap * ff * 4)?;
+            MoeScratch::ensure(&mut sc.act, rows_cap * ff * 4)?;
+            let gb = sc.g.as_ref().expect("確保済み").ptr();
+            let ub = sc.u.as_ref().expect("確保済み").ptr();
+            let act = sc.act.as_ref().expect("確保済み").ptr();
+            // グループ局所のときは、行の先頭を**グループの先頭から**の相対番号へ
+            // 直した `seg` を積む (カーネルは `obase + (s.ro + r)*n_out` に書く)。
+            let seg_gl: Option<Vec<u32>> = if gl {
+                match exp_pf::seg_group_local(seg, &bounds) {
+                    Some(v) => Some(v),
+                    None => return Ok(None),
+                }
+            } else {
+                None
+            };
+            sc.seg
+                .as_ref()
+                .expect("確保済み")
+                .copy_from(seg_gl.as_deref().unwrap_or(seg))?;
+            let segb = sc.seg.as_ref().expect("確保済み").ptr();
             // 2. グループごとに上げて計算する。`pg/pu/pd` の表は全体を 1 本で持ち、
             //    グループの先頭を指して起動する。
             let pg_tab = sc.pg.as_ref().expect("確保済み");
@@ -11627,12 +11657,27 @@ fn moe_experts_iq_pf_layer_stream_io(
                 pf_stream_t_add(1, t_wait.elapsed().as_nanos() as u64);
                 // (d) カーネルを積む。
                 let t_l = std::time::Instant::now();
-                let ro_start = seg[a * 4 + 1] as usize;
-                let ro_end = if b > a {
+                let abs_start = seg[a * 4 + 1] as usize;
+                let abs_end = if b > a {
                     let last = b - 1;
                     seg[last * 4 + 1] as usize + seg[last * 4] as usize
                 } else {
-                    ro_start
+                    abs_start
+                };
+                // task 242: グループ局所のときは行の添字を 0 起点にする。
+                // `seg` は相対化して積んであるので、カーネルへは `ro_start = 0`
+                // と「グループ先頭行だけ足した**入力**の行表」を渡す。
+                // down の行表 (`rows_id`) は足さない: down の入力は `act` で、
+                // これはグループ局所 (0 起点) に置いてある。
+                let (ro_start, ro_end) = if gl {
+                    (0usize, abs_end.saturating_sub(abs_start))
+                } else {
+                    (abs_start, abs_end)
+                };
+                let rg_g = if gl {
+                    rg + (abs_start as u64) * 4
+                } else {
+                    rg
                 };
                 unsafe {
                     pf_launch_group(
@@ -11650,7 +11695,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                         act,
                         hb,
                         segb + (a * 16) as u64,
-                        rg,
+                        rg_g,
                         rid,
                         b - a,
                         ro_start,

@@ -561,6 +561,22 @@ pub fn reg_bytes() -> usize {
 /// expert の出力 13.8 GB を戻すため。加えて MoE の作業域 2.7 GB と事前の
 /// 追い出し 6 GB が decode のヒット率を落とす。
 /// 次に採るなら **活性をデバイスに残したまま** 層優先を回すこと (REPORT_P227 §7)。
+///
+/// # 実測 (task 233 / 242 で活性をデバイスに残した版)
+///
+/// 往復 (14k で 34 GB) は消え、3,826 tok は base 比 -10〜12% まで来た回もある。
+/// しかし 14,018 tok は **+8〜17%** で目標 (-10%) に届かず、14k 後の decode も
+/// base の 1.6 倍 (lab t242c: ヒット率 0.829 対 0.973、decode 23.0 対 18.1 ms/tok)。
+/// 原因は 3 つ:
+/// (1) グループのポインタ表の同期 H2D (層あたり 243-410 ms) は非同期化しても
+///     待ちが「ステージングの再利用待ち」に移っただけで、14k では消えない
+///     (`use_s` 11.2-11.9 s)。層優先は 1 expert あたりの行数が多いので、GEMV が
+///     重みではなく活性の再読みで律速になる。
+/// (2) 14k では `h` (1,505 MiB) の連続確保が失敗し、追い出し階段が expert の
+///     LRU を全部捨てる (slab がチャンク単位でしか返さない)。
+/// (3) 作業域を小さくする `DENNO_PF_LM_GL` と、追い出した expert を戻す
+///     `DENNO_PF_LM_RELOAD` はどちらも壁時計を改善しなかった (下記の各 doc)。
+/// **採らない** (`ADOPT: no` t242c)。ゲートは 3 本とも既定 off のまま残す。
 pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
 
 /// `DENNO_PF_LM_LAYER` の解釈 (純関数)。**明示的な真値だけ on**。
@@ -860,6 +876,101 @@ pub fn group_bounds(needs: &[usize], cap: usize, max_group: usize) -> Option<Vec
         out.push((start, needs.len()));
     }
     Some(out)
+}
+
+/// task 242: グループ局所の g/u/act に要る行数 (グループの最大行数)。
+///
+/// `seg` は 4 語 × segment (`[行数, 行の先頭, 0, 0]`)、`bounds` は
+/// [`group_bounds`] の結果 (segment の index 範囲)。層優先 prefill は
+/// カーネルの出力ポインタを `先頭 - グループ先頭行 * n_out * 4` で渡すので、
+/// g/u/act は**この行数**だけ持てばよい (14k で 0.86 GB → 0.11 GB)。
+///
+/// 範囲外・空なら `None` (呼び出し側は従来の全体サイズへ落ちる)。
+pub fn max_group_rows(seg: &[u32], bounds: &[(usize, usize)]) -> Option<usize> {
+    if seg.len() % 4 != 0 || bounds.is_empty() {
+        return None;
+    }
+    let nseg = seg.len() / 4;
+    let mut mx = 0usize;
+    for &(a, b) in bounds {
+        if a >= b || b > nseg {
+            return None;
+        }
+        let last = b - 1;
+        let start = seg[a * 4 + 1] as usize;
+        let end = (seg[last * 4 + 1] as usize).checked_add(seg[last * 4] as usize)?;
+        if end < start {
+            return None;
+        }
+        mx = mx.max(end - start);
+    }
+    if mx == 0 {
+        return None;
+    }
+    Some(mx)
+}
+
+/// task 242: グループ局所用に、各 segment の行の先頭を**グループの先頭から**の
+/// 相対番号へ直した `seg` を返す (`[行数, 行の先頭, 0, 0]` × segment)。
+///
+/// カーネルは出力を `obase + (s.ro + r)*n_out` に書き、入力を
+/// `rows[s.ro + r]` から読む。グループ局所では `obase` をグループのバッファの
+/// 先頭にしたいので `s.ro` を 0 起点にし、行表 (`rows_gu` / `rows_id`) の
+/// ポインタをグループ先頭行だけ足して渡す (呼び出し側)。
+///
+/// 行の先頭がグループの先頭より小さければ `None` (plan の並びが壊れている)。
+pub fn seg_group_local(seg: &[u32], bounds: &[(usize, usize)]) -> Option<Vec<u32>> {
+    if seg.len() % 4 != 0 || bounds.is_empty() {
+        return None;
+    }
+    let nseg = seg.len() / 4;
+    let mut out = seg.to_vec();
+    for &(a, b) in bounds {
+        if a >= b || b > nseg {
+            return None;
+        }
+        let base = seg[a * 4 + 1];
+        for i in a..b {
+            let off = out[i * 4 + 1];
+            out[i * 4 + 1] = off.checked_sub(base)?;
+        }
+    }
+    Some(out)
+}
+
+/// task 242: グループ局所の g/u/act を使うか (`DENNO_PF_LM_GL`)。
+/// **既定 off**。`1` / `on` / `true` で有効。
+///
+/// 効くのは層優先 prefill の**デバイス出力**のときだけ (チャンク経路の
+/// ホスト出力は従来どおり全体サイズ)。
+///
+/// lab t242b の実測では狙いどおり作業域が 2,870 → 2,100 MiB、追い出しが
+/// 2,371 → 1,603 MiB、14k のストリーミングが 46.1 → 35.0 GB になった。
+/// しかし lab t242c (GL のみ) の壁時計は 3,826 tok -1% / 14,018 tok **+17%** で、
+/// GL を切った t242b の lmno (+7.6%) より悪い (別 run なので断定はできない)。
+/// 採否 no なので既定 off。
+pub fn lm_group_local() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("DENNO_PF_LM_GL").ok() {
+        Some(s) => matches!(s.trim(), "1" | "on" | "true"),
+        None => false,
+    })
+}
+
+/// task 242: 層優先 prefill が追い出した expert を終端で戻すか
+/// (`DENNO_PF_LM_RELOAD`)。**既定 off**。`1` / `on` / `true` で有効。
+///
+/// lab t242b の実測: 戻すのに 809 本 / 1,603 MiB で +0.8-1.5 秒かかり、
+/// しかも 14k 後の decode のヒット率は 0.837 のまま (base は 0.973) だった。
+/// 理由は prefill の途中で 1,505 MiB の `h` を確保できず、`DevBuffer` の
+/// 追い出し階段が expert の LRU を全部捨てるため (戻した分も一緒に消える)。
+/// つまり戻す相手が残っていない。ゲートは残すが既定 off。
+pub fn lm_reload_evicted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("DENNO_PF_LM_RELOAD").ok() {
+        Some(s) => matches!(s.trim(), "1" | "on" | "true"),
+        None => false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,6 +1414,138 @@ mod tests {
         seen.sort_unstable();
         want.sort_unstable();
         assert_eq!(seen, want, "行の取りこぼし・重複がある");
+    }
+
+    /// task 242: グループ局所の g/u/act に要る行数は「グループの最大行数」。
+    ///
+    /// カーネルは行の添字が絶対なので、呼び出し側は
+    /// `ポインタ - グループ先頭行 * n_out * 4` で渡す。この行数だけ持てば、
+    /// どのグループも自分の範囲しか触らない。
+    #[test]
+    fn max_group_rows_is_the_largest_group_span() {
+        // 6 expert / 行数 3,1,2,4,1,2 (合計 13)。
+        let seg: Vec<u32> = vec![
+            3, 0, 0, 0, // rows 0..3
+            1, 3, 0, 0, // rows 3..4
+            2, 4, 0, 0, // rows 4..6
+            4, 6, 0, 0, // rows 6..10
+            1, 10, 0, 0, // rows 10..11
+            2, 11, 0, 0, // rows 11..13
+        ];
+        // 2 グループ: 0..6 は 6 行、6..13 は 7 行。
+        assert_eq!(max_group_rows(&seg, &[(0, 3), (3, 6)]), Some(7));
+        // 1 グループなら全体 (13 行)。
+        assert_eq!(max_group_rows(&seg, &[(0, 6)]), Some(13));
+        // 3 グループ: 6 / 4 / 2 行。
+        assert_eq!(max_group_rows(&seg, &[(0, 3), (3, 4), (4, 6)]), Some(6));
+        // 壊れた入力は None (呼び出し側は従来の全体サイズへ落ちる)。
+        assert_eq!(max_group_rows(&seg, &[]), None);
+        assert_eq!(max_group_rows(&seg[..11], &[(0, 3)]), None);
+        assert_eq!(max_group_rows(&seg, &[(0, 9)]), None);
+        assert_eq!(max_group_rows(&seg, &[(2, 2)]), None);
+        // group_bounds の結果と組み合わせても一致する。
+        let needs = vec![100usize, 100, 100, 100, 100, 100];
+        let bounds = group_bounds(&needs, 350, 64).expect("3 本ずつ 2 グループ");
+        assert_eq!(bounds, vec![(0, 3), (3, 6)]);
+        assert_eq!(max_group_rows(&seg, &bounds), Some(7));
+    }
+
+    /// task 242: グループ局所の `seg` は各行の先頭がグループ先頭から 0 起点に
+    /// なり、行表をグループ先頭行だけ足して渡せば元の行に対応する。
+    #[test]
+    fn seg_group_local_rebases_each_group_to_zero() {
+        let seg: Vec<u32> = vec![
+            3, 0, 0, 0, // rows 0..3
+            1, 3, 0, 0, // rows 3..4
+            2, 4, 0, 0, // rows 4..6
+            4, 6, 0, 0, // rows 6..10
+            1, 10, 0, 0, // rows 10..11
+            2, 11, 0, 0, // rows 11..13
+        ];
+        let bounds = vec![(0usize, 3usize), (3, 6)];
+        let gl = seg_group_local(&seg, &bounds).expect("直せる");
+        assert_eq!(gl.len(), seg.len());
+        // 行数は変えない。
+        for i in 0..6 {
+            assert_eq!(gl[i * 4], seg[i * 4], "segment {i} の行数が変わった");
+        }
+        // グループ 0 は元のまま (先頭が 0)、グループ 1 は 6 を引く。
+        assert_eq!(&gl[0..12], &seg[0..12]);
+        assert_eq!(&gl[12..24], &[4, 0, 0, 0, 1, 4, 0, 0, 2, 5, 0, 0]);
+        // 相対化しても「グループの最大行数」は同じ。
+        assert_eq!(max_group_rows(&gl, &bounds), max_group_rows(&seg, &bounds));
+        // 1 グループなら全体が 0 起点 (先頭は元から 0 なので不変)。
+        assert_eq!(seg_group_local(&seg, &[(0, 6)]).as_deref(), Some(&seg[..]));
+        // 壊れた入力は None。
+        assert_eq!(seg_group_local(&seg, &[]), None);
+        assert_eq!(seg_group_local(&seg[..11], &[(0, 3)]), None);
+        assert_eq!(seg_group_local(&seg, &[(0, 9)]), None);
+        // 先頭より小さい行番号が来たら None (plan の並びが壊れている)。
+        // segment 4 はグループ 1 (先頭 6) の中なので、0 は先頭より小さい。
+        let mut bad = seg.clone();
+        bad[4 * 4 + 1] = 0;
+        assert_eq!(seg_group_local(&bad, &[(0, 3), (3, 6)]), None);
+    }
+
+    /// task 242: グループ局所の添字をカーネルと同じ式で辿り、どの領域も
+    /// はみ出さないこと (lab t242a は down の行表を足して error 700 になった)。
+    ///
+    /// - gate/up: 出力 = `(rel + r) * ff + row0` → `rows_cap * ff` 未満
+    /// - gate/up: 入力 = `x[rows_gu[abs_start + rel + r]]` → `ntok` 未満
+    /// - down: 入力 = `act[rows_id[rel + r]]` = `act[rel + r]` → グループ局所
+    ///   (`abs_start` を足したら act の範囲外になる)
+    #[test]
+    fn group_local_indices_stay_inside_the_group_scratch() {
+        // 5 expert / 行数 40,10,80,25,5 (= 160 行) / トークンは 7 個を巡回。
+        let rows_per = [40usize, 10, 80, 25, 5];
+        let ntok = 7usize;
+        let (ff, e) = (4usize, 3usize);
+        let mut by_expert: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut t = 0usize;
+        for &m in rows_per.iter() {
+            let mut v = Vec::new();
+            for _ in 0..m {
+                v.push((t % ntok, 0));
+                t += 1;
+            }
+            by_expert.push(v);
+        }
+        let pick = vec![true; 5];
+        let plan = build_plan(&by_expert, &pick);
+        let total_rows = plan.total_rows;
+        assert_eq!(total_rows, 160);
+        let needs = vec![100usize; 5];
+        let bounds = group_bounds(&needs, 250, 64).expect("2 本ずつ + 端数");
+        let gl = seg_group_local(&plan.seg, &bounds).expect("直せる");
+        let cap = max_group_rows(&plan.seg, &bounds).expect("行数");
+        let mut seen = 0usize;
+        for &(a, b) in &bounds {
+            let abs_start = plan.seg[a * 4 + 1] as usize;
+            for i in a..b {
+                let m = gl[i * 4] as usize;
+                let rel0 = gl[i * 4 + 1] as usize;
+                for r in 0..m {
+                    let rel = rel0 + r;
+                    // gate/up の出力はグループの作業域に収まる。
+                    assert!(rel < cap, "g/u の行 {rel} が cap {cap} を超えた");
+                    assert!(rel * ff < cap * ff);
+                    // gate/up の入力は絶対の行表 (abs_start を足したもの) で引く。
+                    let abs_row = abs_start + rel;
+                    assert_eq!(
+                        plan.rows[abs_row], plan.rows[abs_start + rel0 + r],
+                        "行表の対応がずれた"
+                    );
+                    assert!((plan.rows[abs_row] as usize) < ntok);
+                    // down の入力はグループ局所の act (identity のまま)。
+                    assert_eq!(rel, abs_row - abs_start);
+                    assert!(rel * e < cap * e, "act の行 {rel} が範囲外");
+                    // down の出力は全体の h (絶対)。
+                    assert!((abs_row) * e < (total_rows + ntok) * e);
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, total_rows, "全ての行を 1 回ずつ辿る");
     }
 
     /// task 233: 行の加重和の表に共有 expert を 1 列足す。行は

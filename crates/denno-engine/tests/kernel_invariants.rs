@@ -9723,6 +9723,96 @@ fn steer_ptx_matches_the_host_launch_abi() {
 }
 
 // ---------------------------------------------------------------------------
+// task 242: 層優先 prefill の作業域をグループ局所にし、追い出した expert を戻す
+// ---------------------------------------------------------------------------
+
+/// task 242: 14k で 0.86 GB あった g/u/act をグループ 1 個ぶんに縮め、
+/// 作業域のために追い出した expert を prefill の終端で戻す、という 2 点が
+/// 実際に配線されていること (値は lab の担当)。
+#[test]
+fn t242_lm_work_area_is_group_local_and_experts_come_back() {
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    // 1. 追い出すときに鍵を控える (控えないと戻せない)。
+    assert!(
+        lm.contains("crate::model::expert_vram::emergency_free_keys("),
+        "層優先が emergency_free_keys を使っていない (鍵を控えていない)"
+    );
+    assert!(
+        !lm.contains("crate::model::expert_vram::emergency_free("),
+        "層優先が鍵を返さない emergency_free をまだ使っている"
+    );
+    assert!(
+        lm.contains("pf_restore_experts(&self.layers, &evicted)"),
+        "追い出した expert を戻す呼び出しが無い"
+    );
+    // 2. 追い出しの見積りが g/u/act の全体サイズでなくなっている
+    //    (14k で 3 * rows * ff * 4 をそのまま引くと 0.86 GB を空けすぎる)。
+    assert!(
+        !lm.contains("3 * rows * ff * 4"),
+        "g/u/act を全体サイズで見積もっている (グループ局所になっていない)"
+    );
+    assert!(
+        lm.contains("crate::model::exp_pf::lm_group_local()"),
+        "ゲート lm_group_local を読んでいない"
+    );
+    assert!(
+        lm.contains("crate::model::exp_pf::lm_reload_evicted()"),
+        "ゲート lm_reload_evicted を読んでいない"
+    );
+    // 3. ストリーミングはグループ局所のときだけ行の添字を 0 起点にする。
+    let io = fn_body(CUDA_RS, "fn moe_experts_iq_pf_layer_stream_io(");
+    assert!(
+        io.contains("exp_pf::max_group_rows(seg, &bounds)"),
+        "作業域の行数をグループの最大行数から取っていない"
+    );
+    for k in [
+        "let gl = is_dev && exp_pf::lm_group_local();",
+        "exp_pf::seg_group_local(seg, &bounds)",
+        "seg_gl.as_deref().unwrap_or(seg)",
+        "let (ro_start, ro_end) = if gl {",
+        "rg + (abs_start as u64) * 4",
+    ] {
+        assert!(io.contains(k), "ストリーミングに {k} が無い");
+    }
+    // down の入力 (`act`) はグループ局所なので、その行表 (identity) は
+    // 先頭行を足してはいけない (lab t242a はこれを足して error 700 になった)。
+    let io_body = &io;
+    assert!(
+        !io_body.contains("rid + (abs_start"),
+        "down の行表をグループ先頭行だけ足している (act が局所なので範囲外を読む)"
+    );
+    // ポインタを負へずらす形 (端数のアドレスで wrap しうる) は使わない。
+    assert!(
+        !io.contains("wrapping_sub("),
+        "グループ局所をポインタの引き算でやっている (下位アドレスで wrap する)"
+    );
+    // 4. ホスト出力 (チャンク経路) は従来どおり全体サイズのまま。
+    assert!(
+        io.contains("} else {\n                total_rows\n            };"),
+        "グループ局所でないときの全体サイズへの落とし方が変わっている"
+    );
+    // 5. 戻す経路はラッチしない acquire_soft を使う (失敗しても decode を殺さない)。
+    let restore = fn_body(QWEN_SRC, "fn pf_restore_experts(");
+    assert!(
+        restore.contains("expert_vram::acquire_soft("),
+        "戻す経路が acquire_soft でない (確保失敗で CPU に張り付く)"
+    );
+    assert!(
+        !restore.contains("expert_vram::acquire("),
+        "戻す経路がラッチする acquire を使っている"
+    );
+    // 6. 純関数と env ゲートが exp_pf にある。
+    for k in [
+        "pub fn max_group_rows(",
+        "pub fn seg_group_local(",
+        "pub fn lm_group_local(",
+        "pub fn lm_reload_evicted(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // task 233: 層優先 prefill のデバイス MoE (活性をホストへ戻さない)
 // ---------------------------------------------------------------------------
 
