@@ -207,6 +207,54 @@ pub const PF_CHUNK_ENV: &str = "DENNO_PF_CHUNK";
 /// [`PF_CHUNK_ENV`] の既定 (ストリーミング経路のとき)。lab t197a の最良。
 pub const DEFAULT_PF_CHUNK_STREAM: usize = 1536;
 
+/// `DENNO_PF_CHUNK_BALANCE`: チャンクをプロンプト長の**均等割り**で選ぶ (task 239)。
+///
+/// ミス expert は**チャンクごとに上げ直す**ので、転送量はほぼ
+/// 「チャンク数 × 1 チャンクあたりの distinct expert 数」に比例する。
+/// 既定は固定 1536 なので、3,222 トークンのプロンプトは 3 チャンクになり、
+/// 3 回とも同じ expert を上げる (lab t239b の c8869: 3 チャンクで 17,510 本 /
+/// 35.8 GB、c2000: 3 チャンクで 23,732 本 / 48.6 GB)。
+///
+/// on のとき「上限 [`CHUNK_BALANCE_CAP`] の下でチャンク数を最小にする」長さ
+/// (= プロンプト長 / チャンク数 の切り上げ) を使う。3,222 なら 1,611 × 2 枚。
+/// 1 枚の長さが上限を超えないので、GDN のデバイス連鎖の境界 (2048) は踏まない。
+pub const CHUNK_BALANCE_ENV: &str = "DENNO_PF_CHUNK_BALANCE";
+
+/// [`CHUNK_BALANCE_ENV`] の既定 (off = 従来の固定 1536)。
+pub const DEFAULT_CHUNK_BALANCE: bool = false;
+
+/// 均等割りの 1 チャンク上限 (GDN 連鎖の境界 `GDN_CHUNK_MIN_TOKENS` = 2048 の手前)。
+pub const CHUNK_BALANCE_CAP: usize = 2047;
+
+/// [`CHUNK_BALANCE_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn chunk_balance_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_CHUNK_BALANCE,
+    }
+}
+
+/// 均等割りのチャンクを選ぶ (純関数)。
+///
+/// - `n <= base` なら 1 チャンク (`n`)。
+/// - それ以外は「`cap` で割ったときのチャンク数」を保ったまま均等に割る
+///   (端数の小さい最後の 1 枚を作らない)。
+pub fn balanced_chunk(n: usize, base: usize, cap: usize) -> usize {
+    let base = base.max(1);
+    let cap = cap.max(1);
+    if n == 0 || n <= base {
+        return n.max(1).min(base);
+    }
+    let nch = n.div_ceil(cap);
+    n.div_ceil(nch).clamp(1, cap)
+}
+
+/// 均等割りを使うか (プロセスで 1 回だけ env を読む)。
+pub fn chunk_balance() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| chunk_balance_from_value(std::env::var(CHUNK_BALANCE_ENV).ok().as_deref()))
+}
+
 /// [`PF_CHUNK_ENV`] の解釈 (純関数)。0・空・偽値・解析不能は `None` (= 上書きしない)。
 pub fn chunk_override_from_value(v: Option<&str>) -> Option<usize> {
     let s = v?.trim();
@@ -1207,6 +1255,34 @@ mod tests {
         assert_eq!(upload_budget_experts(), (upload_mb() << 20) / 2_048_000);
     }
 
+    /// task 239: 均等割りは「上限の下でチャンク数を最小にする」長さを返す。
+    ///
+    /// 実際のプロンプト長 (lab t239a/t239b の c2000=3,826 / c8869=3,222) で、
+    /// 固定 1536 の 3 枚が 2 枚になること (転送量が 1/3 減る) を固定する。
+    #[test]
+    fn balanced_chunk_minimizes_chunk_count_under_cap() {
+        let (base, cap) = (DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        // 1 枚で収まる長さはそのまま。
+        assert_eq!(balanced_chunk(150, base, cap), 150);
+        assert_eq!(balanced_chunk(1536, base, cap), 1536);
+        // 3,222 → 1,611 × 2 枚 (固定 1536 なら 1,536 + 1,536 + 150 の 3 枚)。
+        let c = balanced_chunk(3222, base, cap);
+        assert_eq!(c, 1611, "c8869 が 2 枚にならない");
+        assert_eq!(3222usize.div_ceil(c), 2);
+        // 3,826 → 1,913 × 2 枚。
+        let c = balanced_chunk(3826, base, cap);
+        assert_eq!(3826usize.div_ceil(c), 2, "c2000 が 2 枚にならない");
+        // 14,018 → 7 枚 (固定 1536 なら 10 枚)。
+        let c = balanced_chunk(14018, base, cap);
+        assert_eq!(14018usize.div_ceil(c), 7);
+        // どの長さでも 1 枚は上限を超えない (GDN 連鎖の境界を踏まない)。
+        for n in [1usize, 512, 1536, 2000, 3222, 3826, 14018, 65536] {
+            let c = balanced_chunk(n, base, cap);
+            assert!(c > 0 && c <= cap.max(base), "n={n} のチャンク {c} が上限外");
+            assert!(n.div_ceil(c) >= 1);
+        }
+    }
+
     /// task 162: 行表は「トークン × j」→ GPU の行番号。載っていない expert の
     /// 位置は穴 (`u32::MAX`) のまま残り、`row_table_zero_slots` で 0 重みになる。
     #[test]
@@ -1349,6 +1425,19 @@ mod tests {
         assert_eq!(stream_split_from_value(Some("x")), 1, "解析不能は既定へ");
         assert_eq!(stream_split_from_value(Some("4")), 4);
         assert_eq!(stream_split_from_value(Some("64")), 16, "上限 16");
+        // task 239: 均等割りのゲートと上限。
+        assert!(
+            !chunk_balance_from_value(None),
+            "既定 off (従来の固定チャンク)"
+        );
+        assert!(!chunk_balance_from_value(Some("0")));
+        assert!(chunk_balance_from_value(Some("1")));
+        assert!(chunk_balance_from_value(Some(" on ")));
+        assert_eq!(
+            CHUNK_BALANCE_CAP + 1,
+            crate::cuda::GDN_CHUNK_MIN_TOKENS,
+            "上限は GDN 連鎖の境界の手前 (2048 を踏むと ssm がホスト経路へ落ちる)"
+        );
         // 分け合った 1 枚 (cuda 側は 3 枚) に、既定のグループ (64 本、
         // 平均 2.05 MB/本) が載ること。
         assert!(
