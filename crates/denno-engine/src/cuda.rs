@@ -40819,12 +40819,16 @@ pub(crate) fn set_gdn_pf_wy_for_test(v: Option<bool>) {
 pub(crate) fn gdn_pf_wy_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         // task 228: 初回は既定 off (lab で採否を決める)。
+        // task 231 (t231a): C = 8 で起動できるようにしたうえで測ったが、
+        // scan_pf が v3 より 11% 遅かった (3826: 392.8 vs 357.0 ms /
+        // 14018: 1458.6 vs 1311.7 ms)。14k cold prefill も +1.3% なので
+        // 既定 off のまま。切り戻し不要 (env = 1 で試せる)。
         None => false,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
-/// WY スキャンを使うか (既定 off。lab の結果で決める)。
+/// WY スキャンを使うか (既定 off。t231a で v3 より遅いと分かった)。
 pub(crate) fn gdn_pf_wy_on() -> bool {
     #[cfg(test)]
     {
