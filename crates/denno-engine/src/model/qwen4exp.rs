@@ -1336,12 +1336,14 @@ pub fn tensor_type_table(f: &GgufFile, p: &Qwen4ExpParams) -> Vec<String> {
             std::env::var(crate::model::expert_vram::EXPERT_VRAM_MB_ENV).ok().as_deref(),
         );
         let cap = cap_mb as u64 * 1024 * 1024;
-        let fit = if layer0 > 0 { cap / layer0 } else { 0 };
+        // 層 0 の 3 行列の合計 = 1 expert のバイト数 × n_expert。
+        let one = layer0 / p.n_expert.max(1) as u64;
+        let fit = if one > 0 { cap / one } else { 0 };
         let total_n = p.n_layer as u64 * p.n_expert as u64;
         out.push(format!(
             "[ttypes] expert: 1 本 {:.3}MB (層 0) / 平均 {:.3}MB / 全 {} 本 {:.1}GB / \
              予算 {}MiB で {} 本 ({:.1}%)",
-            layer0 as f64 / 1e6,
+            one as f64 / 1e6,
             expert_bytes as f64 / expert_n as f64 / 1e6,
             total_n,
             expert_bytes as f64 / 1e9,
@@ -4714,6 +4716,34 @@ fn mix_gpu_enabled() -> bool {
     *ON.get_or_init(|| mix_gpu_from_value(std::env::var("DENNO_MIX_GPU").ok().as_deref()))
 }
 
+/// task 261: `DENNO_MIX_QUANT_GPU` — hc mix の down / up を **旧来の 4 型**
+/// (Q8_0 / Q5_1 / Q4_K / Q5_K) でも GPU で回す。既定 off。
+///
+/// swift15 (mix = BF16) は既存の BF16 経路 (`DENNO_MIX_GPU` + chain) がそのまま
+/// 使える。UD-Q4_K_XL のような **Q8_0 の mix** を持つモデルでは、このゲートが
+/// 無いと mix が丸ごと CPU に落ちる (実測は REPORT_P261.md)。カーネルは
+/// dense 重みレジストリ + `moe_gemv_dev` / `moe_gemm_dev` をそのまま使う。
+pub const MIX_QUANT_GPU_ENV: &str = "DENNO_MIX_QUANT_GPU";
+
+/// [`MIX_QUANT_GPU_ENV`] の解釈 (純関数)。`1` / `true` / `on` だけが真。
+pub fn mix_quant_gpu_from_value(v: Option<&str>) -> bool {
+    crate::model::expert_vram::flag_on(v)
+}
+
+/// mix の量子型を GPU で回すか (プロセスで 1 回だけ env を読む)。既定 off。
+fn mix_quant_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_quant_gpu_from_value(std::env::var(MIX_QUANT_GPU_ENV).ok().as_deref())
+    })
+}
+
+/// GPU の `moe_gemv_dev` / `moe_gemm_dev` が読める 4 型か (dense 重み用)。
+fn mix_legacy_gpu_ty(ty: crate::kquant::GgmlType) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(ty, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K)
+}
+
 /// task 138: `DENNO_MIX_CHAIN` の値を解釈する (純関数・テスト用)。
 /// **既定 on** で、明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
 fn mix_chain_from_value(v: Option<&str>) -> bool {
@@ -5032,18 +5062,33 @@ fn mix_batch_gpu_ok(
 /// 呼び出し側が CPU の [`gemv_batch`] へ落ちること。
 #[cfg(feature = "cuda")]
 fn mix_batch_gpu(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> bool {
-    if !mix_batch_gpu_ok(w.ty(), w.k(), w.n(), nt, mix_batch_gpu_enabled()) {
-        return false;
+    if mix_batch_gpu_ok(w.ty(), w.k(), w.n(), nt, mix_batch_gpu_enabled()) {
+        return crate::cuda::maybe_gpu_mix_bf16_batch_into(
+            w.uid(),
+            w.blocks().as_slice(),
+            w.k(),
+            w.n(),
+            xs,
+            nt,
+            outs,
+        );
     }
-    crate::cuda::maybe_gpu_mix_bf16_batch_into(
-        w.uid(),
-        w.blocks().as_slice(),
-        w.k(),
-        w.n(),
-        xs,
-        nt,
-        outs,
-    )
+    // task 261: 旧来の 4 型 (UD-Q4_K_XL の mix は Q8_0) は dense の量子 GEMM に載せる。
+    // BF16 と同じ「nt トークンまとめて 1 回」の形で、カーネルは prefill の
+    // dense 重み経路と同じ `moe_gemm_dev`。
+    if mix_quant_gpu_enabled() && mix_legacy_gpu_ty(w.ty()) && nt >= MIX_BATCH_GPU_MIN_TOK {
+        return crate::cuda::maybe_gpu_gguf_gemm_into(
+            w.uid(),
+            w.ty(),
+            w.blocks().as_slice(),
+            w.k(),
+            w.n(),
+            xs,
+            nt,
+            outs,
+        );
+    }
+    false
 }
 
 /// cuda feature 無しでは常に CPU。
@@ -5344,6 +5389,41 @@ pub(crate) static MIX_FAST_CALLS: std::sync::atomic::AtomicUsize =
 ///    `d` は独立で、`s` の昇順の加算は 1 つの `d` の中で完結する。
 /// 3. task 106: 合成 (`hc_mixed_into_par`) は戻り値の `Vec` に直接書く
 ///    (scratch へ書いて `to_vec()` で写す 10 KB の 2 パスを 1 パスに)。
+/// task 261: mix の 1 行列 (m=1) を GPU で回す。
+///
+/// BF16 は従来の [`crate::cuda::maybe_gpu_mix_bf16_into`] (f32 展開 /
+/// `dno_matvec_bf16`)、旧来の 4 型は dense 重みレジストリ + `moe_gemv_dev`
+/// ([`crate::cuda::maybe_gpu_gguf_gemv_into`]、`DENNO_MIX_QUANT_GPU` のときだけ)。
+/// どちらも不発なら `false` を返し、呼び出し側が CPU 経路へ落ちる。
+#[cfg(feature = "cuda")]
+fn mix_gemv_gpu(w: &GgufLinear, x: &[f32], out: &mut [f32]) -> bool {
+    if !mix_gpu_enabled() {
+        return false;
+    }
+    if w.ty() == crate::kquant::GgmlType::Bf16 {
+        return crate::cuda::maybe_gpu_mix_bf16_into(
+            w.uid(),
+            w.blocks().as_slice(),
+            w.k(),
+            w.n(),
+            x,
+            out,
+        );
+    }
+    if mix_quant_gpu_enabled() && mix_legacy_gpu_ty(w.ty()) {
+        return crate::cuda::maybe_gpu_gguf_gemv_into(
+            w.uid(),
+            w.ty(),
+            w.blocks().as_slice(),
+            w.k(),
+            w.n(),
+            x,
+            out,
+        );
+    }
+    false
+}
+
 fn hc_mix_quant_fast(
     res: &HyperStreams,
     norm: &[f32],
@@ -5586,16 +5666,7 @@ fn hc_mix_quant_fast(
             // 成功すると `last_linear_ran_on_gpu` が立つので下の `note_down` が gpu= を
             // 積む ([mix-kprof] の内訳で見える)。
             #[cfg(feature = "cuda")]
-            let gpu_down = mix_gpu_enabled()
-                && down.ty() == crate::kquant::GgmlType::Bf16
-                && crate::cuda::maybe_gpu_mix_bf16_into(
-                    down.uid(),
-                    down.blocks().as_slice(),
-                    down.k(),
-                    down.n(),
-                    xn,
-                    lo,
-                );
+            let gpu_down = mix_gemv_gpu(down, xn, lo);
             #[cfg(not(feature = "cuda"))]
             let gpu_down = false;
             if !gpu_down {
@@ -5621,16 +5692,7 @@ fn hc_mix_quant_fast(
             // up 実形 (k=320 < n=10240) は短い行なので task 121 でも逐次版のまま
             // (ビット一致)。
             #[cfg(feature = "cuda")]
-            let gpu_up = mix_gpu_enabled()
-                && up.ty() == crate::kquant::GgmlType::Bf16
-                && crate::cuda::maybe_gpu_mix_bf16_into(
-                    up.uid(),
-                    up.blocks().as_slice(),
-                    up.k(),
-                    up.n(),
-                    lo,
-                    gate,
-                );
+            let gpu_up = mix_gemv_gpu(up, lo, gate);
             #[cfg(not(feature = "cuda"))]
             let gpu_up = false;
             if !gpu_up {
@@ -8597,14 +8659,18 @@ fn expert_route() -> Route {
                 {
                     expert_vram::init(mb.saturating_mul(1024 * 1024));
                     let min_hit = expert_min_hit();
+                    let (k1, k2, kg) = crate::cuda::CudaCtx::expert_kernel_status();
                     eprintln!(
                         "[flash] expert GPU: ON (VRAM {} MiB, 既定の CPU 経路は使わない / \
                          ヒット率 < {} のトークンは CPU: DENNO_EXPERT_GPU_MIN_HIT / \
-                         IQ ゲート {} / 上げ直し {}/tok)",
+                         IQ ゲート {} / 上げ直し {}/tok / 旧 4 型カーネル gemv={} gemv2={} gemm={})",
                         mb,
                         min_hit,
                         if iq { "on" } else { "off" },
-                        crate::model::exp_iq::upload_per_token()
+                        crate::model::exp_iq::upload_per_token(),
+                        k1,
+                        k2,
+                        kg
                     );
                 }
             }
@@ -10505,9 +10571,13 @@ fn moe_expert_gpu(
     })
     .map_err(|e| one(format!("層 {}: expert {ei}: VRAM 経路: {e:#}", lw.il)))?;
     let Some(got) = got else {
+        // task 261: 載らなかった 1 本 (理由は expert_vram 側の fb 内訳が出す)。
+        crate::model::exp_iq::note_lookup(1, 0);
         return Ok(None);
     };
     let hit = got.hit;
+    // task 261: 層一括を使わない経路でもヒット率を数える。
+    crate::model::exp_iq::note_lookup(1, u32::from(hit));
     let dev = got.dev;
 
     let ctx = |e: anyhow::Error, m: ExpertMatrix| {
@@ -10608,6 +10678,9 @@ fn moe_experts_gpu_batched(
         })
         .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 経路 (層一括): {err:#}", lw.il)))?;
         let Some(a) = got else {
+            // task 261: 1 本でも載らないと層ごと per-expert 経路へ落ちる。回数を残す
+            // (「なぜ GPU で回らなかったか」を [exp-iq] の 1 行で読むため)。
+            crate::model::exp_iq::note_batch_bail();
             return Ok(None);
         };
         if a.hit {
@@ -10616,6 +10689,10 @@ fn moe_experts_gpu_batched(
         devs.push(a.dev);
         ids.push(ei as u16);
     }
+    // task 261: 層一括経路のヒット率を [exp-iq] に積む (従来は IQ 経路だけが
+    // 数えていたので、旧 4 型のモデルではヒット率が読めなかった)。
+    crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
+    crate::model::exp_iq::note_batch_ok();
     let ptr_table = |m: ExpertMatrix| -> Vec<u64> { devs.iter().map(|d| d.ptr(m)).collect() };
     let (pg, pu, pd) = (
         ptr_table(ExpertMatrix::Gate),

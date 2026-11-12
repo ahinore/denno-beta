@@ -1789,9 +1789,18 @@ mod gpu {
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
     {
         if ALLOC_DEAD.load(Ordering::Relaxed) {
+            // task 261: プロセス寿命のラッチ。静かに全部 CPU へ落ちるので 1 回だけ出す。
+            static DEAD_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !DEAD_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] ALLOC_DEAD: 以後すべて CPU 経路 (確保失敗のラッチ)");
+            }
             return Ok(None);
         }
         let Some(cache) = CACHE.get() else {
+            static NOCACHE_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !NOCACHE_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] CACHE 未初期化: すべて CPU 経路");
+            }
             return Ok(None);
         };
         let mut g = cache
@@ -1829,6 +1838,19 @@ mod gpu {
             {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 FB_TYPE.fetch_add(1, Ordering::Relaxed);
+                // task 261: 型で落ちるのは静かなので 1 回だけ理由を出す
+                // (どの型が・どのカーネル不足で載らないか)。
+                static TYPE_LOGGED: AtomicU64 = AtomicU64::new(0);
+                if TYPE_LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+                    eprintln!(
+                        "[exp-vram] 型が GPU 経路に無い: ty={:?} k={} n={} (旧 4 型 ready={} / IQ ready={})",
+                        s.ty,
+                        s.k,
+                        s.n,
+                        crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k),
+                        crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
+                    );
+                }
                 return Ok(None);
             }
             mbytes[i] = s.bytes()?;
@@ -1993,9 +2015,18 @@ mod gpu {
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
     {
         if ALLOC_DEAD.load(Ordering::Relaxed) {
+            // task 261: プロセス寿命のラッチ。静かに全部 CPU へ落ちるので 1 回だけ出す。
+            static DEAD_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !DEAD_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] ALLOC_DEAD: 以後すべて CPU 経路 (確保失敗のラッチ)");
+            }
             return Ok(None);
         }
         let Some(cache) = CACHE.get() else {
+            static NOCACHE_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !NOCACHE_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] CACHE 未初期化: すべて CPU 経路");
+            }
             return Ok(None);
         };
         // 1. 参照と場所の確保 (ロック内)。

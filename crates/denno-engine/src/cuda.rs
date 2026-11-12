@@ -5127,6 +5127,15 @@ impl CudaCtx {
     }
 
 
+    /// task 261: 旧 4 型 (Q8_0 / Q5_1 / Q4_K / Q5_K) を回すカーネルの有無
+    /// `(m=1 の GEMV, v2 GEMV, prefill GEMM)`。診断用 (数値経路に影響しない)。
+    pub fn expert_kernel_status() -> (bool, bool, bool) {
+        match shared_ctx() {
+            Some(c) => (c.f_moe.is_some(), c.f_moe2.is_some(), c.f_gemm_q.is_some()),
+            None => (false, false, false),
+        }
+    }
+
     /// P39: expert を VRAM に載せてよいか (カーネルと型が対応しているか)。
     ///
     /// 載せてから `false` で落ちると VRAM が無駄に埋まるので、**載せる前**に
