@@ -24368,99 +24368,180 @@ pub fn pf_res_park_load(i: usize, rows: usize, hc: usize, e: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// task 257: prefill 作業域のプール (起動時に 1 本だけ確保し、prefill 中は確保しない)
+// task 257/265: prefill 作業域のプール (expert から借りて、prefill の終端で返す)
 // ---------------------------------------------------------------------------
 //
 // task 250 は層優先 + tensor core で 14k cold prefill を 25.4 s → 9.9-15.0 s に
 // 縮めたが、作業域 (1.3-2.2 GB) を expert がカードを埋めた**後**に確保しようと
 // して失敗し、追い出し階段が expert を 33,497 MiB 全捨てした (decode 18.4 →
-// 32-52 ms/tok)。ここでは作業域を expert キャッシュが空の時点で 1 本 ensure し、
-// prefill の確保はその中の区画を指す**非所有ビュー**にする。
+// 32-52 ms/tok)。task 257 は起動時に 1 本確保して解決したが、expert の予算を
+// そのぶん削ったので 14k 後の decode が +11.3% になった (lab t257b)。
+//
+// task 265 は **prefill のあいだだけ借りる**: 長い prefill の入口で 1 本だけ
+// `alloc_tagged` に出し (足りない分は task 256 の経路がチャンク単位で expert を
+// 追い出して空ける)、終端で `cuMemFree` する。expert の LRU 上限は実空きから
+// 引き直される (`expert_vram::effective_expert_cap`) ので、返せば自動で戻る。
 //
 // レイアウトは [`crate::model::pf_pool::layout`] (純関数) が形から組む。
-// プールは `DENNO_EXPERT_VRAM_MB` から引く (呼び出し側 = `expert_route`)。
-// 区画に収まらない要求は従来の `alloc_tagged` に落ちる (fail open)。
+// 借りられないときは従来の `alloc_tagged` に落ちる (fail open)。
 
-/// プール本体 (プロセスで 1 本)。`None` は「確保できなかった」。
+/// 借りているプール本体 (1 prefill のあいだだけ `Some`)。
+///
+/// 中身は非所有ビュー ([`pool_view`]) が指すので、**返す前にビューを落とす**
+/// ([`pf_pool_release`] が 3 つの置き場を先に片付ける)。
 #[cfg(feature = "cuda")]
-static PF_POOL: std::sync::OnceLock<Option<&'static DevBuffer>> = std::sync::OnceLock::new();
+static PF_POOL: std::sync::Mutex<Option<DevBuffer>> = std::sync::Mutex::new(None);
 
 #[cfg(feature = "cuda")]
 thread_local! {
     /// このスレッドの prefill で使う区画 (リクエストの先頭で組み直す)。
     static PF_POOL_LAYOUT: std::cell::RefCell<Option<crate::model::pf_pool::Layout>> =
         const { std::cell::RefCell::new(None) };
+    /// このスレッドがプールを借りたか (= 返す責任があるか)。
+    static PF_POOL_OWNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// task 257: プールを 1 回だけ確保する (戻り値は確保できたバイト数。0 = 無効)。
+/// task 265: 借りたプールの返却責任 (drop で expert に返す)。
 ///
-/// **expert キャッシュが空の時点** (最初の MoE の直前) に呼ぶこと。以降の
-/// 確保はすべてこの中のビューになる。
+/// prefill の入口で受け取り、関数の終端 (早期撤退も含む) で落とす。借りられな
+/// かったときは `owned == false` で、drop は何もしない。
 #[cfg(feature = "cuda")]
-pub fn pf_pool_init(bytes: usize) -> usize {
-    if bytes == 0 {
-        return 0;
-    }
-    let slot = PF_POOL.get_or_init(|| {
-        let Some(ctx) = shared_ctx() else {
-            return None;
-        };
-        if ctx.make_current().is_err() {
-            return None;
-        }
-        match DevBuffer::alloc_tagged(bytes, crate::mem_audit::TAG_OTHER) {
-            Ok(b) => {
-                let b: &'static DevBuffer = Box::leak(Box::new(b));
-                Some(b)
-            }
-            Err(e) => {
-                tracing::warn!("pf_pool: プール {} MiB の確保に失敗: {e:#}", bytes >> 20);
-                None
-            }
-        }
-    });
-    slot.map(|b| b.bytes()).unwrap_or(0)
+pub struct PfPoolGuard {
+    owned: bool,
 }
 
-/// task 257: 確保済みのプールのバイト数 (0 = 無し)。
+#[cfg(feature = "cuda")]
+impl PfPoolGuard {
+    /// この prefill が実際にプールを借りたか。
+    pub fn is_held(&self) -> bool {
+        self.owned
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PfPoolGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            pf_pool_release();
+        }
+    }
+}
+
+/// task 265: いま借りているプールのバイト数 (0 = 借りていない)。
 #[cfg(feature = "cuda")]
 pub fn pf_pool_len() -> usize {
-    PF_POOL.get().and_then(|s| s.as_ref()).map(|b| b.bytes()).unwrap_or(0)
+    PF_POOL
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|b| b.bytes()))
+        .unwrap_or(0)
 }
 
-/// task 257: このリクエストの区画を組む (`pf_pool::layout` がプールに収まるときだけ)。
+/// task 265: 長い prefill の入口で作業域を expert から借りる。
 ///
-/// 収まらない・プールが無いときは `false` を返し、確保は従来の経路に落ちる。
-/// 1 リクエストで 1 回だけ呼ぶ (層ループの中では呼ばない)。
+/// - `n.nt_all` が `DENNO_PF_POOL_MIN_TOK` 未満 → 借りない (短い経路を変えない)。
+/// - レイアウトが組めない / `DENNO_PF_POOL_MB` を超える → 借りない。
+/// - 確保に失敗 → 借りない (呼び出し側は従来の `alloc_tagged`)。
+///
+/// 成功したら区画を組んで `owned == true` のガードを返す。同じスレッドで
+/// 二重に呼ばれたときは既存の区画を組み直すだけ (返すのは最初のガード)。
 #[cfg(feature = "cuda")]
-pub fn pf_pool_begin(n: &crate::model::pf_pool::Need) -> bool {
-    let pool = pf_pool_len();
-    let Some(l) = crate::model::pf_pool::layout(n) else {
-        PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = None);
-        return false;
-    };
-    if pool == 0 || !crate::model::pf_pool::fits(&l, pool) {
-        if pool > 0 {
-            eprintln!(
-                "[pf-pool] 作業域の見積り {} MiB がプール {} MiB に収まらない → 従来の確保",
-                l.total >> 20,
-                pool >> 20
-            );
-        }
-        PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = None);
-        return false;
+pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
+    let not_held = PfPoolGuard { owned: false };
+    if n.nt_all < crate::model::pf_pool::pf_pool_min_tok() {
+        return not_held;
     }
-    PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
-    eprintln!(
-        "[pf-pool] 作業域 {} MiB を予約区画から配る (タイル {} / プール {} MiB)",
-        l.total >> 20,
-        n.tile,
-        pool >> 20
-    );
-    true
+    let Some(l) = crate::model::pf_pool::layout(n) else {
+        return not_held;
+    };
+    let cap = crate::model::pf_pool::pf_pool_bytes();
+    if l.total > cap {
+        eprintln!(
+            "[pf-pool] 作業域の見積り {} MiB が上限 {} MiB を超える → 従来の確保",
+            l.total >> 20,
+            cap >> 20
+        );
+        return not_held;
+    }
+    if PF_POOL_OWNED.with(|c| c.get()) {
+        // 同じリクエストの中で 2 回目 (層優先 → チャンク優先の落ちなど)。
+        PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
+        return not_held;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return not_held;
+    };
+    if ctx.make_current().is_err() {
+        return not_held;
+    }
+    // 借りる判断と確保を 1 つのロックで行う (別スレッドが借りている最中に
+    // 上書きすると、そのビューが dangling になる)。
+    let mut slot = match PF_POOL.lock() {
+        Ok(g) => g,
+        Err(_) => return not_held,
+    };
+    if slot.is_some() {
+        return not_held;
+    }
+    let free_before = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
+    match DevBuffer::alloc_tagged(l.total, crate::mem_audit::TAG_OTHER) {
+        Ok(b) => {
+            let bytes = b.bytes();
+            *slot = Some(b);
+            drop(slot);
+            let free_after = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
+            PF_POOL_OWNED.with(|c| c.set(true));
+            PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
+            eprintln!(
+                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB)",
+                bytes >> 20,
+                n.tile,
+                n.nt_all,
+                free_before.map(|b| b >> 20).unwrap_or(0),
+                free_after.map(|b| b >> 20).unwrap_or(0)
+            );
+            PfPoolGuard { owned: true }
+        }
+        Err(e) => {
+            drop(slot);
+            tracing::warn!("pf_pool: 作業域 {} MiB を借りられない: {e:#}", l.total >> 20);
+            eprintln!(
+                "[pf-pool] 作業域 {} MiB を借りられない → 従来の確保",
+                l.total >> 20
+            );
+            not_held
+        }
+    }
 }
 
-/// task 257: 区画 `r` の `idx` 枚目を指す非所有ビュー (プールが無ければ `None`)。
+/// task 265: 借りたプールを expert に返す (cuMemFree)。
+///
+/// 先に 3 つの置き場 (活性 / スクラッチ / PfDev) を落とす。残ったビューは
+/// 解放後に dangling になるため、順序はここで固定する。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_release() {
+    pf_lm_release();
+    pf_scratch_drop();
+    pf_release();
+    PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = None);
+    let buf = match PF_POOL.lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => None,
+    };
+    PF_POOL_OWNED.with(|c| c.set(false));
+    if let Some(b) = buf {
+        let bytes = b.bytes();
+        drop(b);
+        let free = dev_mem_mb().map(|(f, _)| f).unwrap_or(0);
+        eprintln!(
+            "[pf-pool] 作業域 {} MiB を expert に返した (空き {} MiB)",
+            bytes >> 20,
+            free
+        );
+    }
+}
+
+/// task 265: 区画 `r` の `idx` 枚目を指す非所有ビュー (借りていなければ `None`)。
 #[cfg(feature = "cuda")]
 fn pool_view(r: crate::model::pf_pool::R, idx: usize, want: usize) -> Option<DevBuffer> {
     let l = PF_POOL_LAYOUT.with(|c| *c.borrow())?;
@@ -24475,8 +24556,9 @@ fn pool_view(r: crate::model::pf_pool::R, idx: usize, want: usize) -> Option<Dev
     if idx >= slots || u == 0 || u < want {
         return None;
     }
-    let pool = PF_POOL.get()?.as_ref()?;
     let off = g.off.checked_add(idx.checked_mul(u)?)?;
+    let pool = PF_POOL.lock().ok()?;
+    let pool = pool.as_ref()?;
     if off.checked_add(u)? > pool.bytes() {
         return None;
     }
@@ -37443,13 +37525,13 @@ mod tests {
     use super::*;
     use crate::tensor;
 
-    /// task 257: プールが無い (このテストでは `pf_pool_init` を呼ばない) とき、
-    /// `pf_pool_begin` は false を返し、区画ビューも取れない = 従来の確保に落ちる。
+    /// task 257/265: プールを借りられない (このテストには CUDA context が無い) とき、
+    /// ガードは `owned == false` で、区画ビューも取れない = 従来の確保に落ちる。
     ///
     /// プールの**発火側**は lab の実測でしか確かめられないが、fail open の契約は
     /// ここで固定する (確保の分岐が黙って変わらないように)。
     #[test]
-    fn pool_begin_is_false_without_pool_and_views_are_none() {
+    fn pool_acquire_without_a_context_is_fail_open() {
         let need = crate::model::pf_pool::Need {
             nt_all: 14018,
             tile: 5120,
@@ -37467,11 +37549,40 @@ mod tests {
         };
         // レイアウト自体は組める (純関数)。
         assert!(crate::model::pf_pool::layout(&need).is_some());
-        // プールは未確保なので active にならない。
+        // 借りられないので active にならない。
+        {
+            let guard = pf_pool_acquire(&need);
+            assert!(!guard.is_held());
+            assert_eq!(pf_pool_len(), 0);
+            assert!(pool_view(crate::model::pf_pool::R::H, 0, 1).is_none());
+            assert!(pool_view(crate::model::pf_pool::R::Stage, 0, 1).is_none());
+        }
+        // 借りていない状態で release しても落ちない (二重解放しない)。
+        pf_pool_release();
         assert_eq!(pf_pool_len(), 0);
-        assert!(!pf_pool_begin(&need));
-        assert!(pool_view(crate::model::pf_pool::R::H, 0, 1).is_none());
-        assert!(pool_view(crate::model::pf_pool::R::Stage, 0, 1).is_none());
+    }
+
+    /// task 265: しきい値未満のプロンプトはプールに触らない (短い経路を変えない)。
+    #[test]
+    fn pool_acquire_skips_short_prompts() {
+        let need = crate::model::pf_pool::Need {
+            nt_all: 32,
+            tile: 32,
+            k: 10,
+            e: 2560,
+            ff: 1024,
+            sff: 1024,
+            hc: 4,
+            lr: 256,
+            chunk: 32,
+            ne: 512,
+            tc: true,
+            stage_bytes: 512 << 20,
+            stage_slots: PF_STAGE_SLOTS,
+        };
+        let guard = pf_pool_acquire(&need);
+        assert!(!guard.is_held());
+        assert_eq!(pf_pool_len(), 0);
     }
 
     /// task 210: 捨てた cache の ID のミラーは残さない (生きている ID は残す)。

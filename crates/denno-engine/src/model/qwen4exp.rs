@@ -3784,9 +3784,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 return Ok(Some(v));
             }
         }
-        // task 257: 作業域のプール (起動時に確保済み) をこのリクエストの形で組む。
+        // task 257/265: 作業域のプール (この prefill のあいだ expert から借りる)。
         // チャンク優先は 1 チャンクぶんの MoE なので、タイル = 最初のチャンク。
-        self.pf_pool_begin_for(ctx.len(), first_nt, first_nt, hc, lr);
+        // ガードはこの関数のスコープに置く (早期撤退でも終端で返る)。
+        let _pool = self.pf_pool_begin_for(first_nt, first_nt, first_nt, hc, lr);
         if !crate::cuda::pf_begin(first_nt, hc, e, lr) {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
@@ -4185,13 +4186,21 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         Ok(Some(vec![logits]))
     }
 
-    /// task 257: このリクエストの形で prefill 作業域のプール区画を組む。
+    /// task 257/265: このリクエストの形で prefill 作業域のプール区画を組む。
     ///
-    /// プールは起動時に 1 本だけ確保済み (`DENNO_PF_POOL`)。ここでは形から
-    /// 区画のオフセットを決めるだけで、デバイスの確保はしない。収まらないときは
-    /// `pf_pool_begin` が false を返し、確保は従来の `alloc_tagged` に落ちる。
+    /// task 265: プールは **この prefill のあいだだけ** expert から借りる。
+    /// 戻り値のガードを prefill の関数スコープに置くと、終端 (早期撤退も含む) で
+    /// 返る。借りられないときは `owned == false` で、確保は従来の
+    /// `alloc_tagged` に落ちる (fail open。リクエストは失敗させない)。
     #[cfg(feature = "cuda")]
-    fn pf_pool_begin_for(&self, nt_all: usize, tile: usize, chunk: usize, hc: usize, lr: usize) {
+    fn pf_pool_begin_for(
+        &self,
+        nt_all: usize,
+        tile: usize,
+        chunk: usize,
+        hc: usize,
+        lr: usize,
+    ) -> crate::cuda::PfPoolGuard {
         let e = self.p.n_embd;
         let ff = self.p.n_ff_exp;
         // tensor core の grouped GEMM がこのモデルで実際に使えるか (層 0 の型で判定)。
@@ -4210,7 +4219,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 ff,
                 e,
             );
-        let _ = crate::cuda::pf_pool_begin(&crate::model::pf_pool::Need {
+        crate::cuda::pf_pool_acquire(&crate::model::pf_pool::Need {
             nt_all,
             tile,
             k: self.p.n_expert_used,
@@ -4224,7 +4233,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             tc,
             stage_bytes: crate::model::exp_pf::stream_bytes(),
             stage_slots: crate::cuda::PF_STAGE_SLOTS,
-        });
+        })
     }
 
     /// task 227: 層優先の常駐 prefill (`DENNO_PF_LM_LAYER=1`)。
@@ -4266,8 +4275,16 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         if ranges.len() < 2 {
             return Ok(None);
         }
-        // task 257: 作業域のプール (起動時に確保済み) をこのリクエストの形で組む。
-        self.pf_pool_begin_for(nt_all, crate::model::exp_pf::lm_tile(nt_all), chunk.min(nt_all), hc, lr);
+        // task 257/265: 作業域のプールをこのリクエストの形で組む (長い prefill の
+        // あいだだけ expert から借りる)。ガードはこの関数のスコープに置くので、
+        // どの早期撤退でも終端で返る。
+        let _pool = self.pf_pool_begin_for(
+            nt_all,
+            crate::model::exp_pf::lm_tile(nt_all),
+            chunk.min(nt_all),
+            hc,
+            lr,
+        );
         if !crate::cuda::pf_begin(chunk.min(nt_all), hc, e, lr) {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
@@ -4770,6 +4787,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         crate::cuda::pf_lm_release();
         crate::cuda::pf_scratch_drop();
         crate::cuda::pf_release();
+        // task 265: 借りた作業域を expert に返す (ここでカードが expert に戻る)。
+        drop(_pool);
         // task 250: 作業域の外部予約を返す (LRU の上限がここで戻る)。
         drop(reserve_guard);
         // task 242: 作業域のために追い出した expert を戻す (prefill の終端)。
@@ -9184,25 +9203,20 @@ fn expert_route() -> Route {
             Route::Vram => {
                 #[cfg(feature = "cuda")]
                 {
-                    // task 257: prefill の作業域を **expert が載る前**に 1 本で確保する。
-                    // 予算は DENNO_EXPERT_VRAM_MB から引く (カードの合計は変えない)。
-                    // task 250 はこの確保を prefill の最中 (expert 22 GB の後) に出して
-                    // 失敗し、追い出し階段が expert を全捨てした (decode 32-52 ms/tok)。
-                    let pool = if crate::model::pf_pool::pf_pool_on() {
-                        crate::cuda::pf_pool_init(crate::model::pf_pool::pf_pool_bytes())
-                    } else {
-                        0
-                    };
-                    let pool_mb = pool >> 20;
-                    let cap_mb = mb.saturating_sub(pool_mb);
-                    expert_vram::init(cap_mb.saturating_mul(1024 * 1024));
-                    if pool > 0 {
+                    // task 265: prefill の作業域は **起動時には取らない**。長い
+                    // prefill の入口で expert から借り、終端で返す
+                    // (`pf_pool_acquire` / `PfPoolGuard`)。予算は削らないので、
+                    // 起動直後の decode と短いプロンプトは base と同一になる。
+                    expert_vram::init(mb.saturating_mul(1024 * 1024));
+                    if crate::model::pf_pool::pf_pool_on() {
                         eprintln!(
-                            "[pf-pool] prefill の作業域 {} MiB を起動時に確保した \
-                             (expert 予算 {} → {} MiB)",
-                            pool_mb, mb, cap_mb
+                            "[pf-pool] 長い prefill (>= {} tok) のときだけ expert から \
+                             作業域を借りる (上限 {} MiB / 終端で返す)",
+                            crate::model::pf_pool::pf_pool_min_tok(),
+                            crate::model::pf_pool::pf_pool_bytes() >> 20
                         );
                     }
+                    let cap_mb = mb;
                     let min_hit = expert_min_hit();
                     eprintln!(
                         "[flash] expert GPU: ON (VRAM {} MiB, 既定の CPU 経路は使わない / \

@@ -1,4 +1,4 @@
-//! task 257: prefill の作業域を**起動時に 1 本だけ**確保するプール。
+//! task 257/265: prefill の作業域を **prefill のあいだだけ expert から借りる**プール。
 //!
 //! # なぜ要るか
 //!
@@ -8,32 +8,41 @@
 //! 連続確保を出し、`DevBuffer::alloc_tagged` の追い出し階段が expert を
 //! 33,497 MiB **全捨て** した (14k 後の decode 18.4 → 32-52 ms/tok)。
 //!
-//! ここでは作業域を **expert が載る前** (最初の MoE の直前 = キャッシュが空の
-//! 時点) に 1 本で確保し、prefill の間はその中を切り出して使う。確保は
-//! プロセスで 1 回だけなので、prefill の最中に `cuMemAlloc` を出さない。
+//! task 257 は作業域を起動時に 1 本で確保した (確保は通った) が、そのぶん
+//! expert の予算を 2,688 MiB 削ったので 14k 後の decode が +11.3% になった
+//! (lab t257b、ADOPT: no)。
+//!
+//! task 265 は **起動時には何も取らない**。長い prefill の入口で
+//! `DevBuffer::alloc_tagged` に 1 本だけ出し、足りない分はその経路が
+//! チャンク単位で expert を追い出して空ける (task 256)。prefill の終端で
+//! **そのまま返す** (cuMemFree) ので、decode のあいだカードは expert に
+//! 明け渡される。expert の LRU 上限は実空きから引き直される
+//! (`expert_vram::effective_expert_cap`) ので、会計も自動で戻る。
 //!
 //! # 会計
 //!
-//! プールは `DENNO_EXPERT_VRAM_MB` から引く (22000 + 2560 MiB のプールなら
-//! expert の予算は 19440 MiB)。カードの合計は変えない。
+//! 借りるのは「いまの空き + 追い出したチャンク」で、借りているあいだだけ
+//! 実空きが減る。返せば元に戻る (プロセス寿命で固定しない)。
 //!
 //! # ゲート
 //!
-//! - `DENNO_PF_POOL=1`: プールを使う (**既定 off**)。lab t257b で採否を決めた
+//! - `DENNO_PF_POOL=1`: プールを使う (**既定 off**)。lab の採否で決めた
 //!   (下の「採否」)。
-//! - `DENNO_PF_POOL_MB=<n>`: プールの大きさ (既定 [`DEFAULT_POOL_MB`])。
+//! - `DENNO_PF_POOL_MB=<n>`: 1 回に借りる上限 (既定 [`DEFAULT_POOL_MB`])。
+//!   レイアウトがこれを超えるときは借りない (従来の確保に落ちる)。
+//! - `DENNO_PF_POOL_MIN_TOK=<n>`: 借りる最小トークン数 (既定
+//!   [`DEFAULT_POOL_MIN_TOK`] = 2048)。これ未満のプロンプトはプールに触らない
+//!   (短い prefill と decode の経路を 1 バイトも変えない)。
 //!
-//! # 採否 (task 257、lab t257b、2026-11-12、depth8k / swift15-abl-IQ3_S)
+//! # 採否
 //!
-//! **既定 off のまま**。14k cold prefill は base 25.13 s → 17.51 s (-30.3%)、
-//! 3,826 は 7.24 s → 3.39 s (-53.3%) で prefill の Target は満たしたが、
-//! 14k 後の decode が 18.15 → 20.2 ms/tok (+11.3%、許容は +2%) で落ちた。
-//! 同じ expert 予算 (19,312 MiB) でプールなしの cap も 19.6 ms/tok (+8.0%)
-//! なので、予算を 2,688 MiB 削ること自体が Target を割る。プールの上乗せは
-//! +3% で、`[q4prof]` の decode の ple が 3.3 → 182.7/354.8 ms に跳ねる。
+//! task 257 (lab t257b): 起動時確保 + 予算削減は prefill の Target を満たしたが
+//! 14k 後の decode が +11.3% で不採用。task 265 で「借りて返す」形に変えた
+//! (採否は REPORT_P265.md の 1 行目)。
 //!
-//! レイアウト ([`layout`]) がプールに収まらないときは `None` を返し、呼び出し側は
-//! 従来どおり `alloc_tagged` で取る (fail open。数値は変わらない)。
+//! レイアウト ([`layout`]) が組めない・上限を超える・確保できないときは
+//! `None` を返し、呼び出し側は従来どおり `alloc_tagged` で取る
+//! (fail open。数値は変わらない)。
 
 /// `DENNO_PF_POOL`: プール経路のゲート。
 pub const PF_POOL_ENV: &str = "DENNO_PF_POOL";
@@ -42,11 +51,41 @@ pub const PF_POOL_MB_ENV: &str = "DENNO_PF_POOL_MB";
 
 /// プールの既定の大きさ (MiB)。
 ///
+/// task 265: 起動時に確保する量ではなく、**1 回に借りる上限**になった。
 /// 14k / `DENNO_PF_LM_TILE=5120` / tensor core のレイアウトは約 2,535 MiB
 /// (mixed + ffn 274、h 550、act 200、x + oacc 100、staging 512、PfDev 851、
 /// shared expert の x / ga / gu / sh 147、表 1)。2,688 MiB はその上に
 /// 約 150 MiB の余裕を残す。
 pub const DEFAULT_POOL_MB: usize = 2688;
+
+/// `DENNO_PF_POOL_MIN_TOK`: プールを借りる最小トークン数。
+pub const PF_POOL_MIN_TOK_ENV: &str = "DENNO_PF_POOL_MIN_TOK";
+
+/// プールを借りる最小トークン数の既定値。
+///
+/// これ未満のプロンプトは層優先でも作業域が 1 GB 未満なので、借りても
+/// 追い出す expert のほうが高くつく。実測した長文は 3,826 と 14,018。
+pub const DEFAULT_POOL_MIN_TOK: usize = 2048;
+
+/// [`PF_POOL_MIN_TOK_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
+pub fn pf_pool_min_tok_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_POOL_MIN_TOK),
+        None => DEFAULT_POOL_MIN_TOK,
+    }
+}
+
+/// プールを借りる最小トークン数 (env はプロセスで 1 回だけ読む)。
+pub fn pf_pool_min_tok() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pf_pool_min_tok_from_value(std::env::var(PF_POOL_MIN_TOK_ENV).ok().as_deref())
+    })
+}
 
 /// 区画の開始オフセットを合わせる単位 (バイト)。CUDA の確保は 256 B 整列なので、
 /// 区画の先頭は 1 KiB に揃えておく (同じバッファ内の別区画を別カーネルが
@@ -387,6 +426,19 @@ mod tests {
         assert_eq!(pf_pool_mb_from_value(Some("0")), DEFAULT_POOL_MB);
         assert_eq!(pf_pool_mb_from_value(Some("x")), DEFAULT_POOL_MB);
         assert_eq!(pf_pool_mb_from_value(Some("1024")), 1024);
+    }
+
+    /// task 265: プールを借りる最小トークン (既定 2,048)。0 / 解析不能は既定。
+    #[test]
+    fn min_tok_defaults_and_parses() {
+        assert_eq!(pf_pool_min_tok_from_value(None), DEFAULT_POOL_MIN_TOK);
+        assert_eq!(pf_pool_min_tok_from_value(Some("0")), DEFAULT_POOL_MIN_TOK);
+        assert_eq!(pf_pool_min_tok_from_value(Some("")), DEFAULT_POOL_MIN_TOK);
+        assert_eq!(pf_pool_min_tok_from_value(Some("x")), DEFAULT_POOL_MIN_TOK);
+        assert_eq!(pf_pool_min_tok_from_value(Some("512")), 512);
+        // 実測した長文 (3,826 / 14,018) はどちらも既定のしきい値を超える。
+        assert!(3826 >= DEFAULT_POOL_MIN_TOK);
+        assert!(14018 >= DEFAULT_POOL_MIN_TOK);
     }
 
     /// 14k / TILE=5120 / TC の作業域が 2,560 MiB に収まる (task 257 の前提)。
