@@ -9280,7 +9280,11 @@ pub fn pf_moe_shared_tail(total_rows: usize, ntok: usize, e: usize) -> Option<CU
     let off = total_rows.checked_mul(e)?.checked_mul(4)?;
     PF_SCRATCH.with(|cell| -> Option<CUdeviceptr> {
         let mut sc = cell.borrow_mut();
-        MoeScratch::ensure(&mut sc.h, bytes).ok()?;
+        if let Some(v) = pool_view(crate::model::pf_pool::R::H, 0, bytes) {
+            sc.h = Some(v);
+        } else {
+            MoeScratch::ensure(&mut sc.h, bytes).ok()?;
+        }
         let b = sc.h.as_ref()?;
         if b.bytes() < bytes {
             return None;
@@ -9414,17 +9418,18 @@ pub fn moe_experts_iq_pf_layer(
     let mut alloc = || -> Result<bool> {
         PF_SCRATCH.with(|cell| -> Result<bool> {
             let mut sc = cell.borrow_mut();
-            MoeScratch::ensure(&mut sc.x, xs.len() * 4)?;
-            MoeScratch::ensure(&mut sc.g, ng * 4)?;
-            MoeScratch::ensure(&mut sc.u, ng * 4)?;
-            MoeScratch::ensure(&mut sc.act, ng * 4)?;
-            MoeScratch::ensure(&mut sc.h, nh * 4)?;
-            MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
-            MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
-            MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
-            MoeScratch::ensure(&mut sc.seg, nseg * 16)?;
-            MoeScratch::ensure(&mut sc.rows_gu, total_rows * 4)?;
-            MoeScratch::ensure(&mut sc.rows_id, total_rows * 4)?;
+            // task 257: プールがあれば区画 (prefill 中に cuMemAlloc を出さない)。
+            ensure_region(&mut sc.x, crate::model::pf_pool::R::X, 0, xs.len() * 4)?;
+            ensure_region(&mut sc.g, crate::model::pf_pool::R::G, 0, ng * 4)?;
+            ensure_region(&mut sc.u, crate::model::pf_pool::R::U, 0, ng * 4)?;
+            ensure_region(&mut sc.act, crate::model::pf_pool::R::Act, 0, ng * 4)?;
+            ensure_region(&mut sc.h, crate::model::pf_pool::R::H, 0, nh * 4)?;
+            ensure_region(&mut sc.pg, crate::model::pf_pool::R::Pg, 0, nseg * 8)?;
+            ensure_region(&mut sc.pu, crate::model::pf_pool::R::Pu, 0, nseg * 8)?;
+            ensure_region(&mut sc.pd, crate::model::pf_pool::R::Pd, 0, nseg * 8)?;
+            ensure_region(&mut sc.seg, crate::model::pf_pool::R::Seg, 0, nseg * 16)?;
+            ensure_region(&mut sc.rows_gu, crate::model::pf_pool::R::RowsGu, 0, total_rows * 4)?;
+            ensure_region(&mut sc.rows_id, crate::model::pf_pool::R::RowsId, 0, total_rows * 4)?;
             {
                 let xb = sc.x.as_ref().expect("確保済み");
                 xb.copy_from(xs)?;
@@ -9619,7 +9624,7 @@ const PF_STAGE_MIN_MB: usize = 16;
 /// 引っかかり、ホストの写しと DMA が計算と直列になる (lab t162b: chunk 2048 で
 /// 1 グループ 4.4 ms = 計算 2.6 + 写し 0.9 + DMA 0.8 の和)。3 枚にすると
 /// 写しは 2 つ前のグループの計算と重なる。
-const PF_STAGE_SLOTS: usize = 3;
+pub(crate) const PF_STAGE_SLOTS: usize = 3;
 
 fn pf_stage_align_up(x: usize) -> usize {
     x.div_ceil(PF_STAGE_ALIGN) * PF_STAGE_ALIGN
@@ -9736,9 +9741,14 @@ pub fn arena_usage() -> Option<(usize, usize)> {
 ///
 /// `DevBuffer::alloc_tagged` は失敗すると expert を追い出すので**使わない**
 /// (decode の在庫を動かさないのがこの経路の前提)。
-fn pf_stage_alloc(want: usize) -> Option<DevBuffer> {
+///
+/// task 257: プールがあれば `slot` 枚目の区画をそのまま使う (確保しない)。
+fn pf_stage_alloc(want: usize, slot: usize) -> Option<DevBuffer> {
     if want == 0 {
         return None;
+    }
+    if let Some(v) = pool_view(crate::model::pf_pool::R::Stage, slot, want) {
+        return Some(v);
     }
     let free_mb = dev_mem_mb().map(|(f, _)| f).unwrap_or(0);
     let room = free_mb.saturating_sub(PF_STAGE_RESERVE_MB) << 20;
@@ -9941,7 +9951,7 @@ fn pf_slot_prepare(
             }
         }
         let want = need.max(PF_STAGE_MIN_MB << 20);
-        match pf_stage_alloc(want) {
+        match pf_stage_alloc(want, s) {
             Some(b) => {
                 st.slot[s].cap = b.bytes();
                 st.slot[s].buf = Some(b);
@@ -10590,11 +10600,12 @@ pub fn pf_dma_probe(host: &[u8]) -> bool {
         return false;
     }
     let hp = host.as_ptr() as usize;
-    let Some(dev) = pf_stage_alloc(n) else {
+    // 探針はプールを使わない (`usize::MAX` の枚数は無いので必ず通常の確保)。
+    let Some(dev) = pf_stage_alloc(n, usize::MAX) else {
         eprintln!("[pf-probe] デバイス {} MiB を確保できない — 測らない", n >> 20);
         return false;
     };
-    let Some(busy_dev) = pf_stage_alloc(64 << 20) else {
+    let Some(busy_dev) = pf_stage_alloc(64 << 20, usize::MAX) else {
         return false;
     };
     let Ok(wc) = PinMem::alloc_flags(n, true) else {
@@ -12048,22 +12059,23 @@ fn moe_experts_iq_pf_layer_stream_io(
             let mut sc = cell.borrow_mut();
             // task 254: 作業域の確保と活性・表の H2D (1 層 1 回) の台帳。
             let t_scratch = pf_host::stamp();
+            // task 257: プールがあれば区画 (prefill 中に cuMemAlloc を出さない)。
             // task 233: デバイス入力のときは `x` の作業域 (と H2D) を丸ごと省く。
             if host_x.is_some() {
-                MoeScratch::ensure(&mut sc.x, in_elems * 4)?;
+                ensure_region(&mut sc.x, crate::model::pf_pool::R::X, 0, in_elems * 4)?;
             }
-            MoeScratch::ensure(&mut sc.h, nh * 4)?;
-            MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
-            MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
-            MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
-            MoeScratch::ensure(&mut sc.seg, nseg * 16)?;
-            MoeScratch::ensure(&mut sc.rows_gu, total_rows * 4)?;
-            MoeScratch::ensure(&mut sc.rows_id, total_rows * 4)?;
-            MoeScratch::ensure(&mut sc.prow, ntok * kk * 4)?;
-            MoeScratch::ensure(&mut sc.wrow, ntok * kk * 4)?;
+            ensure_region(&mut sc.h, crate::model::pf_pool::R::H, 0, nh * 4)?;
+            ensure_region(&mut sc.pg, crate::model::pf_pool::R::Pg, 0, nseg * 8)?;
+            ensure_region(&mut sc.pu, crate::model::pf_pool::R::Pu, 0, nseg * 8)?;
+            ensure_region(&mut sc.pd, crate::model::pf_pool::R::Pd, 0, nseg * 8)?;
+            ensure_region(&mut sc.seg, crate::model::pf_pool::R::Seg, 0, nseg * 16)?;
+            ensure_region(&mut sc.rows_gu, crate::model::pf_pool::R::RowsGu, 0, total_rows * 4)?;
+            ensure_region(&mut sc.rows_id, crate::model::pf_pool::R::RowsId, 0, total_rows * 4)?;
+            ensure_region(&mut sc.prow, crate::model::pf_pool::R::Prow, 0, ntok * kk * 4)?;
+            ensure_region(&mut sc.wrow, crate::model::pf_pool::R::Wrow, 0, ntok * kk * 4)?;
             // task 233: デバイス出力のときは oacc も要らない (置き場へ直接書く)。
             if host_out.is_some() {
-                MoeScratch::ensure(&mut sc.oacc, ntok * e * 4)?;
+                ensure_region(&mut sc.oacc, crate::model::pf_pool::R::Oacc, 0, ntok * e * 4)?;
             }
             {
                 if let Some(xs) = host_x {
@@ -12202,7 +12214,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                     if st.slot[i].cap >= want_slot && st.slot[i].buf.is_some() {
                         continue;
                     }
-                    if let Some(b) = pf_stage_alloc(want_slot) {
+                    if let Some(b) = pf_stage_alloc(want_slot, i) {
                         st.slot[i].cap = b.bytes();
                         st.slot[i].buf = Some(b);
                     } else {
@@ -12262,14 +12274,14 @@ fn moe_experts_iq_pf_layer_stream_io(
             let (gb, ub) = if tc_kernels.is_some() {
                 (0u64, 0u64)
             } else {
-                MoeScratch::ensure(&mut sc.g, rows_cap * ff * 4)?;
-                MoeScratch::ensure(&mut sc.u, rows_cap * ff * 4)?;
+                ensure_region(&mut sc.g, crate::model::pf_pool::R::G, 0, rows_cap * ff * 4)?;
+                ensure_region(&mut sc.u, crate::model::pf_pool::R::U, 0, rows_cap * ff * 4)?;
                 (
                     sc.g.as_ref().expect("確保済み").ptr(),
                     sc.u.as_ref().expect("確保済み").ptr(),
                 )
             };
-            MoeScratch::ensure(&mut sc.act, rows_cap * ff * 4)?;
+            ensure_region(&mut sc.act, crate::model::pf_pool::R::Act, 0, rows_cap * ff * 4)?;
             let act = sc.act.as_ref().expect("確保済み").ptr();
             // グループ局所のときは、行の先頭を**グループの先頭から**の相対番号へ
             // 直した `seg` を積む (カーネルは `obase + (s.ro + r)*n_out` に書く)。
@@ -13076,7 +13088,7 @@ mod pf_stream_tests {
     /// 通らない。ここでは確保要求 0 で何も取らないことを固定する。
     #[test]
     fn stage_alloc_is_a_noop_for_zero() {
-        assert!(pf_stage_alloc(0).is_none());
+        assert!(pf_stage_alloc(0, 0).is_none());
     }
 
     /// task 254: 表の非同期 H2D のゲートは他のゲートと同じ解釈で、GPU が無い
@@ -24244,14 +24256,15 @@ pub fn pf_begin(nt: usize, hc: usize, e: usize, lr: usize) -> bool {
             d.lr = lr;
         }
         let hc_dim = hc * e;
-        Scratch::ensure_tagged(&mut d.res, nt * hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
-        Scratch::ensure_tagged(&mut d.xn, nt * hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
-        Scratch::ensure_tagged(&mut d.lo, nt * lr * 4, crate::mem_audit::TAG_OTHER)?;
-        Scratch::ensure_tagged(&mut d.gate, nt * hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
-        Scratch::ensure_tagged(&mut d.mixed, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
-        Scratch::ensure_tagged(&mut d.inj, nt * hc * 4, crate::mem_audit::TAG_OTHER)?;
-        Scratch::ensure_tagged(&mut d.bo, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
-        Scratch::ensure_tagged(&mut d.gamma, hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
+        // task 257: プールがあれば区画 (prefill 中に cuMemAlloc を出さない)。
+        ensure_region(&mut d.res, crate::model::pf_pool::R::DevRes, 0, nt * hc_dim * 4)?;
+        ensure_region(&mut d.xn, crate::model::pf_pool::R::DevXn, 0, nt * hc_dim * 4)?;
+        ensure_region(&mut d.lo, crate::model::pf_pool::R::DevLo, 0, nt * lr * 4)?;
+        ensure_region(&mut d.gate, crate::model::pf_pool::R::DevGate, 0, nt * hc_dim * 4)?;
+        ensure_region(&mut d.mixed, crate::model::pf_pool::R::DevMixed, 0, nt * e * 4)?;
+        ensure_region(&mut d.inj, crate::model::pf_pool::R::DevInj, 0, nt * hc * 4)?;
+        ensure_region(&mut d.bo, crate::model::pf_pool::R::DevBo, 0, nt * e * 4)?;
+        ensure_region(&mut d.gamma, crate::model::pf_pool::R::DevGamma, 0, hc_dim * 4)?;
         Ok(())
     });
     match r {
@@ -24273,8 +24286,11 @@ pub fn pf_res_park_ensure(slots: usize, rows: usize, hc: usize, e: usize) -> boo
     PF_DEV.with(|cell| -> bool {
         let mut d = cell.borrow_mut();
         while d.park.len() < slots {
-            match DevBuffer::alloc_tagged(want, crate::mem_audit::TAG_OTHER) {
-                Ok(b) => d.park.push(b),
+            // task 257: プールがあればその区画 (D2D の退避域も prefill 中に取らない)。
+            let i = d.park.len();
+            let mut slot: Option<DevBuffer> = None;
+            match ensure_region(&mut slot, crate::model::pf_pool::R::DevPark, i, want) {
+                Ok(()) => d.park.push(slot.expect("ensure_region が入れる")),
                 Err(e) => {
                     tracing::warn!("pf_res_park_ensure: 確保に失敗: {e:#}");
                     return false;
@@ -24345,6 +24361,137 @@ pub fn pf_res_park_load(i: usize, rows: usize, hc: usize, e: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// task 257: prefill 作業域のプール (起動時に 1 本だけ確保し、prefill 中は確保しない)
+// ---------------------------------------------------------------------------
+//
+// task 250 は層優先 + tensor core で 14k cold prefill を 25.4 s → 9.9-15.0 s に
+// 縮めたが、作業域 (1.3-2.2 GB) を expert がカードを埋めた**後**に確保しようと
+// して失敗し、追い出し階段が expert を 33,497 MiB 全捨てした (decode 18.4 →
+// 32-52 ms/tok)。ここでは作業域を expert キャッシュが空の時点で 1 本 ensure し、
+// prefill の確保はその中の区画を指す**非所有ビュー**にする。
+//
+// レイアウトは [`crate::model::pf_pool::layout`] (純関数) が形から組む。
+// プールは `DENNO_EXPERT_VRAM_MB` から引く (呼び出し側 = `expert_route`)。
+// 区画に収まらない要求は従来の `alloc_tagged` に落ちる (fail open)。
+
+/// プール本体 (プロセスで 1 本)。`None` は「確保できなかった」。
+#[cfg(feature = "cuda")]
+static PF_POOL: std::sync::OnceLock<Option<&'static DevBuffer>> = std::sync::OnceLock::new();
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    /// このスレッドの prefill で使う区画 (リクエストの先頭で組み直す)。
+    static PF_POOL_LAYOUT: std::cell::RefCell<Option<crate::model::pf_pool::Layout>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// task 257: プールを 1 回だけ確保する (戻り値は確保できたバイト数。0 = 無効)。
+///
+/// **expert キャッシュが空の時点** (最初の MoE の直前) に呼ぶこと。以降の
+/// 確保はすべてこの中のビューになる。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_init(bytes: usize) -> usize {
+    if bytes == 0 {
+        return 0;
+    }
+    let slot = PF_POOL.get_or_init(|| {
+        let Some(ctx) = shared_ctx() else {
+            return None;
+        };
+        if ctx.make_current().is_err() {
+            return None;
+        }
+        match DevBuffer::alloc_tagged(bytes, crate::mem_audit::TAG_OTHER) {
+            Ok(b) => {
+                let b: &'static DevBuffer = Box::leak(Box::new(b));
+                Some(b)
+            }
+            Err(e) => {
+                tracing::warn!("pf_pool: プール {} MiB の確保に失敗: {e:#}", bytes >> 20);
+                None
+            }
+        }
+    });
+    slot.map(|b| b.bytes()).unwrap_or(0)
+}
+
+/// task 257: 確保済みのプールのバイト数 (0 = 無し)。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_len() -> usize {
+    PF_POOL.get().and_then(|s| s.as_ref()).map(|b| b.bytes()).unwrap_or(0)
+}
+
+/// task 257: このリクエストの区画を組む (`pf_pool::layout` がプールに収まるときだけ)。
+///
+/// 収まらない・プールが無いときは `false` を返し、確保は従来の経路に落ちる。
+/// 1 リクエストで 1 回だけ呼ぶ (層ループの中では呼ばない)。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_begin(n: &crate::model::pf_pool::Need) -> bool {
+    let pool = pf_pool_len();
+    let Some(l) = crate::model::pf_pool::layout(n) else {
+        PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = None);
+        return false;
+    };
+    if pool == 0 || !crate::model::pf_pool::fits(&l, pool) {
+        if pool > 0 {
+            eprintln!(
+                "[pf-pool] 作業域の見積り {} MiB がプール {} MiB に収まらない → 従来の確保",
+                l.total >> 20,
+                pool >> 20
+            );
+        }
+        PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = None);
+        return false;
+    }
+    PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
+    eprintln!(
+        "[pf-pool] 作業域 {} MiB を予約区画から配る (タイル {} / プール {} MiB)",
+        l.total >> 20,
+        n.tile,
+        pool >> 20
+    );
+    true
+}
+
+/// task 257: 区画 `r` の `idx` 枚目を指す非所有ビュー (プールが無ければ `None`)。
+#[cfg(feature = "cuda")]
+fn pool_view(r: crate::model::pf_pool::R, idx: usize, want: usize) -> Option<DevBuffer> {
+    let l = PF_POOL_LAYOUT.with(|c| *c.borrow())?;
+    let g = l.region(r);
+    let u = l.unit(r);
+    let slots = match r {
+        crate::model::pf_pool::R::LmInj => l.lm_inj_slots,
+        crate::model::pf_pool::R::Stage => l.stage_slots,
+        crate::model::pf_pool::R::DevPark => l.dev_park_slots,
+        _ => 1,
+    };
+    if idx >= slots || u == 0 || u < want {
+        return None;
+    }
+    let pool = PF_POOL.get()?.as_ref()?;
+    let off = g.off.checked_add(idx.checked_mul(u)?)?;
+    if off.checked_add(u)? > pool.bytes() {
+        return None;
+    }
+    Some(pool.view_at(off, u))
+}
+
+/// task 257: 区画があればそこを指すビューを `cap` に入れ、無ければ従来どおり確保する。
+#[cfg(feature = "cuda")]
+fn ensure_region(
+    cap: &mut Option<DevBuffer>,
+    r: crate::model::pf_pool::R,
+    idx: usize,
+    want: usize,
+) -> anyhow::Result<()> {
+    if let Some(v) = pool_view(r, idx, want) {
+        *cap = Some(v);
+        return Ok(());
+    }
+    MoeScratch::ensure(cap, want)
+}
+
+// ---------------------------------------------------------------------------
 // task 233: 層優先 prefill の「全トークンの活性」をデバイスに置いたままにする
 // ---------------------------------------------------------------------------
 //
@@ -24399,11 +24546,14 @@ pub fn pf_lm_ensure(nt: usize, e: usize, hc: usize, chunk: usize) -> bool {
             };
         }
         let r = (|| -> anyhow::Result<()> {
-            Scratch::ensure_tagged(&mut d.mixed, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
-            Scratch::ensure_tagged(&mut d.ffn, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
+            // task 257: プールがあればその区画 (prefill 中に cuMemAlloc を出さない)。
+            ensure_region(&mut d.mixed, crate::model::pf_pool::R::LmMixed, 0, nt * e * 4)?;
+            ensure_region(&mut d.ffn, crate::model::pf_pool::R::LmFfn, 0, nt * e * 4)?;
             while d.inj.len() < slots {
-                let b = DevBuffer::alloc_tagged(chunk * hc * 4, crate::mem_audit::TAG_OTHER)?;
-                d.inj.push(b);
+                let i = d.inj.len();
+                let mut slot: Option<DevBuffer> = None;
+                ensure_region(&mut slot, crate::model::pf_pool::R::LmInj, i, chunk * hc * 4)?;
+                d.inj.push(slot.expect("ensure_region が入れる"));
             }
             Ok(())
         })();
@@ -37284,6 +37434,36 @@ mod q4_attn_tests {
 mod tests {
     use super::*;
     use crate::tensor;
+
+    /// task 257: プールが無い (このテストでは `pf_pool_init` を呼ばない) とき、
+    /// `pf_pool_begin` は false を返し、区画ビューも取れない = 従来の確保に落ちる。
+    ///
+    /// プールの**発火側**は lab の実測でしか確かめられないが、fail open の契約は
+    /// ここで固定する (確保の分岐が黙って変わらないように)。
+    #[test]
+    fn pool_begin_is_false_without_pool_and_views_are_none() {
+        let need = crate::model::pf_pool::Need {
+            nt_all: 14018,
+            tile: 5120,
+            k: 10,
+            e: 2560,
+            ff: 1024,
+            hc: 4,
+            lr: 256,
+            chunk: 1536,
+            ne: 512,
+            tc: true,
+            stage_bytes: 512 << 20,
+            stage_slots: PF_STAGE_SLOTS,
+        };
+        // レイアウト自体は組める (純関数)。
+        assert!(crate::model::pf_pool::layout(&need).is_some());
+        // プールは未確保なので active にならない。
+        assert_eq!(pf_pool_len(), 0);
+        assert!(!pf_pool_begin(&need));
+        assert!(pool_view(crate::model::pf_pool::R::H, 0, 1).is_none());
+        assert!(pool_view(crate::model::pf_pool::R::Stage, 0, 1).is_none());
+    }
 
     /// task 210: 捨てた cache の ID のミラーは残さない (生きている ID は残す)。
     /// ミラーは ID を鍵にした LRU で、上限 (3584 MiB) まで残るのが仕様なので、

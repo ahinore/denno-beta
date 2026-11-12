@@ -3784,6 +3784,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 return Ok(Some(v));
             }
         }
+        // task 257: 作業域のプール (起動時に確保済み) をこのリクエストの形で組む。
+        // チャンク優先は 1 チャンクぶんの MoE なので、タイル = 最初のチャンク。
+        self.pf_pool_begin_for(ctx.len(), first_nt, first_nt, hc, lr);
         if !crate::cuda::pf_begin(first_nt, hc, e, lr) {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
@@ -4182,6 +4185,30 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         Ok(Some(vec![logits]))
     }
 
+    /// task 257: このリクエストの形で prefill 作業域のプール区画を組む。
+    ///
+    /// プールは起動時に 1 本だけ確保済み (`DENNO_PF_POOL`)。ここでは形から
+    /// 区画のオフセットを決めるだけで、デバイスの確保はしない。収まらないときは
+    /// `pf_pool_begin` が false を返し、確保は従来の `alloc_tagged` に落ちる。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_begin_for(&self, nt_all: usize, tile: usize, chunk: usize, hc: usize, lr: usize) {
+        let _ = crate::cuda::pf_pool_begin(&crate::model::pf_pool::Need {
+            nt_all,
+            tile,
+            k: self.p.n_expert_used,
+            e: self.p.n_embd,
+            ff: self.p.n_ff_exp,
+            hc,
+            lr,
+            chunk: chunk.max(1),
+            ne: self.p.n_expert,
+            // `lm_group_local` が on のときは tensor core を使わない (g / u が要る)。
+            tc: crate::model::exp_pf::tc_exp_on() && !crate::model::exp_pf::lm_group_local(),
+            stage_bytes: crate::model::exp_pf::stream_bytes(),
+            stage_slots: crate::cuda::PF_STAGE_SLOTS,
+        });
+    }
+
     /// task 227: 層優先の常駐 prefill (`DENNO_PF_LM_LAYER=1`)。
     ///
     /// 部品はチャンク優先の常駐連鎖と同じで、順序だけが違う。層 L について
@@ -4221,6 +4248,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         if ranges.len() < 2 {
             return Ok(None);
         }
+        // task 257: 作業域のプール (起動時に確保済み) をこのリクエストの形で組む。
+        self.pf_pool_begin_for(nt_all, crate::model::exp_pf::lm_tile(nt_all), chunk.min(nt_all), hc, lr);
         if !crate::cuda::pf_begin(chunk.min(nt_all), hc, e, lr) {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
@@ -9119,13 +9148,31 @@ fn expert_route() -> Route {
             Route::Vram => {
                 #[cfg(feature = "cuda")]
                 {
-                    expert_vram::init(mb.saturating_mul(1024 * 1024));
+                    // task 257: prefill の作業域を **expert が載る前**に 1 本で確保する。
+                    // 予算は DENNO_EXPERT_VRAM_MB から引く (カードの合計は変えない)。
+                    // task 250 はこの確保を prefill の最中 (expert 22 GB の後) に出して
+                    // 失敗し、追い出し階段が expert を全捨てした (decode 32-52 ms/tok)。
+                    let pool = if crate::model::pf_pool::pf_pool_on() {
+                        crate::cuda::pf_pool_init(crate::model::pf_pool::pf_pool_bytes())
+                    } else {
+                        0
+                    };
+                    let pool_mb = pool >> 20;
+                    let cap_mb = mb.saturating_sub(pool_mb);
+                    expert_vram::init(cap_mb.saturating_mul(1024 * 1024));
+                    if pool > 0 {
+                        eprintln!(
+                            "[pf-pool] prefill の作業域 {} MiB を起動時に確保した \
+                             (expert 予算 {} → {} MiB)",
+                            pool_mb, mb, cap_mb
+                        );
+                    }
                     let min_hit = expert_min_hit();
                     eprintln!(
                         "[flash] expert GPU: ON (VRAM {} MiB, 既定の CPU 経路は使わない / \
                          ヒット率 < {} のトークンは CPU: DENNO_EXPERT_GPU_MIN_HIT / \
                          IQ ゲート {} / 上げ直し {}/tok)",
-                        mb,
+                        cap_mb,
                         min_hit,
                         if iq { "on" } else { "off" },
                         crate::model::exp_iq::upload_per_token()
