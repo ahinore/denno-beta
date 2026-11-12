@@ -4192,18 +4192,36 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     /// `pf_pool_begin` が false を返し、確保は従来の `alloc_tagged` に落ちる。
     #[cfg(feature = "cuda")]
     fn pf_pool_begin_for(&self, nt_all: usize, tile: usize, chunk: usize, hc: usize, lr: usize) {
+        let e = self.p.n_embd;
+        let ff = self.p.n_ff_exp;
+        // tensor core の grouped GEMM がこのモデルで実際に使えるか (層 0 の型で判定)。
+        // 使えないときは GEMV 経路になり g / u の作業域が要るので、その分も取る。
+        let lw0 = &self.layers[0];
+        let (ty_g, ty_u, ty_d) = (lw0.gate_exps.ty, lw0.up_exps.ty, lw0.down_exps.ty);
+        let tc = crate::model::exp_pf::tc_exp_on()
+            && !crate::model::exp_pf::lm_group_local()
+            && crate::cuda::exp_tc_ready()
+            && crate::cuda::tc_shapes_ok(
+                crate::model::exp_pf::slot(ty_g),
+                crate::model::exp_pf::slot(ty_d),
+                ty_g == ty_u,
+                e,
+                ff,
+                ff,
+                e,
+            );
         let _ = crate::cuda::pf_pool_begin(&crate::model::pf_pool::Need {
             nt_all,
             tile,
             k: self.p.n_expert_used,
-            e: self.p.n_embd,
-            ff: self.p.n_ff_exp,
+            e,
+            ff,
+            sff: lw0.gate_shexp.n(),
             hc,
             lr,
             chunk: chunk.max(1),
             ne: self.p.n_expert,
-            // `lm_group_local` が on のときは tensor core を使わない (g / u が要る)。
-            tc: crate::model::exp_pf::tc_exp_on() && !crate::model::exp_pf::lm_group_local(),
+            tc,
             stage_bytes: crate::model::exp_pf::stream_bytes(),
             stage_slots: crate::cuda::PF_STAGE_SLOTS,
         });
@@ -4645,29 +4663,47 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
             }
             if !ffn_dev {
+                // task 257: フォールバックは**タイル単位**で回す。nt_all で一気に回すと
+                // 作業域 (14k で h 1.5 GB) がプールに収まらず、確保失敗 → ストリーム
+                // 停止 → 以後すべて CPU で 209 s になる (lab t257a の実測)。
+                if lm_fallback == 0 {
+                    eprintln!(
+                        "[pf-lm] 層 {il}: dev MoE を諦めた (理由: {}) → CPU (タイル {} 単位)",
+                        lm_decline_reason(),
+                        tile
+                    );
+                }
                 lm_fallback += 1;
                 let buf = mixed_buf.get_or_insert_with(|| PfHostBuf::new(nt_all * e));
                 if !crate::cuda::pf_lm_take_mixed(&mut buf.as_mut_slice()[..nt_all * e]) {
                     Self::pf_bail("mixed の D2H に失敗")?;
                 }
                 let mixed_all: &[f32] = &buf.as_slice()[..nt_all * e];
-                let ffn = moe_ffn_quant_batch_tapped(
-                    &self.p,
-                    lw,
-                    mixed_all,
-                    nt_all,
-                    self.expert_cache.as_ref(),
-                    roles.as_deref_mut(),
-                    true,
-                    iv,
-                )?;
-                if ffn.len() != nt_all * e {
-                    return Err(one(format!(
-                        "層 {il}: MoE の出力長 {} が nt {nt_all} * n_embd {e} と違う",
-                        ffn.len()
-                    )));
+                let mut ffn_all = vec![0.0f32; nt_all * e];
+                let mut t0 = 0usize;
+                while t0 < nt_all {
+                    let nt = tile.min(nt_all - t0);
+                    let last = t0 + nt == nt_all;
+                    let ffn = moe_ffn_quant_batch_tapped(
+                        &self.p,
+                        lw,
+                        &mixed_all[t0 * e..(t0 + nt) * e],
+                        nt,
+                        self.expert_cache.as_ref(),
+                        roles.as_deref_mut(),
+                        last,
+                        iv,
+                    )?;
+                    if ffn.len() != nt * e {
+                        return Err(one(format!(
+                            "層 {il}: MoE の出力長 {} が nt {nt} * n_embd {e} と違う",
+                            ffn.len()
+                        )));
+                    }
+                    ffn_all[t0 * e..(t0 + nt) * e].copy_from_slice(&ffn);
+                    t0 += nt;
                 }
-                if !crate::cuda::pf_lm_upload_ffn(&ffn) {
+                if !crate::cuda::pf_lm_upload_ffn(&ffn_all) {
                     Self::pf_bail("MoE の出力を置き場へ上げられない")?;
                 }
             }
@@ -16073,6 +16109,25 @@ fn moe_ffn_quant_batch_lm_dev(
 ///
 /// `h` などの作業域はタイルの行数で取るので、14k でも 1.5 GB の連続確保が要らない。
 #[allow(clippy::too_many_arguments)]
+/// task 257: dev MoE を諦めた理由 (診断。層ループの外で 1 行だけ出す)。
+#[cfg(feature = "cuda")]
+thread_local! {
+    static LM_DECLINE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// task 257: 理由を控えて `false` を返す (呼び出し側が 1 行だけ出す)。
+#[cfg(feature = "cuda")]
+fn lm_decline(reason: &'static str) -> bool {
+    LM_DECLINE.with(|c| c.set(reason));
+    false
+}
+
+/// task 257: 直前の dev MoE が諦めた理由 (空 = 無い)。
+#[cfg(feature = "cuda")]
+fn lm_decline_reason() -> &'static str {
+    LM_DECLINE.with(|c| c.get())
+}
+
 fn moe_ffn_quant_batch_lm_dev_at(
     p: &Qwen4ExpParams,
     lw: &LayerW,
@@ -16108,13 +16163,13 @@ fn moe_ffn_quant_batch_lm_dev_at(
         pf_router_gpu_on(),
         lw.gate_inp.k() == e,
     ) {
-        return Ok(false);
+        return Ok(lm_decline("gate"));
     }
     let Some(xs_dev) = crate::cuda::pf_lm_mixed_ptr(tok0, nt_all, e) else {
-        return Ok(false);
+        return Ok(lm_decline("mixed ptr"));
     };
     let Some(out_base) = crate::cuda::pf_lm_ffn_ptr(nt_all, e) else {
-        return Ok(false);
+        return Ok(lm_decline("ffn ptr"));
     };
     // 出力もこのタイルの先頭へずらす (`out` は nt_all 行の置き場)。
     let out_dev = out_base + (tok0 * e * 4) as u64;
@@ -16122,7 +16177,7 @@ fn moe_ffn_quant_batch_lm_dev_at(
     let skip_routed = iv.block_off(lw.il, IvBlock::Moe);
     let skip_shared = iv.block_off(lw.il, IvBlock::Shared);
     if skip_routed {
-        return Ok(false);
+        return Ok(lm_decline("skip_routed"));
     }
     // 1. ルータ (入力をデバイスから直接読む)。probs だけホストへ戻る。
     let mut probs = vec![0.0f32; nt * ne];
@@ -16136,7 +16191,7 @@ fn moe_ffn_quant_batch_lm_dev_at(
         &mut probs,
         GgmlType::F32,
     ) {
-        return Ok(false);
+        return Ok(lm_decline("router gemm"));
     }
     mark(0);
     let sm_block = router_sm_block();
@@ -16180,7 +16235,7 @@ fn moe_ffn_quant_batch_lm_dev_at(
     let pick: Vec<bool> = by_expert.iter().map(|p| !p.is_empty()).collect();
     let plan = crate::model::exp_pf::build_plan(&by_expert, &pick);
     if plan.total_rows == 0 {
-        return Ok(false);
+        return Ok(lm_decline("no rows"));
     }
     let total_rows = plan.total_rows;
     mark(2);
@@ -16191,7 +16246,7 @@ fn moe_ffn_quant_batch_lm_dev_at(
         let sff = lw.gate_shexp.n();
         let gn = lw.gate_inp_shexp.n();
         if sff == 0 || gn == 0 {
-            return Ok(false);
+            return Ok(lm_decline("shared shape"));
         }
         let mut sg = vec![0.0f32; nt * gn];
         if !crate::cuda::maybe_gpu_f32_gemm_batch_dev_into(
@@ -16204,11 +16259,11 @@ fn moe_ffn_quant_batch_lm_dev_at(
             &mut sg,
             GgmlType::F32,
         ) {
-            return Ok(false);
+            return Ok(lm_decline("shared router"));
         }
         sh_w = (0..nt).map(|t| hyper::sigmoid(sg[t * gn])).collect();
         let Some(tail) = crate::cuda::pf_moe_shared_tail(total_rows, nt, e) else {
-            return Ok(false);
+            return Ok(lm_decline("shared tail"));
         };
         if !crate::cuda::pf_shared_dev_to(
             xs_dev,
@@ -16220,7 +16275,7 @@ fn moe_ffn_quant_batch_lm_dev_at(
             Qwen4Exp::pf_lin(&lw.down_shexp),
             tail,
         ) {
-            return Ok(false);
+            return Ok(lm_decline("shared dev"));
         }
         sh_dev = tail;
     }
@@ -16298,7 +16353,7 @@ fn moe_ffn_quant_batch_lm_dev_at(
         ff,
     )? {
         Some(_) => {}
-        None => return Ok(false),
+        None => return Ok(lm_decline("stream")),
     }
     mark(4);
     // 5. 役割 RMS (チャンク末尾のトークン)。

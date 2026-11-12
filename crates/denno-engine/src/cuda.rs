@@ -11523,6 +11523,12 @@ fn exp_tc_ptx_path() -> std::path::PathBuf {
 
 /// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
 /// (以後このプロセスでは tensor core 経路を使わず、既存の GEMV へ落ちる)。
+/// task 257: プールのレイアウト判定からも見られるようにする (g/u を取るか)。
+#[cfg(feature = "cuda")]
+pub fn exp_tc_ready() -> bool {
+    exp_tc_kernels().is_some()
+}
+
 fn exp_tc_kernels() -> Option<&'static ExpTcKernels> {
     EXP_TC_KERNELS
         .get_or_init(|| {
@@ -27475,12 +27481,13 @@ fn pf_shared_impl(
     };
     let r = PF2_DEV.with(|cell| -> Result<()> {
         let mut d = cell.borrow_mut();
-        pf2_ensure(&mut d.x, nt * e * 4)?;
-        pf2_ensure(&mut d.ga, nt * sff * 4)?;
-        pf2_ensure(&mut d.gu, nt * sff * 4)?;
+        // task 257: shared expert の作業域もプールから (タイルの行数で足りる)。
+        ensure_region(&mut d.x, crate::model::pf_pool::R::ShX, 0, nt * e * 4)?;
+        ensure_region(&mut d.ga, crate::model::pf_pool::R::ShGa, 0, nt * sff * 4)?;
+        ensure_region(&mut d.gu, crate::model::pf_pool::R::ShGu, 0, nt * sff * 4)?;
         // task 233: デバイス出力のときは `sh` (ホストへ戻すための中間) を確保しない。
         if matches!(out, SharedOut::Host(_)) {
-            pf2_ensure(&mut d.sh, nt * e * 4)?;
+            ensure_region(&mut d.sh, crate::model::pf_pool::R::ShSh, 0, nt * e * 4)?;
         }
         // swiglu の出力は x の領域へ (gate/up を撃ったあとの x はもう不要。
         // ga を in-place で上書きすると別名になるので避ける)。
@@ -37448,6 +37455,7 @@ mod tests {
             k: 10,
             e: 2560,
             ff: 1024,
+            sff: 1024,
             hc: 4,
             lr: 256,
             chunk: 1536,

@@ -32,10 +32,11 @@ pub const PF_POOL_MB_ENV: &str = "DENNO_PF_POOL_MB";
 
 /// プールの既定の大きさ (MiB)。
 ///
-/// 14k / `DENNO_PF_LM_TILE=5120` / tensor core のレイアウトは約 2,388 MiB
+/// 14k / `DENNO_PF_LM_TILE=5120` / tensor core のレイアウトは約 2,535 MiB
 /// (mixed + ffn 274、h 550、act 200、x + oacc 100、staging 512、PfDev 851、
-/// 表 1)。2,560 MiB はその上に約 170 MiB の余裕を残す。
-pub const DEFAULT_POOL_MB: usize = 2560;
+/// shared expert の x / ga / gu / sh 147、表 1)。2,688 MiB はその上に
+/// 約 150 MiB の余裕を残す。
+pub const DEFAULT_POOL_MB: usize = 2688;
 
 /// 区画の開始オフセットを合わせる単位 (バイト)。CUDA の確保は 256 B 整列なので、
 /// 区画の先頭は 1 KiB に揃えておく (同じバッファ内の別区画を別カーネルが
@@ -135,11 +136,19 @@ pub enum R {
     DevGamma,
     /// `PfDev::park` の 1 枚 (`[chunk][hc][e]`)
     DevPark,
+    /// shared expert の入力 (`[tile][e]`、`pf_shared_impl` の `d.x`)
+    ShX,
+    /// shared expert の gate (`[tile][sff]`)
+    ShGa,
+    /// shared expert の up (`[tile][sff]`)
+    ShGu,
+    /// shared expert の down 出力 (`[tile][e]`、ホスト出力のときだけ)
+    ShSh,
 }
 
 impl R {
     /// 全部の区画 (レイアウトの並び順)。
-    pub const ALL: [R; 27] = [
+    pub const ALL: [R; 31] = [
         R::LmMixed,
         R::LmFfn,
         R::LmInj,
@@ -167,6 +176,10 @@ impl R {
         R::DevBo,
         R::DevGamma,
         R::DevPark,
+        R::ShX,
+        R::ShGa,
+        R::ShGu,
+        R::ShSh,
     ];
 }
 
@@ -183,6 +196,8 @@ pub struct Need {
     pub e: usize,
     /// expert の隠れ長。
     pub ff: usize,
+    /// shared expert の隠れ長。
+    pub sff: usize,
     /// hc mix の分岐数。
     pub hc: usize,
     /// hc mix の低ランク長。
@@ -310,6 +325,11 @@ pub fn layout(n: &Need) -> Option<Layout> {
     l.set(R::DevBo, elems4(n.chunk, n.e)?, 1)?;
     l.set(R::DevGamma, elems4(1, hc_e)?, 1)?;
     l.set(R::DevPark, elems4(n.chunk, hc_e)?, l.dev_park_slots)?;
+    // --- shared expert (`pf_shared_impl` の作業域) ---
+    l.set(R::ShX, elems4(n.tile, n.e)?, 1)?;
+    l.set(R::ShGa, elems4(n.tile, n.sff.max(1))?, 1)?;
+    l.set(R::ShGu, elems4(n.tile, n.sff.max(1))?, 1)?;
+    l.set(R::ShSh, elems4(n.tile, n.e)?, 1)?;
     Some(l)
 }
 
@@ -323,13 +343,14 @@ mod tests {
     use super::*;
 
     fn need() -> Need {
-        // 本番モデル相当 (e=2560 / k=10 / hc=4 / ff=1024) の 14k。
+        // 本番モデル相当 (e=2560 / k=10 / hc=4 / ff=1024 / sff=1024) の 14k。
         Need {
             nt_all: 14018,
             tile: 5120,
             k: 10,
             e: 2560,
             ff: 1024,
+            sff: 1024,
             hc: 4,
             lr: 256,
             chunk: 1536,
@@ -373,8 +394,11 @@ mod tests {
         // 複数枚の区画は全枚ぶんを確保する。
         assert_eq!(l.region(R::Stage).bytes, l.unit(R::Stage) * l.stage_slots);
         assert_eq!(l.region(R::DevPark).bytes, l.unit(R::DevPark) * l.dev_park_slots);
-        // 余裕 (推定 170 MiB 前後) を空けたまま収まる。
-        assert!(pool - l.total > (100 << 20), "余裕 {} B", pool - l.total);
+        // 余裕 (推定 100 MiB 前後) を空けたまま収まる。
+        assert!(pool - l.total > (64 << 20), "余裕 {} B", pool - l.total);
+        // shared expert の隠れ長が 2 倍でも収まる (本番の sff は ff 以下)。
+        let wide = layout(&Need { sff: 2048, ..need() }).expect("レイアウト");
+        assert!(fits(&wide, pool), "sff=2048 で {} B", wide.total);
     }
 
     /// tensor core を使わないときは g / u が要り、2,560 MiB には収まらない。
