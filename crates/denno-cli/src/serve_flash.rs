@@ -680,6 +680,9 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     if let Some(line) = denno_engine::model::expert_ram::stats_line() {
         eprintln!("{line}");
     }
+    // task 271: 直前のリクエストの tier 別ヒット率をエンドポイント用に写す
+    // (この直後に両方の積算を 0 に戻す)。
+    record_last_tier_hits();
     denno_engine::model::expert_ram::stats_reset();
     // task 260 step 1: ホスト側のバイトの出所 (minflt / majflt / 常駐量)。
     if let Some(line) = denno_engine::model::expert_ram::probe_line(tag) {
@@ -2309,10 +2312,52 @@ fn select_model(flash: &Flash, body: &Value) -> Result<(bool, String), String> {
     Ok((true, id))
 }
 
+/// task 271: 直前のリクエスト (decode) の tier 別の当たり。
+///
+/// `exp_iq` の参照/ヒットと `expert_ram` の VRAM ミス転送元はリクエスト終端で
+/// 0 に戻るので、戻す直前にここへ写す。`/v1/experts/stats` はこの写しを返す
+/// (積算ではなく「直前の 1 リクエスト」)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LastTierHits {
+    /// decode で参照した expert の本数
+    lookups: u64,
+    /// そのうち VRAM に載っていた本数
+    vram: u64,
+    /// VRAM ミスのうち RAM tier から上げた本数
+    ram: u64,
+    /// VRAM ミスのうち mmap (ファイル) から読んだ本数
+    mmap: u64,
+}
+
+static LAST_TIER: std::sync::Mutex<Option<LastTierHits>> = std::sync::Mutex::new(None);
+
+/// リクエスト終端のカウンタを [`LAST_TIER`] へ写す (0 に戻す前に呼ぶ)。
+///
+/// 参照 0 件 (prefill だけで終わったリクエスト) では書き換えない。
+/// ミス本数と転送元の積算は別の計器なので、`lookups` を超えないように丸める。
+fn record_last_tier_hits() {
+    let (lookups, hits) = denno_engine::model::exp_iq::lookups_hits();
+    if lookups == 0 {
+        return;
+    }
+    let (miss_ram, miss_mmap) = denno_engine::model::expert_ram::miss_stats();
+    let vram = hits.min(lookups);
+    let miss = lookups - vram;
+    let ram = miss_ram.min(miss);
+    let mmap = miss_mmap.min(miss - ram);
+    *LAST_TIER.lock().unwrap_or_else(|e| e.into_inner()) = Some(LastTierHits {
+        lookups,
+        vram,
+        ram,
+        mmap,
+    });
+}
+
 /// task 263: `GET /v1/experts/stats` の形。
 ///
 /// tier ごとの本数と MB、記録された使用回数のうち各 tier が覆う割合、
 /// 記録ファイルと最後に保存できた時刻。ビューワが後で描くためのもの。
+/// task 271: mmap tier と、直前のリクエストの tier 別ヒット率を足した。
 fn experts_stats_json() -> Value {
     use denno_engine::model::{exp_stats, expert_ram, expert_vram};
     let counts = exp_stats::current_counts();
@@ -2342,6 +2387,49 @@ fn experts_stats_json() -> Value {
     let vram = expert_vram::cache_usage();
     let ram = expert_ram::status();
     let plan = exp_stats::plan();
+    // task 271: mmap tier = 記録された expert のうち VRAM にも RAM にも載って
+    // いない本数。1 本のバイト数は expert_bytes / (n_layer * n_expert)。
+    let (mmap_experts, mmap_bytes) = match &counts {
+        Some(c) => {
+            let cells = (c.n_layer as usize).saturating_mul(c.n_expert as usize);
+            let per = if cells > 0 {
+                c.expert_bytes / cells as u64
+            } else {
+                0
+            };
+            let resident: std::collections::HashSet<(u16, u16)> =
+                vkeys.iter().chain(rkeys.iter()).copied().collect();
+            let mut n = 0usize;
+            for layer in 0..c.n_layer as usize {
+                for e in 0..c.n_expert as usize {
+                    let i = layer * c.n_expert as usize + e;
+                    if c.cells.get(i).copied().unwrap_or(0) > 0
+                        && !resident.contains(&(layer as u16, e as u16))
+                    {
+                        n += 1;
+                    }
+                }
+            }
+            (n, n as u64 * per)
+        }
+        None => (0, 0),
+    };
+    let last = *LAST_TIER.lock().unwrap_or_else(|e| e.into_inner());
+    let last_json = last.map(|l| {
+        let rate = |n: u64| {
+            if l.lookups > 0 {
+                n.min(l.lookups) as f64 / l.lookups as f64
+            } else {
+                0.0
+            }
+        };
+        json!({
+            "lookups": l.lookups,
+            "vram": {"hits": l.vram, "hit_rate": rate(l.vram)},
+            "ram": {"hits": l.ram, "hit_rate": rate(l.ram)},
+            "mmap": {"hits": l.mmap, "hit_rate": rate(l.mmap)},
+        })
+    });
     json!({
         "enabled": exp_stats::enabled(),
         "file": exp_stats::stats_path().map(|p| p.display().to_string()),
@@ -2365,6 +2453,11 @@ fn experts_stats_json() -> Value {
             "mb": ram.map(|r| (r.3 >> 20) as usize),
             "pinned_mb": ram.map(|r| (r.2 >> 20) as usize),
         },
+        "mmap": {
+            "experts": mmap_experts,
+            "mb": mmap_bytes >> 20,
+        },
+        "last_request": last_json,
         "coverage": {
             "vram": frac(cov_v),
             "ram": frac(cov_r),
@@ -2487,6 +2580,9 @@ fn handle_req(
         return match select_model(flash, &body) {
             Ok((true, id)) => {
                 eprintln!("[flash] model select: {id} を選んだ。応答のあと終了して起動し直す (exit {EXIT_MODEL_SWITCH})");
+                // task 271: プロセスが終わる前に、いまのモデルの使用回数を書く
+                // (切り替えで直前の数分の回数を失わない)。
+                save_stats_on_stop("model select");
                 EXIT_AFTER.store(EXIT_MODEL_SWITCH, std::sync::atomic::Ordering::SeqCst);
                 send_json(&mut stream, "202 Accepted", &json!({"switching": true, "id": id}))
             }
@@ -2735,6 +2831,52 @@ impl Drop for StatsSaveOnExit {
     }
 }
 
+/// task 271: 終了の直前に expert 使用回数を書く (SIGTERM / モデル切り替え)。
+///
+/// 20 秒ごとの保存とは別に、終了経路でもう一度書く。`save_now` は新しい
+/// 回数が無ければ何もしないので、二重に呼んでも安全 (一時ファイル → rename の
+/// 原子的な 1 手順は `save_now` の中)。
+fn save_stats_on_stop(why: &str) {
+    if let Some(line) = denno_engine::model::exp_stats::save_now() {
+        eprintln!("[flash] {why}: {line}");
+    }
+}
+
+/// task 271: SIGTERM で使用回数を保存してから終了する。
+///
+/// 既定の SIGTERM はその場でプロセスを殺すので、20 秒ごとの保存の谷間の
+/// 回数が消える。tokio の signal ハンドラ (ハンドラ本体は async-signal-safe な
+/// 書き込みだけ) を専用スレッドで待ち、通常の文脈で [`save_stats_on_stop`] を
+/// 呼んでから終了する。
+#[cfg(unix)]
+fn spawn_sigterm_saver() {
+    let _ = std::thread::Builder::new()
+        .name("sigterm-save".to_string())
+        .spawn(|| {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                let Ok(mut sig) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                else {
+                    return;
+                };
+                sig.recv().await;
+                eprintln!("[flash] SIGTERM: expert 使用回数を保存して終了する");
+                save_stats_on_stop("SIGTERM");
+                std::process::exit(0);
+            });
+        });
+}
+
+/// 非 unix では SIGTERM が無いので何もしない。
+#[cfg(not(unix))]
+fn spawn_sigterm_saver() {}
+
 /// 要求の読み取りは接続ごとのスレッドで行い、読めた要求を主スレッドへ渡す
 /// (モデルを触る処理は今まで通り主スレッドで 1 本ずつ)。`POST /v1/abort` だけは
 /// 読み取りスレッドで即答するので、生成中 (主スレッドが塞がっている間) でも止められる。
@@ -2781,6 +2923,9 @@ fn spawn_acceptor(listener: TcpListener) -> std::sync::mpsc::Receiver<std::io::R
 }
 
 pub fn run(cfg: FlashConfig) -> Result<()> {
+    // task 271: SIGTERM でも使用回数を失わない (保存してから終了する)。
+    // モデルの読み込みより前に仕掛ける (読み込み中の停止でも 1 回は走る)。
+    spawn_sigterm_saver();
     // task 119b: プールの初回使用 (モデル読み込み) の前に既定スレッド数を決める。
     ensure_rayon_pool();
     // task 213: 既定 on のゲートが必要とする PTX を起動時に監査する。
@@ -3061,6 +3206,9 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                             eprintln!("[steer] 記録の保存に失敗: {e}");
                         }
                     }
+                    // task 271: 使用回数も終了前にもう一度書く (選択の応答で
+                    // 保存済みなら save_now は何もしない)。
+                    save_stats_on_stop("model select");
                     eprintln!("[flash] exit {code} (モデルの切り替え)");
                     std::process::exit(code);
                 }
@@ -3176,12 +3324,25 @@ mod flash_tests {
     #[test]
     fn experts_stats_json_has_every_tier() {
         let v = experts_stats_json();
-        for k in ["enabled", "file", "last_save", "recorded", "vram", "ram", "coverage", "plan"] {
+        for k in [
+            "enabled",
+            "file",
+            "last_save",
+            "recorded",
+            "vram",
+            "ram",
+            "mmap",
+            "last_request",
+            "coverage",
+            "plan",
+        ] {
             assert!(v.get(k).is_some(), "{k} が無い: {v}");
         }
-        assert_eq!(v["enabled"], json!(false));
-        assert_eq!(v["file"], Value::Null);
-        for t in ["vram", "ram"] {
+        // 形だけを見る (task 271 で記録先を設定するテストが同居するため、
+        // enabled / file の値は「型が正しい」ことだけ確かめる)。
+        assert!(v["enabled"].is_boolean(), "{v}");
+        assert!(v["file"].is_string() || v["file"].is_null(), "{v}");
+        for t in ["vram", "ram", "mmap"] {
             for k in ["experts", "mb"] {
                 assert!(v[t].get(k).is_some(), "{t}.{k} が無い: {v}");
             }
@@ -3192,6 +3353,61 @@ mod flash_tests {
         }
         // JSON にできる (NaN が混ざっていない)
         assert!(serde_json::to_string(&v).is_ok());
+    }
+
+    /// task 271: 直前のリクエストの tier 別ヒット率。exp_iq の参照/ヒットと
+    /// expert_ram のミス転送元から写し、lookups を超えない (率は 0..1)。
+    ///
+    /// 共有カウンタを触るので、このテストの中だけで 0 に戻してから使う。
+    #[test]
+    fn last_tier_hits_split_vram_ram_mmap() {
+        use denno_engine::model::{exp_iq, expert_ram};
+        exp_iq::stats_reset();
+        expert_ram::miss_reset();
+        // 10 参照中 6 が VRAM、ミス 4 のうち 3 が RAM tier、1 が mmap。
+        exp_iq::note_lookup(10, 6);
+        expert_ram::note_miss_source(true);
+        expert_ram::note_miss_source(true);
+        expert_ram::note_miss_source(true);
+        expert_ram::note_miss_source(false);
+        record_last_tier_hits();
+        let got = *LAST_TIER.lock().unwrap();
+        assert_eq!(
+            got,
+            Some(LastTierHits {
+                lookups: 10,
+                vram: 6,
+                ram: 3,
+                mmap: 1,
+            })
+        );
+        // エンドポイントにも同じ数字が載る
+        let v = experts_stats_json();
+        assert_eq!(v["last_request"]["lookups"], 10);
+        assert_eq!(v["last_request"]["vram"]["hits"], 6);
+        assert_eq!(v["last_request"]["ram"]["hits"], 3);
+        assert_eq!(v["last_request"]["mmap"]["hits"], 1);
+        for (t, want) in [("vram", 0.6), ("ram", 0.3), ("mmap", 0.1)] {
+            let x = v["last_request"][t]["hit_rate"].as_f64().expect("数値");
+            assert!((x - want).abs() < 1e-9, "{t} hit_rate={x} (期待 {want})");
+        }
+
+        // 参照 0 件 (prefill だけで終わったリクエスト) では前の値を残す。
+        exp_iq::stats_reset();
+        expert_ram::miss_reset();
+        record_last_tier_hits();
+        assert_eq!(*LAST_TIER.lock().unwrap(), got);
+
+        // 転送元の積算がミス本数を超えても率は 1 を超えない (丸める)。
+        exp_iq::note_lookup(2, 0);
+        for _ in 0..5 {
+            expert_ram::note_miss_source(true);
+        }
+        record_last_tier_hits();
+        let v = experts_stats_json();
+        assert_eq!(v["last_request"]["ram"]["hits"], 2);
+        assert_eq!(v["last_request"]["mmap"]["hits"], 0);
+        assert_eq!(v["last_request"]["ram"]["hit_rate"], 1.0);
     }
 
     /// P51: read_req が WS の Upgrade ヘッダを拾える (名前は小文字で保持)。

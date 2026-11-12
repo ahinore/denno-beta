@@ -253,9 +253,15 @@
     </div>
 
     <div class="box">
-      <h2>state <span class="dim">/api/v1/cache</span></h2>
+      <h2>state <span class="dim">/api/v1/cache · experts</span></h2>
       <div class="kv"><span>kv main</span><b id="kv-main">-</b></div>
       <div class="kv"><span>kv aux</span><b id="kv-aux">-</b></div>
+      <div class="kv" style="margin-top:6px"><span>exp vram</span><b id="ex-vram">-</b></div>
+      <div class="kv"><span>exp ram</span><b id="ex-ram">-</b></div>
+      <div class="kv"><span>exp mmap</span><b id="ex-mmap">-</b></div>
+      <div class="kv"><span>exp cover</span><b id="ex-cov">-</b></div>
+      <div id="exfile" class="small dim" style="margin-top:2px;word-break:break-all"></div>
+      <div id="exerr" class="err"></div>
       <div class="row2">
         <button id="btn-kvclear" class="b warn" title="サーバーが持つ文脈 (full attention の KV、GDN の再帰状態と conv 履歴) を捨てる。次のチャットは最初から prefill し直す">clear KV cache</button>
         <button id="btn-resclear" class="b" title="層の壁に出している残差 stream・ブロック・expert の表示 (per token / accumulated) を 0 に戻す">clear residual</button>
@@ -276,6 +282,7 @@ import { decodeFrame, FrameDecodeError } from '/frames.mjs';
 import {
   DEFAULT_SHAPE_RAW, WALL_COLORS, createMapState, createMockStore,
   createSelection, clearSelection as clearSel, depthValue, heat, mergeBodies, fitExpertLimit,
+  expertCoverageText, expertStatsView, expertTierText,
   mockTokenFrames, normaliseShape, rampRGB, roleForBlock, selectionCount,
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
   toggleItem, addItem, removeItem, selectionItems, wallHitTest,
@@ -372,6 +379,7 @@ function startMock(why) {
   setBadge('mock · ' + why, 'badge mock');
   rebuild(shape);
   refreshAll('mock');
+  refreshExperts();
   startMockFrames();
 }
 
@@ -450,6 +458,7 @@ async function boot() {
   }
   await probeLive(true);
   refreshCtx();
+  refreshExperts();
   loadModels();
 }
 // ---- 壁のレイアウト (task 235) -------------------------------------------
@@ -919,6 +928,8 @@ async function waitModel(id, label) {
     if (r.status === 200 && r.body && r.body.current) {
       if (r.body.current === id) {
         setModelStat(label + ' に切り替えた (' + secs + ' s)', false);
+        // task 271: 切り替え後のプロセスの tier を 1 回読んでから読み直す。
+        await refreshExperts();
         setTimeout(() => location.reload(), 800);
         return;
       }
@@ -985,6 +996,29 @@ async function refreshCtx() {
   const r = mock ? mock.handle('GET', '/v1/cache') : await apiQuiet('/v1/cache');
   if (r.status === 200 && r.body && typeof r.body === 'object') renderCtx(r.body);
   else { $('kv-main').textContent = '? (' + r.status + ')'; $('kv-aux').textContent = '?'; }
+}
+
+// task 271: expert の tier (VRAM / RAM / mmap) の本数と MB、直前のリクエストの
+// tier 別ヒット率、記録の覆盖率、記録ファイルと最終保存。リクエストの終わりと
+// 5 秒ごと、モデル切り替えの直後に読み直す。古いサーバー (404) では欄を "?" にする。
+async function refreshExperts() {
+  const r = mock ? mock.handle('GET', '/v1/experts/stats') : await apiQuiet('/v1/experts/stats');
+  if (r.status !== 200 || !r.body || typeof r.body !== 'object') {
+    $('exerr').textContent = 'GET /v1/experts/stats → ' + r.status;
+    for (const id of ['ex-vram', 'ex-ram', 'ex-mmap', 'ex-cov']) $(id).textContent = '?';
+    $('exfile').textContent = '';
+    return;
+  }
+  $('exerr').textContent = '';
+  const v = expertStatsView(r.body);
+  $('ex-vram').textContent = expertTierText(v.rows[0]);
+  $('ex-ram').textContent = expertTierText(v.rows[1]);
+  $('ex-mmap').textContent = expertTierText(v.rows[2]);
+  $('ex-cov').textContent = expertCoverageText(v.coverage);
+  const saved = v.savedUnix == null
+    ? 'not saved yet'
+    : 'saved ' + new Date(v.savedUnix * 1000).toLocaleTimeString('ja-JP', { hour12: false });
+  $('exfile').textContent = (v.file || 'file -') + ' · ' + saved + (v.enabled ? '' : ' · off');
 }
 
 function clearResidualView() {
@@ -1446,6 +1480,7 @@ async function pollState() {
       else if (b.body.epoch !== undefined) noteEpoch(b.body.epoch, 'external change');
     }
     await refreshCtx();
+    await refreshExperts();
   } finally {
     polling = false;
   }
@@ -1568,6 +1603,7 @@ async function sendMsg(text) {
   setBusy(false);
   if (!mock) refreshSteer('chat');
   refreshCtx();
+  refreshExperts();
   if (r.stop === 'max_tokens' && r.acc && !r.err) showContinue(node);
 }
 
@@ -1584,6 +1620,7 @@ async function continueMsg(node) {
   setBusy(false);
   if (!mock) refreshSteer('chat');
   refreshCtx();
+  refreshExperts();
   if (r.stop === 'max_tokens' && r.acc !== base && !r.err) showContinue(node);
 }
 
