@@ -10845,6 +10845,33 @@ fn moe_experts_gpu_batched(
             n: e,
         },
     ];
+    // task 266: ミスする expert の 3 行列を、H2D の**前**に背景スレッドで
+    // 並列に読ませる (`DENNO_DEC_MISS_READ=1` のときだけ)。メインスレッドは
+    // そのまま下の acquire (H2D) を回すが、同じページのフォルトはページロックで
+    // 1 回に畳まれるので二重読みにはならない。値・経路は 1 バイトも変わらない。
+    #[cfg(feature = "cuda")]
+    if crate::model::exp_prefetch::miss_read_enabled() {
+        let mut parts: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::with_capacity(n);
+        for &ei in sel {
+            let key = ExpertKey {
+                layer: lw.il as u16,
+                expert: ei as u16,
+            };
+            // 載っている expert は触らない (ヒットは mmap を読まない)。
+            if matches!(expert_vram::lookup(key, shapes), Ok(Some(_))) {
+                continue;
+            }
+            let part = |w: &ExpertW| w.slice_mapped(ei).ok().flatten();
+            if let (Some(g), Some(u), Some(d)) = (
+                part(&lw.gate_exps),
+                part(&lw.up_exps),
+                part(&lw.down_exps),
+            ) {
+                parts.push(vec![g, u, d]);
+            }
+        }
+        crate::model::exp_prefetch::submit_misses(parts);
+    }
     // 1. 全 expert を VRAM に載せる (1 本でも載らなければ per-expert 経路へ)。
     //    P45: 載っていた本数 (`hit`) を数え、ゲートの 1 サンプルにする。
     let mut devs = Vec::with_capacity(n);

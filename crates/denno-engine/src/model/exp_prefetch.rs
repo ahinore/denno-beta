@@ -51,6 +51,21 @@ pub const THREADS_ENV: &str = "DENNO_DEC_PREF_THREADS";
 /// `DENNO_DEC_PREF_TOUCH`: 1 なら madvise ではなくページを実際に触る。
 pub const TOUCH_ENV: &str = "DENNO_DEC_PREF_TOUCH";
 
+/// `DENNO_DEC_MISS_READ`: その層でミスした expert を**アップロードの前に**
+/// 背景スレッドで並列に読む (ページを触って page cache に載せる)。**既定 off**。
+///
+/// 予測は要らない: ミスは `acquire` の直前で確定しているので、そこから
+/// 3 行列 x `DENNO_DEC_PREF_CHUNKS` 分割を背景で読み始め、メインスレッドは
+/// そのまま従来どおり 1 本ずつ H2D する。同じページを触っても、フォルトは
+/// ページロックで 1 回に畳まれる (二重読みにはならない)。
+///
+/// 1 本 3.07 MB の読みは mmap のフォルト (readahead 128 KiB 窓) で 0.86 ms
+/// = 3.6 GB/s。並列に流すとキュー深さが増えるので、その分だけ縮む。
+pub const MISS_READ_ENV: &str = "DENNO_DEC_MISS_READ";
+
+/// `DENNO_DEC_PREF_CHUNKS`: ミス読みのときに 1 行列を何分割して流すか (既定 2)。
+pub const CHUNKS_ENV: &str = "DENNO_DEC_PREF_CHUNKS";
+
 /// 待ち行列の上限 (expert 本数)。溢れた分は積まない (結果は従来と同じ)。
 pub const MAX_QUEUE: usize = 256;
 
@@ -64,6 +79,11 @@ pub fn on_from_value(v: Option<&str>) -> bool {
 
 /// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
 static OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 先読みのどれかの経路が有効か。
+pub fn any_enabled() -> bool {
+    enabled() || miss_read_enabled()
+}
 
 /// ゲートが有効か (プロセスで 1 回だけ env を読む)。
 pub fn enabled() -> bool {
@@ -108,13 +128,35 @@ fn threads() -> usize {
     *N.get_or_init(|| usize_env(THREADS_ENV, 2).min(8))
 }
 
+/// [`MISS_READ_ENV`] の解釈 (純関数)。`1` / `on` / `true` / `yes` だけが真。
+pub fn miss_read_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// ミス読みのゲート (プロセスで 1 回だけ env を読む)。既定 off。
+pub fn miss_read_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| miss_read_from_value(std::env::var(MISS_READ_ENV).ok().as_deref()))
+}
+
+/// ミス読みの分割数 (1 なら分割しない)。
+fn chunks() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| usize_env(CHUNKS_ENV, 2).min(8))
+}
+
 fn touch_mode() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
-            std::env::var(TOUCH_ENV).ok().as_deref(),
-            Some("1") | Some("on") | Some("true")
-        )
+        // ミス読みの経路はフォルトを確定させたいので既定で touch。
+        miss_read_enabled()
+            || matches!(
+                std::env::var(TOUCH_ENV).ok().as_deref(),
+                Some("1") | Some("on") | Some("true")
+            )
     })
 }
 
@@ -261,7 +303,7 @@ fn touch_pages(b: &[u8]) {
 /// 待ち行列が満杯なら**積まない** (落としても従来経路と同じ結果になる)。
 /// 戻り値は積んだ本数。
 pub fn submit(jobs: Vec<Vec<Part>>) -> usize {
-    if !enabled() || jobs.is_empty() {
+    if !any_enabled() || jobs.is_empty() {
         return 0;
     }
     let p = pool();
@@ -294,6 +336,41 @@ pub fn note_skips(resident: u64, no_part: u64) {
     SKIP_PART.fetch_add(no_part, Ordering::Relaxed);
 }
 
+/// その層でミスした expert の `[gate, up, down]` を、分割して**背景で読む**。
+///
+/// `acquire` (= H2D) の直前に呼ぶ。戻り値は積んだ Part 数。値には触れない。
+pub fn submit_misses(parts: Vec<Vec<Part>>) -> usize {
+    if !miss_read_enabled() || parts.is_empty() {
+        return 0;
+    }
+    let nch = chunks();
+    let mut jobs: Vec<Vec<Part>> = Vec::new();
+    for triple in parts {
+        let mut split: Vec<Part> = Vec::with_capacity(triple.len() * nch);
+        for p in triple {
+            if nch <= 1 || p.len < nch * 4096 {
+                split.push(p);
+                continue;
+            }
+            let step = p.len / nch;
+            for i in 0..nch {
+                let off = p.off + i * step;
+                let len = if i + 1 == nch { p.len - i * step } else { step };
+                split.push(Part {
+                    map: Arc::clone(&p.map),
+                    off,
+                    len,
+                });
+            }
+        }
+        jobs.push(split);
+    }
+    let n = jobs.len();
+    MISS_SUB.fetch_add(n as u64, Ordering::Relaxed);
+    submit(jobs);
+    n
+}
+
 /// 積む予定の鍵を「積んだ集合」に写す (当たり率の分母)。
 pub fn note_submitted_keys(keys: &[(u16, u16)]) {
     if !enabled() {
@@ -316,6 +393,8 @@ static SNAP_IDS: AtomicU64 = AtomicU64::new(0);
 static SKIP_RES: AtomicU64 = AtomicU64::new(0);
 /// 積算 (診断): mmap のハンドルが取れず飛ばした本数 (ヒープ実体など)。
 static SKIP_PART: AtomicU64 = AtomicU64::new(0);
+/// 積算 (診断): ミス読み (`DENNO_DEC_MISS_READ`) で積んだ expert 本数。
+static MISS_SUB: AtomicU64 = AtomicU64::new(0);
 /// 積算 (診断): 背景スレッドが実際に readahead を投げた範囲の合計 (バイト)。
 static TOUCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -330,13 +409,13 @@ static QUEUE_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// 1 リクエストぶんの 1 行。ゲート off / 実績 0 なら `None`。
 pub fn stats_line() -> Option<String> {
-    if !enabled() {
+    if !any_enabled() {
         return None;
     }
     let sub = SUBMITTED.load(Ordering::Relaxed);
     // 0 でも出す: 「ゲートは on なのに 1 本も積んでいない」ことが分かるように
     // (`begin_token` が 1 回も呼ばれていない / 常駐で全部飛ばした / mmap が無い)。
-    if sub == 0 && TOKENS.load(Ordering::Relaxed) == 0 {
+    if sub == 0 && TOKENS.load(Ordering::Relaxed) == 0 && MISS_SUB.load(Ordering::Relaxed) == 0 {
         return None;
     }
     let tokens = TOKENS.load(Ordering::Relaxed).max(1);
@@ -350,9 +429,10 @@ pub fn stats_line() -> Option<String> {
         0.0
     };
     Some(format!(
-        "[dec-pref] tokens={tokens} sels={} snap/tok={:.1} sub={sub} sub/tok={:.1} \
+        "[dec-pref] tokens={tokens} miss_sub={} sels={} snap/tok={:.1} sub={sub} sub/tok={:.1} \
          skip_res={} skip_part={} used={used} used_frac={:.2} done={done} dropped={} \
          bytes={:.1}MB gbs={gbs:.2} work={:.1}ms queue_max={} thr={} touch={}",
+        MISS_SUB.load(Ordering::Relaxed),
         SELS.load(Ordering::Relaxed),
         SNAP_IDS.load(Ordering::Relaxed) as f64 / tokens as f64,
         sub as f64 / tokens as f64,
@@ -372,7 +452,7 @@ pub fn stats_line() -> Option<String> {
 pub fn stats_reset() {
     for c in [
         &TOKENS, &SUBMITTED, &DONE, &DROPPED, &BYTES, &USED, &WORK_NS, &QUEUE_MAX, &SELS,
-        &SNAP_IDS, &SKIP_RES, &SKIP_PART, &TOUCHED,
+        &SNAP_IDS, &SKIP_RES, &SKIP_PART, &TOUCHED, &MISS_SUB,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -432,6 +512,28 @@ mod tests {
         assert!(third.iter().all(|v| v.is_empty()));
         // 積算: begin_token 3 回。
         assert_eq!(counters().0, 3);
+        stats_reset();
+        set_enabled_for_tests(None);
+    }
+
+    /// task 266: ミス読みのゲートは既定 off、明示的な真値だけ on。
+    #[test]
+    fn miss_read_gate_values() {
+        assert!(!miss_read_from_value(None));
+        assert!(!miss_read_from_value(Some("")));
+        assert!(!miss_read_from_value(Some("0")));
+        assert!(!miss_read_from_value(Some("off")));
+        assert!(miss_read_from_value(Some("1")));
+        assert!(miss_read_from_value(Some(" TRUE ")));
+    }
+
+    /// ミス読みは 1 本を chunks 分割して積む (分割しても範囲は元のまま)。
+    #[test]
+    fn miss_read_splits_ranges() {
+        set_enabled_for_tests(Some(true));
+        stats_reset();
+        // 空なら何もしない。
+        assert_eq!(submit_misses(Vec::new()), 0);
         stats_reset();
         set_enabled_for_tests(None);
     }
