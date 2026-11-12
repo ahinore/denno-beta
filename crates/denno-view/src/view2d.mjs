@@ -1265,6 +1265,10 @@ export function createMockStore(shape, opts = {}) {
           body: { epoch: st.epoch, experts_off: [], blocks_off: [], streams_off: [] },
         };
       }
+      if (m === 'GET' && p === '/v1/model/choices') {
+        // モックは切り替えできない (実 API も DENNO_MODEL_CHOICES が無ければ同じ形)。
+        return { status: 200, body: { switchable: false, current: null, current_dir: 'mock/model', choices: [] } };
+      }
       if (m === 'POST' && p === '/v1/abort') {
         // モックには走っている生成が無い (実 API も生成中でなければ空振り)。
         return { status: 200, body: { aborted: false, generating: false } };

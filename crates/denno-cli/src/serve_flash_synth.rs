@@ -1885,6 +1885,78 @@ fn abort_stops_generation_and_is_not_carried_over() {
     assert_eq!(again.n_out, full.n_out, "止めたあとの生成が最後まで走らない");
 }
 
+/// モデルの一覧と選択: 一覧は今のモデルを current にし、別モデルの選択は選択ファイルを
+/// 書いて 202 を返し、終了 (exit 75) を予約する。同じモデル・未知の id・.gguf の無い
+/// ディレクトリは切り替えない。env が無いサーバーは切り替え不可と答える。
+#[test]
+fn model_choices_and_select_http() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    let dir = TempDir::new("flash-model-select");
+    let mut flash = build_flash(&dir);
+    let cur = flash.parts[0].parent().unwrap().to_path_buf();
+    let other = PathBuf::from(dir.path("other"));
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("m-00001-of-00001.gguf"), b"x").unwrap();
+    let empty = PathBuf::from(dir.path("empty"));
+    std::fs::create_dir_all(&empty).unwrap();
+    let conf = PathBuf::from(dir.path("models.conf"));
+    let sel = PathBuf::from(dir.path("model_select"));
+    std::fs::write(
+        &conf,
+        format!(
+            "# id|dir|label|env\nA|{}|モデル A|\n\nB|{}|モデル B|DENNO_START_PREFETCH=0\nC|{}\nA|/dup|重複は無視|\n",
+            cur.display(),
+            other.display(),
+            empty.display()
+        ),
+    )
+    .unwrap();
+
+    // env が無ければ切り替え不可
+    std::env::remove_var("DENNO_MODEL_CHOICES");
+    std::env::remove_var("DENNO_MODEL_SELECT");
+    let v = http_json(&http_roundtrip(&mut flash, &http_req("GET", "/v1/model/choices", "")));
+    assert_eq!(v["switchable"], false);
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", r#"{"id":"B"}"#));
+    assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+
+    std::env::set_var("DENNO_MODEL_CHOICES", &conf);
+    std::env::set_var("DENNO_MODEL_SELECT", &sel);
+    let v = http_json(&http_roundtrip(&mut flash, &http_req("GET", "/v1/model/choices", "")));
+    assert_eq!(v["switchable"], true);
+    assert_eq!(v["current"], "A");
+    let ids: Vec<&str> = v["choices"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["A", "B", "C"]);
+    assert_eq!(v["choices"][0]["default"], true);
+    assert_eq!(v["choices"][1]["label"], "モデル B");
+    assert_eq!(v["choices"][1]["env"], "DENNO_START_PREFETCH=0");
+    assert_eq!(v["choices"][1]["available"], true);
+    assert_eq!(v["choices"][2]["available"], false);
+    assert_eq!(v["choices"][2]["label"], "C");
+
+    // 未知 / .gguf 無し / 不正な本文は 400、選択ファイルは書かない
+    for b in [r#"{"id":"Z"}"#, r#"{"id":"C"}"#, r#"{}"#, "not json"] {
+        let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", b));
+        assert!(resp.starts_with("HTTP/1.1 400"), "{b}: {resp}");
+    }
+    assert!(!sel.exists());
+    // 同じモデルは切り替えない
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", r#"{"id":"A"}"#));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert_eq!(http_json(&resp)["switching"], false);
+    assert_eq!(super::EXIT_AFTER.load(Ordering::SeqCst), 0);
+    // 別のモデル: 202、選択ファイル、終了の予約
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", r#"{"id":"B"}"#));
+    assert!(resp.starts_with("HTTP/1.1 202 Accepted"), "{resp}");
+    assert_eq!(http_json(&resp)["switching"], true);
+    assert_eq!(std::fs::read_to_string(&sel).unwrap().trim(), "B");
+    assert_eq!(super::EXIT_AFTER.load(Ordering::SeqCst), super::EXIT_MODEL_SWITCH);
+    super::EXIT_AFTER.store(0, Ordering::SeqCst);
+    std::env::remove_var("DENNO_MODEL_CHOICES");
+    std::env::remove_var("DENNO_MODEL_SELECT");
+}
+
 // ---------------------------------------------------------------------------
 // task 218: 残差の平均の記録 / ステアリングの HTTP
 // ---------------------------------------------------------------------------

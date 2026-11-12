@@ -634,3 +634,11 @@ test('モック店: POST /v1/abort は生成が無いので空振り (200)', () 
   assert.equal(r.status, 200);
   assert.deepEqual(r.body, { aborted: false, generating: false });
 });
+
+test('モック店: GET /v1/model/choices は切り替え不可の形', () => {
+  const m = createMockStore({ layers: 2, n_expert: 4, n_expert_used: 1, n_hc: 1, n_embd: 8 });
+  const r = m.handle('GET', '/v1/model/choices');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.switchable, false);
+  assert.deepEqual(r.body.choices, []);
+});

@@ -2142,6 +2142,150 @@ fn send_abort_reply(stream: &mut TcpStream) -> Result<()> {
     send_json(stream, "200 OK", &json!({"aborted": generating, "generating": generating}))
 }
 
+// ---------------------------------------------------------------------------
+// モデルの選択 (`GET /v1/model/choices` / `POST /v1/model/select`)
+// ---------------------------------------------------------------------------
+//
+// GPU と RAM に載るモデルは 1 つだけなので、選び直しは「選択を書いて終了 →
+// 外側の起動ループ (serve_loop.sh) が選ばれたモデルで起動し直す」で行う。
+// 一覧は `DENNO_MODEL_CHOICES` のファイル (1 行 1 モデル `id|dir|label|env`、
+// `#` はコメント、先頭の行が既定)、選択は `DENNO_MODEL_SELECT` のファイルに id を書く。
+// どちらかが未設定なら切り替えは無効 (今まで通り)。
+
+/// 切り替えのための終了コード (serve_loop.sh はこれを見て起動し直す)。
+pub const EXIT_MODEL_SWITCH: i32 = 75;
+
+/// 主ループがリクエストの後に見る終了要求 (0 = なし)。
+static EXIT_AFTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[derive(Clone, Debug, PartialEq)]
+struct ModelChoice {
+    id: String,
+    dir: String,
+    label: String,
+    /// 起動ループが付ける env (`K=V` を空白区切り)。表示だけに使う。
+    env: String,
+}
+
+fn parse_choices(text: &str) -> Vec<ModelChoice> {
+    let mut out: Vec<ModelChoice> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+        if f.len() < 2 || f[0].is_empty() || f[1].is_empty() {
+            continue;
+        }
+        if out.iter().any(|c| c.id == f[0]) {
+            continue;
+        }
+        out.push(ModelChoice {
+            id: f[0].to_string(),
+            dir: f[1].to_string(),
+            label: f.get(2).map(|s| s.to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| f[0].to_string()),
+            env: f.get(3).map(|s| s.to_string()).unwrap_or_default(),
+        });
+    }
+    out
+}
+
+fn choices_paths() -> Option<(PathBuf, PathBuf)> {
+    let c = std::env::var("DENNO_MODEL_CHOICES").ok().filter(|s| !s.is_empty())?;
+    let s = std::env::var("DENNO_MODEL_SELECT").ok().filter(|s| !s.is_empty())?;
+    Some((PathBuf::from(c), PathBuf::from(s)))
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
+/// いま動いているモデルのディレクトリ (最初の part の親)。
+fn current_model_dir(flash: &Flash) -> Option<PathBuf> {
+    flash.parts.first().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+}
+
+fn dir_gguf_bytes(dir: &Path) -> Option<u64> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut n = 0u64;
+    let mut any = false;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x == "gguf").unwrap_or(false) {
+            n += e.metadata().map(|m| m.len()).unwrap_or(0);
+            any = true;
+        }
+    }
+    any.then_some(n)
+}
+
+fn model_choices_json(flash: &Flash) -> Value {
+    let cur_dir = current_model_dir(flash);
+    let Some((cpath, _)) = choices_paths() else {
+        return json!({
+            "switchable": false,
+            "current": Value::Null,
+            "current_dir": cur_dir.map(|d| d.display().to_string()),
+            "choices": [],
+        });
+    };
+    let list = std::fs::read_to_string(&cpath).map(|t| parse_choices(&t)).unwrap_or_default();
+    let mut current: Option<String> = None;
+    let rows: Vec<Value> = list
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let here = cur_dir.as_deref().is_some_and(|d| same_dir(d, Path::new(&c.dir)));
+            if here && current.is_none() {
+                current = Some(c.id.clone());
+            }
+            let bytes = dir_gguf_bytes(Path::new(&c.dir));
+            json!({
+                "id": c.id, "label": c.label, "dir": c.dir, "env": c.env,
+                "default": i == 0,
+                "available": bytes.is_some(),
+                "size_gb": bytes.map(|b| (b as f64 / 1e9 * 10.0).round() / 10.0),
+            })
+        })
+        .collect();
+    json!({
+        "switchable": true,
+        "current": current,
+        "current_dir": cur_dir.map(|d| d.display().to_string()),
+        "choices": rows,
+    })
+}
+
+/// 選択を検証して書く。切り替えるなら Ok(true) (呼び出し側が応答後に終了を予約)。
+fn select_model(flash: &Flash, body: &Value) -> Result<(bool, String), String> {
+    let (cpath, spath) = choices_paths().ok_or("このサーバーはモデルの切り替えに対応していない (DENNO_MODEL_CHOICES / DENNO_MODEL_SELECT が無い)")?;
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("id (文字列) が要る")?
+        .to_string();
+    let text = std::fs::read_to_string(&cpath)
+        .map_err(|e| format!("{} を読めない: {e}", cpath.display()))?;
+    let list = parse_choices(&text);
+    let c = list
+        .iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| format!("未知のモデル {id:?}"))?;
+    if dir_gguf_bytes(Path::new(&c.dir)).is_none() {
+        return Err(format!("{} に .gguf が無い", c.dir));
+    }
+    if current_model_dir(flash).is_some_and(|d| same_dir(&d, Path::new(&c.dir))) {
+        return Ok((false, id));
+    }
+    std::fs::write(&spath, format!("{id}\n"))
+        .map_err(|e| format!("{} に書けない: {e}", spath.display()))?;
+    Ok((true, id))
+}
+
 /// 1 接続ぶんを読んでから処理する (テストと単発用)。本番の listen は
 /// [`run`] が読み取りを別スレッドで行い、`/v1/abort` だけはそこで即答する。
 #[cfg(test)]
@@ -2229,6 +2373,25 @@ fn handle_req(
     if req.method == "DELETE" && path == "/v1/intervene" {
         let cfg = iv::clear(&flash.shape.engine_shape());
         return send_json(&mut stream, "200 OK", &intervene_to_json(&cfg));
+    }
+    // ビューワ用: モデルの一覧と選択 (選び直しはプロセスの再起動で行う)。
+    if req.method == "GET" && path == "/v1/model/choices" {
+        return send_json(&mut stream, "200 OK", &model_choices_json(flash));
+    }
+    if req.method == "POST" && path == "/v1/model/select" {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
+        };
+        return match select_model(flash, &body) {
+            Ok((true, id)) => {
+                eprintln!("[flash] model select: {id} を選んだ。応答のあと終了して起動し直す (exit {EXIT_MODEL_SWITCH})");
+                EXIT_AFTER.store(EXIT_MODEL_SWITCH, std::sync::atomic::Ordering::SeqCst);
+                send_json(&mut stream, "202 Accepted", &json!({"switching": true, "id": id}))
+            }
+            Ok((false, id)) => send_json(&mut stream, "200 OK", &json!({"switching": false, "id": id})),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
     }
     // ビューワ用: 保持している文脈 (KV / GDN 状態) の確認と破棄。
     if req.method == "GET" && path == "/v1/cache" {
@@ -2778,6 +2941,15 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 if st.attempted() > 0 {
                     eprintln!("{}", denno_engine::gpu_budget::summary_line(&st));
                     denno_engine::gpu_budget::reset_weight_upload_stats();
+                }
+                // モデルの選び直し: 応答を返したあとで終了し、起動ループに任せる。
+                let code = EXIT_AFTER.load(std::sync::atomic::Ordering::SeqCst);
+                if code != 0 {
+                    if let Err(e) = steer::flush() {
+                        eprintln!("[steer] 記録の保存に失敗: {e}");
+                    }
+                    eprintln!("[flash] exit {code} (モデルの切り替え)");
+                    std::process::exit(code);
                 }
             }
             Err(e) => eprintln!("[flash] accept 失敗: {e}"),
