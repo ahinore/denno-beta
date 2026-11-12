@@ -106,7 +106,7 @@ def main():
         p = 0
         for j in range(8):
             p |= code[(x >> (8 * j)) & 0xFF] << (2 * j)
-        pack2.append("%du" % p)
+        pack2.append("%d" % p)
     out.append("// IQ2_S の詰めた表 (1 値 2 bit、code 0/1/2 = 8/25/43、3 は未使用)。")
     emit_u16(out, "dno_iq2s_grid2", "IQ2S_GRID", pack2)
     # IQ3_S: 512 本の u64 の **上位 4 バイトは全 0** で、どの経路も読まない
@@ -117,7 +117,7 @@ def main():
         x = int(v, 0)
         if (x >> 32) != 0:
             raise SystemExit("IQ3S_GRID の上位 32 bit が 0 でない: %#x" % x)
-        pack32.append("%du" % (x & 0xFFFFFFFF))
+        pack32.append("%d" % (x & 0xFFFFFFFF))
     out.append("// IQ3_S の詰めた表 (各本の下位 32 bit。上位 32 bit は全 0 で未使用)。")
     emit_u32(out, "dno_iq3s_grid32", "IQ3S_GRID", pack32)
     sys.stdout.write("\n".join(out) + "\n")
