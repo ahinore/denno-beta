@@ -1180,9 +1180,9 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup,
-    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many, Acquired,
-    CheckAcc, ExpertDev, ExpertShape,
+    acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallback_breakdown,
+    fallbacks, init, lookup, lookup_many, note_check, peek_many, take_alloc_error, take_check,
+    touch_many, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1344,6 +1344,12 @@ mod gpu {
     static ENV_CAP: OnceLock<usize> = OnceLock::new();
     /// 全 evict 後も確保できなかった回数 (診断用)
     static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+    /// task 261: フォールバックの理由別カウンタ (type = カーネルが無い型 /
+    /// budget = 予算に 1 本が入らない / alloc = 実メモリの確保に失敗)。
+    /// 合計は [`FALLBACKS`] と一致する (どの経路で落ちたかを切り分けるため)。
+    static FB_TYPE: AtomicU64 = AtomicU64::new(0);
+    static FB_BUDGET: AtomicU64 = AtomicU64::new(0);
+    static FB_ALLOC: AtomicU64 = AtomicU64::new(0);
     /// 1 本が上限より大きいことを 1 回だけ言うためのラッチ
     static OVERSIZE_LOGGED: AtomicBool = AtomicBool::new(false);
     /// task 152: slab のチャンク確保に失敗したことを 1 回だけ言うためのラッチ
@@ -1624,6 +1630,19 @@ mod gpu {
         FALLBACKS.load(Ordering::Relaxed)
     }
 
+    /// task 261: フォールバックの内訳 `(合計, 型, 予算, 確保失敗)`。
+    ///
+    /// 「GPU に載らなかった理由」を 1 行で出すためのもの。合計は
+    /// [`fallbacks`] と同じで、内訳の和が合計と一致する。
+    pub fn fallback_breakdown() -> (u64, u64, u64, u64) {
+        (
+            FALLBACKS.load(Ordering::Relaxed),
+            FB_TYPE.load(Ordering::Relaxed),
+            FB_BUDGET.load(Ordering::Relaxed),
+            FB_ALLOC.load(Ordering::Relaxed),
+        )
+    }
+
     /// task 144: **載っているときだけ** expert を返す (ミスで H2D しない)。
     ///
     /// 層一括の IQ 経路は「ヒットした expert だけ GPU、ミスは CPU」で回すので、
@@ -1809,6 +1828,7 @@ mod gpu {
                 && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
             {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                FB_TYPE.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             }
             mbytes[i] = s.bytes()?;
@@ -1828,6 +1848,7 @@ mod gpu {
                     );
                 }
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                FB_BUDGET.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             }
         };
@@ -1911,6 +1932,7 @@ mod gpu {
         }
         let Some(bufs) = bufs else {
             FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            FB_ALLOC.fetch_add(1, Ordering::Relaxed);
             let n = ALLOC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
             let msg = last_err
                 .map(|e| format!("{e:#}"))
@@ -2002,6 +2024,7 @@ mod gpu {
                     && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
                 {
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    FB_TYPE.fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
                 }
                 mbytes[i] = s.bytes()?;
@@ -2012,6 +2035,7 @@ mod gpu {
                 Ok(v) => drop(v),
                 Err(_) => {
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    FB_BUDGET.fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
                 }
             }
@@ -2054,6 +2078,7 @@ mod gpu {
         }
         let Some(bufs) = bufs else {
             FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            FB_ALLOC.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
         let dev = Arc::new(ExpertDev {

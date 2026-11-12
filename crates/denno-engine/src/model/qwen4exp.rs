@@ -1237,10 +1237,124 @@ pub fn validate(f: &GgufFile) -> Result<Qwen4ExpParams> {
     }
 
     if errs.is_empty() {
+        // task 261: `DENNO_TENSOR_TYPES=1` のときだけ、量子型の分布を役割ごとに
+        // 1 行ずつ出す (診断用。既定 off なので数値・ログは従来と同一)。
+        if std::env::var_os(TENSOR_TYPES_ENV).is_some() {
+            for line in tensor_type_table(f, &p) {
+                eprintln!("{line}");
+            }
+        }
         Ok(p)
     } else {
         Err(Qwen4ExpError(errs))
     }
+}
+
+/// `DENNO_TENSOR_TYPES`: 読み込んだ GGUF の量子型を役割ごとに stderr へ出す。既定 off。
+pub const TENSOR_TYPES_ENV: &str = "DENNO_TENSOR_TYPES";
+
+/// テンソル名 → 役割 (診断の集計キー)。`blk.N.` を落として後ろで見る。
+fn tensor_role(name: &str) -> &'static str {
+    let suffix = name
+        .strip_prefix("blk.")
+        .and_then(|r| r.split_once('.'))
+        .map(|(_, s)| s)
+        .unwrap_or(name);
+    if suffix.starts_with("ffn_gate_exps") {
+        "expert_gate"
+    } else if suffix.starts_with("ffn_up_exps") {
+        "expert_up"
+    } else if suffix.starts_with("ffn_down_exps") {
+        "expert_down"
+    } else if suffix.starts_with("ffn_gate_inp") {
+        "router"
+    } else if suffix.starts_with("ffn_") && suffix.contains("shexp") {
+        "shared"
+    } else if suffix.starts_with("attn_") || suffix.starts_with("ssm_") {
+        "attn_gdn"
+    } else if suffix.starts_with("indexer.") {
+        "indexer"
+    } else if suffix.starts_with("hc_") {
+        "mix"
+    } else if suffix.starts_with("ple_") {
+        "ple_layer"
+    } else if suffix == "per_layer_token_embd.weight" {
+        "ple_table"
+    } else if suffix == "token_embd.weight" {
+        "embed"
+    } else if suffix.starts_with("output") {
+        "head"
+    } else {
+        "other"
+    }
+}
+
+/// 役割ごとの量子型ヒストグラム + expert 1 本のバイト数 (診断用の文字列)。
+///
+/// `DENNO_TENSOR_TYPES=1` のとき [`validate`] が stderr へ出す。実 GGUF を
+/// 読まないと分からない「どの型が GPU 経路に載るか」を 1 画面で見るためのもの。
+pub fn tensor_type_table(f: &GgufFile, p: &Qwen4ExpParams) -> Vec<String> {
+    use std::collections::BTreeMap;
+    // 役割 -> (型名 -> (本数, バイト数))
+    let mut m: BTreeMap<&'static str, BTreeMap<&'static str, (usize, u64)>> = BTreeMap::new();
+    let mut expert_bytes = 0u64;
+    let mut expert_n = 0u64;
+    let mut layer0 = 0u64;
+    for name in &f.tensor_order {
+        let Some(t) = f.tensor(name) else { continue };
+        let role = tensor_role(name);
+        let e = m
+            .entry(role)
+            .or_default()
+            .entry(ty_name(t.ty))
+            .or_insert((0, 0));
+        e.0 += 1;
+        e.1 += t.nbytes;
+        if role.starts_with("expert_") {
+            expert_bytes += t.nbytes;
+            expert_n += p.n_expert as u64;
+            if name.starts_with("blk.0.") {
+                layer0 += t.nbytes;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (role, tys) in &m {
+        let total: u64 = tys.values().map(|(_, b)| *b).sum();
+        let parts: Vec<String> = tys
+            .iter()
+            .map(|(t, (n, b))| format!("{t}x{n} {:.1}MB", *b as f64 / 1e6))
+            .collect();
+        out.push(format!(
+            "[ttypes] {role}: {:.2}GB ({})",
+            total as f64 / 1e9,
+            parts.join(" / ")
+        ));
+    }
+    if layer0 > 0 {
+        let cap_mb = crate::model::expert_vram::vram_mb_from_value(
+            std::env::var(crate::model::expert_vram::EXPERT_VRAM_MB_ENV).ok().as_deref(),
+        );
+        let cap = cap_mb as u64 * 1024 * 1024;
+        let fit = if layer0 > 0 { cap / layer0 } else { 0 };
+        let total_n = p.n_layer as u64 * p.n_expert as u64;
+        out.push(format!(
+            "[ttypes] expert: 1 本 {:.3}MB (層 0) / 平均 {:.3}MB / 全 {} 本 {:.1}GB / \
+             予算 {}MiB で {} 本 ({:.1}%)",
+            layer0 as f64 / 1e6,
+            expert_bytes as f64 / expert_n as f64 / 1e6,
+            total_n,
+            expert_bytes as f64 / 1e9,
+            cap_mb,
+            fit,
+            if total_n > 0 {
+                fit as f64 / total_n as f64 * 100.0
+            } else {
+                0.0
+            }
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -25208,4 +25322,28 @@ mod task225_router_dev_mirror {
             assert!((s - 1.0).abs() < 1e-5, "行 {t} の和 {s}");
         }
     }
+}
+
+// task 261: `DENNO_TENSOR_TYPES` の役割分類 (診断の集計キー)。実 GGUF 無しで
+// 名前 → 役割の対応だけを固定する。
+#[test]
+fn tensor_role_groups_by_suffix() {
+    assert_eq!(tensor_role("blk.7.ffn_gate_exps.weight"), "expert_gate");
+    assert_eq!(tensor_role("blk.7.ffn_up_exps.weight"), "expert_up");
+    assert_eq!(tensor_role("blk.7.ffn_down_exps.weight"), "expert_down");
+    assert_eq!(tensor_role("blk.7.ffn_gate_shexp.weight"), "shared");
+    assert_eq!(tensor_role("blk.7.ffn_up_shexp.weight"), "shared");
+    assert_eq!(tensor_role("blk.7.ffn_gate_inp.weight"), "router");
+    assert_eq!(tensor_role("blk.7.ffn_gate_inp_shexp.weight"), "router");
+    assert_eq!(tensor_role("blk.7.attn_qkv.weight"), "attn_gdn");
+    assert_eq!(tensor_role("blk.7.ssm_out.weight"), "attn_gdn");
+    assert_eq!(tensor_role("blk.7.attn_q.weight"), "attn_gdn");
+    assert_eq!(tensor_role("blk.3.indexer.q_proj.weight"), "indexer");
+    assert_eq!(tensor_role("blk.7.hc_attn_up.weight"), "mix");
+    assert_eq!(tensor_role("blk.1.ple_key.weight"), "ple_layer");
+    assert_eq!(tensor_role("per_layer_token_embd.weight"), "ple_table");
+    assert_eq!(tensor_role("token_embd.weight"), "embed");
+    assert_eq!(tensor_role("output.weight"), "head");
+    assert_eq!(tensor_role("output_hc_norm.weight"), "head");
+    assert_eq!(tensor_role("blk.0.ssm_a"), "attn_gdn");
 }

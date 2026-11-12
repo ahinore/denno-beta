@@ -317,8 +317,14 @@ pub fn stats_line() -> Option<String> {
         None => "vram=-".to_string(),
     };
     let up_ms = UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
+    // task 261: 載らなかった理由の内訳 (`type` = カーネルが無い型 / `budget` =
+    // 予算に 1 本が入らない / `alloc` = 実メモリの確保に失敗)。
+    #[cfg(feature = "cuda")]
+    let (fb, fb_ty, fb_budget, fb_alloc) = crate::model::expert_vram::fallback_breakdown();
+    #[cfg(not(feature = "cuda"))]
+    let (fb, fb_ty, fb_budget, fb_alloc) = (0u64, 0u64, 0u64, 0u64);
     Some(format!(
-        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} {vram}",
+        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} fb={fb}(type={fb_ty} budget={fb_budget} alloc={fb_alloc}) {vram}",
         h as f64 / l as f64
     ))
 }
