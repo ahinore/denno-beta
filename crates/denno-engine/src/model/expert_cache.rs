@@ -861,6 +861,48 @@ impl ExpertCache {
     pub fn reset_stats(&mut self) {
         lock_inner(&self.inner).stats = CacheStats::default();
     }
+
+    /// task 263: いま載っている鍵の一覧 (順序は不定)。
+    ///
+    /// 再調整が「いまの集合」と「欲しい集合」を比べるのに使う。
+    pub fn keys(&self) -> Vec<ExpertKey> {
+        lock_inner(&self.inner).map.keys().copied().collect()
+    }
+
+    /// task 263: 指定した鍵を落とす (載っていなければ false)。
+    ///
+    /// 読者が `Arc` を持っている間はバイト列が生き続ける (スロット番号だけ
+    /// 先に返す)。固定長ストアでは区間も返却する。
+    pub fn evict(&self, key: ExpertKey) -> bool {
+        let mut g = lock_inner(&self.inner);
+        let Some(sid) = g.map.remove(&key) else {
+            return false;
+        };
+        if let Some(old) = g.slots[sid as usize].take() {
+            g.unlink(sid);
+            g.store_free(sid);
+            self.store.recycle(old.buf);
+            return true;
+        }
+        false
+    }
+
+    /// 常駐している実バイト数 (スロット数 x スロット長)。
+    pub fn used_bytes(&self) -> u64 {
+        let g = lock_inner(&self.inner);
+        g.map
+            .values()
+            .filter_map(|&sid| g.slots[sid as usize].as_ref())
+            .map(|s| s.len as u64)
+            .sum()
+    }
+}
+
+impl Inner {
+    /// スロット番号を空きに戻す (`evict` 用)。
+    fn store_free(&mut self, sid: u32) {
+        self.free.push(sid);
+    }
 }
 
 /// 毒されたロックは中身を取り戻して使う (キャッシュは数値の正しさに無関係)。
@@ -1170,6 +1212,25 @@ impl ExpertCacheSet {
     /// task 260: ヒットだけを引くモードか (RAM tier)。
     pub fn peek_only(&self) -> bool {
         self.peek_only
+    }
+
+    /// task 263: 常駐している expert の鍵 (gate 行列から。3 行列は同じ集合)。
+    pub fn keys(&self) -> Vec<ExpertKey> {
+        self.caches[ExpertMatrix::Gate.index()].keys()
+    }
+
+    /// task 263: 全行列から鍵を落とす。1 本でも落ちたら true。
+    pub fn evict(&self, key: ExpertKey) -> bool {
+        let mut any = false;
+        for c in &self.caches {
+            any |= c.evict(key);
+        }
+        any
+    }
+
+    /// task 263: 常駐している実バイト数 (3 行列の和)。
+    pub fn used_bytes(&self) -> u64 {
+        self.caches.iter().map(|c| c.used_bytes()).sum()
     }
 
     /// pinned に置けているバイト数 (3 行列の和)。RAM tier の診断用。

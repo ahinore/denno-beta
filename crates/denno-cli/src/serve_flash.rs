@@ -2309,6 +2309,84 @@ fn select_model(flash: &Flash, body: &Value) -> Result<(bool, String), String> {
     Ok((true, id))
 }
 
+/// task 263: `GET /v1/experts/stats` の形。
+///
+/// tier ごとの本数と MB、記録された使用回数のうち各 tier が覆う割合、
+/// 記録ファイルと最後に保存できた時刻。ビューワが後で描くためのもの。
+fn experts_stats_json() -> Value {
+    use denno_engine::model::{exp_stats, expert_ram, expert_vram};
+    let counts = exp_stats::current_counts();
+    let vkeys: Vec<(u16, u16)> = expert_vram::keys()
+        .iter()
+        .map(|k| (k.layer, k.expert))
+        .collect();
+    let rkeys: Vec<(u16, u16)> = expert_ram::keys()
+        .iter()
+        .map(|k| (k.layer, k.expert))
+        .collect();
+    let (cov_v, cov_r, total) = match &counts {
+        Some(c) => {
+            let (a, t) = exp_stats::coverage(c, &vkeys);
+            let (b, _) = exp_stats::coverage(c, &rkeys);
+            (a, b, t)
+        }
+        None => (0, 0, 0),
+    };
+    let frac = |a: u64| {
+        if total > 0 {
+            a.min(total) as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    let vram = expert_vram::cache_usage();
+    let ram = expert_ram::status();
+    let plan = exp_stats::plan();
+    json!({
+        "enabled": exp_stats::enabled(),
+        "file": exp_stats::stats_path().map(|p| p.display().to_string()),
+        "last_save": exp_stats::last_save().map(|(t, b)| json!({"unix": t, "bytes": b})),
+        "recorded": counts.as_ref().map(|c| json!({
+            "dir": c.dir,
+            "expert_bytes": c.expert_bytes,
+            "n_layer": c.n_layer,
+            "n_expert": c.n_expert,
+            "experts": c.nonzero(),
+            "uses": total,
+        })),
+        "vram": {
+            "experts": vkeys.len(),
+            "mb": vram.map(|(u, _)| u >> 20),
+            "cap_mb": vram.map(|(_, c)| c >> 20),
+        },
+        "ram": {
+            "experts": ram.map(|r| r.0),
+            "slots": ram.map(|r| r.1),
+            "mb": ram.map(|r| (r.3 >> 20) as usize),
+            "pinned_mb": ram.map(|r| (r.2 >> 20) as usize),
+        },
+        "coverage": {
+            "vram": frac(cov_v),
+            "ram": frac(cov_r),
+            "total": frac(cov_v.saturating_add(cov_r)),
+        },
+        "plan": plan.map(|p| json!({
+            "at": p.at,
+            "planned_experts": p.planned_experts,
+            "vram_experts": p.vram_experts,
+            "vram_mb": p.vram_bytes >> 20,
+            "ram_experts": p.ram_experts,
+            "ram_mb": p.ram_bytes >> 20,
+            "cover_vram": p.cover_vram,
+            "cover_ram": p.cover_ram,
+            "cover_total": p.cover_total,
+            "secs": p.secs,
+            "promoted": p.promoted,
+            "dropped": p.dropped,
+        })),
+    })
+}
+
 /// 1 接続ぶんを読んでから処理する (テストと単発用)。本番の listen は
 /// [`run`] が読み取りを別スレッドで行い、`/v1/abort` だけはそこで即答する。
 #[cfg(test)]
@@ -2419,6 +2497,10 @@ fn handle_req(
     // ビューワ用: 保持している文脈 (KV / GDN 状態) の確認と破棄。
     if req.method == "GET" && path == "/v1/cache" {
         return send_json(&mut stream, "200 OK", &flash.ctx_json());
+    }
+    // task 263: expert の常駐状態 (tier ごとの本数・MB・覆盖率・記録ファイル)。
+    if req.method == "GET" && path == "/v1/experts/stats" {
+        return send_json(&mut stream, "200 OK", &experts_stats_json());
     }
     if req.method == "DELETE" && path == "/v1/cache" {
         let v = flash.clear_ctx();
@@ -2826,28 +2908,33 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
     let chunk = std::env::var("DENNO_PREFILL_BATCH_CHUNK").unwrap_or_else(|_| "8".into());
 
-    // task 146: (層, expert) の使用回数と、起動時の事前ロード。
-    // `DENNO_EXPERT_IQ_GPU=1` かつ `DENNO_EXPERT_IQ_STATS_FILE` が設定されている
-    // ときだけ動く。**起動時のモデル構築より前に起こす**のが大事で、構築 (数秒) の
-    // 間に上位 expert を載せておかないと、最初のリクエストが来た時点で数本しか
-    // 載っていない (lab t146b: 昇順で下位 3,212 本しか載らず、ヒット率が素と同じ)。
-    // どちらも背景スレッドなので `/v1/models` が返るまでの時間は変わらない。
+    // task 146/263: (層, expert) の使用回数と、起動プラン (VRAM → RAM)。
+    // 記録先は `DENNO_EXPERT_IQ_STATS_FILE` (明示) か `DENNO_EXPERT_STATS_DIR`
+    // (モデルごとのファイル)。どちらも無ければ丸ごと off。
+    // **起動時のモデル構築より前に起こす**のが大事で、構築 (数秒) の間に
+    // 上位 expert を載せておかないと、最初のリクエストが来た時点で数本しか
+    // 載っていない (lab t146b)。背景スレッドなので `/v1/models` は遅れない。
+    let model_dir_name = cfg
+        .dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stats_path =
+        denno_engine::model::exp_stats::set_identity(&model_dir_name, expert_bytes, n_layer, n_expert);
     let _stats_guard = if denno_engine::model::exp_stats::enabled() {
-        let dir_name = cfg
-            .dir
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        denno_engine::model::exp_stats::set_identity(&dir_name, expert_bytes, n_layer, n_expert);
-        // 事前ロード: 回数の多い順に VRAM へ載せる。decode 中は譲る。
-        let parts_pre = parts.clone();
-        std::thread::spawn(move || {
-            if let Some(line) =
-                denno_engine::model::qwen4exp::preload_experts_from_stats(&parts_pre, &dir_name)
-            {
-                eprintln!("{line}");
-            }
-        });
+        eprintln!(
+            "[exp-stats] on file={} (iq_gpu={} vram={} ram={})",
+            stats_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            u8::from(denno_engine::model::exp_iq::iq_gpu_enabled()),
+            std::env::var("DENNO_EXPERT_VRAM_MB").unwrap_or_default(),
+            std::env::var("DENNO_EXPERT_RAM_MB").unwrap_or_default()
+        );
+        // 起動プラン: 回数の多い順に VRAM tier → RAM tier。decode 中は譲り、
+        // 走行中は RAM tier を回数に追従させる (低優先度)。
+        denno_engine::model::qwen4exp::spawn_expert_plan(parts.clone(), model_dir_name.clone());
         // 保存: 新しい回数があるときだけ、20 秒ごとに原子的に書く (decode の外)。
         std::thread::spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_secs(
@@ -3082,6 +3169,29 @@ mod flash_tests {
         assert!(get_static("/", "x").is_none());
         assert!(get_static("/v1/telemetry/ws", "x").is_none());
         assert!(get_static("/v1/messages", "x").is_none());
+    }
+
+    /// task 263: `/v1/experts/stats` の形。env 未設定のテストでは off で、
+    /// file / recorded / plan は null、tier の数字は 0 (キーは必ず在る)。
+    #[test]
+    fn experts_stats_json_has_every_tier() {
+        let v = experts_stats_json();
+        for k in ["enabled", "file", "last_save", "recorded", "vram", "ram", "coverage", "plan"] {
+            assert!(v.get(k).is_some(), "{k} が無い: {v}");
+        }
+        assert_eq!(v["enabled"], json!(false));
+        assert_eq!(v["file"], Value::Null);
+        for t in ["vram", "ram"] {
+            for k in ["experts", "mb"] {
+                assert!(v[t].get(k).is_some(), "{t}.{k} が無い: {v}");
+            }
+        }
+        for k in ["vram", "ram", "total"] {
+            let x = v["coverage"][k].as_f64().expect("数値");
+            assert!((0.0..=1.0).contains(&x), "{k}={x}");
+        }
+        // JSON にできる (NaN が混ざっていない)
+        assert!(serde_json::to_string(&v).is_ok());
     }
 
     /// P51: read_req が WS の Upgrade ヘッダを拾える (名前は小文字で保持)。

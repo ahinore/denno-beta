@@ -1181,7 +1181,7 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 #[cfg(feature = "cuda")]
 pub use gpu::{
     acquire, acquire_deferred, acquire_host, acquire_soft, cache_usage, check_enabled, fallbacks,
-    init, lookup, lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
+    init, keys, lookup, lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
     Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
@@ -1535,6 +1535,18 @@ mod gpu {
         let c = CACHE.get()?;
         let g = c.lock().ok()?;
         Some((g.used_bytes(), g.cap_bytes()))
+    }
+
+    /// task 263: いま VRAM に載っている expert の鍵 (エンドポイントと再調整用)。
+    /// 未初期化なら空。
+    pub fn keys() -> Vec<ExpertKey> {
+        let Some(c) = CACHE.get() else {
+            return Vec::new();
+        };
+        let Ok(g) = c.lock() else {
+            return Vec::new();
+        };
+        g.lru_keys()
     }
 
     /// (LRU 使用中バイト, 外部予約バイト, 上限バイト)。未初期化なら `None`。

@@ -275,6 +275,45 @@ pub fn stats_reset() {
     }
 }
 
+/// task 263: 常駐している expert の鍵 (エンドポイントと再調整用)。
+pub fn keys() -> Vec<crate::model::expert_cache::ExpertKey> {
+    get().map(|s| s.keys()).unwrap_or_default()
+}
+
+/// task 263: 常駐している実バイト数。
+pub fn used_bytes() -> u64 {
+    get().map(|s| s.used_bytes()).unwrap_or(0)
+}
+
+/// task 263: `(常駐本数, スロット数, pinned バイト, 使用バイト)`。tier が無ければ `None`。
+pub fn status() -> Option<(usize, usize, u64, u64)> {
+    let set = get()?;
+    Some((
+        set.used_experts(),
+        set.slots(crate::model::expert_cache::ExpertMatrix::Gate),
+        set.pinned_bytes(),
+        set.used_bytes(),
+    ))
+}
+
+/// task 263: 再調整の間隔 (秒)。
+///
+/// `DENNO_EXPERT_RAM_REBALANCE_SECS` は `0` で再調整を止める (既定 30 秒)。
+/// 起動プランのあと、この間隔で「いまの回数の上位」に RAM tier を寄せる。
+pub const REBALANCE_SECS_ENV: &str = "DENNO_EXPERT_RAM_REBALANCE_SECS";
+
+/// [`REBALANCE_SECS_ENV`] の既定 (秒)。
+pub const DEFAULT_REBALANCE_SECS: u64 = 30;
+
+/// 再調整の間隔 (秒)。`0` = しない。
+pub fn rebalance_secs() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match env(REBALANCE_SECS_ENV) {
+        Some(s) => s.trim().parse::<u64>().unwrap_or(DEFAULT_REBALANCE_SECS),
+        None => DEFAULT_REBALANCE_SECS,
+    })
+}
+
 /// `MemAvailable` (バイト)。
 pub fn mem_available() -> Option<u64> {
     crate::model::expert_cache::mem_available()

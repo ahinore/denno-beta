@@ -2190,15 +2190,19 @@ fn build_expert_caches_with_mb(
 // 引く順番は VRAM tier → RAM tier → mmap。
 
 /// 行列ごとの `RamSpec` と、モデルの expert 総バイト数 (RAM tier の上限)。
-fn expert_ram_shape(layers: &[LayerW]) -> Result<([RamSpec; 3], u64)> {
+fn expert_ram_shape(layers: &[(ExpertW, ExpertW, ExpertW)]) -> Result<([RamSpec; 3], u64)> {
     let mut specs = Vec::with_capacity(3);
     let mut expert_bytes = 0u64;
-    for m in ExpertMatrix::ALL {
+    for (mi, _) in ExpertMatrix::ALL.iter().enumerate() {
         let mut slot_bytes = 0usize;
         let mut total = 0u64;
         let mut n_expert = 0usize;
-        for l in layers {
-            let w = matrix_w(l, m);
+        for (g, u, d) in layers {
+            let w = match mi {
+                0 => g,
+                1 => u,
+                _ => d,
+            };
             let s = ExpertSlice::new(w.ty, w.n_in, w.n_out, w.n_expert, 0)
                 .map_err(|err| one(format!("{}: {err}", w.name)))?;
             slot_bytes = slot_bytes.max(s.len);
@@ -2219,46 +2223,111 @@ fn expert_ram_shape(layers: &[LayerW]) -> Result<([RamSpec; 3], u64)> {
     Ok(([gate, up, down], expert_bytes))
 }
 
-/// 充填の順番。`DENNO_EXPERT_IQ_STATS_FILE` の使用回数 (多い順) があれば
-/// それ、無ければ (層, expert) 昇順 (= ファイル順で I/O が素直)。
-fn expert_ram_fill_order(
-    f: &GgufFile,
-    n_layer: usize,
-    n_expert: usize,
-    expert_bytes: u64,
-) -> Vec<(u16, u16)> {
-    use crate::model::exp_stats;
-    if let Some(path) = exp_stats::stats_path() {
-        let dir = f
-            .path_at(0)
-            .and_then(|p| p.parent())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if let Ok(c) = exp_stats::load_file(path, &dir, expert_bytes) {
-            if c.n_layer as usize == n_layer && c.n_expert as usize == n_expert {
-                let o = exp_stats::preload_order(&c);
-                if !o.is_empty() {
-                    return o;
+/// task 260/263: 起動時に RAM tier の下ごしらえだけする (**確保しない**)。
+///
+/// tier の作成と充填は背景の起動プラン ([`plan_experts_from_stats`]) が行う。
+/// ここで `install(None)` してはいけない: プランは `build_model` より先に
+/// 走るので、先に出来た tier を消してしまう (プランは起動の数秒を
+/// 事前ロードに使うため、構築より前に起こしてある)。
+///
+/// 覚えるのは診断用の範囲だけ (`DENNO_EXPERT_RAM_PROBE` / `DROP`)。
+fn expert_ram_prepare(f: &GgufFile, layers: &[LayerW]) -> Result<()> {
+    use crate::model::expert_ram;
+
+    if layers.is_empty() {
+        return Ok(());
+    }
+    // 診断用の範囲 (probe の mincore / page cache の drop)。tier の有無に依らず覚える。
+    if expert_ram::probe_enabled() || expert_ram::drop_enabled() {
+        let mut ranges: Vec<(usize, u64, u64)> = Vec::new();
+        let mut mmap: Vec<(usize, usize)> = Vec::new();
+        for l in layers {
+            for m in ExpertMatrix::ALL {
+                let w = matrix_w(l, m);
+                if let Some((part, off, len)) = f.tensor_mapping_parts(&w.name) {
+                    ranges.push((part, off as u64, len as u64));
                 }
+                let b = w.blocks.as_slice();
+                mmap.push((b.as_ptr() as usize, b.len()));
             }
         }
+        let parts: Vec<std::path::PathBuf> = (0..f.part_count())
+            .filter_map(|i| f.path_at(i).map(|p| p.to_path_buf()))
+            .collect();
+        expert_ram::install_ranges(parts, ranges, mmap);
     }
-    // 使用回数が無いときは **expert 優先** (全層を均等に回す)。層優先だと
-    // 予算が尽きたときに後ろの層が 1 本も載らず、decode がその層だけ disk に
-    // 落ちる (lab t260a で 48 層中 9 層しか載らなかった)。
-    let mut out = Vec::with_capacity(n_layer.saturating_mul(n_expert));
-    for e in 0..n_expert {
-        for l in 0..n_layer {
-            out.push((l as u16, e as u16));
-        }
-    }
-    out
+    Ok(())
 }
 
-/// 予算ぶんを起動時に充填する。戻り値は (バイト, 本数, 秒, 上限で止めたか)。
+/// task 260/263: RAM tier を作って install する (充填はしない)。
+///
+/// 予算は `DENNO_EXPERT_RAM_MB` (未設定 = 無効。`auto` = MemAvailable − 余裕を
+/// expert 総量で頭打ち)。`DENNO_EXPERT_RAM_MB` が 0 / 未設定なら `None`。
+fn expert_ram_build(
+    f: &GgufFile,
+    layers: &[(ExpertW, ExpertW, ExpertW)],
+) -> Result<Option<std::sync::Arc<ExpertCacheSet>>> {
+    use crate::model::expert_ram;
+
+    if layers.is_empty() {
+        return Ok(None);
+    }
+    if !expert_ram::enabled() {
+        return Ok(None);
+    }
+    let (specs, expert_bytes) = expert_ram_shape(layers)?;
+    let n_experts = layers
+        .len()
+        .saturating_mul(layers[0].0.n_expert)
+        .max(1);
+    let per_expert = expert_bytes / n_experts as u64;
+    let budget = expert_ram::budget_bytes_env(expert_bytes);
+    if budget < per_expert.max(1) {
+        eprintln!(
+            "[exp-ram] off: 予算 {} MiB が expert 1 本 ({:.2} MiB) に満たない (MemAvailable={:?} MiB / expert 総量 {} MiB)",
+            budget >> 20,
+            per_expert as f64 / (1024.0 * 1024.0),
+            expert_ram::mem_available().map(|b| b >> 20),
+            expert_bytes >> 20
+        );
+        return Ok(None);
+    }
+    let mut paths = Vec::with_capacity(f.part_count());
+    for i in 0..f.part_count() {
+        let p = f
+            .path_at(i)
+            .ok_or_else(|| one(format!("expert RAM tier: パート {i} のパスが無い")))?;
+        paths.push(p.to_path_buf());
+    }
+    let set = ExpertCacheSet::new_ram(
+        budget,
+        specs,
+        &paths,
+        expert_ram::margin_bytes(),
+        expert_ram::want_pinned(),
+    )
+    .map_err(|err| one(format!("expert RAM tier の構築に失敗: {err}")))?;
+    let slots = set.slots(ExpertMatrix::Gate);
+    if slots == 0 {
+        eprintln!("[exp-ram] off: スロット 0");
+        return Ok(None);
+    }
+    let set = std::sync::Arc::new(set);
+    expert_ram::install(Some(std::sync::Arc::clone(&set)));
+    eprintln!(
+        "[exp-ram] tier: budget={}MiB slots={} pin={} margin={}MiB",
+        budget >> 20,
+        slots,
+        u8::from(expert_ram::want_pinned()),
+        expert_ram::margin_bytes() >> 20
+    );
+    Ok(Some(set))
+}
+
+/// 予算ぶんを充填する。戻り値は (バイト, 本数, 秒, 上限で止めたか)。
 fn expert_ram_fill(
     set: &ExpertCacheSet,
-    layers: &[LayerW],
+    layers: &[(ExpertW, ExpertW, ExpertW)],
     order: &[(u16, u16)],
 ) -> (u64, usize, f64, bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2284,17 +2353,23 @@ fn expert_ram_fill(
             stopped = true;
             break;
         }
+        if crate::model::exp_stats::busy() {
+            // decode 中は譲る (リクエストを待たせない)。
+            while crate::model::exp_stats::busy() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
         let one = |&(layer, expert): &(u16, u16)| {
-            let Some(lw) = layers.get(layer as usize) else {
+            let Some((g, u, d)) = layers.get(layer as usize) else {
                 return;
             };
             let key = ExpertKey { layer, expert };
             let mut n = 0u64;
-            for m in ExpertMatrix::ALL {
-                let w = matrix_w(lw, m);
+            for (mi, w) in [g, u, d].into_iter().enumerate() {
                 let Ok((off, len)) = w.slice_abs(expert as usize) else {
                     return;
                 };
+                let m = ExpertMatrix::ALL[mi];
                 if set.get(m, w.file, key, off, len).is_ok() {
                     n += len as u64;
                 }
@@ -2333,122 +2408,6 @@ fn expert_ram_fill(
         t0.elapsed().as_secs_f64(),
         stopped,
     )
-}
-
-/// task 260: RAM tier を組んで起動時に充填する。ログ 1 行を返す。
-///
-/// 予算は `DENNO_EXPERT_RAM_MB` (未設定は自動 = MemAvailable − 余裕、モデルの
-/// expert 総量で頭打ち)。`0` で完全に従来 (tier を作らない)。
-fn build_expert_ram(f: &GgufFile, layers: &[LayerW]) -> Result<Option<String>> {
-    use crate::model::expert_ram;
-
-    if layers.is_empty() {
-        return Ok(None);
-    }
-    // **前のモデルの tier を先に落とす**。落とさずに次の予算を測ると
-    // MemAvailable が古い tier に食われていて、予算が半分以下になる
-    // (lab t260a: 46 GB の次が 11 GB になり、9 層しか載らなかった)。
-    expert_ram::install(None);
-    // pinned (`cuMemHostAlloc`) は CUDA の context が要る。無いスレッドでは
-    // ヒープへ落ちる (lab t260a はこれで pin=0 だった)。
-    #[cfg(feature = "cuda")]
-    {
-        if expert_ram::want_pinned() && !crate::cuda::make_current_on_this_thread() {
-            eprintln!("[exp-ram] pinned を諦める (CUDA の context を張れない) → ヒープ");
-        }
-    }
-    // 診断用の範囲 (probe の mincore / page cache の drop)。tier の有無に依らず覚える。
-    if expert_ram::probe_enabled() || expert_ram::drop_enabled() {
-        let mut ranges: Vec<(usize, u64, u64)> = Vec::new();
-        let mut mmap: Vec<(usize, usize)> = Vec::new();
-        for l in layers {
-            for m in ExpertMatrix::ALL {
-                let w = matrix_w(l, m);
-                if let Some((part, off, len)) = f.tensor_mapping_parts(&w.name) {
-                    ranges.push((part, off as u64, len as u64));
-                }
-                let b = w.blocks.as_slice();
-                mmap.push((b.as_ptr() as usize, b.len()));
-            }
-        }
-        let parts: Vec<std::path::PathBuf> = (0..f.part_count())
-            .filter_map(|i| f.path_at(i).map(|p| p.to_path_buf()))
-            .collect();
-        expert_ram::install_ranges(parts, ranges, mmap);
-    }
-    if !expert_ram::enabled() {
-        // 前のモデルの tier を落とす (pinned も解放する)。
-        expert_ram::install(None);
-        return Ok(None);
-    }
-    let (specs, expert_bytes) = expert_ram_shape(layers)?;
-    let n_experts = layers.len().saturating_mul(layers[0].gate_exps.n_expert).max(1);
-    let per_expert = expert_bytes / n_experts as u64;
-    let budget = expert_ram::budget_bytes_env(expert_bytes);
-    if budget < per_expert.max(1) {
-        return Ok(Some(format!(
-            "[exp-ram] off: 予算 {} MiB が expert 1 本 ({:.2} MiB) に満たない (MemAvailable={:?} MiB / expert 総量 {} MiB)",
-            budget >> 20,
-            per_expert as f64 / (1024.0 * 1024.0),
-            expert_ram::mem_available().map(|b| b >> 20),
-            expert_bytes >> 20
-        )));
-    }
-    let mut paths = Vec::with_capacity(f.part_count());
-    for i in 0..f.part_count() {
-        let p = f
-            .path_at(i)
-            .ok_or_else(|| one(format!("expert RAM tier: パート {i} のパスが無い")))?;
-        paths.push(p.to_path_buf());
-    }
-    let set = ExpertCacheSet::new_ram(
-        budget,
-        specs,
-        &paths,
-        expert_ram::margin_bytes(),
-        expert_ram::want_pinned(),
-    )
-    .map_err(|err| one(format!("expert RAM tier の構築に失敗: {err}")))?;
-    let slots = set.slots(ExpertMatrix::Gate);
-    if slots == 0 {
-        return Ok(Some("[exp-ram] off: スロット 0".to_string()));
-    }
-    let set = std::sync::Arc::new(set);
-    expert_ram::install(Some(std::sync::Arc::clone(&set)));
-
-    let n_layer = layers.len();
-    let n_expert = layers[0].gate_exps.n_expert;
-    let mut line = format!(
-        "[exp-ram] tier: budget={}MiB slots={} pin={} margin={}MiB",
-        budget >> 20,
-        slots,
-        u8::from(expert_ram::want_pinned()),
-        expert_ram::margin_bytes() >> 20
-    );
-    if expert_ram::fill_enabled() {
-        let order = expert_ram_fill_order(f, n_layer, n_expert, expert_bytes);
-        let (bytes, experts, secs, stopped) = expert_ram_fill(&set, layers, &order);
-        line.push_str(&format!(
-            " filled={}MiB/{experts} experts in {secs:.2}s ({:.2} GB/s) pinned_now={}MiB stopped={}",
-            bytes >> 20,
-            if secs > 0.0 {
-                bytes as f64 / secs / 1e9
-            } else {
-                0.0
-            },
-            set.pinned_bytes() >> 20,
-            u8::from(stopped)
-        ));
-        if stopped {
-            line.push_str(&format!(
-                " (MemAvailable={:?} MiB で停止)",
-                expert_ram::mem_available().map(|b| b >> 20)
-            ));
-        }
-    } else {
-        line.push_str(" fill=off");
-    }
-    Ok(Some(line))
 }
 
 /// task 260: RAM tier から expert 1 本 (3 行列) のバイト列を取る。
@@ -2942,11 +2901,10 @@ impl Qwen4Exp {
 
         // P-MOE-G1: expert キャッシュ (既定 OFF。`DENNO_EXPERT_CACHE_MB` > 0 で構築)。
         let expert_cache = build_expert_caches(f, &layers)?;
-        // task 260: ホスト RAM tier (`DENNO_EXPERT_RAM_MB`。未設定は自動)。
-        // 起動時に予算ぶんを充填する (page cache と違って追い出されない)。
-        if let Some(line) = build_expert_ram(f, &layers)? {
-            eprintln!("{line}");
-        }
+        // task 260/263: ホスト RAM tier (`DENNO_EXPERT_RAM_MB`)。**作成と充填は
+        // 背景の起動プラン**が行う (ここで確保すると `/v1/models` が遅れる)。
+        // ここでは診断用の mmap 範囲を覚えるだけ。
+        expert_ram_prepare(f, &layers)?;
 
         Ok(Qwen4Exp {
             p,
@@ -11798,26 +11756,22 @@ pub fn expert_identity_bytes(f: &GgufFile, p: &Qwen4ExpParams) -> u64 {
     total
 }
 
-/// task 146: 記録した使用回数の上位から VRAM へ事前ロードする (起動時の背景スレッド)。
+/// task 146/263: 起動プラン。記録した使用回数の多い順に **VRAM tier → RAM tier**
+/// へ 1 回のパスで載せる (起動時の背景スレッド)。
 ///
 /// 呼び出し側 ([`crate::model::exp_stats`] と CLI) の契約:
 ///
-/// - ゲートは `DENNO_EXPERT_IQ_GPU=1` かつ `DENNO_EXPERT_IQ_STATS_FILE` が設定
-///   されていること ([`crate::model::exp_stats::enabled`])。呼ばれても、ファイルが
-///   無い・壊れている・版違い・別モデルなら **何も載せずに 1 行だけ返す**。
-///   起動もリクエストも落とさない。
-/// - **回数の多い順に載せ、載せ終わったら少ない順に touch し直す**。
-///   途中で切れても (最初のリクエストが来て decode に譲った場合) 上位が載って
-///   いるようにするため。touch は H2D しないので、完了後は「一番よく使う expert が
-///   一番最後に触られて = 一番追い出されにくい」になる。予算
-///   (`DENNO_EXPERT_VRAM_MB` - 予備) に届いたら止める。
-/// - decode 中 (`exp_stats::busy()`) は載せない。2 ms 寝て待ち、空いたら続きから。
-///   1 本の H2D は 0.3 ms 程度だが、LRU のロックを持つ間 decode の `lookup` が
-///   待つので、そもそも重ならないようにしてある。
-///
-/// 戻り値は 1 行のログ (呼び出し側が `eprintln!` する)。
+/// - ゲートは [`crate::model::exp_stats::enabled`]。呼ばれても、ファイルが無い・
+///   壊れている・版違い・別モデルなら **何も載せずに 1 行だけ返す**。起動も
+///   リクエストも落とさない。
+/// - **回数の多い順**に載せる。まず VRAM (`DENNO_EXPERT_VRAM_MB` - 予備、
+///   実カードの空きでも丸める)、次に残りを RAM tier (`DENNO_EXPERT_RAM_MB`)。
+///   どちらも decode 中 (`exp_stats::busy()`) は 2 ms 寝て譲る。
+/// - VRAM は載せ終わったら「少ない順」に touch し直す (H2D なし)。LRU の末尾 =
+///   最初に追い出される、が一番使わない expert になる。
+/// - 戻り値は 1 行のログ (tier ごとの本数・MB・記録された使用回数の覆盖率・時間)。
 #[cfg(feature = "cuda")]
-pub fn preload_experts_from_stats(
+pub fn plan_experts_from_stats(
     parts: &[std::path::PathBuf],
     dir_name: &str,
 ) -> Option<String> {
@@ -11829,73 +11783,38 @@ pub fn preload_experts_from_stats(
     let t0 = Instant::now();
     let f = match GgufFile::open_split(parts) {
         Ok(f) => f,
-        Err(e) => return Some(format!("[exp-preload] off: GGUF を開けない: {e}")),
+        Err(e) => return Some(format!("[exp-plan] off: GGUF を開けない: {e}")),
     };
     let p = match Qwen4ExpParams::from_meta(&f) {
         Ok(p) => p,
-        Err(e) => return Some(format!("[exp-preload] off: メタデータを読めない: {e}")),
+        Err(e) => return Some(format!("[exp-plan] off: メタデータを読めない: {e}")),
     };
     let total_bytes = expert_identity_bytes(&f, &p);
     let zeros = |dir: &str| {
         exp_stats::Counts::zeros(dir, total_bytes, p.n_layer as u32, p.n_expert as u32)
     };
-    let counts = match exp_stats::load_file(path, dir_name, total_bytes) {
+    let counts = match exp_stats::load_file(&path, dir_name, total_bytes) {
         Ok(c) => c,
         Err(e) => {
             // 記録は使わないが、このセッションの回数は保存したいので履歴を据える。
             exp_stats::install_prior(&zeros(dir_name));
-            return Some(format!("[exp-preload] off: {e}"));
+            return Some(format!("[exp-plan] off: {e}"));
         }
     };
     if counts.n_layer as usize != p.n_layer || counts.n_expert as usize != p.n_expert {
         exp_stats::install_prior(&zeros(dir_name));
         return Some(format!(
-            "[exp-preload] off: 記録の形が違う ({}x{} / 今回 {}x{})",
+            "[exp-plan] off: 記録の形が違う ({}x{} / 今回 {}x{})",
             counts.n_layer, counts.n_expert, p.n_layer, p.n_expert
         ));
     }
     exp_stats::install_prior(&counts);
     let plan = exp_stats::preload_order(&counts);
     if plan.is_empty() {
-        return Some("[exp-preload] off: 記録が空 (回数 0)".to_string());
+        return Some("[exp-plan] off: 記録が空 (回数 0)".to_string());
     }
-    // VRAM 予算をここで初期化する (初回の MoE 呼び出しと同じ 1 回きりの決定)。
-    let _ = expert_route();
-    let Some((_, cap)) = expert_vram::cache_usage() else {
-        return Some(
-            "[exp-preload] off: expert の VRAM 予算が無い (DENNO_EXPERT_VRAM_MB=0 / cuda 無効)"
-                .to_string(),
-        );
-    };
-    let reserve = exp_stats::preload_reserve_bytes();
-    let mut target = cap.saturating_sub(reserve);
-    // このスレッドで CUDA の current context を張る。CUDA の current context は
-    // スレッドローカルなので、これをしないと最初の cuMemAlloc が error 201
-    // (INVALID_CONTEXT) で落ちる (lab t146a で実際に踏んだ: ALLOC_DEAD が立って
-    // decode が全部 CPU になった)。物理容量の取得も context が要る。
-    if !crate::cuda::make_current_on_this_thread() {
-        return Some("[exp-preload] off: CUDA の context をこのスレッドに張れない".to_string());
-    }
-    // 実カードの容量でも丸める: dense 重みの予算 (`DENNO_GPU_WEIGHT_MB`) と
-    // 予備を引いたぶんまで。`DENNO_EXPERT_VRAM_MB` を大きく設定しても、
-    // 起動直後に VRAM を埋め切って後続の重み upload を失敗させない。
-    // (t147a: 24,000 + 重み 12,000 は 32 GB のカードに収まらず 14k prefill で OOM)
-    let weight_cap = crate::gpu_budget::weight_cap_bytes() as usize;
-    let physical = crate::cuda::dev_mem_mb().map(|(_, total_mb)| {
-        (total_mb << 20)
-            .saturating_sub(weight_cap)
-            .saturating_sub(reserve)
-    });
-    if let Some(p) = physical {
-        target = target.min(p);
-    }
-    if reserve >= cap {
-        return Some(format!(
-            "[exp-preload] off: 予算 {} MiB が予備 {} MiB 以下",
-            cap >> 20,
-            reserve >> 20
-        ));
-    }
+    let n_plan = plan.len();
+
     // 層ごとの読み口 (mmap のスライスだけ。ページは触らない)。
     let mut layers: Vec<(ExpertW, ExpertW, ExpertW)> = Vec::with_capacity(p.n_layer);
     for il in 0..p.n_layer {
@@ -11911,12 +11830,39 @@ pub fn preload_experts_from_stats(
                     Err(err) => format!("{err}"),
                     Ok(_) => "読み口を開けない".to_string(),
                 };
-                return Some(format!("[exp-preload] off: 層 {il}: {msg}"));
+                return Some(format!("[exp-plan] off: 層 {il}: {msg}"));
             }
         }
     }
 
-    let n_plan = plan.len();
+    // VRAM 予算をここで初期化する (初回の MoE 呼び出しと同じ 1 回きりの決定)。
+    let _ = expert_route();
+    let vram_cap = expert_vram::cache_usage().map(|(_, cap)| cap);
+    let ram_on = crate::model::expert_ram::enabled();
+    if vram_cap.is_none() && !ram_on {
+        return Some(
+            "[exp-plan] off: VRAM も RAM tier も無効 (DENNO_EXPERT_VRAM_MB=0 / DENNO_EXPERT_RAM_MB=0)"
+                .to_string(),
+        );
+    }
+    // CUDA の current context はスレッドローカル。これをしないと最初の
+    // cuMemAlloc が error 201 (INVALID_CONTEXT) で落ちる (lab t146a)。
+    if !crate::cuda::make_current_on_this_thread() {
+        return Some("[exp-plan] off: CUDA の context をこのスレッドに張れない".to_string());
+    }
+    let reserve = exp_stats::preload_reserve_bytes();
+    let mut target = vram_cap.unwrap_or(0).saturating_sub(reserve);
+    // 実カードの容量でも丸める: dense 重みの予算 (`DENNO_GPU_WEIGHT_MB`) と
+    // 予備を引いたぶんまで (t147a: 24,000 + 重み 12,000 は 32 GB に収まらず OOM)。
+    let weight_cap = crate::gpu_budget::weight_cap_bytes() as usize;
+    if let Some((_, total_mb)) = crate::cuda::dev_mem_mb() {
+        let physical = (total_mb << 20)
+            .saturating_sub(weight_cap)
+            .saturating_sub(reserve);
+        target = target.min(physical);
+    }
+    let vram_on = vram_cap.is_some_and(|c| c > reserve) && target > 0;
+
     let mut loaded = 0usize;
     let mut paused_ms = 0f64;
     // 前の失敗理由が残っていれば捨てる (停止理由の取り違えを防ぐ)。
@@ -11925,102 +11871,309 @@ pub fn preload_experts_from_stats(
     let mut stop: Option<String> = None;
     // 載せた順 (最後に touch を掛け直して「一番よく使う = 最後に使った」にする)。
     let mut loaded_keys: Vec<ExpertKey> = Vec::new();
-    // **回数の多い順**に載せる (lab t146b: 昇順だと予算で切れたときに下位だけが
-    // 載り、最初のリクエストのヒット率が素の 0.51 より悪くなりうる)。
-    // 全部載せ終わったら昇順 (= 少ない順) に touch し直して、追い出されにくさを
-    // 回数の順に戻す (touch は H2D しない)。
-    for (layer, expert) in plan.into_iter().rev() {
-        let (li, ei) = (layer as usize, expert as usize);
-        let Some((g, u, d)) = layers.get(li) else {
-            continue;
-        };
-        let shapes = [
-            ExpertShape {
-                ty: g.ty,
-                k: g.n_in,
-                n: g.n_out,
-            },
-            ExpertShape {
-                ty: u.ty,
-                k: u.n_in,
-                n: u.n_out,
-            },
-            ExpertShape {
-                ty: d.ty,
-                k: d.n_in,
-                n: d.n_out,
-            },
-        ];
-        let Ok(want) = shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) else {
-            stop = Some("expert のバイト数が求まらない".to_string());
-            break;
-        };
-        let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
-        if exp_stats::budget_full(used, want, target) {
-            stop = Some(format!("予算 (target {} MiB) に到達", target >> 20));
-            break;
-        }
-        // decode 中は譲る (リクエストを待たせない)。
-        if exp_stats::busy() {
-            let t = Instant::now();
-            while exp_stats::busy() {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            paused_ms += t.elapsed().as_secs_f64() * 1e3;
-        }
-        let key = ExpertKey { layer, expert };
-        let got = expert_vram::acquire_soft(key, shapes, || {
-            Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
-        });
-        match got {
-            Ok(Some(_)) => {
-                loaded += 1;
-                loaded_keys.push(key);
-            }
-            // 型が未対応・確保失敗はそこで止める。理由は 1 行に残す。
-            Ok(None) => {
-                stop = Some(match expert_vram::take_alloc_error() {
-                    Some(e) => format!("確保に失敗: {e}"),
-                    None => "この expert は GPU に載せられない (型・予算)".to_string(),
-                });
+    // まだ載せていない plan の本数 (RAM tier はここから続ける)。
+    let mut remain = plan.len();
+    if vram_on {
+        for i in (0..plan.len()).rev() {
+            let (layer, expert) = plan[i];
+            remain = i + 1;
+            let (li, ei) = (layer as usize, expert as usize);
+            let Some((g, u, d)) = layers.get(li) else {
+                continue;
+            };
+            let shapes = [
+                ExpertShape {
+                    ty: g.ty,
+                    k: g.n_in,
+                    n: g.n_out,
+                },
+                ExpertShape {
+                    ty: u.ty,
+                    k: u.n_in,
+                    n: u.n_out,
+                },
+                ExpertShape {
+                    ty: d.ty,
+                    k: d.n_in,
+                    n: d.n_out,
+                },
+            ];
+            let Ok(want) = shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) else {
+                stop = Some("expert のバイト数が求まらない".to_string());
+                break;
+            };
+            let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
+            if !exp_stats::fits(used as u64, want as u64, target as u64) {
+                stop = Some(format!("VRAM 予算 (target {} MiB) に到達", target >> 20));
                 break;
             }
-            Err(e) => {
-                stop = Some(format!("{e:#}"));
-                break;
+            // decode 中は譲る (リクエストを待たせない)。
+            if exp_stats::busy() {
+                let t = Instant::now();
+                while exp_stats::busy() {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                paused_ms += t.elapsed().as_secs_f64() * 1e3;
+            }
+            let key = ExpertKey { layer, expert };
+            let got = expert_vram::acquire_soft(key, shapes, || {
+                Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
+            });
+            match got {
+                Ok(Some(_)) => {
+                    loaded += 1;
+                    loaded_keys.push(key);
+                    remain = i;
+                }
+                // 型が未対応・確保失敗はそこで止める。理由は 1 行に残す。
+                Ok(None) => {
+                    stop = Some(match expert_vram::take_alloc_error() {
+                        Some(e) => format!("確保に失敗: {e}"),
+                        None => "この expert は GPU に載せられない (型・予算)".to_string(),
+                    });
+                    break;
+                }
+                Err(e) => {
+                    stop = Some(format!("{e:#}"));
+                    break;
+                }
             }
         }
     }
-    // 載せたものを「少ない順」に触り直す (H2D なし)。これで LRU の末尾 (= 最初に
-    // 追い出される) が一番使わない expert になり、task の「most used are evicted
-    // last」になる。載せ終わる前に止まった場合も、載っている範囲で同じ性質になる。
+    // 載せたものを「少ない順」に触り直す (H2D なし)。LRU の末尾 (= 最初に
+    // 追い出される) が一番使わない expert になり、task の「most used are
+    // evicted last」になる。
     loaded_keys.reverse();
     if !loaded_keys.is_empty() {
         expert_vram::touch_many(&loaded_keys);
     }
+    let vram_bytes = expert_vram::cache_usage().map_or(0, |(u, _)| u) as u64;
+    let vkeys: Vec<(u16, u16)> = loaded_keys.iter().map(|k| (k.layer, k.expert)).collect();
+    let (cov_vram, total_uses) = exp_stats::coverage(&counts, &vkeys);
+
+    // ---- RAM tier: 残りを回数の多い順に ----
+    let mut ram_experts = 0usize;
+    let mut ram_bytes = 0u64;
+    let mut cov_ram = 0u64;
+    let mut ram_msg = String::new();
+    if ram_on && remain > 0 {
+        match expert_ram_build(&f, &layers) {
+            Ok(Some(set)) => {
+                let cap = set.slots(ExpertMatrix::Gate);
+                let todo: Vec<(u16, u16)> = (0..remain).rev().map(|i| plan[i]).collect();
+                let (bytes, n, secs, rstop) = expert_ram_fill(&set, &layers, &todo);
+                ram_experts = n;
+                ram_bytes = bytes;
+                let rkeys: Vec<(u16, u16)> = crate::model::expert_ram::keys()
+                    .iter()
+                    .map(|k| (k.layer, k.expert))
+                    .collect();
+                cov_ram = exp_stats::coverage(&counts, &rkeys).0;
+                ram_msg = format!(
+                    " ram={n}/{cap} experts {}MiB (cover {:.3}) in {secs:.2}s{}",
+                    bytes >> 20,
+                    if total_uses > 0 { cov_ram as f64 / total_uses as f64 } else { 0.0 },
+                    if rstop { " stopped" } else { "" }
+                );
+            }
+            Ok(None) => ram_msg = " ram=off".to_string(),
+            Err(e) => ram_msg = format!(" ram=off ({e:#})"),
+        }
+    } else if ram_on {
+        ram_msg = " ram=full (残り 0)".to_string();
+    }
+
     let secs = t0.elapsed().as_secs_f64();
-    let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
+    let frac = |a: u64| {
+        if total_uses > 0 {
+            a.min(total_uses) as f64 / total_uses as f64
+        } else {
+            0.0
+        }
+    };
+    let cover_total = frac(cov_vram.saturating_add(cov_ram));
+    exp_stats::set_plan(exp_stats::PlanSnapshot {
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        planned_experts: n_plan,
+        vram_experts: loaded,
+        vram_bytes,
+        ram_experts,
+        ram_bytes,
+        cover_vram: frac(cov_vram),
+        cover_ram: frac(cov_ram),
+        cover_total,
+        secs,
+        promoted: 0,
+        dropped: 0,
+    });
     Some(format!(
-        "[exp-preload] loaded={loaded} experts {used}MiB/{}MiB in {secs:.2}s \
-         (plan={n_plan} target={}MiB reserve={}MiB phys={:?}MiB paused={paused_ms:.0}ms \
-         stop={:?} key_rate={:.3})",
-        cap >> 20,
-        target >> 20,
-        reserve >> 20,
-        physical.map(|p| p >> 20),
-        stop,
-        loaded as f64 / n_plan.max(1) as f64
+        "[exp-plan] planned={n_plan} uses={total_uses} vram={loaded} experts {}MiB (cover {:.3}){ram_msg} \
+         total cover {cover_total:.3} rest=mmap in {secs:.2}s paused={paused_ms:.0}ms stop={stop:?}",
+        vram_bytes >> 20,
+        frac(cov_vram)
     ))
 }
 
-/// `cuda` feature 無しでは VRAM へ載せられない (常に `None` = 何もしない)。
+/// `cuda` feature 無しでは tier に載せられない (常に `None` = 何もしない)。
 #[cfg(not(feature = "cuda"))]
-pub fn preload_experts_from_stats(
+pub fn plan_experts_from_stats(
     _parts: &[std::path::PathBuf],
     _dir_name: &str,
 ) -> Option<String> {
     None
 }
+
+/// task 263: RAM tier を「いまの回数の上位」に寄せる 1 パス。
+///
+/// - 欲しい集合 = 回数の多い順に `slots` 本 (スロット数 = RAM 予算ぶん)。
+/// - それ以外の常駐を落とし、足りないぶんを昇順 (少ない順) に埋める
+///   (一番熱いのが最後に触られて、次に落とされにくい)。
+/// - 64 本ずつ・チャンクの間で 20 ms 寝る。decode 中は譲る。**低優先度**。
+///
+/// 変更が無ければ `None`。
+#[cfg(feature = "cuda")]
+fn rebalance_once(parts: &[std::path::PathBuf], dir_name: &str) -> Option<String> {
+    use crate::model::{exp_stats, expert_ram};
+    use std::time::Duration;
+
+    let set = expert_ram::get()?;
+    let counts = exp_stats::current_counts()?;
+    if counts.dir != dir_name {
+        return None;
+    }
+    let plan = exp_stats::preload_order(&counts);
+    let cap = set.slots(ExpertMatrix::Gate);
+    if cap == 0 || plan.is_empty() {
+        return None;
+    }
+    // VRAM に載っている expert は RAM tier に重複して置かない (起動プランと
+    // 同じ「VRAM → RAM」の順)。VRAM の LRU は走行中に入れ替わるので毎回引く。
+    let vram: std::collections::HashSet<(u16, u16)> = crate::model::expert_vram::keys()
+        .iter()
+        .map(|k| (k.layer, k.expert))
+        .collect();
+    let want: std::collections::HashSet<(u16, u16)> = plan
+        .iter()
+        .rev()
+        .filter(|k| !vram.contains(k))
+        .take(cap)
+        .copied()
+        .collect();
+    let have: Vec<(u16, u16)> = set.keys().iter().map(|k| (k.layer, k.expert)).collect();
+    let have_set: std::collections::HashSet<(u16, u16)> = have.iter().copied().collect();
+    let drop_keys: Vec<ExpertKey> = have
+        .iter()
+        .filter(|k| !want.contains(k))
+        .map(|&(layer, expert)| ExpertKey { layer, expert })
+        .collect();
+    // 昇順 (少ない順) に埋める = 一番熱いのが最後に触られる。
+    let fill_keys: Vec<(u16, u16)> = plan
+        .iter()
+        .filter(|k| want.contains(k) && !have_set.contains(k))
+        .copied()
+        .collect();
+    if drop_keys.is_empty() && fill_keys.is_empty() {
+        return None;
+    }
+    let mut dropped = 0usize;
+    for chunk in drop_keys.chunks(64) {
+        while exp_stats::busy() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for k in chunk {
+            if set.evict(*k) {
+                dropped += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut promoted = 0usize;
+    if !fill_keys.is_empty() {
+        let f = GgufFile::open_split(parts).ok()?;
+        let p = Qwen4ExpParams::from_meta(&f).ok()?;
+        let mut layers: Vec<(ExpertW, ExpertW, ExpertW)> = Vec::with_capacity(p.n_layer);
+        for il in 0..p.n_layer {
+            let load = |m: &str| ExpertW::load(&f, &format!("blk.{il}.{m}"), &p);
+            match (
+                load("ffn_gate_exps.weight"),
+                load("ffn_up_exps.weight"),
+                load("ffn_down_exps.weight"),
+            ) {
+                (Ok(g), Ok(u), Ok(d)) => layers.push((g, u, d)),
+                _ => return None,
+            }
+        }
+        for chunk in fill_keys.chunks(64) {
+            while exp_stats::busy() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            for &(layer, expert) in chunk {
+                let Some((g, u, d)) = layers.get(layer as usize) else {
+                    continue;
+                };
+                let key = ExpertKey { layer, expert };
+                let mut ok = true;
+                for (mi, w) in [g, u, d].into_iter().enumerate() {
+                    let Ok((off, len)) = w.slice_abs(expert as usize) else {
+                        ok = false;
+                        break;
+                    };
+                    if set.get(ExpertMatrix::ALL[mi], w.file, key, off, len).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    promoted += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    exp_stats::add_rebalance(promoted, dropped);
+    let (cov, total) = exp_stats::coverage(&counts, &expert_ram::keys().iter().map(|k| (k.layer, k.expert)).collect::<Vec<_>>());
+    Some(format!(
+        "[exp-plan] rebalance promoted={promoted} dropped={dropped} resident={} cover={:.3}",
+        expert_ram::keys().len(),
+        if total > 0 { cov as f64 / total as f64 } else { 0.0 }
+    ))
+}
+
+/// task 263: 起動プラン + 走行中の再調整を 1 本の背景スレッドで回す。
+///
+/// 起動プランは `build_model` より前に起こす (構築の数秒を充填に使う)。
+/// RAM tier が無い・記録が無いときはプランが 1 行返すだけで、再調整も回さない。
+#[cfg(feature = "cuda")]
+pub fn spawn_expert_plan(parts: Vec<std::path::PathBuf>, dir_name: String) {
+    std::thread::Builder::new()
+        .name("exp-plan".into())
+        .spawn(move || {
+            if let Some(line) = plan_experts_from_stats(&parts, &dir_name) {
+                eprintln!("{line}");
+            }
+            let secs = crate::model::expert_ram::rebalance_secs();
+            if secs == 0 {
+                return;
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                if !crate::model::expert_ram::active() || !crate::model::exp_stats::enabled() {
+                    continue;
+                }
+                if let Some(line) = rebalance_once(&parts, &dir_name) {
+                    eprintln!("{line}");
+                }
+            }
+        })
+        .ok();
+}
+
+/// `cuda` feature 無しでは何もしない。
+#[cfg(not(feature = "cuda"))]
+pub fn spawn_expert_plan(_parts: Vec<std::path::PathBuf>, _dir_name: String) {}
 
 #[cfg(not(feature = "cuda"))]
 fn moe_experts_gpu_batched(
@@ -15405,6 +15558,10 @@ fn moe_ffn_quant_batch_full(
     moe_sub_add(0, t_router.elapsed());
     // 区間を閉じる (experts の時間を router に二重計上しない)。
     drop(_l_router);
+    // task 263: prefill の選択も数える (8 トークンに 1 回 = 重み 1/8)。
+    // decode の履歴を長いプロンプトで塗り潰さないための重みで、コストは
+    // `(nt/8) * k` 回の fetch_add (ロックなし・確保なし)。
+    crate::model::exp_stats::observe_batch(p.n_layer, p.n_expert, lw.il, &sels, k, nt);
     // P56: RouterTopK は**チャンク末尾の 1 トークンだけ**送る。
     //
     // 理由: 全トークンを送ると 1 プロンプトで nt × n_layer 枚 (512 トークン ×
@@ -16930,6 +17087,48 @@ mod tests {
             layers.iter().all(|l| *l == 0),
             "層 0 以外に積まれた: {layers:?}"
         );
+    }
+
+    /// task 263: prefill のバッチ経路が 8 トークンに 1 回だけ数えている。
+    ///
+    /// nt=24, k=n_expert_used なら標本は t=0,8,16 の 3 本 → 3 * k 回。
+    #[test]
+    fn exp_stats_counts_prefill_batch_path() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("exp_stats_batch");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        let nt = 24usize;
+        let xs: Vec<f32> = (0..nt)
+            .flat_map(|i| x.iter().map(move |v| v * (i as f32 + 1.0)).collect::<Vec<_>>())
+            .collect();
+
+        let _on = crate::model::exp_stats::enable_for_test();
+        let before: u64 = crate::model::exp_stats::session()
+            .map(|c| c.snapshot().iter().map(|v| *v as u64).sum())
+            .unwrap_or(0);
+        let out = moe_ffn_quant_batch(&p, &lw, &xs, nt, None).expect("batch");
+        assert_eq!(out.len(), nt * p.n_embd);
+        let cells = crate::model::exp_stats::session().expect("カウンタが作られていない");
+        let snap = cells.snapshot();
+        let after: u64 = snap.iter().map(|v| *v as u64).sum();
+        let samples = nt.div_ceil(crate::model::exp_stats::PREFILL_STRIDE) as u64;
+        assert_eq!(
+            after - before,
+            samples * p.n_expert_used as u64,
+            "prefill の計数が標本数 x k でない (samples={samples}, k={})",
+            p.n_expert_used
+        );
+        // 積まれたのは層 0 のセルだけ (合成モデルは層 0 だけ回す)
+        let ne = p.n_expert;
+        assert!(snap
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v > 0)
+            .all(|(i, _)| i / ne == 0));
     }
 
     /// task 155: `DENNO_SHARED_TAIL` の解釈と、GPU が無いときのフォールバック。
