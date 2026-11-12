@@ -676,6 +676,14 @@ pub(crate) fn try_experts(
     if !enabled() {
         return Ok(false);
     }
+    // task 266: カーネルが読めるのは **ブロック量子の 4 型だけ** (Q8_0 / Q5_1 /
+    // Q4_K / Q5_K)。既定 on にしても IQ 型のモデル (swift15) の prefill を
+    // 1 バイトも触らないよう、配車の前にここで落とす (エラーにもしない)。
+    for s in [&gate, &up, &down] {
+        if !block_type_ok(s.ty) {
+            return Ok(false);
+        }
+    }
     if xs.len() != nt * e || out.len() != nt * e {
         bail!("moe_grouped_gpu: 入出力の長さが nt({nt}) * e({e}) と違う");
     }
@@ -787,6 +795,17 @@ pub(crate) fn try_experts(
         }
     }
     Ok(ran)
+}
+
+/// task 266: grouped GEMM のカーネルが読める量子型か (ブロック量子の 4 型だけ)。
+///
+/// IQ 型 (swift15 の expert) はカーネルが知らないので、既定 on にしても
+/// 配車・pack の前に落とす (他モデルの prefill を 1 バイトも触らない)。
+pub(crate) fn block_type_ok(ty: GgmlType) -> bool {
+    matches!(
+        ty,
+        GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K
+    )
 }
 
 /// `DENNO_MOE_GROUPED_CHECK=1` で、プロセス内の最初の 1 層だけ true。
@@ -1400,6 +1419,17 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    /// task 266: 型の関門。4 型だけが通り、IQ / BF16 / F32 は配車の前に落ちる。
+    #[test]
+    fn block_types_are_the_kernel_four() {
+        for t in [GgmlType::Q8_0, GgmlType::Q5_1, GgmlType::Q4K, GgmlType::Q5K] {
+            assert!(block_type_ok(t), "{t:?} は通るはず");
+        }
+        for t in [GgmlType::Bf16, GgmlType::F32, GgmlType::IQ3S, GgmlType::IQ4Nl] {
+            assert!(!block_type_ok(t), "{t:?} は落ちるはず");
         }
     }
 

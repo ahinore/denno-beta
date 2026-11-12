@@ -9,6 +9,7 @@ pub mod expert_ram;
 pub mod expert_slab;
 pub mod exp_kprof;
 pub mod exp_miss_up;
+pub mod exp_prefetch;
 pub mod exp_stats;
 pub mod exp_up_worker;
 pub mod expert_vram;

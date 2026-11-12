@@ -281,6 +281,22 @@ pub fn note_gpu_layer(n: u32) {
     GPU_EXPERTS.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// task 261: 層一括 (旧 4 型) 経路が 1 層を GPU で完了した回数。
+static BATCH_OK: AtomicU64 = AtomicU64::new(0);
+
+/// task 261: 層一括経路が expert を載せられず per-expert 経路へ落ちた回数。
+static BATCH_BAIL: AtomicU64 = AtomicU64::new(0);
+
+/// 層一括経路が 1 層を回し切った。
+pub fn note_batch_ok() {
+    BATCH_OK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 層一括経路が途中で諦めた (1 本でも VRAM に載らなかった)。
+pub fn note_batch_bail() {
+    BATCH_BAIL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 上げ直し (H2D) を 1 本ぶん積む。
 pub fn note_upload() {
     UPLOADS.fetch_add(1, Ordering::Relaxed);
@@ -317,8 +333,17 @@ pub fn stats_line() -> Option<String> {
         None => "vram=-".to_string(),
     };
     let up_ms = UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
+    // task 261: 載らなかった理由の内訳 (`type` = カーネルが無い型 / `budget` =
+    // 予算に 1 本が入らない / `alloc` = 実メモリの確保に失敗)。
+    #[cfg(feature = "cuda")]
+    let (fb, fb_ty, fb_budget, fb_alloc) = crate::model::expert_vram::fallback_breakdown();
+    #[cfg(not(feature = "cuda"))]
+    let (fb, fb_ty, fb_budget, fb_alloc) = (0u64, 0u64, 0u64, 0u64);
+    // task 261: 旧 4 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層一括経路の当たり外れ。
+    let batch_ok = BATCH_OK.load(Ordering::Relaxed);
+    let batch_bail = BATCH_BAIL.load(Ordering::Relaxed);
     Some(format!(
-        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} {vram}",
+        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} batch_ok={batch_ok} batch_bail={batch_bail} fb={fb}(type={fb_ty} budget={fb_budget} alloc={fb_alloc}) {vram}",
         h as f64 / l as f64
     ))
 }
@@ -350,6 +375,8 @@ pub fn stats_reset() {
         &UPLOAD_LAYERS,
         &UPLOAD_N,
         &UPLOAD_LAYERS_NS,
+        &BATCH_OK,
+        &BATCH_BAIL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
