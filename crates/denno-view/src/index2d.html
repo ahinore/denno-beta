@@ -258,7 +258,7 @@
 import { decodeFrame, FrameDecodeError } from '/frames.mjs';
 import {
   DEFAULT_SHAPE_RAW, WALL_COLORS, createMapState, createMockStore,
-  createSelection, clearSelection as clearSel, depthValue, heat, mergeBodies,
+  createSelection, clearSelection as clearSel, depthValue, heat, mergeBodies, fitExpertLimit,
   mockTokenFrames, normaliseShape, rampRGB, roleForBlock, selectionCount,
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
   toggleItem, addItem, removeItem, selectionItems, wallHitTest,
@@ -660,11 +660,19 @@ async function postIntervene(body) {
 
 $('btn-off').addEventListener('click', async () => {
   if (!selectionCount(sel)) { $('iverr').textContent = 'selection is empty (click or drag on the map)'; return; }
-  const body = mergeBodies(
+  const merged = mergeBodies(
     { experts_off: applied.experts_off, blocks_off: applied.blocks_off, streams_off: applied.streams_off },
     selectionToBody(sel),
   );
-  if (await postIntervene(body)) { clearSel(sel); renderState(); dirty = true; }
+  // 層あたり n_expert_used 個は残す規則 (実 API は 400) に収めてから送る。
+  const fit = fitExpertLimit(merged, shape, applied);
+  if (await postIntervene(fit.body)) {
+    clearSel(sel); renderState(); dirty = true;
+    if (fit.notes.length) {
+      $('iverr').textContent = fit.notes.slice(0, 3).join(' / ') +
+        (fit.notes.length > 3 ? ' / ほか ' + (fit.notes.length - 3) + ' 層' : '');
+    }
+  }
 });
 
 $('btn-on').addEventListener('click', async () => {

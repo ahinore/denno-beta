@@ -647,6 +647,56 @@ export function mergeBodies(a, b) {
   return selectionToBody(sel);
 }
 
+/// off にする本文を「層あたり残る expert ≥ n_expert_used」(実 API の規則、満たさないと
+/// 400) に収める。ドラッグで層のタイルをほぼ覆うと、expert が全部 / ほぼ全部選ばれて
+/// この規則に当たる。
+///   - 層の expert が全部 off → その層の expert を外して `moe` ブロック (routed expert
+///     全体の skip) を off にする。意味は同じ (routed expert を 1 つも使わない)。
+///   - 残りが 1..k-1 → 今回新しく選んだ expert のうち番号の大きい方から、足りない数だけ
+///     on のまま残す (前から off のものは触らない)。
+/// `prev` は今の off (applied)。戻り値 { body, notes }。notes は層ごとの説明。
+export function fitExpertLimit(body, shape, prev) {
+  const s = normaliseShape(shape);
+  const k = s.n_expert_used | 0;
+  const ne = s.n_expert | 0;
+  const out = {
+    experts_off: (body.experts_off || []).map((p) => [p[0], p[1]]),
+    blocks_off: (body.blocks_off || []).map((p) => [p[0], p[1]]),
+    streams_off: (body.streams_off || []).map((p) => [p[0], p[1]]),
+  };
+  const notes = [];
+  if (!(k > 0 && ne > 0) || out.experts_off.length === 0) return { body: out, notes };
+  const before = new Set((prev && prev.experts_off ? prev.experts_off : []).map((p) => p[0] + ':' + p[1]));
+  const byLayer = new Map();
+  for (const [l, e] of out.experts_off) {
+    if (!byLayer.has(l)) byLayer.set(l, []);
+    byLayer.get(l).push(e);
+  }
+  const drop = new Set();
+  for (const [l, list] of byLayer) {
+    const remaining = ne - list.length;
+    if (remaining >= k) continue;
+    if (remaining <= 0) {
+      for (const e of list) drop.add(l + ':' + e);
+      if (!out.blocks_off.some((b) => b[0] === l && b[1] === 'moe')) out.blocks_off.push([l, 'moe']);
+      notes.push('層 ' + l + ': expert を全部選んだので moe ブロックを off にした');
+      continue;
+    }
+    const need = k - remaining;
+    const fresh = list.filter((e) => !before.has(l + ':' + e)).sort((a, b) => b - a);
+    const keep = fresh.slice(0, need);
+    for (const e of keep) drop.add(l + ':' + e);
+    notes.push('層 ' + l + ': 最低 ' + k + ' 個の expert が要るので ' + keep.length + ' 個を on のまま残した (' +
+      keep.slice().sort((a, b) => a - b).join(',') + ')');
+  }
+  if (drop.size) {
+    out.experts_off = out.experts_off.filter((p) => !drop.has(p[0] + ':' + p[1]));
+    out.blocks_off.sort((a, b) => a[0] - b[0] || BLOCKS.indexOf(a[1]) - BLOCKS.indexOf(b[1]));
+  }
+  notes.sort((a, b) => Number(a.split(' ')[1]) - Number(b.split(' ')[1]));
+  return { body: out, notes };
+}
+
 /// 選択を item の配列に戻す (テストとデバッグ用)。
 export function selectionItems(sel) {
   const out = [];
