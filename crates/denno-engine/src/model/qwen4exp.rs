@@ -37,7 +37,7 @@ use std::fmt;
 
 use crate::gguf::{GgufFile, GgufTensorInfo, GgufValue, TensorRef};
 use crate::kquant::GgmlType;
-use crate::model::expert_cache::{self, CacheSpec, ExpertCacheSet, ExpertKey, ExpertMatrix};
+use crate::model::expert_cache::{self, CacheSpec, ExpertCacheSet, ExpertKey, ExpertMatrix, RamSpec};
 use crate::model::expert_vram::{self, Route};
 use crate::model::hyper::{self, HyperParams, HyperStreams};
 use crate::model::intervene::{self, Block as IvBlock, View as IvView};
@@ -2189,24 +2189,30 @@ fn build_expert_caches_with_mb(
 // 誰の物でもなく大きな読みで追い出されるが、ここは追い出されない。
 // 引く順番は VRAM tier → RAM tier → mmap。
 
-/// 行列ごとの `slot_bytes` と、モデルの expert 総バイト数 (RAM tier の上限)。
-fn expert_ram_shape(
-    layers: &[LayerW],
-) -> Result<([CacheSpec; 3], u64)> {
+/// 行列ごとの `RamSpec` と、モデルの expert 総バイト数 (RAM tier の上限)。
+fn expert_ram_shape(layers: &[LayerW]) -> Result<([RamSpec; 3], u64)> {
     let mut specs = Vec::with_capacity(3);
     let mut expert_bytes = 0u64;
     for m in ExpertMatrix::ALL {
         let mut slot_bytes = 0usize;
+        let mut total = 0u64;
+        let mut n_expert = 0usize;
         for l in layers {
             let w = matrix_w(l, m);
             let s = ExpertSlice::new(w.ty, w.n_in, w.n_out, w.n_expert, 0)
                 .map_err(|err| one(format!("{}: {err}", w.name)))?;
             slot_bytes = slot_bytes.max(s.len);
-            expert_bytes = expert_bytes.saturating_add(s.len as u64 * w.n_expert as u64);
+            total = total.saturating_add(s.len as u64 * w.n_expert as u64);
+            n_expert = w.n_expert;
         }
-        specs.push(CacheSpec { slot_bytes });
+        specs.push(RamSpec {
+            slot_bytes,
+            total_bytes: total,
+            n_expert,
+        });
+        expert_bytes = expert_bytes.saturating_add(total);
     }
-    let [gate, up, down]: [CacheSpec; 3] = specs
+    let [gate, up, down]: [RamSpec; 3] = specs
         .try_into()
         .map_err(|_| one("expert RAM tier: 行列の指定が 3 本でない"))?;
     Ok(([gate, up, down], expert_bytes))
@@ -2236,9 +2242,12 @@ fn expert_ram_fill_order(
             }
         }
     }
+    // 使用回数が無いときは **expert 優先** (全層を均等に回す)。層優先だと
+    // 予算が尽きたときに後ろの層が 1 本も載らず、decode がその層だけ disk に
+    // 落ちる (lab t260a で 48 層中 9 層しか載らなかった)。
     let mut out = Vec::with_capacity(n_layer.saturating_mul(n_expert));
-    for l in 0..n_layer {
-        for e in 0..n_expert {
+    for e in 0..n_expert {
+        for l in 0..n_layer {
             out.push((l as u16, e as u16));
         }
     }
@@ -2295,7 +2304,20 @@ fn expert_ram_fill(
         match &pool {
             Ok(p) => {
                 use rayon::prelude::*;
-                p.install(|| chunk.par_iter().for_each(one));
+                // pinned の確保は context の張ったスレッドで行う (1 回だけ)。
+                p.install(|| {
+                    chunk.par_iter().for_each_init(
+                        || {
+                            #[cfg(feature = "cuda")]
+                            {
+                                if crate::model::expert_ram::want_pinned() {
+                                    let _ = crate::cuda::make_current_on_this_thread();
+                                }
+                            }
+                        },
+                        |_, it| one(it),
+                    )
+                });
             }
             Err(_) => {
                 for it in chunk {
@@ -2322,6 +2344,18 @@ fn build_expert_ram(f: &GgufFile, layers: &[LayerW]) -> Result<Option<String>> {
     if layers.is_empty() {
         return Ok(None);
     }
+    // **前のモデルの tier を先に落とす**。落とさずに次の予算を測ると
+    // MemAvailable が古い tier に食われていて、予算が半分以下になる
+    // (lab t260a: 46 GB の次が 11 GB になり、9 層しか載らなかった)。
+    expert_ram::install(None);
+    // pinned (`cuMemHostAlloc`) は CUDA の context が要る。無いスレッドでは
+    // ヒープへ落ちる (lab t260a はこれで pin=0 だった)。
+    #[cfg(feature = "cuda")]
+    {
+        if expert_ram::want_pinned() && !crate::cuda::make_current_on_this_thread() {
+            eprintln!("[exp-ram] pinned を諦める (CUDA の context を張れない) → ヒープ");
+        }
+    }
     // 診断用の範囲 (probe の mincore / page cache の drop)。tier の有無に依らず覚える。
     if expert_ram::probe_enabled() || expert_ram::drop_enabled() {
         let mut ranges: Vec<(usize, u64, u64)> = Vec::new();
@@ -2347,9 +2381,8 @@ fn build_expert_ram(f: &GgufFile, layers: &[LayerW]) -> Result<Option<String>> {
         return Ok(None);
     }
     let (specs, expert_bytes) = expert_ram_shape(layers)?;
-    let per_expert = specs[0].slot_bytes as u64
-        + specs[1].slot_bytes as u64
-        + specs[2].slot_bytes as u64;
+    let n_experts = layers.len().saturating_mul(layers[0].gate_exps.n_expert).max(1);
+    let per_expert = expert_bytes / n_experts as u64;
     let budget = expert_ram::budget_bytes_env(expert_bytes);
     if budget < per_expert.max(1) {
         return Ok(Some(format!(
@@ -2421,7 +2454,11 @@ fn build_expert_ram(f: &GgufFile, layers: &[LayerW]) -> Result<Option<String>> {
 ///
 /// ミスしたらファイルから読んで**埋める** (`DENNO_EXPERT_RAM_MB` の予算内)。
 /// tier が無効 / 予算外 / 失敗なら `None` を返し、呼び出し側は mmap へ落ちる。
-fn ram_regions(lw: &LayerW, ei: usize) -> Option<[std::sync::Arc<crate::model::expert_cache::Region>; 3]> {
+fn ram_regions(
+    lw: &LayerW,
+    ei: usize,
+    fill: bool,
+) -> Option<[std::sync::Arc<crate::model::expert_cache::Region>; 3]> {
     let set = crate::model::expert_ram::get()?;
     let key = ExpertKey {
         layer: lw.il as u16,
@@ -2433,9 +2470,18 @@ fn ram_regions(lw: &LayerW, ei: usize) -> Option<[std::sync::Arc<crate::model::e
         let Ok((off, len)) = w.slice_abs(ei) else {
             return None;
         };
-        match set.get(m, w.file, key, off, len) {
-            Ok(r) => out.push(r),
-            Err(_) => return None,
+        if fill {
+            match set.get(m, w.file, key, off, len) {
+                Ok(r) => out.push(r),
+                Err(_) => return None,
+            }
+        } else {
+            // `fill == false`: ヒットだけ。ミスで pread しない (decode の
+            // クリティカルパスで 3 MB を読み直さないため。lab t260a)。
+            match set.peek(m, key, len) {
+                Some(r) => out.push(r),
+                None => return None,
+            }
         }
     }
     let [a, b, c]: [std::sync::Arc<crate::model::expert_cache::Region>; 3] = out.try_into().ok()?;
@@ -2444,24 +2490,7 @@ fn ram_regions(lw: &LayerW, ei: usize) -> Option<[std::sync::Arc<crate::model::e
 
 /// task 260: RAM tier の**ヒットだけ**を引く (ミスで pread しない。prefill 用)。
 fn ram_peek(lw: &LayerW, ei: usize) -> Option<[std::sync::Arc<crate::model::expert_cache::Region>; 3]> {
-    let set = crate::model::expert_ram::get()?;
-    let key = ExpertKey {
-        layer: lw.il as u16,
-        expert: ei as u16,
-    };
-    let mut out: Vec<std::sync::Arc<crate::model::expert_cache::Region>> = Vec::with_capacity(3);
-    for m in ExpertMatrix::ALL {
-        let w = matrix_w(lw, m);
-        let Ok((_, len)) = w.slice_abs(ei) else {
-            return None;
-        };
-        match set.peek(m, key, len) {
-            Some(r) => out.push(r),
-            None => return None,
-        }
-    }
-    let [a, b, c]: [std::sync::Arc<crate::model::expert_cache::Region>; 3] = out.try_into().ok()?;
-    Some([a, b, c])
+    ram_regions(lw, ei, false)
 }
 
 /// task 260: VRAM へ上げる expert 1 本のホストバイト列の出所。
@@ -2476,7 +2505,9 @@ struct HostExpert {
 impl HostExpert {
     fn new(lw: &LayerW, ei: usize) -> Self {
         HostExpert {
-            regions: ram_regions(lw, ei),
+            // `DENNO_EXPERT_RAM_ADAPT=1` のときだけ使用時に埋める (既定 off:
+            // decode のミスで 3 MB を読み直すコストが勝つ。lab t260a)。
+            regions: ram_regions(lw, ei, crate::model::expert_ram::adapt_enabled()),
         }
     }
 
@@ -14581,7 +14612,7 @@ fn iq_pf_stream_layer(
         if resident.get(ei).and_then(|r| r.as_ref()).is_some() {
             continue;
         }
-        ram[ei] = ram_peek(lw, ei);
+        ram[ei] = ram_regions(lw, ei, crate::model::expert_ram::adapt_enabled());
     }
     let mut entries: Vec<crate::cuda::PfStreamEntry<'_>> = Vec::with_capacity(ne);
     for (ei, picks) in by_expert.iter().enumerate() {
@@ -20088,15 +20119,22 @@ mod tests {
 
         // 2. tier を top-k がちょうど入る予算で作る
         let lens = expert_lens(&lw);
+        let n_ex = p.n_expert;
         let specs = [
-            CacheSpec {
+            RamSpec {
                 slot_bytes: lens[0],
+                total_bytes: lens[0] as u64 * n_ex as u64,
+                n_expert: n_ex,
             },
-            CacheSpec {
+            RamSpec {
                 slot_bytes: lens[1],
+                total_bytes: lens[1] as u64 * n_ex as u64,
+                n_expert: n_ex,
             },
-            CacheSpec {
+            RamSpec {
                 slot_bytes: lens[2],
+                total_bytes: lens[2] as u64 * n_ex as u64,
+                n_expert: n_ex,
             },
         ];
         let per: u64 = lens.iter().map(|&b| b as u64).sum();

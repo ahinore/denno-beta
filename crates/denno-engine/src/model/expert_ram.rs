@@ -290,6 +290,13 @@ pub fn mem_available() -> Option<u64> {
 pub const PROBE_ENV: &str = "DENNO_EXPERT_RAM_PROBE";
 /// `DENNO_EXPERT_RAM_DROP`: 1 でリクエストごとに expert の page cache を落とす。
 pub const DROP_ENV: &str = "DENNO_EXPERT_RAM_DROP";
+/// `DENNO_EXPERT_RAM_ADAPT`: 1 で使用時に埋める (LRU)。**既定 off**。
+///
+/// off のときの tier は「起動時に充填した固定の集合」で、decode のミスでは
+/// ファイルを読み直さない。lab t260a の実測: decode のミスで pread して
+/// 埋める経路は、ヒット率が上がる前に 29% 遅くなった (page cache と同じ
+/// バイト列をもう一度読むだけで、page cache を追い出す)。
+pub const ADAPT_ENV: &str = "DENNO_EXPERT_RAM_ADAPT";
 
 /// expert テンソルのファイル範囲 (part, off, len)。落とすときに使う。
 static RANGES: RwLock<Vec<(usize, u64, u64)>> = RwLock::new(Vec::new());
@@ -313,6 +320,11 @@ pub fn probe_enabled() -> bool {
 
 pub fn drop_enabled() -> bool {
     flag(DROP_ENV)
+}
+
+/// 使用時に埋めるか (`DENNO_EXPERT_RAM_ADAPT=1`。既定 off)。
+pub fn adapt_enabled() -> bool {
+    flag(ADAPT_ENV)
 }
 
 /// モデルの expert 範囲を覚える (リクエストをまたいで使う)。

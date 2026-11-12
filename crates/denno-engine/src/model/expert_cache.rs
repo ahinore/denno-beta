@@ -321,17 +321,17 @@ impl std::fmt::Debug for Region {
     }
 }
 
-/// 塊の確保器。**固定長スロット**を塊から切り出す (task 260 の RAM tier)。
+/// 塊の確保器。**可変長の区間**を塊から切り出す (task 260 の RAM tier)。
 ///
-/// 1 塊 = `per_chunk * slot_bytes` バイト。塊は必要になったときに 1 枚ずつ
-/// 確保する (起動時に予算ぶんを丸ごと確保しない)。確保の前に
-/// `/proc/meminfo` の `MemAvailable` を見て、`margin_bytes` を割るなら
-/// それ以上伸ばさない (スワップ / OOM killer を避ける)。
+/// 1 塊 = 1 GiB (必要になったときに 1 枚ずつ確保する)。区間の長さは expert の
+/// 実バイト数なので、行列ごとの最大値で丸めない (IQ3_S の mixed 量子化で
+/// 1.65 倍の無駄が出た: lab t260a)。確保の前に `/proc/meminfo` の
+/// `MemAvailable` を見て、`margin_bytes` を割るならそれ以上伸ばさない。
 struct FixedStore {
+    /// 1 区間の上限 (行列の最大 expert バイト数)。
     slot_bytes: usize,
-    per_chunk: usize,
-    /// これ以上スロットを増やさない (予算)。
-    limit_slots: usize,
+    /// これ以上確保しない (この行列の予算)。
+    limit_bytes: u64,
     /// 塊を増やす前に残っていなければならない空き (バイト)。
     margin_bytes: u64,
     /// pinned を試すか (`DENNO_EXPERT_RAM_PIN=0` で false)。
@@ -341,76 +341,80 @@ struct FixedStore {
 
 struct FixedInner {
     chunks: Vec<Arc<Chunk>>,
-    /// 次に切り出すスロット番号 (0 から)。
-    next: usize,
-    /// 追い出しで返ってきた区間 (再利用)。
-    free: Vec<(Arc<Chunk>, usize)>,
-    /// 予算切れ / 空き不足で伸ばすのをやめた (ログは 1 回だけ)。
+    /// いま区間を切り出している塊の番号。
+    cur: usize,
+    /// その塊の中の次の空き。
+    off: usize,
+    /// 追い出しで返ってきた区間 (chunk, off, len)。
+    free: Vec<(Arc<Chunk>, usize, usize)>,
+    /// 確保済みのバイト数 (会計)。
+    used: u64,
+    /// 予算切れ / 空き不足で伸ばすのをやめた。
     stop: bool,
 }
 
+/// 1 塊のバイト数。
+const RAM_CHUNK: usize = 1 << 30;
+
 impl FixedStore {
-    fn new(slot_bytes: usize, limit_slots: usize, margin_bytes: u64, want_pinned: bool) -> Self {
-        // 1 塊は 1 GiB まで (cuMemHostAlloc の 1 回の確保を小さく保つ)。
-        let per_chunk = ((1usize << 30) / slot_bytes.max(1)).max(1);
+    fn new(slot_bytes: usize, limit_bytes: u64, margin_bytes: u64, want_pinned: bool) -> Self {
         FixedStore {
-            slot_bytes,
-            per_chunk,
-            limit_slots,
+            slot_bytes: slot_bytes.max(1),
+            limit_bytes,
             margin_bytes,
             want_pinned,
             inner: Mutex::new(FixedInner {
                 chunks: Vec::new(),
-                next: 0,
+                cur: 0,
+                off: 0,
                 free: Vec::new(),
+                used: 0,
                 stop: false,
             }),
         }
     }
 
-    /// 1 区間を返す。予算切れ・空き不足なら `None` (呼び出し側はキャッシュしない)。
-    ///
-    /// `len` は `slot_bytes` 以下であること (超えるのは呼び出し側の誤り)。
+    /// `len` バイトの区間を返す。予算切れ・空き不足なら `None`
+    /// (呼び出し側はキャッシュしない = 毎回 mmap 経路)。
     fn take(&self, len: usize) -> Option<Arc<Region>> {
         if len > self.slot_bytes {
             return None;
         }
         let mut g = lock_fixed(&self.inner);
-        // 1. 返ってきた区間を優先する (新しい塊を確保しない)。
-        while let Some((chunk, off)) = g.free.pop() {
-            if off + len <= chunk.bytes() {
-                return Some(Region::new(chunk, off, len));
-            }
+        // 1. 返ってきた区間のうち、収まるものを優先する (小さい順に探す)。
+        let pick = g
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, &(_, _, l))| l >= len)
+            .min_by_key(|(_, &(_, _, l))| l)
+            .map(|(i, _)| i);
+        if let Some(i) = pick {
+            let (chunk, off, _) = g.free.swap_remove(i);
+            return Some(Region::new(chunk, off, len));
         }
-        // 2. 予算の範囲で次のスロットを切り出す。
-        if g.next >= self.limit_slots {
+        // 2. 予算の範囲で次の区間を切り出す。
+        if g.used + len as u64 > self.limit_bytes {
             g.stop = true;
             return None;
         }
-        let idx = g.next;
-        let (ci, off) = (idx / self.per_chunk, (idx % self.per_chunk) * self.slot_bytes);
-        if ci >= g.chunks.len() {
+        if g.chunks.is_empty() || g.off + len > RAM_CHUNK {
             // 新しい塊。空きが margin を割るなら伸ばさない。
-            let bytes = self.per_chunk * self.slot_bytes;
             if let Some(avail) = mem_available() {
-                if avail < self.margin_bytes.saturating_add(bytes as u64) {
+                if avail < self.margin_bytes.saturating_add(RAM_CHUNK as u64) {
                     g.stop = true;
                     return None;
                 }
             }
-            let (chunk, pinned) = Chunk::new(bytes, self.want_pinned);
-            if !pinned && self.want_pinned && !g.chunks.is_empty() {
-                // 2 枚目以降で pinned が取れない = 断片化 / 上限。ヒープで続ける。
-            }
-            if chunk.bytes() < bytes {
-                // ヒープの確保にも失敗した (OOM 直前)。伸ばさない。
-                g.stop = true;
-                return None;
-            }
+            let (chunk, _pinned) = Chunk::new(RAM_CHUNK.min(self.limit_bytes as usize).max(len), self.want_pinned);
             g.chunks.push(chunk);
+            g.cur = g.chunks.len() - 1;
+            g.off = 0;
         }
-        g.next += 1;
-        let chunk = Arc::clone(&g.chunks[ci]);
+        let chunk = Arc::clone(&g.chunks[g.cur]);
+        let off = g.off;
+        g.off += len;
+        g.used += len as u64;
         Some(Region::new(chunk, off, len))
     }
 
@@ -419,8 +423,9 @@ impl FixedStore {
         let Ok(r) = Arc::try_unwrap(region) else {
             return; // まだ読者が居る
         };
+        let (len, off) = (r.len(), r.off);
         let mut g = lock_fixed(&self.inner);
-        g.free.push((r.chunk, r.off));
+        g.free.push((r.chunk, off, len));
     }
 
     fn pinned_bytes(&self) -> u64 {
@@ -433,8 +438,7 @@ impl FixedStore {
     }
 
     fn reserved_bytes(&self) -> u64 {
-        let g = lock_fixed(&self.inner);
-        (g.next * self.slot_bytes) as u64
+        lock_fixed(&self.inner).used
     }
 
     fn stopped(&self) -> bool {
@@ -685,18 +689,16 @@ impl ExpertCache {
         margin_bytes: u64,
         want_pinned: bool,
     ) -> Self {
-        let limit_slots = if slot_bytes == 0 {
-            0
-        } else {
-            ((limit_bytes / slot_bytes as u64) as usize).min(slots)
-        };
+        // LRU の本数は呼び出し側の見積り (`slots`) をそのまま使う。区間の
+        // 長さは実バイトなので、バイト予算は `limit_bytes` で別に持つ。
+        let limit_slots = if limit_bytes == 0 { 0 } else { slots };
         ExpertCache {
             slots: limit_slots,
             slot_bytes,
             inner: Mutex::new(Inner::new(limit_slots)),
             store: Store::Fixed(FixedStore::new(
                 slot_bytes,
-                limit_slots,
+                limit_bytes,
                 margin_bytes,
                 want_pinned,
             )),
@@ -993,6 +995,20 @@ pub struct CacheSpec {
     pub slot_bytes: usize,
 }
 
+/// task 260: RAM tier の 1 行列ぶんの指定。
+///
+/// 区間は expert の実バイト数で切るので、予算の配分と LRU の本数は
+/// **実バイトの合計**から決める (最大値で丸めると IQ3_S で 1.65 倍の無駄)。
+#[derive(Clone, Copy, Debug)]
+pub struct RamSpec {
+    /// その行列の最大 expert バイト数 (1 区間の上限)。
+    pub slot_bytes: usize,
+    /// その行列の expert 総バイト数 (モデル全体)。
+    pub total_bytes: u64,
+    /// 層あたりの expert 数。
+    pub n_expert: usize,
+}
+
 /// gate / up / down の 3 本をまとめたキャッシュ (forward 経路から使う口)。
 ///
 /// 3 本を別々に持つのは、行列ごとに expert のバイト数が違う (Q4_K の gate/up
@@ -1077,14 +1093,14 @@ impl ExpertCacheSet {
     }
 
     /// task 260: **RAM tier** を作る。総バイト予算 `budget_bytes` を 3 行列へ
-    /// `slot_bytes` の比で配る (1 expert = 3 行列がそろって入るので、
-    /// 行列あたりの本数は同じになる)。
+    /// 実バイトの比で配る (1 expert = 3 行列がそろって入るので、行列あたりの
+    /// 本数は同じになる)。
     ///
     /// 常駐先は `cuMemHostAlloc` の pinned (取れなければヒープ)。塊を増やす前に
     /// `MemAvailable` が `margin_bytes` を割っていないか確かめる。
     pub fn new_ram(
         budget_bytes: u64,
-        specs: [CacheSpec; 3],
+        specs: [RamSpec; 3],
         paths: &[PathBuf],
         margin_bytes: u64,
         want_pinned: bool,
@@ -1092,13 +1108,20 @@ impl ExpertCacheSet {
         if paths.is_empty() {
             bail!("expert RAM tier: GGUF のパートが 0 本 (読み口を作れない)");
         }
-        let bytes = [
-            specs[0].slot_bytes.max(1),
-            specs[1].slot_bytes.max(1),
-            specs[2].slot_bytes.max(1),
-        ];
-        let per_expert = bytes[0] as u64 + bytes[1] as u64 + bytes[2] as u64;
-        let experts = (budget_bytes / per_expert) as usize;
+        let total: u64 = specs
+            .iter()
+            .map(|s| s.total_bytes.max(1))
+            .sum::<u64>()
+            .max(1);
+        // 行列ごとの予算は実バイトの比で配る。LRU の本数は
+        // 「予算 × 行列の expert 本数 / 全体バイト数」(1 本あたりの平均で割る)。
+        let mut limit = [0u64; 3];
+        let mut slots = [0usize; 3];
+        for (i, s) in specs.iter().enumerate() {
+            limit[i] = (budget_bytes as u128 * s.total_bytes.max(1) as u128 / total as u128) as u64;
+            slots[i] = ((limit[i] as u128 * s.n_expert as u128) / s.total_bytes.max(1) as u128)
+                as usize;
+        }
         let mut readers: Vec<Box<dyn PreadAt>> = Vec::with_capacity(paths.len());
         for p in paths {
             readers.push(Box::new(FileReader::open(p)?));
@@ -1107,23 +1130,23 @@ impl ExpertCacheSet {
             mb: (budget_bytes >> 20) as usize,
             caches: [
                 ExpertCache::new_fixed(
-                    experts,
-                    bytes[0],
-                    experts as u64 * bytes[0] as u64,
+                    slots[0],
+                    specs[0].slot_bytes.max(1),
+                    limit[0],
                     margin_bytes,
                     want_pinned,
                 ),
                 ExpertCache::new_fixed(
-                    experts,
-                    bytes[1],
-                    experts as u64 * bytes[1] as u64,
+                    slots[1],
+                    specs[1].slot_bytes.max(1),
+                    limit[1],
                     margin_bytes,
                     want_pinned,
                 ),
                 ExpertCache::new_fixed(
-                    experts,
-                    bytes[2],
-                    experts as u64 * bytes[2] as u64,
+                    slots[2],
+                    specs[2].slot_bytes.max(1),
+                    limit[2],
                     margin_bytes,
                     want_pinned,
                 ),
@@ -1763,16 +1786,29 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("dummy.bin");
         std::fs::write(&p, vec![7u8; 1 << 16]).expect("temp file");
+        // 1 本 = 1 KiB + 1 KiB + 2 KiB = 4 KiB、8 本ぶんの総バイト
         let specs = [
-            CacheSpec { slot_bytes: 1024 },
-            CacheSpec { slot_bytes: 1024 },
-            CacheSpec { slot_bytes: 2048 },
+            RamSpec {
+                slot_bytes: 1024,
+                total_bytes: 8 * 1024,
+                n_expert: 8,
+            },
+            RamSpec {
+                slot_bytes: 1024,
+                total_bytes: 8 * 1024,
+                n_expert: 8,
+            },
+            RamSpec {
+                slot_bytes: 2048,
+                total_bytes: 16 * 1024,
+                n_expert: 8,
+            },
         ];
-        // 8 MiB 予算 / 1 本 4 KiB = 2048 本
-        let set = ExpertCacheSet::new_ram(8 << 20, specs, &[p.clone()], 0, false).expect("set");
-        assert_eq!(set.slots(ExpertMatrix::Gate), 2048);
-        assert_eq!(set.slots(ExpertMatrix::Up), 2048);
-        assert_eq!(set.slots(ExpertMatrix::Down), 2048);
+        // 32 KiB 予算 / 1 本 4 KiB = 8 本
+        let set = ExpertCacheSet::new_ram(32 << 10, specs, &[p.clone()], 0, false).expect("set");
+        assert_eq!(set.slots(ExpertMatrix::Gate), 8);
+        assert_eq!(set.slots(ExpertMatrix::Up), 8);
+        assert_eq!(set.slots(ExpertMatrix::Down), 8);
         assert_eq!(set.reserved_bytes(), 0, "確保は初回アクセスまで遅延する");
         assert!(!set.stopped());
         // 予算が 1 本に満たなければスロット 0
