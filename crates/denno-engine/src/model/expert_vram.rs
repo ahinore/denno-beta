@@ -584,12 +584,23 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
     /// task 146 の事前ロードが、載せ終わったあとに「回数の少ない順」へ並べ直す
     /// ために使う。載っていない key は黙って飛ばす。
     pub fn touch_many(&mut self, keys: &[K]) {
+        let _ = self.touch_many_count(keys);
+    }
+
+    /// [`VramLru::touch_many`] と同じで、載っていて触れた本数を返す (task 246)。
+    ///
+    /// 呼び出し側が「寄せ直しが何本に当たったか」を 1 行で出せるようにする
+    /// (緑 = 発火の証拠ではないので、発火と当たり数を数える)。
+    pub fn touch_many_count(&mut self, keys: &[K]) -> usize {
+        let mut n = 0usize;
         for k in keys {
             if let Some(s) = self.entries.get_mut(k) {
                 self.clock = self.clock.saturating_add(1);
                 s.last_use = self.clock;
+                n += 1;
             }
         }
+        n
     }
 
     /// 登録簿から外す (値は呼び出し側へ返す)。
@@ -733,6 +744,22 @@ pub fn emergency_free(need: usize) -> usize {
     {
         let _ = need;
         0
+    }
+}
+
+/// task 242: [`emergency_free`] の「追い出した鍵も返す」版 (古い順)。
+///
+/// 層優先 prefill が作業域を空けるために追い出した expert を、prefill の終端で
+/// 戻すために使う。GPU 無しのビルドは `(0, [])`。
+pub fn emergency_free_keys(need: usize) -> (usize, Vec<ExpertKey>) {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::emergency_free_keys(need)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = need;
+        (0, Vec::new())
     }
 }
 
@@ -1011,8 +1038,8 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 #[cfg(feature = "cuda")]
 pub use gpu::{
     acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup,
-    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many, Acquired,
-    CheckAcc, ExpertDev, ExpertShape,
+    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
+    touch_many_count, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1160,11 +1187,17 @@ mod gpu {
     /// task 146: 事前ロードの最後に、回数の少ない順で呼んで「一番よく使う expert が
     /// 一番追い出されにくい」状態にする。未初期化・ロック破損なら何もしない。
     pub fn touch_many(keys: &[ExpertKey]) {
+        let _ = touch_many_count(keys);
+    }
+
+    /// [`touch_many`] と同じで、載っていて触れた本数を返す (task 246 の診断用)。
+    pub fn touch_many_count(keys: &[ExpertKey]) -> usize {
         let Some(c) = CACHE.get() else {
-            return;
+            return 0;
         };
-        if let Ok(mut g) = c.lock() {
-            g.touch_many(keys);
+        match c.lock() {
+            Ok(mut g) => g.touch_many_count(keys),
+            Err(_) => 0,
         }
     }
 
@@ -1191,20 +1224,30 @@ mod gpu {
     /// `try_lock` なので、expert の確保が LRU のロック保持中に走っている場合は
     /// 何もしない (呼び出し側 = [`acquire_opts`] が自分で追い出して再試行する)。
     pub fn emergency_free(need: usize) -> usize {
+        emergency_free_keys(need).0
+    }
+
+    /// task 242: [`emergency_free`] の「追い出した鍵も返す」版。
+    ///
+    /// 戻り値は `(空けたバイト数, 追い出した鍵)`。鍵は**古い順** (LRU の先頭から)。
+    /// 層優先 prefill は、作業域を空けるために追い出した expert を prefill の
+    /// 終端で戻す (戻さないと次の decode のヒット率が 0.75 → 0.25 に落ちる)。
+    pub fn emergency_free_keys(need: usize) -> (usize, Vec<ExpertKey>) {
         let Some(c) = CACHE.get() else {
-            return 0;
+            return (0, Vec::new());
         };
         let Ok(mut g) = c.try_lock() else {
-            return 0;
+            return (0, Vec::new());
         };
         let evicted = g.evict_until_free(need);
         let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
+        let keys: Vec<ExpertKey> = evicted.iter().map(|(k, _)| *k).collect();
         drop(evicted); // DevBuffer が落ちて VRAM が空く
         // task 152: slab ではスロットを返してもデバイスメモリは戻らない。空に
         // なったチャンクを落として**実メモリ**を返す (lab t152a の g24 は
         // これが無くて 14k で q4 attention が CPU に落ちた)。
         let released = crate::model::expert_slab::release_empty(need);
-        freed.saturating_add(released)
+        (freed.saturating_add(released), keys)
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。
@@ -1973,6 +2016,12 @@ mod tests {
         // 載っていない key は黙って飛ばす
         c.touch_many(&[99]);
         assert_eq!(c.used_bytes(), used - 100);
+        // task 246: 当たった本数を返す版 (`pf-reseed` の診断がこれで発火を数える)。
+        // この時点で載っているのは 3 と 4 だけ (1 は追い出し済み)。
+        let n = c.touch_many_count(&[4, 99, 1, 3]);
+        assert_eq!(n, 2, "載っている 2 本だけ数える");
+        assert_eq!(c.used_bytes(), used - 100, "触ってもバイト数は変わらない");
+        assert_eq!(c.stats().misses, misses, "H2D は起きない");
     }
 
     /// どの並びで入れても `used_bytes` は上限を超えない。
