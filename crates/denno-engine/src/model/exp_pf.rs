@@ -1428,6 +1428,40 @@ pub fn lm_reload_evicted() -> bool {
     })
 }
 
+/// task 265: 層優先 prefill の終端で「末尾 N トークンの expert」を LRU へ戻す
+/// (`DENNO_PF_WARM_TOK`、既定 1536)。
+///
+/// # なぜ要るか
+///
+/// 層優先 prefill は expert を**ステージ経由で流すだけ**で decode の LRU を
+/// 温めない (`experts=0`)。そのため prefill の終端で LRU に残っているのは
+/// 「prefill 前の内容」で、次の decode が 14k の作業集合を自分で上げ直す
+/// (lab t265a: ヒット率 0.956 / ミス 21 本/tok、base は 0.974 / 12.5 本)。
+///
+/// チャンク優先 (base) は最後のチャンクを回した副作用で LRU がその
+/// チャンクの expert で埋まる。ここでは同じことを明示的に行う: 層ループの
+/// 最後のタイルで「末尾 N トークンに使われた expert」を控え、層ごとに
+/// `acquire_soft` で LRU へ入れる。14k/N=1536 で約 4,800 本 / 14.7 GB を
+/// 上げ直す (推定 +1 秒。prefill の Target には 3.5 秒の余裕がある)。
+///
+/// 0 で無効。プールを借りている prefill だけで動く (`PfPoolGuard::is_held`)。
+pub const WARM_TOK_ENV: &str = "DENNO_PF_WARM_TOK";
+
+/// task 265: [`WARM_TOK_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
+pub fn warm_tok_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some("0") => 0,
+        Some(s) => s.parse::<usize>().ok().unwrap_or(1536),
+        None => 1536,
+    }
+}
+
+/// task 265: 末尾何トークンの expert を LRU へ戻すか (env はプロセスで 1 回)。
+pub fn warm_tok() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| warm_tok_from_value(std::env::var(WARM_TOK_ENV).ok().as_deref()))
+}
+
 // ---------------------------------------------------------------------------
 // 1 リクエストぶんの観測 (REPORT 用)
 // ---------------------------------------------------------------------------
@@ -2557,5 +2591,15 @@ mod tests {
         assert_eq!(c.max_abs, 5.0e-6);
         assert_eq!(c.max_rel, 2.0e-6);
         assert!(take_check().is_none(), "取り出したら空になる");
+    }
+
+    /// task 265: warm するトークン数 (既定 1,536)。0 で無効。
+    #[test]
+    fn warm_tok_defaults_and_zero() {
+        assert_eq!(warm_tok_from_value(None), 1536);
+        assert_eq!(warm_tok_from_value(Some("")), 1536);
+        assert_eq!(warm_tok_from_value(Some("x")), 1536);
+        assert_eq!(warm_tok_from_value(Some("0")), 0);
+        assert_eq!(warm_tok_from_value(Some("512")), 512);
     }
 }

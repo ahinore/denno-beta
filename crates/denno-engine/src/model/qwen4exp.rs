@@ -4425,6 +4425,12 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let mut mixed_buf: Option<PfHostBuf> = None;
         // 診断: ホスト経路へ落ちた層の数 (`DENNO_PF_LM_DBG=1` で 1 行)。
         let mut lm_fallback = 0usize;
+        // task 265: 末尾トークンの expert を decode 用に LRU へ戻す (プールを
+        // 借りた prefill だけ)。控えるのは層ごと、入れるのも層ごと。
+        let warm_on = _pool.is_held() && crate::model::exp_pf::warm_tok() > 0;
+        let mut warm_keys: Vec<crate::model::expert_cache::ExpertKey> = Vec::new();
+        let mut warm_n = 0usize;
+        let mut warm_bytes = 0usize;
         // task 233: attention の入口は CPU が読むので、チャンクぶんだけホストへ戻す。
         let mut attn_buf = PfHostBuf::new(chunk * e);
         for il in 0..n_layer {
@@ -4657,6 +4663,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     roles.as_deref_mut(),
                     true,
                     iv,
+                    if warm_on { Some(&mut warm_keys) } else { None },
                 )?;
             } else {
                 let mut t0 = 0usize;
@@ -4672,6 +4679,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         roles.as_deref_mut(),
                         last,
                         iv,
+                        if warm_on { Some(&mut warm_keys) } else { None },
                     )? {
                         ffn_dev = false;
                         break;
@@ -4723,6 +4731,14 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 if !crate::cuda::pf_lm_upload_ffn(&ffn_all) {
                     Self::pf_bail("MoE の出力を置き場へ上げられない")?;
                 }
+            }
+            // task 265: 末尾トークンの expert を LRU へ戻す (decode のヒット率を
+            // base 並みに戻す)。1 本 3 MB の H2D を層ごとにまとめて出す。
+            if warm_on && !warm_keys.is_empty() {
+                let (n, bytes) = pf_restore_experts(&self.layers, &warm_keys);
+                warm_n += n;
+                warm_bytes += bytes;
+                warm_keys.clear();
             }
             q4prof::add(&q4prof::MOE, t_moe);
             // ---- 3. 全チャンクの combine ----
@@ -4782,6 +4798,15 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         }
         if std::env::var_os("DENNO_PF_LM_DBG").is_some() {
             eprintln!("[pf-lm-dbg] layers={n_layer} fallback={lm_fallback}");
+        }
+        // task 265: decode 用に戻した expert (LRU の温め) の集計。
+        if warm_on {
+            eprintln!(
+                "[pf-warm] 末尾 {} トークンの expert を {} 本 ({} MiB) LRU へ戻した",
+                crate::model::exp_pf::warm_tok().min(nt_all),
+                warm_n,
+                warm_bytes >> 20
+            );
         }
         // task 233: 置き場と MoE の作業域 (14k で合計 約 3.5 GB) を decode に返す。
         crate::cuda::pf_lm_release();
@@ -16113,8 +16138,9 @@ fn moe_ffn_quant_batch_lm_dev(
     roles: Option<&mut RoleRms>,
     emit_router: bool,
     iv: IvView<'_>,
+    warm: Option<&mut Vec<crate::model::expert_cache::ExpertKey>>,
 ) -> Result<bool> {
-    moe_ffn_quant_batch_lm_dev_at(p, lw, 0, nt, nt, roles, emit_router, iv)
+    moe_ffn_quant_batch_lm_dev_at(p, lw, 0, nt, nt, roles, emit_router, iv, warm)
 }
 
 /// task 250: 層優先 MoE の**トークンタイル版**。`tok0` 行目から `nt` 行だけを
@@ -16151,6 +16177,7 @@ fn moe_ffn_quant_batch_lm_dev_at(
     mut roles: Option<&mut RoleRms>,
     emit_last: bool,
     iv: IvView<'_>,
+    mut warm: Option<&mut Vec<crate::model::expert_cache::ExpertKey>>,
 ) -> Result<bool> {
     use crate::model::expert_cache::ExpertKey;
     use crate::model::expert_vram::ExpertShape;
@@ -16247,6 +16274,21 @@ fn moe_ffn_quant_batch_lm_dev_at(
         }
     }
     let pick: Vec<bool> = by_expert.iter().map(|p| !p.is_empty()).collect();
+    // task 265: decode 用の warm。末尾 `DENNO_PF_WARM_TOK` トークンに使われた
+    // expert を控える (層ループの外で `acquire_soft` で LRU へ戻す)。
+    if let Some(w) = warm.as_deref_mut() {
+        let keep_from = nt_all.saturating_sub(crate::model::exp_pf::warm_tok());
+        if tok0 + nt > keep_from {
+            for (ei, rows) in by_expert.iter().enumerate() {
+                if rows.iter().any(|(t, _)| tok0 + *t >= keep_from) {
+                    w.push(ExpertKey {
+                        layer: lw.il as u16,
+                        expert: ei as u16,
+                    });
+                }
+            }
+        }
+    }
     let plan = crate::model::exp_pf::build_plan(&by_expert, &pick);
     if plan.total_rows == 0 {
         return Ok(lm_decline("no rows"));

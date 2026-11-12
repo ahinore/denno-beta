@@ -99,8 +99,48 @@ pub fn pf_pool_from_value(v: Option<&str>) -> bool {
 
 /// プールを使うか (プロセスで 1 回だけ env を読む)。
 pub fn pf_pool_on() -> bool {
+    #[cfg(test)]
+    {
+        // env を触らずに分岐を固定するためのフック (`--test-threads=1` 前提)。
+        let f = FORCE_ON.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| pf_pool_from_value(std::env::var(PF_POOL_ENV).ok().as_deref()))
+}
+
+/// テスト用: `pf_pool_on()` を env 無しで固定する (`None` で解除)。
+#[cfg(test)]
+pub(crate) fn set_force_on_for_test(v: Option<bool>) {
+    FORCE_ON.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+static FORCE_ON: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// 借りるかどうかと借りるレイアウトの決定 (純関数)。
+///
+/// `on` はゲート (`DENNO_PF_POOL`)、`min_tok` は最小トークン数
+/// (`DENNO_PF_POOL_MIN_TOK`)、`cap` は上限バイト (`DENNO_PF_POOL_MB`)。
+/// どれかで落ちたら `None` = 従来の `alloc_tagged` に落ちる (fail open)。
+pub fn borrow_plan(n: &Need, on: bool, min_tok: usize, cap: usize) -> Option<Layout> {
+    if !on || n.nt_all < min_tok {
+        return None;
+    }
+    let l = layout(n)?;
+    if l.total > cap {
+        return None;
+    }
+    Some(l)
 }
 
 /// [`PF_POOL_MB_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
@@ -439,6 +479,39 @@ mod tests {
         // 実測した長文 (3,826 / 14,018) はどちらも既定のしきい値を超える。
         assert!(3826 >= DEFAULT_POOL_MIN_TOK);
         assert!(14018 >= DEFAULT_POOL_MIN_TOK);
+    }
+
+    /// task 265: 借りるかどうかの決定 (ゲート / しきい値 / 上限)。
+    ///
+    /// 既定 (off) では長いプロンプトでも何も借りない = 従来経路と同一。
+    #[test]
+    fn borrow_plan_needs_gate_threshold_and_cap() {
+        let n = need();
+        let cap = DEFAULT_POOL_MB << 20;
+        // ゲート off は常に借りない。
+        assert!(borrow_plan(&n, false, DEFAULT_POOL_MIN_TOK, cap).is_none());
+        // しきい値未満は借りない (3,826 / 14,018 は借りる)。
+        assert!(borrow_plan(&n, true, DEFAULT_POOL_MIN_TOK, cap).is_some());
+        assert!(borrow_plan(&Need { nt_all: 2047, ..n }, true, 2048, cap).is_none());
+        assert!(borrow_plan(&Need { nt_all: 2048, ..n }, true, 2048, cap).is_some());
+        // 上限より大きいレイアウトは借りない (fail open)。
+        let total = layout(&n).expect("レイアウト").total;
+        assert!(borrow_plan(&n, true, DEFAULT_POOL_MIN_TOK, total).is_some());
+        assert!(borrow_plan(&n, true, DEFAULT_POOL_MIN_TOK, total - 1).is_none());
+        // 形が壊れていれば借りない。
+        assert!(borrow_plan(&Need { e: 0, ..n }, true, DEFAULT_POOL_MIN_TOK, cap).is_none());
+    }
+
+    /// task 265: 3,826 トークンのレイアウトも既定の上限に収まる (借りる側の前提)。
+    #[test]
+    fn three_point_eight_k_fits_default_pool() {
+        let l = layout(&Need {
+            nt_all: 3826,
+            tile: 3826,
+            ..need()
+        })
+        .expect("レイアウト");
+        assert!(fits(&l, DEFAULT_POOL_MB << 20), "total {} B", l.total);
     }
 
     /// 14k / TILE=5120 / TC の作業域が 2,560 MiB に収まる (task 257 の前提)。

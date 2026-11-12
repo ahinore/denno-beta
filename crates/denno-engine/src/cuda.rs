@@ -24448,21 +24448,17 @@ pub fn pf_pool_len() -> usize {
 #[cfg(feature = "cuda")]
 pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
     let not_held = PfPoolGuard { owned: false };
-    if n.nt_all < crate::model::pf_pool::pf_pool_min_tok() {
-        return not_held;
-    }
-    let Some(l) = crate::model::pf_pool::layout(n) else {
+    // ゲート / しきい値 / 上限は純関数で決める (既定では何も借りない =
+    // 従来の `alloc_tagged` と 1 バイトも変わらない)。
+    let cap = crate::model::pf_pool::pf_pool_bytes();
+    let Some(l) = crate::model::pf_pool::borrow_plan(
+        n,
+        crate::model::pf_pool::pf_pool_on(),
+        crate::model::pf_pool::pf_pool_min_tok(),
+        cap,
+    ) else {
         return not_held;
     };
-    let cap = crate::model::pf_pool::pf_pool_bytes();
-    if l.total > cap {
-        eprintln!(
-            "[pf-pool] 作業域の見積り {} MiB が上限 {} MiB を超える → 従来の確保",
-            l.total >> 20,
-            cap >> 20
-        );
-        return not_held;
-    }
     if PF_POOL_OWNED.with(|c| c.get()) {
         // 同じリクエストの中で 2 回目 (層優先 → チャンク優先の落ちなど)。
         PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
@@ -37525,8 +37521,9 @@ mod tests {
     use super::*;
     use crate::tensor;
 
-    /// task 257/265: プールを借りられない (このテストには CUDA context が無い) とき、
-    /// ガードは `owned == false` で、区画ビューも取れない = 従来の確保に落ちる。
+    /// task 257/265: ゲートを on にしても CUDA context が無ければ借りられない。
+    /// ガードは `owned == false`、区画ビューも取れない = 従来の確保に落ちる
+    /// (リクエストは失敗させない)。
     ///
     /// プールの**発火側**は lab の実測でしか確かめられないが、fail open の契約は
     /// ここで固定する (確保の分岐が黙って変わらないように)。
@@ -37549,7 +37546,7 @@ mod tests {
         };
         // レイアウト自体は組める (純関数)。
         assert!(crate::model::pf_pool::layout(&need).is_some());
-        // 借りられないので active にならない。
+        crate::model::pf_pool::set_force_on_for_test(Some(true));
         {
             let guard = pf_pool_acquire(&need);
             assert!(!guard.is_held());
@@ -37560,6 +37557,7 @@ mod tests {
         // 借りていない状態で release しても落ちない (二重解放しない)。
         pf_pool_release();
         assert_eq!(pf_pool_len(), 0);
+        crate::model::pf_pool::set_force_on_for_test(None);
     }
 
     /// task 265: しきい値未満のプロンプトはプールに触らない (短い経路を変えない)。
@@ -37580,9 +37578,35 @@ mod tests {
             stage_bytes: 512 << 20,
             stage_slots: PF_STAGE_SLOTS,
         };
+        crate::model::pf_pool::set_force_on_for_test(Some(true));
         let guard = pf_pool_acquire(&need);
         assert!(!guard.is_held());
         assert_eq!(pf_pool_len(), 0);
+        crate::model::pf_pool::set_force_on_for_test(None);
+    }
+
+    /// task 265: ゲートが既定 (off) なら長いプロンプトでも何も借りない。
+    #[test]
+    fn pool_acquire_default_off_borrows_nothing() {
+        let need = crate::model::pf_pool::Need {
+            nt_all: 14018,
+            tile: 5120,
+            k: 10,
+            e: 2560,
+            ff: 1024,
+            sff: 1024,
+            hc: 4,
+            lr: 256,
+            chunk: 1536,
+            ne: 512,
+            tc: true,
+            stage_bytes: 512 << 20,
+            stage_slots: PF_STAGE_SLOTS,
+        };
+        crate::model::pf_pool::set_force_on_for_test(Some(false));
+        let guard = pf_pool_acquire(&need);
+        assert!(!guard.is_held());
+        crate::model::pf_pool::set_force_on_for_test(None);
     }
 
     /// task 210: 捨てた cache の ID のミラーは残さない (生きている ID は残す)。
