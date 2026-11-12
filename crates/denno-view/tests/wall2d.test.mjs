@@ -15,7 +15,7 @@ import {
   DEFAULT_SHAPE, DEFAULT_SHAPE_RAW, MAP_CHROME, WALL_COLORS, WALL_GEOM,
   actLevel, addItem, createMapState, createMockStore, createSelection, depthValue, heat,
   mapPaneSize, mockTokenFrames, rampRGB, selectionCount, selectionToBody, wallExpertRect,
-  wallHitTest, wallItemsInRect, wallLayout,
+  wallHitTest, wallItemsInRect, wallLayout, fitExpertLimit,
 } from '../src/view2d.mjs';
 
 const FULL = wallLayout(DEFAULT_SHAPE, mapPaneSize({ w: 1366, h: 768 }));
@@ -307,4 +307,61 @@ test('mockTokenFrames: 決定的で、壁の状態を埋める (skip も作れ�
   const st2 = createMapState(DEFAULT_SHAPE);
   for (const f of withOff) st2.onFrame(f);
   assert.equal(st2.skip[0][offE], 1, 'amber bit is set for the mock skip');
+});
+
+// ---- 層あたり n_expert_used 個を残す規則 (実 API は満たさないと 400) --------------
+
+const REAL = {
+  layers: 48, n_expert: 512, n_expert_used: 10, n_hc: 4, n_embd: 2560,
+  layer_kinds: Array.from({ length: 48 }, (_, i) => (i % 4 === 3 ? 'full' : 'gdn')),
+  ple_layers: [1],
+};
+
+function dragBody(lay, x0, y0, x1, y1) {
+  const sel = createSelection();
+  for (const it of wallItemsInRect(lay, x0, y0, x1, y1)) addItem(sel, it);
+  return selectionToBody(sel);
+}
+
+test('fitExpertLimit: タイル全体のドラッグは moe off に置き換わり、実 API の規則を満たす', () => {
+  const lay = wallLayout(REAL, { w: 1600, h: 900 });
+  const t = lay.tiles[5];
+  const raw = dragBody(lay, t.x - 1, t.y - 1, t.x + t.w + 1, t.y + t.h + 1);
+  assert.equal(raw.experts_off.filter((p) => p[0] === 5).length, 512);
+  const m = createMockStore(REAL);
+  assert.equal(m.handle('POST', '/v1/intervene', raw).status, 400, '直しの前は 400 のはず');
+  const fit = fitExpertLimit(raw, REAL, null);
+  assert.equal(fit.body.experts_off.filter((p) => p[0] === 5).length, 0);
+  assert.ok(fit.body.blocks_off.some((b) => b[0] === 5 && b[1] === 'moe'));
+  assert.equal(fit.notes.length, 1);
+  assert.equal(m.handle('POST', '/v1/intervene', fit.body).status, 200);
+});
+
+test('fitExpertLimit: 残りが 1..k-1 になる選択は、新しく選んだ側から k 個に届くまで on に残す', () => {
+  // 例: 1 行目の途中からドラッグして層の 507 個を選ぶ (残り 5 < 10 で実 API は 400)
+  const raw = { experts_off: Array.from({ length: 507 }, (_, e) => [2, e + 5]), blocks_off: [], streams_off: [] };
+  const m = createMockStore(REAL);
+  assert.equal(m.handle('POST', '/v1/intervene', raw).status, 400, '直しの前は 400 のはず');
+  const fit = fitExpertLimit(raw, REAL, null);
+  const off = fit.body.experts_off.filter((p) => p[0] === 2).map((p) => p[1]);
+  assert.equal(512 - off.length, 10, '残りがちょうど k 個になっていない');
+  // 番号の大きい 5 個 (507..511) を on に残す
+  for (const e of [507, 508, 509, 510, 511]) assert.ok(!off.includes(e), e + ' が off のまま');
+  assert.equal(fit.notes.length, 1);
+  assert.ok(fit.notes[0].includes('層 2: ') && fit.notes[0].includes('5 個を on のまま残した (507,508,509,510,511)'), fit.notes[0]);
+  assert.equal(m.handle('POST', '/v1/intervene', fit.body).status, 200);
+});
+
+test('fitExpertLimit: 前から off の expert は残さない側に回さない / 規則内なら何もしない', () => {
+  const prev = { experts_off: Array.from({ length: 500 }, (_, e) => [0, e]) };
+  const body = { experts_off: Array.from({ length: 505 }, (_, e) => [0, e]), blocks_off: [], streams_off: [] };
+  const fit = fitExpertLimit(body, REAL, prev);
+  const off = fit.body.experts_off.map((p) => p[1]);
+  assert.equal(off.length, 502);
+  for (let e = 0; e < 500; e++) assert.ok(off.includes(e), '前から off の ' + e + ' が on に戻った');
+  assert.deepEqual(fit.body.blocks_off, []);
+  const ok = { experts_off: [[3, 1], [3, 2]], blocks_off: [[1, 'ple']], streams_off: [[0, 1]] };
+  const same = fitExpertLimit(ok, REAL, null);
+  assert.deepEqual(same.body, ok);
+  assert.deepEqual(same.notes, []);
 });

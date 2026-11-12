@@ -916,6 +916,12 @@ impl Flash {
         // task 248: prefill の間だけ確保の台帳のピークを控える
         // (`DENNO_Q4_PROFILE` が無ければ guard は何もしない)。
         let _peak = denno_engine::mem_audit::peak_window("prefill");
+        // task 256: prefill の作業域を先に予約する (`DENNO_PREFILL_WORK_MB`、
+        // 既定 0 = 何もしない)。空きが足りなければチャンクを丸ごと空けて場所を作り、
+        // 終わったら release する (解放したチャンクは通常の LRU が埋め直す)。
+        let _work = denno_engine::model::expert_vram::reserve_work_area(
+            denno_engine::model::expert_vram::prefill_work_bytes(),
+        );
         if !self.tap_on() {
             return Ok(dec.prefill_batched(prompt, self.batch)?);
         }
@@ -983,12 +989,42 @@ impl Flash {
         n
     }
 
+    /// ビューワ用: いま持っている文脈 (main / aux) のトークン数と epoch。
+    /// 文脈 = full attention の KV と GDN の再帰状態・conv 履歴・PLE conv 履歴。
+    /// 残差 stream そのものはトークンごとに作り直すので、リクエストの間には残らない。
+    fn ctx_json(&self) -> Value {
+        let one = |c: &Option<Cached>| match c {
+            Some(c) => json!({"tokens": c.toks.len(), "epoch": c.epoch}),
+            None => Value::Null,
+        };
+        json!({"main": one(&self.cache), "aux": one(&self.aux)})
+    }
+
+    /// ビューワ用: 文脈 (main / aux) を両方捨て、decoder の系列状態も空に戻す。
+    /// 次のリクエストは前置きを再利用せず、最初から prefill する。
+    /// 介入 epoch は動かさない (介入の設定は変えていないので)。
+    fn clear_ctx(&mut self) -> Value {
+        let tokens = self.cache.as_ref().map_or(0, |c| c.toks.len())
+            + self.aux.as_ref().map_or(0, |c| c.toks.len());
+        let n = usize::from(self.cache.take().is_some()) + usize::from(self.aux.take().is_some());
+        if let Some(d) = self.dec.as_mut() {
+            d.reset();
+        }
+        eprintln!("[flash] cache clear: 文脈を {n} 本捨てた ({tokens} tok, KV / GDN 状態)");
+        let mut v = self.ctx_json();
+        v["dropped"] = json!(n);
+        v["dropped_tokens"] = json!(tokens);
+        v
+    }
+
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
         // task 217: このリクエストの間は介入設定を固定する。生成中に
         // `POST /v1/intervene` が来ても、いま走っている生成の数値は変わらない
         // (次のリクエストから効く)。forward 側はピン留めを読むだけ。
         let _iv_pin = iv::pin_request();
+        // 生成中の印 (`POST /v1/abort` はこの間だけ効く)。始めに古い停止要求を捨てる。
+        let _gen = GenGuard::enter();
         // task 218: `DENNO_STEER_RECORD` のときは 1 リクエストごとに平均を保存する
         // (停止は不要。プロセスが落ちても直前のリクエストまでが残る)。
         let _steer_flush = SteerFlushGuard;
@@ -1306,6 +1342,12 @@ impl Flash {
         // off では atomic load 1 回で、イベントは 1 本も打たない。
         q4ledger::tline_begin();
         'gen: while out.len() < req.max_tokens {
+            // `POST /v1/abort`: 次のトークンを作らずに終わる。ここでは out の全トークンが
+            // step 済みなので、文脈は max_tokens で止まったときと同じく一貫している。
+            if take_abort() {
+                eprintln!("[flash] abort: {} トークンで停止", out.len());
+                break 'gen;
+            }
             if spec_on {
                 // P109: n-gram 投機ステップ。q0 は engine の argmax (greedy)。
                 let d_topk = q4prof::dstamp();
@@ -2047,13 +2089,235 @@ impl Drop for SteerFlushGuard {
     }
 }
 
-fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
+// ---------------------------------------------------------------------------
+// 生成の強制停止 (`POST /v1/abort`)
+// ---------------------------------------------------------------------------
+
+/// 停止要求。decode のトークンごとに見る (立っていたら次のトークンを作らずに終わる)。
+static ABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// いま生成中か (停止要求は生成中だけ受ける。空振りの要求を次の生成に持ち越さない)。
+static GENERATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 生成の間だけ GENERATING を立てる。始めに古い停止要求を捨てる。
+struct GenGuard;
+
+impl GenGuard {
+    fn enter() -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        ABORT.store(false, SeqCst);
+        GENERATING.store(true, SeqCst);
+        GenGuard
+    }
+}
+
+impl Drop for GenGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        GENERATING.store(false, SeqCst);
+        ABORT.store(false, SeqCst);
+    }
+}
+
+/// テスト: ABORT / GENERATING はプロセス全体の状態なので、触るテストはこれで直列にする。
+#[cfg(test)]
+static ABORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 停止要求を出す。生成中でなければ何もしない。戻り値は「生成中に要求した」か。
+fn request_abort() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if GENERATING.load(SeqCst) {
+        ABORT.store(true, SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+/// 停止要求が立っていれば下ろして true。
+fn take_abort() -> bool {
+    ABORT.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `POST /v1/abort` か (生成中も受け付ける経路。主スレッドを待たない)。
+fn is_abort_req(req: &HttpReq) -> bool {
+    req.method == "POST" && req.path.split('?').next() == Some("/v1/abort")
+}
+
+fn send_abort_reply(stream: &mut TcpStream) -> Result<()> {
+    let generating = request_abort();
+    if generating {
+        eprintln!("[flash] abort: 停止要求を受けた (次のトークンで止める)");
+    }
+    send_json(stream, "200 OK", &json!({"aborted": generating, "generating": generating}))
+}
+
+// ---------------------------------------------------------------------------
+// モデルの選択 (`GET /v1/model/choices` / `POST /v1/model/select`)
+// ---------------------------------------------------------------------------
+//
+// GPU と RAM に載るモデルは 1 つだけなので、選び直しは「選択を書いて終了 →
+// 外側の起動ループ (serve_loop.sh) が選ばれたモデルで起動し直す」で行う。
+// 一覧は `DENNO_MODEL_CHOICES` のファイル (1 行 1 モデル `id|dir|label|env`、
+// `#` はコメント、先頭の行が既定)、選択は `DENNO_MODEL_SELECT` のファイルに id を書く。
+// どちらかが未設定なら切り替えは無効 (今まで通り)。
+
+/// 切り替えのための終了コード (serve_loop.sh はこれを見て起動し直す)。
+pub const EXIT_MODEL_SWITCH: i32 = 75;
+
+/// 主ループがリクエストの後に見る終了要求 (0 = なし)。
+static EXIT_AFTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[derive(Clone, Debug, PartialEq)]
+struct ModelChoice {
+    id: String,
+    dir: String,
+    label: String,
+    /// 起動ループが付ける env (`K=V` を空白区切り)。表示だけに使う。
+    env: String,
+}
+
+fn parse_choices(text: &str) -> Vec<ModelChoice> {
+    let mut out: Vec<ModelChoice> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+        if f.len() < 2 || f[0].is_empty() || f[1].is_empty() {
+            continue;
+        }
+        if out.iter().any(|c| c.id == f[0]) {
+            continue;
+        }
+        out.push(ModelChoice {
+            id: f[0].to_string(),
+            dir: f[1].to_string(),
+            label: f.get(2).map(|s| s.to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| f[0].to_string()),
+            env: f.get(3).map(|s| s.to_string()).unwrap_or_default(),
+        });
+    }
+    out
+}
+
+fn choices_paths() -> Option<(PathBuf, PathBuf)> {
+    let c = std::env::var("DENNO_MODEL_CHOICES").ok().filter(|s| !s.is_empty())?;
+    let s = std::env::var("DENNO_MODEL_SELECT").ok().filter(|s| !s.is_empty())?;
+    Some((PathBuf::from(c), PathBuf::from(s)))
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
+/// いま動いているモデルのディレクトリ (最初の part の親)。
+fn current_model_dir(flash: &Flash) -> Option<PathBuf> {
+    flash.parts.first().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+}
+
+fn dir_gguf_bytes(dir: &Path) -> Option<u64> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut n = 0u64;
+    let mut any = false;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x == "gguf").unwrap_or(false) {
+            n += e.metadata().map(|m| m.len()).unwrap_or(0);
+            any = true;
+        }
+    }
+    any.then_some(n)
+}
+
+fn model_choices_json(flash: &Flash) -> Value {
+    let cur_dir = current_model_dir(flash);
+    let Some((cpath, _)) = choices_paths() else {
+        return json!({
+            "switchable": false,
+            "current": Value::Null,
+            "current_dir": cur_dir.map(|d| d.display().to_string()),
+            "choices": [],
+        });
+    };
+    let list = std::fs::read_to_string(&cpath).map(|t| parse_choices(&t)).unwrap_or_default();
+    let mut current: Option<String> = None;
+    let rows: Vec<Value> = list
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let here = cur_dir.as_deref().is_some_and(|d| same_dir(d, Path::new(&c.dir)));
+            if here && current.is_none() {
+                current = Some(c.id.clone());
+            }
+            let bytes = dir_gguf_bytes(Path::new(&c.dir));
+            json!({
+                "id": c.id, "label": c.label, "dir": c.dir, "env": c.env,
+                "default": i == 0,
+                "available": bytes.is_some(),
+                "size_gb": bytes.map(|b| (b as f64 / 1e9 * 10.0).round() / 10.0),
+            })
+        })
+        .collect();
+    json!({
+        "switchable": true,
+        "current": current,
+        "current_dir": cur_dir.map(|d| d.display().to_string()),
+        "choices": rows,
+    })
+}
+
+/// 選択を検証して書く。切り替えるなら Ok(true) (呼び出し側が応答後に終了を予約)。
+fn select_model(flash: &Flash, body: &Value) -> Result<(bool, String), String> {
+    let (cpath, spath) = choices_paths().ok_or("このサーバーはモデルの切り替えに対応していない (DENNO_MODEL_CHOICES / DENNO_MODEL_SELECT が無い)")?;
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("id (文字列) が要る")?
+        .to_string();
+    let text = std::fs::read_to_string(&cpath)
+        .map_err(|e| format!("{} を読めない: {e}", cpath.display()))?;
+    let list = parse_choices(&text);
+    let c = list
+        .iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| format!("未知のモデル {id:?}"))?;
+    if dir_gguf_bytes(Path::new(&c.dir)).is_none() {
+        return Err(format!("{} に .gguf が無い", c.dir));
+    }
+    if current_model_dir(flash).is_some_and(|d| same_dir(&d, Path::new(&c.dir))) {
+        return Ok((false, id));
+    }
+    std::fs::write(&spath, format!("{id}\n"))
+        .map_err(|e| format!("{} に書けない: {e}", spath.display()))?;
+    Ok((true, id))
+}
+
+/// 1 接続ぶんを読んでから処理する (テストと単発用)。本番の listen は
+/// [`run`] が読み取りを別スレッドで行い、`/v1/abort` だけはそこで即答する。
+#[cfg(test)]
+fn handle(flash: &mut Flash, stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut r = BufReader::new(stream.try_clone()?);
     let Some(req) = read_req(&mut r)? else {
         return Ok(());
     };
+    handle_req(flash, stream, r, req)
+}
+
+fn handle_req(
+    flash: &mut Flash,
+    mut stream: TcpStream,
+    r: BufReader<TcpStream>,
+    req: HttpReq,
+) -> Result<()> {
     let path = req.path.split('?').next().unwrap_or("/").to_string();
+    // 生成中でない間に来た停止要求 (読み取りスレッドを通らないテスト経路など)。
+    if is_abort_req(&req) {
+        return send_abort_reply(&mut stream);
+    }
 
     // P51: 推論テレメトリの WebSocket (denno-view の購読先)。101 を返して
     // クライアントを登録し、以後は relay スレッドが書く。推論は待たない。
@@ -2118,6 +2382,33 @@ fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
     if req.method == "DELETE" && path == "/v1/intervene" {
         let cfg = iv::clear(&flash.shape.engine_shape());
         return send_json(&mut stream, "200 OK", &intervene_to_json(&cfg));
+    }
+    // ビューワ用: モデルの一覧と選択 (選び直しはプロセスの再起動で行う)。
+    if req.method == "GET" && path == "/v1/model/choices" {
+        return send_json(&mut stream, "200 OK", &model_choices_json(flash));
+    }
+    if req.method == "POST" && path == "/v1/model/select" {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
+        };
+        return match select_model(flash, &body) {
+            Ok((true, id)) => {
+                eprintln!("[flash] model select: {id} を選んだ。応答のあと終了して起動し直す (exit {EXIT_MODEL_SWITCH})");
+                EXIT_AFTER.store(EXIT_MODEL_SWITCH, std::sync::atomic::Ordering::SeqCst);
+                send_json(&mut stream, "202 Accepted", &json!({"switching": true, "id": id}))
+            }
+            Ok((false, id)) => send_json(&mut stream, "200 OK", &json!({"switching": false, "id": id})),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    // ビューワ用: 保持している文脈 (KV / GDN 状態) の確認と破棄。
+    if req.method == "GET" && path == "/v1/cache" {
+        return send_json(&mut stream, "200 OK", &flash.ctx_json());
+    }
+    if req.method == "DELETE" && path == "/v1/cache" {
+        let v = flash.clear_ctx();
+        return send_json(&mut stream, "200 OK", &v);
     }
     // task 218: 残差の平均の記録 / 適用 (ビューワが使う)。
     if req.method == "GET" && path == "/v1/steer" {
@@ -2346,6 +2637,51 @@ impl Drop for StatsSaveOnExit {
             eprintln!("{line}");
         }
     }
+}
+
+/// 要求の読み取りは接続ごとのスレッドで行い、読めた要求を主スレッドへ渡す
+/// (モデルを触る処理は今まで通り主スレッドで 1 本ずつ)。`POST /v1/abort` だけは
+/// 読み取りスレッドで即答するので、生成中 (主スレッドが塞がっている間) でも止められる。
+type Job = (TcpStream, BufReader<TcpStream>, HttpReq);
+
+fn spawn_acceptor(listener: TcpListener) -> std::sync::mpsc::Receiver<std::io::Result<Job>> {
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Job>>();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let tx = tx.clone();
+            let stream = match s {
+                Ok(s) => s,
+                Err(e) => {
+                    if tx.send(Err(e)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            std::thread::spawn(move || {
+                stream.set_nodelay(true).ok();
+                let Ok(clone) = stream.try_clone() else { return };
+                let mut r = BufReader::new(clone);
+                let req = match read_req(&mut r) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => return,
+                    Err(e) => {
+                        eprintln!("[flash] 要求を読めない: {e:#}");
+                        return;
+                    }
+                };
+                if is_abort_req(&req) {
+                    let mut stream = stream;
+                    if let Err(e) = send_abort_reply(&mut stream) {
+                        eprintln!("[flash] abort の応答に失敗: {e:#}");
+                    }
+                    return;
+                }
+                let _ = tx.send(Ok((stream, r, req)));
+            });
+        }
+    });
+    rx
 }
 
 pub fn run(cfg: FlashConfig) -> Result<()> {
@@ -2588,12 +2924,13 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("{addr} を listen できない"))?;
     eprintln!("[flash] listening on http://{addr} model={}", cfg.name);
-    for s in listener.incoming() {
+    let rx = spawn_acceptor(listener);
+    for s in rx {
         match s {
-            Ok(stream) => {
+            Ok((stream, r, req)) => {
                 let t = Instant::now();
                 // 逐次処理 (モデルは 1 つ、同時リクエストは受けない)
-                if let Err(e) = handle(&mut flash, stream) {
+                if let Err(e) = handle_req(&mut flash, stream, r, req) {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
@@ -2613,6 +2950,18 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 if st.attempted() > 0 {
                     eprintln!("{}", denno_engine::gpu_budget::summary_line(&st));
                     denno_engine::gpu_budget::reset_weight_upload_stats();
+                }
+                // モデルの選び直し: 応答を返したあとで終了し、起動ループに任せる。
+                let code = EXIT_AFTER.load(std::sync::atomic::Ordering::SeqCst);
+                if code != 0 {
+                    // 記録中のときだけ保存する (記録していないときの flush はエラーを返す)。
+                    if steer::rec_status().is_some() {
+                        if let Err(e) = steer::flush() {
+                            eprintln!("[steer] 記録の保存に失敗: {e}");
+                        }
+                    }
+                    eprintln!("[flash] exit {code} (モデルの切り替え)");
+                    std::process::exit(code);
                 }
             }
             Err(e) => eprintln!("[flash] accept 失敗: {e}"),
@@ -2647,6 +2996,39 @@ mod flash_tests {
         let mut buf = Vec::new();
         let _ = s.read_to_end(&mut buf);
         String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// 生成中 (主スレッドが要求を取りに来ない間) でも `POST /v1/abort` は読み取り
+    /// スレッドで即答し、停止要求を立てる。ほかの要求は主スレッドへ順に渡る。
+    #[test]
+    fn acceptor_answers_abort_while_main_is_busy() {
+        use std::io::Write as _;
+        let _lk = ABORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let rx = spawn_acceptor(l);
+        // 主スレッドが生成中 (rx を読まない) のつもり
+        let _gen = GenGuard::enter();
+        let mut a = TcpStream::connect(addr).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        a.write_all(b"POST /v1/abort HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        let resp = read_all(&mut a);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(resp.contains("\"aborted\":true"), "{resp}");
+        assert!(take_abort(), "停止要求が立っていない");
+        // ふつうの要求は主スレッド側の channel に届く (読み取りスレッドでは答えない)
+        let mut b = TcpStream::connect(addr).unwrap();
+        b.write_all(b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        let job = rx.recv_timeout(Duration::from_secs(5)).expect("要求が主スレッドに届かない").unwrap();
+        assert_eq!(job.2.method, "GET");
+        assert_eq!(job.2.path, "/v1/models");
+        drop(_gen);
+        // 生成していないときは空振り
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"POST /v1/abort HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        assert!(read_all(&mut c).contains("\"aborted\":false"));
+        assert!(!take_abort());
     }
 
     /// P51: 従来からの GET 応答はバイト列まで変えない (テレメトリの有無に依らない)。
