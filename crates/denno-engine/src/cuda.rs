@@ -3281,39 +3281,62 @@ impl DevBuffer {
                     pin.ptr as *mut u8,
                     bytes,
                 );
-                match thread_up_stream() {
-                    Some((s, ev)) => {
-                        let l = lib()?;
-                        check(
-                            (l.memcpy_htod_async)(
-                                self.ptr + offset as CUdeviceptr,
-                                pin.ptr,
-                                bytes,
-                                s,
-                            ),
-                            "cuMemcpyHtoDAsync (pinned slab)",
-                        )?;
-                        let (Some(rec), Some(es)) = (l.event_record, l.event_sync) else {
-                            bail!("event_record / event_sync が無い (up stream)");
-                        };
-                        check(rec(ev, s), "cuEventRecord (up stream)")?;
-                        check(es(ev), "cuEventSynchronize (up stream)")?;
-                    }
-                    None => {
-                        check(
-                            (lib()?.memcpy_htod)(
-                                self.ptr + offset as CUdeviceptr,
-                                pin.ptr,
-                                bytes,
-                            ),
-                            "cuMemcpyHtoD (pinned slab)",
-                        )?;
-                    }
+                self.upload_ptr_at(offset, pin.ptr as *const u8, bytes)
+            }
+        })
+    }
+
+    /// task 260: 転送元が **すでに pinned** (RAM tier の区間) のときの H2D。
+    ///
+    /// `upload_pinned_at` は毎回 thread-local の bounce へ写してから DMA する。
+    /// RAM tier の区間はそのまま DMA できるので、2 MB の写し (実測 0.2 ms/本) を
+    /// 省ける。`src_pinned == false` は従来経路 (挙動を変えない)。
+    pub(crate) fn upload_at_from(&self, offset: usize, data: &[u8], src_pinned: bool) -> Result<()> {
+        if !src_pinned {
+            return self.upload_pinned_at(offset, data);
+        }
+        let bytes = data.len();
+        if bytes == 0 {
+            return Ok(());
+        }
+        assert!(
+            offset.saturating_add(bytes) <= self.bytes,
+            "DevBuffer::upload_at_from: 範囲外 (offset={offset}, bytes={bytes}, len={})",
+            self.bytes
+        );
+        self.upload_ptr_at(offset, data.as_ptr(), bytes)
+    }
+
+    /// ホストのポインタから H2D する (転送元は pinned であること)。
+    ///
+    /// `upload_pinned_at` と `upload_at_from` の共通部分 (ストリームの有無・
+    /// イベント同期・台帳の積算)。転送するバイト列はどちらの入口でも同じ。
+    fn upload_ptr_at(&self, offset: usize, src: *const u8, bytes: usize) -> Result<()> {
+        let src = src as *const c_void;
+        unsafe {
+            match thread_up_stream() {
+                Some((s, ev)) => {
+                    let l = lib()?;
+                    check(
+                        (l.memcpy_htod_async)(self.ptr + offset as CUdeviceptr, src, bytes, s),
+                        "cuMemcpyHtoDAsync (pinned slab)",
+                    )?;
+                    let (Some(rec), Some(es)) = (l.event_record, l.event_sync) else {
+                        bail!("event_record / event_sync が無い (up stream)");
+                    };
+                    check(rec(ev, s), "cuEventRecord (up stream)")?;
+                    check(es(ev), "cuEventSynchronize (up stream)")?;
+                }
+                None => {
+                    check(
+                        (lib()?.memcpy_htod)(self.ptr + offset as CUdeviceptr, src, bytes),
+                        "cuMemcpyHtoD (pinned slab)",
+                    )?;
                 }
             }
-            dbg_htod(bytes);
-            Ok(())
-        })
+        }
+        dbg_htod(bytes);
+        Ok(())
     }
 
     /// s165: 既存のデバイス領域の一部を指す**非所有**ビュー。連結重み
@@ -11799,6 +11822,91 @@ impl Drop for PinMem {
     fn drop(&mut self) {
         unsafe {
             let _ = (lib().unwrap().mem_host_free)(self.ptr);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 260: ホスト RAM tier 用の pinned な塊
+// ---------------------------------------------------------------------------
+//
+// `DENNO_EXPERT_RAM_MB` の常駐先。CUDA の `cuMemHostAlloc` で確保した
+// **ページロック済み**のホストメモリで、次の 2 つが狙い:
+//
+// 1. どの大きな読みにも追い出されない (page cache との違いはここだけ)。production の
+//    実測では、別モデルを回したあとに IQ3_S へ戻すと page cache が抜けていて、
+//    最初のリクエストが 149 ms/tok (平常 26) になっていた。
+// 2. H2D の転送元にできる (pinned 52.6 GB/s / pageable 19.6 GB/s)。expert の
+//    上げ直しで bounce コピーを挟まない経路 [`crate::cuda::PinnedHost`] を
+//    そのまま `cuMemcpyHtoD` に渡せる。
+//
+// 確保に失敗したら `None` を返す (呼び出し側はヒープの塊へ落ちる)。失敗で
+// リクエストを落とさない。
+pub struct PinnedHost {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+// 生ポインタを保持するだけ (中身はページロックされたホストメモリで、
+// CPU からも GPU からも見える。排他は呼び出し側の LRU が持つ)。
+unsafe impl Send for PinnedHost {}
+unsafe impl Sync for PinnedHost {}
+
+impl PinnedHost {
+    /// `bytes` バイトの pinned ホストメモリを確保する。0 バイトは失敗扱い。
+    #[cfg(feature = "cuda")]
+    pub fn alloc(bytes: usize) -> Option<Self> {
+        if bytes == 0 {
+            return None;
+        }
+        const CU_MEMHOSTALLOC_PORTABLE: u32 = 0x01;
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let lib = lib().ok()?;
+        let ok = unsafe {
+            check(
+                (lib.mem_host_alloc)(&mut ptr, bytes, CU_MEMHOSTALLOC_PORTABLE),
+                "cuMemHostAlloc (RAM tier)",
+            )
+            .is_ok()
+        };
+        if !ok || ptr.is_null() {
+            return None;
+        }
+        Some(Self { ptr, bytes })
+    }
+
+    /// GPU の無いビルドでは常に失敗する (ヒープへ落ちる)。
+    #[cfg(not(feature = "cuda"))]
+    pub fn alloc(_bytes: usize) -> Option<Self> {
+        None
+    }
+
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr as *mut u8
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.bytes) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.bytes) }
+    }
+}
+
+impl Drop for PinnedHost {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            if let Ok(l) = lib() {
+                unsafe {
+                    let _ = (l.mem_host_free)(self.ptr);
+                }
+            }
         }
     }
 }

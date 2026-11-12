@@ -676,6 +676,15 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     if let Some(line) = denno_engine::model::exp_iq::stats_line() {
         eprintln!("{line}");
     }
+    // task 260: ホスト RAM tier の当たり (`DENNO_EXPERT_RAM_MB` のときだけ 1 行)。
+    if let Some(line) = denno_engine::model::expert_ram::stats_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::expert_ram::stats_reset();
+    // task 260 step 1: ホスト側のバイトの出所 (minflt / majflt / 常駐量)。
+    if let Some(line) = denno_engine::model::expert_ram::probe_line(tag) {
+        eprintln!("{line}");
+    }
     // task 190: ヒット本数ごとのミス CPU / 上げ直しの表 (PROFILE のときだけ)。
     if tag == "decode" {
         for line in denno_engine::model::exp_iq::hit_lines(128) {
@@ -1039,6 +1048,11 @@ impl Flash {
         // task 146: 背景の事前ロードに「いま推論中」を知らせる (ロックを奪い合わない)。
         // ガードは戻るとき (失敗経路も) に下ろす。
         let _busy = denno_engine::model::exp_stats::busy_guard();
+        // task 260 診断 (`DENNO_EXPERT_RAM_DROP=1`): リクエストの先頭で expert の
+        // page cache を落とす (dense 重みは落とさない)。冷えた機械の再現用。
+        for line in denno_engine::model::expert_ram::drop_pages_if_enabled() {
+            eprintln!("{line}");
+        }
         // P78: 層の外の内訳 (tokenize は prefill wall の外なので別に積む)。
         let t_tok = prekprof::stamp();
         // 継続生成 (continue: true): 最後が assistant なら、その分を閉じずに

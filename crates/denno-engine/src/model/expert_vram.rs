@@ -1180,9 +1180,9 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup,
-    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many, Acquired,
-    CheckAcc, ExpertDev, ExpertShape,
+    acquire, acquire_deferred, acquire_host, acquire_soft, cache_usage, check_enabled, fallbacks,
+    init, lookup, lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
+    Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1742,6 +1742,23 @@ mod gpu {
         acquire_opts(key, shapes, load, true)
     }
 
+    /// task 260: バイト列が **すでに pinned** (ホスト RAM tier の区間) のときの
+    /// [`acquire`]。bounce コピーを挟まず、そのまま DMA する。
+    ///
+    /// `src_pinned` が嘘でも壊れない (pageable からの `cuMemcpyHtoD` は合法。
+    /// driver が内部で staging するだけ = 従来と同じ速さ)。
+    pub fn acquire_host<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+        src_pinned: bool,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        acquire_opts_p(key, shapes, load, true, src_pinned)
+    }
+
     /// 1 本を VRAM へ上げる (事前ロード用)。`acquire_opts` の非ラッチ版。
     pub fn acquire_soft<'a, F>(
         key: ExpertKey,
@@ -1765,6 +1782,20 @@ mod gpu {
         shapes: [ExpertShape; 3],
         load: F,
         latch_on_fail: bool,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        acquire_opts_p(key, shapes, load, latch_on_fail, false)
+    }
+
+    /// [`acquire_opts`] の本体 (+ task 260 の転送元 pinned 指定)。
+    fn acquire_opts_p<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+        latch_on_fail: bool,
+        src_pinned: bool,
     ) -> Result<Option<Acquired>>
     where
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
@@ -1874,9 +1905,9 @@ mod gpu {
                 Some(s) => {
                     let base = s.offset();
                     let h = s.handle();
-                    h.upload_pinned_at(base + offs[0], gb)
-                        .and_then(|_| h.upload_pinned_at(base + offs[1], ub))
-                        .and_then(|_| h.upload_pinned_at(base + offs[2], db))
+                    h.upload_at_from(base + offs[0], gb, src_pinned)
+                        .and_then(|_| h.upload_at_from(base + offs[1], ub, src_pinned))
+                        .and_then(|_| h.upload_at_from(base + offs[2], db, src_pinned))
                 }
                 None => alloc_three(pinned, gb, ub, db).map(|b| direct = Some(b)),
             };

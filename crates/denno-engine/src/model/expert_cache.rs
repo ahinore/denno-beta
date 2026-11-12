@@ -169,11 +169,371 @@ impl PreadAt for FileReader {
     }
 }
 
-/// 1 スロットぶんの常駐。
+/// 1 スロットぶんの常駐。`len` は実際の expert のバイト数で、`buf` の容量は
+/// それ以上 (固定長の塊から切り出したときは `slot_bytes` ぶん)。
 struct Slot {
     key: ExpertKey,
     len: usize,
-    buf: Arc<Vec<u8>>,
+    buf: Arc<Region>,
+}
+
+// ---------------------------------------------------------------------------
+// task 260: 常駐先の塊 (pinned / heap)
+// ---------------------------------------------------------------------------
+
+/// `cuda` feature の有無をここで吸収する (GPU 無しのビルドでは常に `None`)。
+#[cfg(feature = "cuda")]
+type PinnedHost = crate::cuda::PinnedHost;
+
+/// GPU 無しのビルド用の代役 (構築されない)。
+#[cfg(not(feature = "cuda"))]
+struct PinnedHost;
+
+#[cfg(not(feature = "cuda"))]
+impl PinnedHost {
+    fn alloc(_bytes: usize) -> Option<Self> {
+        None
+    }
+    fn ptr(&self) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    fn bytes(&self) -> usize {
+        0
+    }
+}
+
+/// 塊の中身。`Pinned` は CUDA の `cuMemHostAlloc` で確保したページロック済みの
+/// ホストメモリ (大きな読みに追い出されない)、`Heap` は従来の `Vec<u8>`。
+enum ChunkMem {
+    Heap(Vec<u8>),
+    Pinned(PinnedHost),
+}
+
+/// 同じ塊を指す `Region` が共有する (ページロックは解放まで解かない)。
+pub struct Chunk {
+    mem: ChunkMem,
+}
+
+// 生ポインタ (pinned) と `Vec` を持つだけ。中身の読み書きの排他は
+// LRU (ミューテックス) と `Region` の参照カウントが持つ。
+unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
+
+impl Chunk {
+    fn heap(bytes: usize) -> Arc<Chunk> {
+        Arc::new(Chunk {
+            mem: ChunkMem::Heap(vec![0u8; bytes.max(1)]),
+        })
+    }
+
+    /// 読み込み済みの `Vec` をそのまま塊にする (ヒープ経路)。
+    fn from_vec(v: Vec<u8>) -> Arc<Chunk> {
+        Arc::new(Chunk {
+            mem: ChunkMem::Heap(v),
+        })
+    }
+
+    /// pinned が取れたら pinned、取れなければヒープ (失敗でリクエストを落とさない)。
+    fn new(bytes: usize, want_pinned: bool) -> (Arc<Chunk>, bool) {
+        if want_pinned {
+            if let Some(p) = PinnedHost::alloc(bytes) {
+                return (
+                    Arc::new(Chunk {
+                        mem: ChunkMem::Pinned(p),
+                    }),
+                    true,
+                );
+            }
+        }
+        (Chunk::heap(bytes), false)
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        match &self.mem {
+            ChunkMem::Heap(v) => v.as_ptr() as *mut u8,
+            ChunkMem::Pinned(p) => p.ptr(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match &self.mem {
+            ChunkMem::Heap(v) => v.len(),
+            ChunkMem::Pinned(p) => p.bytes(),
+        }
+    }
+
+    fn is_pinned(&self) -> bool {
+        matches!(self.mem, ChunkMem::Pinned(_))
+    }
+}
+
+/// 塊の中の 1 区間 = expert 1 本ぶんの生バイト。
+///
+/// `Arc<Region>` を clone すれば、LRU から追い出されてもバイト列は生きる
+/// (追い出し側は `Arc::try_unwrap` が成功したときだけ場所を再利用する)。
+pub struct Region {
+    chunk: Arc<Chunk>,
+    off: usize,
+    len: usize,
+}
+
+impl Region {
+    fn new(chunk: Arc<Chunk>, off: usize, len: usize) -> Arc<Region> {
+        debug_assert!(off + len <= chunk.bytes(), "Region が塊の外を指す");
+        Arc::new(Region { chunk, off, len })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.chunk.as_ptr().add(self.off), self.len) }
+    }
+
+    /// 書き込み用。**この `Region` を排他で持っている** (他の `Arc` が無い) ときだけ
+    /// 呼ぶ。同じ塊の他の区間とは重ならないので、区間ごとの排他で足りる。
+    ///
+    /// # Safety
+    /// 呼び出し側が同じ区間への読み書きを同時に行わないこと。
+    unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.chunk.as_ptr().add(self.off), self.len)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.chunk.is_pinned()
+    }
+}
+
+impl std::ops::Deref for Region {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for Region {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Region")
+            .field("len", &self.len)
+            .field("pinned", &self.is_pinned())
+            .finish()
+    }
+}
+
+/// 塊の確保器。**固定長スロット**を塊から切り出す (task 260 の RAM tier)。
+///
+/// 1 塊 = `per_chunk * slot_bytes` バイト。塊は必要になったときに 1 枚ずつ
+/// 確保する (起動時に予算ぶんを丸ごと確保しない)。確保の前に
+/// `/proc/meminfo` の `MemAvailable` を見て、`margin_bytes` を割るなら
+/// それ以上伸ばさない (スワップ / OOM killer を避ける)。
+struct FixedStore {
+    slot_bytes: usize,
+    per_chunk: usize,
+    /// これ以上スロットを増やさない (予算)。
+    limit_slots: usize,
+    /// 塊を増やす前に残っていなければならない空き (バイト)。
+    margin_bytes: u64,
+    /// pinned を試すか (`DENNO_EXPERT_RAM_PIN=0` で false)。
+    want_pinned: bool,
+    inner: Mutex<FixedInner>,
+}
+
+struct FixedInner {
+    chunks: Vec<Arc<Chunk>>,
+    /// 次に切り出すスロット番号 (0 から)。
+    next: usize,
+    /// 追い出しで返ってきた区間 (再利用)。
+    free: Vec<(Arc<Chunk>, usize)>,
+    /// 予算切れ / 空き不足で伸ばすのをやめた (ログは 1 回だけ)。
+    stop: bool,
+}
+
+impl FixedStore {
+    fn new(slot_bytes: usize, limit_slots: usize, margin_bytes: u64, want_pinned: bool) -> Self {
+        // 1 塊は 1 GiB まで (cuMemHostAlloc の 1 回の確保を小さく保つ)。
+        let per_chunk = ((1usize << 30) / slot_bytes.max(1)).max(1);
+        FixedStore {
+            slot_bytes,
+            per_chunk,
+            limit_slots,
+            margin_bytes,
+            want_pinned,
+            inner: Mutex::new(FixedInner {
+                chunks: Vec::new(),
+                next: 0,
+                free: Vec::new(),
+                stop: false,
+            }),
+        }
+    }
+
+    /// 1 区間を返す。予算切れ・空き不足なら `None` (呼び出し側はキャッシュしない)。
+    ///
+    /// `len` は `slot_bytes` 以下であること (超えるのは呼び出し側の誤り)。
+    fn take(&self, len: usize) -> Option<Arc<Region>> {
+        if len > self.slot_bytes {
+            return None;
+        }
+        let mut g = lock_fixed(&self.inner);
+        // 1. 返ってきた区間を優先する (新しい塊を確保しない)。
+        while let Some((chunk, off)) = g.free.pop() {
+            if off + len <= chunk.bytes() {
+                return Some(Region::new(chunk, off, len));
+            }
+        }
+        // 2. 予算の範囲で次のスロットを切り出す。
+        if g.next >= self.limit_slots {
+            g.stop = true;
+            return None;
+        }
+        let idx = g.next;
+        let (ci, off) = (idx / self.per_chunk, (idx % self.per_chunk) * self.slot_bytes);
+        if ci >= g.chunks.len() {
+            // 新しい塊。空きが margin を割るなら伸ばさない。
+            let bytes = self.per_chunk * self.slot_bytes;
+            if let Some(avail) = mem_available() {
+                if avail < self.margin_bytes.saturating_add(bytes as u64) {
+                    g.stop = true;
+                    return None;
+                }
+            }
+            let (chunk, pinned) = Chunk::new(bytes, self.want_pinned);
+            if !pinned && self.want_pinned && !g.chunks.is_empty() {
+                // 2 枚目以降で pinned が取れない = 断片化 / 上限。ヒープで続ける。
+            }
+            if chunk.bytes() < bytes {
+                // ヒープの確保にも失敗した (OOM 直前)。伸ばさない。
+                g.stop = true;
+                return None;
+            }
+            g.chunks.push(chunk);
+        }
+        g.next += 1;
+        let chunk = Arc::clone(&g.chunks[ci]);
+        Some(Region::new(chunk, off, len))
+    }
+
+    /// 追い出した区間を返す (読者が居なければ再利用する)。
+    fn give_back(&self, region: Arc<Region>) {
+        let Ok(r) = Arc::try_unwrap(region) else {
+            return; // まだ読者が居る
+        };
+        let mut g = lock_fixed(&self.inner);
+        g.free.push((r.chunk, r.off));
+    }
+
+    fn pinned_bytes(&self) -> u64 {
+        let g = lock_fixed(&self.inner);
+        g.chunks
+            .iter()
+            .filter(|c| c.is_pinned())
+            .map(|c| c.bytes() as u64)
+            .sum()
+    }
+
+    fn reserved_bytes(&self) -> u64 {
+        let g = lock_fixed(&self.inner);
+        (g.next * self.slot_bytes) as u64
+    }
+
+    fn stopped(&self) -> bool {
+        lock_fixed(&self.inner).stop
+    }
+}
+
+fn lock_fixed(m: &Mutex<FixedInner>) -> std::sync::MutexGuard<'_, FixedInner> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `MemAvailable` (バイト)。読めなければ `None` (このときは伸ばす判断を保留せず、
+/// 予算だけで止める)。
+pub fn mem_available() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// 常駐先。従来のヒープ (プール) と、task 260 の固定長ストア。
+enum Store {
+    Heap(Mutex<Vec<Vec<u8>>>),
+    Fixed(FixedStore),
+}
+
+impl Store {
+    /// 区間を 1 本確保する (固定長ストアのみ)。ヒープは `None` (Vec を使う)。
+    fn take(&self, len: usize) -> Option<Arc<Region>> {
+        match self {
+            Store::Fixed(f) => f.take(len),
+            Store::Heap(_) => None,
+        }
+    }
+
+    /// ヒープの作業域を 1 本 (再利用プールから)。
+    fn take_vec(&self, len: usize) -> Vec<u8> {
+        let mut v = match self {
+            Store::Heap(p) => lock_vecs(p).pop().unwrap_or_default(),
+            Store::Fixed(_) => Vec::new(),
+        };
+        if v.len() < len {
+            // `resize` は伸びたぶんだけを 0 で埋める (既存の中身は使わない)。
+            v.resize(len, 0);
+        } else {
+            v.truncate(len);
+        }
+        v
+    }
+
+    /// 追い出した区間を返す。読者が居なければ再利用する。
+    fn recycle(&self, region: Arc<Region>) {
+        match self {
+            Store::Fixed(f) => f.give_back(region),
+            Store::Heap(p) => {
+                let Ok(r) = Arc::try_unwrap(region) else {
+                    return;
+                };
+                let Region { chunk, .. } = r;
+                if let Ok(c) = Arc::try_unwrap(chunk) {
+                    if let ChunkMem::Heap(v) = c.mem {
+                        let mut g = lock_vecs(p);
+                        if g.len() < 64 {
+                            g.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn pinned_bytes(&self) -> u64 {
+        match self {
+            Store::Fixed(f) => f.pinned_bytes(),
+            Store::Heap(_) => 0,
+        }
+    }
+
+    fn reserved_bytes(&self) -> u64 {
+        match self {
+            Store::Fixed(f) => f.reserved_bytes(),
+            Store::Heap(_) => 0,
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        match self {
+            Store::Fixed(f) => f.stopped(),
+            Store::Heap(_) => false,
+        }
+    }
+}
+
+fn lock_vecs(m: &Mutex<Vec<Vec<u8>>>) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// ロックで守る状態。
@@ -188,8 +548,6 @@ struct Inner {
     head: u32,
     tail: u32,
     free: Vec<u32>,
-    /// 追い出した `Vec` の再利用プール (毎ミスで 1 MB を zero 初期化しない)。
-    pool: Vec<Vec<u8>>,
     stats: CacheStats,
 }
 
@@ -204,7 +562,6 @@ impl Inner {
             tail: NIL,
             // pop() で 0 から使う
             free: (0..cap as u32).rev().collect(),
-            pool: Vec::new(),
             stats: CacheStats::default(),
         }
     }
@@ -244,7 +601,7 @@ impl Inner {
     }
 
     /// スロットを確保して `key` を入れる。満杯なら tail を追い出す。
-    fn insert(&mut self, key: ExpertKey, len: usize, buf: Arc<Vec<u8>>) {
+    fn insert(&mut self, key: ExpertKey, len: usize, buf: Arc<Region>, store: &Store) {
         let sid = match self.free.pop() {
             Some(s) => s,
             None => {
@@ -256,13 +613,8 @@ impl Inner {
                     self.map.remove(&old.key);
                 }
                 self.stats.evictions += 1;
-                // 読者が居なければバッファを再利用する (ゼロ初期化を避ける)。
-                if let Ok(mut b) = Arc::try_unwrap(old.buf) {
-                    b.clear();
-                    if self.pool.len() < self.slots.len() {
-                        self.pool.push(b);
-                    }
-                }
+                // 読者が居なければ場所を返す (ヒープはゼロ初期化を避ける)。
+                store.recycle(old.buf);
                 v
             }
         };
@@ -287,6 +639,8 @@ pub struct ExpertCache {
     slots: usize,
     slot_bytes: usize,
     inner: Mutex<Inner>,
+    /// task 260: 常駐先 (ヒープのプール / 固定長の塊)。
+    store: Store,
 }
 
 impl std::fmt::Debug for ExpertCache {
@@ -312,7 +666,56 @@ impl ExpertCache {
             slots,
             slot_bytes,
             inner: Mutex::new(Inner::new(slots)),
+            store: Store::Heap(Mutex::new(Vec::new())),
         }
+    }
+
+    /// task 260: **固定長の塊**から切り出すキャッシュを作る (RAM tier)。
+    ///
+    /// `limit_bytes` はこの行列に使ってよい総バイト数、`margin_bytes` は塊を
+    /// 増やす前に `MemAvailable` に残すべきバイト数、`want_pinned` は
+    /// `cuMemHostAlloc` を試すか (失敗したらヒープ)。
+    ///
+    /// `slots` は上限 (バイト予算から決まる) で、塊は必要になったときに
+    /// 1 GiB ずつ確保する。
+    pub fn new_fixed(
+        slots: usize,
+        slot_bytes: usize,
+        limit_bytes: u64,
+        margin_bytes: u64,
+        want_pinned: bool,
+    ) -> Self {
+        let limit_slots = if slot_bytes == 0 {
+            0
+        } else {
+            ((limit_bytes / slot_bytes as u64) as usize).min(slots)
+        };
+        ExpertCache {
+            slots: limit_slots,
+            slot_bytes,
+            inner: Mutex::new(Inner::new(limit_slots)),
+            store: Store::Fixed(FixedStore::new(
+                slot_bytes,
+                limit_slots,
+                margin_bytes,
+                want_pinned,
+            )),
+        }
+    }
+
+    /// 固定長ストアで pinned に置けているバイト数 (診断用。ヒープなら 0)。
+    pub fn pinned_bytes(&self) -> u64 {
+        self.store.pinned_bytes()
+    }
+
+    /// 固定長ストアが既に切り出したバイト数 (予算の使用量)。
+    pub fn reserved_bytes(&self) -> u64 {
+        self.store.reserved_bytes()
+    }
+
+    /// 空き不足 / 予算切れで伸ばすのを止めたか。
+    pub fn stopped(&self) -> bool {
+        self.store.stopped()
     }
 
     /// スロット数。
@@ -347,7 +750,7 @@ impl ExpertCache {
         off: u64,
         len: usize,
         src: &dyn PreadAt,
-    ) -> Result<Arc<Vec<u8>>> {
+    ) -> Result<Arc<Region>> {
         if len == 0 {
             bail!("{:?}: expert のバイト数が 0 (読む意味が無い)", key);
         }
@@ -370,7 +773,7 @@ impl ExpertCache {
             let mut g = lock_inner(&self.inner);
             g.stats.misses += 1;
             g.stats.bytes_read += n as u64;
-            return Ok(Arc::new(buf));
+            return Ok(Region::new(Chunk::from_vec(buf), 0, len));
         }
 
         // ヒット判定 (ロック内)。Arc を clone したらすぐ離す。
@@ -388,30 +791,68 @@ impl ExpertCache {
             g.stats.misses += 1;
         }
 
-        // ミス: プールから作業域を 1 本取り、ロックの外で読む。
-        let mut buf = {
-            let mut g = lock_inner(&self.inner);
-            g.pool.pop().unwrap_or_default()
-        };
-        buf.resize(len, 0);
-        let n = match read_into(src, off, &mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                // 失敗したバッファは返さない (半端な内容をプールに残さない)。
-                return Err(e);
+        // ミス: 書き込み先を 1 本用意して、ロックの外で読む。
+        //
+        // task 260: 固定長ストアでは**区間へ直接 pread する** (pinned メモリに
+        // そのまま入るので、ヒープへ読んでから写すコピーが無い)。
+        let mut region = self.store.take(len);
+        let mut scratch: Option<Vec<u8>> = None;
+        if region.is_none() {
+            scratch = Some(self.store.take_vec(len));
+        }
+        let n = {
+            let dst: &mut [u8] = match (&mut region, &mut scratch) {
+                (Some(r), _) => {
+                    // take 直後で参照は 1 本だけ (書き込みは排他)。
+                    let r = Arc::get_mut(r).expect("take 直後の Region は排他");
+                    unsafe { r.as_mut_slice() }
+                }
+                (None, Some(v)) => v.as_mut_slice(),
+                (None, None) => unreachable!("書き込み先が無い"),
+            };
+            match read_into(src, off, dst) {
+                Ok(n) => n,
+                Err(e) => {
+                    // 失敗した作業域は返さない (半端な内容を再利用しない)。
+                    return Err(e);
+                }
             }
         };
-        let arc = Arc::new(buf);
+        let arc = match region {
+            Some(r) => r,
+            None => {
+                let v = scratch.expect("書き込み先が無い");
+                let n = v.len();
+                Region::new(Chunk::from_vec(v), 0, n)
+            }
+        };
         {
             let mut g = lock_inner(&self.inner);
             g.stats.bytes_read += n as u64;
-            g.insert(key, len, arc.clone());
+            g.insert(key, len, arc.clone(), &self.store);
         }
         Ok(arc)
     }
 
     pub fn stats(&self) -> CacheStats {
         lock_inner(&self.inner).stats
+    }
+
+    /// task 260: ヒットだけを引く (ミスで pread しない)。
+    pub fn peek(&self, key: ExpertKey, len: usize) -> Option<Arc<Region>> {
+        let mut g = lock_inner(&self.inner);
+        let sid = *g.map.get(&key)?;
+        let hit = match g.slots[sid as usize].as_ref() {
+            Some(s) => s.len == len,
+            None => false,
+        };
+        if !hit {
+            return None;
+        }
+        let buf = g.slots[sid as usize].as_ref().expect("有効").buf.clone();
+        g.touch(sid);
+        g.stats.hits += 1;
+        Some(buf)
     }
 
     /// 統計だけを 0 に戻す (スロットの中身と LRU の順序はそのまま)。
@@ -635,6 +1076,77 @@ impl ExpertCacheSet {
         })
     }
 
+    /// task 260: **RAM tier** を作る。総バイト予算 `budget_bytes` を 3 行列へ
+    /// `slot_bytes` の比で配る (1 expert = 3 行列がそろって入るので、
+    /// 行列あたりの本数は同じになる)。
+    ///
+    /// 常駐先は `cuMemHostAlloc` の pinned (取れなければヒープ)。塊を増やす前に
+    /// `MemAvailable` が `margin_bytes` を割っていないか確かめる。
+    pub fn new_ram(
+        budget_bytes: u64,
+        specs: [CacheSpec; 3],
+        paths: &[PathBuf],
+        margin_bytes: u64,
+        want_pinned: bool,
+    ) -> Result<Self> {
+        if paths.is_empty() {
+            bail!("expert RAM tier: GGUF のパートが 0 本 (読み口を作れない)");
+        }
+        let bytes = [
+            specs[0].slot_bytes.max(1),
+            specs[1].slot_bytes.max(1),
+            specs[2].slot_bytes.max(1),
+        ];
+        let per_expert = bytes[0] as u64 + bytes[1] as u64 + bytes[2] as u64;
+        let experts = (budget_bytes / per_expert) as usize;
+        let mut readers: Vec<Box<dyn PreadAt>> = Vec::with_capacity(paths.len());
+        for p in paths {
+            readers.push(Box::new(FileReader::open(p)?));
+        }
+        Ok(ExpertCacheSet {
+            mb: (budget_bytes >> 20) as usize,
+            caches: [
+                ExpertCache::new_fixed(
+                    experts,
+                    bytes[0],
+                    experts as u64 * bytes[0] as u64,
+                    margin_bytes,
+                    want_pinned,
+                ),
+                ExpertCache::new_fixed(
+                    experts,
+                    bytes[1],
+                    experts as u64 * bytes[1] as u64,
+                    margin_bytes,
+                    want_pinned,
+                ),
+                ExpertCache::new_fixed(
+                    experts,
+                    bytes[2],
+                    experts as u64 * bytes[2] as u64,
+                    margin_bytes,
+                    want_pinned,
+                ),
+            ],
+            readers,
+        })
+    }
+
+    /// pinned に置けているバイト数 (3 行列の和)。RAM tier の診断用。
+    pub fn pinned_bytes(&self) -> u64 {
+        self.caches.iter().map(|c| c.pinned_bytes()).sum()
+    }
+
+    /// 塊として既に確保したバイト数 (予算の使用量)。
+    pub fn reserved_bytes(&self) -> u64 {
+        self.caches.iter().map(|c| c.reserved_bytes()).sum()
+    }
+
+    /// 空き不足 / 予算切れで伸ばすのを止めた行列があるか。
+    pub fn stopped(&self) -> bool {
+        self.caches.iter().any(|c| c.stopped())
+    }
+
     /// 設定された MB (0 は作れない = `from_mb` を呼ばない前提)。
     pub fn mb(&self) -> usize {
         self.mb
@@ -679,7 +1191,7 @@ impl ExpertCacheSet {
         key: ExpertKey,
         off: u64,
         len: usize,
-    ) -> Result<Arc<Vec<u8>>> {
+    ) -> Result<Arc<Region>> {
         let n = self.readers.len();
         if part >= n {
             bail!("expert キャッシュ: パート {part} が範囲外 ({n} 本)");
@@ -690,6 +1202,21 @@ impl ExpertCacheSet {
     /// 行列ごとの統計。
     pub fn stats(&self, m: ExpertMatrix) -> CacheStats {
         self.caches[m.index()].stats()
+    }
+
+    /// task 260: **ヒットだけ**を引く (ミスで pread しない)。prefill の
+    /// ストリームが RAM tier に載っている expert だけを使うときに使う。
+    ///
+    /// ヒットは LRU を触る (使われた事実を残す)。`len` が違うスロットは
+    /// ミス扱い (別の層で同じ鍵・別の長さは起きないが、`get` と同じ規則にする)。
+    pub fn peek(&self, m: ExpertMatrix, key: ExpertKey, len: usize) -> Option<Arc<Region>> {
+        self.caches[m.index()].peek(key, len)
+    }
+
+    /// task 260: 統計だけを 0 に戻す (中身と LRU の順序はそのまま)。
+    pub fn reset_stats_for(&self, m: ExpertMatrix) {
+        let mut g = lock_inner(&self.caches[m.index()].inner);
+        g.stats = CacheStats::default();
     }
 
     /// 行列ごとのヒット率 (要求が 0 件なら 0.0)。
@@ -1152,6 +1679,105 @@ mod tests {
         assert!(set.report(ExpertMatrix::Gate).contains("resident_mib=0"));
         assert_eq!(set.slots(ExpertMatrix::Down), 1);
         assert_eq!(set.mb(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // task 260: 固定長ストア (RAM tier)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn task260_fixed_store_reuses_slots_and_holds_the_budget() {
+        let data = pat(1 << 16);
+        let src = Mem::new(data.clone());
+        // 2 スロット (slot_bytes 1024)。3 本目で追い出しが起きる。
+        let c = ExpertCache::new_fixed(2, 1024, 2 * 1024, 0, false);
+        assert_eq!(c.slots(), 2);
+        assert_eq!(c.slot_bytes(), 1024);
+        let (k0, k1, k2) = (key(0, 0), key(0, 1), key(0, 2));
+        let a = c.get(k0, 0, 1024, &src).unwrap();
+        assert_eq!(&a[..], &data[0..1024], "区間の中身がファイルと違う");
+        let _ = c.get(k1, 1024, 1024, &src).unwrap();
+        assert_eq!(c.reserved_bytes(), 2048);
+        // 3 本目: 追い出して同じ場所を使い回す (確保は増えない)
+        let _ = c.get(k2, 2048, 1024, &src).unwrap();
+        assert_eq!(c.reserved_bytes(), 2048, "予算を超えて塊を増やした");
+        let s = c.stats();
+        assert_eq!((s.hits, s.misses, s.evictions), (0, 3, 1));
+        // 追い出された k0 はミス (pread が 1 回増える)
+        let reads = src.reads();
+        let _ = c.get(k0, 0, 1024, &src).unwrap();
+        assert_eq!(src.reads(), reads + 1, "追い出した鍵がヒットした");
+        assert_eq!(c.used(), 2, "常駐数がスロット数を超えた");
+    }
+
+    #[test]
+    fn task260_fixed_store_zero_budget_reads_every_time() {
+        let data = pat(4096);
+        let src = Mem::new(data.clone());
+        let c = ExpertCache::new_fixed(4, 1024, 0, 0, false);
+        assert_eq!(c.slots(), 0, "予算 0 でスロットができた");
+        let _ = c.get(key(0, 0), 0, 1024, &src).unwrap();
+        let _ = c.get(key(0, 0), 0, 1024, &src).unwrap();
+        assert_eq!(src.reads(), 2, "予算 0 は毎回 pread のはず");
+        assert_eq!(c.used(), 0);
+    }
+
+    #[test]
+    fn task260_fixed_store_peek_does_not_read() {
+        let data = pat(8192);
+        let src = Mem::new(data.clone());
+        let c = ExpertCache::new_fixed(1, 512, 512, 0, false);
+        let k = key(3, 4);
+        assert!(c.peek(k, 512).is_none(), "空のストアで peek が当たった");
+        assert_eq!(src.reads(), 0, "peek が pread した");
+        let _ = c.get(k, 0, 512, &src).unwrap();
+        let r = src.reads();
+        let p = c.peek(k, 512).expect("ヒット");
+        assert_eq!(&p[..], &data[0..512]);
+        assert_eq!(src.reads(), r, "peek が pread した");
+        assert!(c.peek(k, 511).is_none(), "長さ違いをヒットにした");
+        assert_eq!(c.stats().hits, 1, "peek のヒットが数えられていない");
+    }
+
+    #[test]
+    fn task260_fixed_store_falls_back_to_heap_without_gpu() {
+        // pinned を要求しても GPU / pinned が取れなければヒープで動く
+        // (失敗でリクエストを落とさない)。テスト環境には GPU が無い。
+        let data = pat(4096);
+        let src = Mem::new(data.clone());
+        let c = ExpertCache::new_fixed(2, 1024, 2048, 0, true);
+        let r = c.get(key(0, 0), 0, 1024, &src).unwrap();
+        assert_eq!(&r[..], &data[0..1024]);
+        assert_eq!(r.len(), 1024, "len が要求と違う");
+        let _ = c.get(key(0, 1), 1024, 1024, &src).unwrap();
+        // GPU の無いテストでは pinned は 0
+        if crate::model::expert_ram::mem_available().is_none() {
+            assert_eq!(c.pinned_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn task260_new_ram_splits_the_budget_by_slot_bytes() {
+        let dir = std::env::temp_dir().join("denno_expert_ram_set");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("dummy.bin");
+        std::fs::write(&p, vec![7u8; 1 << 16]).expect("temp file");
+        let specs = [
+            CacheSpec { slot_bytes: 1024 },
+            CacheSpec { slot_bytes: 1024 },
+            CacheSpec { slot_bytes: 2048 },
+        ];
+        // 8 MiB 予算 / 1 本 4 KiB = 2048 本
+        let set = ExpertCacheSet::new_ram(8 << 20, specs, &[p.clone()], 0, false).expect("set");
+        assert_eq!(set.slots(ExpertMatrix::Gate), 2048);
+        assert_eq!(set.slots(ExpertMatrix::Up), 2048);
+        assert_eq!(set.slots(ExpertMatrix::Down), 2048);
+        assert_eq!(set.reserved_bytes(), 0, "確保は初回アクセスまで遅延する");
+        assert!(!set.stopped());
+        // 予算が 1 本に満たなければスロット 0
+        let tiny = ExpertCacheSet::new_ram(1024, specs, &[p], 0, false).expect("set");
+        assert_eq!(tiny.slots(ExpertMatrix::Gate), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
