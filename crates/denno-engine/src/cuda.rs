@@ -48409,17 +48409,29 @@ pub fn gdn_ba_gpu_on() -> bool {
     *ON.get_or_init(|| parse_gdn_ba_gpu(std::env::var("DENNO_GDN_BA_GPU").ok().as_deref()))
 }
 
-/// task 269: F32 の beta/alpha 重みを VRAM に常駐させる (uid ごと・grow only)。
+/// task 269: F32 / BF16 の beta/alpha 重みを VRAM に常駐させる (uid ごと)。
 ///
-/// 量は 36 層 × 983 KB ≈ 35 MB で、`DENNO_GPU_WEIGHT_MB` の追い出し対象には
-/// しない (毎トークン触るので常駐が前提)。確保に失敗したら `None` = 従来経路。
-fn ba_gpu_weight(uid: u64, blocks: &[u8], k: usize, n: usize) -> Option<CUdeviceptr> {
+/// 量は 36 層 × 491 KB (BF16) ≈ 18 MB で、`DENNO_GPU_WEIGHT_MB` の追い出し
+/// 対象にはしない (毎トークン触るので常駐が前提)。確保に失敗したら `None`
+/// = 従来経路 (呼び出し側が事前に型を見て選ぶので、ここでの失敗は OOM だけ)。
+fn ba_gpu_weight(
+    uid: u64,
+    ty: crate::kquant::GgmlType,
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+) -> Option<CUdeviceptr> {
     static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, (usize, usize, usize)>>> =
         OnceLock::new();
     // (k, n, bytes) と DevBuffer の ptr を別表で持つ (DevBuffer は Send でないため
-    // thread_local ではなく static の生ポインタで持つ。プロセス寿命で解放しない)。
+    // static の生ポインタで持つ。プロセス寿命で解放しない)。
     static PTRS: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> = OnceLock::new();
-    let bytes = k.checked_mul(n)?.checked_mul(4)?;
+    let bpp = match ty {
+        crate::kquant::GgmlType::F32 => 4usize,
+        crate::kquant::GgmlType::Bf16 => 2usize,
+        _ => return None,
+    };
+    let bytes = k.checked_mul(n)?.checked_mul(bpp)?;
     if blocks.len() != bytes {
         return None;
     }
@@ -48437,32 +48449,47 @@ fn ba_gpu_weight(uid: u64, blocks: &[u8], k: usize, n: usize) -> Option<CUdevice
     }
     let buf = DevBuffer::from_slice_tagged(blocks, crate::mem_audit::TAG_MIX_F32).ok()?;
     let p = buf.ptr();
-    // DevBuffer を解放しないよう、生ポインタだけを残して Box を leak する
-    // (プロセス寿命の常駐。35 MB 程度なので許容)。
+    // プロセス寿命の常駐 (18-35 MB)。DevBuffer の drop を呼ばない。
     std::mem::forget(buf);
     reg.lock().ok()?.insert(uid, (k, n, bytes));
     ptrs.lock().ok()?.insert(uid, p as usize);
     Some(p)
 }
 
-/// task 269: beta/alpha (F32) を 1 発の matvec で `x_dev` → `out_dev` へ。
-fn gdn_launch_ba_f32(
+/// task 269: beta/alpha の重み型がデバイス経路で扱えるか (純関数)。
+pub fn gdn_ba_ty_ok(ty: crate::kquant::GgmlType) -> bool {
+    matches!(
+        ty,
+        crate::kquant::GgmlType::F32 | crate::kquant::GgmlType::Bf16
+    )
+}
+
+/// task 269: beta/alpha を 1 発の matvec で `x_dev` → `out_dev` へ。
+fn gdn_launch_ba(
     ctx: &CudaCtx,
     unit: &GdnGgufUnit<'_>,
     x_dev: CUdeviceptr,
     out_dev: CUdeviceptr,
 ) -> Result<()> {
-    if unit.ty != crate::kquant::GgmlType::F32 || unit.n == 0 || unit.n > 65535 {
+    use crate::kquant::GgmlType as T;
+    if !gdn_ba_ty_ok(unit.ty) || unit.n == 0 || unit.n > 65535 {
         bail!("gdn ba: 型/行数が想定外 ({:?}, n={})", unit.ty, unit.n);
     }
-    let w = ba_gpu_weight(unit.uid, unit.blocks, unit.k, unit.n)
+    let w = ba_gpu_weight(unit.uid, unit.ty, unit.blocks, unit.k, unit.n)
         .ok_or_else(|| anyhow::anyhow!("gdn ba: 重みを VRAM に置けない (uid={})", unit.uid))?;
-    // 並列縮約版 (1 行 = 1 ブロック・256 スレッド)。PTX に無ければ逐次版 (128)。
-    let (f, thr) = match matvec_f32_r_fn(ctx) {
-        Some(fr) => (fr, 256u32),
-        None => match matvec_f32_fn(ctx) {
-            Some(f) => (f, 128u32),
-            None => bail!("gdn ba: dno_matvec_f32 が PTX に無い"),
+    // 並列縮約版 (1 行 = 1 ブロック・256 スレッド)。BF16 は型そのままの
+    // カーネル (BF16 -> f32 は正確)、F32 は f32 版。
+    let (f, thr) = match unit.ty {
+        T::Bf16 => (
+            matvec_bf16_r_fn(ctx).ok_or_else(|| anyhow::anyhow!("gdn ba: dno_matvec_bf16_r が無い"))?,
+            256u32,
+        ),
+        _ => match matvec_f32_r_fn(ctx) {
+            Some(fr) => (fr, 256u32),
+            None => match matvec_f32_fn(ctx) {
+                Some(f) => (f, 128u32),
+                None => bail!("gdn ba: dno_matvec_f32 が PTX に無い"),
+            },
         },
     };
     let (mut ph, mut pw, mut po) = (x_dev, w, out_dev);
@@ -49237,7 +49264,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         // task 269: beta/alpha の f32 matvec を qkv GEMV より前に積む
         // (scan は最後なので順序は同一ストリームで保証される)。
         for (u, off) in req.ba_units {
-            gdn_launch_ba_f32(ctx, u, px, pb + (*off * 4) as CUdeviceptr)?;
+            gdn_launch_ba(ctx, u, px, pb + (*off * 4) as CUdeviceptr)?;
             stage_sync!("ba_gemv");
         }
         for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {

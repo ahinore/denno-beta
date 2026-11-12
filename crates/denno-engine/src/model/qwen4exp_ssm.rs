@@ -464,10 +464,21 @@ impl SsmLayer {
     /// task 269: beta/alpha の「1 発 GEMV の単位」を呼び出し順で列挙する
     /// ([`SsmLayer::gdn_qkv_units`] と同じ規約。出力の行オフセット =
     /// [`FusedLinear::gemv_unit_out_offset`])。
+    ///
+    /// **型がデバイス経路で扱えないときは空を返す** (fail closed)。呼び出し側は
+    /// 空なら従来どおりホストで GEMV を回す。submit の中で失敗させると
+    /// `gdn_gpu_scan` がプロセス全体で不使用になる (lab t269b で実際に踏んだ)
+    /// ので、判定はここで先に済ませる。
     #[cfg(feature = "cuda")]
     fn gdn_ba_units(&self) -> Vec<(crate::cuda::GdnGgufUnit<'_>, usize)> {
-        self.beta_alpha
-            .gemv_units()
+        let units = self.beta_alpha.gemv_units();
+        if units
+            .iter()
+            .any(|u| !crate::cuda::gdn_ba_ty_ok(u.ty()) || u.n() == 0)
+        {
+            return Vec::new();
+        }
+        units
             .iter()
             .enumerate()
             .map(|(i, u)| {
