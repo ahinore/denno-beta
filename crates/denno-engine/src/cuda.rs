@@ -3049,6 +3049,14 @@ pub fn parse_keep_experts(v: Option<&str>, default_on: bool) -> bool {
 /// (task248 の警告 0 回)。発火するのは確保に失敗したときだけで、そのときは
 /// 追い出しが「要求 + チャンク 1 本」で止まり、足りなければ Err (= 呼び出し側が
 /// CPU 経路へ) になる。
+///
+/// task 256 で追い出しの中身をチャンク単位にした (lab t256a、`c57c92c`)。
+/// base は task256 の記録 0 行 (発火せず)、md5 SAME・decode 19.5/19.6/19.4
+/// ms/tok・prefill 26.14/26.25/25.21 s (14k cold)。強制 COND
+/// (`DENNO_EXPERT_VRAM_MB=24000` + `DENNO_PREFILL_WORK_MB=1500`) は空き 15 MiB
+/// まで使い切っても errors 0・テキスト sane で、1 イベントの解放は
+/// 要求 255 MiB に対して 255 MiB (上限は要求 + チャンク = 511 MiB)。
+/// ゲートの既定は on のまま (採否 yes)。`REPORT_P256.md`。
 pub const ALLOC_KEEP_EXPERTS_DEFAULT: bool = true;
 
 /// task 248: 確保失敗時に expert を全捨てしない方針か。
