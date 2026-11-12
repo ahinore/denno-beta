@@ -586,12 +586,23 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
     /// task 146 の事前ロードが、載せ終わったあとに「回数の少ない順」へ並べ直す
     /// ために使う。載っていない key は黙って飛ばす。
     pub fn touch_many(&mut self, keys: &[K]) {
+        let _ = self.touch_many_count(keys);
+    }
+
+    /// [`VramLru::touch_many`] と同じで、載っていて触れた本数を返す (task 246)。
+    ///
+    /// 呼び出し側が「寄せ直しが何本に当たったか」を 1 行で出せるようにする
+    /// (緑 = 発火の証拠ではないので、発火と当たり数を数える)。
+    pub fn touch_many_count(&mut self, keys: &[K]) -> usize {
+        let mut n = 0usize;
         for k in keys {
             if let Some(s) = self.entries.get_mut(k) {
                 self.clock = self.clock.saturating_add(1);
                 s.last_use = self.clock;
+                n += 1;
             }
         }
+        n
     }
 
     /// 登録簿から外す (値は呼び出し側へ返す)。
@@ -735,6 +746,22 @@ pub fn emergency_free(need: usize) -> usize {
     {
         let _ = need;
         0
+    }
+}
+
+/// task 242: [`emergency_free`] の「追い出した鍵も返す」版 (古い順)。
+///
+/// 層優先 prefill が作業域を空けるために追い出した expert を、prefill の終端で
+/// 戻すために使う。GPU 無しのビルドは `(0, [])`。
+pub fn emergency_free_keys(need: usize) -> (usize, Vec<ExpertKey>) {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::emergency_free_keys(need)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = need;
+        (0, Vec::new())
     }
 }
 
@@ -1180,9 +1207,10 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallback_breakdown,
-    fallbacks, init, lookup, lookup_many, note_check, peek_many, take_alloc_error, take_check,
-    touch_many, Acquired, CheckAcc, ExpertDev, ExpertShape,
+    acquire, acquire_deferred, acquire_host, acquire_soft, cache_usage, check_enabled,
+    fallback_breakdown, fallbacks, init, keys, lookup, lookup_many, note_check, peek_many,
+    take_alloc_error, take_check, touch_many, touch_many_count, Acquired, CheckAcc, ExpertDev,
+    ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1374,11 +1402,17 @@ mod gpu {
     /// task 146: 事前ロードの最後に、回数の少ない順で呼んで「一番よく使う expert が
     /// 一番追い出されにくい」状態にする。未初期化・ロック破損なら何もしない。
     pub fn touch_many(keys: &[ExpertKey]) {
+        let _ = touch_many_count(keys);
+    }
+
+    /// [`touch_many`] と同じで、載っていて触れた本数を返す (task 246 の診断用)。
+    pub fn touch_many_count(keys: &[ExpertKey]) -> usize {
         let Some(c) = CACHE.get() else {
-            return;
+            return 0;
         };
-        if let Ok(mut g) = c.lock() {
-            g.touch_many(keys);
+        match c.lock() {
+            Ok(mut g) => g.touch_many_count(keys),
+            Err(_) => 0,
         }
     }
 
@@ -1405,20 +1439,30 @@ mod gpu {
     /// `try_lock` なので、expert の確保が LRU のロック保持中に走っている場合は
     /// 何もしない (呼び出し側 = [`acquire_opts`] が自分で追い出して再試行する)。
     pub fn emergency_free(need: usize) -> usize {
+        emergency_free_keys(need).0
+    }
+
+    /// task 242: [`emergency_free`] の「追い出した鍵も返す」版。
+    ///
+    /// 戻り値は `(空けたバイト数, 追い出した鍵)`。鍵は**古い順** (LRU の先頭から)。
+    /// 層優先 prefill は、作業域を空けるために追い出した expert を prefill の
+    /// 終端で戻す (戻さないと次の decode のヒット率が 0.75 → 0.25 に落ちる)。
+    pub fn emergency_free_keys(need: usize) -> (usize, Vec<ExpertKey>) {
         let Some(c) = CACHE.get() else {
-            return 0;
+            return (0, Vec::new());
         };
         let Ok(mut g) = c.try_lock() else {
-            return 0;
+            return (0, Vec::new());
         };
         let evicted = g.evict_until_free(need);
         let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
+        let keys: Vec<ExpertKey> = evicted.iter().map(|(k, _)| *k).collect();
         drop(evicted); // DevBuffer が落ちて VRAM が空く
         // task 152: slab ではスロットを返してもデバイスメモリは戻らない。空に
         // なったチャンクを落として**実メモリ**を返す (lab t152a の g24 は
         // これが無くて 14k で q4 attention が CPU に落ちた)。
         let released = crate::model::expert_slab::release_empty(need);
-        freed.saturating_add(released)
+        (freed.saturating_add(released), keys)
     }
 
     /// task 256: 1 本の確保のために、**チャンクを丸ごと**空けて実メモリを返す。
@@ -1541,6 +1585,18 @@ mod gpu {
         let c = CACHE.get()?;
         let g = c.lock().ok()?;
         Some((g.used_bytes(), g.cap_bytes()))
+    }
+
+    /// task 263: いま VRAM に載っている expert の鍵 (エンドポイントと再調整用)。
+    /// 未初期化なら空。
+    pub fn keys() -> Vec<ExpertKey> {
+        let Some(c) = CACHE.get() else {
+            return Vec::new();
+        };
+        let Ok(g) = c.lock() else {
+            return Vec::new();
+        };
+        g.lru_keys()
     }
 
     /// (LRU 使用中バイト, 外部予約バイト, 上限バイト)。未初期化なら `None`。
@@ -1761,6 +1817,23 @@ mod gpu {
         acquire_opts(key, shapes, load, true)
     }
 
+    /// task 260: バイト列が **すでに pinned** (ホスト RAM tier の区間) のときの
+    /// [`acquire`]。bounce コピーを挟まず、そのまま DMA する。
+    ///
+    /// `src_pinned` が嘘でも壊れない (pageable からの `cuMemcpyHtoD` は合法。
+    /// driver が内部で staging するだけ = 従来と同じ速さ)。
+    pub fn acquire_host<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+        src_pinned: bool,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        acquire_opts_p(key, shapes, load, true, src_pinned)
+    }
+
     /// 1 本を VRAM へ上げる (事前ロード用)。`acquire_opts` の非ラッチ版。
     pub fn acquire_soft<'a, F>(
         key: ExpertKey,
@@ -1784,6 +1857,20 @@ mod gpu {
         shapes: [ExpertShape; 3],
         load: F,
         latch_on_fail: bool,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        acquire_opts_p(key, shapes, load, latch_on_fail, false)
+    }
+
+    /// [`acquire_opts`] の本体 (+ task 260 の転送元 pinned 指定)。
+    fn acquire_opts_p<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+        latch_on_fail: bool,
+        src_pinned: bool,
     ) -> Result<Option<Acquired>>
     where
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
@@ -1829,12 +1916,19 @@ mod gpu {
         // 6 型 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0) も
         // `kernels_exp_iq.ptx` があれば載せてよい (`DENNO_EXPERT_IQ_GPU=1` のときだけ
         // `moe_gemv_iq_ready` が真になる)。ゲートが off なら従来どおり false。
+        //
+        // task 268: **層一括カーネル (`kernels_moe_batch.ptx`) で回せる型も受ける**。
+        // UD-Q4_K_XL の decode は層一括経路 (`moe_experts_gpu_batched`) だけを通り、
+        // ここの判定は per-expert カーネル (`kernels_moe.ptx`) しか見ていなかった。
+        // 一括カーネルは Q4_K / Q5_K / Q5_1 / Q8_0 を全部持つので、載せてよい
+        // (= 事前ロードが 1 本も載せられない、を防ぐ)。
         let mut want = 0usize;
         // task 152: 3 行列のバイト数 (slab のスロット配分に使う)。
         let mut mbytes = [0usize; 3];
         for (i, s) in shapes.iter().enumerate() {
             if !crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k)
                 && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
+                && !crate::cuda::moe_gemv_seg_ready(s.ty, s.k)
             {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 FB_TYPE.fetch_add(1, Ordering::Relaxed);
@@ -1917,9 +2011,9 @@ mod gpu {
                 Some(s) => {
                     let base = s.offset();
                     let h = s.handle();
-                    h.upload_pinned_at(base + offs[0], gb)
-                        .and_then(|_| h.upload_pinned_at(base + offs[1], ub))
-                        .and_then(|_| h.upload_pinned_at(base + offs[2], db))
+                    h.upload_at_from(base + offs[0], gb, src_pinned)
+                        .and_then(|_| h.upload_at_from(base + offs[1], ub, src_pinned))
+                        .and_then(|_| h.upload_at_from(base + offs[2], db, src_pinned))
                 }
                 None => alloc_three(pinned, gb, ub, db).map(|b| direct = Some(b)),
             };
@@ -2364,6 +2458,12 @@ mod tests {
         // 載っていない key は黙って飛ばす
         c.touch_many(&[99]);
         assert_eq!(c.used_bytes(), used - 100);
+        // task 246: 当たった本数を返す版 (`pf-reseed` の診断がこれで発火を数える)。
+        // この時点で載っているのは 3 と 4 だけ (1 は追い出し済み)。
+        let n = c.touch_many_count(&[4, 99, 1, 3]);
+        assert_eq!(n, 2, "載っている 2 本だけ数える");
+        assert_eq!(c.used_bytes(), used - 100, "触ってもバイト数は変わらない");
+        assert_eq!(c.stats().misses, misses, "H2D は起きない");
     }
 
     /// どの並びで入れても `used_bytes` は上限を超えない。
@@ -2894,5 +2994,55 @@ mod tests {
         assert_eq!(g.probes(), 1);
         assert_eq!(g.decide(0, Some(8)), GateDecision::Probe);
         assert_eq!(g.probes(), 2);
+    }
+
+    /// task 268: 事前ロードのバイト数が K 系 / legacy 型でも求まること。
+    ///
+    /// UD-Q4_K_XL の実形 (hidden 2560 / expert FF 640、gate/up = Q4_K、
+    /// down = Q5_1) で 1 本 = 3,072,000 B。`bytes()` が型で落ちると
+    /// 起動プランが VRAM に 1 本も載せられない (t263c でそう読めた)。
+    #[test]
+    fn plan_bytes_cover_k_and_legacy_types() {
+        use crate::kquant::GgmlType as T;
+        let ud = [
+            ExpertShape {
+                ty: T::Q4K,
+                k: 2560,
+                n: 640,
+            },
+            ExpertShape {
+                ty: T::Q4K,
+                k: 2560,
+                n: 640,
+            },
+            ExpertShape {
+                ty: T::Q5_1,
+                k: 640,
+                n: 2560,
+            },
+        ];
+        let sizes: Vec<usize> = ud.iter().map(|s| s.bytes().expect("K 系で求まる")).collect();
+        // Q4_K: 2560/256 * 144 = 1440 B/行 * 640 = 921,600
+        assert_eq!(sizes[0], 921_600);
+        assert_eq!(sizes[1], 921_600);
+        // Q5_1: 640/32 * 24 = 480 B/行 * 2560 = 1,228,800
+        assert_eq!(sizes[2], 1_228_800);
+        assert_eq!(sizes.iter().sum::<usize>(), 3_072_000);
+        // Q5_K / Q8_0 も同じ入口で求まる (legacy 4 型。k は型のブロックで割り切る)
+        for ty in [T::Q5K, T::Q8_0, T::Q5_1] {
+            let s = ExpertShape {
+                ty,
+                k: 2560,
+                n: 640,
+            };
+            assert!(s.bytes().is_ok(), "{ty:?} のバイト数が求まらない");
+        }
+        // 端数 (ブロックで割り切れない) は今までどおり Err (fail closed)
+        let bad = ExpertShape {
+            ty: T::Q4K,
+            k: 640,
+            n: 2560,
+        };
+        assert!(bad.bytes().is_err(), "Q4_K の 640 は 256 で割り切れない");
     }
 }

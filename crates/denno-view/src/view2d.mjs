@@ -15,6 +15,9 @@
 //   DELETE /v1/steer/snapshots/<name>
 //   POST   /v1/steer/apply  {terms:[{snapshot,coef}], layers:[from,to), alpha, mode}
 //   DELETE /v1/steer/apply
+//   GET    /v1/cache       -> {main:{tokens,epoch}|null, aux:{...}|null} / DELETE で全消し
+//   GET    /v1/experts/stats -> {enabled, file, last_save, recorded, vram, ram, mmap,
+//                                coverage, last_request, plan} (task 271)
 //
 // task 220: `/2d` はこの契約を `/api` プロキシ経由でそのまま使う。モック
 // (`createMockStore`) は実 API の**検証規則と status まで写した**もので、shape が
@@ -1084,6 +1087,68 @@ function apiError(message) {
 /// ステアリングの snapshot 名 (engine の `steer::validate_name` と同じ)。
 const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
+// ---- expert tier (task 271) ----------------------------------------------
+
+/// `/v1/experts/stats` の本文を state 欄の行に落とす (純関数)。
+///
+/// 実 API (denno-cli の `experts_stats_json`) の形:
+///   { enabled, file, last_save:{unix,bytes}|null,
+///     recorded:{dir,expert_bytes,n_layer,n_expert,experts,uses}|null,
+///     vram:{experts,mb,cap_mb}, ram:{experts,slots,mb,pinned_mb},
+///     mmap:{experts,mb}, coverage:{vram,ram,total},
+///     last_request:{lookups,vram:{hits,hit_rate},ram:{...},mmap:{...}}|null,
+///     plan:{...}|null }
+///
+/// 古いサーバー (404) や欠けたキーでも呼べるように、数値でない値は null に落とす。
+/// `hit` は 0..1 (表示で % に丸める)。
+export function expertStatsView(body) {
+  const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  const num = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const x = Number(v);
+    return Number.isFinite(x) ? x : null;
+  };
+  const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+  const last = obj(b.last_request);
+  const hasLast = b.last_request && typeof b.last_request === 'object';
+  const tier = (key) => {
+    const t = obj(b[key]);
+    const raw = hasLast ? num(obj(last[key]).hit_rate) : null;
+    return {
+      key,
+      experts: num(t.experts),
+      mb: num(t.mb),
+      hit: raw == null ? null : Math.max(0, Math.min(1, raw)),
+    };
+  };
+  const cov = obj(b.coverage);
+  const save = obj(b.last_save);
+  return {
+    enabled: b.enabled === true,
+    file: typeof b.file === 'string' && b.file ? b.file : null,
+    savedUnix: num(save.unix),
+    savedBytes: num(save.bytes),
+    uses: num(obj(b.recorded).uses),
+    rows: [tier('vram'), tier('ram'), tier('mmap')],
+    coverage: { vram: num(cov.vram), ram: num(cov.ram), total: num(cov.total) },
+  };
+}
+
+/// 1 tier の 1 行: "12,345 exp · 21,000 MB · last 91%"。欠けた値は "-"。
+export function expertTierText(row) {
+  const r = row || {};
+  const n = (v) => (v == null ? '-' : Number(v).toLocaleString('en-US'));
+  const p = r.hit == null ? '-' : Math.round(r.hit * 100) + '%';
+  return n(r.experts) + ' exp · ' + n(r.mb) + ' MB · last ' + p;
+}
+
+/// 記録された使用回数のうち各 tier が覆う割合: "vram 70% · ram 20% · total 90%"。
+export function expertCoverageText(cov) {
+  const c = cov || {};
+  const p = (v) => (v == null ? '-' : Math.round(Number(v) * 100) + '%');
+  return 'vram ' + p(c.vram) + ' · ram ' + p(c.ram) + ' · total ' + p(c.total);
+}
+
 /// shape が 404 のときの API 代役。`handle(method, path, body)` -> `{status, body}`。
 ///
 /// **実 API と同じ規則**にしてある (task 220 で差分を全部寄せた):
@@ -1198,6 +1263,43 @@ export function createMockStore(shape, opts = {}) {
     };
   }
 
+  /// task 271: `/v1/experts/stats` の代役。形から決まる固定値で、トークンでは
+  /// 変わらない (実 API の tier の本数も decode では大きく動かない)。
+  /// 実 API と同じキーを全部返す (ビューワはここだけで描画を確かめられる)。
+  function expertStats() {
+    const total = s.layers * s.n_expert;
+    const per = 3_072_000; // gate+up+down 1 本ぶんのバイト数 (合成の値)
+    const mb = (n) => Math.floor((n * per) / (1024 * 1024));
+    const vramExperts = Math.floor(total * 0.35);
+    const ramExperts = Math.floor(total * 0.25);
+    const mmapExperts = total - vramExperts - ramExperts;
+    const looks = s.layers * s.n_expert_used;
+    const vramHits = Math.round(looks * 0.9);
+    const ramHits = Math.round(looks * 0.07);
+    const mmapHits = Math.max(0, looks - vramHits - ramHits);
+    const rate = (n) => (looks > 0 ? n / looks : 0);
+    return {
+      enabled: true,
+      file: 'mock/dnnoexps-mock-' + per * total + '.bin',
+      last_save: { unix: now(), bytes: 24 + 4 + 8 + total * 4 },
+      recorded: {
+        dir: 'mock', expert_bytes: per * total, n_layer: s.layers,
+        n_expert: s.n_expert, experts: total, uses: looks,
+      },
+      vram: { experts: vramExperts, mb: mb(vramExperts), cap_mb: mb(vramExperts) + 512 },
+      ram: { experts: ramExperts, slots: ramExperts, mb: mb(ramExperts), pinned_mb: mb(ramExperts) },
+      mmap: { experts: mmapExperts, mb: mb(mmapExperts) },
+      coverage: { vram: 0.7, ram: 0.2, total: 0.9 },
+      last_request: {
+        lookups: looks,
+        vram: { hits: vramHits, hit_rate: rate(vramHits) },
+        ram: { hits: ramHits, hit_rate: rate(ramHits) },
+        mmap: { hits: mmapHits, hit_rate: rate(mmapHits) },
+      },
+      plan: null,
+    };
+  }
+
   const store = {
     shape: s,
     state: () => jsonClone(store.snapshot()),
@@ -1275,6 +1377,10 @@ export function createMockStore(shape, opts = {}) {
       }
       if (m === 'GET' && p === '/v1/cache') {
         return { status: 200, body: ctxStatus() };
+      }
+      if (m === 'GET' && p === '/v1/experts/stats') {
+        // task 271: tier ごとの本数・MB、直前のリクエストの当たり (実 API と同じ形)。
+        return { status: 200, body: expertStats() };
       }
       if (m === 'DELETE' && p === '/v1/cache') {
         const dropped = st.ctx_tokens > 0 ? 1 : 0;

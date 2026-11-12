@@ -1957,6 +1957,136 @@ fn model_choices_and_select_http() {
     std::env::remove_var("DENNO_MODEL_SELECT");
 }
 
+/// task 271: モデルの切り替え (POST /v1/model/select) は、応答の前に
+/// いまのモデルの使用回数をファイルへ書く (切り替えで直前の回数を失わない)。
+#[test]
+fn model_select_saves_expert_stats() {
+    use denno_engine::model::exp_stats;
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    let dir = TempDir::new("flash-select-stats");
+    let mut flash = build_flash(&dir);
+    let cur = flash.parts[0].parent().unwrap().to_path_buf();
+    let other = PathBuf::from(dir.path("other"));
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("m-00001-of-00001.gguf"), b"x").unwrap();
+    let conf = PathBuf::from(dir.path("models.conf"));
+    let sel = PathBuf::from(dir.path("model_select"));
+    std::fs::write(
+        &conf,
+        format!(
+            "A|{}|モデル A|\nB|{}|モデル B|\n",
+            cur.display(),
+            other.display()
+        ),
+    )
+    .unwrap();
+    std::env::set_var("DENNO_MODEL_CHOICES", &conf);
+    std::env::set_var("DENNO_MODEL_SELECT", &sel);
+
+    // 記録先をこのテスト用にする。1 セルだけ数えて dirty にする。
+    let sdir = TempDir::new("flash-select-stats-dir");
+    std::env::remove_var(exp_stats::STATS_FILE_ENV);
+    std::env::set_var(exp_stats::STATS_DIR_ENV, sdir.path("stats"));
+    exp_stats::set_identity("modelA", 3_072_000, 2, 4);
+    let path = exp_stats::stats_path().expect("記録先が決まらない");
+    exp_stats::install_prior(&exp_stats::Counts::zeros("modelA", 3_072_000, 2, 4));
+    exp_stats::observe_layer(2, 4, 1, &[0, 3, 3]);
+    assert!(exp_stats::dirty(), "数えたのに dirty でない");
+
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", r#"{"id":"B"}"#));
+    assert!(resp.starts_with("HTTP/1.1 202 Accepted"), "{resp}");
+    assert!(
+        path.exists(),
+        "切り替えで使用回数が書かれていない: {}",
+        path.display()
+    );
+    let saved = exp_stats::load_file(&path, "modelA", 3_072_000).expect("保存したファイルが読める");
+    assert_eq!(saved.get(1, 0), Some(1), "層 1 expert 0 の回数");
+    assert_eq!(saved.get(1, 3), Some(2), "層 1 expert 3 の回数");
+    assert!(!exp_stats::dirty(), "保存したのに dirty のまま");
+
+    // 後片付け: ゲートを閉じ、数えたぶんを 0 に戻す (他のテストに持ち越さない)。
+    super::EXIT_AFTER.store(0, Ordering::SeqCst);
+    std::env::remove_var("DENNO_MODEL_CHOICES");
+    std::env::remove_var("DENNO_MODEL_SELECT");
+    std::env::remove_var(exp_stats::STATS_DIR_ENV);
+    exp_stats::configure("modelA", 3_072_000);
+    if let Some(c) = exp_stats::session() {
+        c.reset();
+    }
+}
+
+/// task 271: SIGTERM で使用回数を保存してから終了する。
+///
+/// プロセスを終える分岐なので、子プロセス (このテストバイナリを
+/// `--ignored` + 名前フィルタで起動) の中で発火させる。親は子の終了コード 0 と
+/// 保存されたファイルを見る。子のテストは
+/// [`sigterm_child_saves_and_exits`]。
+#[test]
+fn sigterm_saves_stats_before_exit() {
+    let dir = TempDir::new("flash-sigterm");
+    let exe = std::env::current_exe().expect("テストバイナリのパス");
+    let out = std::process::Command::new(exe)
+        .args(["sigterm_child_saves_and_exits", "--ignored", "--nocapture"])
+        .env("DENNO_P271_SIGTERM_DIR", dir.path("stats"))
+        .output()
+        .expect("子プロセスを起動できない");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "子が 0 で終わらない: {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("SIGTERM"),
+        "SIGTERM の分岐が発火していない:\n{stderr}"
+    );
+    // 保存されたファイルを読む (子が数えたセルが残っている)。
+    let path = std::fs::read_dir(dir.path("stats"))
+        .expect("保存先が無い")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "bin").unwrap_or(false))
+        .expect("保存ファイルが無い");
+    let c = denno_engine::model::exp_stats::load_file(&path, "sigterm", 3_072_000)
+        .expect("保存ファイルが読める");
+    assert_eq!(c.get(1, 0), Some(1), "層 1 expert 0 の回数");
+    assert_eq!(c.get(1, 3), Some(2), "層 1 expert 3 の回数");
+}
+
+/// 親テスト [`sigterm_saves_stats_before_exit`] が子プロセスで走らせる。
+///
+/// 保存先を決めて 1 セル数え、自分へ SIGTERM を送る。保存の分岐が発火すれば
+/// `save_stats_on_stop` が書いて `process::exit(0)` する。発火しなければ
+/// 5 秒後に panic して子が非 0 で終わる (親が検出する)。
+#[test]
+#[ignore = "親テストが子プロセスとして走らせる (自分へ SIGTERM を送る)"]
+fn sigterm_child_saves_and_exits() {
+    use denno_engine::model::exp_stats;
+    let dir = std::env::var("DENNO_P271_SIGTERM_DIR").expect("親から渡される");
+    std::env::remove_var(exp_stats::STATS_FILE_ENV);
+    std::env::set_var(exp_stats::STATS_DIR_ENV, &dir);
+    exp_stats::set_identity("sigterm", 3_072_000, 2, 4);
+    exp_stats::install_prior(&exp_stats::Counts::zeros("sigterm", 3_072_000, 2, 4));
+    exp_stats::observe_layer(2, 4, 1, &[0, 3, 3]);
+    assert!(exp_stats::dirty(), "数えたのに dirty でない");
+    super::spawn_sigterm_saver();
+    // ハンドラの設置を待ってから自分へ送る (設置前に送ると既定の動作で死ぬ)。
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = std::process::id().to_string();
+    let sent = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -TERM に失敗");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    panic!("SIGTERM のあと 5 秒たっても終了しない (保存の分岐が発火していない)");
+}
+
 // ---------------------------------------------------------------------------
 // task 218: 残差の平均の記録 / ステアリングの HTTP
 // ---------------------------------------------------------------------------

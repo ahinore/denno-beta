@@ -348,6 +348,18 @@ pub fn stats_line() -> Option<String> {
     ))
 }
 
+/// task 271: 直前のリクエストの参照数と VRAM ヒット数。
+///
+/// `stats_line` と同じ積算を、整形せずに返す。`/v1/experts/stats` が
+/// 「直前のリクエストの tier 別ヒット率」を出すのに使う (リクエスト終端で
+/// [`stats_reset`] が 0 に戻す前に写す)。ゲート off でも 0/0 を返すだけ。
+pub fn lookups_hits() -> (u64, u64) {
+    (
+        LOOKUPS.load(Ordering::Relaxed),
+        HITS.load(Ordering::Relaxed),
+    )
+}
+
 /// 積算を 0 に戻す (リクエスト終端)。
 pub fn stats_reset() {
     for c in [
