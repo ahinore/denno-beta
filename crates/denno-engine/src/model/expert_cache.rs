@@ -1005,7 +1005,11 @@ pub struct RamSpec {
     pub slot_bytes: usize,
     /// その行列の expert 総バイト数 (モデル全体)。
     pub total_bytes: u64,
-    /// 層あたりの expert 数。
+    /// **モデル全体**の expert 本数 (層数 × 層あたりの expert 数)。
+    ///
+    /// ここを層あたりの本数にすると LRU の本数が 1/層数 になり、lab t260b で
+    /// 46 GB の予算に対して 493 本しか持てず、decode が 17 GB 読み直して
+    /// 3 倍遅くなった。
     pub n_expert: usize,
 }
 
@@ -1026,6 +1030,12 @@ pub struct ExpertCacheSet {
     mb: usize,
     caches: [ExpertCache; 3],
     readers: Vec<Box<dyn PreadAt>>,
+    /// task 260: **ヒットだけ**を引く (ミスで pread しない) モード。RAM tier 用。
+    ///
+    /// ミスしたら呼び出し側が mmap のスライスへ落ちる。page cache にある
+    /// バイト列をわざわざ読み直して tier を埋めるのは、lab t260a/b で
+    /// decode を 29〜54% 遅くした (読み直し + page cache の追い出し)。
+    peek_only: bool,
 }
 
 impl ExpertCacheSet {
@@ -1089,6 +1099,7 @@ impl ExpertCacheSet {
                 ExpertCache::new(slots[2], slot_bytes[2]),
             ],
             readers,
+            peek_only: false,
         })
     }
 
@@ -1152,7 +1163,13 @@ impl ExpertCacheSet {
                 ),
             ],
             readers,
+            peek_only: true,
         })
+    }
+
+    /// task 260: ヒットだけを引くモードか (RAM tier)。
+    pub fn peek_only(&self) -> bool {
+        self.peek_only
     }
 
     /// pinned に置けているバイト数 (3 行列の和)。RAM tier の診断用。

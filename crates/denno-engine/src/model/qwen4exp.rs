@@ -2203,7 +2203,8 @@ fn expert_ram_shape(layers: &[LayerW]) -> Result<([RamSpec; 3], u64)> {
                 .map_err(|err| one(format!("{}: {err}", w.name)))?;
             slot_bytes = slot_bytes.max(s.len);
             total = total.saturating_add(s.len as u64 * w.n_expert as u64);
-            n_expert = w.n_expert;
+            // **モデル全体**の本数 (層数 × 層あたり)。
+            n_expert = n_expert.saturating_add(w.n_expert);
         }
         specs.push(RamSpec {
             slot_bytes,
@@ -16135,16 +16136,27 @@ fn expert_gemv_cached(
     out: &mut [f32],
 ) -> Result<()> {
     let (off, len) = w.slice_abs(key.expert as usize)?;
-    let bytes = c
-        .get(m, w.file, key, off, len)
-        .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))?;
+    // task 260: `peek_only` (RAM tier) は**ヒットだけ**を引き、ミスは mmap へ落ちる
+    // (pread で埋めない)。従来の `DENNO_EXPERT_CACHE_MB` はミスで埋める。
+    let tier = if c.peek_only() {
+        c.peek(m, key, len)
+    } else {
+        Some(
+            c.get(m, w.file, key, off, len)
+                .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))?,
+        )
+    };
+    let bytes: &[u8] = match &tier {
+        Some(r) => r.as_slice(),
+        None => w.slice(key.expert as usize)?,
+    };
     // mmap 経路と同じゲートを通す (同じバイト列なら同じカーネル・同じ丸め順)。
-    if moe_expert::expert_gemv_any_vnni(w.ty, &bytes, w.n_in, w.n_out, x, out)
+    if moe_expert::expert_gemv_any_vnni(w.ty, bytes, w.n_in, w.n_out, x, out)
         .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))?
     {
         return Ok(());
     }
-    moe_expert::expert_gemv_any(w.ty, &bytes, w.n_in, w.n_out, x, out)
+    moe_expert::expert_gemv_any(w.ty, bytes, w.n_in, w.n_out, x, out)
         .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))
 }
 
@@ -16166,15 +16178,24 @@ fn expert_gemv_cached_seq(
         expert: ei as u16,
     };
     let (off, len) = w.slice_abs(ei)?;
-    let bytes = c
-        .get(m, w.file, key, off, len)
-        .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))?;
-    if moe_expert::expert_gemv_any_vnni_seq(w.ty, &bytes, w.n_in, w.n_out, x, out)
+    let tier = if c.peek_only() {
+        c.peek(m, key, len)
+    } else {
+        Some(
+            c.get(m, w.file, key, off, len)
+                .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))?,
+        )
+    };
+    let bytes: &[u8] = match &tier {
+        Some(r) => r.as_slice(),
+        None => w.slice(ei)?,
+    };
+    if moe_expert::expert_gemv_any_vnni_seq(w.ty, bytes, w.n_in, w.n_out, x, out)
         .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))?
     {
         return Ok(());
     }
-    moe_expert::expert_gemv_any_seq(w.ty, &bytes, w.n_in, w.n_out, x, out)
+    moe_expert::expert_gemv_any_seq(w.ty, bytes, w.n_in, w.n_out, x, out)
         .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))
 }
 
@@ -20149,26 +20170,36 @@ mod tests {
         );
         crate::model::expert_ram::install(Some(std::sync::Arc::clone(&set)));
 
+        // 2. tier が空ならミスは mmap へ落ちる (pread して埋めない)。
+        //    これが lab t260a/b の教訓: decode のミスで埋めると 3 倍遅くなる。
         let mut got = vec![0.0f32; sel.len() * e];
         expert_miss_contribs_into(&lw, &sel, &x, e, ff, &mut got).expect("ram 1 回目");
-        assert_bitwise_eq(&want, &got, "mmap vs ram tier (1 回目)");
+        assert_bitwise_eq(&want, &got, "mmap vs ram tier (空の tier)");
+        assert!(set.peek_only(), "RAM tier はヒットだけを引くモードのはず");
+        assert_eq!(set.used_experts(), 0, "decode のミスで tier を埋めた");
         for &m in ExpertMatrix::ALL.iter() {
             let s = set.stats(m);
-            assert_eq!(s.misses, sel.len() as u64, "{m:?}: 1 回目で埋めていない");
-            assert_eq!(s.hits, 0, "{m:?}: 空の tier でヒットした");
+            assert_eq!(s.misses, 0, "{m:?}: peek なのにミスを数えた");
+            assert_eq!(s.bytes_read, 0, "{m:?}: peek なのに pread した");
         }
 
-        // 3. 2 回目はヒット (pread は増えない)
+        // 3. 明示的に埋める (起動時の充填と同じ経路) → 2 回目はヒット。
+        for &ei in sel.iter() {
+            assert!(
+                ram_regions(&lw, ei, true).is_some(),
+                "tier へ充填できない (expert {ei})"
+            );
+        }
         let reads: Vec<u64> = ExpertMatrix::ALL
             .iter()
             .map(|&m| set.stats(m).bytes_read)
             .collect();
         let mut again = vec![0.0f32; sel.len() * e];
         expert_miss_contribs_into(&lw, &sel, &x, e, ff, &mut again).expect("ram 2 回目");
-        assert_bitwise_eq(&want, &again, "mmap vs ram tier (2 回目)");
+        assert_bitwise_eq(&want, &again, "mmap vs ram tier (充填後)");
         for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
             let s = set.stats(m);
-            assert_eq!(s.hits, sel.len() as u64, "{m:?}: 2 回目でヒットしていない");
+            assert_eq!(s.hits, sel.len() as u64, "{m:?}: 充填後にヒットしていない");
             assert_eq!(s.bytes_read, reads[k], "{m:?}: ヒットなのに pread した");
         }
         // GPU の無いテストでは pinned は取れない = ヒープで動く
