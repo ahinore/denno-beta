@@ -346,6 +346,11 @@ mod gpu {
         let (u, t) = s.slots();
         (u, t, s.allocated_bytes())
     }
+
+    /// task 256: チャンク数 (診断と解放数の記録用)。
+    pub fn chunk_count() -> usize {
+        slab().chunk_count()
+    }
 }
 
 /// 空チャンクを落として `need` バイトまで実メモリを返す (cuda feature のときだけ)。
@@ -372,37 +377,145 @@ pub fn stats() -> (usize, usize, usize) {
     }
 }
 
+/// task 256: いま slab が持っているチャンク数 (cuda 無しは 0)。
+pub fn chunk_count() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::chunk_count()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// `slot_bytes` のスロットを確保する (cuda feature のときだけ)。
 #[cfg(feature = "cuda")]
 pub fn alloc_slot(slot_bytes: usize) -> anyhow::Result<SlabSlot<crate::cuda::DevBuffer>> {
     gpu::alloc_slot(slot_bytes)
 }
 
-/// チャンク一覧 `(id, バイト数, 最古の最終使用)` から、**丸ごと空ける**
-/// チャンクを選ぶ (task 248)。
+/// task 256: 1 チャンクの位置と冷たさ。
 ///
-/// 古い順 (最古の最終使用が小さい順、同値は id 昇順) に、合計バイト数が
-/// `need` 以上になるまで選ぶ。チャンクを丸ごと空けていないと slab は実メモリを
-/// 返さないので、1 本の大きな確保のために expert をバラバラに追い出しても
-/// 意味が無い (REPORT_P242 の 14k 層優先)。
+/// `last_use` は**チャンクの中で一番新しい最終使用**。小さいほど「どの expert も
+/// 久しく使われていない」= 冷たい。追い出しで失うヒットが少ない順に選ぶため、
+/// チャンク内の最古ではなく**最新**を鍵にする (1 本だけ古い玉が混ざったチャンクを
+/// 冷たいと誤認しない)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkSpan {
+    /// slab のチャンク識別子 ([`SlabSlot::chunk_id`])。
+    pub id: usize,
+    /// チャンクの先頭アドレス (バイト)。
+    pub addr: usize,
+    /// チャンク 1 本のバイト数。
+    pub bytes: usize,
+    /// チャンクの中で一番新しい最終使用。
+    pub last_use: u64,
+}
+
+/// task 256: 丸ごと空けるチャンクの選択結果。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvictPlan {
+    /// 空けるチャンクの id (アドレス順)。
+    pub ids: Vec<usize>,
+    /// 空けるバイト数の合計。
+    pub bytes: usize,
+    /// 選んだ範囲の冷たさ (範囲内で一番新しい最終使用)。
+    pub last_use: u64,
+}
+
+/// `free` バイトの空きがある状態で、`need` バイトの**連続した**空きを作るために
+/// 丸ごと空けるチャンクを選ぶ (純関数、task 256)。
 ///
-/// 合計が `need` に届かなくても、選べるだけ返す (呼び出し側は失敗を許容する)。
-pub fn chunks_to_empty(chunks: &[(usize, usize, u64)], need: usize) -> Vec<usize> {
-    if need == 0 {
-        return Vec::new();
+/// - 既に `free >= need` なら何も選ばない (追い出さない)。
+/// - アドレスが連続するチャンクの並び (run) の中から、不足分
+///   `need - free` 以上になる**窓**を選ぶ。窓のチャンクを全部空けるので、
+///   解放後の範囲は必ず連続になる (slab はチャンクが空にならないと実メモリを
+///   返さない。バラバラに追い出しても連続した空きはできない)。
+/// - 窓は「不足分を超えたところで止める」ので、追い出す量は
+///   `不足分 + 1 チャンク未満` に収まる (要求 + 1 チャンクを超えない)。
+/// - 窓の選び方: 一番冷たい窓 (窓内で一番新しい最終使用が小さい)、同着は
+///   合計バイトが小さい方、次に id 列の辞書順 (決定的)。
+/// - どの run でも不足分に届かなければ、全チャンクから冷たい順に必要量まで選ぶ
+///   (連続は諦めるが、実メモリは戻る)。
+pub fn plan_eviction(spans: &[ChunkSpan], free: usize, need: usize) -> EvictPlan {
+    let deficit = need.saturating_sub(free);
+    if deficit == 0 || spans.is_empty() {
+        return EvictPlan::default();
     }
-    let mut v: Vec<(usize, usize, u64)> = chunks.to_vec();
-    v.sort_unstable_by_key(|(id, _, oldest)| (*oldest, *id));
-    let mut out = Vec::new();
-    let mut got = 0usize;
-    for (id, bytes, _) in v {
-        if got >= need {
+    // アドレス順に並べ、隙間なく続くチャンクを run に切る。
+    let mut v = spans.to_vec();
+    v.sort_unstable_by_key(|s| (s.addr, s.id));
+    let mut runs: Vec<Vec<ChunkSpan>> = Vec::new();
+    for s in v {
+        let cont = runs
+            .last()
+            .and_then(|r| r.last())
+            .is_some_and(|p| p.addr.saturating_add(p.bytes) == s.addr);
+        if cont {
+            if let Some(r) = runs.last_mut() {
+                r.push(s);
+            }
+        } else {
+            runs.push(vec![s]);
+        }
+    }
+    let mut best: Option<EvictPlan> = None;
+    for r in &runs {
+        for i in 0..r.len() {
+            let n = count_until(&r[i..], deficit);
+            if n == 0 {
+                continue;
+            }
+            let window = &r[i..i + n];
+            let sum: usize = window.iter().map(|s| s.bytes).sum();
+            if sum < deficit {
+                // この run は不足分に届かない (以降の i も届かない)。
+                break;
+            }
+            let cand = EvictPlan {
+                ids: window.iter().map(|s| s.id).collect(),
+                bytes: sum,
+                last_use: window.iter().map(|s| s.last_use).max().unwrap_or(0),
+            };
+            if best.as_ref().map_or(true, |b| cooler(&cand, b)) {
+                best = Some(cand);
+            }
+        }
+    }
+    if let Some(b) = best {
+        return b;
+    }
+    // run だけで不足分に届かない: 全体から冷たい順に選ぶ。
+    let mut all = spans.to_vec();
+    all.sort_unstable_by_key(|s| (s.last_use, s.id));
+    let mut out = EvictPlan::default();
+    for s in all {
+        if out.bytes >= deficit {
             break;
         }
-        got = got.saturating_add(bytes);
-        out.push(id);
+        out.bytes = out.bytes.saturating_add(s.bytes);
+        out.last_use = out.last_use.max(s.last_use);
+        out.ids.push(s.id);
     }
     out
+}
+
+/// 先頭から合計が `deficit` 以上になるまでの本数 (必ず 1 本以上)。
+fn count_until(run: &[ChunkSpan], deficit: usize) -> usize {
+    let mut sum = 0usize;
+    for (i, s) in run.iter().enumerate() {
+        sum = sum.saturating_add(s.bytes);
+        if sum >= deficit {
+            return i + 1;
+        }
+    }
+    run.len()
+}
+
+/// `a` のほうが冷たい (同着は小さい・id 列が小さい) か。
+fn cooler(a: &EvictPlan, b: &EvictPlan) -> bool {
+    (a.last_use, a.bytes, &a.ids) < (b.last_use, b.bytes, &b.ids)
 }
 
 #[cfg(test)]
@@ -539,22 +652,151 @@ mod tests {
         assert!(s.alloc(0, |_| Ok(1u32)).is_err());
     }
 
-    /// task 248: 丸ごと空けるチャンクは「古い順」に必要量まで選ぶ。
+    /// task 256: 連続した空きを検査するための偽デバイス (MiB 単位)。
+    ///
+    /// `cuMemAlloc` は「連続した空き」しか返せないので、チャンクを丸ごと
+    /// 空けたあとに本当に連続領域ができるかを、アドレスを持つ偽デバイスで見る。
+    struct FakeDev {
+        total: usize,
+        /// (先頭, 長さ) MiB。確保済みの区間だけを持つ。
+        used: Vec<(usize, usize)>,
+    }
+
+    impl FakeDev {
+        fn new(total: usize) -> Self {
+            Self {
+                total,
+                used: Vec::new(),
+            }
+        }
+
+        /// 先頭から最初に収まる隙間へ置く (first fit)。置けなければ `None`。
+        fn alloc(&mut self, bytes: usize) -> Option<usize> {
+            let mut segs = self.used.clone();
+            segs.sort_unstable();
+            let mut start = 0usize;
+            for (s, l) in segs {
+                if s.saturating_sub(start) >= bytes {
+                    break;
+                }
+                start = start.max(s.saturating_add(l));
+            }
+            if start.saturating_add(bytes) > self.total {
+                return None;
+            }
+            self.used.push((start, bytes));
+            Some(start)
+        }
+
+        fn free(&mut self, start: usize) {
+            self.used.retain(|(s, _)| *s != start);
+        }
+
+        fn free_bytes(&self) -> usize {
+            self.total
+                .saturating_sub(self.used.iter().map(|(_, l)| *l).sum::<usize>())
+        }
+
+        /// 連続した `bytes` MiB の空きがあるか。
+        fn can_alloc_contig(&self, bytes: usize) -> bool {
+            if bytes > self.free_bytes() {
+                return false;
+            }
+            let mut segs = self.used.clone();
+            segs.sort_unstable();
+            let mut start = 0usize;
+            for (s, l) in segs {
+                if s.saturating_sub(start) >= bytes {
+                    return true;
+                }
+                start = start.max(s.saturating_add(l));
+            }
+            self.total.saturating_sub(start) >= bytes
+        }
+    }
+
+    /// task 256: チャンクを丸ごと空けると「連続した N MiB」ができる。
+    ///
+    /// 追い出すのは run (アドレスが連続するチャンク列) の中の窓だけ。
+    /// 追い出した量は不足分 + 1 チャンク未満に収まる。
     #[test]
-    fn chunks_to_empty_picks_oldest_until_enough() {
+    fn plan_eviction_creates_a_contiguous_range() {
         let mib = 1usize << 20;
-        let chunks = vec![(10usize, 256 * mib, 5u64), (11, 256 * mib, 1), (12, 256 * mib, 9)];
-        // 1505 MiB には 6 本要るが、ここは 3 本しかない → 全部 (古い順)。
-        assert_eq!(chunks_to_empty(&chunks, 1505 * mib), vec![11, 10, 12]);
-        // 300 MiB なら 2 本 (古い 11, 10)。
-        assert_eq!(chunks_to_empty(&chunks, 300 * mib), vec![11, 10]);
-        // 1 バイトでも 1 本。
-        assert_eq!(chunks_to_empty(&chunks, 1), vec![11]);
-        // 0 は何も選ばない。
-        assert!(chunks_to_empty(&chunks, 0).is_empty());
-        // 同着は id 昇順 (決定的)。
-        let tie = vec![(3usize, 16usize, 7u64), (2, 16, 7)];
-        assert_eq!(chunks_to_empty(&tie, 32), vec![2, 3]);
+        let chunk = 256usize;
+        // 2,816 MiB のカード: A 4 本 (0..1,024)、dense 1,280 (1,024..2,304)、
+        // B 2 本 (2,304..2,816)。空き 0。
+        let mut dev = FakeDev::new(2816);
+        let mut starts = Vec::new();
+        for _ in 0..4 {
+            starts.push(dev.alloc(chunk).expect("A"));
+        }
+        assert_eq!(dev.alloc(1280), Some(1024));
+        let b_starts: Vec<usize> = (0..2).map(|_| dev.alloc(chunk).expect("B")).collect();
+        assert_eq!(dev.free_bytes(), 0);
+
+        // A は冷たい (last_use 10..14)、B は熱い (100, 101)。
+        let mut spans: Vec<ChunkSpan> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ChunkSpan {
+                id: 100 + i,
+                addr: s * mib,
+                bytes: chunk * mib,
+                last_use: 10 + i as u64,
+            })
+            .collect();
+        spans.extend(b_starts.iter().enumerate().map(|(i, s)| ChunkSpan {
+            id: 200 + i,
+            addr: s * mib,
+            bytes: chunk * mib,
+            last_use: 100 + i as u64,
+        }));
+
+        // 600 MiB の確保: 不足分 600 → A の 3 本 (768 MiB)。
+        let plan = plan_eviction(&spans, dev.free_bytes() * mib, 600 * mib);
+        assert_eq!(plan.bytes, 768 * mib, "3 本で足りる: {plan:?}");
+        assert_eq!(plan.ids, vec![100, 101, 102], "冷たい A の先頭から: {plan:?}");
+        assert!(
+            plan.bytes < 600 * mib + chunk * mib,
+            "要求 + 1 チャンクを超えた: {plan:?}"
+        );
+        for (id, s) in plan.ids.iter().zip(starts.iter()) {
+            let _ = id;
+            dev.free(*s);
+        }
+        assert!(dev.can_alloc_contig(600), "連続 600 MiB が取れない");
+        assert!(!dev.can_alloc_contig(900), "空けすぎ (900 MiB も取れてしまう)");
+
+        // 空きが足りていれば 1 本も追い出さない。
+        assert_eq!(plan_eviction(&spans, 600 * mib, 600 * mib), EvictPlan::default());
+        // 0 バイトの要求でも追い出さない。
+        assert_eq!(plan_eviction(&spans, 0, 0), EvictPlan::default());
+    }
+
+    /// task 256: run が 2 つあるときは、より冷たい窓を選ぶ。
+    #[test]
+    fn plan_eviction_prefers_the_colder_run() {
+        let mib = 1usize << 20;
+        let span = |id: usize, addr_mib: usize, last_use: u64| ChunkSpan {
+            id,
+            addr: addr_mib * mib,
+            bytes: 256 * mib,
+            last_use,
+        };
+        // run1: 0, 256 (熱い 90, 91) / run2: 4,096, 4,352 (冷たい 1, 2)。
+        let spans = vec![
+            span(1, 0, 90),
+            span(2, 256, 91),
+            span(3, 4096, 1),
+            span(4, 4352, 2),
+        ];
+        let plan = plan_eviction(&spans, 0, 300 * mib);
+        assert_eq!(plan.ids, vec![3, 4], "冷たい run2: {plan:?}");
+        // run が 1 本ずつしかなくても、全体から冷たい順に選ぶ。
+        let apart = vec![span(1, 0, 90), span(2, 512, 5)];
+        let plan = plan_eviction(&apart, 0, 300 * mib);
+        assert_eq!(plan.ids, vec![2, 1], "全体の冷たい順: {plan:?}");
+        assert_eq!(plan.bytes, 512 * mib);
     }
 
     #[test]

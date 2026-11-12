@@ -3062,25 +3062,21 @@ pub fn alloc_keep_experts() -> bool {
     })
 }
 
-/// task 248: 確保 1 本が失敗したときに expert を追い出してよい上限 (バイト)。
+/// task 256: 確保 1 本が失敗したときに expert を追い出してよい上限 (バイト)。
 ///
-/// - expert タグ: 要求 + チャンク 1 本。slab はチャンクが空にならないと実メモリを
-///   返さないので、チャンク 1 本ぶんは動かせる余地を残す (2 MB の expert 1 本でも
-///   1 チャンクは空けないと実際には戻らない)。
-/// - それ以外で要求がチャンクの半分以上: 要求 + チャンク 1 本。
-/// - それ以外: 要求 + 64 MiB。
+/// slab はチャンクが空にならないと実メモリを返さないので、上限はタグに
+/// よらず **要求 + チャンク 1 本**。1 MiB の確保が 1 本通らないだけでも、
+/// 実メモリを戻すには 1 チャンクは空ける必要がある (`DENNO_EXPERT_SLAB_MB`)。
+/// 追い出し側 (`expert_slab::plan_eviction`) は不足分を超えたところで止まるので、
+/// 実際の追い出しはこの上限未満に収まる。
 ///
 /// `None` は「上限なし = 従来の階段」(gate off)。
-pub fn evict_cap_bytes(need: usize, tag: &'static str, chunk: usize, keep: bool) -> Option<usize> {
+pub fn evict_cap_bytes(need: usize, _tag: &'static str, chunk: usize, keep: bool) -> Option<usize> {
     if !keep {
         return None;
     }
     let chunk = chunk.max(1 << 20);
-    if tag == crate::mem_audit::TAG_EXPERTS || need >= chunk / 2 {
-        Some(need.saturating_add(chunk))
-    } else {
-        Some(need.saturating_add(64 << 20))
-    }
+    Some(need.saturating_add(chunk))
 }
 
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
@@ -3126,32 +3122,29 @@ impl DevBuffer {
                 // 32 MiB が 1 本通らないだけで全部追い出され、decode が
                 // 21 → 35 ms/tok になった。
                 //
-                // task 248: 階段の最後 (全部) を廃止する。1 本の確保のために
-                // expert の LRU を丸ごと捨てる経路を作らない (REPORT_P242 の
-                // 14k 層優先は 1,505 MiB の連続確保が通らず 39,755 MiB を全捨て
-                // した)。足りなければ Err を返し、呼び出し側が小さいタイル /
-                // CPU 経路へ落ちる。
-                if let Some(cap) = evict_cap_bytes(
+                // task 256: 追い出しは**チャンク単位**にする。slab はチャンクが
+                // 空にならないと実メモリを返さないので、LRU を 1 本ずつ追い出しても
+                // 連続した空きはできない (t253 の 32 MiB が 41,550 MiB の追い出しで
+                // も通らなかった)。不足分を満たす「アドレスが連続するチャンクの窓」を
+                // 冷たい順に選び、丸ごと空けてから 1 回だけ再試行する。
+                // 追い出す量は要求 + チャンク 1 本未満 (evict_cap_bytes)。
+                if evict_cap_bytes(
                     bytes,
                     tag,
                     crate::model::expert_slab::chunk_bytes(),
                     alloc_keep_experts(),
-                ) {
-                    let chunk = crate::model::expert_slab::chunk_bytes().max(1 << 20);
-                    let is_experts = tag == crate::mem_audit::TAG_EXPERTS;
-                    let freed = if !is_experts && bytes >= chunk / 2 {
-                        // slab はチャンクが空にならないと実メモリを返さない。
-                        // 大きな作業域はチャンクを丸ごと空けて返す。
-                        crate::model::expert_vram::emergency_free_chunks(bytes)
-                    } else {
-                        crate::model::expert_vram::emergency_free(cap)
-                    };
-                    if freed == 0 {
+                )
+                .is_some()
+                {
+                    let rep = crate::model::expert_vram::emergency_free_chunks(bytes);
+                    if rep.is_empty() {
+                        // 空けられない (LRU のロックが取れない / 空チャンクが作れない)
+                        // → 呼び出し側が小さいタイルか CPU 経路へ落ちる。
                         return Err(e);
                     }
                     tracing::warn!(
-                        "task248: 確保失敗 → expert を {} MiB 追い出して再試行 ({e:#})",
-                        freed >> 20
+                        "task256: 確保失敗 ({e:#}) → チャンク単位で追い出して再試行: {}",
+                        rep.line()
                     );
                     return match Self::raw_alloc(bytes) {
                         Ok(ptr) => {
@@ -35179,11 +35172,12 @@ mod tests {
         assert_eq!(*sat.last().unwrap(), usize::MAX);
     }
 
-    /// task 248: 1 本の確保で追い出してよい量の上限。
+    /// task 256: 1 本の確保で追い出してよい量の上限。
     ///
     /// 従来の階段は最後が「全部」で、1,505 MiB の作業域 1 本のために
-    /// 39,755 MiB の expert を捨てていた。ここでは
-    /// 「要求 + 64 MiB」(expert) / 「要求 + チャンク 1 本」(大きな作業域) に切る。
+    /// 39,755 MiB の expert を捨てていた。いまはタグによらず
+    /// 「要求 + チャンク 1 本」で切る (1 MiB の確保でも、実メモリを戻すには
+    /// 1 チャンクは空ける必要がある)。
     #[test]
     fn evict_cap_is_bounded_per_allocation() {
         let mib = 1usize << 20;
@@ -35192,13 +35186,12 @@ mod tests {
         let cap = evict_cap_bytes(1505 * mib, crate::mem_audit::TAG_OTHER, chunk, true);
         assert_eq!(cap, Some(1505 * mib + chunk), "作業域の上限: {cap:?}");
         assert!(cap.unwrap() < 2 * 1024 * mib, "22 GB を捨てる上限になっている");
-        // 小さな確保は要求 + 64 MiB。
+        // 小さな確保も同じ (チャンクを 1 本空けないと実メモリが戻らない)。
         assert_eq!(
             evict_cap_bytes(2 * mib, crate::mem_audit::TAG_OTHER, chunk, true),
-            Some(2 * mib + (64 << 20))
+            Some(2 * mib + chunk)
         );
-        // expert タグ (スラブのチャンク確保 256 MiB も含む) は要求 + チャンク。
-        // 2 MB の expert 1 本でも、実メモリを返すには 1 チャンク空ける必要がある。
+        // expert タグ (スラブのチャンク確保 256 MiB も含む) も要求 + チャンク。
         assert_eq!(
             evict_cap_bytes(chunk, crate::mem_audit::TAG_EXPERTS, chunk, true),
             Some(chunk + chunk)
@@ -35207,15 +35200,37 @@ mod tests {
             evict_cap_bytes(2 * mib, crate::mem_audit::TAG_EXPERTS, chunk, true),
             Some(2 * mib + chunk)
         );
-        // 小さな作業域は要求 + 64 MiB のまま。
         assert_eq!(
             evict_cap_bytes(2 * mib, crate::mem_audit::TAG_GROUPED, chunk, true),
-            Some(2 * mib + (64 << 20))
+            Some(2 * mib + chunk)
         );
         // gate off は従来 (上限なし = 階段の最後まで)。
         assert_eq!(
             evict_cap_bytes(1505 * mib, crate::mem_audit::TAG_OTHER, chunk, false),
             None
+        );
+        // 選び方 (plan_eviction) もこの上限未満で止まる。
+        let spans = vec![
+            crate::model::expert_slab::ChunkSpan {
+                id: 1,
+                addr: 0,
+                bytes: chunk,
+                last_use: 1,
+            },
+            crate::model::expert_slab::ChunkSpan {
+                id: 2,
+                addr: chunk,
+                bytes: chunk,
+                last_use: 2,
+            },
+        ];
+        let plan = crate::model::expert_slab::plan_eviction(&spans, 0, 2 * mib);
+        assert_eq!(plan.ids, vec![1], "1 本で足りる: {plan:?}");
+        assert!(
+            plan.bytes < cap.unwrap(),
+            "上限を超えた: {} >= {}",
+            plan.bytes,
+            cap.unwrap()
         );
     }
 

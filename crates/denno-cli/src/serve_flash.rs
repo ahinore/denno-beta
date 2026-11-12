@@ -916,6 +916,12 @@ impl Flash {
         // task 248: prefill の間だけ確保の台帳のピークを控える
         // (`DENNO_Q4_PROFILE` が無ければ guard は何もしない)。
         let _peak = denno_engine::mem_audit::peak_window("prefill");
+        // task 256: prefill の作業域を先に予約する (`DENNO_PREFILL_WORK_MB`、
+        // 既定 0 = 何もしない)。空きが足りなければチャンクを丸ごと空けて場所を作り、
+        // 終わったら release する (解放したチャンクは通常の LRU が埋め直す)。
+        let _work = denno_engine::model::expert_vram::reserve_work_area(
+            denno_engine::model::expert_vram::prefill_work_bytes(),
+        );
         if !self.tap_on() {
             return Ok(dec.prefill_batched(prompt, self.batch)?);
         }
