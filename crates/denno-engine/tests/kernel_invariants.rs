@@ -10019,6 +10019,175 @@ fn steer_ptx_matches_the_host_launch_abi() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// task 242: 層優先 prefill の作業域をグループ局所にし、追い出した expert を戻す
+// ---------------------------------------------------------------------------
+
+/// task 242: 14k で 0.86 GB あった g/u/act をグループ 1 個ぶんに縮め、
+/// 作業域のために追い出した expert を prefill の終端で戻す、という 2 点が
+/// 実際に配線されていること (値は lab の担当)。
+#[test]
+fn t242_lm_work_area_is_group_local_and_experts_come_back() {
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    // 1. 追い出すときに鍵を控える (控えないと戻せない)。
+    assert!(
+        lm.contains("crate::model::expert_vram::emergency_free_keys("),
+        "層優先が emergency_free_keys を使っていない (鍵を控えていない)"
+    );
+    assert!(
+        !lm.contains("crate::model::expert_vram::emergency_free("),
+        "層優先が鍵を返さない emergency_free をまだ使っている"
+    );
+    assert!(
+        lm.contains("pf_restore_experts(&self.layers, &evicted)"),
+        "追い出した expert を戻す呼び出しが無い"
+    );
+    // 2. 追い出しの見積りが g/u/act の全体サイズでなくなっている
+    //    (14k で 3 * rows * ff * 4 をそのまま引くと 0.86 GB を空けすぎる)。
+    assert!(
+        !lm.contains("3 * rows * ff * 4"),
+        "g/u/act を全体サイズで見積もっている (グループ局所になっていない)"
+    );
+    assert!(
+        lm.contains("crate::model::exp_pf::lm_group_local()"),
+        "ゲート lm_group_local を読んでいない"
+    );
+    assert!(
+        lm.contains("crate::model::exp_pf::lm_reload_evicted()"),
+        "ゲート lm_reload_evicted を読んでいない"
+    );
+    // 3. ストリーミングはグループ局所のときだけ行の添字を 0 起点にする。
+    let io = fn_body(CUDA_RS, "fn moe_experts_iq_pf_layer_stream_io(");
+    assert!(
+        io.contains("exp_pf::max_group_rows(seg, &bounds)"),
+        "作業域の行数をグループの最大行数から取っていない"
+    );
+    for k in [
+        "let gl = is_dev && exp_pf::lm_group_local();",
+        "exp_pf::seg_group_local(seg, &bounds)",
+        "seg_gl.as_deref().unwrap_or(seg)",
+        "let (ro_start, ro_end) = if gl {",
+        "rg + (abs_start as u64) * 4",
+    ] {
+        assert!(io.contains(k), "ストリーミングに {k} が無い");
+    }
+    // down の入力 (`act`) はグループ局所なので、その行表 (identity) は
+    // 先頭行を足してはいけない (lab t242a はこれを足して error 700 になった)。
+    let io_body = &io;
+    assert!(
+        !io_body.contains("rid + (abs_start"),
+        "down の行表をグループ先頭行だけ足している (act が局所なので範囲外を読む)"
+    );
+    // ポインタを負へずらす形 (端数のアドレスで wrap しうる) は使わない。
+    assert!(
+        !io.contains("wrapping_sub("),
+        "グループ局所をポインタの引き算でやっている (下位アドレスで wrap する)"
+    );
+    // 4. ホスト出力 (チャンク経路) は従来どおり全体サイズのまま。
+    assert!(
+        io.contains("} else {\n                total_rows\n            };"),
+        "グループ局所でないときの全体サイズへの落とし方が変わっている"
+    );
+    // 5. 戻す経路はラッチしない acquire_soft を使う (失敗しても decode を殺さない)。
+    let restore = fn_body(QWEN_SRC, "fn pf_restore_experts(");
+    assert!(
+        restore.contains("expert_vram::acquire_soft("),
+        "戻す経路が acquire_soft でない (確保失敗で CPU に張り付く)"
+    );
+    assert!(
+        !restore.contains("expert_vram::acquire("),
+        "戻す経路がラッチする acquire を使っている"
+    );
+    // 6. 純関数と env ゲートが exp_pf にある。
+    for k in [
+        "pub fn max_group_rows(",
+        "pub fn seg_group_local(",
+        "pub fn lm_group_local(",
+        "pub fn lm_reload_evicted(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 233: 層優先 prefill のデバイス MoE (活性をホストへ戻さない)
+// ---------------------------------------------------------------------------
+
+const EXP_PF_SRC: &str = include_str!("../src/model/exp_pf.rs");
+
+/// task 233: 層優先 (デバイス) 経路でもステアリングの点がチャンク経路と同じこと。
+///
+/// 層の入口で `pf_steer_apply` → mix → attn → combine → mix → MoE → combine →
+/// `pf_steer_acc`。層優先は ffn の combine が `pf_combine_at` (デバイスの MoE
+/// 出力) になるだけで、点は動かない。
+#[test]
+fn t233_lm_steer_points_match_chunk_path() {
+    let chunk = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident(");
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    for (name, body) in [("chunk", chunk), ("lm", lm)] {
+        let p_apply = body
+            .find("crate::cuda::pf_steer_apply(")
+            .unwrap_or_else(|| panic!("{name}: 層入口の適用が無い"));
+        let p_mix = body
+            .find("crate::cuda::pf_mix(")
+            .unwrap_or_else(|| panic!("{name}: mix が無い"));
+        let p_acc = body
+            .find("crate::cuda::pf_steer_acc(")
+            .unwrap_or_else(|| panic!("{name}: 出口の記録が無い"));
+        assert!(p_apply < p_mix, "{name}: 適用が mix より後ろにある");
+        assert!(p_mix < p_acc, "{name}: 記録が mix より前にある");
+    }
+    // 層優先は MoE の出力 (デバイス) をそのまま combine する。
+    let p_at = lm
+        .find("crate::cuda::pf_combine_at(")
+        .expect("層優先が pf_combine_at を使っていない");
+    let p_acc = lm.find("crate::cuda::pf_steer_acc(").expect("acc が無い");
+    assert!(p_at < p_acc, "層優先: combine が記録より後ろにある");
+    // mixed の D2H は attention の入口 (CPU が読む) の 1 回だけ。ffn の入口は
+    // 置き場へ D2D で写す (MoE の入力はホストへ戻さない)。
+    assert_eq!(
+        lm.matches("crate::cuda::pf_take_mixed(").count(),
+        1,
+        "層優先が mixed を 2 回以上ホストへ戻している"
+    );
+    let p_take = lm
+        .find("crate::cuda::pf_take_mixed(")
+        .expect("attn 入口の D2H が無い");
+    let p_park = lm
+        .find("crate::cuda::pf_lm_park_mixed(")
+        .expect("層優先が mixed を置き場へ写していない");
+    assert!(
+        p_take < p_park,
+        "ffn の入口が置き場へ写していない (attn の D2H だけを許す)"
+    );
+    assert!(
+        lm.contains("crate::cuda::pf_lm_inj_save(") && lm.contains("crate::cuda::pf_lm_inj_load("),
+        "inject の退避 / 復帰が無い (task 227 は最後のチャンクの inject を全チャンクに使った)"
+    );
+    // デバイス MoE の入口と、その入力 / 出力が置き場から来ること。
+    // task 250: トークンタイル (`DENNO_PF_LM_TILE`) で `tok0` 行目から `nt` 行を
+    // 受けるので、mixed の先頭はタイルの先頭、ffn の置き場は全行のまま (出力は
+    // `tok0 * e * 4` だけずらす)。
+    for k in [
+        "fn moe_ffn_quant_batch_lm_dev(",
+        "crate::cuda::pf_lm_mixed_ptr(tok0, nt_all, e)",
+        "crate::cuda::pf_lm_ffn_ptr(nt_all, e)",
+        "let out_dev = out_base + (tok0 * e * 4) as u64;",
+        "crate::cuda::pf_shared_dev_to(",
+        "crate::cuda::moe_experts_iq_pf_layer_stream_dev(",
+        "crate::cuda::pf_combine_at(",
+        "pub fn pf_lm_ensure(",
+        "pub fn pf_scratch_drop(",
+        "pub fn row_table_with_shared(",
+    ] {
+        assert!(
+            QWEN_SRC.contains(k) || CUDA_RS.contains(k) || EXP_PF_SRC.contains(k),
+            "どこにも {k} が無い"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // task 228: GDN スキャン WY (UT) 形式チャンク版 (kernels_gdn_pf_wy.cu)
 // ---------------------------------------------------------------------------
 

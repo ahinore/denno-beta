@@ -207,6 +207,320 @@ pub const PF_CHUNK_ENV: &str = "DENNO_PF_CHUNK";
 /// [`PF_CHUNK_ENV`] の既定 (ストリーミング経路のとき)。lab t197a の最良。
 pub const DEFAULT_PF_CHUNK_STREAM: usize = 1536;
 
+/// `DENNO_PF_CHUNK_BALANCE`: チャンクをプロンプト長の**均等割り**で選ぶ (task 239)。
+///
+/// ミス expert は**チャンクごとに上げ直す**ので、転送量はほぼ
+/// 「チャンク数 × 1 チャンクあたりの distinct expert 数」に比例する。
+/// 既定は固定 1536 なので、3,222 トークンのプロンプトは 3 チャンクになり、
+/// 3 回とも同じ expert を上げる (lab t239b の c8869: 3 チャンクで 17,510 本 /
+/// 35.8 GB、c2000: 3 チャンクで 23,732 本 / 48.6 GB)。
+///
+/// on のとき「上限 [`CHUNK_BALANCE_CAP`] の下でチャンク数を最小にする」長さ
+/// (= プロンプト長 / チャンク数 の切り上げ) を使う。3,222 なら 1,611 × 2 枚。
+/// 1 枚の長さが上限を超えないので、GDN のデバイス連鎖の境界 (2048) は踏まない。
+pub const CHUNK_BALANCE_ENV: &str = "DENNO_PF_CHUNK_BALANCE";
+
+/// [`CHUNK_BALANCE_ENV`] の既定 (off = 従来の固定 1536)。
+///
+/// lab t239d (tools、c8869=3,222 tok / c2000=3,826 tok、base/bal/base2/bal2/bal3):
+///
+/// | cond | c8869 cold | c2000 cold | c8869 decode |
+/// | --- | --- | --- | --- |
+/// | base2 (基準) | 6.07 s | 7.13 s | 18.2 ms/tok |
+/// | bal/bal2/bal3 | **5.53 s** | 6.91 s | 18.5-18.6 ms/tok |
+///
+/// prefill は -8.9% (c8869) / -3.1% (c2000) だが、c8869 の decode が +2%、
+/// その機序は expert のヒット率 0.929 → 0.912 (最後のチャンクが LRU に残す
+/// 集合が変わる)。目標の「decode は 1% 以内」を超えるので**既定 off**。
+///
+/// task 246 で 2 回測り直した (br239 を int-auto 1d36583f6 に載せ、ゲートは既定 off)。
+/// t246a (5 COND: x0/base/bal/reseed/base2) と t246c (3 COND: x0/reseed/base2):
+///
+/// | cond | c8869 cold prefill | c2000 cold | c8869 cold decode | c8869 turn2 decode |
+/// | --- | --- | --- | --- | --- |
+/// | base / base2 | 6.35 / 6.01 s | 7.06 / 7.08 s | 18.8 / 18.7 | 19.6 / 19.5 |
+/// | bal (balance のみ) | **5.46 s** | 6.87 s | 20.0 | 19.0 |
+/// | reseed (balance + DEC_RESEED) | **5.47 / 5.48 s** | 6.84 / 6.82 s | 19.8 / 19.8 | 19.2 / 19.1 |
+///
+/// prefill は -9.0% (c8869) / -3.3% (c2000) で目標を満たすが、**c8869 cold の直後の
+/// decode だけ +5.8%** が 2 run で再現する (turn2 の decode は -3% と逆)。
+/// 機序は t239d のヒット率ではない: 同じ run の `[exp-iq]` は base も bal も
+/// `lookups=46560 hits=42349 hit_rate=0.910 uploads=876` で**完全に一致**する。
+/// 候補は生成列が変わることによる page cache (PLE 表で 1 回 216 ms の跳ねを観測)。
+/// 目標 (decode +1% 以内) を満たさないので既定 off のまま。
+pub const DEFAULT_CHUNK_BALANCE: bool = false;
+
+/// 均等割りの 1 チャンク上限 (GDN 連鎖の境界 `GDN_CHUNK_MIN_TOKENS` = 2048 の手前)。
+pub const CHUNK_BALANCE_CAP: usize = 2047;
+
+/// [`CHUNK_BALANCE_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn chunk_balance_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_CHUNK_BALANCE,
+    }
+}
+
+/// 均等割りのチャンクを選ぶ (純関数)。
+///
+/// - `n <= base` なら 1 チャンク (`n`)。
+/// - それ以外は「`cap` で割ったときのチャンク数」を保ったまま均等に割る
+///   (端数の小さい最後の 1 枚を作らない)。
+pub fn balanced_chunk(n: usize, base: usize, cap: usize) -> usize {
+    let base = base.max(1);
+    let cap = cap.max(1);
+    if n == 0 || n <= base {
+        return n.max(1).min(base);
+    }
+    let nch = n.div_ceil(cap);
+    n.div_ceil(nch).clamp(1, cap)
+}
+
+/// この prefill のチャンク長 (純関数)。
+///
+/// 均等割りは「ストリーミング経路」「`DENNO_PF_CHUNK_BALANCE` が on」
+/// 「`DENNO_PF_CHUNK` の**明示**指定が無い」の 3 つが揃ったときだけ効く。
+/// 長いプロンプト (2 枚を超える) まで広げるのは `long_on`
+/// ([`CHUNK_BALANCE_LONG_ENV`]) が on のときだけ (task 246 で追加)。
+///
+/// **`chunk_override()` で判定してはいけない**: あれは未設定のとき
+/// `Some(DEFAULT_PF_CHUNK_STREAM)` を返すので、常に「明示指定あり」に見えて
+/// ゲートが一度も発火しない (lab t239c で実際に踏んだ)。明示判定は
+/// [`chunk_override_from_value`] に生の env を渡して行う。
+pub fn chunk_for_prefill(
+    n: usize,
+    base: usize,
+    cap: usize,
+    balance_on: bool,
+    long_on: bool,
+    stream_on: bool,
+    explicit_override: bool,
+) -> usize {
+    let cap = cap.max(1);
+    if !balance_on || !stream_on || explicit_override {
+        return base.max(1);
+    }
+    // 2 枚以内は task 239 の範囲。それを超える長さは long ゲートが要る。
+    if n > cap.saturating_mul(2) && !long_on {
+        return base.max(1);
+    }
+    balanced_chunk(n, base, cap)
+}
+
+
+/// 均等割りを使うか (プロセスで 1 回だけ env を読む)。
+pub fn chunk_balance() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| chunk_balance_from_value(std::env::var(CHUNK_BALANCE_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_CHUNK_BALANCE_LONG`: 均等割りを 2 枚を超える長さ (14k など) まで
+/// 広げる (task 246)。
+///
+/// 3,222 トークンは 1,611 × 2 枚で済むが、14,018 は 1,536 固定だと 10 枚
+/// (9 × 1,536 + 194) になり、同じ expert を 10 回上げる。上限
+/// [`CHUNK_BALANCE_CAP`] (2,047) の下で枚数を最小にすると 2,003 × 7 枚になり、
+/// 転送量が約 3 割減る見込み (推定)。
+///
+/// 既定は off (第 1 ラウンドの lab で測ってから決める)。
+pub const CHUNK_BALANCE_LONG_ENV: &str = "DENNO_PF_CHUNK_BALANCE_LONG";
+
+/// [`CHUNK_BALANCE_LONG_ENV`] の既定 (off = 従来の固定 1,536)。
+///
+/// lab t246b (depth8k、int-auto 1d36583f6 + br239、x0/base/lbal/lbal2/base2):
+///
+/// | cond | c8000 cold (14,018 tok) | 転送 up_MB | copy_s | c8000 cold decode | c2000 cold |
+/// | --- | --- | --- | --- | --- | --- |
+/// | base / base2 | 25.11 / 25.11 s | 151,898 | 5.89 | 18.4 / 18.4 | 7.07 / 7.09 s |
+/// | lbal | 24.41 s | 122,068 | 4.80 | 18.9 | 6.80 s |
+/// | lbal2 | 24.33 s | 122,068 | 4.74 | 18.3 | 6.80 s |
+///
+/// チャンクは 10 枚 (9 枚ストリーム + 194 トークンの従来経路) から 2,003 × 7 枚へ。
+/// 転送は -20%、copy は -1.1 s だが**壁時計は -2.9%** にとどまる (14k の prefill は
+/// 転送よりホスト側の計算が支配的で、7 枚が上限 = GDN 連鎖の境界 2,048 の手前)。
+/// 目標の -5% に届かないので**既定 off**。
+pub const DEFAULT_CHUNK_BALANCE_LONG: bool = false;
+
+/// [`CHUNK_BALANCE_LONG_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn chunk_balance_long_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_CHUNK_BALANCE_LONG,
+    }
+}
+
+/// 長いプロンプトまで均等割りするか (プロセスで 1 回だけ env を読む)。
+pub fn chunk_balance_long() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        chunk_balance_long_from_value(std::env::var(CHUNK_BALANCE_LONG_ENV).ok().as_deref())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// task 246: prefill 終端で decode の作業集合を LRU の先頭へ寄せる
+// ---------------------------------------------------------------------------
+//
+// 機序 (REPORT_P239): 固定 1,536 で切ると 3,222 トークンの末尾が 150 トークン
+// (< `stream_min_tok` = 512) になり、その 1 枚だけ**従来経路**へ落ちる。従来経路は
+// 1 トークンずつ `moe_ffn_quant` を通るので、ヒットした expert を `acquire` で
+// 触る (= LRU の先頭へ寄せる)。均等割りで 2 枚にすると全チャンクがストリーミング
+// 経路 (peek のみ = **LRU を触らない**) になり、末尾の温めが消える。これが
+// c8869 の decode ヒット率 0.929 → 0.912 / decode +2% の正体。
+//
+// 対策は H2D を伴わない「触り直し」: 最後のチャンクの末尾 `TOK` トークンが選んだ
+// expert を、**トークン順 → 層順 → j 順**に `touch_many` する。これは従来経路が
+// やっていたことと同じ順序で、載っていない鍵は黙って飛ばす (アップロードしない)。
+// `TOK` は従来経路に落ちていた末尾チャンクの長さ (c8869 で 150、14k で 194) を
+// 覆う 256 を既定にする。
+
+/// `DENNO_PF_DEC_RESEED`: prefill の終端で末尾トークンの expert を LRU の先頭へ
+/// 寄せ直す (task 246、H2D なし)。
+pub const DEC_RESEED_ENV: &str = "DENNO_PF_DEC_RESEED";
+
+/// [`DEC_RESEED_ENV`] の既定 (off)。
+///
+/// lab t246a / t246c (tools) の実測: 発火はする (`[pf-reseed] tok=256 keys=122880
+/// resident=89844 (73.1%) in 1.84ms`、`[pf-reseed] tok=19 ... in 0.25ms` = 短い
+/// prefill でも末尾 19 トークンぶん)。decode のヒット率は 0.910 → 0.913 (+0.3 pp)
+/// で、COND 全体の decode 中央値は 20.3 → 20.3 (変化なし)。
+/// **c8869 cold の直後の decode +5.8% は消えない** (bal 20.0 / reseed 19.8 /
+/// base 18.8) ので、目標 (decode +1% 以内) は満たさない。既定 off。
+pub const DEFAULT_DEC_RESEED: bool = false;
+
+/// `DENNO_PF_DEC_RESEED_TOK`: 何トークンぶんを寄せ直すか (既定 256)。
+pub const DEC_RESEED_TOK_ENV: &str = "DENNO_PF_DEC_RESEED_TOK";
+
+/// [`DEC_RESEED_TOK_ENV`] の既定。
+pub const DEFAULT_DEC_RESEED_TOK: usize = 256;
+
+/// [`DEC_RESEED_TOK_ENV`] の上限 (これを超える指定は丸める)。
+pub const DEC_RESEED_TOK_MAX: usize = 4096;
+
+/// [`DEC_RESEED_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn dec_reseed_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_DEC_RESEED,
+    }
+}
+
+/// 寄せ直しを使うか (プロセスで 1 回だけ env を読む)。
+pub fn dec_reseed_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dec_reseed_from_value(std::env::var(DEC_RESEED_ENV).ok().as_deref()))
+}
+
+/// [`DEC_RESEED_TOK_ENV`] の解釈 (純関数)。0 と解析不能は既定。
+pub fn dec_reseed_tok_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n > 0 => n.min(DEC_RESEED_TOK_MAX),
+        _ => DEFAULT_DEC_RESEED_TOK,
+    }
+}
+
+/// 寄せ直すトークン数 (プロセスで 1 回だけ env を読む)。
+pub fn dec_reseed_tok() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| dec_reseed_tok_from_value(std::env::var(DEC_RESEED_TOK_ENV).ok().as_deref()))
+}
+
+/// 末尾トークンの選択を控える器。
+///
+/// `per_layer[layer]` は「層 `layer` の末尾 `tok` トークン × k 本」を
+/// **トークン昇順 → j 昇順**で平らに持つ (先頭が `nt - tok` 番目のトークン)。
+#[derive(Default)]
+struct DecHot {
+    /// 最後に観測したチャンクのトークン数 (層 0 で更新)。
+    nt: usize,
+    /// 1 トークンあたりの選択数 (層で同じ)。
+    k: usize,
+    /// 控えた末尾トークン数。
+    tok: usize,
+    /// 層 → 末尾トークンの選択 (平ら)。
+    per_layer: Vec<Vec<u16>>,
+}
+
+thread_local! {
+    static DEC_HOT: std::cell::RefCell<DecHot> = std::cell::RefCell::new(DecHot::default());
+}
+
+/// 1 層ぶんの選択を控える本体 (純粋・テスト可能)。
+///
+/// 層 0 がチャンクの先頭 (このエンジンは層を 0 から順に回す)。チャンクが
+/// 変わると前のチャンクの内容は捨てるので、prefill が終わった時点では
+/// **最後のチャンク**の末尾トークンだけが残る。
+fn note_tail_into(h: &mut DecHot, layer: usize, nt: usize, k: usize, sels: &[usize], tok: usize) {
+    if nt == 0 || k == 0 || tok == 0 || sels.len() != nt * k {
+        return;
+    }
+    if layer == 0 || h.nt != nt || h.k != k {
+        if layer != 0 {
+            // 層によってチャンク長が違うのは想定外 (控えない方が安全)。
+            return;
+        }
+        h.nt = nt;
+        h.k = k;
+        h.tok = tok.min(nt);
+        h.per_layer.clear();
+    }
+    if h.tok != tok.min(nt) || h.k != k {
+        return;
+    }
+    if h.per_layer.len() <= layer {
+        h.per_layer.resize_with(layer + 1, Vec::new);
+    }
+    let lo = nt - h.tok;
+    let row = &mut h.per_layer[layer];
+    row.clear();
+    row.extend(sels[lo * k..].iter().map(|&e| e as u16));
+}
+
+/// 1 層ぶんの選択を控える (`sels` は `nt * k` の平らな配列、行はトークン昇順)。
+pub fn note_tail_selection(layer: usize, nt: usize, k: usize, sels: &[usize]) {
+    if !dec_reseed_on() {
+        return;
+    }
+    let tok = dec_reseed_tok();
+    DEC_HOT.with(|c| note_tail_into(&mut c.borrow_mut(), layer, nt, k, sels, tok));
+}
+
+/// 控えた選択を「触る順」で取り出す本体 (純粋・テスト可能)。取り出したら消す。
+///
+/// 順序は従来経路 (1 トークンずつ回す経路) と同じ
+/// 「トークン昇順 → 層昇順 → j 昇順」。`touch_many` は渡した順に新しくするので、
+/// 最後のトークンの選択が一番「最近使った」になる。
+fn take_dec_hot_from(h: &mut DecHot, tok: usize) -> (Vec<(u16, u16)>, usize) {
+    let (ntok, k) = (h.tok.min(tok), h.k);
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    if ntok > 0 && k > 0 {
+        out.reserve(ntok * k * h.per_layer.len());
+        for t in 0..ntok {
+            for (layer, row) in h.per_layer.iter().enumerate() {
+                if row.len() != ntok * k {
+                    continue;
+                }
+                for j in 0..k {
+                    out.push((layer as u16, row[t * k + j]));
+                }
+            }
+        }
+    }
+    *h = DecHot::default();
+    (out, ntok)
+}
+
+/// 控えた選択を「触る順」で取り出す (**取り出したら消す**)。ゲート off なら空。
+///
+/// 戻り値は `(keys, 末尾トークン数)`。
+pub fn take_dec_hot_keys() -> (Vec<(u16, u16)>, usize) {
+    if !dec_reseed_on() {
+        return (Vec::new(), 0);
+    }
+    let tok = dec_reseed_tok();
+    DEC_HOT.with(|c| take_dec_hot_from(&mut c.borrow_mut(), tok))
+}
+
 /// [`PF_CHUNK_ENV`] の解釈 (純関数)。0・空・偽値・解析不能は `None` (= 上書きしない)。
 pub fn chunk_override_from_value(v: Option<&str>) -> Option<usize> {
     let s = v?.trim();
@@ -297,6 +611,37 @@ pub const DEFAULT_STREAM_UT: bool = false;
 /// lab t165b: グループ 64 で 14k cold が 100.01 s (wc=0) → 95.06 s (wc=1)、
 /// probe 27.3 → 53.5 GB/s。t165c でも 95.31 s で再現。
 pub const DEFAULT_STREAM_WC: bool = true;
+
+/// `DENNO_PF_STREAM_SPLIT`: ステージングの写しと H2D を何分割して重ねるか (task 239)。
+///
+/// 従来 (1) は「グループ全体を pinned へ写す → 非同期 H2D を 1 回積む → 完了を待つ」
+/// なので、**写しと DMA が直列**になる。lab t239a の c8869 cold では
+/// up_MB=35,799 に対して copy_s=1.39、probe_GBs=54.6 (DMA 0.66 s) で、
+/// この 2.05 s が prefill 6.02 s の 34% を占めていた。
+///
+/// n 分割すると DMA(i) が写し(i+1) と重なる (DMA は非ブロッキングストリーム上)。
+/// 端数は最後の 1 枚へ寄せるので、デバイスへ渡るバイト列は 1 分割と同一 (数値不変)。
+pub const STREAM_SPLIT_ENV: &str = "DENNO_PF_STREAM_SPLIT";
+
+/// [`STREAM_SPLIT_ENV`] の既定値 (1 = 従来の 1 回写し + 1 回 DMA)。
+pub const DEFAULT_STREAM_SPLIT: usize = 1;
+
+/// [`STREAM_SPLIT_ENV`] の解釈 (純関数)。0・解析不能は既定へ、上限 16。
+pub fn stream_split_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_STREAM_SPLIT;
+    };
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => n.clamp(1, 16),
+        _ => DEFAULT_STREAM_SPLIT,
+    }
+}
+
+/// 写し / H2D の分割数 (プロセスで 1 回だけ env を読む)。
+pub fn stream_split() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| stream_split_from_value(std::env::var(STREAM_SPLIT_ENV).ok().as_deref()))
+}
 
 /// 1 回の起動で受ける行数 (`kernels_exp_iq_pf.cu` の `PF_MR`)。
 pub const ROWS_PER_LAUNCH: usize = 16;
@@ -467,6 +812,266 @@ pub fn stream_wc() -> bool {
             std::env::var(STREAM_WC_ENV).ok().as_deref(),
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// task 227: 転送 (写し + DMA) の詰まりを取るための 3 本
+// ---------------------------------------------------------------------------
+//
+// 台帳 (REPORT_P226 §2) では 14k の転送 14.76 s のうち写しが 5.90 s、
+// H2D のブロックが 8.85 s。どちらも同じホストメモリ帯域を食い、しかも
+// **1 グループ = 「全部写す → 1 回 DMA → 待つ」の直列**なので、
+// バイトを減らしても時間が動かなかった。以下は独立に切り替えられる。
+
+/// `DENNO_PF_STREAM_CHUNK_KB`: バウンスと DMA を何 KB ずつ交互に流すか
+/// (0 = 従来どおりグループ全体を 1 回で写して 1 回で DMA)。
+///
+/// 小さく刻むと、DMA が読むバイトが L3 (16 MB) / L2 に残っている間に
+/// 流せる可能性がある (推定。lab で測る)。値は 64 KiB..65536 KiB に丸める。
+pub const STREAM_CHUNK_KB_ENV: &str = "DENNO_PF_STREAM_CHUNK_KB";
+
+/// [`STREAM_CHUNK_KB_ENV`] の既定値 (0 = 従来の直列)。
+pub const DEFAULT_STREAM_CHUNK_KB: usize = 0;
+
+/// 1 回に流すバイト数 (0 = 従来経路)。
+pub fn stream_chunk_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let kb = env_usize(STREAM_CHUNK_KB_ENV, DEFAULT_STREAM_CHUNK_KB);
+        if kb == 0 {
+            return 0;
+        }
+        kb.clamp(64, 65536) << 10
+    })
+}
+
+/// `DENNO_PF_STREAM_SRC`: DMA の転送元。
+///
+/// - `pin` (既定): mmap → WC pinned のバウンスを挟む (task 162 の経路)
+/// - `page`: mmap のページをそのまま pageable として DMA する (写しを消す。
+///   driver が内部でバウンスする。ホスト側は呼び出しの間ブロックする)
+/// - `reg`: mmap のページを `cuMemHostRegister` で pin して直接 DMA する
+///   (写しを消し、DMA も pinned 速度。driver が file backed を拒否したら
+///   スライス単位で `page` へ落ちる)
+pub const STREAM_SRC_ENV: &str = "DENNO_PF_STREAM_SRC";
+
+/// [`STREAM_SRC_ENV`] の既定値 (0 = pin バウンス)。
+pub const DEFAULT_STREAM_SRC: u8 = 0;
+
+/// 転送元の解釈 (純関数)。未知の値は既定 (pin) に落とす。
+pub fn stream_src_from_value(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("page") => 1,
+        Some("reg") => 2,
+        _ => DEFAULT_STREAM_SRC,
+    }
+}
+
+/// 転送元 (`DENNO_PF_STREAM_SRC`、プロセスで 1 回だけ読む)。
+pub fn stream_src() -> u8 {
+    static N: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *N.get_or_init(|| stream_src_from_value(std::env::var(STREAM_SRC_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_REG_MB`: `DENNO_PF_STREAM_SRC=reg` で pin する上限 (MiB、既定 16384)。
+///
+/// pin したページはカーネルが回収できないので、モデル全体 (約 50 GB) を
+/// pin すると RAM が足りなくなる。上限を超えたぶんは pageable で積む。
+pub const REG_MB_ENV: &str = "DENNO_PF_REG_MB";
+
+/// [`REG_MB_ENV`] の既定値 (MiB)。
+pub const DEFAULT_REG_MB: usize = 16384;
+
+/// pin してよいバイト数。
+pub fn reg_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(REG_MB_ENV, DEFAULT_REG_MB).saturating_mul(1 << 20))
+}
+
+/// `DENNO_PF_TC_EXP=1`: prefill の expert グループを tensor core の grouped GEMM
+/// (`kernels_exp_iq_tc.cu`) で回す (task 250、既定 off)。
+///
+/// 現行の m 行 GEMV は 1 block = 8 出力行なので、1 expert あたりの活性読みが
+/// `n_out/8 × m × n_in × 4 B` になる。1 expert の重みは約 2 MB なので、
+/// 行数が多い (m = 300 前後) layer major では活性の再読みが重みを上回る
+/// (REPORT_P242)。新カーネルは 64 トークン × 64 行のタイルで受けるので、
+/// 活性の読みが 8 分の 1 になり、積は bf16 の mma (FP32 アキュムレート) で行う。
+///
+/// 数値は変わる (重みと活性を bf16 に丸める。丸めだけの差)。
+///
+/// # 実測 (task 250、lab t250a / t250c / t250d、`DENNO_PF_LM_LAYER=1` と併用)
+///
+/// 層優先の MoE をこのカーネルに替えると prefill は大きく縮む。
+/// 14k cold prefill は base の 25.1-26.4 s に対し **9.9 s (t250c)** /
+/// **15.0 s (t250d、`DENNO_PF_LM_TILE` でトークン分割)**、3,826 は 7.03 → 3.25 s。
+/// ところが 14k 後の decode が 18.4 → 32-52 ms/tok に落ちる。機序は作業域の
+/// 確保で、VRAM はすでに expert 22 GB + 重みで埋まっているため、1.3-1.5 GB の
+/// 連続確保が「空き 123 MiB」で失敗し、追い出し階段が expert を 33,497 MiB
+/// **全捨て** する (decode のヒット率 0.95 → 0.86、moe experts 573 → 1,679 ms)。
+/// `DENNO_PF_LM_RESERVE` / `DENNO_PF_LM_RELOAD` / トークン分割のどれでも
+/// 確保そのものは通らず (予約 2,186 MiB でも実空き 1,243 MiB)、**採らない**
+/// (`ADOPT: no` t250d)。ゲートは既定 off のまま残す。確保器が作業域のぶんを
+/// 実際に返せるようになるまで (task 248 の領域)、この経路は既定にしない。
+pub const TC_EXP_ENV: &str = "DENNO_PF_TC_EXP";
+
+/// [`TC_EXP_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn tc_exp_from_value(v: Option<&str>) -> bool {
+    // task 265 (2026-11-13, operator approved): default on; only an explicit
+    // false value (0 / off / false / no) turns it off.
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
+/// グループ GEMM を tensor core で回すか (プロセスで 1 回だけ env を読む)。
+pub fn tc_exp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| tc_exp_from_value(std::env::var(TC_EXP_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_LM_LAYER=1`: prefill の層ループを層優先にする (task 227、既定 off)。
+///
+/// いまはチャンク優先 (チャンク → 全 48 層) なので、1 つの expert が
+/// **チャンクの数だけ** H2D で運ばれる (14k で 9 パス = 158.5 GB)。層優先にすると
+/// 1 プロンプトで 1 回 (48 層 × 512 本 = 50 GB が上限) になり、VRAM の
+/// expert キャッシュも要らない (同じ expert を二度使わない)。
+/// 代償は、層のあいだ全チャンクの残差を保持すること (n_tokens × n_embd × hc × 4)。
+///
+/// # 実測 (lab t227b、sha 9de5b3d2b、depth8k)
+///
+/// バイトは狙いどおり減った: 14k の `[exp-pf-stream] up_MB` は 158.5 GB →
+/// **46.7 GB (-70%)**、copy_s 5.90 → 2.40。ところが壁時計は 3.8k +2.3% /
+/// 14k **+21.6%**、14k 後の decode は 18.4 → 36.0 ms/tok で、**採らない**
+/// (`ADOPT: no`)。理由は層でまとめたぶん、全トークンの活性 (14k で 143 MB) を
+/// router / shared / expert 段で 3 回上げ直し (48 層で 20.6 GB)、shared と
+/// expert の出力 13.8 GB を戻すため。加えて MoE の作業域 2.7 GB と事前の
+/// 追い出し 6 GB が decode のヒット率を落とす。
+/// 次に採るなら **活性をデバイスに残したまま** 層優先を回すこと (REPORT_P227 §7)。
+///
+/// # 実測 (task 233 / 242 で活性をデバイスに残した版)
+///
+/// 往復 (14k で 34 GB) は消え、3,826 tok は base 比 -10〜12% まで来た回もある。
+/// しかし 14,018 tok は **+8〜17%** で目標 (-10%) に届かず、14k 後の decode も
+/// base の 1.6 倍 (lab t242c: ヒット率 0.829 対 0.973、decode 23.0 対 18.1 ms/tok)。
+/// 原因は 3 つ:
+/// (1) グループのポインタ表の同期 H2D (層あたり 243-410 ms) は非同期化しても
+///     待ちが「ステージングの再利用待ち」に移っただけで、14k では消えない
+///     (`use_s` 11.2-11.9 s)。層優先は 1 expert あたりの行数が多いので、GEMV が
+///     重みではなく活性の再読みで律速になる。
+/// (2) 14k では `h` (1,505 MiB) の連続確保が失敗し、追い出し階段が expert の
+///     LRU を全部捨てる (slab がチャンク単位でしか返さない)。
+/// (3) 作業域を小さくする `DENNO_PF_LM_GL` と、追い出した expert を戻す
+///     `DENNO_PF_LM_RELOAD` はどちらも壁時計を改善しなかった (下記の各 doc)。
+/// **採らない** (`ADOPT: no` t242c)。ゲートは 3 本とも既定 off のまま残す。
+pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
+
+/// `DENNO_PF_LM_TILE`: 層優先 prefill の MoE を **何トークンずつ**回すか
+/// (task 250、既定 0 = 分割しない)。
+///
+/// 層優先は 1 層ぶんの全トークンの expert 出力 `h` を連続領域で取る。
+/// 14k では 1.5 GB になり、lab t250a / t250c では `cuMemAlloc` が
+/// 「要求 1,505 MiB / 空き 1,243 MiB」で失敗し、追い出し階段が LRU を
+/// **全部**捨てた (22 GB → 0、decode のヒット率 0.25)。トークンで割ると
+/// `h` が 1/分割数になり、連続確保が通る。
+///
+/// 代償は expert の H2D が分割数だけ増えること (14k で 1 パス 46 GB、写し 2.5 s)。
+/// 1024 未満は 1024 に丸める。
+///
+/// # 実測 (lab t250d、sha 35273d56e、depth8k)
+///
+/// `h` は 14k で 1.5 GB → 471 MiB (5,120) / 660 MiB (7,168) になり、
+/// **それでも確保は通らなかった**。VRAM は expert 22 GB + 重みで埋まっていて、
+/// 「要求 1,368 MiB / 空き 123 MiB」→ 追い出し階段が 33,497 MiB 全捨て、が再現する。
+/// 14k cold prefill は 15.0 s (base 25.6 s の -41%)、3,826 は 3.25 s (-54%) だが、
+/// 14k 後の decode は 18.4 → 31.9 ms/tok (+69%) で目標 (+1% 以内) に届かない。
+/// 分割しない t250c の 52.0 ms/tok よりはましだが、採らない (`ADOPT: no` t250d)。
+pub const LM_TILE_ENV: &str = "DENNO_PF_LM_TILE";
+
+/// task 265: the token tile used when `DENNO_PF_LM_TILE` is unset (lab t265c).
+pub const DEFAULT_LM_TILE: usize = 5120;
+
+/// [`LM_TILE_ENV`] の解釈 (純関数)。0 / 解析不能は分割しない。
+pub fn lm_tile_from_value(v: Option<&str>) -> usize {
+    // task 265 (2026-11-13): unset or empty = 5120 (lab t265c); explicit 0 = no split.
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_LM_TILE;
+    };
+    match s.parse::<usize>() {
+        Ok(n) if n >= 1024 => n,
+        _ => 0,
+    }
+}
+
+/// 1 回の MoE で受けるトークン数 (nt 以下に丸める。0 相当なら分割しない)。
+pub fn lm_tile(nt: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let t = *N.get_or_init(|| lm_tile_from_value(std::env::var(LM_TILE_ENV).ok().as_deref()));
+    if t == 0 || t >= nt {
+        nt
+    } else {
+        t
+    }
+}
+
+/// `DENNO_PF_LM_RESERVE=1`: 層優先 prefill の作業域を **外部予約**として
+/// expert の予算へ計上する (task 250、既定 off)。
+///
+/// いまは作業域 (14k で約 2 GB) を `DevBuffer::alloc_tagged` で取るので、
+/// 確保のたびに LRU の追い出し階段が走り、確保したまま解放しない作業域のぶん
+/// LRU の上限が縮んだままになる (lab t250a: 22 GB → 8.2 GB、decode の
+/// ヒット率 0.247)。予約にすると上限が作業域のぶんだけ下がり、prefill の
+/// 終端で返るので、次の decode で上限が戻る。
+///
+/// # 実測 (lab t250c、sha a57edfdec)
+///
+/// 予約自体は効いた (`作業域 2186 MiB を予約した (会計=true)`) が、
+/// **確保は通らなかった**: 予約後の実空きは 1,243 MiB で、要求 1,505 MiB に
+/// 足りず、追い出し階段が 39,171 MiB 全捨て。expert の slab はチャンクが
+/// 空になるまで実メモリを返さないので、予約で LRU を 2 GB 削っても連続領域は
+/// 空かない。14k 後の decode は 22.4 ms/tok (+24.8%) で目標に届かない。
+pub const LM_RESERVE_ENV: &str = "DENNO_PF_LM_RESERVE";
+
+/// [`LM_RESERVE_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn lm_reserve_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 作業域を外部予約するか (プロセスで 1 回だけ env を読む)。
+pub fn lm_reserve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lm_reserve_from_value(std::env::var(LM_RESERVE_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_LM_LAYER` の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn lm_layer_from_value(v: Option<&str>) -> bool {
+    // task 265 (2026-11-13, operator approved): default on; only an explicit
+    // false value (0 / off / false / no) turns it off.
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
+/// 層優先 prefill を使うか (プロセスで 1 回だけ env を読む)。
+pub fn lm_layer_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lm_layer_from_value(std::env::var(LM_LAYER_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_DMA_PROBE=1`: prefill の先頭で 1 回だけ H2D の素の速度を測る
+/// (診断専用・既定 off)。測るのは `[pf-probe]` の 1 行群で、数値経路は変えない。
+pub const DMA_PROBE_ENV: &str = "DENNO_PF_DMA_PROBE";
+
+/// `DENNO_PF_DMA_PROBE` の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn dma_probe_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 素の H2D を測るか (プロセスで 1 回だけ env を読む)。
+pub fn dma_probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dma_probe_from_value(std::env::var(DMA_PROBE_ENV).ok().as_deref()))
 }
 
 /// 型 → カーネルのスロット (decode の `kernels_exp_iq` と同じ順)。
@@ -662,6 +1267,39 @@ pub fn row_table_full(
     Some(prow)
 }
 
+/// task 233: 行の加重和の表に「共有 expert の行」を 1 列足す (純関数)。
+///
+/// `prow` / `wrow` は `ntok * k` (行は expert 昇順、加重和の項の順そのもの)。
+/// 戻り値は `ntok * (k + 1)` で、各トークンの**最後の 1 項**が共有 expert の
+/// 行 (`shared_row0 + t`) と係数 `sh_w[t]` になる。共有 expert の出力を MoE の
+/// 作業域の末尾の行へ書いておけば、加重和のカーネル 1 回で routed と共有が
+/// 同じ出力に載る (ホストへ戻さない)。
+pub fn row_table_with_shared(
+    prow: &[u32],
+    wrow: &[f32],
+    ntok: usize,
+    k: usize,
+    shared_row0: usize,
+    sh_w: &[f32],
+) -> Option<(Vec<u32>, Vec<f32>)> {
+    if k == 0 || ntok == 0 || prow.len() != ntok * k || wrow.len() < ntok * k {
+        return None;
+    }
+    if sh_w.len() < ntok || shared_row0 > u32::MAX as usize {
+        return None;
+    }
+    let kk = k + 1;
+    let mut pr = vec![0u32; ntok * kk];
+    let mut wr = vec![0f32; ntok * kk];
+    for t in 0..ntok {
+        pr[t * kk..t * kk + k].copy_from_slice(&prow[t * k..(t + 1) * k]);
+        wr[t * kk..t * kk + k].copy_from_slice(&wrow[t * k..(t + 1) * k]);
+        pr[t * kk + k] = (shared_row0 + t) as u32;
+        wr[t * kk + k] = sh_w[t];
+    }
+    Some((pr, wr))
+}
+
 /// task 162: 載っていない (t, j) を「重み 0・行 0」にして和から外す。
 ///
 /// `prow` の穴を 0 で埋め、`weights` の同じ位置を 0.0 にする。0 × 有限値 = 0
@@ -709,6 +1347,101 @@ pub fn group_bounds(needs: &[usize], cap: usize, max_group: usize) -> Option<Vec
     Some(out)
 }
 
+/// task 242: グループ局所の g/u/act に要る行数 (グループの最大行数)。
+///
+/// `seg` は 4 語 × segment (`[行数, 行の先頭, 0, 0]`)、`bounds` は
+/// [`group_bounds`] の結果 (segment の index 範囲)。層優先 prefill は
+/// カーネルの出力ポインタを `先頭 - グループ先頭行 * n_out * 4` で渡すので、
+/// g/u/act は**この行数**だけ持てばよい (14k で 0.86 GB → 0.11 GB)。
+///
+/// 範囲外・空なら `None` (呼び出し側は従来の全体サイズへ落ちる)。
+pub fn max_group_rows(seg: &[u32], bounds: &[(usize, usize)]) -> Option<usize> {
+    if seg.len() % 4 != 0 || bounds.is_empty() {
+        return None;
+    }
+    let nseg = seg.len() / 4;
+    let mut mx = 0usize;
+    for &(a, b) in bounds {
+        if a >= b || b > nseg {
+            return None;
+        }
+        let last = b - 1;
+        let start = seg[a * 4 + 1] as usize;
+        let end = (seg[last * 4 + 1] as usize).checked_add(seg[last * 4] as usize)?;
+        if end < start {
+            return None;
+        }
+        mx = mx.max(end - start);
+    }
+    if mx == 0 {
+        return None;
+    }
+    Some(mx)
+}
+
+/// task 242: グループ局所用に、各 segment の行の先頭を**グループの先頭から**の
+/// 相対番号へ直した `seg` を返す (`[行数, 行の先頭, 0, 0]` × segment)。
+///
+/// カーネルは出力を `obase + (s.ro + r)*n_out` に書き、入力を
+/// `rows[s.ro + r]` から読む。グループ局所では `obase` をグループのバッファの
+/// 先頭にしたいので `s.ro` を 0 起点にし、行表 (`rows_gu` / `rows_id`) の
+/// ポインタをグループ先頭行だけ足して渡す (呼び出し側)。
+///
+/// 行の先頭がグループの先頭より小さければ `None` (plan の並びが壊れている)。
+pub fn seg_group_local(seg: &[u32], bounds: &[(usize, usize)]) -> Option<Vec<u32>> {
+    if seg.len() % 4 != 0 || bounds.is_empty() {
+        return None;
+    }
+    let nseg = seg.len() / 4;
+    let mut out = seg.to_vec();
+    for &(a, b) in bounds {
+        if a >= b || b > nseg {
+            return None;
+        }
+        let base = seg[a * 4 + 1];
+        for i in a..b {
+            let off = out[i * 4 + 1];
+            out[i * 4 + 1] = off.checked_sub(base)?;
+        }
+    }
+    Some(out)
+}
+
+/// task 242: グループ局所の g/u/act を使うか (`DENNO_PF_LM_GL`)。
+/// **既定 off**。`1` / `on` / `true` で有効。
+///
+/// 効くのは層優先 prefill の**デバイス出力**のときだけ (チャンク経路の
+/// ホスト出力は従来どおり全体サイズ)。
+///
+/// lab t242b の実測では狙いどおり作業域が 2,870 → 2,100 MiB、追い出しが
+/// 2,371 → 1,603 MiB、14k のストリーミングが 46.1 → 35.0 GB になった。
+/// しかし lab t242c (GL のみ) の壁時計は 3,826 tok -1% / 14,018 tok **+17%** で、
+/// GL を切った t242b の lmno (+7.6%) より悪い (別 run なので断定はできない)。
+/// 採否 no なので既定 off。
+pub fn lm_group_local() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("DENNO_PF_LM_GL").ok() {
+        Some(s) => matches!(s.trim(), "1" | "on" | "true"),
+        None => false,
+    })
+}
+
+/// task 242: 層優先 prefill が追い出した expert を終端で戻すか
+/// (`DENNO_PF_LM_RELOAD`)。**既定 off**。`1` / `on` / `true` で有効。
+///
+/// lab t242b の実測: 戻すのに 809 本 / 1,603 MiB で +0.8-1.5 秒かかり、
+/// しかも 14k 後の decode のヒット率は 0.837 のまま (base は 0.973) だった。
+/// 理由は prefill の途中で 1,505 MiB の `h` を確保できず、`DevBuffer` の
+/// 追い出し階段が expert の LRU を全部捨てるため (戻した分も一緒に消える)。
+/// つまり戻す相手が残っていない。ゲートは残すが既定 off。
+pub fn lm_reload_evicted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("DENNO_PF_LM_RELOAD").ok() {
+        Some(s) => matches!(s.trim(), "1" | "on" | "true"),
+        None => false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 1 リクエストぶんの観測 (REPORT 用)
 // ---------------------------------------------------------------------------
@@ -741,6 +1474,8 @@ static STREAM_ENQ_NS: AtomicU64 = AtomicU64::new(0);
 static STREAM_READY_NS: AtomicU64 = AtomicU64::new(0);
 /// task 165: ステージングの再利用待ち (前のグループの計算完了待ち)。
 static STREAM_SLOT_NS: AtomicU64 = AtomicU64::new(0);
+/// task 233: スロット再利用前の「計算完了イベント」待ち (診断。今まで台帳に出ていなかった)。
+static STREAM_USE_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
 static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 上げの回数 (グループ数)。
@@ -751,6 +1486,24 @@ static STREAM_SPILL: AtomicU64 = AtomicU64::new(0);
 static STREAM_CPU_MISS_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 最初のグループで測った実 H2D 速度 (GB/s × 1000、0 = 未測)。
 static STREAM_PROBE_MBPS: AtomicU64 = AtomicU64::new(0);
+/// task 227: `cuMemHostRegister` を試したバイト数 / 通ったバイト数 / 回数 / 時間。
+static REG_BYTES: AtomicU64 = AtomicU64::new(0);
+static REG_OK_BYTES: AtomicU64 = AtomicU64::new(0);
+static REG_CALLS: AtomicU64 = AtomicU64::new(0);
+static REG_NS: AtomicU64 = AtomicU64::new(0);
+/// task 227: 通ったフラグ (u32::MAX = まだ通っていない)。
+static REG_FLAGS: AtomicU64 = AtomicU64::new(u32::MAX as u64);
+
+/// task 227: `cuMemHostRegister` の 1 回ぶんを積む。
+pub fn note_reg(bytes: usize, ok: bool, ns: u64, flags: u32) {
+    REG_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    REG_CALLS.fetch_add(1, Ordering::Relaxed);
+    REG_NS.fetch_add(ns, Ordering::Relaxed);
+    if ok {
+        REG_OK_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        REG_FLAGS.store(flags as u64, Ordering::Relaxed);
+    }
+}
 
 /// 1 層ぶんの参照を積む (`lookups` = 選択 expert 数、`hits` = 載っていた数)。
 pub fn note_lookup(lookups: u32, hits: u32) {
@@ -821,6 +1574,11 @@ pub fn note_stream_group(
     STREAM_READY_NS.fetch_add(ready_ns, Ordering::Relaxed);
     STREAM_WAIT_NS.fetch_add(wait_ns, Ordering::Relaxed);
     STREAM_SLOT_NS.fetch_add(slot_ns, Ordering::Relaxed);
+}
+
+/// task 233: スロット再利用前の計算完了待ちの時間を積む (診断)。
+pub fn note_stream_use_ns(ns: u64) {
+    STREAM_USE_NS.fetch_add(ns, Ordering::Relaxed);
 }
 
 /// task 162: ストリーミングで 1 層を GPU に載せた。
@@ -917,6 +1675,7 @@ pub fn stats_line() -> Option<String> {
         let enq = STREAM_ENQ_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let ready = STREAM_READY_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let slotw = STREAM_SLOT_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let use_s = STREAM_USE_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let exps = STREAM_EXPERTS.load(Ordering::Relaxed);
         let rows = STREAM_ROWS.load(Ordering::Relaxed);
         // 1000 倍して持っている MB/s を GB/s へ。
@@ -924,8 +1683,9 @@ pub fn stats_line() -> Option<String> {
         out.push_str(&format!(
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
-             ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={}",
+             ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={} \
+             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -940,6 +1700,13 @@ pub fn stats_line() -> Option<String> {
             u8::from(stream_ut()),
             stream_group(),
             stream_min_tok(),
+            stream_chunk_bytes() >> 10,
+            stream_src(),
+            REG_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+            REG_OK_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+            REG_CALLS.load(Ordering::Relaxed),
+            REG_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            REG_FLAGS.load(Ordering::Relaxed) as u32,
         ));
         // task 254: 表の非同期 H2D が発火したか (gate on の証拠)。
         #[cfg(feature = "cuda")]
@@ -981,6 +1748,10 @@ pub fn stats_reset() {
         &STREAM_SPILL,
         &STREAM_CPU_MISS_NS,
         &STREAM_PROBE_MBPS,
+        &REG_BYTES,
+        &REG_OK_BYTES,
+        &REG_CALLS,
+        &REG_NS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -1125,6 +1896,166 @@ mod tests {
         assert_eq!(seen, want, "行の取りこぼし・重複がある");
     }
 
+    /// task 242: グループ局所の g/u/act に要る行数は「グループの最大行数」。
+    ///
+    /// カーネルは行の添字が絶対なので、呼び出し側は
+    /// `ポインタ - グループ先頭行 * n_out * 4` で渡す。この行数だけ持てば、
+    /// どのグループも自分の範囲しか触らない。
+    #[test]
+    fn max_group_rows_is_the_largest_group_span() {
+        // 6 expert / 行数 3,1,2,4,1,2 (合計 13)。
+        let seg: Vec<u32> = vec![
+            3, 0, 0, 0, // rows 0..3
+            1, 3, 0, 0, // rows 3..4
+            2, 4, 0, 0, // rows 4..6
+            4, 6, 0, 0, // rows 6..10
+            1, 10, 0, 0, // rows 10..11
+            2, 11, 0, 0, // rows 11..13
+        ];
+        // 2 グループ: 0..6 は 6 行、6..13 は 7 行。
+        assert_eq!(max_group_rows(&seg, &[(0, 3), (3, 6)]), Some(7));
+        // 1 グループなら全体 (13 行)。
+        assert_eq!(max_group_rows(&seg, &[(0, 6)]), Some(13));
+        // 3 グループ: 6 / 4 / 2 行。
+        assert_eq!(max_group_rows(&seg, &[(0, 3), (3, 4), (4, 6)]), Some(6));
+        // 壊れた入力は None (呼び出し側は従来の全体サイズへ落ちる)。
+        assert_eq!(max_group_rows(&seg, &[]), None);
+        assert_eq!(max_group_rows(&seg[..11], &[(0, 3)]), None);
+        assert_eq!(max_group_rows(&seg, &[(0, 9)]), None);
+        assert_eq!(max_group_rows(&seg, &[(2, 2)]), None);
+        // group_bounds の結果と組み合わせても一致する。
+        let needs = vec![100usize, 100, 100, 100, 100, 100];
+        let bounds = group_bounds(&needs, 350, 64).expect("3 本ずつ 2 グループ");
+        assert_eq!(bounds, vec![(0, 3), (3, 6)]);
+        assert_eq!(max_group_rows(&seg, &bounds), Some(7));
+    }
+
+    /// task 242: グループ局所の `seg` は各行の先頭がグループ先頭から 0 起点に
+    /// なり、行表をグループ先頭行だけ足して渡せば元の行に対応する。
+    #[test]
+    fn seg_group_local_rebases_each_group_to_zero() {
+        let seg: Vec<u32> = vec![
+            3, 0, 0, 0, // rows 0..3
+            1, 3, 0, 0, // rows 3..4
+            2, 4, 0, 0, // rows 4..6
+            4, 6, 0, 0, // rows 6..10
+            1, 10, 0, 0, // rows 10..11
+            2, 11, 0, 0, // rows 11..13
+        ];
+        let bounds = vec![(0usize, 3usize), (3, 6)];
+        let gl = seg_group_local(&seg, &bounds).expect("直せる");
+        assert_eq!(gl.len(), seg.len());
+        // 行数は変えない。
+        for i in 0..6 {
+            assert_eq!(gl[i * 4], seg[i * 4], "segment {i} の行数が変わった");
+        }
+        // グループ 0 は元のまま (先頭が 0)、グループ 1 は 6 を引く。
+        assert_eq!(&gl[0..12], &seg[0..12]);
+        assert_eq!(&gl[12..24], &[4, 0, 0, 0, 1, 4, 0, 0, 2, 5, 0, 0]);
+        // 相対化しても「グループの最大行数」は同じ。
+        assert_eq!(max_group_rows(&gl, &bounds), max_group_rows(&seg, &bounds));
+        // 1 グループなら全体が 0 起点 (先頭は元から 0 なので不変)。
+        assert_eq!(seg_group_local(&seg, &[(0, 6)]).as_deref(), Some(&seg[..]));
+        // 壊れた入力は None。
+        assert_eq!(seg_group_local(&seg, &[]), None);
+        assert_eq!(seg_group_local(&seg[..11], &[(0, 3)]), None);
+        assert_eq!(seg_group_local(&seg, &[(0, 9)]), None);
+        // 先頭より小さい行番号が来たら None (plan の並びが壊れている)。
+        // segment 4 はグループ 1 (先頭 6) の中なので、0 は先頭より小さい。
+        let mut bad = seg.clone();
+        bad[4 * 4 + 1] = 0;
+        assert_eq!(seg_group_local(&bad, &[(0, 3), (3, 6)]), None);
+    }
+
+    /// task 242: グループ局所の添字をカーネルと同じ式で辿り、どの領域も
+    /// はみ出さないこと (lab t242a は down の行表を足して error 700 になった)。
+    ///
+    /// - gate/up: 出力 = `(rel + r) * ff + row0` → `rows_cap * ff` 未満
+    /// - gate/up: 入力 = `x[rows_gu[abs_start + rel + r]]` → `ntok` 未満
+    /// - down: 入力 = `act[rows_id[rel + r]]` = `act[rel + r]` → グループ局所
+    ///   (`abs_start` を足したら act の範囲外になる)
+    #[test]
+    fn group_local_indices_stay_inside_the_group_scratch() {
+        // 5 expert / 行数 40,10,80,25,5 (= 160 行) / トークンは 7 個を巡回。
+        let rows_per = [40usize, 10, 80, 25, 5];
+        let ntok = 7usize;
+        let (ff, e) = (4usize, 3usize);
+        let mut by_expert: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut t = 0usize;
+        for &m in rows_per.iter() {
+            let mut v = Vec::new();
+            for _ in 0..m {
+                v.push((t % ntok, 0));
+                t += 1;
+            }
+            by_expert.push(v);
+        }
+        let pick = vec![true; 5];
+        let plan = build_plan(&by_expert, &pick);
+        let total_rows = plan.total_rows;
+        assert_eq!(total_rows, 160);
+        let needs = vec![100usize; 5];
+        let bounds = group_bounds(&needs, 250, 64).expect("2 本ずつ + 端数");
+        let gl = seg_group_local(&plan.seg, &bounds).expect("直せる");
+        let cap = max_group_rows(&plan.seg, &bounds).expect("行数");
+        let mut seen = 0usize;
+        for &(a, b) in &bounds {
+            let abs_start = plan.seg[a * 4 + 1] as usize;
+            for i in a..b {
+                let m = gl[i * 4] as usize;
+                let rel0 = gl[i * 4 + 1] as usize;
+                for r in 0..m {
+                    let rel = rel0 + r;
+                    // gate/up の出力はグループの作業域に収まる。
+                    assert!(rel < cap, "g/u の行 {rel} が cap {cap} を超えた");
+                    assert!(rel * ff < cap * ff);
+                    // gate/up の入力は絶対の行表 (abs_start を足したもの) で引く。
+                    let abs_row = abs_start + rel;
+                    assert_eq!(
+                        plan.rows[abs_row], plan.rows[abs_start + rel0 + r],
+                        "行表の対応がずれた"
+                    );
+                    assert!((plan.rows[abs_row] as usize) < ntok);
+                    // down の入力はグループ局所の act (identity のまま)。
+                    assert_eq!(rel, abs_row - abs_start);
+                    assert!(rel * e < cap * e, "act の行 {rel} が範囲外");
+                    // down の出力は全体の h (絶対)。
+                    assert!((abs_row) * e < (total_rows + ntok) * e);
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, total_rows, "全ての行を 1 回ずつ辿る");
+    }
+
+    /// task 233: 行の加重和の表に共有 expert を 1 列足す。行は
+    /// 「routed (expert 昇順) のあと、各トークンの共有行」で、係数は sh_w。
+    #[test]
+    fn row_table_with_shared_appends_one_term_per_token() {
+        let (ntok, k) = (3usize, 2usize);
+        let prow: Vec<u32> = vec![0, 5, 1, 6, 2, 7];
+        let wrow: Vec<f32> = vec![0.5, 0.5, 0.25, 0.75, 1.0, 0.0];
+        let sh: Vec<f32> = vec![0.9, 0.8, 0.7];
+        let (pr, wr) = row_table_with_shared(&prow, &wrow, ntok, k, 6, &sh).expect("足せる");
+        assert_eq!(pr.len(), ntok * (k + 1));
+        assert_eq!(wr.len(), ntok * (k + 1));
+        for t in 0..ntok {
+            assert_eq!(
+                &pr[t * 3..t * 3 + 2],
+                &prow[t * 2..(t + 1) * 2],
+                "routed の行が動いた"
+            );
+            assert_eq!(wr[t * 3], wrow[t * 2], "routed の重みが動いた");
+            assert_eq!(wr[t * 3 + 1], wrow[t * 2 + 1]);
+            assert_eq!(pr[t * 3 + 2], (6 + t) as u32, "共有の行は h の末尾");
+            assert_eq!(wr[t * 3 + 2], sh[t], "共有の係数");
+        }
+        // 形が合わないときは None (黙って詰めない)。
+        assert!(row_table_with_shared(&prow, &wrow, ntok, k, 6, &sh[..2]).is_none());
+        assert!(row_table_with_shared(&prow[..5], &wrow, ntok, k, 6, &sh).is_none());
+        assert!(row_table_with_shared(&prow, &wrow, ntok, 0, 6, &sh).is_none());
+    }
+
     /// 全部ヒットなら行数は選択数 (nt x k) と一致する。
     #[test]
     fn plan_all_hits_covers_every_pair() {
@@ -1185,6 +2116,179 @@ mod tests {
     #[test]
     fn upload_budget_is_bytes_over_expert_size() {
         assert_eq!(upload_budget_experts(), (upload_mb() << 20) / 2_048_000);
+    }
+
+    /// task 239: 均等割りの**発火**条件。
+    ///
+    /// lab t239c では `chunk_override().is_some()` で判定していたため、
+    /// 未設定でも `Some(既定)` が返ってゲートが一度も発火せず、up_MB が
+    /// バイト一致のままだった。ここで 4 条件の全組み合わせを固定する。
+    #[test]
+    fn chunk_for_prefill_fires_only_on_all_three_conditions() {
+        let (n, base, cap) = (3222usize, DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        // 3 条件が揃ったときだけ均等割り (3,222 → 1,611 × 2 枚)。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, true, false), 1611);
+        // ゲート off。
+        assert_eq!(chunk_for_prefill(n, base, cap, false, false, true, false), base);
+        // ストリーミング off (従来経路)。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, false, false), base);
+        // `DENNO_PF_CHUNK` の明示指定がある。
+        assert_eq!(chunk_for_prefill(n, base, cap, true, false, true, true), base);
+        // 1 枚で収まる長さはゲート on でもそのまま。
+        assert_eq!(chunk_for_prefill(1000, base, cap, true, false, true, false), 1000);
+        // 2 枚を超える長さ (14k) は long ゲート off なら触らない (task 197 の実測領域)。
+        assert_eq!(
+            chunk_for_prefill(14018, base, cap, true, false, true, false),
+            base,
+            "長いプロンプトのチャンクを変えてしまった"
+        );
+        assert_eq!(chunk_for_prefill(4095, base, cap, true, false, true, false), base);
+        // 2 枚ちょうどまでは均等割り。
+        assert_eq!(chunk_for_prefill(4094, base, cap, true, false, true, false), 2047);
+    }
+
+    /// task 246: 長いプロンプトの均等割りは専用ゲート (`BALANCE_LONG`) の内側だけ。
+    ///
+    /// 14,018 は固定 1,536 で 10 枚 (9 × 1,536 + 194)、均等割りで 2,003 × 7 枚。
+    /// 枚数が 3 割減るので、ミス expert の上げ直しもそのぶん減る (推定)。
+    #[test]
+    fn chunk_balance_long_extends_to_long_prompts() {
+        let (base, cap) = (DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        assert!(!chunk_balance_long_from_value(None), "既定は off");
+        assert!(!chunk_balance_long_from_value(Some("0")));
+        assert!(chunk_balance_long_from_value(Some("1")));
+        assert!(chunk_balance_long_from_value(Some(" on ")));
+        // long off: 14k は従来の 1,536 のまま (10 枚)。
+        assert_eq!(
+            chunk_for_prefill(14018, base, cap, true, false, true, false),
+            base
+        );
+        // long on: 2,003 × 7 枚。
+        let c = chunk_for_prefill(14018, base, cap, true, true, true, false);
+        assert_eq!(c, 2003);
+        assert_eq!(14018usize.div_ceil(c), 7);
+        // 上限は GDN 連鎖の境界 (2,048) の手前を守る。
+        assert!(c <= cap && c < 2048);
+        // 短いプロンプトの答えは long の有無で変わらない。
+        for n in [1000usize, 3222, 3826, 4094] {
+            assert_eq!(
+                chunk_for_prefill(n, base, cap, true, true, true, false),
+                chunk_for_prefill(n, base, cap, true, false, true, false),
+                "n={n} で long が短い側の答えを変えた"
+            );
+        }
+    }
+
+    /// task 246: 寄せ直しのゲート解釈とトークン数の丸め。
+    #[test]
+    fn dec_reseed_parses_values() {
+        assert!(!DEFAULT_DEC_RESEED, "既定 off でない");
+        assert!(!dec_reseed_from_value(None));
+        assert!(!dec_reseed_from_value(Some("0")));
+        assert!(!dec_reseed_from_value(Some("off")));
+        assert!(dec_reseed_from_value(Some("1")));
+        assert!(dec_reseed_from_value(Some("on")));
+        assert!(dec_reseed_from_value(Some(" true ")));
+        // 既定は 256 (従来経路に落ちていた末尾チャンクの 150 / 194 を覆う)。
+        assert_eq!(DEFAULT_DEC_RESEED_TOK, 256);
+        assert_eq!(dec_reseed_tok_from_value(None), DEFAULT_DEC_RESEED_TOK);
+        assert_eq!(dec_reseed_tok_from_value(Some("0")), DEFAULT_DEC_RESEED_TOK);
+        assert_eq!(dec_reseed_tok_from_value(Some("x")), DEFAULT_DEC_RESEED_TOK);
+        assert_eq!(dec_reseed_tok_from_value(Some("64")), 64);
+        assert_eq!(
+            dec_reseed_tok_from_value(Some("999999")),
+            DEC_RESEED_TOK_MAX,
+            "上限で丸めていない"
+        );
+    }
+
+    /// task 246: 控えるのは**最後のチャンクの末尾トークン**だけで、
+    /// 触る順は「トークン昇順 → 層昇順 → j 昇順」(従来経路と同じ)。
+    #[test]
+    fn dec_hot_keeps_only_the_tail_in_token_major_order() {
+        let (nt, k, tok) = (4usize, 2usize, 2usize);
+        let mut h = DecHot::default();
+        // 1 枚目のチャンク (層 0..1)。トークン t の選択は (10*t + layer) 系。
+        for layer in 0..2usize {
+            let sels: Vec<usize> = (0..nt * k)
+                .map(|i| 100 + layer * 10 + (i / k) * 2 + (i % k))
+                .collect();
+            note_tail_into(&mut h, layer, nt, k, &sels, tok);
+        }
+        // 2 枚目のチャンク (同じ長さ) は前のチャンクを捨てる。
+        for layer in 0..2usize {
+            let sels: Vec<usize> = (0..nt * k)
+                .map(|i| layer * 10 + (i / k) * 2 + (i % k))
+                .collect();
+            note_tail_into(&mut h, layer, nt, k, &sels, tok);
+        }
+        let (keys, ntok) = take_dec_hot_from(&mut h, tok);
+        assert_eq!(ntok, 2, "末尾 2 トークンだけのはず");
+        // t=2: 層 0 の j=0,1 → 4,5 / 層 1 の j=0,1 → 14,15
+        // t=3: 層 0 → 6,7 / 層 1 → 16,17
+        assert_eq!(
+            keys,
+            vec![(0, 4), (0, 5), (1, 14), (1, 15), (0, 6), (0, 7), (1, 16), (1, 17)],
+            "トークン昇順 → 層昇順 → j 昇順になっていない"
+        );
+        // 取り出したら空 (次の prefill のぶんと混ざらない)。
+        let (again, _) = take_dec_hot_from(&mut h, tok);
+        assert!(again.is_empty(), "取り出し後に残っている");
+    }
+
+    /// task 246: `tok` がチャンク長以上なら全トークン、0 相当なら空。
+    #[test]
+    fn dec_hot_tail_window_is_clamped() {
+        let (nt, k) = (3usize, 1usize);
+        let mut h = DecHot::default();
+        for layer in 0..2usize {
+            let sels: Vec<usize> = (0..nt).map(|t| layer * 10 + t).collect();
+            note_tail_into(&mut h, layer, nt, k, &sels, nt * 4);
+        }
+        let (keys, ntok) = take_dec_hot_from(&mut h, nt * 4);
+        assert_eq!(ntok, nt);
+        assert_eq!(keys.len(), 2 * nt);
+        // 先頭のトークンから順に出る。
+        assert_eq!(keys[0], (0, 0));
+        assert_eq!(keys[1], (1, 10));
+    }
+
+    /// task 246: 形が合わない入力は控えない (壊れた配列で層を跨がない)。
+    #[test]
+    fn dec_hot_ignores_malformed_selection() {
+        let mut h = DecHot::default();
+        note_tail_into(&mut h, 0, 4, 2, &[1, 2, 3], 2); // 長さ不足
+        assert!(take_dec_hot_from(&mut h, 2).0.is_empty());
+        note_tail_into(&mut h, 0, 0, 2, &[], 2);
+        assert!(take_dec_hot_from(&mut h, 2).0.is_empty());
+    }
+
+    /// task 239: 均等割りは「上限の下でチャンク数を最小にする」長さを返す。
+    ///
+    /// 実際のプロンプト長 (lab t239a/t239b の c2000=3,826 / c8869=3,222) で、
+    /// 固定 1536 の 3 枚が 2 枚になること (転送量が 1/3 減る) を固定する。
+    #[test]
+    fn balanced_chunk_minimizes_chunk_count_under_cap() {
+        let (base, cap) = (DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        // 1 枚で収まる長さはそのまま。
+        assert_eq!(balanced_chunk(150, base, cap), 150);
+        assert_eq!(balanced_chunk(1536, base, cap), 1536);
+        // 3,222 → 1,611 × 2 枚 (固定 1536 なら 1,536 + 1,536 + 150 の 3 枚)。
+        let c = balanced_chunk(3222, base, cap);
+        assert_eq!(c, 1611, "c8869 が 2 枚にならない");
+        assert_eq!(3222usize.div_ceil(c), 2);
+        // 3,826 → 1,913 × 2 枚。
+        let c = balanced_chunk(3826, base, cap);
+        assert_eq!(3826usize.div_ceil(c), 2, "c2000 が 2 枚にならない");
+        // 14,018 → 7 枚 (固定 1536 なら 10 枚)。
+        let c = balanced_chunk(14018, base, cap);
+        assert_eq!(14018usize.div_ceil(c), 7);
+        // どの長さでも 1 枚は上限を超えない (GDN 連鎖の境界を踏まない)。
+        for n in [1usize, 512, 1536, 2000, 3222, 3826, 14018, 65536] {
+            let c = balanced_chunk(n, base, cap);
+            assert!(c > 0 && c <= cap.max(base), "n={n} のチャンク {c} が上限外");
+            assert!(n.div_ceil(c) >= 1);
+        }
     }
 
     /// task 162: 行表は「トークン × j」→ GPU の行番号。載っていない expert の
@@ -1295,6 +2399,30 @@ mod tests {
         );
         assert!(stream_wc_from_value(true, Some(" on ")), "前後の空白は無視する");
         assert!(!stream_wc_from_value(true, Some("no")));
+        // task 227: 転送元の選択 (既定は pin = バウンス) と、素の H2D の探針。
+        assert_eq!(stream_src_from_value(None), DEFAULT_STREAM_SRC);
+        assert_eq!(stream_src_from_value(Some("")), DEFAULT_STREAM_SRC);
+        assert_eq!(stream_src_from_value(Some("pin")), 0);
+        assert_eq!(stream_src_from_value(Some("page")), 1);
+        assert_eq!(stream_src_from_value(Some("reg")), 2);
+        assert_eq!(stream_src_from_value(Some(" reg ")), 2, "前後の空白は無視する");
+        assert_eq!(stream_src_from_value(Some("bogus")), DEFAULT_STREAM_SRC);
+        assert_eq!(DEFAULT_STREAM_SRC, 0, "既定は従来のバウンス");
+        assert_eq!(DEFAULT_STREAM_CHUNK_KB, 0, "既定は従来の直列");
+        // task 227: 探針は明示的な真値だけ on。
+        assert!(!dma_probe_from_value(None));
+        assert!(!dma_probe_from_value(Some("")));
+        assert!(!dma_probe_from_value(Some("0")));
+        assert!(!dma_probe_from_value(Some("off")));
+        assert!(dma_probe_from_value(Some("1")));
+        assert!(dma_probe_from_value(Some(" on ")));
+        // task 265: 層優先 prefill は既定 on、明示的な偽値だけ off。
+        assert!(lm_layer_from_value(None));
+        assert!(lm_layer_from_value(Some("")));
+        assert!(!lm_layer_from_value(Some("0")));
+        assert!(!lm_layer_from_value(Some("off")));
+        assert!(lm_layer_from_value(Some("1")));
+        assert!(lm_layer_from_value(Some(" yes ")));
         assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
         // task 197: チャンク上書きは「明示した正の数だけ」効く。
         assert_eq!(chunk_override_from_value(None), None);
@@ -1318,6 +2446,30 @@ mod tests {
         assert!(DEFAULT_STREAM_ON, "lab t165c で採用して既定 on");
         assert!(DEFAULT_STREAM_WC, "write-combined のバウンスが効いた");
         assert_eq!(stream_group(), 64, "グループ 64 が最良");
+        // task 239: 分割は既定 1 (従来の 1 回写し + 1 回 DMA)。
+        assert_eq!(
+            stream_split_from_value(None),
+            DEFAULT_STREAM_SPLIT,
+            "未設定は既定 (1 = 従来)"
+        );
+        assert_eq!(stream_split_from_value(Some("")), 1);
+        assert_eq!(stream_split_from_value(Some("0")), 1, "0 は既定へ");
+        assert_eq!(stream_split_from_value(Some("x")), 1, "解析不能は既定へ");
+        assert_eq!(stream_split_from_value(Some("4")), 4);
+        assert_eq!(stream_split_from_value(Some("64")), 16, "上限 16");
+        // task 239: 均等割りのゲートと上限。
+        assert!(
+            !chunk_balance_from_value(None),
+            "既定 off (従来の固定チャンク)"
+        );
+        assert!(!chunk_balance_from_value(Some("0")));
+        assert!(chunk_balance_from_value(Some("1")));
+        assert!(chunk_balance_from_value(Some(" on ")));
+        assert_eq!(
+            CHUNK_BALANCE_CAP + 1,
+            crate::cuda::GDN_CHUNK_MIN_TOKENS,
+            "上限は GDN 連鎖の境界の手前 (2048 を踏むと ssm がホスト経路へ落ちる)"
+        );
         // 分け合った 1 枚 (cuda 側は 3 枚) に、既定のグループ (64 本、
         // 平均 2.05 MB/本) が載ること。
         assert!(
