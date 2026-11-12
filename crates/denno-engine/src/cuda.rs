@@ -12823,8 +12823,9 @@ mod pf_exp_tc_tests {
     /// ゲートの真理値表 (既定 off・明示的な真値だけ on)。
     #[test]
     fn tc_exp_gate_is_strictly_opt_in() {
-        assert!(!crate::model::exp_pf::tc_exp_from_value(None));
-        assert!(!crate::model::exp_pf::tc_exp_from_value(Some("")));
+        // task 265: 既定 on、明示的な偽値だけ off。
+        assert!(crate::model::exp_pf::tc_exp_from_value(None));
+        assert!(crate::model::exp_pf::tc_exp_from_value(Some("")));
         assert!(!crate::model::exp_pf::tc_exp_from_value(Some("0")));
         assert!(!crate::model::exp_pf::tc_exp_from_value(Some("off")));
         assert!(!crate::model::exp_pf::tc_exp_from_value(Some(" false ")));
@@ -12837,8 +12838,8 @@ mod pf_exp_tc_tests {
     #[test]
     fn lm_tile_covers_the_prompt_exactly_once() {
         use crate::model::exp_pf::lm_tile_from_value;
-        assert_eq!(lm_tile_from_value(None), 0, "既定は分割しない");
-        assert_eq!(lm_tile_from_value(Some("")), 0);
+        assert_eq!(lm_tile_from_value(None), 5120, "task 265: 既定は 5120");
+        assert_eq!(lm_tile_from_value(Some("")), 5120);
         assert_eq!(lm_tile_from_value(Some("0")), 0);
         assert_eq!(lm_tile_from_value(Some("1023")), 0, "1024 未満は分割しない");
         assert_eq!(lm_tile_from_value(Some("7168")), 7168);

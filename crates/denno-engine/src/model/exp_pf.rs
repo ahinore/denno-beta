@@ -916,7 +916,12 @@ pub const TC_EXP_ENV: &str = "DENNO_PF_TC_EXP";
 
 /// [`TC_EXP_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
 pub fn tc_exp_from_value(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+    // task 265 (2026-11-13, operator approved): default on; only an explicit
+    // false value (0 / off / false / no) turns it off.
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
 }
 
 /// グループ GEMM を tensor core で回すか (プロセスで 1 回だけ env を読む)。
@@ -983,10 +988,14 @@ pub const LM_LAYER_ENV: &str = "DENNO_PF_LM_LAYER";
 /// 分割しない t250c の 52.0 ms/tok よりはましだが、採らない (`ADOPT: no` t250d)。
 pub const LM_TILE_ENV: &str = "DENNO_PF_LM_TILE";
 
+/// task 265: the token tile used when `DENNO_PF_LM_TILE` is unset (lab t265c).
+pub const DEFAULT_LM_TILE: usize = 5120;
+
 /// [`LM_TILE_ENV`] の解釈 (純関数)。0 / 解析不能は分割しない。
 pub fn lm_tile_from_value(v: Option<&str>) -> usize {
+    // task 265 (2026-11-13): unset or empty = 5120 (lab t265c); explicit 0 = no split.
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
-        return 0;
+        return DEFAULT_LM_TILE;
     };
     match s.parse::<usize>() {
         Ok(n) if n >= 1024 => n,
@@ -1036,7 +1045,12 @@ pub fn lm_reserve_on() -> bool {
 
 /// `DENNO_PF_LM_LAYER` の解釈 (純関数)。**明示的な真値だけ on**。
 pub fn lm_layer_from_value(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+    // task 265 (2026-11-13, operator approved): default on; only an explicit
+    // false value (0 / off / false / no) turns it off.
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
 }
 
 /// 層優先 prefill を使うか (プロセスで 1 回だけ env を読む)。
@@ -2402,9 +2416,9 @@ mod tests {
         assert!(!dma_probe_from_value(Some("off")));
         assert!(dma_probe_from_value(Some("1")));
         assert!(dma_probe_from_value(Some(" on ")));
-        // task 227: 層優先 prefill も明示的な真値だけ on。
-        assert!(!lm_layer_from_value(None));
-        assert!(!lm_layer_from_value(Some("")));
+        // task 265: 層優先 prefill は既定 on、明示的な偽値だけ off。
+        assert!(lm_layer_from_value(None));
+        assert!(lm_layer_from_value(Some("")));
         assert!(!lm_layer_from_value(Some("0")));
         assert!(!lm_layer_from_value(Some("off")));
         assert!(lm_layer_from_value(Some("1")));

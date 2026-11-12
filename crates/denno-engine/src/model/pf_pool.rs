@@ -100,7 +100,12 @@ pub const POOL_ALIGN: usize = 1024;
 
 /// [`PF_POOL_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
 pub fn pf_pool_from_value(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+    // task 265 (2026-11-13, operator approved): default on; only an explicit
+    // false value (0 / off / false / no) turns it off.
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
 }
 
 /// プールを使うか (プロセスで 1 回だけ env を読む)。
@@ -458,10 +463,11 @@ mod tests {
 
     #[test]
     fn gate_reads_only_explicit_true() {
-        for v in [None, Some(""), Some("0"), Some("off"), Some("no"), Some("2")] {
+        // task 265: 既定 on、明示的な偽値だけ off。
+        for v in [Some("0"), Some("off"), Some("no"), Some("false")] {
             assert!(!pf_pool_from_value(v), "{v:?} は off");
         }
-        for v in [Some("1"), Some("on"), Some("true"), Some("yes")] {
+        for v in [None, Some(""), Some("2"), Some("1"), Some("on"), Some("true"), Some("yes")] {
             assert!(pf_pool_from_value(v), "{v:?} は on");
         }
     }
