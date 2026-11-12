@@ -2945,8 +2945,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 // モデルの選び直し: 応答を返したあとで終了し、起動ループに任せる。
                 let code = EXIT_AFTER.load(std::sync::atomic::Ordering::SeqCst);
                 if code != 0 {
-                    if let Err(e) = steer::flush() {
-                        eprintln!("[steer] 記録の保存に失敗: {e}");
+                    // 記録中のときだけ保存する (記録していないときの flush はエラーを返す)。
+                    if steer::rec_status().is_some() {
+                        if let Err(e) = steer::flush() {
+                            eprintln!("[steer] 記録の保存に失敗: {e}");
+                        }
                     }
                     eprintln!("[flash] exit {code} (モデルの切り替え)");
                     std::process::exit(code);
