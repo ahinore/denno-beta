@@ -2338,8 +2338,13 @@ fn expert_ram_fill(
     let bytes = AtomicU64::new(0);
     let done = AtomicU64::new(0);
     let mut stopped = false;
-    // 1 チャンクずつ「予算が残っているか」を見る (並列の内側では止められない)。
-    const CHUNK: usize = 512;
+    // 1 チャンクずつ「予算が残っているか」と「decode 中か」を見る。
+    //
+    // task 263: 512 から 64 へ下げた。lab t263c (UD-Q4_K_XL) で 512 本
+    // (= 約 512 MB の pread) の塊がリクエスト中に 1 個走り、33 トークンの
+    // prefill が 0.88 -> 1.13 s (+29%) になった。64 本 = 約 64 MB なら
+    // 1 リクエストに重なっても ~30 ms で済む (推定)。
+    const CHUNK: usize = 64;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(crate::model::expert_ram::threads().max(1))
         .thread_name(|i| format!("exp-ram-fill-{i}"))
@@ -11956,7 +11961,7 @@ pub fn plan_experts_from_stats(
     let mut ram_bytes = 0u64;
     let mut cov_ram = 0u64;
     let mut ram_msg = String::new();
-    if ram_on && remain > 0 {
+    if ram_on && remain > 0 && crate::model::expert_ram::fill_enabled() {
         match expert_ram_build(&f, &layers) {
             Ok(Some(set)) => {
                 let cap = set.slots(ExpertMatrix::Gate);
@@ -12155,7 +12160,9 @@ pub fn spawn_expert_plan(parts: Vec<std::path::PathBuf>, dir_name: String) {
                 eprintln!("{line}");
             }
             let secs = crate::model::expert_ram::rebalance_secs();
-            if secs == 0 {
+            // `DENNO_EXPERT_RAM_FILL=0` は「起動時に埋めない」なので、
+            // 追従 (再調整) も回さない (使用時に埋まる経路だけ残す)。
+            if secs == 0 || !crate::model::expert_ram::fill_enabled() {
                 return;
             }
             loop {

@@ -34,7 +34,11 @@
 //!   19.4 → 46.4 ms/tok になった。cold の prefill は 17.21 → 8.89 s (-48%) と
 //!   狙いどおりなので、**大きさを絞れば**両立する見込み (未検証)。
 //! - `DENNO_EXPERT_RAM_PIN`: `0` で pinned を諦めてヒープ (A/B 用。既定 on)。
-//! - `DENNO_EXPERT_RAM_FILL`: `0` で起動時の充填をしない (使用時に埋まる。既定 on)。
+//! - `DENNO_EXPERT_RAM_FILL`: `0` で起動時の充填と追従 (再調整) をしない
+//!   (使用時に埋まる。既定 on)。task 263 から充填は**起動プラン**が行う
+//!   (VRAM tier の残りを回数の多い順に)。tier の作成もプランの中。
+//! - `DENNO_EXPERT_RAM_REBALANCE_SECS`: 走行中に RAM tier を回数の上位へ
+//!   寄せ直す間隔 (秒、既定 30、`0` で止める)。低優先度 (decode 中は譲る)。
 //! - `DENNO_EXPERT_RAM_DBG`: `1` で 1 リクエストごとに 1 行 stderr。
 
 use std::sync::{Arc, RwLock};
