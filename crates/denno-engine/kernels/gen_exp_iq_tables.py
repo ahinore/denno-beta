@@ -63,6 +63,14 @@ def emit_i8(out, cname, vals):
     out.append("")
 
 
+def emit_u16(out, cname, name, vals):
+    out.append("__device__ const unsigned short %s[%d] = {" % (cname, len(vals)))
+    for i in range(0, len(vals), 12):
+        out.append("    " + ", ".join(v + "u" for v in vals[i : i + 12]) + ",")
+    out.append("};")
+    out.append("")
+
+
 def main():
     src = open(SRC, encoding="utf-8").read()
     out = [
@@ -71,11 +79,47 @@ def main():
         "#pragma once",
         "",
     ]
-    emit_u64(out, "dno_iq2s_grid", "IQ2S_GRID", parse(src, "IQ2S_GRID"))
-    emit_u64(out, "dno_iq3s_grid", "IQ3S_GRID", parse(src, "IQ3S_GRID"))
+    iq2s = parse(src, "IQ2S_GRID")
+    iq3s = parse(src, "IQ3S_GRID")
+    emit_u64(out, "dno_iq2s_grid", "IQ2S_GRID", iq2s)
+    emit_u64(out, "dno_iq3s_grid", "IQ3S_GRID", iq3s)
     emit_u32(out, "dno_iq3xxs_grid", "IQ3XXS_GRID", parse(src, "IQ3XXS_GRID"))
     emit_u8(out, "dno_ksigns_iq2xs", parse(src, "KSIGNS_IQ2XS"))
     emit_i8(out, "dno_kvalues_iq4nl", parse(src, "KVALUES_IQ4NL"))
+
+    # task 275: 詰めた表 (v3 カーネル用)。
+    #
+    # IQ2_S: 1024 本の u64 の **8 バイトすべて**を使うが、現れる値は 3 種類しかない。
+    # 2 bit x 8 = 16 bit に詰める (8 KB -> 2 KB、shared の読みが 64 bit -> 16 bit)。
+    v2s = set()
+    for v in iq2s:
+        x = int(v, 0)
+        for j in range(8):
+            v2s.add((x >> (8 * j)) & 0xFF)
+    lut = sorted(v2s)
+    if lut != [8, 25, 43]:
+        raise SystemExit("IQ2S_GRID の値が {8,25,43} でない: %r" % (lut,))
+    code = {v: i for i, v in enumerate(lut)}
+    pack2 = []
+    for v in iq2s:
+        x = int(v, 0)
+        p = 0
+        for j in range(8):
+            p |= code[(x >> (8 * j)) & 0xFF] << (2 * j)
+        pack2.append("%du" % p)
+    out.append("// IQ2_S の詰めた表 (1 値 2 bit、code 0/1/2 = 8/25/43、3 は未使用)。")
+    emit_u16(out, "dno_iq2s_grid2", "IQ2S_GRID", pack2)
+    # IQ3_S: 512 本の u64 の **上位 4 バイトは全 0** で、どの経路も読まない
+    # (kquant.rs の IQ3S 分岐も kernels_exp_iq*.cu も g1[j] / g2[j] (j < 4) だけ)。
+    # 下位 32 bit だけの表にする (4 KB -> 2 KB、64 bit -> 32 bit の読み)。
+    pack32 = []
+    for v in iq3s:
+        x = int(v, 0)
+        if (x >> 32) != 0:
+            raise SystemExit("IQ3S_GRID の上位 32 bit が 0 でない: %#x" % x)
+        pack32.append("%du" % (x & 0xFFFFFFFF))
+    out.append("// IQ3_S の詰めた表 (各本の下位 32 bit。上位 32 bit は全 0 で未使用)。")
+    emit_u32(out, "dno_iq3s_grid32", "IQ3S_GRID", pack32)
     sys.stdout.write("\n".join(out) + "\n")
 
 
