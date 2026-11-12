@@ -34,11 +34,17 @@
 //!   [`DEFAULT_POOL_MIN_TOK`] = 2048)。これ未満のプロンプトはプールに触らない
 //!   (短い prefill と decode の経路を 1 バイトも変えない)。
 //!
-//! # 採否
+//! # 採否 (task 265、lab t265a / t265c、2026-11-12、depth8k / swift15-abl-IQ3_S)
 //!
-//! task 257 (lab t257b): 起動時確保 + 予算削減は prefill の Target を満たしたが
-//! 14k 後の decode が +11.3% で不採用。task 265 で「借りて返す」形に変えた
-//! (採否は REPORT_P265.md の 1 行目)。
+//! **既定 off のまま** (ADOPT: no)。借りて返す形は prefill の Target を満たした:
+//! 14k cold 25.07 → 16.54 s (-34.0%、目標 -20%)、3,826 cold 7.27 → 3.34 s
+//! (-54.0%、目標 -30%)、短い decode +0.2%、errors 0、text sane。
+//! 落ちたのは 14k 後の decode で、18.52 → 19.40 ms/tok (+4.8%、許容 +2%)。
+//! 原因は予算ではなく **LRU の中身**: 層優先 prefill は expert をステージ経由で
+//! 流すだけで decode の LRU を温めない (`[exp-pf] experts=0`) ので、prefill 前の
+//! 内容が残る (ヒット率 0.956、base 0.974。ミス 21 本/tok vs 12.5)。
+//! 末尾トークンの expert を戻す warm (lab t265b) は 16,254 本 / 31 GB を出し入れ
+//! して VRAM を壊した (decode 255-292 ms/tok、text BROKEN) ので削除した。
 //!
 //! レイアウト ([`layout`]) が組めない・上限を超える・確保できないときは
 //! `None` を返し、呼び出し側は従来どおり `alloc_tagged` で取る
