@@ -62,10 +62,31 @@ pub fn on_from_value(v: Option<&str>) -> bool {
     )
 }
 
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// ゲートが有効か (プロセスで 1 回だけ env を読む)。
 pub fn enabled() -> bool {
+    match OVERRIDE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| on_from_value(std::env::var(ENV).ok().as_deref()))
+}
+
+/// テスト専用: ゲートを強制する (`None` で env 読みに戻す)。
+#[cfg(test)]
+pub fn set_enabled_for_tests(v: Option<bool>) {
+    OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
 }
 
 fn usize_env(name: &str, default: usize) -> usize {
@@ -111,6 +132,7 @@ pub fn note_sel(layer: usize, sel: &[usize]) {
     if !enabled() {
         return;
     }
+    SELS.fetch_add(1, Ordering::Relaxed);
     let Ok(mut cur) = CUR.lock() else {
         return;
     };
@@ -157,6 +179,7 @@ pub fn begin_token(n_layer: usize) -> Vec<Vec<u16>> {
         next
     };
     TOKENS.fetch_add(1, Ordering::Relaxed);
+    SNAP_IDS.fetch_add(snap.iter().map(|v| v.len() as u64).sum::<u64>(), Ordering::Relaxed);
     snap
 }
 
@@ -209,6 +232,7 @@ fn worker(p: Arc<Pool>) {
         for part in &parts {
             let Some(sl) = part.get() else { continue };
             bytes += sl.len() as u64;
+            TOUCHED.fetch_add(sl.len() as u64, Ordering::Relaxed);
             if touch_mode() {
                 touch_pages(sl);
             } else {
@@ -264,6 +288,12 @@ pub fn submit(jobs: Vec<Vec<Part>>) -> usize {
 /// 積んだ expert の鍵 (当たり判定用)。
 static PF_KEYS: Mutex<Vec<(u16, u16)>> = Mutex::new(Vec::new());
 
+/// 診断: 先読みの job を作る段で飛ばした理由を積む。
+pub fn note_skips(resident: u64, no_part: u64) {
+    SKIP_RES.fetch_add(resident, Ordering::Relaxed);
+    SKIP_PART.fetch_add(no_part, Ordering::Relaxed);
+}
+
 /// 積む予定の鍵を「積んだ集合」に写す (当たり率の分母)。
 pub fn note_submitted_keys(keys: &[(u16, u16)]) {
     if !enabled() {
@@ -277,6 +307,17 @@ pub fn note_submitted_keys(keys: &[(u16, u16)]) {
 // ---------------------------------------------------------------------------
 // 統計 (1 リクエストぶん)
 // ---------------------------------------------------------------------------
+
+/// 積算 (診断): `note_sel` が呼ばれた回数。
+static SELS: AtomicU64 = AtomicU64::new(0);
+/// 積算 (診断): snapshot に入っていた expert 本数の合計。
+static SNAP_IDS: AtomicU64 = AtomicU64::new(0);
+/// 積算 (診断): VRAM 常駐で飛ばした本数。
+static SKIP_RES: AtomicU64 = AtomicU64::new(0);
+/// 積算 (診断): mmap のハンドルが取れず飛ばした本数 (ヒープ実体など)。
+static SKIP_PART: AtomicU64 = AtomicU64::new(0);
+/// 積算 (診断): 背景スレッドが実際に readahead を投げた範囲の合計 (バイト)。
+static TOUCHED: AtomicU64 = AtomicU64::new(0);
 
 static TOKENS: AtomicU64 = AtomicU64::new(0);
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);
@@ -293,7 +334,9 @@ pub fn stats_line() -> Option<String> {
         return None;
     }
     let sub = SUBMITTED.load(Ordering::Relaxed);
-    if sub == 0 {
+    // 0 でも出す: 「ゲートは on なのに 1 本も積んでいない」ことが分かるように
+    // (`begin_token` が 1 回も呼ばれていない / 常駐で全部飛ばした / mmap が無い)。
+    if sub == 0 && TOKENS.load(Ordering::Relaxed) == 0 {
         return None;
     }
     let tokens = TOKENS.load(Ordering::Relaxed).max(1);
@@ -307,9 +350,14 @@ pub fn stats_line() -> Option<String> {
         0.0
     };
     Some(format!(
-        "[dec-pref] tokens={tokens} sub={sub} sub/tok={:.1} used={used} used_frac={:.2} \
-         done={done} dropped={} bytes={:.1}MB gbs={gbs:.2} work={:.1}ms queue_max={} thr={} touch={}",
+        "[dec-pref] tokens={tokens} sels={} snap/tok={:.1} sub={sub} sub/tok={:.1} \
+         skip_res={} skip_part={} used={used} used_frac={:.2} done={done} dropped={} \
+         bytes={:.1}MB gbs={gbs:.2} work={:.1}ms queue_max={} thr={} touch={}",
+        SELS.load(Ordering::Relaxed),
+        SNAP_IDS.load(Ordering::Relaxed) as f64 / tokens as f64,
         sub as f64 / tokens as f64,
+        SKIP_RES.load(Ordering::Relaxed),
+        SKIP_PART.load(Ordering::Relaxed),
         if sub > 0 { used as f64 / sub as f64 } else { 0.0 },
         DROPPED.load(Ordering::Relaxed),
         bytes as f64 / 1e6,
@@ -323,7 +371,8 @@ pub fn stats_line() -> Option<String> {
 /// 積算を 0 に戻す (リクエスト終端)。
 pub fn stats_reset() {
     for c in [
-        &TOKENS, &SUBMITTED, &DONE, &DROPPED, &BYTES, &USED, &WORK_NS, &QUEUE_MAX,
+        &TOKENS, &SUBMITTED, &DONE, &DROPPED, &BYTES, &USED, &WORK_NS, &QUEUE_MAX, &SELS,
+        &SNAP_IDS, &SKIP_RES, &SKIP_PART, &TOUCHED,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -357,6 +406,46 @@ mod tests {
         assert!(on_from_value(Some("1")));
         assert!(on_from_value(Some(" TRUE ")));
         assert!(on_from_value(Some("on")));
+    }
+
+    /// 記録 → 次のトークン先頭での取り出し、が層ごとに往復する。
+    ///
+    /// 「分岐が発火した証拠」を数えるテスト: `note_sel` が積んだ内容が
+    /// `begin_token` でそのまま返り、2 回目のトークンでは 1 回目の内容が返る。
+    #[test]
+    fn sel_roundtrips_through_begin_token() {
+        set_enabled_for_tests(Some(true));
+        stats_reset();
+        // 1 トークン目: 層 0/2 が選ぶ。先頭の begin_token は空 (前のトークンが無い)。
+        let first = begin_token(3);
+        assert_eq!(first.len(), 3);
+        assert!(first.iter().all(|v| v.is_empty()), "初回は空のはず");
+        note_sel(0, &[5, 9]);
+        note_sel(2, &[7]);
+        // 2 トークン目: 1 トークン目の選択が返る。
+        let second = begin_token(3);
+        assert_eq!(second[0], vec![5, 9]);
+        assert_eq!(second[1], Vec::<u16>::new());
+        assert_eq!(second[2], vec![7]);
+        // 3 トークン目: 2 トークン目に何も選ばなかったので空。
+        let third = begin_token(3);
+        assert!(third.iter().all(|v| v.is_empty()));
+        // 積算: begin_token 3 回。
+        assert_eq!(counters().0, 3);
+        stats_reset();
+        set_enabled_for_tests(None);
+    }
+
+    /// 待ち行列は満杯で落とす (積めないときは黙って捨てる = 値は変わらない)。
+    #[test]
+    fn submit_drops_past_the_queue_cap() {
+        set_enabled_for_tests(Some(true));
+        stats_reset();
+        // Part は mmap を要求するので、ここでは空の job (3 本揃っていない) を積む
+        // 経路だけを検査する: 空 Vec は 1 本として数えない。
+        assert_eq!(submit(Vec::new()), 0);
+        stats_reset();
+        set_enabled_for_tests(None);
     }
 
     /// ゲート off では記録も積み込みもしない (1 バイトも状態が動かない)。

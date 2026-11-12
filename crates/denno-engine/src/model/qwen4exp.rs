@@ -3117,6 +3117,7 @@ impl Qwen4Exp {
         let max = crate::model::exp_prefetch::max_per_token();
         let mut jobs: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::new();
         let mut keys: Vec<(u16, u16)> = Vec::new();
+        let (mut n_res, mut n_nopart) = (0u64, 0u64);
         'layers: for (il, ids) in snap.iter().enumerate() {
             if il >= self.layers.len() {
                 break;
@@ -3128,6 +3129,7 @@ impl Qwen4Exp {
                 }
                 let key = (il as u16, eid);
                 if resident.contains(&key) {
+                    n_res += 1;
                     continue;
                 }
                 let part = |w: &ExpertW| w.slice_mapped(eid as usize).ok().flatten();
@@ -3136,12 +3138,14 @@ impl Qwen4Exp {
                     part(&lw.up_exps),
                     part(&lw.down_exps),
                 ) else {
+                    n_nopart += 1;
                     continue;
                 };
                 jobs.push(vec![g, u, d]);
                 keys.push(key);
             }
         }
+        crate::model::exp_prefetch::note_skips(n_res, n_nopart);
         crate::model::exp_prefetch::note_submitted_keys(&keys);
         crate::model::exp_prefetch::submit(jobs);
     }
