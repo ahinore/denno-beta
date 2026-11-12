@@ -75,6 +75,8 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use crate::model::expert_cache::ExpertKey;
 
@@ -736,6 +738,173 @@ pub fn emergency_free(need: usize) -> usize {
     }
 }
 
+/// task 256: 1 回の追い出しイベントの記録 (ログ 1 行ぶん)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EvictReport {
+    /// 確保したかったバイト数。
+    pub requested: usize,
+    /// 実際に解放できたチャンク数。
+    pub chunks: usize,
+    /// 追い出した expert 数。
+    pub experts: usize,
+    /// 解放できた実バイト数。
+    pub released: usize,
+}
+
+impl EvictReport {
+    /// ログ 1 行 (要求・解放チャンク数・追い出した expert 数・解放バイト)。
+    pub fn line(&self) -> String {
+        format!(
+            "requested={} MiB chunks={} experts={} released={} MiB",
+            self.requested >> 20,
+            self.chunks,
+            self.experts,
+            self.released >> 20
+        )
+    }
+
+    /// 何も解放できなかったか。
+    pub fn is_empty(&self) -> bool {
+        self.released == 0 && self.chunks == 0 && self.experts == 0
+    }
+}
+
+/// task 256: 1 本の確保のために **slab のチャンクを丸ごと**空けて実メモリを返す。
+///
+/// `request` は確保したいバイト数。不足分だけを、アドレスが連続するチャンクの
+/// 窓で空ける (`plan_eviction`)。cuda feature 無しでは何も解放しない。
+pub fn emergency_free_chunks(request: usize) -> EvictReport {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::emergency_free_chunks(request)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        EvictReport {
+            requested: request,
+            ..EvictReport::default()
+        }
+    }
+}
+
+/// task 256: prefill の作業域を予約する (`DENNO_PREFILL_WORK_MB`、既定 0 = 予約しない)。
+///
+/// 予約は「これから N バイトの作業域を確保する」という宣言で、確保そのものは
+/// しない。`reserve_work_area` が不足分のチャンクを空け、prefill の中の確保が
+/// その空きを使う。終わったら [`WorkReserve`] を drop する (= `release`)。
+pub fn prefill_work_bytes() -> usize {
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var(PREFILL_WORK_MB_ENV)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .map(|mb| mb.saturating_mul(1 << 20))
+            .unwrap_or(0)
+    })
+}
+
+/// `DENNO_PREFILL_WORK_MB`: prefill の作業域として予約する MiB (既定 0)。
+pub const PREFILL_WORK_MB_ENV: &str = "DENNO_PREFILL_WORK_MB";
+
+/// task 256: 予約中のバイト数 (入れ子の予約を二重に空けないため)。
+static RESERVED: AtomicUsize = AtomicUsize::new(0);
+
+/// `need` の予約で空けるべき不足分 (純関数)。
+///
+/// 既に `reserved` バイト予約済みなら、その分は「これから使う空き」として数える。
+pub fn reserve_deficit(need: usize, free: usize, reserved: usize) -> usize {
+    need.saturating_sub(reserved).saturating_sub(free)
+}
+
+/// task 256: prefill の作業域の予約 (drop = release)。
+///
+/// 例:
+/// ```ignore
+/// let _work = expert_vram::reserve_work_area(1500 << 20);
+/// // prefill (この中の確保は、予約で空けたチャンクを使う)
+/// // drop で release。解放したチャンクは通常の LRU が後で埋め直す。
+/// ```
+pub struct WorkReserve {
+    need: usize,
+    report: EvictReport,
+}
+
+impl WorkReserve {
+    /// 予約したバイト数。
+    pub fn bytes(&self) -> usize {
+        self.need
+    }
+
+    /// 予約のために空けた内容 (何も空けなかったら空)。
+    pub fn report(&self) -> EvictReport {
+        self.report
+    }
+
+    /// 明示的に release する (drop と同じ)。
+    pub fn release(self) {}
+}
+
+impl Drop for WorkReserve {
+    fn drop(&mut self) {
+        RESERVED.fetch_sub(self.need.min(RESERVED.load(Ordering::Relaxed)), Ordering::Relaxed);
+        if !self.report.is_empty() {
+            tracing::info!(
+                "task256: prefill の作業域を解放 ({} / 予約 {} MiB)",
+                self.report.line(),
+                self.need >> 20
+            );
+        }
+    }
+}
+
+/// task 256: prefill の作業域を予約する。既に空きが足りていれば何もしない。
+///
+/// 予約はバイト数の記録だけで、メモリを掴み続けない (作業域そのものは prefill が
+/// 確保する)。予約で空けたチャンクは、release 後は通常の LRU が埋め直す。
+pub fn reserve_work_area(need: usize) -> WorkReserve {
+    if need == 0 {
+        return WorkReserve {
+            need: 0,
+            report: EvictReport::default(),
+        };
+    }
+    let reserved = RESERVED.load(Ordering::Relaxed);
+    let free = dev_free_bytes();
+    let deficit = reserve_deficit(need, free, reserved);
+    let mut report = if deficit > 0 {
+        // 空きが足りない分だけ、チャンクを丸ごと空ける。予約済みのぶんは
+        // 既に空けてあるので、`need` から引いた分だけを要求する。
+        emergency_free_chunks(need.saturating_sub(reserved))
+    } else {
+        EvictReport {
+            requested: 0,
+            ..EvictReport::default()
+        }
+    };
+    // ログは「予約した総量」で出す (空けたのは不足分だけ)。
+    if !report.is_empty() {
+        report.requested = need;
+        tracing::warn!("task256: 予約 {} MiB → {}", need >> 20, report.line());
+    }
+    RESERVED.fetch_add(need, Ordering::Relaxed);
+    WorkReserve { need, report }
+}
+
+/// task 256: デバイスの空きバイト数 (cuda 無しは 0)。
+fn dev_free_bytes() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::dev_mem_mb()
+            .map(|(f, _)| f.saturating_mul(1 << 20))
+            .unwrap_or(0)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// task 149: 確保に失敗したあと「LRU を追い出して再試行」するかの判定 (純関数)。
 ///
 /// - 再試行は **1 回だけ** (`attempt == 0`)。
@@ -766,11 +935,12 @@ pub fn effective_expert_cap(env_cap: usize) -> usize {
     // 空きを直接使えばその両方が自動的に効く (確保のたびに引き直す)。
     let free = free_mb.saturating_mul(1 << 20);
     let reserve = (crate::mem_audit::vram_reserve_mb() as usize).saturating_mul(1 << 20);
-    crate::mem_audit::card_expert_cap_from_free(
+    crate::mem_audit::card_expert_cap_from_free_with(
         env_cap,
         crate::mem_audit::experts_live_bytes(),
         free,
         reserve,
+        crate::mem_audit::fill_free_on(),
     )
 }
 
@@ -1074,9 +1244,47 @@ mod gpu {
         bytes: usize,
     }
 
+    impl ExpertBufs {
+        /// task 248: slab のスロットなら `(チャンク id, チャンク 1 本のバイト数)`。
+        ///
+        /// per-expert 確保 (`Direct`) はチャンクを持たないので `None`。
+        pub fn chunk_info(&self) -> Option<(usize, usize)> {
+            match self {
+                ExpertBufs::Slab { slot, .. } => Some((slot.chunk_id(), slot.chunk_bytes())),
+                ExpertBufs::Direct(_) => None,
+            }
+        }
+
+        /// task 256: slab のスロットなら `(チャンク id, 先頭アドレス, バイト数)`。
+        ///
+        /// 「アドレスが連続するチャンクの窓」を選ぶために、先頭アドレスが要る
+        /// (`cuMemAlloc` は連続した空きしか返せないので、飛び飛びに空けても
+        /// 大きな確保は通らない)。
+        pub fn chunk_span(&self) -> Option<(usize, usize, usize)> {
+            match self {
+                ExpertBufs::Slab { slot, .. } => Some((
+                    slot.chunk_id(),
+                    slot.handle().ptr() as usize,
+                    slot.chunk_bytes(),
+                )),
+                ExpertBufs::Direct(_) => None,
+            }
+        }
+    }
+
     impl ExpertDev {
         pub fn bytes(&self) -> usize {
             self.bytes
+        }
+
+        /// task 248: slab のスロットなら `(チャンク id, チャンク 1 本のバイト数)`。
+        pub fn chunk_info(&self) -> Option<(usize, usize)> {
+            self.bufs.chunk_info()
+        }
+
+        /// task 256: slab のスロットなら `(チャンク id, 先頭アドレス, バイト数)`。
+        pub fn chunk_span(&self) -> Option<(usize, usize, usize)> {
+            self.bufs.chunk_span()
         }
 
         pub fn shapes(&self) -> [ExpertShape; 3] {
@@ -1205,6 +1413,98 @@ mod gpu {
         // これが無くて 14k で q4 attention が CPU に落ちた)。
         let released = crate::model::expert_slab::release_empty(need);
         freed.saturating_add(released)
+    }
+
+    /// task 256: 1 本の確保のために、**チャンクを丸ごと**空けて実メモリを返す。
+    ///
+    /// 選ぶのは「アドレスが連続するチャンクの窓」のうち一番冷たいもの
+    /// ([`crate::model::expert_slab::plan_eviction`])。窓の expert を全員追い出して
+    /// から空チャンクを解放する (slab はチャンクが空にならないと `cuMemFree`
+    /// しない)。合計は不足分 + チャンク 1 本未満に収まる。
+    ///
+    /// `request` は**確保したいバイト数**。いまの空き (`cuMemGetInfo`) を引いた
+    /// 不足分だけを空ける。戻り値に「要求・解放チャンク数・追い出した expert 数・
+    /// 実際に解放できたバイト数」を入れる (呼び出し側が 1 行で記録する)。
+    ///
+    /// LRU のロックを持っているスレッド (expert のロード中) からは何もできない
+    /// (`try_lock`)。その場合は 0 を返し、呼び出し側が CPU 経路へ落ちる。
+    pub fn emergency_free_chunks(request: usize) -> EvictReport {
+        let mut rep = EvictReport {
+            requested: request,
+            ..EvictReport::default()
+        };
+        if request == 0 {
+            return rep;
+        }
+        let Some(c) = CACHE.get() else {
+            return rep;
+        };
+        let Ok(mut g) = c.try_lock() else {
+            return rep;
+        };
+        // 失敗直後なので、キャッシュ (64 MiB / 2 秒) ではなく実測を引く。
+        let free = crate::cuda::dev_mem_mb()
+            .map(|(f, _)| f.saturating_mul(1 << 20))
+            .unwrap_or(0);
+        // チャンクごとに (先頭アドレス, バイト数, 一番新しい最終使用, 鍵) を集める。
+        let mut map: std::collections::HashMap<usize, (usize, usize, u64, Vec<ExpertKey>)> =
+            std::collections::HashMap::new();
+        for (k, s) in g.entries.iter() {
+            let Some((id, addr, bytes)) = s.value.chunk_span() else {
+                continue;
+            };
+            let e = map.entry(id).or_insert((addr, bytes, 0, Vec::new()));
+            e.2 = e.2.max(s.last_use);
+            e.3.push(*k);
+        }
+        if map.is_empty() {
+            // slab に載っていない (per-expert 確保) なら、追い出しで実メモリが戻る。
+            let evicted = g.evict_until_free(request.saturating_sub(free));
+            rep.experts = evicted.len();
+            let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
+            drop(evicted);
+            drop(g);
+            let released = crate::model::expert_slab::release_empty(request.saturating_sub(free));
+            rep.released = freed.saturating_add(released);
+            return rep;
+        }
+        let spans: Vec<crate::model::expert_slab::ChunkSpan> = map
+            .iter()
+            .map(|(id, (addr, bytes, last_use, _))| crate::model::expert_slab::ChunkSpan {
+                id: *id,
+                addr: *addr,
+                bytes: *bytes,
+                last_use: *last_use,
+            })
+            .collect();
+        let plan = crate::model::expert_slab::plan_eviction(&spans, free, request);
+        if plan.ids.is_empty() {
+            return rep;
+        }
+        let chunks_before = crate::model::expert_slab::chunk_count();
+        let bytes_before = crate::model::expert_slab::stats().2;
+        let mut evicted = Vec::new();
+        for id in &plan.ids {
+            if let Some((_, _, _, keys)) = map.remove(id) {
+                for k in keys {
+                    if let Some(v) = g.remove(&k) {
+                        evicted.push(v);
+                    }
+                }
+            }
+        }
+        rep.experts = evicted.len();
+        drop(evicted); // SlabSlot が空きリストへ戻る
+        drop(g); // LRU のロックを離してからチャンクを解放する
+        let deficit = request.saturating_sub(free);
+        let released = crate::model::expert_slab::release_empty(deficit);
+        rep.released = released;
+        rep.chunks = chunks_before.saturating_sub(crate::model::expert_slab::chunk_count());
+        let bytes_after = crate::model::expert_slab::stats().2;
+        if rep.released == 0 {
+            rep.released = bytes_before.saturating_sub(bytes_after);
+        }
+        rep
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。
@@ -1852,6 +2152,41 @@ mod gpu {
 mod tests {
     use super::*;
     use crate::model::expert_cache::ExpertKey;
+
+    // ---- task 256: 作業域の予約 ------------------------------------------
+
+    /// 予約の不足分は「必要 - 予約済み - 空き」。0 未満は 0。
+    #[test]
+    fn reserve_deficit_accounts_for_reserved_and_free() {
+        let mib = 1usize << 20;
+        assert_eq!(reserve_deficit(1500 * mib, 1800 * mib, 0), 0, "空きで足りる");
+        assert_eq!(reserve_deficit(1500 * mib, 1000 * mib, 0), 500 * mib);
+        // 入れ子の予約は二重に空けない (既に予約した分は「これから使う空き」)。
+        assert_eq!(reserve_deficit(1500 * mib, 1000 * mib, 500 * mib), 0);
+        assert_eq!(reserve_deficit(1500 * mib, 0, 0), 1500 * mib);
+        assert_eq!(reserve_deficit(0, 0, 0), 0);
+        // 予約済みが要求より大きくても負にしない。
+        assert_eq!(reserve_deficit(100 * mib, 0, 200 * mib), 0);
+    }
+
+    /// ログ 1 行に要求・チャンク数・expert 数・解放バイトが入る。
+    #[test]
+    fn evict_report_line_has_the_four_numbers() {
+        let r = EvictReport {
+            requested: 1505 << 20,
+            chunks: 2,
+            experts: 96,
+            released: 512 << 20,
+        };
+        assert_eq!(
+            r.line(),
+            "requested=1505 MiB chunks=2 experts=96 released=512 MiB"
+        );
+        assert!(!r.is_empty());
+        assert!(EvictReport::default().is_empty());
+        // 予約なし (need = 0) は何もしない。
+        assert_eq!(reserve_work_area(0).bytes(), 0);
+    }
 
     // ---- task 149: 確保失敗 → 追い出し → 再試行の順序 ----------------------
 
