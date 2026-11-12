@@ -3308,6 +3308,15 @@ impl Qwen4Exp {
         // (エラーで抜けても Drop で戻る)。decode の間は抱えない。
         #[cfg(feature = "cuda")]
         let _pf_stream_guard = PfStreamGuard;
+        // task 270: チャンクを上げると prefill の作業域 (mix の res / scratch +
+        // MoE の行バッファ + staging) がそのぶん増える。`DENNO_PREFILL_WORK_MB`
+        // が指定されていれば、足りない分を expert の LRU から**チャンク単位で
+        // 先に**空けておく。途中の確保失敗で staging が取れず、streaming が
+        // 黙って落ちる (14k が 25 → 39 s になった t270a) のを防ぐ。drop で release。
+        #[cfg(feature = "cuda")]
+        let _pf_work = crate::model::expert_vram::reserve_work_area(
+            crate::model::expert_vram::prefill_work_bytes(),
+        );
         let logits = if batch && self.attn.layer_major_safe() {
             self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)?
         } else {
