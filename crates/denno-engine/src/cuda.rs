@@ -12867,7 +12867,13 @@ mod pf_exp_tc_tests {
         use crate::model::exp_pf::{lm_reserve_from_value, tc_exp_from_value};
         for v in [None, Some(""), Some("0"), Some("off"), Some("false")] {
             assert!(!lm_reserve_from_value(v), "lm_reserve({v:?})");
+        }
+        // task 265: tc_exp is default on; only explicit false values turn it off.
+        for v in [Some("0"), Some("off"), Some("false")] {
             assert!(!tc_exp_from_value(v), "tc_exp({v:?})");
+        }
+        for v in [None, Some("")] {
+            assert!(tc_exp_from_value(v), "tc_exp({v:?})");
         }
         for v in [Some("1"), Some("on"), Some("true"), Some(" yes ")] {
             assert!(lm_reserve_from_value(v), "lm_reserve({v:?})");
