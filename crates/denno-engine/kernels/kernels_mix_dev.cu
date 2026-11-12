@@ -16,6 +16,9 @@
 //   nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels_mix_dev.cu -o kernels_mix_dev.ptx
 // まとめて作るなら `kernels/build_ptx.sh mix_dev`。
 
+// task 266: dno_expf (glibc expf の逐語再現) が uint32_t / uint64_t を使う。
+#include <cstdint>
+
 // 32 スレッドの warp 内縮約 → 8 warp の縮約 (block 256 固定) → 全スレッドへ配る。
 // red は 16 float 以上の作業域 (呼び出し側の static shared)。
 // 加算順は固定 (offset 16,8,4,2,1 と warp 番号の昇順)。
