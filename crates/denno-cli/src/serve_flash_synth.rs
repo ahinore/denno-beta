@@ -1770,6 +1770,193 @@ fn intervene_epoch_invalidates_both_contexts() {
     std::env::remove_var("DENNO_FLASH_AUX_CTX");
 }
 
+/// ビューワの「clear KV cache」: GET /v1/cache が main / aux を返し、
+/// DELETE /v1/cache が両方を捨てる。次のリクエストは前置きを再利用しない。
+#[test]
+fn cache_http_get_delete_drops_both_contexts() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+    std::env::remove_var("DENNO_FLASH_AUX_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_RATIO");
+
+    let dir = TempDir::new("flash-cache-http");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let e0 = iv::current_epoch();
+
+    // 空のとき
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/cache", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert!(v["main"].is_null() && v["aux"].is_null(), "{v}");
+
+    flash.generate(&gen_req(LONG_A), no_emit).expect("A");
+    flash.generate(&side_b_req(), no_emit).expect("B");
+    let main_tok = flash.cache.as_ref().expect("主の文脈が無い").toks.len();
+    let aux_tok = flash.aux.as_ref().expect("脇の文脈が無い").toks.len();
+
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/cache", ""));
+    let v = http_json(&resp);
+    assert_eq!(v["main"]["tokens"], main_tok);
+    assert_eq!(v["aux"]["tokens"], aux_tok);
+    assert_eq!(v["main"]["epoch"], e0);
+
+    let resp = http_roundtrip(&mut flash, &http_req("DELETE", "/v1/cache", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert_eq!(v["dropped"], 2);
+    assert_eq!(v["dropped_tokens"], main_tok + aux_tok);
+    assert!(v["main"].is_null() && v["aux"].is_null(), "{v}");
+    assert!(flash.cache.is_none() && flash.aux.is_none());
+    // 介入 epoch は動かさない
+    assert_eq!(iv::current_epoch(), e0, "cache clear で epoch が動いた");
+
+    // 2 回目は捨てるものが無い (エラーにしない)
+    let v = http_json(&http_roundtrip(&mut flash, &http_req("DELETE", "/v1/cache", "")));
+    assert_eq!(v["dropped"], 0);
+
+    // 次のリクエストは full prefill
+    flash.generate(&gen_req(LONG_A), no_emit).expect("A2");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "cache clear のあとに古い prefix を再利用した"
+    );
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+}
+
+/// `POST /v1/abort`: 生成中の要求で次のトークンから止まる。生成していないときの
+/// 要求は空振り (次の生成に持ち越さない)。止めたあとの文脈は次のターンで使える。
+#[test]
+fn abort_stops_generation_and_is_not_carried_over() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    let _a = super::ABORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+
+    let dir = TempDir::new("flash-abort");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let long = |max: usize| {
+        GenReq::from_json(
+            &serde_json::json!({
+                "messages": [{"role": "user", "content": LONG_A}],
+                "max_tokens": max,
+                "temperature": 0.0,
+            }),
+            max,
+        )
+        .expect("GenReq")
+    };
+
+    // 生成していないときの要求は空振り
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/abort", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert_eq!(http_json(&resp)["aborted"], false);
+    // 空振りは次の生成を止めない
+    let full = flash.generate(&long(24), no_emit).expect("full");
+    assert!(full.n_out > 2, "合成モデルが {} トークンで終わり、停止を試せない", full.n_out);
+
+    // 生成中 (最初の差分を出したところ) で要求 → そこで止まる
+    let mut calls = 0usize;
+    let mut accepted = false;
+    let out = flash
+        .generate(&long(24), |_d| {
+            calls += 1;
+            if calls == 1 {
+                accepted = super::request_abort();
+            }
+            Ok(())
+        })
+        .expect("aborted");
+    assert!(calls >= 1, "合成モデルが本文を出さず、停止を試せない");
+    assert!(accepted, "生成中の停止要求が受け付けられない");
+    assert!(out.n_out <= 2, "停止要求のあとも生成が続いた: {} トークン", out.n_out);
+    assert_eq!(out.stop_reason, "end_turn");
+    assert!(flash.cache.is_some(), "止めた生成の文脈が残っていない");
+
+    // 次の生成は普通に最後まで走る (要求は持ち越さない)
+    let again = flash.generate(&long(24), no_emit).expect("again");
+    assert_eq!(again.n_out, full.n_out, "止めたあとの生成が最後まで走らない");
+}
+
+/// モデルの一覧と選択: 一覧は今のモデルを current にし、別モデルの選択は選択ファイルを
+/// 書いて 202 を返し、終了 (exit 75) を予約する。同じモデル・未知の id・.gguf の無い
+/// ディレクトリは切り替えない。env が無いサーバーは切り替え不可と答える。
+#[test]
+fn model_choices_and_select_http() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    let dir = TempDir::new("flash-model-select");
+    let mut flash = build_flash(&dir);
+    let cur = flash.parts[0].parent().unwrap().to_path_buf();
+    let other = PathBuf::from(dir.path("other"));
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("m-00001-of-00001.gguf"), b"x").unwrap();
+    let empty = PathBuf::from(dir.path("empty"));
+    std::fs::create_dir_all(&empty).unwrap();
+    let conf = PathBuf::from(dir.path("models.conf"));
+    let sel = PathBuf::from(dir.path("model_select"));
+    std::fs::write(
+        &conf,
+        format!(
+            "# id|dir|label|env\nA|{}|モデル A|\n\nB|{}|モデル B|DENNO_START_PREFETCH=0\nC|{}\nA|/dup|重複は無視|\n",
+            cur.display(),
+            other.display(),
+            empty.display()
+        ),
+    )
+    .unwrap();
+
+    // env が無ければ切り替え不可
+    std::env::remove_var("DENNO_MODEL_CHOICES");
+    std::env::remove_var("DENNO_MODEL_SELECT");
+    let v = http_json(&http_roundtrip(&mut flash, &http_req("GET", "/v1/model/choices", "")));
+    assert_eq!(v["switchable"], false);
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", r#"{"id":"B"}"#));
+    assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+
+    std::env::set_var("DENNO_MODEL_CHOICES", &conf);
+    std::env::set_var("DENNO_MODEL_SELECT", &sel);
+    let v = http_json(&http_roundtrip(&mut flash, &http_req("GET", "/v1/model/choices", "")));
+    assert_eq!(v["switchable"], true);
+    assert_eq!(v["current"], "A");
+    let ids: Vec<&str> = v["choices"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["A", "B", "C"]);
+    assert_eq!(v["choices"][0]["default"], true);
+    assert_eq!(v["choices"][1]["label"], "モデル B");
+    assert_eq!(v["choices"][1]["env"], "DENNO_START_PREFETCH=0");
+    assert_eq!(v["choices"][1]["available"], true);
+    assert_eq!(v["choices"][2]["available"], false);
+    assert_eq!(v["choices"][2]["label"], "C");
+
+    // 未知 / .gguf 無し / 不正な本文は 400、選択ファイルは書かない
+    for b in [r#"{"id":"Z"}"#, r#"{"id":"C"}"#, r#"{}"#, "not json"] {
+        let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", b));
+        assert!(resp.starts_with("HTTP/1.1 400"), "{b}: {resp}");
+    }
+    assert!(!sel.exists());
+    // 同じモデルは切り替えない
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", r#"{"id":"A"}"#));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert_eq!(http_json(&resp)["switching"], false);
+    assert_eq!(super::EXIT_AFTER.load(Ordering::SeqCst), 0);
+    // 別のモデル: 202、選択ファイル、終了の予約
+    let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/model/select", r#"{"id":"B"}"#));
+    assert!(resp.starts_with("HTTP/1.1 202 Accepted"), "{resp}");
+    assert_eq!(http_json(&resp)["switching"], true);
+    assert_eq!(std::fs::read_to_string(&sel).unwrap().trim(), "B");
+    assert_eq!(super::EXIT_AFTER.load(Ordering::SeqCst), super::EXIT_MODEL_SWITCH);
+    super::EXIT_AFTER.store(0, Ordering::SeqCst);
+    std::env::remove_var("DENNO_MODEL_CHOICES");
+    std::env::remove_var("DENNO_MODEL_SELECT");
+}
+
 // ---------------------------------------------------------------------------
 // task 218: 残差の平均の記録 / ステアリングの HTTP
 // ---------------------------------------------------------------------------
