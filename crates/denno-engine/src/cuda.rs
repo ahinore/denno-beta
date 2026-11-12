@@ -5149,6 +5149,54 @@ impl CudaCtx {
             .unwrap_or(false)
     }
 
+    /// task 266: デバイスにある重み・入力・出力で GEMV を **1 回積むだけ**。
+    ///
+    /// [`Self::moe_gemv_dev`] は H2D / 起動 / 同期 / D2H を 1 呼び出しでやるが、
+    /// mix の鎖 (down → silu → up → hc_mixed) は中間をデバイスに残したまま
+    /// 続けたいので、起動だけを切り出す。完了待ちは呼び出し側が鎖の末尾で 1 回。
+    ///
+    /// `false` = この型・形では GPU で回せない (呼び出し側は CPU へ)。
+    pub fn moe_gemv_dev_ptrs(
+        &self,
+        ty: crate::kquant::GgmlType,
+        dev_w: CUdeviceptr,
+        dev_x: CUdeviceptr,
+        dev_out: CUdeviceptr,
+        n_in: usize,
+        n_out: usize,
+    ) -> Result<bool> {
+        let mode = gemv_kernel_mode();
+        let Some(plan) = self.plan_moe_gemv(ty, n_in, n_out, mode)? else {
+            return Ok(false);
+        };
+        unsafe {
+            let (mut pw, mut px, mut po) = (dev_w, dev_x, dev_out);
+            let (mut n_in_c, mut n_out_c, mut rb_c) =
+                (n_in as c_int, n_out as c_int, plan.rb as c_int);
+            let (mut rows_c, mut lanes_c) =
+                (plan.rows_per_block as c_int, plan.lanes as c_int);
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut n_in_c as *mut _ as *mut c_void,
+                &mut n_out_c as *mut _ as *mut c_void,
+                &mut rb_c as *mut _ as *mut c_void,
+                &mut rows_c as *mut _ as *mut c_void,
+                &mut lanes_c as *mut _ as *mut c_void,
+            ];
+            let nargs = if plan.lanes > 1 { 8 } else { 6 };
+            self.launch_async(
+                plan.f,
+                (plan.grid, 1, 1),
+                (plan.block_dim, 1, 1),
+                plan.shmem,
+                &mut args[..nargs],
+            )?;
+        }
+        Ok(true)
+    }
+
     /// P-PF-GB: prefill 用の量子 GEMM (nt トークン一括, `kernels_gemm.ptx`)。
     ///
     /// 数値契約は **解除済み** (2026-10-28 のオペレーター指示)。`-fmad=true` で
@@ -25814,6 +25862,231 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
     }
 }
 
+/// task 266: hc mix が **量子型** (Q8_0 / Q5_1 / Q4_K / Q5_K) のときの
+/// **down → lo_apply(silu) → up → hc_mixed を 1 回の同期に畳む**経路。
+///
+/// `xn` は呼び出し側が計算済みの正規化入力 (`[hc][e]`)。UD-Q4_K_XL の mix は
+/// Q8_0 で、従来は 1 呼び出し 2 往復 (down の GEMV と up の GEMV がそれぞれ
+/// H2D + 同期 + D2H) = 1 トークン 194 起動 / 194 同期だった (REPORT_P261.md)。
+/// ここでは中間 (`lo`, `gate`) をデバイスに残したまま 4 本積み、同期は末尾の 1 回
+/// だけにする。値は CPU とビット一致 (silu は dno_expf = glibc expf の逐語再現)。
+///
+/// `false` = 経路が使えない (型・形・PTX・重みの常駐)。呼び出し側は従来経路へ。
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_gpu_mix_q_chain_into(
+    down_uid: u64,
+    down_ty: crate::kquant::GgmlType,
+    down_bytes: &[u8],
+    k1: usize,
+    n1: usize,
+    up_uid: u64,
+    up_ty: crate::kquant::GgmlType,
+    up_bytes: &[u8],
+    k2: usize,
+    n2: usize,
+    inv_hc: f32,
+    e: usize,
+    hc: usize,
+    xn: &[f32],
+    out: &mut [f32],
+) -> bool {
+    use std::sync::atomic::Ordering as AO;
+    if !cuda_enabled() || MIX_GPU_BROKEN.load(AO::Relaxed) {
+        return false;
+    }
+    // 形: down は k1 -> n1、up は n1 -> n2 (= hc * e)。
+    if k1 == 0
+        || n1 == 0
+        || n2 == 0
+        || e == 0
+        || hc == 0
+        || k2 != n1
+        || n2 != k1
+        || n2 / e != hc
+        || xn.len() != k1
+        || out.len() != e
+        || k1 < n1
+        || k1 > i32::MAX as usize
+        || n1 > i32::MAX as usize
+        || n2 > i32::MAX as usize
+        || e > i32::MAX as usize
+    {
+        return false;
+    }
+    // 4 型だけ (Q8_0 / Q5_1 / Q4_K / Q5_K)。
+    let ty_ok = |ty: crate::kquant::GgmlType| {
+        use crate::kquant::GgmlType as T;
+        matches!(ty, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K)
+    };
+    if !ty_ok(down_ty) || !ty_ok(up_ty) {
+        return false;
+    }
+    if gguf_row_bytes(down_ty, k1).is_none() || gguf_row_bytes(up_ty, n1).is_none() {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(err) = ctx.make_current() {
+        mix_gpu_broken_once(&format!("cuCtxSetCurrent (mix q chain): {err:#}"));
+        return false;
+    }
+    let Some(f_mixed) = hc_mixed_f32_fn(ctx) else {
+        return false;
+    };
+    let Some(mdk) = mix_dev_kernels() else {
+        return false;
+    };
+    // lo_apply のカーネルが無い PTX (task 266 より前) では通さない。
+    let Some(f_silu) = mdk.lo_silu else {
+        return false;
+    };
+    let wd = match weights_for_gguf(down_uid, down_ty, down_bytes, k1, n1) {
+        Ok(w) => w.buf.ptr(),
+        Err(err) => {
+            mix_gpu_broken_once(&format!("mix q chain down 重みの常駐に失敗: {err:#}"));
+            return false;
+        }
+    };
+    let wu = match weights_for_gguf(up_uid, up_ty, up_bytes, n1, n2) {
+        Ok(w) => w.buf.ptr(),
+        Err(err) => {
+            mix_gpu_broken_once(&format!("mix q chain up 重みの常駐に失敗: {err:#}"));
+            return false;
+        }
+    };
+    let Some(lib) = lib().ok() else {
+        return false;
+    };
+    const MIXED_THREADS: usize = 256;
+    let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        let _kp_win = dec_kprof::window(
+            dec_kprof::MIX,
+            dec_kprof::cur_layer(),
+            dec_kprof::cur_pos(),
+            3,
+        );
+        let mut s = cell.borrow_mut();
+        let MixGpuScratch {
+            x: dx,
+            lo: dlo,
+            out: dout,
+            mixed: dm,
+            hx,
+            ho,
+        } = &mut *s;
+        Scratch::ensure(dx, k1 * 4)?;
+        Scratch::ensure(dlo, n1 * 4)?;
+        Scratch::ensure(dout, n2 * 4)?;
+        Scratch::ensure(dm, e * 4)?;
+        Scratch::ensure_pin(hx, k1 * 4)?;
+        Scratch::ensure_pin(ho, e * 4)?;
+        let (dx, dlo, dout, dm) = (
+            dx.as_ref().unwrap(),
+            dlo.as_ref().unwrap(),
+            dout.as_ref().unwrap(),
+            dm.as_ref().unwrap(),
+        );
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        dec_kprof::step("mix_h2d_pack", || {
+            hx.as_mut_slice::<f32>()[..k1].copy_from_slice(xn)
+        });
+        let kp_cp = dec_kprof::op_begin(
+            || "H2D@a".to_string(),
+            (0, 0, 0),
+            (0, 0, 0),
+            0,
+            k1 * 4,
+        );
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    k1 * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync (mix q chain)",
+            )?;
+        }
+        dec_kprof::op_end(kp_cp);
+        // 1. down (量子 GEMV, デバイス内)
+        let ok = ctx.moe_gemv_dev_ptrs(down_ty, wd, dx.ptr(), dlo.ptr(), k1, n1)?;
+        if !ok {
+            return Err(anyhow::anyhow!("down の GEMV 計画が無い"));
+        }
+        // 2. lo_apply (silu(v * inv_hc)) — in-place
+        unsafe {
+            let (mut pv, mut nc) = (dlo.ptr(), n1 as c_int);
+            let mut invc = inv_hc;
+            let mut args = [
+                &mut pv as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut invc as *mut _ as *mut c_void,
+            ];
+            let grid = n1.div_ceil(THREADS_Q).max(1) as u32;
+            ctx.launch_async(f_silu, (grid, 1, 1), (THREADS_Q as u32, 1, 1), 0, &mut args)?;
+        }
+        // 3. up (量子 GEMV)
+        let ok = ctx.moe_gemv_dev_ptrs(up_ty, wu, dlo.ptr(), dout.ptr(), n1, n2)?;
+        if !ok {
+            return Err(anyhow::anyhow!("up の GEMV 計画が無い"));
+        }
+        // 4. hc_mixed (xn と gate から mixed)
+        unsafe {
+            let (mut px, mut pg, mut pm) = (dx.ptr(), dout.ptr(), dm.ptr());
+            let (mut ec, mut hcc) = (e as c_int, hc as c_int);
+            let mut invc2 = inv_hc;
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut pg as *mut _ as *mut c_void,
+                &mut pm as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut hcc as *mut _ as *mut c_void,
+                &mut invc2 as *mut _ as *mut c_void,
+            ];
+            let grid = (e.div_ceil(MIXED_THREADS).max(1)) as u32;
+            ctx.launch_async(
+                f_mixed,
+                (grid, 1, 1),
+                (MIXED_THREADS as u32, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+        let kp_cp = dec_kprof::op_begin(
+            || "D2H@a".to_string(),
+            (0, 0, 0),
+            (0, 0, 0),
+            0,
+            e * 4,
+        );
+        unsafe {
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (mix q chain)",
+            )?;
+        }
+        dec_kprof::op_end(kp_cp);
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        ctx.sync()?;
+        dec_kprof::step("mix_pack", || {
+            out.copy_from_slice(&ho.as_slice::<f32>()[..e])
+        });
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Err(e) => {
+            mix_gpu_broken_once(&format!("mix q chain failed: {e:#}"));
+            false
+        }
+    }
+}
+
 /// task 110: hc mix BF16 展開重みの常駐を解放する (`GgufLinear::drop` から)。
 /// 載っていない uid は触らない。MIX_GPU_W が未初期化 (一度も GPU に載せていない)
 /// なら何もしない。
@@ -25905,11 +26178,17 @@ pub(crate) fn mix_dev_attempts_reset() {
 }
 
 /// kernels_mix_dev.ptx のカーネル一式 (2 本そろって初めて `Some`)。
+/// task 266: mix の量子 chain の要素カーネルのスレッド数 (lo_silu は 256 固定)。
+const THREADS_Q: usize = 256;
+
 struct MixDevKernels {
     #[allow(dead_code)]
     module: CUmodule,
     norm: CUfunction,
     inj: CUfunction,
+    /// task 266: lo_apply (silu(v * inv_hc))。**古い PTX には無い**ので任意。
+    /// 無いときは Q8 の fused chain が CPU 経路へ落ちる (従来の経路は不変)。
+    lo_silu: Option<CUfunction>,
 }
 
 unsafe impl Send for MixDevKernels {}
@@ -25967,7 +26246,14 @@ fn mix_dev_kernels() -> Option<&'static MixDevKernels> {
                 };
                 let norm = get(b"dno_mix_norm\0")?;
                 let inj = get(b"dno_mix_inj\0")?;
-                Some(MixDevKernels { module, norm, inj })
+                // task 266: 任意 (古い PTX には無い)。
+                let lo_silu = get(b"dno_mix_lo_silu\0");
+                Some(MixDevKernels {
+                    module,
+                    norm,
+                    inj,
+                    lo_silu,
+                })
             }
         })
         .as_ref()

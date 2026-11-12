@@ -2947,6 +2947,11 @@ impl Qwen4Exp {
         // (逐次 prefill の末尾 1 トークンもここに入るが、値は CPU 経路と一致する
         // 契約なので問題にしない)。off ではガードの drop が 1 回走るだけ。
         let _gw = gdn_gpu_win::window(nt == 1);
+        // task 266: decode (nt == 1) のトークン先頭で、前のトークンの選択に基づく
+        // 先読みを背景スレッドへ積む (`DENNO_DEC_PREF=1` のときだけ)。
+        if nt == 1 {
+            self.decode_prefetch_token_start();
+        }
         for il in 0..self.p.n_layer {
             // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
             // task 155: 層の入口の下ごしらえを台帳の `loop` 行に分ける。
@@ -3087,6 +3092,63 @@ impl Qwen4Exp {
     fn gather_ple_many(&self, ctx: &[u32], start: usize) -> Result<Vec<Option<Vec<f32>>>> {
         gather_ple_many_rt(self.ple.as_deref(), ctx, start)
     }
+
+    /// task 266: decode のトークン先頭で、**1 トークン前の選択**のうち VRAM に
+    /// 載っていない expert のページを背景スレッドへ先読みさせる。
+    ///
+    /// `DENNO_DEC_PREF=1` のときだけ動く (既定 off)。予測が外れても捨てるだけで、
+    /// 値・経路は 1 バイトも変わらない。VRAM に載っている expert は mmap を
+    /// 触らないので積まない (ヒット率 0.9 のぶんを読まない)。
+    #[cfg(feature = "cuda")]
+    fn decode_prefetch_token_start(&self) {
+        if !crate::model::exp_prefetch::enabled() {
+            return;
+        }
+        let snap = crate::model::exp_prefetch::begin_token(self.p.n_layer);
+        if snap.is_empty() {
+            return;
+        }
+        // いま VRAM に載っている (層, expert) を 1 回だけ写す。
+        let resident: std::collections::HashSet<(u16, u16)> =
+            expert_vram::resident_keys()
+                .into_iter()
+                .map(|k| (k.layer, k.expert))
+                .collect();
+        let max = crate::model::exp_prefetch::max_per_token();
+        let mut jobs: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::new();
+        let mut keys: Vec<(u16, u16)> = Vec::new();
+        'layers: for (il, ids) in snap.iter().enumerate() {
+            if il >= self.layers.len() {
+                break;
+            }
+            let lw = &self.layers[il];
+            for &eid in ids {
+                if jobs.len() >= max {
+                    break 'layers;
+                }
+                let key = (il as u16, eid);
+                if resident.contains(&key) {
+                    continue;
+                }
+                let part = |w: &ExpertW| w.slice_mapped(eid as usize).ok().flatten();
+                let (Some(g), Some(u), Some(d)) = (
+                    part(&lw.gate_exps),
+                    part(&lw.up_exps),
+                    part(&lw.down_exps),
+                ) else {
+                    continue;
+                };
+                jobs.push(vec![g, u, d]);
+                keys.push(key);
+            }
+        }
+        crate::model::exp_prefetch::note_submitted_keys(&keys);
+        crate::model::exp_prefetch::submit(jobs);
+    }
+
+    /// cuda feature 無しでは先読みしない (mmap の Part を作る口が無い)。
+    #[cfg(not(feature = "cuda"))]
+    fn decode_prefetch_token_start(&self) {}
 
     /// 1 層ぶんの本体 (PLE 注入 → attention → MoE FFN)。
     ///
@@ -4738,6 +4800,97 @@ fn mix_quant_gpu_enabled() -> bool {
     })
 }
 
+/// task 266: `DENNO_MIX_QCHAIN` — 量子型 (Q8_0 / Q5_1 / Q4_K / Q5_K) の mix を
+/// **down → silu → up → hc_mixed の 1 同期**に畳む。既定 off。
+///
+/// UD-Q4_K_XL の mix は Q8_0 で、`DENNO_MIX_QUANT_GPU` の逐次経路は 1 呼び出し
+/// 2 往復 (194 起動 / 194 同期 per token) だった。ここでは中間をデバイスに
+/// 残したまま 4 本積む。値は CPU とビット一致 (silu は glibc expf の逐語再現)。
+pub const MIX_QCHAIN_ENV: &str = "DENNO_MIX_QCHAIN";
+
+/// [`MIX_QCHAIN_ENV`] の解釈 (純関数)。`1` / `true` / `on` だけが真
+/// (前後の空白と大小は落とす)。
+pub fn mix_qchain_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// 量子型 mix の fused chain を使うか (プロセスで 1 回だけ env を読む)。既定 off。
+fn mix_qchain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_qchain_from_value(std::env::var(MIX_QCHAIN_ENV).ok().as_deref())
+    })
+}
+
+/// task 266: mix が呼ばれた回数 (ゲート on のときだけ数える。1 プロセス通算)。
+pub(crate) static MIX_QCHAIN_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 266: 量子型 mix の fused chain が走った回数 (1 プロセス通算)。
+/// ゲート on で 0 なら「分岐に入っていない」ことが分かる (診断行 [mix-qchain])。
+pub(crate) static MIX_QCHAIN_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 266: `[mix-qchain]` の 1 行。ゲート off / 0 回なら `None`。
+pub fn mix_qchain_line() -> Option<String> {
+    if !mix_qchain_enabled() {
+        return None;
+    }
+    let n = MIX_QCHAIN_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    let calls = MIX_QCHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    Some(format!(
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3}",
+        if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
+    ))
+}
+
+/// task 266: 集計を 0 に戻す (リクエスト終端)。
+pub fn mix_qchain_reset() {
+    MIX_QCHAIN_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    MIX_QCHAIN_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod mix_qchain_tests {
+    use super::*;
+
+    /// task 266: ゲートは既定 off。`1` / `on` / `true` だけ on。
+    #[test]
+    fn qchain_gate_values() {
+        assert!(!mix_qchain_from_value(None));
+        assert!(!mix_qchain_from_value(Some("")));
+        assert!(!mix_qchain_from_value(Some("0")));
+        assert!(!mix_qchain_from_value(Some("off")));
+        assert!(mix_qchain_from_value(Some("1")));
+        assert!(mix_qchain_from_value(Some(" TRUE ")));
+        assert!(mix_qchain_from_value(Some("on")));
+    }
+
+    /// task 266: fused chain は **ブロック量子の 4 型だけ**。
+    /// BF16 (既定モデルの mix) / F32 / IQ では 1 度も入らない。
+    #[test]
+    fn qchain_types_are_the_block_four() {
+        use crate::kquant::GgmlType as T;
+        for t in [T::Q8_0, T::Q5_1, T::Q4K, T::Q5K] {
+            assert!(quant_gpu_ty_ok(t), "{t:?} は GPU で回せるはず");
+        }
+        for t in [T::Bf16, T::F32, T::F16, T::IQ3S, T::IQ2S, T::IQ4Nl, T::Q2_0] {
+            assert!(!quant_gpu_ty_ok(t), "{t:?} は CPU 経路のままのはず");
+        }
+    }
+
+    /// task 266: ゲート off では診断行を出さない (ログも 1 バイト変えない)。
+    #[test]
+    fn qchain_line_is_silent_when_off() {
+        if !mix_qchain_enabled() {
+            assert!(mix_qchain_line().is_none());
+        }
+    }
+}
+
 /// GPU の `moe_gemv_dev` / `moe_gemm_dev` が読める 4 型か (dense 重み用)。
 fn quant_gpu_ty_ok(ty: crate::kquant::GgmlType) -> bool {
     use crate::kquant::GgmlType as T;
@@ -5423,6 +5576,10 @@ fn hc_mix_quant_fast(
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     #[cfg(test)]
     MIX_FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // task 266: 分岐の分母 (ゲート on のときだけ数える)。
+    if mix_qchain_enabled() {
+        MIX_QCHAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let hc_dim = hp.hc * hp.n_embd;
     let e = hp.n_embd;
@@ -5602,6 +5759,38 @@ fn hc_mix_quant_fast(
                 xn,
                 &mut m,
             ) {
+                chain2_mixed = Some(m);
+            }
+        }
+        // task 266: 量子型 (UD-Q4_K_XL の mix は Q8_0) の fused chain。
+        // down → silu(v*inv_hc) → up → hc_mixed を 1 回の同期で閉じる
+        // (`DENNO_MIX_QCHAIN=1` のときだけ)。不発なら下の 2 往復経路へ落ちる。
+        #[cfg(feature = "cuda")]
+        if chain2_mixed.is_none()
+            && mix_gpu_enabled()
+            && mix_qchain_enabled()
+            && quant_gpu_ty_ok(down.ty())
+            && quant_gpu_ty_ok(up.ty())
+        {
+            let mut m = kp_step!("mix_alloc", vec![0.0f32; e]);
+            if crate::cuda::maybe_gpu_mix_q_chain_into(
+                down.uid(),
+                down.ty(),
+                down.blocks().as_slice(),
+                down.k(),
+                down.n(),
+                up.uid(),
+                up.ty(),
+                up.blocks().as_slice(),
+                up.k(),
+                up.n(),
+                1.0f32 / hp.hc as f32,
+                e,
+                hp.hc,
+                xn,
+                &mut m,
+            ) {
+                MIX_QCHAIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 chain2_mixed = Some(m);
             }
         }
@@ -9985,6 +10174,10 @@ fn moe_ffn_quant_impl(
             emit_expert_skip(lw.il, &probs, k, &sel, m);
         }
     }
+
+    // task 266: 次のトークンの先読み用に、この層の選択を記録する
+    // (ゲート off では atomic load 1 回。値には触れない)。
+    crate::model::exp_prefetch::note_sel(lw.il, &sel);
 
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
     drop(_l_router);
