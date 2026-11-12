@@ -69,15 +69,44 @@
 //!
 //! # 既定
 //!
-//! `DENNO_EXPERT_IQ_STATS_FILE` が未設定なら、この機能は丸ごと off
-//! ([`enabled`] が false = 数える分岐 1 個も通らない)。
+//! `DENNO_EXPERT_IQ_STATS_FILE` か `DENNO_EXPERT_STATS_DIR` が未設定なら、
+//! この機能は丸ごと off ([`enabled`] が false = 数える分岐 1 個も通らない)。
+//!
+//! # task 263: prefill も数える / モデルごとのファイル / 起動プラン
+//!
+//! - **prefill の選択も数える** ([`observe_batch`])。重みは **1/8**
+//!   ([`PREFILL_STRIDE`] = 8 トークンに 1 回)。理由: 1 本の長いプロンプト
+//!   (14k トークン) を重み 1 で数えると 14,000 トークン分になり、何時間もの
+//!   decode 履歴を一撃で塗り潰す。1/8 なら 1,750 トークン分 = 120 トークンの
+//!   decode 約 15 本ぶんで、「長いプロンプトでよく使う expert」は残しつつ
+//!   decode の履歴が主役のままになる。1/8 は「8 トークンに 1 回、その
+//!   トークンの選択を数える」で実装する (整数カウンタのまま、割り算なし)。
+//! - **モデルごとのファイル** (`DENNO_EXPERT_STATS_DIR`)。名前は
+//!   (ディレクトリ名, expert 合計バイト) から作る ([`stats_file_name`])。
+//!   モデルを切り替えても数え間違えないし、別モデルのファイルを読んで
+//!   「別モデルの記録」で捨てることもない。`DENNO_EXPERT_IQ_STATS_FILE` の
+//!   明示パスは従来どおり最優先 (既存の運用手順をそのまま使える)。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// 使用回数のファイルパス。未設定ならこの機能は off。
+/// 使用回数のファイルパス。未設定なら `DENNO_EXPERT_STATS_DIR` を見る。
 pub const STATS_FILE_ENV: &str = "DENNO_EXPERT_IQ_STATS_FILE";
+
+/// task 263: モデルごとのファイルを置くディレクトリ。
+///
+/// ファイル名はモデルの同一性 (ディレクトリ名 + expert 合計バイト) から
+/// 決まる ([`stats_file_name`]) ので、モデルを切り替えても混ざらない。
+/// 明示パス (`DENNO_EXPERT_IQ_STATS_FILE`) があればそちらが優先。
+pub const STATS_DIR_ENV: &str = "DENNO_EXPERT_STATS_DIR";
+
+/// task 263: prefill の選択を数える間隔 (トークン)。重み = 1/8。
+///
+/// 8 トークンに 1 回、そのトークンの top-k を 1 回ずつ数える。理由は
+/// モジュールの doc。1 にすると長いプロンプトが decode の履歴を塗り潰し、
+/// 大きくすると 1 リクエストのプロンプトでしか使わない expert が拾えない。
+pub const PREFILL_STRIDE: usize = 8;
 
 /// 事前ロードで予算から空けておく MiB (`DENNO_EXPERT_VRAM_MB` の内数)。
 ///
@@ -141,19 +170,90 @@ pub fn gate(iq_gpu: bool, file: Option<&str>) -> Option<PathBuf> {
     stats_file_from_value(file)
 }
 
-/// 使用回数のファイル (ゲートが off なら `None`)。
+/// task 263: モデルの同一性からファイル名を作る (`dir` は正規化する)。
 ///
-/// 有効条件は「`DENNO_EXPERT_IQ_GPU=1`」かつ「`DENNO_EXPERT_IQ_STATS_FILE` が
-/// 空でない」。どちらか欠けたらこの機能は丸ごと off。
-pub fn stats_path() -> Option<&'static Path> {
-    static P: OnceLock<Option<PathBuf>> = OnceLock::new();
-    P.get_or_init(|| {
-        gate(
-            crate::model::exp_iq::iq_gpu_enabled(),
-            std::env::var(STATS_FILE_ENV).ok().as_deref(),
-        )
-    })
-    .as_deref()
+/// `dir` はモデルディレクトリの**末尾の名前**を想定する (パスでも動くが、
+/// 区切りは `_` になる)。英数字・`.`・`-`・`_` 以外は `_` にし、長さは
+/// 80 バイトで切る (ext4 の 255 バイト制限に収める)。`expert_bytes` を
+/// 付けるので、同じ名前で量子型が変わっても別ファイルになる。
+pub fn stats_file_name(dir: &str, expert_bytes: u64) -> String {
+    let mut key = String::with_capacity(dir.len() + 24);
+    for ch in dir.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            key.push(ch);
+        } else {
+            key.push('_');
+        }
+    }
+    let key = key.trim_matches('_');
+    let key: String = key.chars().take(80).collect();
+    if key.is_empty() {
+        format!("dnnoexps-model-{expert_bytes}.bin")
+    } else {
+        format!("dnnoexps-{key}-{expert_bytes}.bin")
+    }
+}
+
+/// task 263: 記録先を決める (純関数)。
+///
+/// 1. `DENNO_EXPERT_IQ_STATS_FILE` (明示パス) があればそれ。ただし従来どおり
+///    `DENNO_EXPERT_IQ_GPU=1` が前提。
+/// 2. 無ければ `DENNO_EXPERT_STATS_DIR` + [`stats_file_name`]。こちらは
+///    数える・保存するだけなので IQ ゲートを要らない (RAM tier だけ使う
+///    構成でも履歴を貯められる)。
+/// 3. どちらも無ければ `None` (機能 off)。
+pub fn resolve_stats_path(
+    file: Option<&str>,
+    dir: Option<&str>,
+    model_dir: &str,
+    expert_bytes: u64,
+    iq_gpu: bool,
+) -> Option<PathBuf> {
+    if let Some(p) = gate(iq_gpu, file) {
+        return Some(p);
+    }
+    let d = dir.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(Path::new(d).join(stats_file_name(model_dir, expert_bytes)))
+}
+
+/// 記録先 (未解決なら `None`)。起動時に [`set_identity`] が決める。
+pub fn stats_path() -> Option<PathBuf> {
+    PATH.get()
+        .and_then(|l| l.read().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+static PATH: OnceLock<std::sync::RwLock<Option<PathBuf>>> = OnceLock::new();
+/// 記録先が決まっているか (ホットパスはこれ 1 個の atomic load で返る)。
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn path_slot() -> &'static std::sync::RwLock<Option<PathBuf>> {
+    PATH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// 記録先を決めて有効化する (env を 1 回だけ読む)。戻り値は決まったパス。
+///
+/// モデルの同一性が分かった時点 (起動時、モデル構築の前) で呼ぶ。
+/// 何度呼んでも最後の値が勝つ (モデルの切り替えはプロセス再起動なので
+/// 実際には 1 回)。
+pub fn configure(model_dir: &str, expert_bytes: u64) -> Option<PathBuf> {
+    let file = std::env::var(STATS_FILE_ENV).ok();
+    let dir = std::env::var(STATS_DIR_ENV).ok();
+    let p = resolve_stats_path(
+        file.as_deref(),
+        dir.as_deref(),
+        model_dir,
+        expert_bytes,
+        crate::model::exp_iq::iq_gpu_enabled(),
+    );
+    *path_slot().write().unwrap_or_else(|e| e.into_inner()) = p.clone();
+    ENABLED.store(p.is_some(), Ordering::Relaxed);
+    // 置き場所が無ければ作る (失敗しても起動は止めない。保存だけが失敗する)。
+    if let Some(dir) = p.as_ref().and_then(|p| p.parent()) {
+        if !dir.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+    p
 }
 
 /// 数える・保存する・事前ロードするのいずれかが有効か。
@@ -162,7 +262,7 @@ pub fn enabled() -> bool {
     if TEST_ON.load(Ordering::Relaxed) {
         return true;
     }
-    stats_path().is_some()
+    ENABLED.load(Ordering::Relaxed)
 }
 
 /// テスト専用: ゲートを強制 on にする (戻り値のガードを落とすと戻る)。
@@ -229,6 +329,18 @@ impl Cells {
         }
     }
 
+    /// task 263: prefill の 1 層ぶん (`nt` トークン x `k` 本の平らな配列) を
+    /// [`PREFILL_STRIDE`] 本おきに数える。
+    pub fn observe_batch(&self, layer: usize, sels: &[usize], k: usize, nt: usize) {
+        if k == 0 {
+            return;
+        }
+        for t in sampled_tokens(nt) {
+            let row = &sels[t * k..(t * k + k).min(sels.len())];
+            self.observe(layer, row);
+        }
+    }
+
     /// セルの生値 (`[layer * n_expert + expert]` の順)。
     pub fn snapshot(&self) -> Vec<u32> {
         self.v.iter().map(|c| c.load(Ordering::Relaxed)).collect()
@@ -276,6 +388,41 @@ pub fn observe_layer(n_layer: usize, n_expert: usize, layer: usize, sel: &[usize
     let cells = SESSION.get_or_init(|| Cells::new(n_layer, n_expert));
     cells.observe(layer, sel);
     DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// task 263: prefill の 1 層ぶんの選択 (`nt` トークン x `k` 本の平らな配列) を
+/// [`PREFILL_STRIDE`] 本おきに数える (重み 1/8)。
+///
+/// ホットパスの制約は decode と同じ: ロックなし・確保なし。`enabled()` が
+/// off なら atomic load 1 回で返る。on のときのコストは
+/// `(nt / 8) * k` 回の `fetch_add` (Relaxed)。1 トークンの decode が `k`
+/// 回なので、512 トークンのチャンク 1 個 = decode 64 トークンぶん。
+///
+/// 数えるトークンは `t % PREFILL_STRIDE == 0` のもの (チャンクの先頭から
+/// 8 本おき)。チャンクの割り方で標本が変わるが、順位に効くのは
+/// 「プロンプト全体で繰り返し選ばれる expert」なので実用上は同じ。
+pub fn observe_batch(
+    n_layer: usize,
+    n_expert: usize,
+    layer: usize,
+    sels: &[usize],
+    k: usize,
+    nt: usize,
+) {
+    if !enabled() {
+        return;
+    }
+    if n_layer == 0 || n_expert == 0 || k == 0 || nt == 0 {
+        return;
+    }
+    let cells = SESSION.get_or_init(|| Cells::new(n_layer, n_expert));
+    cells.observe_batch(layer, sels, k, nt);
+    DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// [`observe_batch`] が数えるトークンの位置 (`PREFILL_STRIDE` 本おき)。
+fn sampled_tokens(nt: usize) -> impl Iterator<Item = usize> {
+    (0..nt).step_by(PREFILL_STRIDE)
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +644,45 @@ pub fn budget_full(used: usize, want: usize, target: usize) -> bool {
     used.checked_add(want).map_or(true, |s| s > target)
 }
 
+/// 1 本を載せてよいか ([`budget_full`] の裏返し)。
+pub fn fits(used: u64, want: u64, target: u64) -> bool {
+    !budget_full(used as usize, want as usize, target as usize)
+}
+
+/// task 263: plan (回数の昇順) を VRAM / RAM / mmap に割る (純関数)。
+///
+/// `sizes[i]` は `plan[i]` の 1 本ぶんのバイト数。回数の多い側 (末尾) から
+/// 見て、VRAM 予算 (`vram_target`) に入るあいだ `vram`、続けて RAM 予算
+/// (`ram_budget`) に入るあいだ `ram`、残りは mmap。
+///
+/// 戻り値は `(vram_start, ram_start)`:
+/// `plan[vram_start..]` = VRAM、`plan[ram_start..vram_start]` = RAM、
+/// `plan[..ram_start]` = mmap。1 本も入らないときは両方 `n`。
+pub fn split_plan(sizes: &[u64], vram_target: u64, ram_budget: u64) -> (usize, usize) {
+    let n = sizes.len();
+    let mut used = 0u64;
+    let mut i = n;
+    while i > 0 {
+        let want = sizes[i - 1];
+        if !fits(used, want, vram_target) {
+            break;
+        }
+        used = used.saturating_add(want);
+        i -= 1;
+    }
+    let vram_start = i;
+    let mut used_ram = 0u64;
+    while i > 0 {
+        let want = sizes[i - 1];
+        if !fits(used_ram, want, ram_budget) {
+            break;
+        }
+        used_ram = used_ram.saturating_add(want);
+        i -= 1;
+    }
+    (vram_start, i)
+}
+
 // ---------------------------------------------------------------------------
 // 状態 (同一性・履歴・セッション)
 // ---------------------------------------------------------------------------
@@ -530,14 +716,16 @@ fn state() -> &'static Mutex<SaveState> {
 /// モデルの同一性と形を覚える (起動時、スレッドを起こす前)。
 ///
 /// 事前ロードをしない条件 (ファイル無し・壊れている・別モデル) でも呼ぶ。
-/// 保存だけは続けたいため。
-pub fn set_identity(dir: &str, expert_bytes: u64, n_layer: usize, n_expert: usize) {
+/// 保存だけは続けたいため。task 263: ここで記録先も決める ([`configure`])。
+pub fn set_identity(dir: &str, expert_bytes: u64, n_layer: usize, n_expert: usize) -> Option<PathBuf> {
+    let path = configure(dir, expert_bytes);
     if let Ok(mut s) = state().lock() {
         s.dir = dir.to_string();
         s.expert_bytes = expert_bytes;
         s.n_layer = n_layer as u32;
         s.n_expert = n_expert as u32;
     }
+    path
 }
 
 /// 読み込んだ履歴を「前回まで」として据え、保存を許可する。
@@ -601,21 +789,137 @@ pub fn save_now() -> Option<String> {
         n_expert: n_expert as u32,
         cells: merged.clone(),
     };
-    match save_atomic(path, &c) {
+    match save_atomic(&path, &c) {
         Ok(()) => {
             session_cells.reset();
             DIRTY.store(false, Ordering::Relaxed);
             s.prior = merged;
             let hits = c.nonzero();
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            *LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                bytes,
+            ));
             Some(format!(
                 "[exp-stats] saved {} counted={} cells bytes={} (prior>>{} at load + session)",
                 path.display(),
                 hits,
-                std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                bytes,
                 DECAY_SHIFT
             ))
         }
         Err(e) => Some(format!("[exp-stats] save failed {}: {e}", path.display())),
+    }
+}
+
+/// 最後に保存できた時刻 (unix 秒) とバイト数。まだ保存していなければ `None`。
+static LAST_SAVE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// [`LAST_SAVE`] の読み口 (エンドポイント用)。
+pub fn last_save() -> Option<(u64, u64)> {
+    *LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// いまの回数 (`prior + session`、減衰なし) のスナップショット。
+///
+/// 起動プランと /v1/experts/stats が使う。保存 ([`save_now`]) と違って
+/// 状態を進めない (prior を置き換えない・セッションを 0 に戻さない)。
+pub fn current_counts() -> Option<Counts> {
+    let s = state().lock().ok()?;
+    if !s.ready {
+        return None;
+    }
+    let (n_layer, n_expert) = (s.n_layer, s.n_expert);
+    if n_layer == 0 || n_expert == 0 {
+        return None;
+    }
+    let mut cells = s.prior.clone();
+    if let Some(sess) = session() {
+        let snap = sess.snapshot();
+        if snap.len() == cells.len() {
+            for (a, b) in cells.iter_mut().zip(snap.iter()) {
+                *a = a.saturating_add(*b);
+            }
+        }
+    }
+    Some(Counts {
+        dir: s.dir.clone(),
+        expert_bytes: s.expert_bytes,
+        n_layer,
+        n_expert,
+        cells,
+    })
+}
+
+/// キーの集合が記録した使用回数のうち何割を覆うか (`(覆った回数, 全体)`)。
+///
+/// 重複キーは 1 回だけ数える。範囲外は無視する。
+pub fn coverage(c: &Counts, keys: &[(u16, u16)]) -> (u64, u64) {
+    let ne = c.n_expert as usize;
+    let mut seen = std::collections::HashSet::with_capacity(keys.len());
+    let mut cov = 0u64;
+    for &(l, e) in keys {
+        let (l, e) = (l as usize, e as usize);
+        if l >= c.n_layer as usize || e >= ne {
+            continue;
+        }
+        if !seen.insert((l, e)) {
+            continue;
+        }
+        cov = cov.saturating_add(c.cells[l * ne + e] as u64);
+    }
+    let total = c.cells.iter().map(|v| *v as u64).sum();
+    (cov, total)
+}
+
+// ---------------------------------------------------------------------------
+// 起動プランの記録 (エンドポイント用)
+// ---------------------------------------------------------------------------
+
+/// 起動プラン 1 回ぶんの結果。`/v1/experts/stats` がそのまま返す。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlanSnapshot {
+    /// プランを立てた時刻 (unix 秒)。
+    pub at: u64,
+    /// 記録にあった expert の総数 (回数 > 0)。
+    pub planned_experts: usize,
+    /// VRAM tier に載せた本数 / バイト。
+    pub vram_experts: usize,
+    pub vram_bytes: u64,
+    /// RAM tier に載せた本数 / バイト。
+    pub ram_experts: usize,
+    pub ram_bytes: u64,
+    /// VRAM / RAM / 合計が覆う「記録された使用回数」の割合 (0..1)。
+    pub cover_vram: f64,
+    pub cover_ram: f64,
+    pub cover_total: f64,
+    /// プランにかかった秒。
+    pub secs: f64,
+    /// 再調整で移した本数 (累計)。
+    pub promoted: usize,
+    pub dropped: usize,
+}
+
+static PLAN: Mutex<Option<PlanSnapshot>> = Mutex::new(None);
+
+/// 起動プランの結果を残す。エンドポイントが読む。
+pub fn set_plan(p: PlanSnapshot) {
+    *PLAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+}
+
+/// 残した起動プラン (まだ無ければ `None`)。
+pub fn plan() -> Option<PlanSnapshot> {
+    PLAN.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// 再調整の累計だけを足す (プランが無ければ何もしない)。
+pub fn add_rebalance(promoted: usize, dropped: usize) {
+    if let Some(p) = PLAN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        p.promoted = p.promoted.saturating_add(promoted);
+        p.dropped = p.dropped.saturating_add(dropped);
     }
 }
 
@@ -747,6 +1051,111 @@ mod tests {
         assert_eq!(c.snapshot(), vec![0; 6]);
     }
 
+    /// task 263: prefill は 8 トークンに 1 回だけ数える (重み 1/8)。
+    ///
+    /// 20 トークン x k=2 なら標本は t = 0, 8, 16 の 3 本 x 2 = 6 回。
+    /// グローバルの SESSION は触らない (decode 経路のテストが次元を見るため)。
+    #[test]
+    fn prefill_batch_counts_every_eighth_token() {
+        assert_eq!(sampled_tokens(20).collect::<Vec<_>>(), vec![0, 8, 16]);
+        assert_eq!(sampled_tokens(0).count(), 0);
+        // t ごとに違う expert を選ばせて、数えた t が分かるようにする。
+        let (nt, k) = (20usize, 2usize);
+        let mut sels = vec![0usize; nt * k];
+        for t in 0..nt {
+            sels[t * k] = t % 4;
+            sels[t * k + 1] = 3;
+        }
+        let c = Cells::new(2, 4);
+        c.observe_batch(1, &sels, k, nt);
+        let snap = c.snapshot();
+        // 層 1 の行 = [layer * 4 + expert]。標本の t は 0, 8, 16 で、
+        // すべて t % 4 == 0 なので expert 0 が 3 回、expert 3 が 3 回。
+        assert_eq!(&snap[4..8], &[3, 0, 0, 3], "標本の t が 0,8,16 でない: {snap:?}");
+        // 層 0 は触っていない
+        assert_eq!(&snap[0..4], &[0, 0, 0, 0]);
+        // 範囲外の層・k=0 は何もしない
+        c.observe_batch(9, &sels, k, nt);
+        c.observe_batch(1, &sels, 0, nt);
+        assert_eq!(c.snapshot(), snap);
+    }
+
+    /// task 263: ファイル名は (ディレクトリ名, expert バイト) から作る。
+    #[test]
+    fn per_model_file_name_is_identity_based() {
+        let a = stats_file_name("swift15-abl-IQ3_S", 52_815_000_000);
+        assert_eq!(a, "dnnoexps-swift15-abl-IQ3_S-52815000000.bin");
+        // 同じ名前でも expert バイトが違えば別ファイル
+        assert_ne!(a, stats_file_name("swift15-abl-IQ3_S", 52_815_000_001));
+        // パス区切り・空白は `_` に、先頭末尾の `_` は落とす
+        assert_eq!(
+            stats_file_name("/models/a b/c", 7),
+            "dnnoexps-models_a_b_c-7.bin"
+        );
+        // 空でも衝突しない名前になる
+        assert_eq!(stats_file_name("", 7), "dnnoexps-model-7.bin");
+        // 長すぎる名前は 80 文字で切る
+        let long = "x".repeat(200);
+        let n = stats_file_name(&long, 7);
+        assert!(n.len() <= "dnnoexps-".len() + 80 + "-7.bin".len(), "{n}");
+    }
+
+    /// task 263: 明示ファイル > ディレクトリ > off の優先順。
+    #[test]
+    fn resolve_path_prefers_explicit_file() {
+        // 明示ファイルは IQ ゲートが要る (従来どおり)
+        assert_eq!(
+            resolve_stats_path(Some("/tmp/s.bin"), Some("/d"), "m", 1, true),
+            Some(PathBuf::from("/tmp/s.bin"))
+        );
+        assert_eq!(
+            resolve_stats_path(Some("/tmp/s.bin"), Some("/d"), "m", 1, false),
+            Some(PathBuf::from("/d").join(stats_file_name("m", 1)))
+        );
+        // ファイルが無ければディレクトリ + モデル名 (IQ ゲート不要)
+        assert_eq!(
+            resolve_stats_path(None, Some(" /d "), "m", 1, false),
+            Some(PathBuf::from("/d").join("dnnoexps-m-1.bin"))
+        );
+        assert_eq!(resolve_stats_path(None, Some("  "), "m", 1, true), None);
+        assert_eq!(resolve_stats_path(None, None, "m", 1, true), None);
+    }
+
+    /// task 263: 覆う割合はキーの重複を 1 回だけ数える。
+    #[test]
+    fn coverage_counts_uses_once_per_key() {
+        let mut c = Counts::zeros("m", 1, 2, 3);
+        c.cells = vec![1, 2, 3, 4, 5, 6];
+        // (0,0)=1 + (1,1)=5 = 6 / 全体 21
+        assert_eq!(coverage(&c, &[(0, 0), (1, 1)]), (6, 21));
+        // 重複は 1 回
+        assert_eq!(coverage(&c, &[(0, 0), (0, 0)]), (1, 21));
+        // 範囲外は無視
+        assert_eq!(coverage(&c, &[(9, 0)]), (0, 21));
+        assert_eq!(coverage(&c, &[]), (0, 21));
+    }
+
+    /// task 263: plan の割り方。回数の多い側から VRAM → RAM の順に埋め、
+    /// どちらにも入らない残りは mmap。境界は「ちょうどは入る」。
+    #[test]
+    fn split_plan_fills_vram_then_ram_from_the_hottest() {
+        // 5 本 x 100 バイト (昇順 = index 4 が一番熱い)。
+        let sizes = vec![100u64; 5];
+        // VRAM 300 = 3 本 (上から)、RAM 200 = 2 本 → mmap 0
+        assert_eq!(split_plan(&sizes, 300, 200), (2, 0));
+        // VRAM 100 ちょうど = 1 本、RAM 100 = 1 本、残り 3 本は mmap
+        assert_eq!(split_plan(&sizes, 100, 100), (4, 3));
+        // 予算 0 なら 1 本も載せない
+        assert_eq!(split_plan(&sizes, 0, 0), (5, 5));
+        // VRAM が 1 本未満 (99) でも RAM には入る
+        assert_eq!(split_plan(&sizes, 99, 1000), (5, 0));
+        // 大きさが違う: 末尾 (熱い) が 400 で VRAM 300 には入らない → RAM には入る
+        let sizes = vec![100u64, 100, 100, 100, 400];
+        assert_eq!(split_plan(&sizes, 300, 500), (5, 3));
+        // 空
+        assert_eq!(split_plan(&[], 100, 100), (0, 0));
+    }
+
     /// 有効条件: IQ ゲートと記録先の両方が要る。
     #[test]
     fn gate_needs_both_switch_and_path() {
@@ -823,5 +1232,35 @@ mod tests {
             per_token * 1e6
         );
         assert!(per_token < 0.3e-3, "0.3 ms/token を超えた: {per_token}");
+    }
+
+    /// task 263: prefill の計数の実測コスト (512 トークン x k=10 の 1 層ぶん)。
+    ///
+    /// `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_observe_batch`
+    #[test]
+    #[ignore]
+    fn bench_observe_batch_cost() {
+        let c = Cells::new(48, 512);
+        let sel: Vec<usize> = (0..10).collect();
+        let nt = 512usize;
+        let n = 2_000usize; // チャンク数
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            for layer in 0..48 {
+                for _ in (0..nt).step_by(PREFILL_STRIDE) {
+                    c.observe(layer, &sel);
+                }
+            }
+        }
+        let el = t.elapsed();
+        let per_chunk = el.as_secs_f64() / n as f64;
+        // 1 トークンの decode は 48 層 x 10 本 = 480 回。
+        println!(
+            "observe_batch: {:.1} us / 512-token chunk ({} adds) = {:.3} us/token",
+            per_chunk * 1e6,
+            nt.div_ceil(PREFILL_STRIDE) * 48 * sel.len(),
+            per_chunk * 1e6 / nt as f64
+        );
+        assert!(per_chunk < 5e-3, "5 ms/chunk を超えた: {per_chunk}");
     }
 }

@@ -13,7 +13,8 @@ import { encodeFrame } from '../src/frames.mjs';
 import {
   ACT_BUCKETS, BLOCKS, DEFAULT_SHAPE, DEFAULT_SHAPE_RAW, GEOM, STEER_MODES,
   actBuckets, addItem, clearSelection, createMapState, createMockStore, createSelection,
-  expertCellRect, hasItem, heat, hitTest, itemsInRect, layoutFromShape, mergeBodies,
+  expertCellRect, expertCoverageText, expertStatsView, expertTierText, hasItem, heat,
+  hitTest, itemsInRect, layoutFromShape, mergeBodies,
   mixerKind, normaliseShape, rampRGB, residencyBits, roleForBlock, routerWeights,
   selectionCount, selectionFromBody, selectionItems, selectionToBody, steerApplyBody,
   steerSummary, streamValue, toggleItem, removeItem, skipBits,
@@ -641,4 +642,91 @@ test('モック店: GET /v1/model/choices は切り替え不可の形', () => {
   assert.equal(r.status, 200);
   assert.equal(r.body.switchable, false);
   assert.deepEqual(r.body.choices, []);
+});
+
+// ---- 5. expert tier (task 271) -------------------------------------------
+
+test('モック店: GET /v1/experts/stats は tier ごとの本数・MB・当たりを返す', () => {
+  const m = createMockStore({ layers: 4, n_expert: 8, n_expert_used: 2, n_hc: 1, n_embd: 16 },
+    { now: () => 1762732800 });
+  const r = m.handle('GET', '/v1/experts/stats');
+  assert.equal(r.status, 200);
+  const b = r.body;
+  for (const k of ['enabled', 'file', 'last_save', 'recorded', 'vram', 'ram', 'mmap',
+    'coverage', 'last_request', 'plan']) {
+    assert.ok(k in b, k + ' が無い');
+  }
+  // 3 tier の本数の合計は記録された expert の総数 (mmap は残り)
+  assert.equal(b.recorded.n_layer, 4);
+  assert.equal(b.recorded.n_expert, 8);
+  assert.equal(b.vram.experts + b.ram.experts + b.mmap.experts, 4 * 8);
+  for (const t of ['vram', 'ram', 'mmap']) {
+    assert.ok(b[t].experts >= 0, t);
+    assert.ok(Number.isFinite(b[t].mb), t);
+  }
+  // MB は本数 x 1 本のバイト数 (切り捨て)。1 本 = 3,072,000 B
+  assert.equal(b.vram.mb, Math.floor((b.vram.experts * 3_072_000) / (1024 * 1024)));
+  // 直前のリクエスト: 参照 = 層数 x top-k、率は 0..1 で合計 1 以下
+  assert.equal(b.last_request.lookups, 4 * 2);
+  const sum = b.last_request.vram.hit_rate + b.last_request.ram.hit_rate + b.last_request.mmap.hit_rate;
+  assert.ok(sum <= 1 + 1e-9, '率の合計 ' + sum);
+  assert.ok(b.last_request.vram.hit_rate > b.last_request.ram.hit_rate);
+  // 記録ファイルと最終保存
+  assert.match(b.file, /\.bin$/);
+  assert.equal(b.last_save.unix, 1762732800);
+  // 読み取りだけなので epoch は動かない
+  assert.equal(m.handle('GET', '/v1/intervene').body.epoch, 0);
+});
+
+test('task 271: expertStatsView は実 API の形を tier の行に落とす', () => {
+  const body = {
+    enabled: true, file: '/var/lib/denno/expstats/x.bin',
+    last_save: { unix: 1762732800, bytes: 2048 },
+    recorded: { uses: 480 },
+    vram: { experts: 100, mb: 293 },
+    ram: { experts: 60, mb: 175 },
+    mmap: { experts: 40, mb: 117 },
+    coverage: { vram: 0.7, ram: 0.2, total: 0.9 },
+    last_request: {
+      lookups: 480,
+      vram: { hits: 430, hit_rate: 0.896 },
+      ram: { hits: 40, hit_rate: 40 / 480 },
+      mmap: { hits: 10, hit_rate: 10 / 480 },
+    },
+  };
+  const v = expertStatsView(body);
+  assert.equal(v.enabled, true);
+  assert.equal(v.file, '/var/lib/denno/expstats/x.bin');
+  assert.equal(v.savedUnix, 1762732800);
+  assert.equal(v.uses, 480);
+  assert.deepEqual(v.rows.map((r) => r.key), ['vram', 'ram', 'mmap']);
+  assert.deepEqual(v.rows[0], { key: 'vram', experts: 100, mb: 293, hit: 0.896 });
+  assert.ok(Math.abs(v.rows[1].hit - 40 / 480) < 1e-12);
+  assert.deepEqual(v.coverage, { vram: 0.7, ram: 0.2, total: 0.9 });
+  assert.equal(expertTierText(v.rows[0]), '100 exp · 293 MB · last 90%');
+  assert.equal(expertCoverageText(v.coverage), 'vram 70% · ram 20% · total 90%');
+});
+
+test('task 271: expertStatsView は 404・欠けたキー・範囲外の率に耐える', () => {
+  // 本文なし / 配列 / 文字列は全部「空」に落ちる (古いサーバーの 404 用)
+  for (const bad of [null, undefined, [], 'x']) {
+    const v = expertStatsView(bad);
+    assert.equal(v.enabled, false);
+    assert.equal(v.file, null);
+    assert.equal(v.savedUnix, null);
+    assert.deepEqual(v.rows.map((r) => [r.experts, r.mb, r.hit]),
+      [[null, null, null], [null, null, null], [null, null, null]]);
+  }
+  assert.equal(expertTierText(null), '- exp · - MB · last -');
+  assert.equal(expertCoverageText(null), 'vram - · ram - · total -');
+  // 率は 0..1 に丸める (1 を超える値・負の値でも帯からはみ出さない)
+  const v = expertStatsView({ last_request: { vram: { hit_rate: 1.5 }, ram: { hit_rate: -1 } } });
+  assert.equal(v.rows[0].hit, 1);
+  assert.equal(v.rows[1].hit, 0);
+  assert.equal(v.rows[2].hit, null);
+  // last_request が無ければ率は null (task 263 の古いエンドポイント)
+  const old = expertStatsView({ vram: { experts: 5, mb: 7 } });
+  assert.equal(old.rows[0].experts, 5);
+  assert.equal(old.rows[0].mb, 7);
+  assert.equal(old.rows[0].hit, null);
 });

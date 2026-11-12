@@ -1207,8 +1207,8 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, acquire_deferred, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup,
-    lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
+    acquire, acquire_deferred, acquire_host, acquire_soft, cache_usage, check_enabled, fallbacks,
+    init, keys, lookup, lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
     touch_many_count, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
@@ -1580,6 +1580,18 @@ mod gpu {
         Some((g.used_bytes(), g.cap_bytes()))
     }
 
+    /// task 263: いま VRAM に載っている expert の鍵 (エンドポイントと再調整用)。
+    /// 未初期化なら空。
+    pub fn keys() -> Vec<ExpertKey> {
+        let Some(c) = CACHE.get() else {
+            return Vec::new();
+        };
+        let Ok(g) = c.lock() else {
+            return Vec::new();
+        };
+        g.lru_keys()
+    }
+
     /// (LRU 使用中バイト, 外部予約バイト, 上限バイト)。未初期化なら `None`。
     ///
     /// task 149: 上限は「env の値」ではなく**いまの実効上限**を返す
@@ -1785,6 +1797,23 @@ mod gpu {
         acquire_opts(key, shapes, load, true)
     }
 
+    /// task 260: バイト列が **すでに pinned** (ホスト RAM tier の区間) のときの
+    /// [`acquire`]。bounce コピーを挟まず、そのまま DMA する。
+    ///
+    /// `src_pinned` が嘘でも壊れない (pageable からの `cuMemcpyHtoD` は合法。
+    /// driver が内部で staging するだけ = 従来と同じ速さ)。
+    pub fn acquire_host<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+        src_pinned: bool,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        acquire_opts_p(key, shapes, load, true, src_pinned)
+    }
+
     /// 1 本を VRAM へ上げる (事前ロード用)。`acquire_opts` の非ラッチ版。
     pub fn acquire_soft<'a, F>(
         key: ExpertKey,
@@ -1808,6 +1837,20 @@ mod gpu {
         shapes: [ExpertShape; 3],
         load: F,
         latch_on_fail: bool,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        acquire_opts_p(key, shapes, load, latch_on_fail, false)
+    }
+
+    /// [`acquire_opts`] の本体 (+ task 260 の転送元 pinned 指定)。
+    fn acquire_opts_p<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+        latch_on_fail: bool,
+        src_pinned: bool,
     ) -> Result<Option<Acquired>>
     where
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
@@ -1844,12 +1887,19 @@ mod gpu {
         // 6 型 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0) も
         // `kernels_exp_iq.ptx` があれば載せてよい (`DENNO_EXPERT_IQ_GPU=1` のときだけ
         // `moe_gemv_iq_ready` が真になる)。ゲートが off なら従来どおり false。
+        //
+        // task 268: **層一括カーネル (`kernels_moe_batch.ptx`) で回せる型も受ける**。
+        // UD-Q4_K_XL の decode は層一括経路 (`moe_experts_gpu_batched`) だけを通り、
+        // ここの判定は per-expert カーネル (`kernels_moe.ptx`) しか見ていなかった。
+        // 一括カーネルは Q4_K / Q5_K / Q5_1 / Q8_0 を全部持つので、載せてよい
+        // (= 事前ロードが 1 本も載せられない、を防ぐ)。
         let mut want = 0usize;
         // task 152: 3 行列のバイト数 (slab のスロット配分に使う)。
         let mut mbytes = [0usize; 3];
         for (i, s) in shapes.iter().enumerate() {
             if !crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k)
                 && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
+                && !crate::cuda::moe_gemv_seg_ready(s.ty, s.k)
             {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
@@ -1917,9 +1967,9 @@ mod gpu {
                 Some(s) => {
                     let base = s.offset();
                     let h = s.handle();
-                    h.upload_pinned_at(base + offs[0], gb)
-                        .and_then(|_| h.upload_pinned_at(base + offs[1], ub))
-                        .and_then(|_| h.upload_pinned_at(base + offs[2], db))
+                    h.upload_at_from(base + offs[0], gb, src_pinned)
+                        .and_then(|_| h.upload_at_from(base + offs[1], ub, src_pinned))
+                        .and_then(|_| h.upload_at_from(base + offs[2], db, src_pinned))
                 }
                 None => alloc_three(pinned, gb, ub, db).map(|b| direct = Some(b)),
             };
@@ -2887,5 +2937,55 @@ mod tests {
         assert_eq!(g.probes(), 1);
         assert_eq!(g.decide(0, Some(8)), GateDecision::Probe);
         assert_eq!(g.probes(), 2);
+    }
+
+    /// task 268: 事前ロードのバイト数が K 系 / legacy 型でも求まること。
+    ///
+    /// UD-Q4_K_XL の実形 (hidden 2560 / expert FF 640、gate/up = Q4_K、
+    /// down = Q5_1) で 1 本 = 3,072,000 B。`bytes()` が型で落ちると
+    /// 起動プランが VRAM に 1 本も載せられない (t263c でそう読めた)。
+    #[test]
+    fn plan_bytes_cover_k_and_legacy_types() {
+        use crate::kquant::GgmlType as T;
+        let ud = [
+            ExpertShape {
+                ty: T::Q4K,
+                k: 2560,
+                n: 640,
+            },
+            ExpertShape {
+                ty: T::Q4K,
+                k: 2560,
+                n: 640,
+            },
+            ExpertShape {
+                ty: T::Q5_1,
+                k: 640,
+                n: 2560,
+            },
+        ];
+        let sizes: Vec<usize> = ud.iter().map(|s| s.bytes().expect("K 系で求まる")).collect();
+        // Q4_K: 2560/256 * 144 = 1440 B/行 * 640 = 921,600
+        assert_eq!(sizes[0], 921_600);
+        assert_eq!(sizes[1], 921_600);
+        // Q5_1: 640/32 * 24 = 480 B/行 * 2560 = 1,228,800
+        assert_eq!(sizes[2], 1_228_800);
+        assert_eq!(sizes.iter().sum::<usize>(), 3_072_000);
+        // Q5_K / Q8_0 も同じ入口で求まる (legacy 4 型。k は型のブロックで割り切る)
+        for ty in [T::Q5K, T::Q8_0, T::Q5_1] {
+            let s = ExpertShape {
+                ty,
+                k: 2560,
+                n: 640,
+            };
+            assert!(s.bytes().is_ok(), "{ty:?} のバイト数が求まらない");
+        }
+        // 端数 (ブロックで割り切れない) は今までどおり Err (fail closed)
+        let bad = ExpertShape {
+            ty: T::Q4K,
+            k: 640,
+            n: 2560,
+        };
+        assert!(bad.bytes().is_err(), "Q4_K の 640 は 256 で割り切れない");
     }
 }
