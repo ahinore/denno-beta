@@ -48380,6 +48380,104 @@ pub struct GdnGgufUnit<'a> {
     pub n: usize,
 }
 
+// ---- task 269: beta/alpha 制御投影をデバイスで回す -------------------------
+//
+// 背景 (lab t269a の `[q4prof]`): decode の ssm 層は
+// 「beta/alpha の F32 GEMV を **ホストで** 計算 → qkv GEMV 以降を GPU に 1 発」
+// という順で、ホストの GEMV が終わるまで GPU が遊んでいる。実測は
+// `A_GATE − A_GDN` = 0.785 ms/token (36 層 × 21.8 us) で、これは
+// 983 KB/層 の重みを RAM から読む帯域 (48 GB/s) にほぼ等しい = ホストでは
+// これ以上縮まない。GPU 側は同じ重みが VRAM に載るので 3-5 us で済む。
+//
+// 数値: `dno_matvec_f32_r` (固定の木で縮約) を使うので、CPU の逐次/FMA 経路
+// とは丸め順が違う (**ビット一致しない**)。決定論は保つ。`DENNO_GDN_BA_GPU=0`
+// で従来のホスト計算へ戻る。既定 off (lab の A/B で決める)。
+
+/// task 269: `DENNO_GDN_BA_GPU` の解釈 (純関数)。既定 off。
+///
+/// `1` / `on` / `true` だけ on (取り違えを増やさない)。
+pub fn parse_gdn_ba_gpu(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim),
+        Some("1") | Some("on") | Some("true") | Some("ON") | Some("True")
+    )
+}
+
+/// task 269: beta/alpha を GPU で計算するか (`DENNO_GDN_BA_GPU`・既定 off)。
+pub fn gdn_ba_gpu_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gdn_ba_gpu(std::env::var("DENNO_GDN_BA_GPU").ok().as_deref()))
+}
+
+/// task 269: F32 の beta/alpha 重みを VRAM に常駐させる (uid ごと・grow only)。
+///
+/// 量は 36 層 × 983 KB ≈ 35 MB で、`DENNO_GPU_WEIGHT_MB` の追い出し対象には
+/// しない (毎トークン触るので常駐が前提)。確保に失敗したら `None` = 従来経路。
+fn ba_gpu_weight(uid: u64, blocks: &[u8], k: usize, n: usize) -> Option<CUdeviceptr> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, (usize, usize, usize)>>> =
+        OnceLock::new();
+    // (k, n, bytes) と DevBuffer の ptr を別表で持つ (DevBuffer は Send でないため
+    // thread_local ではなく static の生ポインタで持つ。プロセス寿命で解放しない)。
+    static PTRS: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> = OnceLock::new();
+    let bytes = k.checked_mul(n)?.checked_mul(4)?;
+    if blocks.len() != bytes {
+        return None;
+    }
+    let reg = REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ptrs = PTRS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let g = reg.lock().ok()?;
+        if let Some(&(ek, en, eb)) = g.get(&uid) {
+            if (ek, en, eb) != (k, n, bytes) {
+                return None;
+            }
+            let p = ptrs.lock().ok()?;
+            return p.get(&uid).map(|&v| v as CUdeviceptr);
+        }
+    }
+    let buf = DevBuffer::from_slice_tagged(blocks, crate::mem_audit::TAG_MIX_F32).ok()?;
+    let p = buf.ptr();
+    // DevBuffer を解放しないよう、生ポインタだけを残して Box を leak する
+    // (プロセス寿命の常駐。35 MB 程度なので許容)。
+    std::mem::forget(buf);
+    reg.lock().ok()?.insert(uid, (k, n, bytes));
+    ptrs.lock().ok()?.insert(uid, p as usize);
+    Some(p)
+}
+
+/// task 269: beta/alpha (F32) を 1 発の matvec で `x_dev` → `out_dev` へ。
+fn gdn_launch_ba_f32(
+    ctx: &CudaCtx,
+    unit: &GdnGgufUnit<'_>,
+    x_dev: CUdeviceptr,
+    out_dev: CUdeviceptr,
+) -> Result<()> {
+    if unit.ty != crate::kquant::GgmlType::F32 || unit.n == 0 || unit.n > 65535 {
+        bail!("gdn ba: 型/行数が想定外 ({:?}, n={})", unit.ty, unit.n);
+    }
+    let w = ba_gpu_weight(unit.uid, unit.blocks, unit.k, unit.n)
+        .ok_or_else(|| anyhow::anyhow!("gdn ba: 重みを VRAM に置けない (uid={})", unit.uid))?;
+    // 並列縮約版 (1 行 = 1 ブロック・256 スレッド)。PTX に無ければ逐次版 (128)。
+    let (f, thr) = match matvec_f32_r_fn(ctx) {
+        Some(fr) => (fr, 256u32),
+        None => match matvec_f32_fn(ctx) {
+            Some(f) => (f, 128u32),
+            None => bail!("gdn ba: dno_matvec_f32 が PTX に無い"),
+        },
+    };
+    let (mut ph, mut pw, mut po) = (x_dev, w, out_dev);
+    let (mut kc, mut nc) = (unit.k as c_int, unit.n as c_int);
+    let mut args = [
+        &mut ph as *mut _ as *mut c_void,
+        &mut pw as *mut _ as *mut c_void,
+        &mut po as *mut _ as *mut c_void,
+        &mut kc as *mut _ as *mut c_void,
+        &mut nc as *mut _ as *mut c_void,
+    ];
+    unsafe { ctx.launch_async(f, (unit.n as u32, 1, 1), (thr, 1, 1), 0, &mut args)? };
+    Ok(())
+}
+
 /// `gdn_decode_submit` のリクエスト。
 pub struct GdnDecodeReq<'a> {
     /// SsmLayer インスタンスの nonce (ストアの鍵)。
@@ -48404,6 +48502,10 @@ pub struct GdnDecodeReq<'a> {
     /// beta / alpha (ホスト f32。CPU の F32 GEMV で計算済み)。
     pub beta: &'a [f32],
     pub alpha: &'a [f32],
+    /// task 269: beta/alpha をデバイスで計算する場合の単位と出力行オフセット。
+    /// 空でなければホストの `beta` / `alpha` は読まず、`xba` の beta/alpha 節域へ
+    /// f32 matvec を 1 発ずつ積む (`DENNO_GDN_BA_GPU`)。
+    pub ba_units: &'a [(GdnGgufUnit<'a>, usize)],
     /// ホスト正本の状態 (デバイスが古いときのシードに使う)。
     pub conv_host: &'a [f32],
     pub ssm_host: &'a [f32],
@@ -48982,8 +49084,8 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         if req.cur.len() != req.n_embd
             || req.conv_host.len() != e.conv_len
             || req.ssm_host.len() != e.ssm_len
-            || req.beta.len() != req.nv
-            || req.alpha.len() != req.nv
+            || (req.ba_units.is_empty()
+                && (req.beta.len() != req.nv || req.alpha.len() != req.nv))
         {
             gdn_note_once("入力長が寸法と違う (バグの疑い) → CPU 経路");
             return GdnDecodeRes::cpu();
@@ -49120,14 +49222,24 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             let mut st = cell.borrow_mut();
             st.clear();
             st.extend_from_slice(req.cur);
-            st.extend_from_slice(req.beta);
-            st.extend_from_slice(req.alpha);
+            // task 269: beta/alpha をデバイスで計算するときは詰めない
+            // (節域は同じ位置にあり、matvec の出力がそのまま入る)。
+            if req.ba_units.is_empty() {
+                st.extend_from_slice(req.beta);
+                st.extend_from_slice(req.alpha);
+            }
             e.xba.copy_from(st.as_slice())
         })?;
         stage_sync!("xba_h2d");
         let px = e.xba.ptr();
         let pb = px + (req.n_embd * 4) as CUdeviceptr;
         let pa = pb + (req.nv * 4) as CUdeviceptr;
+        // task 269: beta/alpha の f32 matvec を qkv GEMV より前に積む
+        // (scan は最後なので順序は同一ストリームで保証される)。
+        for (u, off) in req.ba_units {
+            gdn_launch_ba_f32(ctx, u, px, pb + (*off * 4) as CUdeviceptr)?;
+            stage_sync!("ba_gemv");
+        }
         for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
             gdn_launch_gemv_dev(
                 ctx,
@@ -49307,6 +49419,7 @@ mod gdn_decode_scan_tests {
             cur: &[],
             beta: &[],
             alpha: &[],
+            ba_units: &[],
             conv_host: &[],
             ssm_host: &[],
             wconv: &[],
