@@ -23,9 +23,16 @@
 //!
 //! # ゲート
 //!
-//! - `DENNO_EXPERT_RAM_MB`: `0` / `off` で完全に従来 (1 バイトも確保しない)。
-//!   未設定 / `auto` は自動 = `MemAvailable` − 余裕 (`DENNO_EXPERT_RAM_MARGIN_MB`,
-//!   既定 8192 MiB) を、モデルの expert 総バイト数で頭打ちにする。
+//! - `DENNO_EXPERT_RAM_MB`: **未設定 / `0` / `off` は無効** (従来と 1 バイトも
+//!   変わらない)。`auto` は自動 = `MemAvailable` − 余裕
+//!   (`DENNO_EXPERT_RAM_MARGIN_MB`, 既定 8192 MiB) を、モデルの expert 総バイト数で
+//!   頭打ちにする。数値は MiB。
+//!
+//!   **既定 off にしてある理由** (lab t260c の実測): 59 GiB の機械で IQ3_S の
+//!   expert 47 GB を所有すると MemAvailable が 8-10 GB まで落ち、expert 以外
+//!   (dense / PLE / 非常駐 expert) が page cache から追い出されて warm decode が
+//!   19.4 → 46.4 ms/tok になった。cold の prefill は 17.21 → 8.89 s (-48%) と
+//!   狙いどおりなので、**大きさを絞れば**両立する見込み (未検証)。
 //! - `DENNO_EXPERT_RAM_PIN`: `0` で pinned を諦めてヒープ (A/B 用。既定 on)。
 //! - `DENNO_EXPERT_RAM_FILL`: `0` で起動時の充填をしない (使用時に埋まる。既定 on)。
 //! - `DENNO_EXPERT_RAM_DBG`: `1` で 1 リクエストごとに 1 行 stderr。
@@ -55,25 +62,27 @@ pub const DEFAULT_MARGIN_MB: u64 = 8192;
 
 /// `DENNO_EXPERT_RAM_MB` の解釈。
 ///
-/// - `None` (未設定) / 空 / `auto` → `None` = 自動
-/// - `0` / `off` / `false` → `Some(0)` = 無効
+/// - `None` (未設定) / 空 / `0` / `off` / `false` → `Some(0)` = 無効 (既定)
+/// - `auto` → `None` = 自動
 /// - 数値 → `Some(MiB)`
-/// - その他 → `None` (自動。誤植で勝手に無効にしない)
+/// - その他 → `Some(0)` (無効。誤植で勝手にメモリを確保しない)
 pub fn mb_from_value(v: Option<&str>) -> Option<u64> {
     let s = match v {
         Some(s) => s.trim(),
-        None => return None,
+        None => return Some(0),
     };
-    if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+    if s.eq_ignore_ascii_case("auto") {
         return None;
     }
-    if matches!(
-        s.to_ascii_lowercase().as_str(),
-        "0" | "off" | "false" | "no"
-    ) {
+    if s.is_empty()
+        || matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        )
+    {
         return Some(0);
     }
-    s.parse::<u64>().ok().map(Some).unwrap_or(None)
+    s.parse::<u64>().ok().map(Some).unwrap_or(Some(0))
 }
 
 /// ゲートが有効か (0 でも自動でもない)。
@@ -492,27 +501,38 @@ mod tests {
 
     #[test]
     fn mb_values_are_explicit() {
-        assert_eq!(mb_from_value(None), None);
-        assert_eq!(mb_from_value(Some("")), None);
+        // 既定 (未設定) は無効
+        assert_eq!(mb_from_value(None), Some(0));
+        assert_eq!(mb_from_value(Some("")), Some(0));
+        // 自動は明示したときだけ
         assert_eq!(mb_from_value(Some("auto")), None);
         assert_eq!(mb_from_value(Some("AUTO")), None);
         assert_eq!(mb_from_value(Some("0")), Some(0));
         assert_eq!(mb_from_value(Some(" off ")), Some(0));
         assert_eq!(mb_from_value(Some("false")), Some(0));
         assert_eq!(mb_from_value(Some("4096")), Some(4096));
-        // 誤植は自動 (勝手に無効にしない)
-        assert_eq!(mb_from_value(Some("4G")), None);
+        // 誤植は無効 (勝手にメモリを確保しない)
+        assert_eq!(mb_from_value(Some("4G")), Some(0));
         assert!(!enabled_from_value(Some("0")));
-        assert!(enabled_from_value(None));
+        assert!(!enabled_from_value(None));
+        assert!(enabled_from_value(Some("auto")));
         assert!(enabled_from_value(Some("1024")));
     }
 
     #[test]
     fn budget_is_margin_bounded_and_capped_by_experts() {
         let gb = 1u64 << 30;
-        // 自動: MemAvailable - margin と expert 総量の小さいほう
-        assert_eq!(budget_bytes(None, Some(50 * gb), 100 * gb, 8 * gb), 42 * gb);
-        assert_eq!(budget_bytes(None, Some(50 * gb), 10 * gb, 8 * gb), 10 * gb);
+        // 未設定は 0 (既定 off)
+        assert_eq!(budget_bytes(None, Some(50 * gb), 100 * gb, 8 * gb), 0);
+        // 自動 (明示): MemAvailable - margin と expert 総量の小さいほう
+        assert_eq!(
+            budget_bytes(Some("auto"), Some(50 * gb), 100 * gb, 8 * gb),
+            42 * gb
+        );
+        assert_eq!(
+            budget_bytes(Some("auto"), Some(50 * gb), 10 * gb, 8 * gb),
+            10 * gb
+        );
         // 明示でも MemAvailable - margin を超えない
         assert_eq!(
             budget_bytes(Some("40960"), Some(50 * gb), 100 * gb, 8 * gb),
@@ -525,10 +545,13 @@ mod tests {
         // 無効
         assert_eq!(budget_bytes(Some("0"), Some(50 * gb), 100 * gb, 8 * gb), 0);
         // MemAvailable が読めないときは明示予算だけが残る (自動は 0)
-        assert_eq!(budget_bytes(None, None, 100 * gb, 8 * gb), 0);
+        assert_eq!(budget_bytes(Some("auto"), None, 100 * gb, 8 * gb), 0);
         assert_eq!(budget_bytes(Some("2048"), None, 100 * gb, 8 * gb), 2 * gb);
         // 余裕より空きが少ない
-        assert_eq!(budget_bytes(None, Some(4 * gb), 100 * gb, 8 * gb), 0);
+        assert_eq!(
+            budget_bytes(Some("auto"), Some(4 * gb), 100 * gb, 8 * gb),
+            0
+        );
     }
 
     #[test]
