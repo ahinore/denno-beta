@@ -596,3 +596,34 @@ test('BLOCKS と既定形の整合', () => {
   assert.equal(DEFAULT_SHAPE.n_expert_used, 10);
   assert.equal(DEFAULT_SHAPE.n_expert_used <= DEFAULT_SHAPE.n_expert, true);
 });
+
+test('モック店: GET / DELETE /v1/cache (KV の文脈) は epoch を動かさない', () => {
+  const m = createMockStore({ layers: 2, n_expert: 4, n_expert_used: 1, n_hc: 1, n_embd: 8 });
+  let r = m.handle('GET', '/v1/cache');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { main: null, aux: null });
+  m.tick(5);
+  r = m.handle('GET', '/v1/cache');
+  assert.deepEqual(r.body.main, { tokens: 5, epoch: 0 });
+  const e0 = m.handle('GET', '/v1/intervene').body.epoch;
+  r = m.handle('DELETE', '/v1/cache');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.dropped, 1);
+  assert.equal(r.body.dropped_tokens, 5);
+  assert.equal(r.body.main, null);
+  assert.equal(m.handle('GET', '/v1/intervene').body.epoch, e0);
+  // 2 回目は捨てるものが無い
+  assert.equal(m.handle('DELETE', '/v1/cache').body.dropped, 0);
+});
+
+test('地図の状態: reset で残差 stream の元 (role) と累積が 0 に戻る', () => {
+  const st = createMapState({ layers: 2, n_expert: 4, n_expert_used: 1, n_hc: 2, n_embd: 8 }, { mode: 'accum' });
+  st.onFrame({ kind: 'RoleAct', layer: 1, roles: { attn: 0.7, gdn: 0.2 } });
+  st.onFrame({ kind: 'RouterTopK', layer: 0, experts: [2], weights: [1] });
+  assert.ok(streamValue(st.role[1]) > 0);
+  st.reset();
+  assert.equal(streamValue(st.role[1]), 0);
+  assert.equal(Math.max(...st.accum[0]), 0);
+  assert.equal(Math.max(...st.experts[0]), 0);
+  assert.equal(st.frames, 0);
+});

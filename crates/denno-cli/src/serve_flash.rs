@@ -980,6 +980,34 @@ impl Flash {
         n
     }
 
+    /// ビューワ用: いま持っている文脈 (main / aux) のトークン数と epoch。
+    /// 文脈 = full attention の KV と GDN の再帰状態・conv 履歴・PLE conv 履歴。
+    /// 残差 stream そのものはトークンごとに作り直すので、リクエストの間には残らない。
+    fn ctx_json(&self) -> Value {
+        let one = |c: &Option<Cached>| match c {
+            Some(c) => json!({"tokens": c.toks.len(), "epoch": c.epoch}),
+            None => Value::Null,
+        };
+        json!({"main": one(&self.cache), "aux": one(&self.aux)})
+    }
+
+    /// ビューワ用: 文脈 (main / aux) を両方捨て、decoder の系列状態も空に戻す。
+    /// 次のリクエストは前置きを再利用せず、最初から prefill する。
+    /// 介入 epoch は動かさない (介入の設定は変えていないので)。
+    fn clear_ctx(&mut self) -> Value {
+        let tokens = self.cache.as_ref().map_or(0, |c| c.toks.len())
+            + self.aux.as_ref().map_or(0, |c| c.toks.len());
+        let n = usize::from(self.cache.take().is_some()) + usize::from(self.aux.take().is_some());
+        if let Some(d) = self.dec.as_mut() {
+            d.reset();
+        }
+        eprintln!("[flash] cache clear: 文脈を {n} 本捨てた ({tokens} tok, KV / GDN 状態)");
+        let mut v = self.ctx_json();
+        v["dropped"] = json!(n);
+        v["dropped_tokens"] = json!(tokens);
+        v
+    }
+
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
         // task 217: このリクエストの間は介入設定を固定する。生成中に
@@ -2115,6 +2143,14 @@ fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
     if req.method == "DELETE" && path == "/v1/intervene" {
         let cfg = iv::clear(&flash.shape.engine_shape());
         return send_json(&mut stream, "200 OK", &intervene_to_json(&cfg));
+    }
+    // ビューワ用: 保持している文脈 (KV / GDN 状態) の確認と破棄。
+    if req.method == "GET" && path == "/v1/cache" {
+        return send_json(&mut stream, "200 OK", &flash.ctx_json());
+    }
+    if req.method == "DELETE" && path == "/v1/cache" {
+        let v = flash.clear_ctx();
+        return send_json(&mut stream, "200 OK", &v);
     }
     // task 218: 残差の平均の記録 / 適用 (ビューワが使う)。
     if req.method == "GET" && path == "/v1/steer" {

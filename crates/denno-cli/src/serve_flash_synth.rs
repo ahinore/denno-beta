@@ -1770,6 +1770,64 @@ fn intervene_epoch_invalidates_both_contexts() {
     std::env::remove_var("DENNO_FLASH_AUX_CTX");
 }
 
+/// ビューワの「clear KV cache」: GET /v1/cache が main / aux を返し、
+/// DELETE /v1/cache が両方を捨てる。次のリクエストは前置きを再利用しない。
+#[test]
+fn cache_http_get_delete_drops_both_contexts() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let _l = IV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+    std::env::remove_var("DENNO_FLASH_AUX_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_RATIO");
+
+    let dir = TempDir::new("flash-cache-http");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+    let e0 = iv::current_epoch();
+
+    // 空のとき
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/cache", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert!(v["main"].is_null() && v["aux"].is_null(), "{v}");
+
+    flash.generate(&gen_req(LONG_A), no_emit).expect("A");
+    flash.generate(&side_b_req(), no_emit).expect("B");
+    let main_tok = flash.cache.as_ref().expect("主の文脈が無い").toks.len();
+    let aux_tok = flash.aux.as_ref().expect("脇の文脈が無い").toks.len();
+
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/cache", ""));
+    let v = http_json(&resp);
+    assert_eq!(v["main"]["tokens"], main_tok);
+    assert_eq!(v["aux"]["tokens"], aux_tok);
+    assert_eq!(v["main"]["epoch"], e0);
+
+    let resp = http_roundtrip(&mut flash, &http_req("DELETE", "/v1/cache", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    let v = http_json(&resp);
+    assert_eq!(v["dropped"], 2);
+    assert_eq!(v["dropped_tokens"], main_tok + aux_tok);
+    assert!(v["main"].is_null() && v["aux"].is_null(), "{v}");
+    assert!(flash.cache.is_none() && flash.aux.is_none());
+    // 介入 epoch は動かさない
+    assert_eq!(iv::current_epoch(), e0, "cache clear で epoch が動いた");
+
+    // 2 回目は捨てるものが無い (エラーにしない)
+    let v = http_json(&http_roundtrip(&mut flash, &http_req("DELETE", "/v1/cache", "")));
+    assert_eq!(v["dropped"], 0);
+
+    // 次のリクエストは full prefill
+    flash.generate(&gen_req(LONG_A), no_emit).expect("A2");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "cache clear のあとに古い prefix を再利用した"
+    );
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+}
+
 // ---------------------------------------------------------------------------
 // task 218: 残差の平均の記録 / ステアリングの HTTP
 // ---------------------------------------------------------------------------

@@ -1057,6 +1057,8 @@ export function createMockStore(shape, opts = {}) {
     snapshots: [],
     apply: null,
     tokens: 0,
+    // 実 API の main 文脈のトークン数 (GET / DELETE /v1/cache)。
+    ctx_tokens: 0,
   };
   let tick = 0;
 
@@ -1139,6 +1141,13 @@ export function createMockStore(shape, opts = {}) {
     st.epoch++;
   }
 
+  function ctxStatus() {
+    return {
+      main: st.ctx_tokens > 0 ? { tokens: st.ctx_tokens, epoch: st.epoch } : null,
+      aux: null,
+    };
+  }
+
   const store = {
     shape: s,
     state: () => jsonClone(store.snapshot()),
@@ -1162,6 +1171,7 @@ export function createMockStore(shape, opts = {}) {
       tick += n;
       if (st.recording) st.recording.tokens += n;
       st.tokens += n;
+      st.ctx_tokens += n;
     },
 
     handle(method, path, body) {
@@ -1204,6 +1214,16 @@ export function createMockStore(shape, opts = {}) {
           status: 200,
           body: { epoch: st.epoch, experts_off: [], blocks_off: [], streams_off: [] },
         };
+      }
+      if (m === 'GET' && p === '/v1/cache') {
+        return { status: 200, body: ctxStatus() };
+      }
+      if (m === 'DELETE' && p === '/v1/cache') {
+        const dropped = st.ctx_tokens > 0 ? 1 : 0;
+        const tokens = st.ctx_tokens;
+        st.ctx_tokens = 0;
+        // 実 API と同じく介入 epoch は動かさない。
+        return { status: 200, body: Object.assign(ctxStatus(), { dropped, dropped_tokens: tokens }) };
       }
       if (m === 'GET' && p === '/v1/steer') {
         return { status: 200, body: status() };

@@ -236,6 +236,18 @@
     </div>
 
     <div class="box">
+      <h2>state <span class="dim">/api/v1/cache</span></h2>
+      <div class="kv"><span>kv main</span><b id="kv-main">-</b></div>
+      <div class="kv"><span>kv aux</span><b id="kv-aux">-</b></div>
+      <div class="row2">
+        <button id="btn-kvclear" class="b warn" title="サーバーが持つ文脈 (full attention の KV、GDN の再帰状態と conv 履歴) を捨てる。次のチャットは最初から prefill し直す">clear KV cache</button>
+        <button id="btn-resclear" class="b" title="層の壁に出している残差 stream・ブロック・expert の表示 (per token / accumulated) を 0 に戻す">clear residual</button>
+      </div>
+      <div id="kverr" class="err"></div>
+      <div id="kvinfo" class="small dim" style="margin-top:4px"></div>
+    </div>
+
+    <div class="box">
       <h2>requests <span class="dim">last 14</span></h2>
       <div id="reqlog" class="reqlog"></div>
     </div>
@@ -415,9 +427,11 @@ async function boot() {
   if (Q.get('panes') === 'map') { togglePane('chat'); togglePane('ctrl'); }
   if (Q.get('mock') === '1') {
     startMock('forced by ?mock=1');
+    refreshCtx();
     return;
   }
   await probeLive(true);
+  refreshCtx();
 }
 // ---- 壁のレイアウト (task 235) -------------------------------------------
 // 列数とセル寸法は地図の実面積から決める。窓の resize と列の畳み (
@@ -811,6 +825,53 @@ $('btn-clear-apply').addEventListener('click', async () => {
   const r = await api('DELETE', '/v1/steer/apply');
   if (r.status !== 200) { $('steerr').textContent = 'clear apply → ' + r.status + ' ' + errText(r); return; }
   await refreshAll('steering cleared');
+});
+
+// ---- 文脈 (KV / GDN 状態) と残差の表示のクリア ------------------------------
+// サーバーはリクエストの間、main と aux の 2 本の文脈 (full attention の KV、
+// GDN の再帰状態と conv 履歴、PLE conv 履歴) を持ち、次のターンで前置きを使い回す。
+// 残差 stream はトークンごとに作り直すのでサーバーには残らない。画面の残差 stream
+// (と層の壁の表示) は st が持つので、それを 0 に戻すのが clear residual。
+function ctxText(c) {
+  if (!c || typeof c !== 'object') return 'empty';
+  return Number(c.tokens || 0).toLocaleString('en-US') + ' tok (epoch ' + c.epoch + ')';
+}
+
+function renderCtx(body) {
+  $('kv-main').textContent = ctxText(body && body.main);
+  $('kv-aux').textContent = ctxText(body && body.aux);
+}
+
+async function refreshCtx() {
+  const r = mock ? mock.handle('GET', '/v1/cache') : await apiQuiet('/v1/cache');
+  if (r.status === 200 && r.body && typeof r.body === 'object') renderCtx(r.body);
+  else { $('kv-main').textContent = '? (' + r.status + ')'; $('kv-aux').textContent = '?'; }
+}
+
+function clearResidualView() {
+  st.reset();
+  dirty = true;
+  renderState();
+}
+
+$('btn-kvclear').addEventListener('click', async () => {
+  $('kverr').textContent = '';
+  if (busy) { $('kverr').textContent = '生成中はクリアできない (終わってから)'; return; }
+  const r = await api('DELETE', '/v1/cache');
+  if (r.status !== 200 || !r.body || typeof r.body !== 'object') {
+    $('kverr').textContent = 'DELETE /v1/cache → ' + r.status + ' ' + errText(r);
+    return;
+  }
+  renderCtx(r.body);
+  const at = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+  $('kvinfo').textContent = at + ' 文脈 ' + (r.body.dropped | 0) + ' 本 (' +
+    Number(r.body.dropped_tokens || 0).toLocaleString('en-US') + ' tok) を捨てた · 次のチャットは prefill し直す';
+});
+
+$('btn-resclear').addEventListener('click', () => {
+  clearResidualView();
+  const at = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+  $('kvinfo').textContent = at + ' 残差 stream と層の壁の表示を 0 に戻した';
 });
 
 // ---- 地図の描画 (task 235: 層の壁) ---------------------------------------
@@ -1245,6 +1306,7 @@ async function pollState() {
       if (sig !== cur) applySteer(b.body, 'external change');
       else if (b.body.epoch !== undefined) noteEpoch(b.body.epoch, 'external change');
     }
+    await refreshCtx();
   } finally {
     polling = false;
   }
@@ -1366,6 +1428,7 @@ async function sendMsg(text) {
   busy = false;
   chatEl.send.disabled = false;
   if (!mock) refreshSteer('chat');
+  refreshCtx();
   if (r.stop === 'max_tokens' && r.acc && !r.err) showContinue(node);
 }
 
@@ -1381,6 +1444,7 @@ async function continueMsg(node) {
   busy = false;
   chatEl.send.disabled = false;
   if (!mock) refreshSteer('chat');
+  refreshCtx();
   if (r.stop === 'max_tokens' && r.acc !== base && !r.err) showContinue(node);
 }
 
@@ -1429,6 +1493,9 @@ window.__view2d = {
   onSelected: () => $('btn-on').click(),
   clearSelection: () => { clearSel(sel); renderState(); dirty = true; },
   clearOff: () => $('btn-offclear').click(),
+  clearKv: () => $('btn-kvclear').click(),
+  clearResidual: () => $('btn-resclear').click(),
+  refreshCtx: () => refreshCtx(),
   api,
   pushFrame: (f) => handleFrame(f),
   ready: false,
