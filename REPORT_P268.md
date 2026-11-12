@@ -3,8 +3,9 @@ ADOPT: no t268a t268b t268c
 # REPORT P268 — UD-Q4_K_XL の事前ロード / RAM tier / 本番の cold start
 
 branch: br268 (br263 から。int-auto 62a9ad1 は br263 の祖先なので最初の merge は
-不要)。lab のあと int-auto が b8e5de2 (task 265 = dev2 の prefill pool) まで
-進んだので取り込んだ (9c377c5)。commit: 9828537 + 44368eb + 9c377c5 + 最終。
+不要)。lab のあと int-auto が b8e5de2 (task 265 = dev2 の prefill pool) と
+89b7f8a (その赤テストの修正) まで進んだので順に取り込んだ。
+commit: 9828537 + 44368eb + 9c377c5 + 2b940bc + 最終 merge + 最終。
 
 ## 0. 結論
 
@@ -204,13 +205,13 @@ DENNO_EXPERT_RAM_MB=auto
 ## 5. テスト
 
 - `cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1`
-  → 1141 passed / **1 failed** / 100 ignored。落ちるのは
-  `cuda::pf_exp_tc_tests::lm_reserve_gate_is_strictly_opt_in` で、**int-auto
-  b8e5de2 が持ち込んだ既存の赤** (task 265 で `tc_exp_from_value` を既定 on に
-  したのに、テストは既定 off を要求したまま)。私の変更とは無関係
-  (`git show b8e5de2:...` で同じ矛盾を確認)。直すと dev2 の判断を書き換える
-  ことになるので触っていない。
-- `--test kernel_invariants` → 90 passed / 0 failed。
+  → **1142 passed / 0 failed** (100 ignored)。
+- `--test kernel_invariants` → **90 passed / 0 failed**。
+- 途中で int-auto の b8e5de2 が持ち込んだ
+  `cuda::pf_exp_tc_tests::lm_reserve_gate_is_strictly_opt_in` の赤
+  (task 265 で `tc_exp_from_value` を既定 on にしたのに、テストが既定 off を
+  要求していた) が出たが、int-auto 89b7f8a がテスト側を直したので merge 後は
+  全緑。私は触っていない。
 - 追加: K 系 / legacy 型の expert バイト数 (UD 形で 3,072,000 B、端数は Err)、
   auto 予算の境界 (非 expert を引く / 明示値も同じ上限 / 空き不足で 0)、
   ミス転送元の数え上げと reset、drop ゲートの不活性。
