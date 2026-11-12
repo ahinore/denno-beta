@@ -11811,6 +11811,50 @@ pub fn plan_experts_from_stats(
         Err(e) => return Some(format!("[exp-plan] off: メタデータを読めない: {e}")),
     };
     let total_bytes = expert_identity_bytes(&f, &p);
+    // task 268: 本番の「モデルを切り替えた直後の cold start」を lab で作る。
+    //
+    // ゲート (`DENNO_EXPERT_DROP_CACHE_ON_START=1`) のときだけ、**事前ロードが
+    // 1 バイトも読む前**に expert のページを落とす。dense / PLE は落とさない
+    // (本番で冷えるのは expert の範囲だけで、dense は起動時に GPU へ上げる)。
+    // 記録の有無に依らず効くよう、記録を読む**前**に置く (lab の base 側も
+    // 同じ条件で冷やせる)。
+    let mut return_line = String::new();
+    if crate::model::expert_ram::drop_on_start_enabled() {
+        let mut ranges: Vec<(usize, u64, u64)> = Vec::with_capacity(p.n_layer * 3);
+        let mut probes: Vec<(usize, usize)> = Vec::with_capacity(p.n_layer * 3);
+        let mut resident_before = 0u64;
+        for il in 0..p.n_layer {
+            for m in [
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ] {
+                let name = format!("blk.{il}.{m}");
+                let Some((part, off, len)) = f.tensor_mapping_parts(&name) else {
+                    continue;
+                };
+                if let Some(map) = f.mmap_handle_at(part) {
+                    let ptr = map.as_ptr() as usize + off;
+                    resident_before += crate::model::expert_ram::resident_bytes_of(ptr, len);
+                    probes.push((ptr, len));
+                }
+                ranges.push((part, off as u64, len as u64));
+            }
+        }
+        let t_drop = Instant::now();
+        let line = crate::model::expert_ram::drop_ranges(parts, &ranges);
+        let mut resident_after = 0u64;
+        for (ptr, len) in probes {
+            resident_after += crate::model::expert_ram::resident_bytes_of(ptr, len);
+        }
+        return_line.push_str(&format!(
+            "{line} resident={}MiB->{}MiB in {:.2}s; ",
+            resident_before >> 20,
+            resident_after >> 20,
+            t_drop.elapsed().as_secs_f64()
+        ));
+        eprintln!("{return_line}");
+    }
     let zeros = |dir: &str| {
         exp_stats::Counts::zeros(dir, total_bytes, p.n_layer as u32, p.n_expert as u32)
     };
@@ -11819,20 +11863,20 @@ pub fn plan_experts_from_stats(
         Err(e) => {
             // 記録は使わないが、このセッションの回数は保存したいので履歴を据える。
             exp_stats::install_prior(&zeros(dir_name));
-            return Some(format!("[exp-plan] off: {e}"));
+            return Some(format!("[exp-plan] off: {e}{return_line}"));
         }
     };
     if counts.n_layer as usize != p.n_layer || counts.n_expert as usize != p.n_expert {
         exp_stats::install_prior(&zeros(dir_name));
         return Some(format!(
-            "[exp-plan] off: 記録の形が違う ({}x{} / 今回 {}x{})",
+            "[exp-plan] off: 記録の形が違う ({}x{} / 今回 {}x{}){return_line}",
             counts.n_layer, counts.n_expert, p.n_layer, p.n_expert
         ));
     }
     exp_stats::install_prior(&counts);
     let plan = exp_stats::preload_order(&counts);
     if plan.is_empty() {
-        return Some("[exp-plan] off: 記録が空 (回数 0)".to_string());
+        return Some(format!("[exp-plan] off: 記録が空 (回数 0){return_line}"));
     }
     let n_plan = plan.len();
 
@@ -11856,56 +11900,21 @@ pub fn plan_experts_from_stats(
         }
     }
 
-    // task 268: 本番の「モデルを切り替えた直後の cold start」を lab で作る。
-    let mut return_line = String::new();
-    // ゲート (`DENNO_EXPERT_DROP_CACHE_ON_START=1`) のときだけ、**事前ロードが
-    // 1 バイトも読む前**に expert のページを落とす。dense / PLE は落とさない
-    // (本番で冷えるのは expert の範囲だけで、dense は起動時に GPU へ上げる)。
-    if crate::model::expert_ram::drop_on_start_enabled() {
-        let mut ranges: Vec<(usize, u64, u64)> = Vec::with_capacity(layers.len() * 3);
-        let mut resident_before = 0u64;
-        for (g, u, d) in &layers {
-            for w in [g, u, d] {
-                let b = w.blocks.as_slice();
-                resident_before += crate::model::expert_ram::resident_bytes_of(
-                    b.as_ptr() as usize,
-                    b.len(),
-                );
-                ranges.push((w.file, w.abs, b.len() as u64));
-            }
-        }
-        let t_drop = Instant::now();
-        let line = crate::model::expert_ram::drop_ranges(parts, &ranges);
-        let mut resident_after = 0u64;
-        for (g, u, d) in &layers {
-            for w in [g, u, d] {
-                let b = w.blocks.as_slice();
-                resident_after +=
-                    crate::model::expert_ram::resident_bytes_of(b.as_ptr() as usize, b.len());
-            }
-        }
-        return_line.push_str(&format!(
-            "{line} resident={}MiB->{}MiB in {:.2}s; ",
-            resident_before >> 20,
-            resident_after >> 20,
-            t_drop.elapsed().as_secs_f64()
-        ));
-    }
-
     // VRAM 予算をここで初期化する (初回の MoE 呼び出しと同じ 1 回きりの決定)。
     let _ = expert_route();
     let vram_cap = expert_vram::cache_usage().map(|(_, cap)| cap);
     let ram_on = crate::model::expert_ram::enabled();
     if vram_cap.is_none() && !ram_on {
-        return Some(
-            "[exp-plan] off: VRAM も RAM tier も無効 (DENNO_EXPERT_VRAM_MB=0 / DENNO_EXPERT_RAM_MB=0)"
-                .to_string(),
-        );
+        return Some(format!(
+            "[exp-plan] off: VRAM も RAM tier も無効 (DENNO_EXPERT_VRAM_MB=0 / DENNO_EXPERT_RAM_MB=0){return_line}"
+        ));
     }
     // CUDA の current context はスレッドローカル。これをしないと最初の
     // cuMemAlloc が error 201 (INVALID_CONTEXT) で落ちる (lab t146a)。
     if !crate::cuda::make_current_on_this_thread() {
-        return Some("[exp-plan] off: CUDA の context をこのスレッドに張れない".to_string());
+        return Some(format!(
+            "[exp-plan] off: CUDA の context をこのスレッドに張れない{return_line}"
+        ));
     }
     let reserve = exp_stats::preload_reserve_bytes();
     let mut target = vram_cap.unwrap_or(0).saturating_sub(reserve);
@@ -11946,6 +11955,16 @@ pub fn plan_experts_from_stats(
     let mut loaded_keys: Vec<ExpertKey> = Vec::new();
     // まだ載せていない plan の本数 (RAM tier はここから続ける)。
     let mut remain = plan.len();
+    if ud_class {
+        // task 268: VRAM の事前ロードをしない代わりに、**decode の LRU が埋める
+        // ぶん (target / 1 本) を RAM tier から除く**。除かないと tier が一番熱い
+        // 層を抱えてしまい、それは VRAM に載っているので 1 度も引かれない
+        // (t268a の miss_ram=14 がまさにそれ)。tier は「VRAM の次に熱い層」を受ける。
+        let n_all = (p.n_layer * p.n_expert).max(1) as u64;
+        let per = (total_bytes / n_all).max(1);
+        let vram_slots = (target as u64 / per) as usize;
+        remain = plan.len().saturating_sub(vram_slots);
+    }
     if vram_on {
         for i in (0..plan.len()).rev() {
             let (layer, expert) = plan[i];
