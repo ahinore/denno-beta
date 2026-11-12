@@ -230,17 +230,10 @@ pub fn budget_mb_env() -> Option<u64> {
     mb_from_value(env(RAM_MB_ENV).as_deref())
 }
 
-/// env と `MemAvailable` から予算 (バイト) を決める。
-pub fn budget_bytes_env(expert_bytes: u64) -> u64 {
-    budget_bytes(
-        env(RAM_MB_ENV).as_deref(),
-        mem_available(),
-        expert_bytes,
-        margin_bytes(),
-    )
-}
-
-/// task 268: モデルの非 expert バイトを渡す版 (UD-Q4_K_XL の auto 用)。
+/// task 268: env と `MemAvailable` から予算 (バイト) を決める。
+///
+/// モデルの非 expert バイトを渡す版だけを残す (task 263 までの
+/// `budget_bytes_env(expert_bytes)` は、非 expert を引かない古い規則だった)。
 pub fn budget_bytes_env_model(expert_bytes: u64, non_expert_bytes: u64) -> u64 {
     budget_bytes_model(
         env(RAM_MB_ENV).as_deref(),
