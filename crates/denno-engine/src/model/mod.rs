@@ -23,6 +23,7 @@ pub mod moe_expert;
 pub mod moe_grouped;
 pub mod moe_grouped_gpu;
 pub mod pf_host;
+pub mod pf_pool;
 pub mod prekprof;
 pub mod q4ledger;
 pub mod qwen35;
