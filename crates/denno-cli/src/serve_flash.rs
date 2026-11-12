@@ -913,6 +913,9 @@ impl Flash {
     /// (`TapTokens::Last` = チャンク末尾の 1 トークンだけ)。無効時は従来の
     /// `prefill_batched` をそのまま呼ぶ (フックを付けないので数値経路は不変)。
     fn prefill_logits(&self, dec: &mut Qwen4ExpDecoder, prompt: &[u32]) -> Result<Vec<f32>> {
+        // task 248: prefill の間だけ確保の台帳のピークを控える
+        // (`DENNO_Q4_PROFILE` が無ければ guard は何もしない)。
+        let _peak = denno_engine::mem_audit::peak_window("prefill");
         if !self.tap_on() {
             return Ok(dec.prefill_batched(prompt, self.batch)?);
         }

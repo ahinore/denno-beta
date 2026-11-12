@@ -736,6 +736,20 @@ pub fn emergency_free(need: usize) -> usize {
     }
 }
 
+/// task 248: 1 本の大きな確保のために **slab のチャンクを丸ごと**空けて実メモリを
+/// 返す (戻り値は解放したバイト数)。cuda feature 無しでは何も解放しない。
+pub fn emergency_free_chunks(need: usize) -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::emergency_free_chunks(need)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = need;
+        0
+    }
+}
+
 /// task 149: 確保に失敗したあと「LRU を追い出して再試行」するかの判定 (純関数)。
 ///
 /// - 再試行は **1 回だけ** (`attempt == 0`)。
@@ -766,11 +780,12 @@ pub fn effective_expert_cap(env_cap: usize) -> usize {
     // 空きを直接使えばその両方が自動的に効く (確保のたびに引き直す)。
     let free = free_mb.saturating_mul(1 << 20);
     let reserve = (crate::mem_audit::vram_reserve_mb() as usize).saturating_mul(1 << 20);
-    crate::mem_audit::card_expert_cap_from_free(
+    crate::mem_audit::card_expert_cap_from_free_with(
         env_cap,
         crate::mem_audit::experts_live_bytes(),
         free,
         reserve,
+        crate::mem_audit::fill_free_on(),
     )
 }
 
@@ -1074,9 +1089,26 @@ mod gpu {
         bytes: usize,
     }
 
+    impl ExpertBufs {
+        /// task 248: slab のスロットなら `(チャンク id, チャンク 1 本のバイト数)`。
+        ///
+        /// per-expert 確保 (`Direct`) はチャンクを持たないので `None`。
+        pub fn chunk_info(&self) -> Option<(usize, usize)> {
+            match self {
+                ExpertBufs::Slab { slot, .. } => Some((slot.chunk_id(), slot.chunk_bytes())),
+                ExpertBufs::Direct(_) => None,
+            }
+        }
+    }
+
     impl ExpertDev {
         pub fn bytes(&self) -> usize {
             self.bytes
+        }
+
+        /// task 248: slab のスロットなら `(チャンク id, チャンク 1 本のバイト数)`。
+        pub fn chunk_info(&self) -> Option<(usize, usize)> {
+            self.bufs.chunk_info()
         }
 
         pub fn shapes(&self) -> [ExpertShape; 3] {
@@ -1205,6 +1237,66 @@ mod gpu {
         // これが無くて 14k で q4 attention が CPU に落ちた)。
         let released = crate::model::expert_slab::release_empty(need);
         freed.saturating_add(released)
+    }
+
+    /// task 248: 1 本の大きな確保のために、**チャンクを丸ごと**空けて実メモリを返す。
+    ///
+    /// 選ぶのは「チャンクの中で一番古い最終使用」が古い順。合計が `need` 以上に
+    /// なるまで選び、選んだチャンクの expert を全員追い出してから空チャンクを
+    /// 解放する (slab はチャンクが空にならないと `cuMemFree` しない)。
+    ///
+    /// 追い出す量は「チャンク 1 本ぶんの端数」だけ `need` を超える。LRU 全体を
+    /// 捨てる経路はここには無い (足りなければ呼び出し側が諦める)。
+    /// 戻り値は解放した実バイト数。
+    pub fn emergency_free_chunks(need: usize) -> usize {
+        if need == 0 {
+            return 0;
+        }
+        let Some(c) = CACHE.get() else {
+            return 0;
+        };
+        let Ok(mut g) = c.try_lock() else {
+            return 0;
+        };
+        // チャンクごとに (バイト数, 最古の最終使用, そのチャンクの鍵) を集める。
+        let mut map: std::collections::HashMap<usize, (usize, u64, Vec<ExpertKey>)> =
+            std::collections::HashMap::new();
+        for (k, s) in g.entries.iter() {
+            let Some((id, bytes)) = s.value.chunk_info() else {
+                continue;
+            };
+            let e = map.entry(id).or_insert((bytes, u64::MAX, Vec::new()));
+            e.0 = bytes;
+            e.1 = e.1.min(s.last_use);
+            e.2.push(*k);
+        }
+        if map.is_empty() {
+            // slab に載っていない (per-expert 確保) なら、追い出しで実メモリが戻る。
+            let evicted = g.evict_until_free(need);
+            let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
+            drop(evicted);
+            drop(g);
+            let released = crate::model::expert_slab::release_empty(need);
+            return freed.saturating_add(released);
+        }
+        let list: Vec<(usize, usize, u64)> = map
+            .iter()
+            .map(|(id, (bytes, oldest, _))| (*id, *bytes, *oldest))
+            .collect();
+        let ids = crate::model::expert_slab::chunks_to_empty(&list, need);
+        let mut evicted = Vec::new();
+        for id in ids {
+            if let Some((_, _, keys)) = map.remove(&id) {
+                for k in keys {
+                    if let Some(v) = g.remove(&k) {
+                        evicted.push(v);
+                    }
+                }
+            }
+        }
+        drop(evicted); // SlabSlot が空きリストへ戻る
+        drop(g); // LRU のロックを離してからチャンクを解放する
+        crate::model::expert_slab::release_empty(need)
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。
