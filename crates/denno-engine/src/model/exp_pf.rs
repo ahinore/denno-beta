@@ -727,6 +727,13 @@ static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 static SKIP_LAYERS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ストリーミングで GPU に載せた層の数。
 static STREAM_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// task 261: 旧 4 型 (Q8_0 / Q5_1 / Q4_K / Q5_K) の prefill GPU 経路。
+/// `QUANT_PF_LAYERS` = GPU で回し切った層、`QUANT_PF_SKIPS` = 途中で諦めた層。
+static QUANT_PF_LAYERS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_ROWS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_HITS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_SKIPS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ上げた expert 本数 (層またぎの再送を含む)。
 static STREAM_EXPERTS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ上げたバイト数。
@@ -859,6 +866,57 @@ pub fn stream_totals() -> (u64, u64, u64, f64) {
 }
 
 /// 1 リクエストぶんの 1 行。ゲート off / GPU 層 0 なら `None`。
+/// task 261: 旧 4 型の prefill 経路で 1 層を GPU で回し切った。
+pub fn note_quant_pf_layer(rows: u32, hits: u32) {
+    QUANT_PF_LAYERS.fetch_add(1, Ordering::Relaxed);
+    QUANT_PF_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+    QUANT_PF_HITS.fetch_add(hits as u64, Ordering::Relaxed);
+}
+
+/// task 261: 旧 4 型の prefill 経路が GPU を諦めた (CPU 経路へ)。
+pub fn note_quant_pf_skip() {
+    QUANT_PF_SKIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// task 261: 旧 4 型 prefill の GPU 時間 (ns)。
+pub fn note_quant_pf_ns(ns: u64) {
+    QUANT_PF_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// task 261: 旧 4 型 prefill の 1 行 (1 層も回っていなければ `None`)。
+pub fn quant_pf_line() -> Option<String> {
+    let layers = QUANT_PF_LAYERS.load(Ordering::Relaxed);
+    let skips = QUANT_PF_SKIPS.load(Ordering::Relaxed);
+    if layers == 0 && skips == 0 {
+        return None;
+    }
+    let rows = QUANT_PF_ROWS.load(Ordering::Relaxed);
+    let hits = QUANT_PF_HITS.load(Ordering::Relaxed);
+    let ns = QUANT_PF_NS.load(Ordering::Relaxed);
+    Some(format!(
+        "[exp-quant-pf] layers={layers} skips={skips} rows={rows} hits={hits} gpu_ms={:.1} rows/layer={:.1}",
+        ns as f64 / 1e6,
+        if layers > 0 {
+            rows as f64 / layers as f64
+        } else {
+            0.0
+        }
+    ))
+}
+
+/// task 261: 旧 4 型 prefill の積算を 0 に戻す。
+pub fn quant_pf_reset() {
+    for c in [
+        &QUANT_PF_LAYERS,
+        &QUANT_PF_ROWS,
+        &QUANT_PF_HITS,
+        &QUANT_PF_SKIPS,
+        &QUANT_PF_NS,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 pub fn stats_line() -> Option<String> {
     if !pf_enabled() {
         return None;
