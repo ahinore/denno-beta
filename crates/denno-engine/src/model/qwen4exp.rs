@@ -2354,7 +2354,13 @@ fn expert_ram_fill(
     // (= 約 512 MB の pread) の塊がリクエスト中に 1 個走り、33 トークンの
     // prefill が 0.88 -> 1.13 s (+29%) になった。64 本 = 約 64 MB なら
     // 1 リクエストに重なっても ~30 ms で済む (推定)。
-    const CHUNK: usize = 64;
+    //
+    // task 268: 32 本に下げ、**decode 中でも止まらない**ようにした。
+    // t268a の `pre` は 1 リクエスト 10 秒の間ずっと `busy` で待っていたので、
+    // 5,428 スロットのうち 384 本しか埋まらず、tier が 1 度も効かなかった
+    // (miss_ram=14 / miss_mmap=5,925)。待つ代わりに 1 チャンク読んで 2 ms
+    // 譲る (干渉は 1 チャンク = 約 96 MB の pread に限られる)。
+    const CHUNK: usize = 32;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(crate::model::expert_ram::threads().max(1))
         .thread_name(|i| format!("exp-ram-fill-{i}"))
@@ -2369,10 +2375,7 @@ fn expert_ram_fill(
             break;
         }
         if crate::model::exp_stats::busy() {
-            // decode 中は譲る (リクエストを待たせない)。
-            while crate::model::exp_stats::busy() {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let one = |&(layer, expert): &(u16, u16)| {
             let Some((g, u, d)) = layers.get(layer as usize) else {
@@ -11916,13 +11919,29 @@ pub fn plan_experts_from_stats(
         target = target.min(physical);
     }
     let vram_on = vram_cap.is_some_and(|c| c > reserve) && target > 0;
+    // task 268: **UD 級** (expert 総量 > 空きメモリ) は VRAM の事前ロードをしない。
+    //
+    // 根拠 (lab t268a、UD-Q4_K_XL): 事前ロードは (a) 最初のリクエストの prefill が
+    // VRAM を自分の expert で埋めるので数秒で追い出され、(b) 18 GB の読みが
+    // 最初のリクエストと disk を取り合う。t268a の `pre` は VRAM 段だけで 50 秒
+    // かかり (その間ずっと busy 待ち)、RAM tier の構築が最初のリクエストの後に
+    // なって tier が 1 度も効かなかった。UD は **RAM tier に全部を寄せる**。
+    let ud_class = ram_on && total_bytes > crate::model::expert_ram::mem_available().unwrap_or(u64::MAX);
+    let vram_on = vram_on && !ud_class;
 
     let mut loaded = 0usize;
     let mut paused_ms = 0f64;
     // 前の失敗理由が残っていれば捨てる (停止理由の取り違えを防ぐ)。
     let _ = expert_vram::take_alloc_error();
     // 止まった理由 (None = 最後まで載せた)。
-    let mut stop: Option<String> = None;
+    let mut stop: Option<String> = if ud_class {
+        Some(format!(
+            "UD 級 (expert {} MiB > MemAvailable): VRAM へは載せず RAM tier のみ",
+            total_bytes >> 20
+        ))
+    } else {
+        None
+    };
     // 載せた順 (最後に touch を掛け直して「一番よく使う = 最後に使った」にする)。
     let mut loaded_keys: Vec<ExpertKey> = Vec::new();
     // まだ載せていない plan の本数 (RAM tier はここから続ける)。
