@@ -68,6 +68,11 @@
   #send { background:#0f3a4d; color:#9fefff; border:1px solid #2f8aa8; border-radius:3px;
           font:inherit; font-size:11px; padding:0 12px; cursor:pointer; }
   #send:disabled { opacity:.45; cursor:default; }
+  #cbtns { display:flex; flex-direction:column; gap:4px; }
+  #cbtns button { flex:1; font:inherit; font-size:11px; padding:0 10px; border-radius:3px; cursor:pointer;
+                  background:#0b1d27; color:#9fb8c6; border:1px solid #1b4b60; }
+  #cbtns #stop { background:#3a0f14; color:#ffb3b8; border-color:#a8323c; }
+  #cbtns button:disabled { opacity:.35; cursor:default; }
   #cmeta { padding:5px 2px 0; color:var(--dim); font-size:10px; min-height:14px; }
   #chatpane .hint { color:#38505f; font-size:10px; padding-top:4px; }
 
@@ -161,6 +166,10 @@
     <div id="row">
       <textarea id="in" placeholder="prompt… (Enter to send)"></textarea>
       <button id="send">send</button>
+      <div id="cbtns">
+        <button id="stop" disabled title="生成を強制停止する (POST /v1/abort。次のトークンで止まる。長い prefill の途中なら prefill が終わったところで止まる)">stop</button>
+        <button id="chatclear" title="入力欄・会話履歴・表示を消す (サーバーの KV は state 欄の clear KV cache で消す)">clear chat</button>
+      </div>
     </div>
     <div id="cmeta"></div>
     <div class="hint">Enter=send · Shift+Enter=newline · 「続きを生成」で継続 · <a href="#" id="clear" style="color:#5b7280">clear</a></div>
@@ -1422,8 +1431,8 @@ function showContinue(node) {
 
 async function sendMsg(text) {
   if (busy || !text.trim()) return;
-  busy = true;
-  chatEl.send.disabled = true;
+  stopAsked = false;
+  setBusy(true);
   addLine('u', '> ' + text);
   chatEl.inp.value = '';
   hist.push({ role: 'user', content: text });
@@ -1433,8 +1442,8 @@ async function sendMsg(text) {
   if (!r.acc && !r.err) node.textContent = '(空の応答)';
   hist.push({ role: 'assistant', content: r.acc || '' });
   showMeta(r);
-  busy = false;
-  chatEl.send.disabled = false;
+  if (stopAsked) chatEl.meta.textContent += ' · stopped';
+  setBusy(false);
   if (!mock) refreshSteer('chat');
   refreshCtx();
   if (r.stop === 'max_tokens' && r.acc && !r.err) showContinue(node);
@@ -1442,15 +1451,15 @@ async function sendMsg(text) {
 
 async function continueMsg(node) {
   if (busy) return;
-  busy = true;
-  chatEl.send.disabled = true;
+  stopAsked = false;
+  setBusy(true);
   const base = node.textContent;
   const r = await runStream(node, base);
   if (r.err) addLine('e', '[error] ' + r.err);
   if (hist.length && hist[hist.length - 1].role === 'assistant') hist[hist.length - 1].content = r.acc;
   showMeta(r);
-  busy = false;
-  chatEl.send.disabled = false;
+  if (stopAsked) chatEl.meta.textContent += ' · stopped';
+  setBusy(false);
   if (!mock) refreshSteer('chat');
   refreshCtx();
   if (r.stop === 'max_tokens' && r.acc !== base && !r.err) showContinue(node);
@@ -1463,12 +1472,46 @@ chatEl.inp.addEventListener('keydown', (e) => {
     sendMsg(chatEl.inp.value);
   }
 });
-$('clear').addEventListener('click', (e) => {
-  e.preventDefault();
+// 会話を消す (入力欄・履歴・表示)。生成中は先に stop する。
+function clearChat() {
+  if (busy) {
+    chatEl.meta.textContent = '生成中は消せない (先に stop)';
+    return false;
+  }
   hist.length = 0;
   chatEl.log.innerHTML = '';
   chatEl.meta.textContent = '';
-});
+  chatEl.inp.value = '';
+  chatEl.inp.focus();
+  return true;
+}
+$('clear').addEventListener('click', (e) => { e.preventDefault(); clearChat(); });
+$('chatclear').addEventListener('click', () => clearChat());
+
+// 生成の強制停止。サーバーは要求を読み取りスレッドで即答し、次のトークンで止める。
+// 止まった応答は普通に閉じる (それまでの本文と文脈は残る)。
+let stopAsked = false;
+async function stopGen() {
+  if (!busy) return;
+  stopAsked = true;
+  $('stop').disabled = true;
+  const r = await api('POST', '/v1/abort');
+  if (r.status !== 200) {
+    chatEl.meta.textContent = 'stop → ' + r.status + ' ' + errText(r);
+    $('stop').disabled = !busy;
+    return;
+  }
+  chatEl.meta.textContent = r.body && r.body.aborted ? '停止を要求した…' : '生成中ではなかった';
+}
+$('stop').addEventListener('click', () => stopGen());
+
+// busy の出入りで stop / clear chat の可否を切り替える。
+function setBusy(on) {
+  busy = on;
+  chatEl.send.disabled = on;
+  $('stop').disabled = !on;
+  $('chatclear').disabled = on;
+}
 
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
@@ -1501,6 +1544,9 @@ window.__view2d = {
   onSelected: () => $('btn-on').click(),
   clearSelection: () => { clearSel(sel); renderState(); dirty = true; },
   clearOff: () => $('btn-offclear').click(),
+  stop: () => stopGen(),
+  clearChat: () => clearChat(),
+  chatBusy: () => busy,
   clearKv: () => $('btn-kvclear').click(),
   clearResidual: () => $('btn-resclear').click(),
   refreshCtx: () => refreshCtx(),

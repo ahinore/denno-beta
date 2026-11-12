@@ -627,3 +627,10 @@ test('地図の状態: reset で残差 stream の元 (role) と累積が 0 に�
   assert.equal(Math.max(...st.experts[0]), 0);
   assert.equal(st.frames, 0);
 });
+
+test('モック店: POST /v1/abort は生成が無いので空振り (200)', () => {
+  const m = createMockStore({ layers: 2, n_expert: 4, n_expert_used: 1, n_hc: 1, n_embd: 8 });
+  const r = m.handle('POST', '/v1/abort');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { aborted: false, generating: false });
+});

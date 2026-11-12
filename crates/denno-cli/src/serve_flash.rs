@@ -1014,6 +1014,8 @@ impl Flash {
         // `POST /v1/intervene` が来ても、いま走っている生成の数値は変わらない
         // (次のリクエストから効く)。forward 側はピン留めを読むだけ。
         let _iv_pin = iv::pin_request();
+        // 生成中の印 (`POST /v1/abort` はこの間だけ効く)。始めに古い停止要求を捨てる。
+        let _gen = GenGuard::enter();
         // task 218: `DENNO_STEER_RECORD` のときは 1 リクエストごとに平均を保存する
         // (停止は不要。プロセスが落ちても直前のリクエストまでが残る)。
         let _steer_flush = SteerFlushGuard;
@@ -1331,6 +1333,12 @@ impl Flash {
         // off では atomic load 1 回で、イベントは 1 本も打たない。
         q4ledger::tline_begin();
         'gen: while out.len() < req.max_tokens {
+            // `POST /v1/abort`: 次のトークンを作らずに終わる。ここでは out の全トークンが
+            // step 済みなので、文脈は max_tokens で止まったときと同じく一貫している。
+            if take_abort() {
+                eprintln!("[flash] abort: {} トークンで停止", out.len());
+                break 'gen;
+            }
             if spec_on {
                 // P109: n-gram 投機ステップ。q0 は engine の argmax (greedy)。
                 let d_topk = q4prof::dstamp();
@@ -2072,13 +2080,91 @@ impl Drop for SteerFlushGuard {
     }
 }
 
-fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
+// ---------------------------------------------------------------------------
+// 生成の強制停止 (`POST /v1/abort`)
+// ---------------------------------------------------------------------------
+
+/// 停止要求。decode のトークンごとに見る (立っていたら次のトークンを作らずに終わる)。
+static ABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// いま生成中か (停止要求は生成中だけ受ける。空振りの要求を次の生成に持ち越さない)。
+static GENERATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 生成の間だけ GENERATING を立てる。始めに古い停止要求を捨てる。
+struct GenGuard;
+
+impl GenGuard {
+    fn enter() -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        ABORT.store(false, SeqCst);
+        GENERATING.store(true, SeqCst);
+        GenGuard
+    }
+}
+
+impl Drop for GenGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        GENERATING.store(false, SeqCst);
+        ABORT.store(false, SeqCst);
+    }
+}
+
+/// テスト: ABORT / GENERATING はプロセス全体の状態なので、触るテストはこれで直列にする。
+#[cfg(test)]
+static ABORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 停止要求を出す。生成中でなければ何もしない。戻り値は「生成中に要求した」か。
+fn request_abort() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if GENERATING.load(SeqCst) {
+        ABORT.store(true, SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+/// 停止要求が立っていれば下ろして true。
+fn take_abort() -> bool {
+    ABORT.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `POST /v1/abort` か (生成中も受け付ける経路。主スレッドを待たない)。
+fn is_abort_req(req: &HttpReq) -> bool {
+    req.method == "POST" && req.path.split('?').next() == Some("/v1/abort")
+}
+
+fn send_abort_reply(stream: &mut TcpStream) -> Result<()> {
+    let generating = request_abort();
+    if generating {
+        eprintln!("[flash] abort: 停止要求を受けた (次のトークンで止める)");
+    }
+    send_json(stream, "200 OK", &json!({"aborted": generating, "generating": generating}))
+}
+
+/// 1 接続ぶんを読んでから処理する (テストと単発用)。本番の listen は
+/// [`run`] が読み取りを別スレッドで行い、`/v1/abort` だけはそこで即答する。
+#[cfg(test)]
+fn handle(flash: &mut Flash, stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut r = BufReader::new(stream.try_clone()?);
     let Some(req) = read_req(&mut r)? else {
         return Ok(());
     };
+    handle_req(flash, stream, r, req)
+}
+
+fn handle_req(
+    flash: &mut Flash,
+    mut stream: TcpStream,
+    r: BufReader<TcpStream>,
+    req: HttpReq,
+) -> Result<()> {
     let path = req.path.split('?').next().unwrap_or("/").to_string();
+    // 生成中でない間に来た停止要求 (読み取りスレッドを通らないテスト経路など)。
+    if is_abort_req(&req) {
+        return send_abort_reply(&mut stream);
+    }
 
     // P51: 推論テレメトリの WebSocket (denno-view の購読先)。101 を返して
     // クライアントを登録し、以後は relay スレッドが書く。推論は待たない。
@@ -2381,6 +2467,51 @@ impl Drop for StatsSaveOnExit {
     }
 }
 
+/// 要求の読み取りは接続ごとのスレッドで行い、読めた要求を主スレッドへ渡す
+/// (モデルを触る処理は今まで通り主スレッドで 1 本ずつ)。`POST /v1/abort` だけは
+/// 読み取りスレッドで即答するので、生成中 (主スレッドが塞がっている間) でも止められる。
+type Job = (TcpStream, BufReader<TcpStream>, HttpReq);
+
+fn spawn_acceptor(listener: TcpListener) -> std::sync::mpsc::Receiver<std::io::Result<Job>> {
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Job>>();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let tx = tx.clone();
+            let stream = match s {
+                Ok(s) => s,
+                Err(e) => {
+                    if tx.send(Err(e)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            std::thread::spawn(move || {
+                stream.set_nodelay(true).ok();
+                let Ok(clone) = stream.try_clone() else { return };
+                let mut r = BufReader::new(clone);
+                let req = match read_req(&mut r) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => return,
+                    Err(e) => {
+                        eprintln!("[flash] 要求を読めない: {e:#}");
+                        return;
+                    }
+                };
+                if is_abort_req(&req) {
+                    let mut stream = stream;
+                    if let Err(e) = send_abort_reply(&mut stream) {
+                        eprintln!("[flash] abort の応答に失敗: {e:#}");
+                    }
+                    return;
+                }
+                let _ = tx.send(Ok((stream, r, req)));
+            });
+        }
+    });
+    rx
+}
+
 pub fn run(cfg: FlashConfig) -> Result<()> {
     // task 119b: プールの初回使用 (モデル読み込み) の前に既定スレッド数を決める。
     ensure_rayon_pool();
@@ -2621,12 +2752,13 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("{addr} を listen できない"))?;
     eprintln!("[flash] listening on http://{addr} model={}", cfg.name);
-    for s in listener.incoming() {
+    let rx = spawn_acceptor(listener);
+    for s in rx {
         match s {
-            Ok(stream) => {
+            Ok((stream, r, req)) => {
                 let t = Instant::now();
                 // 逐次処理 (モデルは 1 つ、同時リクエストは受けない)
-                if let Err(e) = handle(&mut flash, stream) {
+                if let Err(e) = handle_req(&mut flash, stream, r, req) {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
@@ -2680,6 +2812,39 @@ mod flash_tests {
         let mut buf = Vec::new();
         let _ = s.read_to_end(&mut buf);
         String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// 生成中 (主スレッドが要求を取りに来ない間) でも `POST /v1/abort` は読み取り
+    /// スレッドで即答し、停止要求を立てる。ほかの要求は主スレッドへ順に渡る。
+    #[test]
+    fn acceptor_answers_abort_while_main_is_busy() {
+        use std::io::Write as _;
+        let _lk = ABORT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let rx = spawn_acceptor(l);
+        // 主スレッドが生成中 (rx を読まない) のつもり
+        let _gen = GenGuard::enter();
+        let mut a = TcpStream::connect(addr).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        a.write_all(b"POST /v1/abort HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        let resp = read_all(&mut a);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(resp.contains("\"aborted\":true"), "{resp}");
+        assert!(take_abort(), "停止要求が立っていない");
+        // ふつうの要求は主スレッド側の channel に届く (読み取りスレッドでは答えない)
+        let mut b = TcpStream::connect(addr).unwrap();
+        b.write_all(b"GET /v1/models HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        let job = rx.recv_timeout(Duration::from_secs(5)).expect("要求が主スレッドに届かない").unwrap();
+        assert_eq!(job.2.method, "GET");
+        assert_eq!(job.2.path, "/v1/models");
+        drop(_gen);
+        // 生成していないときは空振り
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"POST /v1/abort HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        assert!(read_all(&mut c).contains("\"aborted\":false"));
+        assert!(!take_abort());
     }
 
     /// P51: 従来からの GET 応答はバイト列まで変えない (テレメトリの有無に依らない)。

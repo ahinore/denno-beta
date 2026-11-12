@@ -1265,6 +1265,10 @@ export function createMockStore(shape, opts = {}) {
           body: { epoch: st.epoch, experts_off: [], blocks_off: [], streams_off: [] },
         };
       }
+      if (m === 'POST' && p === '/v1/abort') {
+        // モックには走っている生成が無い (実 API も生成中でなければ空振り)。
+        return { status: 200, body: { aborted: false, generating: false } };
+      }
       if (m === 'GET' && p === '/v1/cache') {
         return { status: 200, body: ctxStatus() };
       }
