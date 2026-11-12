@@ -24,15 +24,21 @@
 //! # ゲート
 //!
 //! - `DENNO_EXPERT_RAM_MB`: **未設定 / `0` / `off` は無効** (従来と 1 バイトも
-//!   変わらない)。`auto` は自動 = `MemAvailable` − 余裕
-//!   (`DENNO_EXPERT_RAM_MARGIN_MB`, 既定 8192 MiB) を、モデルの expert 総バイト数で
-//!   頭打ちにする。数値は MiB。
+//!   変わらない)。`auto` は自動 = `MemAvailable` − **モデルの非 expert バイト** −
+//!   余裕 (`DENNO_EXPERT_RAM_MARGIN_MB`, 既定 8192 MiB) を、モデルの expert 総
+//!   バイト数で頭打ちにする。数値は MiB。
 //!
-//!   **既定 off にしてある理由** (lab t260c の実測): 59 GiB の機械で IQ3_S の
-//!   expert 47 GB を所有すると MemAvailable が 8-10 GB まで落ち、expert 以外
-//!   (dense / PLE / 非常駐 expert) が page cache から追い出されて warm decode が
-//!   19.4 → 46.4 ms/tok になった。cold の prefill は 17.21 → 8.89 s (-48%) と
-//!   狙いどおりなので、**大きさを絞れば**両立する見込み (未検証)。
+//!   **非 expert バイトを引く理由** (task 268): expert 以外 (dense 重み / PLE の
+//!   表 / KV) は page cache か mmap から読むので、tier がその場所を奪うと
+//!   decode が壊れる。t260c の実測では 59 GiB の機械で IQ3_S の expert 47 GB を
+//!   所有すると MemAvailable が 8-10 GB まで落ち、warm decode が 19.4 →
+//!   46.4 ms/tok になった (tier が page cache を追い出した)。UD-Q4_K_XL は
+//!   104 GB 中 77 GB が expert、27 GB が非 expert なので、auto は
+//!   `MemAvailable − 27 GB − 8 GiB` ≒ 22 GB になる。
+//!
+//!   **既定 off にしてある理由**: 上と同じ (大きさを絞る規則を入れるまでは
+//!   off。task 268 で規則を入れたが、既定 off は変えない =
+//!   `DENNO_EXPERT_RAM_MB` を明示したときだけ動く)。
 //! - `DENNO_EXPERT_RAM_PIN`: `0` で pinned を諦めてヒープ (A/B 用。既定 on)。
 //! - `DENNO_EXPERT_RAM_FILL`: `0` で起動時の充填と追従 (再調整) をしない
 //!   (使用時に埋まる。既定 on)。task 263 から充填は**起動プラン**が行う
@@ -99,9 +105,34 @@ pub fn enabled_from_value(v: Option<&str>) -> bool {
 ///
 /// 自動は `avail - margin` を expert 総量で頭打ちにする。数値指定でも
 /// `avail - margin` を超えない (指定した予算で機械を押し潰さない)。
+///
+/// task 268: モデルの**非 expert バイト**を渡す版が [`budget_bytes_model`]。
+/// こちらは `non_expert = 0` の後方互換 (テストと、モデル総量が分からない
+/// 呼び出し用)。
 pub fn budget_bytes(v: Option<&str>, avail: Option<u64>, expert_bytes: u64, margin: u64) -> u64 {
+    budget_bytes_model(v, avail, expert_bytes, 0, margin)
+}
+
+/// task 268: `non_expert_bytes` (モデル総バイト − expert 総バイト) を
+/// `MemAvailable` から引く予算。
+///
+/// - 自動: `avail - non_expert - margin` (負なら 0) を expert 総量で頭打ち。
+/// - 数値: `min(指定, avail - non_expert - margin, expert_bytes)`。
+///   `MemAvailable` が読めないときは指定値をそのまま使う (従来どおり)。
+///
+/// 規則の根拠は module doc の t260c (47 GB の tier が page cache を追い出して
+/// warm decode を 2.4 倍にした)。expert 以外が page cache に残る大きさに
+/// 抑える、が規則。
+pub fn budget_bytes_model(
+    v: Option<&str>,
+    avail: Option<u64>,
+    expert_bytes: u64,
+    non_expert_bytes: u64,
+    margin: u64,
+) -> u64 {
+    let keep = non_expert_bytes.saturating_add(margin);
     let room = match avail {
-        Some(a) => a.saturating_sub(margin),
+        Some(a) => a.saturating_sub(keep),
         None => 0,
     };
     match mb_from_value(v) {
@@ -209,6 +240,17 @@ pub fn budget_bytes_env(expert_bytes: u64) -> u64 {
     )
 }
 
+/// task 268: モデルの非 expert バイトを渡す版 (UD-Q4_K_XL の auto 用)。
+pub fn budget_bytes_env_model(expert_bytes: u64, non_expert_bytes: u64) -> u64 {
+    budget_bytes_model(
+        env(RAM_MB_ENV).as_deref(),
+        mem_available(),
+        expert_bytes,
+        non_expert_bytes,
+        margin_bytes(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // プロセスで 1 本の tier
 // ---------------------------------------------------------------------------
@@ -263,8 +305,10 @@ pub fn stats_line() -> Option<String> {
     let cap = set.slots(crate::model::expert_cache::ExpertMatrix::Gate);
     let pinned = set.pinned_bytes() >> 20;
     let reserved = set.reserved_bytes() >> 20;
+    // task 268: VRAM ミスの転送元の内訳 (RAM tier から / mmap から)。
+    let (mram, mmmap) = miss_stats();
     Some(format!(
-        "[exp-ram] lookups={n} hits={hits} miss={misses} hit_rate={:.3} resident={used}/{cap} pinned={pinned}MiB reserved={reserved}MiB reads_mib={}",
+        "[exp-ram] lookups={n} hits={hits} miss={misses} hit_rate={:.3} resident={used}/{cap} pinned={pinned}MiB reserved={reserved}MiB reads_mib={} miss_ram={mram} miss_mmap={mmmap}",
         if n > 0 { hits as f64 / n as f64 } else { 0.0 },
         read >> 20
     ))
@@ -277,6 +321,44 @@ pub fn stats_reset() {
             set.reset_stats_for(m);
         }
     }
+    miss_reset();
+}
+
+// ---------------------------------------------------------------------------
+// task 268: VRAM ミスの転送元 (RAM tier / mmap) の内訳
+// ---------------------------------------------------------------------------
+//
+// VRAM に載っていない expert を上げるとき、`acquire_expert` は
+// **RAM tier → mmap** の順に転送元を選ぶ。どちらを使ったかを数える。
+// 「tier が効いている」を緑のテストではなく数字で示すための計器。
+
+static MISS_FROM_RAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MISS_FROM_MMAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// VRAM ミス 1 本の転送元を数える (`from_ram = true` は RAM tier のヒット)。
+pub fn note_miss_source(from_ram: bool) {
+    use std::sync::atomic::Ordering;
+    if from_ram {
+        MISS_FROM_RAM.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MISS_FROM_MMAP.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(RAM tier から上げた本数, mmap から上げた本数)`。
+pub fn miss_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        MISS_FROM_RAM.load(Ordering::Relaxed),
+        MISS_FROM_MMAP.load(Ordering::Relaxed),
+    )
+}
+
+/// 内訳を 0 に戻す。
+pub fn miss_reset() {
+    use std::sync::atomic::Ordering;
+    MISS_FROM_RAM.store(0, Ordering::Relaxed);
+    MISS_FROM_MMAP.store(0, Ordering::Relaxed);
 }
 
 /// task 263: 常駐している expert の鍵 (エンドポイントと再調整用)。
@@ -342,6 +424,14 @@ pub fn mem_available() -> Option<u64> {
 pub const PROBE_ENV: &str = "DENNO_EXPERT_RAM_PROBE";
 /// `DENNO_EXPERT_RAM_DROP`: 1 でリクエストごとに expert の page cache を落とす。
 pub const DROP_ENV: &str = "DENNO_EXPERT_RAM_DROP";
+/// task 268: `1` で**起動プランの直前**に expert の page cache を落とす
+/// (本番の「モデルを切り替えた直後」の再現。テスト用のゲート)。
+///
+/// `DENNO_EXPERT_RAM_DROP` はリクエストの先頭で落とすので初回に間に合わない
+/// (lab t263b: 1 本目は温かいまま 19.3 ms/tok、2 本目が 60 ms/tok になった)。
+/// こちらは起動プラン (= 事前ロード) が 1 バイトも読む前に落とすので、
+/// 「冷えた機械で最初のリクエスト」をそのまま測れる。
+pub const DROP_ON_START_ENV: &str = "DENNO_EXPERT_DROP_CACHE_ON_START";
 /// `DENNO_EXPERT_RAM_ADAPT`: 1 で使用時に埋める (LRU)。**既定 off**。
 ///
 /// off のときの tier は「起動時に充填した固定の集合」で、decode のミスでは
@@ -372,6 +462,11 @@ pub fn probe_enabled() -> bool {
 
 pub fn drop_enabled() -> bool {
     flag(DROP_ENV)
+}
+
+/// task 268: 起動プランの直前の page cache drop が有効か。
+pub fn drop_on_start_enabled() -> bool {
+    flag(DROP_ON_START_ENV)
 }
 
 /// 使用時に埋めるか (`DENNO_EXPERT_RAM_ADAPT=1`。既定 off)。
@@ -478,29 +573,48 @@ pub fn drop_pages_if_enabled() -> Vec<String> {
     }
     let parts = PARTS.read().unwrap_or_else(|e| e.into_inner()).clone();
     let ranges = RANGES.read().unwrap_or_else(|e| e.into_inner()).clone();
+    vec![drop_ranges(&parts, &ranges)]
+}
+
+/// task 268: 指定した範囲の page cache を落とす (起動プラン用)。
+///
+/// `ranges` は `(パート番号, ファイル内オフセット, 長さ)`。戻り値は 1 行のログ。
+/// **ゲートは呼び出し側** (`drop_on_start_enabled`)。
+pub fn drop_ranges(
+    parts: &[std::path::PathBuf],
+    ranges: &[(usize, u64, u64)],
+) -> String {
     let mut files: Vec<std::fs::File> = Vec::with_capacity(parts.len());
-    for p in &parts {
-        files.push(match std::fs::File::open(p) {
-            Ok(f) => f,
-            Err(_) => return vec!["[exp-ram] drop: ファイルを開けない".to_string()],
-        });
+    for p in parts {
+        match std::fs::File::open(p) {
+            Ok(f) => files.push(f),
+            Err(_) => return "[exp-cold] drop: ファイルを開けない".to_string(),
+        }
     }
     let mut ok = 0usize;
     let mut err = 0usize;
-    for (part, off, len) in ranges {
+    let mut bytes = 0u64;
+    for &(part, off, len) in ranges {
         let Some(f) = files.get(part) else {
             err += 1;
             continue;
         };
         if fadvise_dontneed(f, off, len).is_ok() {
             ok += 1;
+            bytes = bytes.saturating_add(len);
         } else {
             err += 1;
         }
     }
-    vec![format!(
-        "[exp-ram] drop expert page cache: ok={ok} err={err} ({DROP_ENV}=1)"
-    )]
+    format!(
+        "[exp-cold] expert page cache dropped: ok={ok} err={err} {}MiB ({DROP_ON_START_ENV})",
+        bytes >> 20
+    )
+}
+
+/// task 268: 範囲の常駐バイト (mincore)。起動時の drop の前後を測るのに使う。
+pub fn resident_bytes_of(ptr: usize, len: usize) -> u64 {
+    resident_bytes(ptr, len)
 }
 
 #[cfg(unix)]
@@ -595,6 +709,69 @@ mod tests {
             budget_bytes(Some("auto"), Some(4 * gb), 100 * gb, 8 * gb),
             0
         );
+    }
+
+    /// task 268: auto は「非 expert バイト + 余裕」を MemAvailable から引く。
+    ///
+    /// UD-Q4_K_XL の実形 (expert 77.0 GB / 非 expert 27.0 GB / MemAvailable
+    /// 57 GiB / 余裕 8 GiB) で、tier が page cache を食い潰さない大きさになる。
+    #[test]
+    fn auto_budget_leaves_room_for_non_expert_bytes() {
+        let gib = 1u64 << 30;
+        let expert = 77 * gib;
+        let non_expert = 27 * gib;
+        // 旧規則 (非 expert を引かない) は 49 GiB を返した = t260c の失敗。
+        assert_eq!(budget_bytes(Some("auto"), Some(57 * gib), expert, 8 * gib), 49 * gib);
+        // 新規則: 57 - 27 - 8 = 22 GiB
+        assert_eq!(
+            budget_bytes_model(Some("auto"), Some(57 * gib), expert, non_expert, 8 * gib),
+            22 * gib
+        );
+        // 明示値も同じ上限で頭打ち (22 GiB を超えて page cache を奪わない)
+        assert_eq!(
+            budget_bytes_model(Some("40960"), Some(57 * gib), expert, non_expert, 8 * gib),
+            22 * gib
+        );
+        // 非 expert が小さければ従来どおり expert 総量で頭打ち
+        assert_eq!(
+            budget_bytes_model(Some("auto"), Some(57 * gib), 10 * gib, 2 * gib, 8 * gib),
+            10 * gib
+        );
+        // 空きが非 expert + 余裕に満たない → 0 (tier を作らない)
+        assert_eq!(
+            budget_bytes_model(Some("auto"), Some(30 * gib), expert, non_expert, 8 * gib),
+            0
+        );
+        // MemAvailable が読めない: 明示値だけが残る
+        assert_eq!(
+            budget_bytes_model(Some("4096"), None, expert, non_expert, 8 * gib),
+            4 * gib
+        );
+        assert_eq!(
+            budget_bytes_model(Some("auto"), None, expert, non_expert, 8 * gib),
+            0
+        );
+    }
+
+    /// task 268: ミス転送元の内訳が数えられ、reset で 0 に戻ること。
+    #[test]
+    fn miss_source_counters_are_reset() {
+        miss_reset();
+        note_miss_source(true);
+        note_miss_source(true);
+        note_miss_source(false);
+        assert_eq!(miss_stats(), (2, 1));
+        miss_reset();
+        assert_eq!(miss_stats(), (0, 0));
+    }
+
+    /// task 268: 起動時 drop のゲートは未設定なら不活性。
+    #[test]
+    fn drop_on_start_is_inert_without_the_gate() {
+        if std::env::var(DROP_ON_START_ENV).is_ok() {
+            return; // ゲートを立てて走らせている環境では検査しない
+        }
+        assert!(!drop_on_start_enabled());
     }
 
     #[test]

@@ -2281,7 +2281,15 @@ fn expert_ram_build(
         .saturating_mul(layers[0].0.n_expert)
         .max(1);
     let per_expert = expert_bytes / n_experts as u64;
-    let budget = expert_ram::budget_bytes_env(expert_bytes);
+    // task 268: モデル総バイト (全パートの長さ) から非 expert を出し、その分を
+    // auto 予算で `MemAvailable` から引く (dense / PLE の page cache を残す)。
+    let model_bytes: u64 = (0..f.part_count())
+        .filter_map(|i| f.path_at(i))
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let non_expert_bytes = model_bytes.saturating_sub(expert_bytes);
+    let budget = expert_ram::budget_bytes_env_model(expert_bytes, non_expert_bytes);
     if budget < per_expert.max(1) {
         eprintln!(
             "[exp-ram] off: 予算 {} MiB が expert 1 本 ({:.2} MiB) に満たない (MemAvailable={:?} MiB / expert 総量 {} MiB)",
@@ -2315,11 +2323,13 @@ fn expert_ram_build(
     let set = std::sync::Arc::new(set);
     expert_ram::install(Some(std::sync::Arc::clone(&set)));
     eprintln!(
-        "[exp-ram] tier: budget={}MiB slots={} pin={} margin={}MiB",
+        "[exp-ram] tier: budget={}MiB slots={} pin={} margin={}MiB model={}MiB non_expert={}MiB",
         budget >> 20,
         slots,
         u8::from(expert_ram::want_pinned()),
-        expert_ram::margin_bytes() >> 20
+        expert_ram::margin_bytes() >> 20,
+        model_bytes >> 20,
+        non_expert_bytes >> 20
     );
     Ok(Some(set))
 }
@@ -2520,6 +2530,9 @@ fn acquire_expert(
         .map_err(ctx);
     }
     let host = HostExpert::new(lw, ei);
+    // task 268: 転送元を数える (RAM tier から / mmap から)。「tier が効いている」
+    // ことを緑ではなく数字で示すための計器。
+    crate::model::expert_ram::note_miss_source(host.regions.is_some());
     if host.regions.is_some() {
         let pinned = host.pinned();
         crate::model::expert_vram::acquire_host(key, shapes, || Ok(host.slices(lw, ei)?), pinned)
@@ -11840,6 +11853,42 @@ pub fn plan_experts_from_stats(
         }
     }
 
+    // task 268: 本番の「モデルを切り替えた直後の cold start」を lab で作る。
+    let mut return_line = String::new();
+    // ゲート (`DENNO_EXPERT_DROP_CACHE_ON_START=1`) のときだけ、**事前ロードが
+    // 1 バイトも読む前**に expert のページを落とす。dense / PLE は落とさない
+    // (本番で冷えるのは expert の範囲だけで、dense は起動時に GPU へ上げる)。
+    if crate::model::expert_ram::drop_on_start_enabled() {
+        let mut ranges: Vec<(usize, u64, u64)> = Vec::with_capacity(layers.len() * 3);
+        let mut resident_before = 0u64;
+        for (g, u, d) in &layers {
+            for w in [g, u, d] {
+                let b = w.blocks.as_slice();
+                resident_before += crate::model::expert_ram::resident_bytes_of(
+                    b.as_ptr() as usize,
+                    b.len(),
+                );
+                ranges.push((w.file, w.abs, b.len() as u64));
+            }
+        }
+        let t_drop = Instant::now();
+        let line = crate::model::expert_ram::drop_ranges(parts, &ranges);
+        let mut resident_after = 0u64;
+        for (g, u, d) in &layers {
+            for w in [g, u, d] {
+                let b = w.blocks.as_slice();
+                resident_after +=
+                    crate::model::expert_ram::resident_bytes_of(b.as_ptr() as usize, b.len());
+            }
+        }
+        return_line.push_str(&format!(
+            "{line} resident={}MiB->{}MiB in {:.2}s; ",
+            resident_before >> 20,
+            resident_after >> 20,
+            t_drop.elapsed().as_secs_f64()
+        ));
+    }
+
     // VRAM 予算をここで初期化する (初回の MoE 呼び出しと同じ 1 回きりの決定)。
     let _ = expert_route();
     let vram_cap = expert_vram::cache_usage().map(|(_, cap)| cap);
@@ -11955,6 +12004,21 @@ pub fn plan_experts_from_stats(
     let vram_bytes = expert_vram::cache_usage().map_or(0, |(u, _)| u) as u64;
     let vkeys: Vec<(u16, u16)> = loaded_keys.iter().map(|k| (k.layer, k.expert)).collect();
     let (cov_vram, total_uses) = exp_stats::coverage(&counts, &vkeys);
+    // task 268: VRAM 段が終わった時点で 1 行出す。RAM tier の充填が長引いて
+    // サーバが落とされても、VRAM に何本載ったかがログに残るようにする
+    // (t263c は [exp-plan] が最後まで出ず、VRAM の結果が分からなかった)。
+    if vram_on {
+        eprintln!(
+            "[exp-plan] vram phase: loaded={loaded} experts {}MiB (cover {:.3}) in {:.2}s stop={stop:?}",
+            vram_bytes >> 20,
+            if total_uses > 0 {
+                cov_vram as f64 / total_uses as f64
+            } else {
+                0.0
+            },
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
     // ---- RAM tier: 残りを回数の多い順に ----
     let mut ram_experts = 0usize;
@@ -12016,7 +12080,7 @@ pub fn plan_experts_from_stats(
     });
     Some(format!(
         "[exp-plan] planned={n_plan} uses={total_uses} vram={loaded} experts {}MiB (cover {:.3}){ram_msg} \
-         total cover {cover_total:.3} rest=mmap in {secs:.2}s paused={paused_ms:.0}ms stop={stop:?}",
+         total cover {cover_total:.3} rest=mmap in {secs:.2}s paused={paused_ms:.0}ms stop={stop:?}{return_line}",
         vram_bytes >> 20,
         frac(cov_vram)
     ))

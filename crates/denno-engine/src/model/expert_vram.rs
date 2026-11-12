@@ -1844,12 +1844,19 @@ mod gpu {
         // 6 型 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0) も
         // `kernels_exp_iq.ptx` があれば載せてよい (`DENNO_EXPERT_IQ_GPU=1` のときだけ
         // `moe_gemv_iq_ready` が真になる)。ゲートが off なら従来どおり false。
+        //
+        // task 268: **層一括カーネル (`kernels_moe_batch.ptx`) で回せる型も受ける**。
+        // UD-Q4_K_XL の decode は層一括経路 (`moe_experts_gpu_batched`) だけを通り、
+        // ここの判定は per-expert カーネル (`kernels_moe.ptx`) しか見ていなかった。
+        // 一括カーネルは Q4_K / Q5_K / Q5_1 / Q8_0 を全部持つので、載せてよい
+        // (= 事前ロードが 1 本も載せられない、を防ぐ)。
         let mut want = 0usize;
         // task 152: 3 行列のバイト数 (slab のスロット配分に使う)。
         let mut mbytes = [0usize; 3];
         for (i, s) in shapes.iter().enumerate() {
             if !crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k)
                 && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
+                && !crate::cuda::moe_gemv_seg_ready(s.ty, s.k)
             {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
@@ -2881,5 +2888,55 @@ mod tests {
         assert_eq!(g.probes(), 1);
         assert_eq!(g.decide(0, Some(8)), GateDecision::Probe);
         assert_eq!(g.probes(), 2);
+    }
+
+    /// task 268: 事前ロードのバイト数が K 系 / legacy 型でも求まること。
+    ///
+    /// UD-Q4_K_XL の実形 (hidden 2560 / expert FF 640、gate/up = Q4_K、
+    /// down = Q5_1) で 1 本 = 3,072,000 B。`bytes()` が型で落ちると
+    /// 起動プランが VRAM に 1 本も載せられない (t263c でそう読めた)。
+    #[test]
+    fn plan_bytes_cover_k_and_legacy_types() {
+        use crate::kquant::GgmlType as T;
+        let ud = [
+            ExpertShape {
+                ty: T::Q4K,
+                k: 2560,
+                n: 640,
+            },
+            ExpertShape {
+                ty: T::Q4K,
+                k: 2560,
+                n: 640,
+            },
+            ExpertShape {
+                ty: T::Q5_1,
+                k: 640,
+                n: 2560,
+            },
+        ];
+        let sizes: Vec<usize> = ud.iter().map(|s| s.bytes().expect("K 系で求まる")).collect();
+        // Q4_K: 2560/256 * 144 = 1440 B/行 * 640 = 921,600
+        assert_eq!(sizes[0], 921_600);
+        assert_eq!(sizes[1], 921_600);
+        // Q5_1: 640/32 * 24 = 480 B/行 * 2560 = 1,228,800
+        assert_eq!(sizes[2], 1_228_800);
+        assert_eq!(sizes.iter().sum::<usize>(), 3_072_000);
+        // Q5_K / Q8_0 も同じ入口で求まる (legacy 4 型。k は型のブロックで割り切る)
+        for ty in [T::Q5K, T::Q8_0, T::Q5_1] {
+            let s = ExpertShape {
+                ty,
+                k: 2560,
+                n: 640,
+            };
+            assert!(s.bytes().is_ok(), "{ty:?} のバイト数が求まらない");
+        }
+        // 端数 (ブロックで割り切れない) は今までどおり Err (fail closed)
+        let bad = ExpertShape {
+            ty: T::Q4K,
+            k: 640,
+            n: 2560,
+        };
+        assert!(bad.bytes().is_err(), "Q4_K の 640 は 256 で割り切れない");
     }
 }
