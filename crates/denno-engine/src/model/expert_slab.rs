@@ -148,6 +148,20 @@ impl<H> SlabSlot<H> {
     pub fn n_slots(&self) -> usize {
         self.chunk.n_slots
     }
+
+    /// task 248: このスロットが属するチャンクの識別子 (ハンドルのアドレス)。
+    ///
+    /// 同じチャンクのスロットは同じ値を返す。「1 本の確保のために expert を
+    /// 丸ごと空けるチャンク」を選ぶのに使う (中身がバラバラに追い出されて
+    /// 実メモリが戻らない、を避ける)。
+    pub fn chunk_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.chunk) as usize
+    }
+
+    /// このチャンク 1 本のバイト数 (`slot_bytes * n_slots`)。
+    pub fn chunk_bytes(&self) -> usize {
+        self.chunk.slot_bytes.saturating_mul(self.chunk.n_slots)
+    }
 }
 
 impl<H> Drop for SlabSlot<H> {
@@ -364,6 +378,33 @@ pub fn alloc_slot(slot_bytes: usize) -> anyhow::Result<SlabSlot<crate::cuda::Dev
     gpu::alloc_slot(slot_bytes)
 }
 
+/// チャンク一覧 `(id, バイト数, 最古の最終使用)` から、**丸ごと空ける**
+/// チャンクを選ぶ (task 248)。
+///
+/// 古い順 (最古の最終使用が小さい順、同値は id 昇順) に、合計バイト数が
+/// `need` 以上になるまで選ぶ。チャンクを丸ごと空けていないと slab は実メモリを
+/// 返さないので、1 本の大きな確保のために expert をバラバラに追い出しても
+/// 意味が無い (REPORT_P242 の 14k 層優先)。
+///
+/// 合計が `need` に届かなくても、選べるだけ返す (呼び出し側は失敗を許容する)。
+pub fn chunks_to_empty(chunks: &[(usize, usize, u64)], need: usize) -> Vec<usize> {
+    if need == 0 {
+        return Vec::new();
+    }
+    let mut v: Vec<(usize, usize, u64)> = chunks.to_vec();
+    v.sort_unstable_by_key(|(id, _, oldest)| (*oldest, *id));
+    let mut out = Vec::new();
+    let mut got = 0usize;
+    for (id, bytes, _) in v {
+        if got >= need {
+            break;
+        }
+        got = got.saturating_add(bytes);
+        out.push(id);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +537,24 @@ mod tests {
     fn alloc_zero_is_an_error() {
         let s: Slab<u32> = Slab::new();
         assert!(s.alloc(0, |_| Ok(1u32)).is_err());
+    }
+
+    /// task 248: 丸ごと空けるチャンクは「古い順」に必要量まで選ぶ。
+    #[test]
+    fn chunks_to_empty_picks_oldest_until_enough() {
+        let mib = 1usize << 20;
+        let chunks = vec![(10usize, 256 * mib, 5u64), (11, 256 * mib, 1), (12, 256 * mib, 9)];
+        // 1505 MiB には 6 本要るが、ここは 3 本しかない → 全部 (古い順)。
+        assert_eq!(chunks_to_empty(&chunks, 1505 * mib), vec![11, 10, 12]);
+        // 300 MiB なら 2 本 (古い 11, 10)。
+        assert_eq!(chunks_to_empty(&chunks, 300 * mib), vec![11, 10]);
+        // 1 バイトでも 1 本。
+        assert_eq!(chunks_to_empty(&chunks, 1), vec![11]);
+        // 0 は何も選ばない。
+        assert!(chunks_to_empty(&chunks, 0).is_empty());
+        // 同着は id 昇順 (決定的)。
+        let tie = vec![(3usize, 16usize, 7u64), (2, 16, 7)];
+        assert_eq!(chunks_to_empty(&tie, 32), vec![2, 3]);
     }
 
     #[test]

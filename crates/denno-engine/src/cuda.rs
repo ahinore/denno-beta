@@ -3046,6 +3046,63 @@ pub fn alloc_retry_wants(bytes: usize) -> Vec<usize> {
     out
 }
 
+/// task 248: `DENNO_ALLOC_KEEP_EXPERTS` の解釈 (純関数)。
+///
+/// 未設定・読めない値は既定 (on)。明示的な偽値だけ off。
+pub fn parse_keep_experts(v: Option<&str>, default_on: bool) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
+    }
+}
+
+/// task 248: 既定 (**on**)。
+///
+/// 1 本の確保のために expert の LRU を丸ごと捨てる経路を塞ぐ
+/// (REPORT_P242 の 14k 層優先: 1,505 MiB の連続確保が通らず 39,755 MiB を全捨て)。
+/// `DENNO_ALLOC_KEEP_EXPERTS=0` で従来の階段 (task 210) に戻せる。
+///
+/// lab t248c (`4cc5129`) の実測: base (on) と `DENNO_ALLOC_KEEP_EXPERTS=0` は
+/// 14k cold prefill 25.13 / 25.15 s、3,826 7.08 / 7.08 s、14k decode 18.4 /
+/// 18.4 ms/tok、md5 も全リクエストで SAME。**正常経路では 1 回も発火しない**
+/// (task248 の警告 0 回)。発火するのは確保に失敗したときだけで、そのときは
+/// 追い出しが「要求 + チャンク 1 本」で止まり、足りなければ Err (= 呼び出し側が
+/// CPU 経路へ) になる。
+pub const ALLOC_KEEP_EXPERTS_DEFAULT: bool = true;
+
+/// task 248: 確保失敗時に expert を全捨てしない方針か。
+pub fn alloc_keep_experts() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_keep_experts(
+            std::env::var("DENNO_ALLOC_KEEP_EXPERTS").ok().as_deref(),
+            ALLOC_KEEP_EXPERTS_DEFAULT,
+        )
+    })
+}
+
+/// task 248: 確保 1 本が失敗したときに expert を追い出してよい上限 (バイト)。
+///
+/// - expert タグ: 要求 + チャンク 1 本。slab はチャンクが空にならないと実メモリを
+///   返さないので、チャンク 1 本ぶんは動かせる余地を残す (2 MB の expert 1 本でも
+///   1 チャンクは空けないと実際には戻らない)。
+/// - それ以外で要求がチャンクの半分以上: 要求 + チャンク 1 本。
+/// - それ以外: 要求 + 64 MiB。
+///
+/// `None` は「上限なし = 従来の階段」(gate off)。
+pub fn evict_cap_bytes(need: usize, tag: &'static str, chunk: usize, keep: bool) -> Option<usize> {
+    if !keep {
+        return None;
+    }
+    let chunk = chunk.max(1 << 20);
+    if tag == crate::mem_audit::TAG_EXPERTS || need >= chunk / 2 {
+        Some(need.saturating_add(chunk))
+    } else {
+        Some(need.saturating_add(64 << 20))
+    }
+}
+
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
 pub struct DevBuffer {
     ptr: CUdeviceptr,
@@ -3088,6 +3145,48 @@ impl DevBuffer {
                 // キャッシュを捨てていた。lab t209a の 14k では prefill の頭で
                 // 32 MiB が 1 本通らないだけで全部追い出され、decode が
                 // 21 → 35 ms/tok になった。
+                //
+                // task 248: 階段の最後 (全部) を廃止する。1 本の確保のために
+                // expert の LRU を丸ごと捨てる経路を作らない (REPORT_P242 の
+                // 14k 層優先は 1,505 MiB の連続確保が通らず 39,755 MiB を全捨て
+                // した)。足りなければ Err を返し、呼び出し側が小さいタイル /
+                // CPU 経路へ落ちる。
+                if let Some(cap) = evict_cap_bytes(
+                    bytes,
+                    tag,
+                    crate::model::expert_slab::chunk_bytes(),
+                    alloc_keep_experts(),
+                ) {
+                    let chunk = crate::model::expert_slab::chunk_bytes().max(1 << 20);
+                    let is_experts = tag == crate::mem_audit::TAG_EXPERTS;
+                    let freed = if !is_experts && bytes >= chunk / 2 {
+                        // slab はチャンクが空にならないと実メモリを返さない。
+                        // 大きな作業域はチャンクを丸ごと空けて返す。
+                        crate::model::expert_vram::emergency_free_chunks(bytes)
+                    } else {
+                        crate::model::expert_vram::emergency_free(cap)
+                    };
+                    if freed == 0 {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "task248: 確保失敗 → expert を {} MiB 追い出して再試行 ({e:#})",
+                        freed >> 20
+                    );
+                    return match Self::raw_alloc(bytes) {
+                        Ok(ptr) => {
+                            crate::mem_audit::note_alloc(tag, bytes.max(1));
+                            Ok(Self {
+                                ptr,
+                                bytes,
+                                owned: true,
+                                tag,
+                            })
+                        }
+                        // 2 回目も駄目なら諦める (全捨てはしない)。
+                        Err(e2) => Err(e2),
+                    };
+                }
                 let mut last = e;
                 for want in alloc_retry_wants(bytes) {
                     let freed = crate::model::expert_vram::emergency_free(want);
@@ -9620,6 +9719,19 @@ pub fn pf_stage_usage() -> (usize, usize) {
     })
 }
 
+/// task 248: prefill の arena の (確保バイト, 実際の使用ピーク)。
+///
+/// 差が大きいほど「過大な作業域」= expert に回せる VRAM (台帳の
+/// `scratch arena` 行は確保バイトしか出さないので、ここで内訳を出す)。
+///
+/// `try_lock` なのは、`arena_alloc` (arena のロック保持中) から
+/// `DevBuffer::alloc_tagged` → `mem_audit::note_alloc` のピーク記録で
+/// 呼ばれうるため (通常の Mutex だと自己デッドロックする)。
+pub fn arena_usage() -> Option<(usize, usize)> {
+    let g = arena_state().try_lock().ok()?;
+    Some((g.plan.capacity(), g.plan.high_water))
+}
+
 /// 空き VRAM から余裕を引いた範囲で確保する (半分ずつ落とす)。
 ///
 /// `DevBuffer::alloc_tagged` は失敗すると expert を追い出すので**使わない**
@@ -9633,12 +9745,14 @@ fn pf_stage_alloc(want: usize) -> Option<DevBuffer> {
     let mut want = want.min(room);
     while want >= (PF_STAGE_MIN_MB << 20) {
         if let Ok(ptr) = DevBuffer::raw_alloc(want) {
-            crate::mem_audit::note_alloc(crate::mem_audit::TAG_EXPERTS, want.max(1));
+            // task 248: ステージングは expert とは別の行にする (台帳の
+            // 「experts」は slab のチャンクだけ、にする)。
+            crate::mem_audit::note_alloc(crate::mem_audit::TAG_PF_STAGE, want.max(1));
             return Some(DevBuffer {
                 ptr,
                 bytes: want,
                 owned: true,
-                tag: crate::mem_audit::TAG_EXPERTS,
+                tag: crate::mem_audit::TAG_PF_STAGE,
             });
         }
         want /= 2;
@@ -12998,6 +13112,24 @@ mod pf_stream_tests {
         assert!(pf_tab::upload(&[]));
         let data: [u8; 0] = [];
         assert!(pf_tab::upload(&[(0u64, 0, &data)]));
+    }
+
+    /// task 248: ピーク記録 (`mem_audit::note_alloc` → `peak_note`) は prefill
+    /// ステージングの確保中にも呼ばれる。ここで thread_local (PF_STREAM の
+    /// RefCell) を読むと**二重借用で panic する** (lab t248b で踏んだ)。
+    /// ピーク記録が thread_local を触らないことを、借用を持ったまま固定する。
+    #[test]
+    fn peak_note_runs_while_the_staging_refcell_is_borrowed() {
+        crate::mem_audit::force_audit_for_test(Some(true));
+        {
+            let _w = crate::mem_audit::peak_window("t");
+            PF_STREAM.with(|cell| {
+                let _st = cell.borrow_mut();
+                crate::mem_audit::note_alloc(crate::mem_audit::TAG_PF_STAGE, 1 << 20);
+                crate::mem_audit::note_free(crate::mem_audit::TAG_PF_STAGE, 1 << 20);
+            });
+        }
+        crate::mem_audit::force_audit_for_test(None);
     }
 
     /// task 165: グループ番号は層をまたいで単調 (連番) に増える。
@@ -37196,6 +37328,62 @@ mod tests {
         let sat = alloc_retry_wants(usize::MAX - 1);
         assert_eq!(sat[0], usize::MAX);
         assert_eq!(*sat.last().unwrap(), usize::MAX);
+    }
+
+    /// task 248: 1 本の確保で追い出してよい量の上限。
+    ///
+    /// 従来の階段は最後が「全部」で、1,505 MiB の作業域 1 本のために
+    /// 39,755 MiB の expert を捨てていた。ここでは
+    /// 「要求 + 64 MiB」(expert) / 「要求 + チャンク 1 本」(大きな作業域) に切る。
+    #[test]
+    fn evict_cap_is_bounded_per_allocation() {
+        let mib = 1usize << 20;
+        let chunk = 256 * mib;
+        // 大きな作業域 (1,505 MiB): 要求 + チャンク。
+        let cap = evict_cap_bytes(1505 * mib, crate::mem_audit::TAG_OTHER, chunk, true);
+        assert_eq!(cap, Some(1505 * mib + chunk), "作業域の上限: {cap:?}");
+        assert!(cap.unwrap() < 2 * 1024 * mib, "22 GB を捨てる上限になっている");
+        // 小さな確保は要求 + 64 MiB。
+        assert_eq!(
+            evict_cap_bytes(2 * mib, crate::mem_audit::TAG_OTHER, chunk, true),
+            Some(2 * mib + (64 << 20))
+        );
+        // expert タグ (スラブのチャンク確保 256 MiB も含む) は要求 + チャンク。
+        // 2 MB の expert 1 本でも、実メモリを返すには 1 チャンク空ける必要がある。
+        assert_eq!(
+            evict_cap_bytes(chunk, crate::mem_audit::TAG_EXPERTS, chunk, true),
+            Some(chunk + chunk)
+        );
+        assert_eq!(
+            evict_cap_bytes(2 * mib, crate::mem_audit::TAG_EXPERTS, chunk, true),
+            Some(2 * mib + chunk)
+        );
+        // 小さな作業域は要求 + 64 MiB のまま。
+        assert_eq!(
+            evict_cap_bytes(2 * mib, crate::mem_audit::TAG_GROUPED, chunk, true),
+            Some(2 * mib + (64 << 20))
+        );
+        // gate off は従来 (上限なし = 階段の最後まで)。
+        assert_eq!(
+            evict_cap_bytes(1505 * mib, crate::mem_audit::TAG_OTHER, chunk, false),
+            None
+        );
+    }
+
+    /// task 248: `DENNO_ALLOC_KEEP_EXPERTS` の真偽表。既定は on。
+    #[test]
+    fn keep_experts_env_truth_table() {
+        assert!(parse_keep_experts(None, true), "未設定は既定");
+        assert!(!parse_keep_experts(None, false));
+        for off in ["0", "off", "false", "no", " off "] {
+            assert!(!parse_keep_experts(Some(off), true), "{off:?} が on になった");
+        }
+        for on in ["1", "on", "true", "yes"] {
+            assert!(parse_keep_experts(Some(on), false), "{on:?} が off になった");
+        }
+        // 読めない値は既定 (ここでは false)。
+        assert!(!parse_keep_experts(Some("2"), false));
+        assert!(parse_keep_experts(Some("2"), true));
     }
 
     /// task 210: `DENNO_ATTN_MIRROR_FORGET` の真偽表。既定は on。
