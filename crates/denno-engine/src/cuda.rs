@@ -20641,21 +20641,22 @@ pub(crate) fn pf_mix_tc_on() -> bool {
     *ON.get_or_init(|| pf_mix_tc_from_value(std::env::var("DENNO_PF_MIX_TC").ok().as_deref()))
 }
 
-/// `DENNO_PF_MIX_Q8TC` の値の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_MIX_Q8TC` の値の解釈 (純関数)。未設定は既定 on、明示的な真値だけ on。
 ///
-/// **既定 off** (task 301。lab の採否が決まるまで切り戻せるようにする)。
-/// UD-Q4_K_XL の hc mix は **Q8_0** の down / up で、既定では従来の量子 GEMM
-/// (1 起動 16 行 x 128 トークン、16 スレッド) を通る。同じ sn3 の Q8_0 入口
-/// (bf16 mma、k 昇順・FP32 アキュムレート) に載せ替える。
+/// **既定 on** (lab t301a で採用)。UD-Q4_K_XL の hc mix は **Q8_0** の
+/// down / up で、既定では従来の量子 GEMM (1 起動 16 行 x 128 トークン、
+/// 16 スレッド) を通る。同じ sn3 の Q8_0 入口 (bf16 mma、k 昇順・FP32
+/// アキュムレート) に載せ替えると、14,018 の mix が 31.06 -> 1.11 s
+/// (-96.4%)、cold prefill が 143.45 -> 115.26 s (-19.7%) になった。
 pub(crate) fn pf_mix_q8_tc_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
 /// prefill の hc mix のうち **Q8_0 の重み** (UD-Q4_K_XL) を sn3 で回すか
-/// (**既定 off**。`DENNO_PF_MIX_Q8TC=1` で on)。
+/// (**既定 on**。`DENNO_PF_MIX_Q8TC=0` で切る)。
 pub(crate) fn pf_mix_q8_tc_on() -> bool {
     #[cfg(test)]
     {
@@ -21021,22 +21022,22 @@ mod pf_tc_tests {
     }
 
     /// task 301: UD-Q4_K_XL の mix (Q8_0 の down / up) を sn3 に載せるゲート。
-    /// 既定 off で、明示的な真値だけ on。強制上書きは往復する。
+    /// **既定 on** (lab t301a で採用)。明示的な偽値だけ off。強制上書きは往復する。
     #[test]
     fn pf_mix_q8_tc_gate_truth_table() {
-        assert!(!pf_mix_q8_tc_from_value(None), "既定 off");
-        for v in ["0", "off", "false", "no", "", "2"] {
+        assert!(pf_mix_q8_tc_from_value(None), "既定 on");
+        for v in ["0", "off", "false", "no", "", " OFF ", "2"] {
             assert!(!pf_mix_q8_tc_from_value(Some(v)), "{v}");
         }
         for v in ["1", "on", "true", "yes", " ON ", " 1 "] {
             assert!(pf_mix_q8_tc_from_value(Some(v)), "{v}");
         }
         let before = pf_mix_q8_tc_on();
-        assert!(!before, "既定 off");
-        set_pf_mix_q8_tc_for_test(Some(true));
-        assert!(pf_mix_q8_tc_on());
+        assert!(before, "既定 on");
         set_pf_mix_q8_tc_for_test(Some(false));
         assert!(!pf_mix_q8_tc_on());
+        set_pf_mix_q8_tc_for_test(Some(true));
+        assert!(pf_mix_q8_tc_on());
         set_pf_mix_q8_tc_for_test(None);
         assert_eq!(pf_mix_q8_tc_on(), before);
     }
