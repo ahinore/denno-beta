@@ -4886,7 +4886,8 @@ impl CudaCtx {
             }
             _ => return None,
         };
-        let lanes = v5_lanes_div(per_unit, 8);
+        // task 281: lane 数の上限は env (`DENNO_GEMV_V5_LANES`。既定 8 = 従来と同じ)。
+        let lanes = v5_lanes_div(per_unit, v5_lanes_cap());
         if lanes == 0 {
             return None;
         }
@@ -6085,6 +6086,33 @@ fn gemv_v5_q5k_kernels() -> Option<&'static V5Q5KKernels> {
 #[cfg(test)]
 pub(crate) fn moe_gemv_v5_q5k_loaded() -> bool {
     gemv_v5_q5k_kernels().is_some()
+}
+
+/// task 281: v5 の lane 数上限 (`DENNO_GEMV_V5_LANES`。既定 8 = これまでと同じ)。
+///
+/// v5 の lane 数は「1 レーンが受け持つ量子ブロック対の数が割り切れる」最大の 2 の冪で、
+/// 長らく `v5_lanes_div(per_unit, 8)` に固定されていた。Q8_0 の k=6144
+/// (`per_unit` = nb/2 = 96) は 8 レーン = block 64 = 640 warp しか立たず、
+/// 16.7 MB/層 の読みが 560 GB/s で止まる (同じカーネルでも k=2560 の 31.5 MB は
+/// 1,057 GB/s = 1 レーンの依存ロード連鎖が長いだけ)。上限を 16 / 32 にすると
+/// 立つ warp が 2 倍 / 4 倍になり、1 レーンの連鎖は 12 -> 6 -> 3 対になる。
+///
+/// 丸めは変わる (1 レーン分の鎖の長さと lane 木の段数が変わる) ので既定は 8 のまま。
+fn parse_v5_lanes(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        Some("32") => 32,
+        Some("16") => 16,
+        Some("4") => 4,
+        Some("2") => 2,
+        Some("1") => 1,
+        _ => 8,
+    }
+}
+
+/// [`parse_v5_lanes`] をプロセスで 1 回だけ読む。
+fn v5_lanes_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| parse_v5_lanes(std::env::var("DENNO_GEMV_V5_LANES").ok().as_deref()))
 }
 
 /// 割り切れる最大の 2 の冪 (1 以上、`cap` 以下)。無ければ 0。
@@ -54264,6 +54292,64 @@ mod task184_tests {
         }
         for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true ")] {
             assert!(parse_dec_mix_injhost(raw), "raw={raw:?} が off になっている");
+        }
+    }
+
+    /// task 281: `DENNO_GEMV_V5_LANES` の真理値表 (純関数)。
+    ///
+    /// 既定は 8 (= これまでの `v5_lanes_div(per_unit, 8)` と同じ)。
+    /// 未設定・空・未知の値・数値でない値はすべて 8 に落ちる (事故で lane 数が
+    /// 動かないように、明示した 1/2/4/16/32 だけを受ける)。
+    #[test]
+    fn v5_lanes_cap_table() {
+        for raw in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("x"),
+            Some("0"),
+            Some("8"),
+            Some("off"),
+            Some("64"),
+        ] {
+            assert_eq!(parse_v5_lanes(raw), 8, "raw={raw:?}");
+        }
+        for (raw, want) in [
+            (Some("1"), 1usize),
+            (Some("2"), 2),
+            (Some("4"), 4),
+            (Some("16"), 16),
+            (Some("32"), 32),
+            (Some(" 16 "), 16),
+        ] {
+            assert_eq!(parse_v5_lanes(raw), want, "raw={raw:?}");
+        }
+    }
+
+    /// task 281: lane 数を上げたときに計画が実際に変わる形と変わらない形。
+    ///
+    /// Q8_0 の `per_unit` は `nb/2 = n_in/64` なので、
+    /// k=6144 (96) は 8 -> 16 -> 32 と上がり、k=2560 (40) と k=1024 (16) は
+    /// 16 では 8 のまま (40 は 16 で割れない)。**block = 8 行 x lanes** なので
+    /// 上限 32 でも 256 スレッドに収まる。
+    #[test]
+    fn v5_lanes_shape_table() {
+        let cases: [(usize, usize, usize); 6] = [
+            // (k, cap, 期待 lanes)
+            (6144, 8, 8),
+            (6144, 16, 16),
+            (6144, 32, 32),
+            (2560, 16, 8),
+            (2560, 32, 8),
+            (1024, 16, 16),
+        ];
+        for (k, cap, want) in cases {
+            let per_unit = k / 64; // Q8_0: nb/2
+            let lanes = v5_lanes_div(per_unit, cap);
+            assert_eq!(lanes, want, "k={k} cap={cap}");
+            let block = 8 * lanes;
+            assert!(block <= 1024, "k={k} cap={cap} block={block}");
+            assert_eq!(per_unit % lanes, 0, "k={k} cap={cap}: 割り切れない");
         }
     }
 
