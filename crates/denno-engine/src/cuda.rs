@@ -6088,7 +6088,7 @@ pub(crate) fn moe_gemv_v5_q5k_loaded() -> bool {
     gemv_v5_q5k_kernels().is_some()
 }
 
-/// task 281: v5 の lane 数上限 (`DENNO_GEMV_V5_LANES`。既定 8 = これまでと同じ)。
+/// task 281/285: v5 の lane 数上限 (`DENNO_GEMV_V5_LANES`。**既定 32**)。
 ///
 /// v5 の lane 数は「1 レーンが受け持つ量子ブロック対の数が割り切れる」最大の 2 の冪で、
 /// 長らく `v5_lanes_div(per_unit, 8)` に固定されていた。Q8_0 の k=6144
@@ -6097,15 +6097,20 @@ pub(crate) fn moe_gemv_v5_q5k_loaded() -> bool {
 /// 1,057 GB/s = 1 レーンの依存ロード連鎖が長いだけ)。上限を 16 / 32 にすると
 /// 立つ warp が 2 倍 / 4 倍になり、1 レーンの連鎖は 12 -> 6 -> 3 対になる。
 ///
-/// 丸めは変わる (1 レーン分の鎖の長さと lane 木の段数が変わる) ので既定は 8 のまま。
+/// 丸めは変わる (1 レーン分の鎖の長さと lane 木の段数が変わる) が、値の差は
+/// 丸めだけで出力は動かない (lab t281a / t285a / t285c で md5 SAME)。task 285 で
+/// 既定を 8 -> 32 にした (t285c: 短い decode 18.0 -> 17.9 ms/tok、2 サンプルずつ
+/// 揃って同方向、prefill は短い点 +0.8% 以内、14k の prefill は base2 と同値)。
+/// 切り戻しは `DENNO_GEMV_V5_LANES=8`。
 fn parse_v5_lanes(raw: Option<&str>) -> usize {
     match raw.map(str::trim) {
         Some("32") => 32,
         Some("16") => 16,
+        Some("8") => 8,
         Some("4") => 4,
         Some("2") => 2,
         Some("1") => 1,
-        _ => 8,
+        _ => 32,
     }
 }
 
@@ -54309,22 +54314,15 @@ mod task184_tests {
     /// 動かないように、明示した 1/2/4/16/32 だけを受ける)。
     #[test]
     fn v5_lanes_cap_table() {
-        for raw in [
-            None,
-            Some(""),
-            Some("  "),
-            Some("x"),
-            Some("0"),
-            Some("8"),
-            Some("off"),
-            Some("64"),
-        ] {
-            assert_eq!(parse_v5_lanes(raw), 8, "raw={raw:?}");
+        // task 285: 既定 (未設定・解釈できない値) は 32。
+        for raw in [None, Some(""), Some("  "), Some("x"), Some("0"), Some("off"), Some("64")] {
+            assert_eq!(parse_v5_lanes(raw), 32, "raw={raw:?}");
         }
         for (raw, want) in [
             (Some("1"), 1usize),
             (Some("2"), 2),
             (Some("4"), 4),
+            (Some("8"), 8),
             (Some("16"), 16),
             (Some("32"), 32),
             (Some(" 16 "), 16),
