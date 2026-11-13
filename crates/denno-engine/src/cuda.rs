@@ -20641,10 +20641,52 @@ pub(crate) fn pf_mix_tc_on() -> bool {
     *ON.get_or_init(|| pf_mix_tc_from_value(std::env::var("DENNO_PF_MIX_TC").ok().as_deref()))
 }
 
+/// `DENNO_PF_MIX_Q8TC` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (task 301。lab の採否が決まるまで切り戻せるようにする)。
+/// UD-Q4_K_XL の hc mix は **Q8_0** の down / up で、既定では従来の量子 GEMM
+/// (1 起動 16 行 x 128 トークン、16 スレッド) を通る。同じ sn3 の Q8_0 入口
+/// (bf16 mma、k 昇順・FP32 アキュムレート) に載せ替える。
+pub(crate) fn pf_mix_q8_tc_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => false,
+    }
+}
+
+/// prefill の hc mix のうち **Q8_0 の重み** (UD-Q4_K_XL) を sn3 で回すか
+/// (**既定 off**。`DENNO_PF_MIX_Q8TC=1` で on)。
+pub(crate) fn pf_mix_q8_tc_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_MIX_Q8TC_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_mix_q8_tc_from_value(std::env::var("DENNO_PF_MIX_Q8TC").ok().as_deref()))
+}
+
 #[cfg(test)]
 static PF_TC_SN3_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(test)]
 static PF_MIX_TC_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static PF_MIX_Q8TC_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_mix_q8_tc_for_test(v: Option<bool>) {
+    PF_MIX_Q8TC_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
 
 #[cfg(test)]
 pub(crate) fn set_pf_tc_shared3_for_test(v: Option<bool>) {
@@ -20976,6 +21018,50 @@ mod pf_tc_tests {
         assert!(!pf_attn_tc_on());
         set_pf_attn_tc_for_test(None);
         assert_eq!(pf_attn_tc_on(), before_a);
+    }
+
+    /// task 301: UD-Q4_K_XL の mix (Q8_0 の down / up) を sn3 に載せるゲート。
+    /// 既定 off で、明示的な真値だけ on。強制上書きは往復する。
+    #[test]
+    fn pf_mix_q8_tc_gate_truth_table() {
+        assert!(!pf_mix_q8_tc_from_value(None), "既定 off");
+        for v in ["0", "off", "false", "no", "", "2"] {
+            assert!(!pf_mix_q8_tc_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", " ON ", " 1 "] {
+            assert!(pf_mix_q8_tc_from_value(Some(v)), "{v}");
+        }
+        let before = pf_mix_q8_tc_on();
+        assert!(!before, "既定 off");
+        set_pf_mix_q8_tc_for_test(Some(true));
+        assert!(pf_mix_q8_tc_on());
+        set_pf_mix_q8_tc_for_test(Some(false));
+        assert!(!pf_mix_q8_tc_on());
+        set_pf_mix_q8_tc_for_test(None);
+        assert_eq!(pf_mix_q8_tc_on(), before);
+    }
+
+    /// task 301: 実形が sn3 の前提 (n_out % 64 == 0 / n_in % 32 == 0 /
+    /// nt >= 64) を満たすこと。満たさない形は従来経路へ落ちる (fail closed)。
+    #[test]
+    fn pf_mix_q8_tc_ud_shapes() {
+        use crate::kquant::GgmlType as T;
+        // 3,826 のチャンク (1,913) と 14k のチャンク (2,047)。
+        for nt in [1913usize, 2047] {
+            for (n_in, n_out) in [(10240usize, 320usize), (320, 10240)] {
+                assert!(
+                    pf_tc_sn3_eligible(T::Q8_0, nt, n_in, n_out, 1),
+                    "nt={nt} k={n_in} n={n_out}"
+                );
+            }
+        }
+        // next turn (19 トークン) は従来経路 (BM 未満)。
+        assert!(!pf_tc_sn3_eligible(T::Q8_0, 19, 10240, 320, 1));
+        assert!(!pf_tc_sn3_eligible(T::Q8_0, 19, 320, 10240, 1));
+        // inject (n=4) は sn3 の対象外。
+        assert!(!pf_tc_sn3_eligible(T::Q8_0, 1913, 10240, 4, 1));
+        // Q8_0 以外の量子型は sn3 の Q8_0 入口を使わない (型ごとの入口が要る)。
+        assert!(!pf_tc_sn3_k_ok(T::Q5_1, 10240));
     }
 
     /// task 222: sn3 は実モデルの 4 つの型と形 (shared の Q5_K と mix の BF16) を
@@ -26320,16 +26406,24 @@ pub fn pf_mix(
                 }
             }
             // task 222: BF16 の down / up をテンソルコアの GEMM で回す
-            // (`DENNO_PF_MIX_TC`。既定 off)。形は実モデルで
+            // (`DENNO_PF_MIX_TC`。**既定 on**、lab t222b で採用)。形は実モデルで
             // down: k=10240 n=320 / up: k=320 n=10240。
-            if pf_mix_tc_on()
-                && kind == PfWKind::Bf16
-                && pf_tc_sn3_eligible(crate::kquant::GgmlType::Bf16, nt, kk, nn, 1)
-            {
-                if let Some(fns) = tc_sn3_kernels() {
-                    let ty = crate::kquant::GgmlType::Bf16;
-                    return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, kk * 2)
-                        .map_err(|e| format!("mix_tc gemm launch: {e:#}"));
+            // task 301: UD-Q4_K_XL の mix は **Q8_0** なので、sn3 の Q8_0 入口へも
+            // 回せるようにする (`DENNO_PF_MIX_Q8TC`、既定 off)。カーネルは同じ
+            // `kernels_gemm_sn3.ptx` で、丸め (bf16) と加算順 (k 昇順) も同じ。
+            let mix_sn3 = match kind {
+                PfWKind::Bf16 if pf_mix_tc_on() => Some((crate::kquant::GgmlType::Bf16, kk * 2)),
+                PfWKind::Quant(crate::kquant::GgmlType::Q8_0, _, rb, _) if pf_mix_q8_tc_on() => {
+                    Some((crate::kquant::GgmlType::Q8_0, rb))
+                }
+                _ => None,
+            };
+            if let Some((ty, rb)) = mix_sn3 {
+                if pf_tc_sn3_eligible(ty, nt, kk, nn, 1) {
+                    if let Some(fns) = tc_sn3_kernels() {
+                        return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, rb)
+                            .map_err(|e| format!("mix_tc gemm launch: {e:#}"));
+                    }
                 }
             }
             // task 195: down / up を n 方向に細かく割るカーネル
