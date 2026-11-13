@@ -701,6 +701,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_pf::stats_reset();
+    // task 261: 旧 4 型 expert の prefill GPU 経路 (1 層も回っていなければ出さない)。
+    if let Some(line) = denno_engine::model::exp_pf::quant_pf_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_pf::quant_pf_reset();
     // task 158: decode のミス expert を GPU で回したぶんの内訳 (`DENNO_DEC_MISS_UP`
     // が on のときだけ 1 行)。1 本あたりのホスト写し時間と実効レートが読める。
     if let Some(line) = denno_engine::model::exp_miss_up::stats_line() {
@@ -712,6 +717,16 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_up_worker::stats_reset();
+    // task 266: decode の先読み (`DENNO_DEC_PREF` のときだけ 1 行)。
+    if let Some(line) = denno_engine::model::exp_prefetch::stats_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_prefetch::stats_reset();
+    // task 266: 量子型 mix の fused chain が走った回数 (`DENNO_MIX_QCHAIN` のときだけ)。
+    if let Some(line) = denno_engine::model::qwen4exp::mix_qchain_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::qwen4exp::mix_qchain_reset();
     if !q4prof::enabled() {
         return;
     }
