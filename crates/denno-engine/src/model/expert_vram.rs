@@ -801,16 +801,28 @@ impl EvictReport {
 /// `request` は確保したいバイト数。不足分だけを、アドレスが連続するチャンクの
 /// 窓で空ける (`plan_eviction`)。cuda feature 無しでは何も解放しない。
 pub fn emergency_free_chunks(request: usize) -> EvictReport {
+    emergency_free_chunks_keys(request).0
+}
+
+/// task 279: [`emergency_free_chunks`] の「追い出した expert の鍵」も返す版。
+///
+/// 鍵は**古い順** (LRU の先頭から)。prefill の作業域を借りるために追い出した
+/// expert を、借りた作業域を返すときに戻すために使う (task 242 の
+/// `emergency_free_keys` と同じ契約)。cuda feature 無しでは何も解放しない。
+pub fn emergency_free_chunks_keys(request: usize) -> (EvictReport, Vec<ExpertKey>) {
     #[cfg(feature = "cuda")]
     {
         gpu::emergency_free_chunks(request)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        EvictReport {
-            requested: request,
-            ..EvictReport::default()
-        }
+        (
+            EvictReport {
+                requested: request,
+                ..EvictReport::default()
+            },
+            Vec::new(),
+        )
     }
 }
 
@@ -1207,9 +1219,10 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, acquire_deferred, acquire_host, acquire_soft, cache_usage, check_enabled, fallbacks,
-    init, keys, lookup, lookup_many, note_check, peek_many, take_alloc_error, take_check, touch_many,
-    touch_many_count, Acquired, CheckAcc, ExpertDev, ExpertShape,
+    acquire, acquire_deferred, acquire_host, acquire_soft, cache_usage, check_enabled,
+    fallback_breakdown, fallbacks, init, keys, lookup, lookup_many, note_check, peek_many,
+    take_alloc_error, take_check, touch_many, touch_many_count, Acquired, CheckAcc, ExpertDev,
+    ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1371,6 +1384,12 @@ mod gpu {
     static ENV_CAP: OnceLock<usize> = OnceLock::new();
     /// 全 evict 後も確保できなかった回数 (診断用)
     static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+    /// task 261: フォールバックの理由別カウンタ (type = カーネルが無い型 /
+    /// budget = 予算に 1 本が入らない / alloc = 実メモリの確保に失敗)。
+    /// 合計は [`FALLBACKS`] と一致する (どの経路で落ちたかを切り分けるため)。
+    static FB_TYPE: AtomicU64 = AtomicU64::new(0);
+    static FB_BUDGET: AtomicU64 = AtomicU64::new(0);
+    static FB_ALLOC: AtomicU64 = AtomicU64::new(0);
     /// 1 本が上限より大きいことを 1 回だけ言うためのラッチ
     static OVERSIZE_LOGGED: AtomicBool = AtomicBool::new(false);
     /// task 152: slab のチャンク確保に失敗したことを 1 回だけ言うためのラッチ
@@ -1471,19 +1490,20 @@ mod gpu {
     ///
     /// LRU のロックを持っているスレッド (expert のロード中) からは何もできない
     /// (`try_lock`)。その場合は 0 を返し、呼び出し側が CPU 経路へ落ちる。
-    pub fn emergency_free_chunks(request: usize) -> EvictReport {
+    /// task 279: 追い出した鍵も返す (借りた作業域を返すときに expert を戻す)。
+    pub fn emergency_free_chunks(request: usize) -> (EvictReport, Vec<ExpertKey>) {
         let mut rep = EvictReport {
             requested: request,
             ..EvictReport::default()
         };
         if request == 0 {
-            return rep;
+            return (rep, Vec::new());
         }
         let Some(c) = CACHE.get() else {
-            return rep;
+            return (rep, Vec::new());
         };
         let Ok(mut g) = c.try_lock() else {
-            return rep;
+            return (rep, Vec::new());
         };
         // 失敗直後なので、キャッシュ (64 MiB / 2 秒) ではなく実測を引く。
         let free = crate::cuda::dev_mem_mb()
@@ -1504,12 +1524,13 @@ mod gpu {
             // slab に載っていない (per-expert 確保) なら、追い出しで実メモリが戻る。
             let evicted = g.evict_until_free(request.saturating_sub(free));
             rep.experts = evicted.len();
+            let keys: Vec<ExpertKey> = evicted.iter().map(|(k, _)| *k).collect();
             let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
             drop(evicted);
             drop(g);
             let released = crate::model::expert_slab::release_empty(request.saturating_sub(free));
             rep.released = freed.saturating_add(released);
-            return rep;
+            return (rep, keys);
         }
         let spans: Vec<crate::model::expert_slab::ChunkSpan> = map
             .iter()
@@ -1522,14 +1543,16 @@ mod gpu {
             .collect();
         let plan = crate::model::expert_slab::plan_eviction(&spans, free, request);
         if plan.ids.is_empty() {
-            return rep;
+            return (rep, Vec::new());
         }
         let chunks_before = crate::model::expert_slab::chunk_count();
         let bytes_before = crate::model::expert_slab::stats().2;
         let mut evicted = Vec::new();
+        let mut keys: Vec<ExpertKey> = Vec::new();
         for id in &plan.ids {
-            if let Some((_, _, _, keys)) = map.remove(id) {
-                for k in keys {
+            if let Some((_, _, _, chunk_keys)) = map.remove(id) {
+                for k in chunk_keys {
+                    keys.push(k);
                     if let Some(v) = g.remove(&k) {
                         evicted.push(v);
                     }
@@ -1547,7 +1570,7 @@ mod gpu {
         if rep.released == 0 {
             rep.released = bytes_before.saturating_sub(bytes_after);
         }
-        rep
+        (rep, keys)
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。
@@ -1677,6 +1700,19 @@ mod gpu {
     /// 上限超過・未対応・確保失敗で CPU へ落ちた回数 (診断用)。
     pub fn fallbacks() -> u64 {
         FALLBACKS.load(Ordering::Relaxed)
+    }
+
+    /// task 261: フォールバックの内訳 `(合計, 型, 予算, 確保失敗)`。
+    ///
+    /// 「GPU に載らなかった理由」を 1 行で出すためのもの。合計は
+    /// [`fallbacks`] と同じで、内訳の和が合計と一致する。
+    pub fn fallback_breakdown() -> (u64, u64, u64, u64) {
+        (
+            FALLBACKS.load(Ordering::Relaxed),
+            FB_TYPE.load(Ordering::Relaxed),
+            FB_BUDGET.load(Ordering::Relaxed),
+            FB_ALLOC.load(Ordering::Relaxed),
+        )
     }
 
     /// task 144: **載っているときだけ** expert を返す (ミスで H2D しない)。
@@ -1856,9 +1892,18 @@ mod gpu {
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
     {
         if ALLOC_DEAD.load(Ordering::Relaxed) {
+            // task 261: プロセス寿命のラッチ。静かに全部 CPU へ落ちるので 1 回だけ出す。
+            static DEAD_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !DEAD_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] ALLOC_DEAD: 以後すべて CPU 経路 (確保失敗のラッチ)");
+            }
             return Ok(None);
         }
         let Some(cache) = CACHE.get() else {
+            static NOCACHE_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !NOCACHE_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] CACHE 未初期化: すべて CPU 経路");
+            }
             return Ok(None);
         };
         let mut g = cache
@@ -1902,6 +1947,20 @@ mod gpu {
                 && !crate::cuda::moe_gemv_seg_ready(s.ty, s.k)
             {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                FB_TYPE.fetch_add(1, Ordering::Relaxed);
+                // task 261: 型で落ちるのは静かなので 1 回だけ理由を出す
+                // (どの型が・どのカーネル不足で載らないか)。
+                static TYPE_LOGGED: AtomicU64 = AtomicU64::new(0);
+                if TYPE_LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+                    eprintln!(
+                        "[exp-vram] 型が GPU 経路に無い: ty={:?} k={} n={} (旧 4 型 ready={} / IQ ready={})",
+                        s.ty,
+                        s.k,
+                        s.n,
+                        crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k),
+                        crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
+                    );
+                }
                 return Ok(None);
             }
             mbytes[i] = s.bytes()?;
@@ -1921,6 +1980,7 @@ mod gpu {
                     );
                 }
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                FB_BUDGET.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             }
         };
@@ -2004,6 +2064,7 @@ mod gpu {
         }
         let Some(bufs) = bufs else {
             FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            FB_ALLOC.fetch_add(1, Ordering::Relaxed);
             let n = ALLOC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
             let msg = last_err
                 .map(|e| format!("{e:#}"))
@@ -2064,9 +2125,18 @@ mod gpu {
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
     {
         if ALLOC_DEAD.load(Ordering::Relaxed) {
+            // task 261: プロセス寿命のラッチ。静かに全部 CPU へ落ちるので 1 回だけ出す。
+            static DEAD_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !DEAD_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] ALLOC_DEAD: 以後すべて CPU 経路 (確保失敗のラッチ)");
+            }
             return Ok(None);
         }
         let Some(cache) = CACHE.get() else {
+            static NOCACHE_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !NOCACHE_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[exp-vram] CACHE 未初期化: すべて CPU 経路");
+            }
             return Ok(None);
         };
         // 1. 参照と場所の確保 (ロック内)。
@@ -2095,6 +2165,7 @@ mod gpu {
                     && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
                 {
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    FB_TYPE.fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
                 }
                 mbytes[i] = s.bytes()?;
@@ -2105,6 +2176,7 @@ mod gpu {
                 Ok(v) => drop(v),
                 Err(_) => {
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    FB_BUDGET.fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
                 }
             }
@@ -2147,6 +2219,7 @@ mod gpu {
         }
         let Some(bufs) = bufs else {
             FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            FB_ALLOC.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
         let dev = Arc::new(ExpertDev {

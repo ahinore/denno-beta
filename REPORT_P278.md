@@ -196,9 +196,10 @@ lab のラウンド上限 (3) を使い切ったので、既定モデルの実�
 ## 6. テスト
 
 - `cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1`
-  -> 1148 passed / 0 failed / 100 ignored
+  -> 1168 passed / 0 failed / 100 ignored (int-auto 0566be1 = dev2 の task 279 を
+  merge した後。merge 前は 1147)
 - `cargo test --release -p denno-engine --features cuda --test kernel_invariants`
-  -> 91 passed / 0 failed
+  -> 93 passed / 0 failed (merge 前は 91)
 - 追加: `expert_batch::tests::seg_layer_gate_defaults_on` /
   `seg_stage_layout_is_packed_and_aligned`、`seg_prof::tests::*`、
   `cuda::tests::seg_k_gate_defaults_on`、

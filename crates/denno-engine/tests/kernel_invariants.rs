@@ -10369,3 +10369,99 @@ fn task278_seg_k_kernels_are_wired() {
     // ホスト側のゲート名 (gate_audit の台帳に載せる前の固定)
     assert!(CUDA_RS.contains("\"DENNO_SEG_K\""), "DENNO_SEG_K のゲートが無い");
 }
+
+// ===========================================================================
+// task 275: expert GEMV v3 (IQ2_S / IQ3_S の表を詰める) と
+//           decode mix の down+inject 版。
+// ===========================================================================
+
+const EXP_IQ_V3_SRC: &str = include_str!("../kernels/kernels_exp_iq_v3.cu");
+const EXP_IQ_TABLES_H: &str = include_str!("../kernels/kernels_exp_iq_tables.h");
+const MIX_DEV3_SRC: &str = include_str!("../kernels/kernels_mix_dev3.cu");
+
+/// v3 の 2 本は v2 と同じ 8 引数・同じ起動形 (4 行 / ブロック) で、shared へは
+/// **詰めた表だけ**を写すこと。元の 8 KB / 4 KB の表を読んでいたら失敗する。
+#[test]
+fn exp_iq_v3_uses_only_compact_tables() {
+    for name in ["dno_exp_gemv_iq2s_v3", "dno_exp_gemv_iq3s_v3"] {
+        let p = kernel_params(EXP_IQ_V3_SRC, name);
+        assert_eq!(
+            p,
+            vec!["wptrs", "xbase", "obase", "seg", "nseg", "n_in", "n_out", "row_bytes"],
+            "{name} の引数が v2 と違う: {p:?}"
+        );
+    }
+    assert!(
+        EXP_IQ_V3_SRC.contains("#define E3_ROWS 4"),
+        "行数 (4 行 / ブロック) が v2 と違う"
+    );
+    assert!(
+        EXP_IQ_V3_SRC.contains("sh[i] = dno_iq2s_grid2[i];"),
+        "IQ2_S が詰めた表を shared へ写していない"
+    );
+    assert!(
+        EXP_IQ_V3_SRC.contains("sh[i] = dno_iq3s_grid32[i];"),
+        "IQ3_S が詰めた表を shared へ写していない"
+    );
+    assert!(
+        !EXP_IQ_V3_SRC.contains("dno_iq2s_grid["),
+        "v3 が IQ2_S の元の 8 KB 表を読んでいる"
+    );
+    assert!(
+        !EXP_IQ_V3_SRC.contains("dno_iq3s_grid["),
+        "v3 が IQ3_S の元の u64 表を読んでいる"
+    );
+    // 詰めた表が .h にあり、元の表と同じ本数であること。
+    assert!(EXP_IQ_TABLES_H.contains("dno_iq2s_grid2[1024]"));
+    assert!(EXP_IQ_TABLES_H.contains("dno_iq3s_grid32[512]"));
+    // build_ptx.sh: fmad (v2 と同じ数値契約) で targets_all に入っている。
+    assert!(
+        BUILD_PTX_SH.contains("exp_iq_v3)    echo \"kernels_exp_iq_v3.cu|fmad\""),
+        "build_ptx.sh の exp_iq_v3 が fmad でない"
+    );
+    assert!(
+        BUILD_PTX_SH
+            .lines()
+            .find(|l| l.starts_with("targets_all="))
+            .unwrap_or("")
+            .contains("exp_iq_v3"),
+        "targets_all に exp_iq_v3 が無い"
+    );
+}
+
+/// down+inject 版は 10 引数で、down の本体が `dno_mix_down_bf16` と同一、
+/// inject は `dno_mix_inj` と同じ 256 スレッド固定の木であること。
+#[test]
+fn mix_dev3_down_inj_is_wired() {
+    let p = kernel_params(MIX_DEV3_SRC, "dno_mix_down_bf16_inj");
+    assert_eq!(
+        p,
+        vec!["x", "w", "out", "k", "n", "inv_hc", "wi", "inj", "ki", "hc"],
+        "dno_mix_down_bf16_inj の引数が違う: {p:?}"
+    );
+    // down の本体 (1 スレッド 8 要素の uint4 読み・warp 木・最後に tid 0 が書く)。
+    assert!(MIX_DEV3_SRC.contains("for (int c = tid * 8; c < k; c += (int)blockDim.x * 8)"));
+    assert!(MIX_DEV3_SRC.contains("const uint4 v = *reinterpret_cast<const uint4*>(rowp + c);"));
+    assert!(MIX_DEV3_SRC.contains("out[j] = __fdiv_rn(v, __fadd_rn(1.0f, dno_expf(-v)));"));
+    // inject は 256 スレッド固定 (dno_mix_inj と同じ刻み・同じ木)。
+    assert!(MIX_DEV3_SRC.contains("for (int i = tid; i < ki; i += 256)"));
+    assert!(MIX_DEV3_SRC.contains("if (active && (t & 31) == 0) red[t >> 5] = v;"));
+    // barrier を分岐で割らない (do_inj はブロックで一様)。
+    assert!(
+        MIX_DEV3_SRC.contains("const bool do_inj = (wi != 0) && (inj != 0) && (j < hc);"),
+        "do_inj に tid 依存が入っている (barrier が分岐する)"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_dev3)     echo \"kernels_mix_dev3.cu|nofmad\""),
+        "build_ptx.sh の mix_dev3 が nofmad でない"
+    );
+    assert!(
+        BUILD_PTX_SH
+            .lines()
+            .find(|l| l.starts_with("targets_all="))
+            .unwrap_or("")
+            .contains("mix_dev3"),
+        "targets_all に mix_dev3 が無い"
+    );
+}
+

@@ -358,16 +358,26 @@ impl SsmLayer {
         };
 
         // beta/alpha は CPU F32 のまま (GPU 経路でも値を変えない。Req の契約)。
+        // task 269: `DENNO_GDN_BA_GPU` のときだけデバイスで計算する (丸め順が
+        // 変わるので既定 off)。ホストの GEMV は 983 KB/層 を RAM から読むので
+        // 36 層で 0.79 ms/token かかり、その間 GPU が遊んでいた。
         let t_ba = std::time::Instant::now();
         let mut ba = vec![0f32; self.beta_alpha.n()];
-        self.beta_alpha.gemv_concat_into("ssm_beta", cur, &mut ba)?;
+        let ba_units = if crate::cuda::gdn_ba_gpu_on() {
+            self.gdn_ba_units()
+        } else {
+            Vec::new()
+        };
+        if ba_units.is_empty() {
+            self.beta_alpha.gemv_concat_into("ssm_beta", cur, &mut ba)?;
+        }
         let beta = &ba[self.beta_alpha.range(0)];
         let alpha = &ba[self.beta_alpha.range(1)];
 
         let qkv_units = self.gdn_qkv_units();
         let t_sub = std::time::Instant::now();
         let res = {
-            let req = self.gdn_decode_req(cur, beta, alpha, &qkv_units);
+            let req = self.gdn_decode_req(cur, beta, alpha, &qkv_units, &ba_units);
             crate::cuda::gdn_decode_submit(&req)
         };
         match res {
@@ -451,6 +461,41 @@ impl SsmLayer {
             .collect()
     }
 
+    /// task 269: beta/alpha の「1 発 GEMV の単位」を呼び出し順で列挙する
+    /// ([`SsmLayer::gdn_qkv_units`] と同じ規約。出力の行オフセット =
+    /// [`FusedLinear::gemv_unit_out_offset`])。
+    ///
+    /// **型がデバイス経路で扱えないときは空を返す** (fail closed)。呼び出し側は
+    /// 空なら従来どおりホストで GEMV を回す。submit の中で失敗させると
+    /// `gdn_gpu_scan` がプロセス全体で不使用になる (lab t269b で実際に踏んだ)
+    /// ので、判定はここで先に済ませる。
+    #[cfg(feature = "cuda")]
+    fn gdn_ba_units(&self) -> Vec<(crate::cuda::GdnGgufUnit<'_>, usize)> {
+        let units = self.beta_alpha.gemv_units();
+        if units
+            .iter()
+            .any(|u| !crate::cuda::gdn_ba_ty_ok(u.ty()) || u.n() == 0)
+        {
+            return Vec::new();
+        }
+        units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                (
+                    crate::cuda::GdnGgufUnit {
+                        uid: u.uid(),
+                        ty: u.ty(),
+                        blocks: u.blocks().as_slice(),
+                        k: u.k(),
+                        n: u.n(),
+                    },
+                    self.beta_alpha.gemv_unit_out_offset(i),
+                )
+            })
+            .collect()
+    }
+
     /// task 128: [`crate::cuda::gdn_decode_submit`] への要求を組む
     /// (field の意味は cuda.rs の `GdnDecodeReq` doc)。
     #[cfg(feature = "cuda")]
@@ -460,6 +505,7 @@ impl SsmLayer {
         beta: &'a [f32],
         alpha: &'a [f32],
         qkv_units: &'a [(crate::cuda::GdnGgufUnit<'a>, usize)],
+        ba_units: &'a [(crate::cuda::GdnGgufUnit<'a>, usize)],
     ) -> crate::cuda::GdnDecodeReq<'a> {
         crate::cuda::GdnDecodeReq {
             nonce: self.nonce,
@@ -480,6 +526,7 @@ impl SsmLayer {
             cur,
             beta,
             alpha,
+            ba_units,
             conv_host: &self.state.conv,
             ssm_host: &self.state.ssm,
             wconv: &self.conv1d,
@@ -1776,6 +1823,45 @@ mod tests {
         }
     }
 
+    /// task 269: beta/alpha をデバイスで計算する単位が、`beta_alpha` の全行を
+    /// **隙間なく 1 回ずつ**覆うこと (task 140 と同じ罠 = 連結時の行オフセット).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_ba_units_tile_beta_alpha_rows() {
+        let (layer, _p) = small_layer();
+        let units = layer.gdn_ba_units();
+        assert!(!units.is_empty(), "beta/alpha の単位が空");
+        let mut cover = vec![0u8; layer.beta_alpha.n()];
+        for (u, off) in &units {
+            assert_eq!(u.ty, GgmlType::F32, "beta/alpha は F32 のはず");
+            assert_eq!(u.k, layer.beta_alpha.k(), "k が beta_alpha と違う");
+            assert!(u.n > 0, "行数 0 の単位");
+            for r in *off..*off + u.n {
+                assert!(r < cover.len(), "行 {r} が beta_alpha の範囲外");
+                cover[r] += 1;
+            }
+        }
+        assert!(
+            cover.iter().all(|&c| c == 1),
+            "beta/alpha の行が重複/欠落している: {cover:?}"
+        );
+    }
+
+    /// task 269: `DENNO_GDN_BA_GPU` の真理値表 (既定 off・明示の真値だけ on)。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_ba_gpu_truth_table() {
+        for raw in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(
+                !crate::cuda::parse_gdn_ba_gpu(raw),
+                "{raw:?} を on と読んだ"
+            );
+        }
+        for raw in [Some("1"), Some("on"), Some("true"), Some(" 1 ")] {
+            assert!(crate::cuda::parse_gdn_ba_gpu(raw), "{raw:?} を off と読んだ");
+        }
+    }
+
     /// task 200: 平坦な入口 ([`SsmLayer::forward_batch_flat`]) がトークン逐次と
     /// ビット一致する (行入口 `forward_batch` と同じ値・同じ状態)。
     #[test]
@@ -2294,7 +2380,8 @@ mod tests {
         let beta = vec![0.25f32; p.n_v_heads];
         let alpha = vec![0.75f32; p.n_v_heads];
         let qkv_units = layer.gdn_qkv_units();
-        let req = layer.gdn_decode_req(&cur, &beta, &alpha, &qkv_units);
+        let ba_units = layer.gdn_ba_units();
+        let req = layer.gdn_decode_req(&cur, &beta, &alpha, &qkv_units, &ba_units);
 
         assert!(req.nonce != 0, "nonce が未発号");
         assert_eq!(req.li, 7);

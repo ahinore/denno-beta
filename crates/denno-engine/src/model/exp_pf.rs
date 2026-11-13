@@ -178,6 +178,15 @@ pub const DEFAULT_PREFILL_CHUNK_STREAM: usize = 1024;
 /// (ssm が 3.96 → 24.7 s、d2h 39.6 → 124.7 GB)。1536 はこの境界の 3/4 で、
 /// 構造的に余裕がある。
 ///
+/// **task 270: この 2048 の壁は `DENNO_PF_CHAIN_BIG=1` で外せる** (既定 off)。
+/// 連鎖の判定は「単発 sigmoid スキャン (`dno_gdn_scan_sig`) が nt < 2048」で
+/// 切られていたが、task 186/225 で v2/v3 (どちらもトークン長の上限を持たない)
+/// が入り、既定では v3 が選ばれる。よって形 (dk = dv = 128 / d_conv = 4) が
+/// 揃えば nt >= 2048 でも連鎖をそのまま使える。`gdn_pf_chain` 側も、投影を
+/// 撃つ前にスキャンカーネルの有無を確かめてから進む (無ければ状態を触らずに
+/// 従来経路へ)。`DENNO_PF_CHUNK` を 3072 以上にすると、14k のチャンク枚数が
+/// 10 → 5 (3072) / 4 (4096) に減り、同じ expert 重みを上げる回数がその分減る。
+///
 /// lab t207a (merge 済み int-auto = br198 + br200 の上で測り直した 5 COND、
 /// base は自分の run の `DENNO_PF_CHUNK=0`):
 ///
@@ -1460,6 +1469,13 @@ static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 static SKIP_LAYERS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ストリーミングで GPU に載せた層の数。
 static STREAM_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// task 261: 旧 4 型 (Q8_0 / Q5_1 / Q4_K / Q5_K) の prefill GPU 経路。
+/// `QUANT_PF_LAYERS` = GPU で回し切った層、`QUANT_PF_SKIPS` = 途中で諦めた層。
+static QUANT_PF_LAYERS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_ROWS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_HITS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_SKIPS: AtomicU64 = AtomicU64::new(0);
+static QUANT_PF_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ上げた expert 本数 (層またぎの再送を含む)。
 static STREAM_EXPERTS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ上げたバイト数。
@@ -1617,6 +1633,57 @@ pub fn stream_totals() -> (u64, u64, u64, f64) {
 }
 
 /// 1 リクエストぶんの 1 行。ゲート off / GPU 層 0 なら `None`。
+/// task 261: 旧 4 型の prefill 経路で 1 層を GPU で回し切った。
+pub fn note_quant_pf_layer(rows: u32, hits: u32) {
+    QUANT_PF_LAYERS.fetch_add(1, Ordering::Relaxed);
+    QUANT_PF_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+    QUANT_PF_HITS.fetch_add(hits as u64, Ordering::Relaxed);
+}
+
+/// task 261: 旧 4 型の prefill 経路が GPU を諦めた (CPU 経路へ)。
+pub fn note_quant_pf_skip() {
+    QUANT_PF_SKIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// task 261: 旧 4 型 prefill の GPU 時間 (ns)。
+pub fn note_quant_pf_ns(ns: u64) {
+    QUANT_PF_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// task 261: 旧 4 型 prefill の 1 行 (1 層も回っていなければ `None`)。
+pub fn quant_pf_line() -> Option<String> {
+    let layers = QUANT_PF_LAYERS.load(Ordering::Relaxed);
+    let skips = QUANT_PF_SKIPS.load(Ordering::Relaxed);
+    if layers == 0 && skips == 0 {
+        return None;
+    }
+    let rows = QUANT_PF_ROWS.load(Ordering::Relaxed);
+    let hits = QUANT_PF_HITS.load(Ordering::Relaxed);
+    let ns = QUANT_PF_NS.load(Ordering::Relaxed);
+    Some(format!(
+        "[exp-quant-pf] layers={layers} skips={skips} rows={rows} hits={hits} gpu_ms={:.1} rows/layer={:.1}",
+        ns as f64 / 1e6,
+        if layers > 0 {
+            rows as f64 / layers as f64
+        } else {
+            0.0
+        }
+    ))
+}
+
+/// task 261: 旧 4 型 prefill の積算を 0 に戻す。
+pub fn quant_pf_reset() {
+    for c in [
+        &QUANT_PF_LAYERS,
+        &QUANT_PF_ROWS,
+        &QUANT_PF_HITS,
+        &QUANT_PF_SKIPS,
+        &QUANT_PF_NS,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 pub fn stats_line() -> Option<String> {
     if !pf_enabled() {
         return None;

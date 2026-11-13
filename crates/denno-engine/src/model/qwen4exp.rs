@@ -1237,10 +1237,126 @@ pub fn validate(f: &GgufFile) -> Result<Qwen4ExpParams> {
     }
 
     if errs.is_empty() {
+        // task 261: `DENNO_TENSOR_TYPES=1` のときだけ、量子型の分布を役割ごとに
+        // 1 行ずつ出す (診断用。既定 off なので数値・ログは従来と同一)。
+        if std::env::var_os(TENSOR_TYPES_ENV).is_some() {
+            for line in tensor_type_table(f, &p) {
+                eprintln!("{line}");
+            }
+        }
         Ok(p)
     } else {
         Err(Qwen4ExpError(errs))
     }
+}
+
+/// `DENNO_TENSOR_TYPES`: 読み込んだ GGUF の量子型を役割ごとに stderr へ出す。既定 off。
+pub const TENSOR_TYPES_ENV: &str = "DENNO_TENSOR_TYPES";
+
+/// テンソル名 → 役割 (診断の集計キー)。`blk.N.` を落として後ろで見る。
+fn tensor_role(name: &str) -> &'static str {
+    let suffix = name
+        .strip_prefix("blk.")
+        .and_then(|r| r.split_once('.'))
+        .map(|(_, s)| s)
+        .unwrap_or(name);
+    if suffix.starts_with("ffn_gate_exps") {
+        "expert_gate"
+    } else if suffix.starts_with("ffn_up_exps") {
+        "expert_up"
+    } else if suffix.starts_with("ffn_down_exps") {
+        "expert_down"
+    } else if suffix.starts_with("ffn_gate_inp") {
+        "router"
+    } else if suffix.starts_with("ffn_") && suffix.contains("shexp") {
+        "shared"
+    } else if suffix.starts_with("attn_") || suffix.starts_with("ssm_") {
+        "attn_gdn"
+    } else if suffix.starts_with("indexer.") {
+        "indexer"
+    } else if suffix.starts_with("hc_") {
+        "mix"
+    } else if suffix.starts_with("ple_") {
+        "ple_layer"
+    } else if suffix == "per_layer_token_embd.weight" {
+        "ple_table"
+    } else if suffix == "token_embd.weight" {
+        "embed"
+    } else if suffix.starts_with("output") {
+        "head"
+    } else {
+        "other"
+    }
+}
+
+/// 役割ごとの量子型ヒストグラム + expert 1 本のバイト数 (診断用の文字列)。
+///
+/// `DENNO_TENSOR_TYPES=1` のとき [`validate`] が stderr へ出す。実 GGUF を
+/// 読まないと分からない「どの型が GPU 経路に載るか」を 1 画面で見るためのもの。
+pub fn tensor_type_table(f: &GgufFile, p: &Qwen4ExpParams) -> Vec<String> {
+    use std::collections::BTreeMap;
+    // 役割 -> (型名 -> (本数, バイト数))
+    let mut m: BTreeMap<&'static str, BTreeMap<&'static str, (usize, u64)>> = BTreeMap::new();
+    let mut expert_bytes = 0u64;
+    let mut expert_n = 0u64;
+    let mut layer0 = 0u64;
+    for name in &f.tensor_order {
+        let Some(t) = f.tensor(name) else { continue };
+        let role = tensor_role(name);
+        let e = m
+            .entry(role)
+            .or_default()
+            .entry(ty_name(t.ty))
+            .or_insert((0, 0));
+        e.0 += 1;
+        e.1 += t.nbytes;
+        if role.starts_with("expert_") {
+            expert_bytes += t.nbytes;
+            expert_n += p.n_expert as u64;
+            if name.starts_with("blk.0.") {
+                layer0 += t.nbytes;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (role, tys) in &m {
+        let total: u64 = tys.values().map(|(_, b)| *b).sum();
+        let parts: Vec<String> = tys
+            .iter()
+            .map(|(t, (n, b))| format!("{t}x{n} {:.1}MB", *b as f64 / 1e6))
+            .collect();
+        out.push(format!(
+            "[ttypes] {role}: {:.2}GB ({})",
+            total as f64 / 1e9,
+            parts.join(" / ")
+        ));
+    }
+    if layer0 > 0 {
+        let cap_mb = crate::model::expert_vram::vram_mb_from_value(
+            std::env::var(crate::model::expert_vram::EXPERT_VRAM_MB_ENV).ok().as_deref(),
+        );
+        let cap = cap_mb as u64 * 1024 * 1024;
+        // 層 0 の 3 行列の合計 = 1 expert のバイト数 × n_expert。
+        let one = layer0 / p.n_expert.max(1) as u64;
+        let fit = if one > 0 { cap / one } else { 0 };
+        let total_n = p.n_layer as u64 * p.n_expert as u64;
+        out.push(format!(
+            "[ttypes] expert: 1 本 {:.3}MB (層 0) / 平均 {:.3}MB / 全 {} 本 {:.1}GB / \
+             予算 {}MiB で {} 本 ({:.1}%)",
+            one as f64 / 1e6,
+            expert_bytes as f64 / expert_n as f64 / 1e6,
+            total_n,
+            expert_bytes as f64 / 1e9,
+            cap_mb,
+            fit,
+            if total_n > 0 {
+                fit as f64 / total_n as f64 * 100.0
+            } else {
+                0.0
+            }
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3211,6 +3327,11 @@ impl Qwen4Exp {
         // (逐次 prefill の末尾 1 トークンもここに入るが、値は CPU 経路と一致する
         // 契約なので問題にしない)。off ではガードの drop が 1 回走るだけ。
         let _gw = gdn_gpu_win::window(nt == 1);
+        // task 266: decode (nt == 1) のトークン先頭で、前のトークンの選択に基づく
+        // 先読みを背景スレッドへ積む (`DENNO_DEC_PREF=1` のときだけ)。
+        if nt == 1 {
+            self.decode_prefetch_token_start();
+        }
         for il in 0..self.p.n_layer {
             // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
             // task 155: 層の入口の下ごしらえを台帳の `loop` 行に分ける。
@@ -3351,6 +3472,67 @@ impl Qwen4Exp {
     fn gather_ple_many(&self, ctx: &[u32], start: usize) -> Result<Vec<Option<Vec<f32>>>> {
         gather_ple_many_rt(self.ple.as_deref(), ctx, start)
     }
+
+    /// task 266: decode のトークン先頭で、**1 トークン前の選択**のうち VRAM に
+    /// 載っていない expert のページを背景スレッドへ先読みさせる。
+    ///
+    /// `DENNO_DEC_PREF=1` のときだけ動く (既定 off)。予測が外れても捨てるだけで、
+    /// 値・経路は 1 バイトも変わらない。VRAM に載っている expert は mmap を
+    /// 触らないので積まない (ヒット率 0.9 のぶんを読まない)。
+    #[cfg(feature = "cuda")]
+    fn decode_prefetch_token_start(&self) {
+        if !crate::model::exp_prefetch::enabled() {
+            return;
+        }
+        let snap = crate::model::exp_prefetch::begin_token(self.p.n_layer);
+        if snap.is_empty() {
+            return;
+        }
+        // いま VRAM に載っている (層, expert) を 1 回だけ写す。
+        let resident: std::collections::HashSet<(u16, u16)> =
+            expert_vram::resident_keys()
+                .into_iter()
+                .map(|k| (k.layer, k.expert))
+                .collect();
+        let max = crate::model::exp_prefetch::max_per_token();
+        let mut jobs: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::new();
+        let mut keys: Vec<(u16, u16)> = Vec::new();
+        let (mut n_res, mut n_nopart) = (0u64, 0u64);
+        'layers: for (il, ids) in snap.iter().enumerate() {
+            if il >= self.layers.len() {
+                break;
+            }
+            let lw = &self.layers[il];
+            for &eid in ids {
+                if jobs.len() >= max {
+                    break 'layers;
+                }
+                let key = (il as u16, eid);
+                if resident.contains(&key) {
+                    n_res += 1;
+                    continue;
+                }
+                let part = |w: &ExpertW| w.slice_mapped(eid as usize).ok().flatten();
+                let (Some(g), Some(u), Some(d)) = (
+                    part(&lw.gate_exps),
+                    part(&lw.up_exps),
+                    part(&lw.down_exps),
+                ) else {
+                    n_nopart += 1;
+                    continue;
+                };
+                jobs.push(vec![g, u, d]);
+                keys.push(key);
+            }
+        }
+        crate::model::exp_prefetch::note_skips(n_res, n_nopart);
+        crate::model::exp_prefetch::note_submitted_keys(&keys);
+        crate::model::exp_prefetch::submit(jobs);
+    }
+
+    /// cuda feature 無しでは先読みしない (mmap の Part を作る口が無い)。
+    #[cfg(not(feature = "cuda"))]
+    fn decode_prefetch_token_start(&self) {}
 
     /// 1 層ぶんの本体 (PLE 注入 → attention → MoE FFN)。
     ///
@@ -3688,6 +3870,15 @@ impl Qwen4Exp {
         // (エラーで抜けても Drop で戻る)。decode の間は抱えない。
         #[cfg(feature = "cuda")]
         let _pf_stream_guard = PfStreamGuard;
+        // task 270: チャンクを上げると prefill の作業域 (mix の res / scratch +
+        // MoE の行バッファ + staging) がそのぶん増える。`DENNO_PREFILL_WORK_MB`
+        // が指定されていれば、足りない分を expert の LRU から**チャンク単位で
+        // 先に**空けておく。途中の確保失敗で staging が取れず、streaming が
+        // 黙って落ちる (14k が 25 → 39 s になった t270a) のを防ぐ。drop で release。
+        #[cfg(feature = "cuda")]
+        let _pf_work = crate::model::expert_vram::reserve_work_area(
+            crate::model::expert_vram::prefill_work_bytes(),
+        );
         let layer_major = batch && self.attn.layer_major_safe();
         let logits = if layer_major {
             self.forward_prefill_batch_tapped(ctx, prefill_chunk_for(ctx.len()), tokens, on_layer, roles)?
@@ -4576,6 +4767,20 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         hc: usize,
         lr: usize,
     ) -> crate::cuda::PfPoolGuard {
+        let need = self.pf_pool_need_for(nt_all, tile, chunk, hc, lr);
+        crate::cuda::pf_pool_acquire(&need)
+    }
+
+    /// task 279: このリクエストの形 (チャンク / タイル) からレイアウトの材料を組む。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_need_for(
+        &self,
+        nt_all: usize,
+        tile: usize,
+        chunk: usize,
+        hc: usize,
+        lr: usize,
+    ) -> crate::model::pf_pool::Need {
         let e = self.p.n_embd;
         let ff = self.p.n_ff_exp;
         // tensor core の grouped GEMM がこのモデルで実際に使えるか (層 0 の型で判定)。
@@ -4594,7 +4799,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 ff,
                 e,
             );
-        crate::cuda::pf_pool_acquire(&crate::model::pf_pool::Need {
+        crate::model::pf_pool::Need {
             nt_all,
             tile,
             k: self.p.n_expert_used,
@@ -4608,7 +4813,68 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             tc,
             stage_bytes: crate::model::exp_pf::stream_bytes(),
             stage_slots: crate::cuda::PF_STAGE_SLOTS,
-        })
+        }
+    }
+
+    /// task 279: 借りられる量から (チャンク, タイル) を選ぶ (純関数の決定 + 上限)。
+    ///
+    /// `DENNO_PF_POOL_BIG=1` のとき、パス数 (= expert 重みの H2D 量) が減る順に
+    /// 候補を試し、[`crate::model::pf_pool::PF_POOL_BIG_MB_ENV`] に収まる最初の組を
+    /// 返す。ゲート off / 候補なし / 上限が増えないときは従来の形を返す
+    /// (呼び出し側はそのまま `pf_pool_acquire_capped` に渡す)。
+    ///
+    /// 戻り値の 3 番目は「大きい形を選んだか」。true のとき呼び出し側は、借りた
+    /// 作業域のぶんに追い出した expert を prefill の終端で LRU へ戻す。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_pick(
+        &self,
+        nt_all: usize,
+        chunk: usize,
+        hc: usize,
+        lr: usize,
+    ) -> (crate::model::pf_pool::Need, usize, bool) {
+        let base_tile = crate::model::exp_pf::lm_tile(nt_all);
+        let base = self.pf_pool_need_for(nt_all, base_tile, chunk.min(nt_all), hc, lr);
+        let cap = crate::model::pf_pool::pf_pool_bytes();
+        if !crate::model::pf_pool::pf_pool_big_on() {
+            return (base, cap, false);
+        }
+        let big_cap = crate::model::pf_pool::pf_pool_big_bytes();
+        if big_cap <= cap {
+            return (base, cap, false);
+        }
+        let max_chunk = crate::model::pf_pool::big_chunk_max();
+        // 2,048 以上のチャンクは GDN prefill の連鎖の上限撤廃 (task 270 の
+        // `DENNO_PF_CHAIN_BIG`) が前提。無いまま大きいチャンクを使うと ssm が
+        // 連鎖の外へ落ちる (task 197: 3.96 → 24.7 s)。
+        let max_chunk = if crate::cuda::chain_big_on() {
+            max_chunk
+        } else {
+            max_chunk.min(crate::model::exp_pf::CHUNK_BALANCE_CAP)
+        };
+        match crate::model::pf_pool::choose_big(&base, big_cap, max_chunk) {
+            Some((c, t, l)) if c != base.chunk || t != base.tile => {
+                let passes = nt_all.div_ceil(t.max(1));
+                let base_passes = nt_all.div_ceil(base.tile.max(1));
+                eprintln!(
+                    "[pf-pool-big] 形を上げた (チャンク {} → {} / タイル {} → {} = {} → {} パス / 作業域 {} MiB)",
+                    base.chunk,
+                    c,
+                    base.tile,
+                    t,
+                    base_passes,
+                    passes,
+                    l.total >> 20
+                );
+                let need = crate::model::pf_pool::Need {
+                    chunk: c,
+                    tile: t,
+                    ..base
+                };
+                (need, big_cap, true)
+            }
+            _ => (base, cap, false),
+        }
     }
 
     /// task 227: 層優先の常駐 prefill (`DENNO_PF_LM_LAYER=1`)。
@@ -4642,24 +4908,28 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let n_layer = self.p.n_layer;
         let chunk = chunk.max(1);
         let nt_all = ctx.len();
-        let ranges: Vec<(usize, usize)> = (0..nt_all)
-            .step_by(chunk)
-            .map(|s| (s, (s + chunk).min(nt_all)))
-            .collect();
         // 1 チャンクならチャンク優先と同じ (層優先にする意味が無い)。
-        if ranges.len() < 2 {
+        if nt_all.div_ceil(chunk) < 2 {
             return Ok(None);
         }
         // task 257/265: 作業域のプールをこのリクエストの形で組む (長い prefill の
         // あいだだけ expert から借りる)。ガードはこの関数のスコープに置くので、
         // どの早期撤退でも終端で返る。
-        let _pool = self.pf_pool_begin_for(
-            nt_all,
-            crate::model::exp_pf::lm_tile(nt_all),
-            chunk.min(nt_all),
-            hc,
-            lr,
-        );
+        // task 279: 借りられる量から (チャンク, タイル) を選ぶ。**大きい形は
+        // プールを実際に借りられたときだけ**使う (借りられないと作業域が組めず、
+        // t270a のように streaming が黙って落ちる)。落ちたら従来の形へ。
+        let (need, pool_cap, big) = self.pf_pool_pick(nt_all, chunk, hc, lr);
+        let _pool = crate::cuda::pf_pool_acquire_capped(&need, pool_cap);
+        let big = big && _pool.is_held();
+        let (chunk, tile) = if _pool.is_held() {
+            (need.chunk.max(1), need.tile)
+        } else {
+            (chunk, crate::model::exp_pf::lm_tile(nt_all))
+        };
+        let ranges: Vec<(usize, usize)> = (0..nt_all)
+            .step_by(chunk)
+            .map(|s| (s, (s + chunk).min(nt_all)))
+            .collect();
         if !crate::cuda::pf_begin(chunk.min(nt_all), hc, e, lr) {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
@@ -4711,7 +4981,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 3
             };
             // task 250: MoE をトークンで割るときは h / act もその行数で足りる。
-            let tile_rows = crate::model::exp_pf::lm_tile(nt_all).saturating_mul(k);
+            // task 279: 行数は選んだタイル (プールのレイアウトと同じ値) を使う。
+            let tile_rows = tile.saturating_mul(k);
             let act_rows = if act_terms == 1 {
                 tile_rows
             } else if crate::model::exp_pf::lm_group_local() {
@@ -5022,7 +5293,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             // task 250: トークンタイル (`DENNO_PF_LM_TILE`)。MoE の作業域
             // (h) はタイルの行数で取るので、14k でも 1.5 GB の連続確保が要らない。
             // 分割しないときは 1 回 (従来と同じ経路)。
-            let tile = crate::model::exp_pf::lm_tile(nt_all);
+            // task 279: プールが借りられたときは選んだタイル (パス数が最小) を使う。
             let mut ffn_dev = true;
             if tile >= nt_all {
                 ffn_dev = moe_ffn_quant_batch_lm_dev(
@@ -5164,6 +5435,22 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         crate::cuda::pf_release();
         // task 265: 借りた作業域を expert に返す (ここでカードが expert に戻る)。
         drop(_pool);
+        // task 279: 大きい形で借りたときは、その確保が追い出した expert を LRU へ
+        // 戻す (借りた作業域だけでなく、代わりに追い出した在庫も返す)。
+        // MoE はもう完了している (末尾の D2H が同期) ので、t265b のように
+        // 実行中のカーネルと衝突しない。本数は借りた量に比例して有界。
+        if big {
+            let keys = crate::cuda::pf_pool_take_evicted();
+            if !keys.is_empty() {
+                let (n, bytes) = pf_restore_experts(&self.layers, &keys);
+                eprintln!(
+                    "[pf-pool] 大きい形で追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
+                    n,
+                    bytes >> 20,
+                    keys.len().saturating_sub(n)
+                );
+            }
+        }
         // task 250: 作業域の外部予約を返す (LRU の上限がここで戻る)。
         drop(reserve_guard);
         // task 242: 作業域のために追い出した expert を戻す (prefill の終端)。
@@ -5697,6 +5984,125 @@ fn mix_gpu_enabled() -> bool {
     *ON.get_or_init(|| mix_gpu_from_value(std::env::var("DENNO_MIX_GPU").ok().as_deref()))
 }
 
+/// task 261: `DENNO_MIX_QUANT_GPU` — hc mix の down / up を **旧来の 4 型**
+/// (Q8_0 / Q5_1 / Q4_K / Q5_K) でも GPU で回す。既定 off。
+///
+/// swift15 (mix = BF16) は既存の BF16 経路 (`DENNO_MIX_GPU` + chain) がそのまま
+/// 使える。UD-Q4_K_XL のような **Q8_0 の mix** を持つモデルでは、このゲートが
+/// 無いと mix が丸ごと CPU に落ちる (実測は REPORT_P261.md)。カーネルは
+/// dense 重みレジストリ + `moe_gemv_dev` / `moe_gemm_dev` をそのまま使う。
+pub const MIX_QUANT_GPU_ENV: &str = "DENNO_MIX_QUANT_GPU";
+
+/// [`MIX_QUANT_GPU_ENV`] の解釈 (純関数)。`1` / `true` / `on` だけが真。
+pub fn mix_quant_gpu_from_value(v: Option<&str>) -> bool {
+    crate::model::expert_vram::flag_on(v)
+}
+
+/// mix の量子型を GPU で回すか (プロセスで 1 回だけ env を読む)。既定 off。
+fn mix_quant_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_quant_gpu_from_value(std::env::var(MIX_QUANT_GPU_ENV).ok().as_deref())
+    })
+}
+
+/// task 266: `DENNO_MIX_QCHAIN` — 量子型 (Q8_0 / Q5_1 / Q4_K / Q5_K) の mix を
+/// **down → silu → up → hc_mixed の 1 同期**に畳む。既定 off。
+///
+/// UD-Q4_K_XL の mix は Q8_0 で、`DENNO_MIX_QUANT_GPU` の逐次経路は 1 呼び出し
+/// 2 往復 (194 起動 / 194 同期 per token) だった。ここでは中間をデバイスに
+/// 残したまま 4 本積む。値は CPU とビット一致 (silu は glibc expf の逐語再現)。
+pub const MIX_QCHAIN_ENV: &str = "DENNO_MIX_QCHAIN";
+
+/// [`MIX_QCHAIN_ENV`] の解釈 (純関数)。`1` / `true` / `on` だけが真
+/// (前後の空白と大小は落とす)。
+pub fn mix_qchain_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// 量子型 mix の fused chain を使うか (プロセスで 1 回だけ env を読む)。既定 off。
+fn mix_qchain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_qchain_from_value(std::env::var(MIX_QCHAIN_ENV).ok().as_deref())
+    })
+}
+
+/// task 266: mix が呼ばれた回数 (ゲート on のときだけ数える。1 プロセス通算)。
+pub(crate) static MIX_QCHAIN_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 266: 量子型 mix の fused chain が走った回数 (1 プロセス通算)。
+/// ゲート on で 0 なら「分岐に入っていない」ことが分かる (診断行 [mix-qchain])。
+pub(crate) static MIX_QCHAIN_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 266: `[mix-qchain]` の 1 行。ゲート off / 0 回なら `None`。
+pub fn mix_qchain_line() -> Option<String> {
+    if !mix_qchain_enabled() {
+        return None;
+    }
+    let n = MIX_QCHAIN_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    let calls = MIX_QCHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    Some(format!(
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3}",
+        if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
+    ))
+}
+
+/// task 266: 集計を 0 に戻す (リクエスト終端)。
+pub fn mix_qchain_reset() {
+    MIX_QCHAIN_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    MIX_QCHAIN_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod mix_qchain_tests {
+    use super::*;
+
+    /// task 266: ゲートは既定 off。`1` / `on` / `true` だけ on。
+    #[test]
+    fn qchain_gate_values() {
+        assert!(!mix_qchain_from_value(None));
+        assert!(!mix_qchain_from_value(Some("")));
+        assert!(!mix_qchain_from_value(Some("0")));
+        assert!(!mix_qchain_from_value(Some("off")));
+        assert!(mix_qchain_from_value(Some("1")));
+        assert!(mix_qchain_from_value(Some(" TRUE ")));
+        assert!(mix_qchain_from_value(Some("on")));
+    }
+
+    /// task 266: fused chain は **ブロック量子の 4 型だけ**。
+    /// BF16 (既定モデルの mix) / F32 / IQ では 1 度も入らない。
+    #[test]
+    fn qchain_types_are_the_block_four() {
+        use crate::kquant::GgmlType as T;
+        for t in [T::Q8_0, T::Q5_1, T::Q4K, T::Q5K] {
+            assert!(quant_gpu_ty_ok(t), "{t:?} は GPU で回せるはず");
+        }
+        for t in [T::Bf16, T::F32, T::F16, T::IQ3S, T::IQ2S, T::IQ4Nl, T::Q2_0] {
+            assert!(!quant_gpu_ty_ok(t), "{t:?} は CPU 経路のままのはず");
+        }
+    }
+
+    /// task 266: ゲート off では診断行を出さない (ログも 1 バイト変えない)。
+    #[test]
+    fn qchain_line_is_silent_when_off() {
+        if !mix_qchain_enabled() {
+            assert!(mix_qchain_line().is_none());
+        }
+    }
+}
+
+/// GPU の `moe_gemv_dev` / `moe_gemm_dev` が読める 4 型か (dense 重み用)。
+fn quant_gpu_ty_ok(ty: crate::kquant::GgmlType) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(ty, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K)
+}
+
 /// task 138: `DENNO_MIX_CHAIN` の値を解釈する (純関数・テスト用)。
 /// **既定 on** で、明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
 fn mix_chain_from_value(v: Option<&str>) -> bool {
@@ -6015,18 +6421,22 @@ fn mix_batch_gpu_ok(
 /// 呼び出し側が CPU の [`gemv_batch`] へ落ちること。
 #[cfg(feature = "cuda")]
 fn mix_batch_gpu(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> bool {
-    if !mix_batch_gpu_ok(w.ty(), w.k(), w.n(), nt, mix_batch_gpu_enabled()) {
-        return false;
+    if mix_batch_gpu_ok(w.ty(), w.k(), w.n(), nt, mix_batch_gpu_enabled()) {
+        return crate::cuda::maybe_gpu_mix_bf16_batch_into(
+            w.uid(),
+            w.blocks().as_slice(),
+            w.k(),
+            w.n(),
+            xs,
+            nt,
+            outs,
+        );
     }
-    crate::cuda::maybe_gpu_mix_bf16_batch_into(
-        w.uid(),
-        w.blocks().as_slice(),
-        w.k(),
-        w.n(),
-        xs,
-        nt,
-        outs,
-    )
+    // task 261: 旧来の 4 型 (UD-Q4_K_XL の mix は Q8_0) の prefill は **GPU にしない**。
+    // lab t261b の実測で、この形 (down は k=10240/n=320、up は k=320/n=10240) の
+    // `moe_gemm_dev` は CPU のバッチ GEMV より遅かった (mix 0.145 -> 0.248 ms/layer、
+    // prefill +15%)。decode の GEMV だけを `DENNO_MIX_QUANT_GPU` で載せる。
+    false
 }
 
 /// cuda feature 無しでは常に CPU。
@@ -6327,6 +6737,41 @@ pub(crate) static MIX_FAST_CALLS: std::sync::atomic::AtomicUsize =
 ///    `d` は独立で、`s` の昇順の加算は 1 つの `d` の中で完結する。
 /// 3. task 106: 合成 (`hc_mixed_into_par`) は戻り値の `Vec` に直接書く
 ///    (scratch へ書いて `to_vec()` で写す 10 KB の 2 パスを 1 パスに)。
+/// task 261: mix の 1 行列 (m=1) を GPU で回す。
+///
+/// BF16 は従来の [`crate::cuda::maybe_gpu_mix_bf16_into`] (f32 展開 /
+/// `dno_matvec_bf16`)、旧来の 4 型は dense 重みレジストリ + `moe_gemv_dev`
+/// ([`crate::cuda::maybe_gpu_gguf_gemv_into`]、`DENNO_MIX_QUANT_GPU` のときだけ)。
+/// どちらも不発なら `false` を返し、呼び出し側が CPU 経路へ落ちる。
+#[cfg(feature = "cuda")]
+fn mix_gemv_gpu(w: &GgufLinear, x: &[f32], out: &mut [f32]) -> bool {
+    if !mix_gpu_enabled() {
+        return false;
+    }
+    if w.ty() == crate::kquant::GgmlType::Bf16 {
+        return crate::cuda::maybe_gpu_mix_bf16_into(
+            w.uid(),
+            w.blocks().as_slice(),
+            w.k(),
+            w.n(),
+            x,
+            out,
+        );
+    }
+    if mix_quant_gpu_enabled() && quant_gpu_ty_ok(w.ty()) {
+        return crate::cuda::maybe_gpu_gguf_gemv_into(
+            w.uid(),
+            w.ty(),
+            w.blocks().as_slice(),
+            w.k(),
+            w.n(),
+            x,
+            out,
+        );
+    }
+    false
+}
+
 fn hc_mix_quant_fast(
     res: &HyperStreams,
     norm: &[f32],
@@ -6337,6 +6782,10 @@ fn hc_mix_quant_fast(
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     #[cfg(test)]
     MIX_FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // task 266: 分岐の分母 (ゲート on のときだけ数える)。
+    if mix_qchain_enabled() {
+        MIX_QCHAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let hc_dim = hp.hc * hp.n_embd;
     let e = hp.n_embd;
@@ -6519,6 +6968,38 @@ fn hc_mix_quant_fast(
                 chain2_mixed = Some(m);
             }
         }
+        // task 266: 量子型 (UD-Q4_K_XL の mix は Q8_0) の fused chain。
+        // down → silu(v*inv_hc) → up → hc_mixed を 1 回の同期で閉じる
+        // (`DENNO_MIX_QCHAIN=1` のときだけ)。不発なら下の 2 往復経路へ落ちる。
+        #[cfg(feature = "cuda")]
+        if chain2_mixed.is_none()
+            && mix_gpu_enabled()
+            && mix_qchain_enabled()
+            && quant_gpu_ty_ok(down.ty())
+            && quant_gpu_ty_ok(up.ty())
+        {
+            let mut m = kp_step!("mix_alloc", vec![0.0f32; e]);
+            if crate::cuda::maybe_gpu_mix_q_chain_into(
+                down.uid(),
+                down.ty(),
+                down.blocks().as_slice(),
+                down.k(),
+                down.n(),
+                up.uid(),
+                up.ty(),
+                up.blocks().as_slice(),
+                up.k(),
+                up.n(),
+                1.0f32 / hp.hc as f32,
+                e,
+                hp.hc,
+                xn,
+                &mut m,
+            ) {
+                MIX_QCHAIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                chain2_mixed = Some(m);
+            }
+        }
         let gpu_chain2 = chain2_mixed.is_some();
         // task 138: down → lo_apply → up を 1 回の同期に畳む経路
         // (`DENNO_MIX_GPU` on・既定 on の `DENNO_MIX_CHAIN`・両方 BF16 のとき)。
@@ -6569,16 +7050,7 @@ fn hc_mix_quant_fast(
             // 成功すると `last_linear_ran_on_gpu` が立つので下の `note_down` が gpu= を
             // 積む ([mix-kprof] の内訳で見える)。
             #[cfg(feature = "cuda")]
-            let gpu_down = mix_gpu_enabled()
-                && down.ty() == crate::kquant::GgmlType::Bf16
-                && crate::cuda::maybe_gpu_mix_bf16_into(
-                    down.uid(),
-                    down.blocks().as_slice(),
-                    down.k(),
-                    down.n(),
-                    xn,
-                    lo,
-                );
+            let gpu_down = mix_gemv_gpu(down, xn, lo);
             #[cfg(not(feature = "cuda"))]
             let gpu_down = false;
             if !gpu_down {
@@ -6604,16 +7076,7 @@ fn hc_mix_quant_fast(
             // up 実形 (k=320 < n=10240) は短い行なので task 121 でも逐次版のまま
             // (ビット一致)。
             #[cfg(feature = "cuda")]
-            let gpu_up = mix_gpu_enabled()
-                && up.ty() == crate::kquant::GgmlType::Bf16
-                && crate::cuda::maybe_gpu_mix_bf16_into(
-                    up.uid(),
-                    up.blocks().as_slice(),
-                    up.k(),
-                    up.n(),
-                    lo,
-                    gate,
-                );
+            let gpu_up = mix_gemv_gpu(up, lo, gate);
             #[cfg(not(feature = "cuda"))]
             let gpu_up = false;
             if !gpu_up {
@@ -10934,6 +11397,10 @@ fn moe_ffn_quant_impl(
         }
     }
 
+    // task 266: 次のトークンの先読み用に、この層の選択を記録する
+    // (ゲート off では atomic load 1 回。値には触れない)。
+    crate::model::exp_prefetch::note_sel(lw.il, &sel);
+
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
     drop(_l_router);
     // task 192: kprof の窓もここで閉じる (expert 段の操作を混ぜない)。
@@ -11522,9 +11989,13 @@ fn moe_expert_gpu(
     let got = acquire_expert(lw, ei, key, shapes)
         .map_err(|e| one(format!("層 {}: expert {ei}: VRAM 経路: {e:#}", lw.il)))?;
     let Some(got) = got else {
+        // task 261: 載らなかった 1 本 (理由は expert_vram 側の fb 内訳が出す)。
+        crate::model::exp_iq::note_lookup(1, 0);
         return Ok(None);
     };
     let hit = got.hit;
+    // task 261: 層一括を使わない経路でもヒット率を数える。
+    crate::model::exp_iq::note_lookup(1, u32::from(hit));
     let dev = got.dev;
 
     let ctx = |e: anyhow::Error, m: ExpertMatrix| {
@@ -11606,6 +12077,33 @@ fn moe_experts_gpu_batched(
             n: e,
         },
     ];
+    // task 266: ミスする expert の 3 行列を、H2D の**前**に背景スレッドで
+    // 並列に読ませる (`DENNO_DEC_MISS_READ=1` のときだけ)。メインスレッドは
+    // そのまま下の acquire (H2D) を回すが、同じページのフォルトはページロックで
+    // 1 回に畳まれるので二重読みにはならない。値・経路は 1 バイトも変わらない。
+    #[cfg(feature = "cuda")]
+    if crate::model::exp_prefetch::miss_read_enabled() {
+        let mut parts: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::with_capacity(n);
+        for &ei in sel {
+            let key = ExpertKey {
+                layer: lw.il as u16,
+                expert: ei as u16,
+            };
+            // 載っている expert は触らない (ヒットは mmap を読まない)。
+            if matches!(expert_vram::lookup(key, shapes), Ok(Some(_))) {
+                continue;
+            }
+            let part = |w: &ExpertW| w.slice_mapped(ei).ok().flatten();
+            if let (Some(g), Some(u), Some(d)) = (
+                part(&lw.gate_exps),
+                part(&lw.up_exps),
+                part(&lw.down_exps),
+            ) {
+                parts.push(vec![g, u, d]);
+            }
+        }
+        crate::model::exp_prefetch::submit_misses(parts);
+    }
     // 1. 全 expert を VRAM に載せる (1 本でも載らなければ per-expert 経路へ)。
     //    P45: 載っていた本数 (`hit`) を数え、ゲートの 1 サンプルにする。
     let mut devs = Vec::with_capacity(n);
@@ -11620,6 +12118,9 @@ fn moe_experts_gpu_batched(
         let got = acquire_expert(lw, ei, key, shapes)
             .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 経路 (層一括): {err:#}", lw.il)))?;
         let Some(a) = got else {
+            // task 261: 1 本でも載らないと層ごと per-expert 経路へ落ちる。回数を残す
+            // (「なぜ GPU で回らなかったか」を [exp-iq] の 1 行で読むため)。
+            crate::model::exp_iq::note_batch_bail();
             return Ok(None);
         };
         if a.hit {
@@ -11628,6 +12129,10 @@ fn moe_experts_gpu_batched(
         devs.push(a.dev);
         ids.push(ei as u16);
     }
+    // task 261: 層一括経路のヒット率を [exp-iq] に積む (従来は IQ 経路だけが
+    // 数えていたので、旧 4 型のモデルではヒット率が読めなかった)。
+    crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
+    crate::model::exp_iq::note_batch_ok();
     let ptr_table = |m: ExpertMatrix| -> Vec<u64> { devs.iter().map(|d| d.ptr(m)).collect() };
     let (pg, pu, pd) = (
         ptr_table(ExpertMatrix::Gate),
@@ -27522,3 +28027,28 @@ mod task225_router_dev_mirror {
         }
     }
 }
+
+// task 261: `DENNO_TENSOR_TYPES` の役割分類 (診断の集計キー)。実 GGUF 無しで
+// 名前 → 役割の対応だけを固定する。
+#[test]
+fn tensor_role_groups_by_suffix() {
+    assert_eq!(tensor_role("blk.7.ffn_gate_exps.weight"), "expert_gate");
+    assert_eq!(tensor_role("blk.7.ffn_up_exps.weight"), "expert_up");
+    assert_eq!(tensor_role("blk.7.ffn_down_exps.weight"), "expert_down");
+    assert_eq!(tensor_role("blk.7.ffn_gate_shexp.weight"), "shared");
+    assert_eq!(tensor_role("blk.7.ffn_up_shexp.weight"), "shared");
+    assert_eq!(tensor_role("blk.7.ffn_gate_inp.weight"), "router");
+    assert_eq!(tensor_role("blk.7.ffn_gate_inp_shexp.weight"), "router");
+    assert_eq!(tensor_role("blk.7.attn_qkv.weight"), "attn_gdn");
+    assert_eq!(tensor_role("blk.7.ssm_out.weight"), "attn_gdn");
+    assert_eq!(tensor_role("blk.7.attn_q.weight"), "attn_gdn");
+    assert_eq!(tensor_role("blk.3.indexer.q_proj.weight"), "indexer");
+    assert_eq!(tensor_role("blk.7.hc_attn_up.weight"), "mix");
+    assert_eq!(tensor_role("blk.1.ple_key.weight"), "ple_layer");
+    assert_eq!(tensor_role("per_layer_token_embd.weight"), "ple_table");
+    assert_eq!(tensor_role("token_embd.weight"), "embed");
+    assert_eq!(tensor_role("output.weight"), "head");
+    assert_eq!(tensor_role("output_hc_norm.weight"), "head");
+    assert_eq!(tensor_role("blk.0.ssm_a"), "attn_gdn");
+}
+
