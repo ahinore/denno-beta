@@ -7400,6 +7400,98 @@ impl SegLayerScratch {
     }
 }
 
+/// task 278: K 系 GEMV の高速版 (`kernels_seg_k.ptx`、1 行 = 1 warp)。
+///
+/// 無ければ旧 `kernels_moe_batch.ptx` (1 行 = 1 スレッド、CPU とビット一致) で
+/// 回す。**あるときは丸め順が変わる** (32 レーンの木) が、決定的ではある。
+struct SegKKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// Q8_0 / Q5_1 / Q4_K / Q5_K ([`moe_batch_slot`] と同じ並び)
+    fns: [CUfunction; 4],
+}
+
+// 生ハンドル (context / module / function)。CudaCtx と同じ規約。
+unsafe impl Send for SegKKernels {}
+unsafe impl Sync for SegKKernels {}
+
+static SEG_K_KERNELS: OnceLock<Option<SegKKernels>> = OnceLock::new();
+
+/// カーネル名 (添字は [`moe_batch_slot`] の順に合わせる)。
+const SEG_K_NAMES: [&[u8]; 4] = [
+    b"dno_seg_gemv_k_q8_0\0",
+    b"dno_seg_gemv_k_q5_1\0",
+    b"dno_seg_gemv_k_q4k\0",
+    b"dno_seg_gemv_k_q5k\0",
+];
+
+/// task 278: 高速版 GEMV (`kernels_seg_k.ptx`) を使うか。
+///
+/// **既定 on** (`DENNO_SEG_K=0` / `off` / `false` で旧 `kernels_moe_batch.ptx` =
+/// CPU とビット一致の経路へ)。丸め順が変わるので A/B と切り戻しのためのゲート。
+pub const SEG_K_ENV: &str = "DENNO_SEG_K";
+
+/// [`SEG_K_ENV`] の解釈 (純関数)。未設定は有効。
+pub fn seg_k_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// 高速版 GEMV が有効か (プロセスで 1 回だけ env を読む)。
+fn seg_k_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| seg_k_from_value(std::env::var(SEG_K_ENV).ok().as_deref()))
+}
+
+/// PTX の置き場所。`DENNO_SEG_K_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_seg_k.ptx`。
+fn seg_k_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_SEG_K_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_seg_k.ptx"),
+    }
+}
+
+/// 高速版のカーネル一式 (初回だけ PTX を読む。失敗は None をキャッシュ)。
+fn seg_k_kernels() -> Option<&'static SegKKernels> {
+    SEG_K_KERNELS
+        .get_or_init(|| {
+            let path = seg_k_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+            }
+            let mut fns = [std::ptr::null_mut(); 4];
+            for (i, name) in SEG_K_NAMES.iter().enumerate() {
+                let mut f: CUfunction = std::ptr::null_mut();
+                unsafe {
+                    if (lib.module_get_function)(&mut f, module, name.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        return None;
+                    }
+                }
+                fns[i] = f;
+            }
+            Some(SegKKernels { module, fns })
+        })
+        .as_ref()
+}
+
 /// prof 用のイベント (null ストリーム)。`DENNO_SEG_PROF` off では何もしない。
 mod seg_ev {
     use super::*;
@@ -7577,9 +7669,17 @@ where
     let Some(ctx) = shared_ctx() else {
         return Ok(false);
     };
-    let Some(kernels) = moe_batch_kernels() else {
-        return Ok(false);
+    // task 278: 高速版 (1 行 = 1 warp) があればそちら。無ければ旧カーネル
+    // (1 行 = 1 スレッド、CPU とビット一致) で回す。
+    let fast = if seg_k_enabled() {
+        seg_k_kernels()
+    } else {
+        None
     };
+    let slow = moe_batch_kernels();
+    if fast.is_none() && slow.is_none() {
+        return Ok(false);
+    }
     // 語呂: silu と和は dec_epi の既存カーネル (PTX が無ければ旧経路へ)。
     let Some(epi) = dec_epi_kernels() else {
         return Ok(false);
@@ -7590,6 +7690,27 @@ where
         moe_batch_slot(ty_d),
     ) else {
         return Ok(false);
+    };
+    let (f_g, f_u, f_d, block, smem_gu, smem_d) = match fast {
+        Some(k) => (
+            k.fns[slot_g],
+            k.fns[slot_u],
+            k.fns[slot_d],
+            (128u32, 1u32, 1u32),
+            0u32,
+            0u32,
+        ),
+        None => {
+            let k = slow.expect("どちらかは在る");
+            (
+                k.fns[slot_g],
+                k.fns[slot_u],
+                k.fns[slot_d],
+                plan_gu.block,
+                plan_gu.smem,
+                plan_d.smem,
+            )
+        }
     };
     ctx.make_current()?;
 
@@ -7660,10 +7781,10 @@ where
                 &mut rb as *mut _ as *mut c_void,
             ];
             ctx.launch_async(
-                kernels.fns[slot_g],
+                f_g,
                 plan_gu.grid,
-                plan_gu.block,
-                plan_gu.smem,
+                block,
+                smem_gu,
                 &mut args,
             )?;
         }
@@ -7686,10 +7807,10 @@ where
                 &mut rb as *mut _ as *mut c_void,
             ];
             ctx.launch_async(
-                kernels.fns[slot_u],
+                f_u,
                 plan_gu.grid,
-                plan_gu.block,
-                plan_gu.smem,
+                block,
+                smem_gu,
                 &mut args,
             )?;
         }
@@ -7742,10 +7863,10 @@ where
                 &mut rb2 as *mut _ as *mut c_void,
             ];
             ctx.launch_async(
-                kernels.fns[slot_d],
+                f_d,
                 plan_d.grid,
-                plan_d.block,
-                plan_d.smem,
+                block,
+                smem_d,
                 &mut args,
             )?;
         }
@@ -38173,6 +38294,17 @@ mod tests {
     use super::*;
     use crate::tensor;
 
+    /// task 278: 高速版 GEMV のゲートは既定 on、明示的な偽値だけ切る。
+    #[test]
+    fn seg_k_gate_defaults_on() {
+        assert!(seg_k_from_value(None), "未設定は有効 (既定)");
+        assert!(seg_k_from_value(Some("1")));
+        assert!(seg_k_from_value(Some(" on ")));
+        assert!(!seg_k_from_value(Some("0")));
+        assert!(!seg_k_from_value(Some("off")));
+        assert!(!seg_k_from_value(Some("false")));
+        assert!(!seg_k_from_value(Some("NO")));
+    }
     /// task 257/265: ゲートを on にしても CUDA context が無ければ借りられない。
     /// ガードは `owned == false`、区画ビューも取れない = 従来の確保に落ちる
     /// (リクエストは失敗させない)。

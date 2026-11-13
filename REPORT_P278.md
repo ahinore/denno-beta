@@ -99,6 +99,43 @@ UD の 1 expert = 3,072,000 B (gate/up Q4_K 2560x640、down Q5_1 640x2560)。
 - `DENNO_EXPERT_GPU_CHECK=1` を付けた COND で `expert_gpu_check` の
   max_abs / max_rel (新経路の数値が CPU と合っているか)。
 
-## 6. t278a の結果
+## 6. t278a の結果 (lab の実測)
 
-(未記入。lab の RESULT.md から転記する)
+run: `MODEL=flash-next-UD-Q4_K_XL SCENARIO=decode PROFILE=1`、commit 1756d15、ptx=none。
+COND: b0 / prof (旧 + `DENNO_SEG_PROF=1`) / segp (新 + prof) / chk (新 + GPU_CHECK) /
+seg (新) / base2。
+
+| COND | decode ms/tok | prefill s | md5 | errors |
+| --- | --- | --- | --- | --- |
+| b0 (最初 = 捨て) | 68.8 | 0.83 | SAME | 0 |
+| prof (旧) | 66.6 | 0.82 | SAME | 0 |
+| segp (新 + prof) | 50.4 | 0.82 | SAME | 0 |
+| chk (新 + GPU_CHECK) | 89.5 | 0.82 | SAME | 0 |
+| seg (新) | 50.0 | 0.82 | SAME | 0 |
+| base2 (基準) | 65.9 | 0.82 | SAME | 0 |
+
+VERDICT seg vs b0 decode -27.4%、base2 比では **-24.1%** (65.9 -> 50.0)。
+prefill -1.8% (b0 比。base2 とは同じ)。md5 は全 COND で SAME (a/b とも)、errors 0、
+text は `# B-Trees: A Comprehensive Explanation ...` で sane。
+
+`[seg-prof]` (1 層あたり、tok=431 の行):
+
+| 経路 | h2d | launch | sync | d2h | GPU gate | GPU up | GPU silu | GPU down | GPU sum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 旧 (prof) | 25 us / 2 回 | 4.5 / 3 | **493 us / 2** | 33 / 2 | 176 | 173 | - | 140 | - |
+| 新 (segp) | 2 us / 1 回 | 6.8 / 5 | 440 us / 1 | 8 / 1 | 180 | 172 | 2.4 | 132 | 3.4 |
+
+- 旧経路の sync 493 us は**カーネル実行そのもの** (イベントの合計 489 us と一致)。
+  文脈同期が背景の転送を待っている、という私の推定は**外れ**だった (このモデルでは
+  上げ直しが走っていない)。原因は 1 行 = 1 スレッドの直列累積で、
+  **gate 53 GB/s / up 54 GB/s / down 92 GB/s** しか出ていないこと。
+- 新経路は 1 層 478 us (プロファイル中の全 `add` の合計) で、うち GPU が 490 us
+  (ミスの CPU 計算 40〜185 us がその裏に隠れる)。**残りの主因は GEMV カーネル**。
+- 1 待ち・小口 H2D 1 回・D2H 10 KB の効果は 0.84 -> 0.50 ms/層。
+
+## 7. 2 ラウンド目 (t278b) でやること
+
+`kernels_seg_k.cu` を足した (`PTX=seg_k`)。1 行 = 1 warp にして k 方向を 32 レーンで
+分割する (IQ 経路と同じ形)。丸め順が変わるので `DENNO_SEG_K=0` で旧カーネルへ
+戻せる。t278b の COND は t278a と同じ 6 本 (b0 / prof / segp / chk / seg / base2) +
+`PTX=seg_k` で、`chk` の `expert_gpu_check` が max_abs / max_rel を出す。
