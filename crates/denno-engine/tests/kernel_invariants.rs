@@ -7451,6 +7451,7 @@ fn pf222_sn3_gates_are_wired_and_default_on() {
     for (fname, env, default_on) in [
         ("pf_tc_shared3_from_value", "DENNO_PF_TC_SHARED3", true),
         ("pf_mix_tc_from_value", "DENNO_PF_MIX_TC", true),
+        ("pf_mix_q8_tc_from_value", "DENNO_PF_MIX_Q8TC", true),
         ("pf_tc_shared4_from_value", "DENNO_PF_TC_SHARED4", false),
     ] {
         let at = CUDA_RS
@@ -7495,12 +7496,18 @@ fn pf222_sn3_gates_are_wired_and_default_on() {
         sh4_at < sn3_at && sn3_at < sn2_at,
         "shared の分岐順が sh4 → sn3 → sn2 でない"
     );
-    // mix: BF16 の down / up を sn3 に渡していること。
+    // mix: BF16 (既定 on) と Q8_0 (task 301、既定 on) の down / up を sn3 に渡すこと。
     assert!(
-        CUDA_RS.contains("if pf_mix_tc_on()")
-            && CUDA_RS.contains("&& kind == PfWKind::Bf16")
-            && CUDA_RS.contains("return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, kk * 2)"),
-        "mix の BF16 経路が sn3 に繋がっていない"
+        CUDA_RS.contains(
+            "PfWKind::Bf16 if pf_mix_tc_on() => Some((crate::kquant::GgmlType::Bf16, kk * 2))"
+        ) && CUDA_RS.contains(
+            "PfWKind::Quant(crate::kquant::GgmlType::Q8_0, _, rb, _) if pf_mix_q8_tc_on()"
+        ),
+        "mix の BF16 / Q8_0 経路が sn3 に繋がっていない"
+    );
+    assert!(
+        CUDA_RS.contains("return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, rb)"),
+        "mix の sn3 起動が行バイト数を型から渡していない"
     );
     // 入力の下限: 64 行未満 (19 トークンの next turn) は従来経路のまま。
     assert!(
