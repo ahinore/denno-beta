@@ -3,8 +3,9 @@ ADOPT: no t291a t291b t291d
 # REPORT P291 — UD-Q4_K_XL の prefill: MoE 作業域の使い回しと down の VNNI GEMM
 
 branch: br291 (int-auto c5cb293 = br282 の merge から。br286 は未 merge だったので
-最初に merge した — `d975f50`)。lab: t291a / t291b / t291d (t291c は COND の
-環境を間違えたため判定に使わない。下の 5.3)。
+最初に merge した — `d975f50`。最後に int-auto 7c2e83f (br290) を取り込んだ
+— 衝突なし)。lab: t291a / t291b / t291d (t291c は COND の環境を間違えたため
+判定に使わない。下の 5.3)。
 
 ## 0. 結論
 
@@ -156,7 +157,7 @@ t291d (既定モデル swift15-abl-IQ3_S、depth、PROFILE=1、baseline の 4 en
 ## 6. テスト
 
 - `cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1`
-  1173 passed / 0 failed。
+  1173 passed / 0 failed (int-auto 7c2e83f を merge した後は 1184 passed / 0 failed)。
 - `cargo test --release -p denno-engine --features cuda --test kernel_invariants`
   95 passed / 0 failed。
 - 追加テスト: `vnni_indexed_rows_match_gathered_rows_bitwise` (索引付き VNNI が
@@ -171,3 +172,6 @@ t291d (既定モデル swift15-abl-IQ3_S、depth、PROFILE=1、baseline の 4 en
   約 2.5 TMAC/s しか出ていない。ここは今回触っていない。
 - expert の 24.0 s のうち約 4 s はページキャッシュのミス (majflt 139k) と推定。
   `DENNO_EXPERT_PREFETCH=1` では改善しなかった (t291a)。
+- merge 後 (int-auto 7c2e83f) に両ゲートを on にしてローカルのベンチを回し直し、
+  1 層 382.8 ms (merge 前 377.9) で変わらないことを確認した。br290 の作業域計画の
+  変更とは独立 (こちらの作業域はホストの `MOE_SCRATCH`)。
