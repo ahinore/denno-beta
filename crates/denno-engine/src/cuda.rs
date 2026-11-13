@@ -7493,6 +7493,10 @@ struct SegKKernels {
     module: CUmodule,
     /// Q8_0 / Q5_1 / Q4_K / Q5_K ([`moe_batch_slot`] と同じ並び)
     fns: [CUfunction; 4],
+    /// task 282: mix 用 (古い PTX には無いので任意)。Q8_0 専用。
+    mix_r8: Option<CUfunction>,
+    /// task 282: mix の down 用 (1 行 = 1 ブロック 256 スレッド)。Q8_0 専用。
+    mix_rowblk: Option<CUfunction>,
 }
 
 // 生ハンドル (context / module / function)。CudaCtx と同じ規約。
@@ -7567,19 +7571,30 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
                     return None;
                 }
             }
+            let get = |name: &[u8]| -> Option<CUfunction> {
+                let mut f: CUfunction = std::ptr::null_mut();
+                let r = unsafe {
+                    (lib.module_get_function)(&mut f, module, name.as_ptr() as *const c_char)
+                };
+                if r == CUDA_SUCCESS {
+                    Some(f)
+                } else {
+                    None
+                }
+            };
             let mut fns = [std::ptr::null_mut(); 4];
             for (i, name) in SEG_K_NAMES.iter().enumerate() {
-                let mut f: CUfunction = std::ptr::null_mut();
-                unsafe {
-                    if (lib.module_get_function)(&mut f, module, name.as_ptr() as *const c_char)
-                        != CUDA_SUCCESS
-                    {
-                        return None;
-                    }
-                }
-                fns[i] = f;
+                fns[i] = get(name)?;
             }
-            Some(SegKKernels { module, fns })
+            // task 282: mix 用の 2 本は任意 (無ければ旧 GEMV へ落ちる)。
+            let mix_r8 = get(b"dno_mix_gemv_q8_0_r8\0");
+            let mix_rowblk = get(b"dno_mix_gemv_q8_0_rowblk\0");
+            Some(SegKKernels {
+                module,
+                fns,
+                mix_r8,
+                mix_rowblk,
+            })
         })
         .as_ref()
 }
@@ -29218,20 +29233,47 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
 /// 丸め順が変わる (warp の木) ので切り戻しは `DENNO_MIX_QK=0`。
 pub const MIX_QK_ENV: &str = "DENNO_MIX_QK";
 
-/// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` で、未設定は両方 true。
-pub fn mix_qk_from_value(v: Option<&str>) -> (bool, bool) {
+/// task 282: mix の GEMV 種別。`Old` = 従来の `plan_moe_gemv` (v3 形)、
+/// `Seg` = `kernels_seg_k.cu` の 1 行 1 warp、`Blk` = 同ファイルの 1 行 1 ブロック
+/// (行数が少ない down 用)、`R8` = 同ファイルの 1 warp 8 行 (行数が多い up 用)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MixGemv {
+    /// 従来 (`plan_moe_gemv` の v3 形。lab t282b の実測で 1 行列 54 us)。
+    Old,
+    /// 1 行 = 1 warp (`dno_seg_gemv_k_q8_0`)。
+    Seg,
+    /// 1 行 = 1 ブロック 256 スレッド (`dno_mix_gemv_q8_0_rowblk`)。
+    Blk,
+    /// 1 warp = 8 行 (`dno_mix_gemv_q8_0_r8`)。
+    R8,
+}
+
+/// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` の種別。
+///
+/// - 未設定 / `1` / `both`: `(Blk, R8)` = 既定 (lab の採否後の形)
+/// - `0` / `off` / `false` : `(Old, Old)` = 切り戻し
+/// - `down`               : `(Blk, Old)`
+/// - `up`                 : `(Old, R8)`
+/// - `seg`                : `(Seg, Seg)` = task 278 の seg_k をそのまま
+pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("0") | Some("off") | Some("false") | Some("no") => (false, false),
-        Some("down") => (true, false),
-        Some("up") => (false, true),
-        _ => (true, true),
+        Some("0") | Some("off") | Some("false") | Some("no") => (MixGemv::Old, MixGemv::Old),
+        Some("down") => (MixGemv::Blk, MixGemv::Old),
+        Some("up") => (MixGemv::Old, MixGemv::R8),
+        Some("seg") => (MixGemv::Seg, MixGemv::Seg),
+        _ => (MixGemv::Blk, MixGemv::R8),
     }
 }
 
-/// [`MIX_QK_ENV`] をプロセスで 1 回だけ読む。`(down, up)`。
-pub fn mix_qk_enabled() -> (bool, bool) {
-    static ON: OnceLock<(bool, bool)> = OnceLock::new();
+/// [`MIX_QK_ENV`] をプロセスで 1 回だけ読む。`(down, up)` の種別。
+pub fn mix_qk_enabled() -> (MixGemv, MixGemv) {
+    static ON: OnceLock<(MixGemv, MixGemv)> = OnceLock::new();
     *ON.get_or_init(|| mix_qk_from_value(std::env::var(MIX_QK_ENV).ok().as_deref()))
+}
+
+/// gate_audit の台帳用 (既定 on のゲート)。どちらかが seg_k 系なら true。
+pub fn mix_qk_gate_on() -> bool {
+    mix_qk_enabled() != (MixGemv::Old, MixGemv::Old)
 }
 
 /// task 282: 高速 GEMV が実際に撃たれた回数 (診断用。プロセス通算)。
@@ -29382,20 +29424,26 @@ pub fn maybe_gpu_mix_q_chain_into(
             hstage,
             ..
         } = &mut *s;
-        // task 282: 形と PTX が揃うときだけ高速 GEMV (1 行 = 1 warp) を使う。
-        // 向き (down / up) ごとに切り替えられる (`DENNO_MIX_QK`)。
-        let (qk_down_on, qk_up_on) = mix_qk_enabled();
-        let qk = seg_k_kernels().and_then(|k| match (
-            moe_batch_slot(down_ty),
-            moe_batch_slot(up_ty),
-            gguf_row_bytes(down_ty, k1),
-            gguf_row_bytes(up_ty, n1),
-        ) {
-            (Some(sd), Some(su), Some(rd), Some(ru)) => Some((k, sd, su, rd, ru)),
-            _ => None,
-        });
-        let fast_down = qk_down_on && qk.is_some();
-        let fast_up = qk_up_on && qk.is_some();
+        // task 282: mix の GEMV を向きごとに選ぶ (`DENNO_MIX_QK`)。
+        // seg_k 系は Q8_0 のときだけ (mix の実型)。形が合わなければ旧 GEMV。
+        let (want_down, want_up) = mix_qk_enabled();
+        let q8 = down_ty == crate::kquant::GgmlType::Q8_0
+            && up_ty == crate::kquant::GgmlType::Q8_0;
+        let rd = gguf_row_bytes(down_ty, k1);
+        let ru = gguf_row_bytes(up_ty, n1);
+        let kern = if q8 { seg_k_kernels() } else { None };
+        let down_kind = match (want_down, kern, rd) {
+            (MixGemv::Blk, Some(k), Some(_)) if k.mix_rowblk.is_some() => MixGemv::Blk,
+            (MixGemv::Seg, Some(k), Some(_)) if moe_batch_slot(down_ty).is_some() => MixGemv::Seg,
+            _ => MixGemv::Old,
+        };
+        let up_kind = match (want_up, kern, ru) {
+            (MixGemv::R8, Some(k), Some(_)) if k.mix_r8.is_some() => MixGemv::R8,
+            (MixGemv::Seg, Some(k), Some(_)) if moe_batch_slot(up_ty).is_some() => MixGemv::Seg,
+            _ => MixGemv::Old,
+        };
+        let fast_down = down_kind != MixGemv::Old;
+        let fast_up = up_kind != MixGemv::Old;
         let need_stage = fast_down || fast_up;
         Scratch::ensure(dx, k1 * 4)?;
         Scratch::ensure(dlo, n1 * 4)?;
@@ -29506,32 +29554,54 @@ pub fn maybe_gpu_mix_q_chain_into(
         };
         // 1. down (量子 GEMV, デバイス内)
         if fast_down {
-            let (fk, slot_d, _, rb_d, _) = qk.expect("fast");
             let st = stage.as_ref().expect("確保済み");
+            let rb_d = rd.expect("形は検査済み");
             unsafe {
-                let mut pw = st.ptr() + off_wd as u64;
-                let mut px = xdev;
-                let mut po = dlo.ptr();
-                let mut ps = st.ptr() + off_sd as u64;
-                let (mut ns, mut ni, mut no, mut rb) =
-                    (1 as c_int, k1 as c_int, n1 as c_int, rb_d as c_int);
-                let mut args = [
-                    &mut pw as *mut _ as *mut c_void,
-                    &mut px as *mut _ as *mut c_void,
-                    &mut po as *mut _ as *mut c_void,
-                    &mut ps as *mut _ as *mut c_void,
-                    &mut ns as *mut _ as *mut c_void,
-                    &mut ni as *mut _ as *mut c_void,
-                    &mut no as *mut _ as *mut c_void,
-                    &mut rb as *mut _ as *mut c_void,
-                ];
-                ctx.launch_async(
-                    fk.fns[slot_d],
-                    (((n1 + 3) / 4) as u32, 1, 1),
-                    (128, 1, 1),
-                    0,
-                    &mut args,
-                )?;
+                match down_kind {
+                    MixGemv::Blk => {
+                        // 1 行 = 1 ブロック (256 スレッド)。k を 8 warp に分ける。
+                        let f = kern.and_then(|k| k.mix_rowblk).expect("検査済み");
+                        let (mut pw, mut px, mut po) = (wd, xdev, dlo.ptr());
+                        let (mut ni, mut no, mut rb) =
+                            (k1 as c_int, n1 as c_int, rb_d as c_int);
+                        let mut args = [
+                            &mut pw as *mut _ as *mut c_void,
+                            &mut px as *mut _ as *mut c_void,
+                            &mut po as *mut _ as *mut c_void,
+                            &mut ni as *mut _ as *mut c_void,
+                            &mut no as *mut _ as *mut c_void,
+                            &mut rb as *mut _ as *mut c_void,
+                        ];
+                        ctx.launch_async(f, (n1 as u32, 1, 1), (256, 1, 1), 32, &mut args)?;
+                    }
+                    _ => {
+                        let fk = kern.expect("検査済み");
+                        let slot_d = moe_batch_slot(down_ty).expect("検査済み");
+                        let mut pw = st.ptr() + off_wd as u64;
+                        let mut px = xdev;
+                        let mut po = dlo.ptr();
+                        let mut ps = st.ptr() + off_sd as u64;
+                        let (mut ns, mut ni, mut no, mut rb) =
+                            (1 as c_int, k1 as c_int, n1 as c_int, rb_d as c_int);
+                        let mut args = [
+                            &mut pw as *mut _ as *mut c_void,
+                            &mut px as *mut _ as *mut c_void,
+                            &mut po as *mut _ as *mut c_void,
+                            &mut ps as *mut _ as *mut c_void,
+                            &mut ns as *mut _ as *mut c_void,
+                            &mut ni as *mut _ as *mut c_void,
+                            &mut no as *mut _ as *mut c_void,
+                            &mut rb as *mut _ as *mut c_void,
+                        ];
+                        ctx.launch_async(
+                            fk.fns[slot_d],
+                            (((n1 + 3) / 4) as u32, 1, 1),
+                            (128, 1, 1),
+                            0,
+                            &mut args,
+                        )?;
+                    }
+                }
             }
         } else {
             let ok = ctx.moe_gemv_dev_ptrs(down_ty, wd, dx.ptr(), dlo.ptr(), k1, n1)?;
@@ -29553,32 +29623,62 @@ pub fn maybe_gpu_mix_q_chain_into(
         }
         // 3. up (量子 GEMV)
         if fast_up {
-            let (fk, _, slot_u, _, rb_u) = qk.expect("fast");
             let st = stage.as_ref().expect("確保済み");
+            let rb_u = ru.expect("形は検査済み");
+            let fk = kern.expect("検査済み");
             unsafe {
-                let mut pw = st.ptr() + off_wu as u64;
-                let mut px = dlo.ptr();
-                let mut po = dout.ptr();
-                let mut ps = st.ptr() + off_su as u64;
-                let (mut ns, mut ni, mut no, mut rb) =
-                    (1 as c_int, n1 as c_int, n2 as c_int, rb_u as c_int);
-                let mut args = [
-                    &mut pw as *mut _ as *mut c_void,
-                    &mut px as *mut _ as *mut c_void,
-                    &mut po as *mut _ as *mut c_void,
-                    &mut ps as *mut _ as *mut c_void,
-                    &mut ns as *mut _ as *mut c_void,
-                    &mut ni as *mut _ as *mut c_void,
-                    &mut no as *mut _ as *mut c_void,
-                    &mut rb as *mut _ as *mut c_void,
-                ];
-                ctx.launch_async(
-                    fk.fns[slot_u],
-                    (((n2 + 3) / 4) as u32, 1, 1),
-                    (128, 1, 1),
-                    0,
-                    &mut args,
-                )?;
+                if up_kind == MixGemv::R8 {
+                    // 1 warp = 8 行。1 ブロック = 4 warp = 32 行。
+                    let f = fk.mix_r8.expect("検査済み");
+                    let mut pw = st.ptr() + off_wu as u64;
+                    let mut px = dlo.ptr();
+                    let mut po = dout.ptr();
+                    let mut ps = st.ptr() + off_su as u64;
+                    let (mut ns, mut ni, mut no, mut rb) =
+                        (1 as c_int, n1 as c_int, n2 as c_int, rb_u as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ps as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void,
+                        &mut ni as *mut _ as *mut c_void,
+                        &mut no as *mut _ as *mut c_void,
+                        &mut rb as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(
+                        f,
+                        (((n2 + 31) / 32) as u32, 1, 1),
+                        (128, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                } else {
+                    let slot_u = moe_batch_slot(up_ty).expect("検査済み");
+                    let mut pw = st.ptr() + off_wu as u64;
+                    let mut px = dlo.ptr();
+                    let mut po = dout.ptr();
+                    let mut ps = st.ptr() + off_su as u64;
+                    let (mut ns, mut ni, mut no, mut rb) =
+                        (1 as c_int, n1 as c_int, n2 as c_int, rb_u as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ps as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void,
+                        &mut ni as *mut _ as *mut c_void,
+                        &mut no as *mut _ as *mut c_void,
+                        &mut rb as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(
+                        fk.fns[slot_u],
+                        (((n2 + 3) / 4) as u32, 1, 1),
+                        (128, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
             }
         } else {
             let ok = ctx.moe_gemv_dev_ptrs(up_ty, wu, dlo.ptr(), dout.ptr(), n1, n2)?;
@@ -39169,19 +39269,20 @@ mod tests {
         assert!(!seg_k_from_value(Some("false")));
         assert!(!seg_k_from_value(Some("NO")));
     }
-    /// task 282: 量子型 mix の高速 GEMV (`DENNO_MIX_QK`) は既定 on (両方向)。
-    /// `down` / `up` で向きごとに切り替えられる (lab t282a で up が遅かったため)。
+    /// task 282: mix の GEMV 種別 (`DENNO_MIX_QK`) の既定は `(Blk, R8)`。
+    /// `0` で旧 GEMV に戻り、`down` / `up` / `seg` で向きごとに選べる。
     #[test]
     fn mix_qk_gate_defaults_on() {
-        assert_eq!(mix_qk_from_value(None), (true, true), "未設定は両方向");
-        assert_eq!(mix_qk_from_value(Some("1")), (true, true));
-        assert_eq!(mix_qk_from_value(Some(" on ")), (true, true));
-        assert_eq!(mix_qk_from_value(Some("0")), (false, false));
-        assert_eq!(mix_qk_from_value(Some("off")), (false, false));
-        assert_eq!(mix_qk_from_value(Some("false")), (false, false));
-        assert_eq!(mix_qk_from_value(Some("NO")), (false, false));
-        assert_eq!(mix_qk_from_value(Some("down")), (true, false));
-        assert_eq!(mix_qk_from_value(Some(" UP ")), (false, true));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Blk, MixGemv::R8), "未設定が既定");
+        assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::Blk, MixGemv::R8));
+        assert_eq!(mix_qk_from_value(Some(" on ")), (MixGemv::Blk, MixGemv::R8));
+        assert_eq!(mix_qk_from_value(Some("0")), (MixGemv::Old, MixGemv::Old));
+        assert_eq!(mix_qk_from_value(Some("off")), (MixGemv::Old, MixGemv::Old));
+        assert_eq!(mix_qk_from_value(Some("false")), (MixGemv::Old, MixGemv::Old));
+        assert_eq!(mix_qk_from_value(Some("NO")), (MixGemv::Old, MixGemv::Old));
+        assert_eq!(mix_qk_from_value(Some("down")), (MixGemv::Blk, MixGemv::Old));
+        assert_eq!(mix_qk_from_value(Some(" UP ")), (MixGemv::Old, MixGemv::R8));
+        assert_eq!(mix_qk_from_value(Some("seg")), (MixGemv::Seg, MixGemv::Seg));
     }
     /// task 282: 前置きバッファのレイアウト (重みポインタ 2 本 / segment 表 2 枚 /
     /// 入力) が詰まっていて、seg 表と xn が 4 / 16 バイト整列であること。

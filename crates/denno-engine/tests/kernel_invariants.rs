@@ -10351,9 +10351,14 @@ fn task278_seg_k_kernels_are_wired() {
         SEG_K_SRC.contains("__shfl_down_sync(0xffffffffu, acc, 16)"),
         "warp 縮約が無い"
     );
-    // 共有メモリを使わない (smem 0 で起動する前提)
+    // 4 本は共有メモリを使わない (smem 0 で起動する前提)。
+    // task 282 の mix 用 2 本は別 (rowblk は 8 warp の部分和に 32 B だけ使う)。
+    let seg_only = SEG_K_SRC
+        .split("// task 282:")
+        .next()
+        .unwrap_or(SEG_K_SRC);
     assert!(
-        !SEG_K_SRC.contains("__shared__"),
+        !seg_only.contains("__shared__"),
         "共有メモリを使うと smem = 0 の起動と食い違う"
     );
     // build_ptx.sh: target が引ける + targets_all に入っている
@@ -10368,6 +10373,63 @@ fn task278_seg_k_kernels_are_wired() {
     assert!(targets.contains("seg_k"), "targets_all に seg_k が無い");
     // ホスト側のゲート名 (gate_audit の台帳に載せる前の固定)
     assert!(CUDA_RS.contains("\"DENNO_SEG_K\""), "DENNO_SEG_K のゲートが無い");
+}
+
+// ===========================================================================
+// task 282: 量子型 mix の GEMV 2 本 (down = 1 行 1 ブロック / up = 1 warp 8 行)
+// ===========================================================================
+
+/// 契約だけを固定する (GPU 無しでは走らせられない)。
+///
+/// lab t282b の `[dec-kprof-avg]` 実測: 従来の `plan_moe_gemv` は
+/// `lanes=2 / rows=8 / blockDim=16` で 1 行列 54 us だった。down (320 行 x
+/// 10,240) は 1 行 1 ブロックで k を 8 warp に割り、up (10,240 行 x 320) は
+/// 1 warp 8 行で固定費を 8 分の 1 にする。
+#[test]
+fn task282_mix_gemv_kernels_are_wired() {
+    // up: 1 warp 8 行。seg_k と同じ 8 引数 ABI、1 ブロック 4 warp = 32 行。
+    assert!(SEG_K_SRC.contains("dno_mix_gemv_q8_0_r8"), "r8 が .cu に無い");
+    assert_eq!(cu_kernel_nargs(SEG_K_SRC, "dno_mix_gemv_q8_0_r8"), 8);
+    assert!(SEG_K_SRC.contains("#define SK_R8 8"), "r8 の行数が 8 でない");
+    assert!(
+        CUDA_RS.contains("b\"dno_mix_gemv_q8_0_r8\\0\""),
+        "cuda.rs が r8 を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("(((n2 + 31) / 32) as u32, 1, 1)"),
+        "r8 の grid が 32 行 / ブロックでない"
+    );
+    // down: 1 行 1 ブロック 256 スレッド (8 warp)、部分和 8 本を固定順で加算。
+    assert!(
+        SEG_K_SRC.contains("dno_mix_gemv_q8_0_rowblk"),
+        "rowblk が .cu に無い"
+    );
+    assert_eq!(cu_kernel_nargs(SEG_K_SRC, "dno_mix_gemv_q8_0_rowblk"), 6);
+    assert!(SEG_K_SRC.contains("#define SKROW_THREADS 256"));
+    assert!(SEG_K_SRC.contains("#define SKROW_WARPS 8"));
+    assert!(
+        SEG_K_SRC.contains("for (int w = 0; w < SKROW_WARPS; ++w) s += red[w];"),
+        "部分和の加算順が固定でない"
+    );
+    assert!(
+        CUDA_RS.contains("b\"dno_mix_gemv_q8_0_rowblk\\0\""),
+        "cuda.rs が rowblk を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("(n1 as u32, 1, 1), (256, 1, 1), 32"),
+        "rowblk の起動形 (grid=行数 / block=256 / smem=32) が違う"
+    );
+    // ゲート名と、既定 on の台帳 (gate_audit) への登録。
+    assert!(CUDA_RS.contains("\"DENNO_MIX_QK\""), "DENNO_MIX_QK のゲートが無い");
+    let audit = include_str!("../src/gate_audit.rs");
+    assert!(
+        audit.contains("\"DENNO_MIX_QK\""),
+        "DENNO_MIX_QK が既定 on の台帳に無い"
+    );
+    assert!(
+        audit.contains("\"dno_mix_gemv_q8_0_r8\""),
+        "台帳のエントリに r8 が無い"
+    );
 }
 
 // ===========================================================================

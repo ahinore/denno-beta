@@ -287,3 +287,103 @@ extern "C" __global__ void dno_seg_gemv_k_q5k(
     acc = sk_reduce(acc);
     if (lane == 0) s.out[row] = acc;
 }
+
+// ---------------------------------------------------------------------------
+// task 282: 行数が多く 1 行が短い形 (UD-Q4_K_XL の mix up = 10,240 行 x 320 要素)
+// 用に、**1 warp = 8 行**をまとめて縮約する版。
+//
+// 1 行 1 warp (`dno_seg_gemv_k_q8_0`) では 1 行 320 要素 = 10 反復しかしないので、
+// 行アドレス / segment の読み / warp 縮約 / store の固定費が 340 B に対して重い
+// (lab t282a: mix の up を seg_k にしたら旧 GEMV より遅くなった)。8 行を同じ
+// warp で回すと固定費が 8 分の 1 になり、8 行 = 2,720 B が連続なので読みも繋がる。
+//
+// 値: 1 行 1 warp 版と同一 (行は独立。1 行の k 昇順アキュムレータと warp 縮約の
+// 木は同じで、8 本のアキュムレータは互いに独立)。
+//
+// 起動形: blockDim = 128 (4 warp)、1 ブロック = 32 行、grid.x = ceil(n_out / 32)。
+// ---------------------------------------------------------------------------
+#define SK_R8 8
+
+extern "C" __global__ void dno_mix_gemv_q8_0_r8(
+    const unsigned char* const* __restrict__ wptrs,
+    const float* __restrict__ xbase,
+    float* __restrict__ obase,
+    const unsigned int* __restrict__ seg,
+    int nseg, int n_in, int n_out, int row_bytes)
+{
+    SkSeg s;
+    if (!sk_seg(wptrs, xbase, obase, seg, nseg, n_in, n_out, &s)) return;
+    const int lane = threadIdx.x & 31u;
+    const int warps = (int)(blockDim.x >> 5);
+    const int row0 = (blockIdx.x * warps + (int)(threadIdx.x >> 5)) * SK_R8;
+    const int nb = n_in >> 5;
+    float acc[SK_R8];
+    #pragma unroll
+    for (int r = 0; r < SK_R8; ++r) acc[r] = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const float xv = s.x[(size_t)b * 32u + (size_t)lane];
+        #pragma unroll
+        for (int r = 0; r < SK_R8; ++r) {
+            const int row = row0 + r;
+            if (row >= n_out) continue;
+            const unsigned char* blk =
+                s.w + (size_t)row * (size_t)row_bytes + (size_t)b * 34u;
+            const float d = sk_f16(blk);
+            const float y = (float)(int)(signed char)blk[2 + lane] * d;
+            acc[r] += y * xv;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < SK_R8; ++r) {
+        const float a = sk_reduce(acc[r]);
+        const int row = row0 + r;
+        if (lane == 0 && row < n_out) s.out[row] = a;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 282: 行数が少なく 1 行が長い形 (UD-Q4_K_XL の mix down = 320 行 x 10,240
+// 要素) 用。**1 行 = 1 ブロック (256 スレッド)** で k を warp 単位に分け、
+// 共有メモリの固定木で縮約する。
+//
+// lab t282b の `[dec-kprof-avg]` 実測: 旧 v3 形 (lanes=2, rows=8, blockDim=16) は
+// down に GPU 全体で 640 スレッドしか使わず、1 行列 3.5 MB に **54 us**
+// (65 GB/s) かかっていた (up も同じ 54 us)。
+//
+// 縮約は「warp 内は sk_reduce の固定木 → 8 warp の部分和を thread 0 が固定順で
+// 加算」で決定的。1 行 1 スレッドの逐次和とは丸め順が違う。
+// 起動形: blockDim = 256 (8 warp)、grid.x = n_out、shared = 8 * 4 B。
+// ---------------------------------------------------------------------------
+#define SKROW_THREADS 256
+#define SKROW_WARPS 8
+
+extern "C" __global__ void dno_mix_gemv_q8_0_rowblk(
+    const unsigned char* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n_in, int n_out, int row_bytes)
+{
+    const int row = (int)blockIdx.x;
+    if (row >= n_out) return;
+    const int t = (int)threadIdx.x;
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const unsigned char* rowp = w + (size_t)row * (size_t)row_bytes;
+    const int nb = n_in >> 5;
+    float acc = 0.0f;
+    for (int b = warp; b < nb; b += SKROW_WARPS) {
+        const unsigned char* blk = rowp + (size_t)b * 34u;
+        const float d = sk_f16(blk);
+        const float y = (float)(int)(signed char)blk[2 + lane] * d;
+        acc += y * x[(size_t)b * 32u + (size_t)lane];
+    }
+    acc = sk_reduce(acc);
+    __shared__ float red[SKROW_WARPS];
+    if (lane == 0) red[warp] = acc;
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < SKROW_WARPS; ++w) s += red[w];
+        out[row] = s;
+    }
+}

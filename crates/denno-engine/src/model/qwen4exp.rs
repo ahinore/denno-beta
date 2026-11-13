@@ -3879,6 +3879,8 @@ impl Qwen4Exp {
         let _pf_work = crate::model::expert_vram::reserve_work_area(
             crate::model::expert_vram::prefill_work_bytes(),
         );
+        // task 282: この prefill の間は mix の fused chain を使わない (decode 専用)。
+        let _pf_seq_guard = enter_prefill_seq();
         let layer_major = batch && self.attn.layer_major_safe();
         let logits = if layer_major {
             self.forward_prefill_batch_tapped(ctx, prefill_chunk_for(ctx.len()), tokens, on_layer, roles)?
@@ -6012,23 +6014,58 @@ fn mix_quant_gpu_enabled() -> bool {
 /// UD-Q4_K_XL の mix は Q8_0 で、`DENNO_MIX_QUANT_GPU` の逐次経路は 1 呼び出し
 /// 2 往復 (194 起動 / 194 同期 per token) だった。ここでは中間をデバイスに
 /// 残したまま 4 本積む。値は CPU とビット一致 (silu は glibc expf の逐語再現)。
+thread_local! {
+    /// task 282: prefill の中か (`forward_prefill_inner` が立てる)。
+    ///
+    /// このモデルの prefill は **1 トークンずつ** `hc_mix_quant_fast` を通るので、
+    /// 量子型 mix の fused chain を prefill でも使うと、chain の同期が prefill の
+    /// GPU 仕事の後ろに並んで **prefill が 6〜10% 遅くなる** (lab t282a/t282b:
+    /// 0.80-0.84 s → 0.89-0.94 s)。decode だけに限ると prefill は 1 バイトも
+    /// 変わらない (従来のホスト経路)。
+    static IN_PREFILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// いま prefill の中か (mix の fused chain の門番)。
+fn in_prefill_seq() -> bool {
+    IN_PREFILL.with(|c| c.get())
+}
+
+/// prefill の入口で立てるガード (Drop で元に戻す)。
+struct PrefillSeqGuard(bool);
+
+impl Drop for PrefillSeqGuard {
+    fn drop(&mut self) {
+        IN_PREFILL.with(|c| c.set(self.0));
+    }
+}
+
+/// prefill の中に入ったことを記録する。
+fn enter_prefill_seq() -> PrefillSeqGuard {
+    PrefillSeqGuard(IN_PREFILL.with(|c| c.replace(true)))
+}
+
 pub const MIX_QCHAIN_ENV: &str = "DENNO_MIX_QCHAIN";
 
-/// [`MIX_QCHAIN_ENV`] の解釈 (純関数)。`1` / `true` / `on` だけが真
-/// (前後の空白と大小は落とす)。
+/// [`MIX_QCHAIN_ENV`] の解釈 (純関数)。**既定 on** (task 282 で採用)。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけが off。
 pub fn mix_qchain_from_value(v: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
-/// 量子型 mix の fused chain を使うか (プロセスで 1 回だけ env を読む)。既定 off。
+/// 量子型 mix の fused chain を使うか (プロセスで 1 回だけ env を読む)。既定 on。
 fn mix_qchain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         mix_qchain_from_value(std::env::var(MIX_QCHAIN_ENV).ok().as_deref())
     })
+}
+
+/// gate_audit の台帳用 (既定 on のゲート)。`DENNO_MIX_QCHAIN` が有効か。
+pub fn mix_qchain_gate_on() -> bool {
+    mix_qchain_enabled()
 }
 
 /// task 266: mix が呼ばれた回数 (ゲート on のときだけ数える。1 プロセス通算)。
@@ -6071,16 +6108,18 @@ pub fn mix_qchain_reset() {
 mod mix_qchain_tests {
     use super::*;
 
-    /// task 266: ゲートは既定 off。`1` / `on` / `true` だけ on。
+    /// task 282: ゲートは既定 on。明示的な偽値だけ off (task 266 では既定 off だった)。
     #[test]
     fn qchain_gate_values() {
-        assert!(!mix_qchain_from_value(None));
-        assert!(!mix_qchain_from_value(Some("")));
-        assert!(!mix_qchain_from_value(Some("0")));
-        assert!(!mix_qchain_from_value(Some("off")));
+        assert!(mix_qchain_from_value(None), "未設定は on (既定)");
+        assert!(mix_qchain_from_value(Some("")));
         assert!(mix_qchain_from_value(Some("1")));
         assert!(mix_qchain_from_value(Some(" TRUE ")));
         assert!(mix_qchain_from_value(Some("on")));
+        assert!(!mix_qchain_from_value(Some("0")));
+        assert!(!mix_qchain_from_value(Some("off")));
+        assert!(!mix_qchain_from_value(Some("false")));
+        assert!(!mix_qchain_from_value(Some(" NO ")));
     }
 
     /// task 266: fused chain は **ブロック量子の 4 型だけ**。
@@ -6096,12 +6135,25 @@ mod mix_qchain_tests {
         }
     }
 
-    /// task 266: ゲート off では診断行を出さない (ログも 1 バイト変えない)。
+    /// ゲートを明示的に切ったときだけ診断行を出さない (既定 on では出る)。
     #[test]
-    fn qchain_line_is_silent_when_off() {
-        if !mix_qchain_enabled() {
-            assert!(mix_qchain_line().is_none());
+    fn qchain_line_follows_the_gate() {
+        assert_eq!(mix_qchain_line().is_some(), mix_qchain_enabled());
+    }
+
+    /// task 282: prefill のガードが立っている間は chain を使わない (decode 専用)。
+    /// prefill で chain を使うと prefill が 6〜10% 遅れる (lab t282a/t282b)。
+    #[test]
+    fn prefill_guard_turns_the_qchain_gate_off() {
+        assert!(!in_prefill_seq(), "既定は prefill の外");
+        {
+            let _g = enter_prefill_seq();
+            assert!(in_prefill_seq(), "ガードの中は prefill");
+            // 門番の式と同じ形 (mix_gpu / 型はここでは true 扱い)。
+            let will = mix_qchain_enabled() && !in_prefill_seq();
+            assert!(!will, "prefill の中では chain を撃たない");
         }
+        assert!(!in_prefill_seq(), "Drop で戻る");
     }
 }
 
@@ -6939,6 +6991,7 @@ fn hc_mix_quant_fast(
         // 鎖が不発なら下の通常位置で計算し直す)。
         let qchain_will = mix_gpu_enabled()
             && mix_qchain_enabled()
+            && !in_prefill_seq()
             && quant_gpu_ty_ok(down.ty())
             && quant_gpu_ty_ok(up.ty());
         let mut inj_early = match inject {
@@ -6992,6 +7045,7 @@ fn hc_mix_quant_fast(
         if chain2_mixed.is_none()
             && mix_gpu_enabled()
             && mix_qchain_enabled()
+            && !in_prefill_seq()
             && quant_gpu_ty_ok(down.ty())
             && quant_gpu_ty_ok(up.ty())
         {
