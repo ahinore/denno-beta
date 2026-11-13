@@ -8044,9 +8044,18 @@ fn gemv_v5_kernels_have_the_v4_abi() {
     // 計画: 8 行/ブロック・レーンは「担当単位が割り切れる最大の 2 の冪」。
     let plan = fn_body(CUDA_RS, "fn plan_moe_gemv_v5(");
     assert!(plan.contains("const ROWS: usize = 8;"), "v5 の rows が 8 でない");
+    // task 281: 上限は env (`DENNO_GEMV_V5_LANES`)。既定は 8 = task 184 のまま。
     assert!(
-        plan.contains("let lanes = v5_lanes_div(per_unit, 8);"),
-        "v5 のレーン決定が per_unit / 8 でない"
+        plan.contains("let lanes = v5_lanes_div(per_unit, v5_lanes_cap());"),
+        "v5 のレーン決定が per_unit / 上限 (env) でない"
+    );
+    assert!(
+        CUDA_RS.contains("fn parse_v5_lanes(raw: Option<&str>) -> usize {"),
+        "task 281: lane 上限の解釈が無い"
+    );
+    assert!(
+        CUDA_RS.contains("parse_v5_lanes(std::env::var(\"DENNO_GEMV_V5_LANES\").ok().as_deref())"),
+        "task 281: DENNO_GEMV_V5_LANES を読んでいない"
     );
     assert!(
         plan.contains("if nb < 2 || nb % 2 != 0 {"),

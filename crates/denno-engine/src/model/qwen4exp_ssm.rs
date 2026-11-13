@@ -1847,17 +1847,17 @@ mod tests {
         );
     }
 
-    /// task 269: `DENNO_GDN_BA_GPU` の真理値表 (既定 off・明示の真値だけ on)。
+    /// task 269/285: `DENNO_GDN_BA_GPU` の真理値表 (**既定 on**・明示の偽値だけ off)。
     #[cfg(feature = "cuda")]
     #[test]
     fn gdn_ba_gpu_truth_table() {
-        for raw in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no")] {
+        for raw in [Some("0"), Some("off"), Some("false"), Some("no"), Some("")] {
             assert!(
                 !crate::cuda::parse_gdn_ba_gpu(raw),
                 "{raw:?} を on と読んだ"
             );
         }
-        for raw in [Some("1"), Some("on"), Some("true"), Some(" 1 ")] {
+        for raw in [None, Some("1"), Some("on"), Some("true"), Some(" 1 "), Some("yes")] {
             assert!(crate::cuda::parse_gdn_ba_gpu(raw), "{raw:?} を off と読んだ");
         }
     }

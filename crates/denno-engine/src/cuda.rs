@@ -3090,6 +3090,28 @@ pub fn alloc_keep_experts() -> bool {
     })
 }
 
+/// task 290: `DENNO_ALLOC_FORCE_CHUNK` — 確保が失敗したあと、`cuMemGetInfo` の
+/// 空きが要求以上に見えても (断片化) 冷たいチャンクを 1 本空けて再試行する
+/// (**既定 on**。`0` / `off` / `false` / `no` で task 256 の従来動作に戻る)。
+///
+/// lab t286c の UD-Q4_K_XL 14k は「空き 3 MiB で 3 MiB の確保が error 2」で
+/// 落ちた。不足分が 0 なので `plan_eviction` が 1 本も選ばず、`emergency_free`
+/// も 0 を返して諦めていた。失敗後の再試行だけは空きを見ずに 1 本空ける。
+pub const ALLOC_FORCE_CHUNK_ENV: &str = "DENNO_ALLOC_FORCE_CHUNK";
+
+/// `DENNO_ALLOC_FORCE_CHUNK` の解釈 (純関数)。未設定・読めない値は既定 (on)。
+pub fn alloc_force_chunk_from_value(v: Option<&str>) -> bool {
+    parse_keep_experts(v, true)
+}
+
+/// 失敗後に 1 チャンク必ず空けるか (プロセスで 1 回だけ env を読む)。
+pub fn alloc_force_chunk() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        alloc_force_chunk_from_value(std::env::var(ALLOC_FORCE_CHUNK_ENV).ok().as_deref())
+    })
+}
+
 /// task 256: 確保 1 本が失敗したときに expert を追い出してよい上限 (バイト)。
 ///
 /// slab はチャンクが空にならないと実メモリを返さないので、上限はタグに
@@ -3187,8 +3209,11 @@ impl DevBuffer {
                 )
                 .is_some()
                 {
-                    let (rep, evicted_keys) =
-                        crate::model::expert_vram::emergency_free_chunks_keys(bytes);
+                    let (rep, evicted_keys) = if alloc_force_chunk() {
+                        crate::model::expert_vram::emergency_free_chunks_forced(bytes)
+                    } else {
+                        crate::model::expert_vram::emergency_free_chunks_keys(bytes)
+                    };
                     // task 279: 追い出した鍵を控える (プールが借りた作業域を返すときに
                     // expert を戻すため)。控えるだけで挙動は変えない。
                     note_alloc_evicted(evicted_keys);
@@ -4886,7 +4911,8 @@ impl CudaCtx {
             }
             _ => return None,
         };
-        let lanes = v5_lanes_div(per_unit, 8);
+        // task 281: lane 数の上限は env (`DENNO_GEMV_V5_LANES`。既定 8 = 従来と同じ)。
+        let lanes = v5_lanes_div(per_unit, v5_lanes_cap());
         if lanes == 0 {
             return None;
         }
@@ -6085,6 +6111,38 @@ fn gemv_v5_q5k_kernels() -> Option<&'static V5Q5KKernels> {
 #[cfg(test)]
 pub(crate) fn moe_gemv_v5_q5k_loaded() -> bool {
     gemv_v5_q5k_kernels().is_some()
+}
+
+/// task 281/285: v5 の lane 数上限 (`DENNO_GEMV_V5_LANES`。**既定 32**)。
+///
+/// v5 の lane 数は「1 レーンが受け持つ量子ブロック対の数が割り切れる」最大の 2 の冪で、
+/// 長らく `v5_lanes_div(per_unit, 8)` に固定されていた。Q8_0 の k=6144
+/// (`per_unit` = nb/2 = 96) は 8 レーン = block 64 = 640 warp しか立たず、
+/// 16.7 MB/層 の読みが 560 GB/s で止まる (同じカーネルでも k=2560 の 31.5 MB は
+/// 1,057 GB/s = 1 レーンの依存ロード連鎖が長いだけ)。上限を 16 / 32 にすると
+/// 立つ warp が 2 倍 / 4 倍になり、1 レーンの連鎖は 12 -> 6 -> 3 対になる。
+///
+/// 丸めは変わる (1 レーン分の鎖の長さと lane 木の段数が変わる) が、値の差は
+/// 丸めだけで出力は動かない (lab t281a / t285a / t285c で md5 SAME)。task 285 で
+/// 既定を 8 -> 32 にした (t285c: 短い decode 18.0 -> 17.9 ms/tok、2 サンプルずつ
+/// 揃って同方向、prefill は短い点 +0.8% 以内、14k の prefill は base2 と同値)。
+/// 切り戻しは `DENNO_GEMV_V5_LANES=8`。
+fn parse_v5_lanes(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        Some("32") => 32,
+        Some("16") => 16,
+        Some("8") => 8,
+        Some("4") => 4,
+        Some("2") => 2,
+        Some("1") => 1,
+        _ => 32,
+    }
+}
+
+/// [`parse_v5_lanes`] をプロセスで 1 回だけ読む。
+fn v5_lanes_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| parse_v5_lanes(std::env::var("DENNO_GEMV_V5_LANES").ok().as_deref()))
 }
 
 /// 割り切れる最大の 2 の冪 (1 以上、`cap` 以下)。無ければ 0。
@@ -25451,7 +25509,11 @@ pub fn pf_pool_len() -> usize {
 /// 二重に呼ばれたときは既存の区画を組み直すだけ (返すのは最初のガード)。
 #[cfg(feature = "cuda")]
 pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
-    pf_pool_acquire_capped(n, crate::model::pf_pool::pf_pool_bytes())
+    pf_pool_acquire_capped(
+        n,
+        crate::model::pf_pool::pf_pool_bytes(),
+        crate::model::pf_pool::pf_pool_reserve_bytes(),
+    )
 }
 
 /// task 279: 上限を指定して借りる (大きい計画は `DENNO_PF_POOL_BIG_MB` を使う)。
@@ -25459,8 +25521,17 @@ pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
 /// 上限は `cap` だけで決まり、レイアウトは `n` (チャンク / タイル) から組む。
 /// 呼び出し側が選んだ大きい形がここで上限を超える / 確保できないときは
 /// `owned == false` を返し、呼び出し側は従来のチャンク・タイルへ戻す。
+///
+/// task 290: 借りたあとに `reserve` バイトを残す。足りない分は**先に**チャンク
+/// 単位で expert を追い出しておく (確保の失敗経路に任せると、借りた直後の空きが
+/// 100-200 MiB になり、prefill の後半の数 MiB の確保が断片化で落ちる)。追い出した
+/// 鍵は [`PF_POOL_EVICTED`] に積み、呼び出し側が prefill の終端で LRU へ戻す。
 #[cfg(feature = "cuda")]
-pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> PfPoolGuard {
+pub fn pf_pool_acquire_capped(
+    n: &crate::model::pf_pool::Need,
+    cap: usize,
+    reserve: usize,
+) -> PfPoolGuard {
     let not_held = PfPoolGuard { owned: false };
     // ゲート / しきい値 / 上限は純関数で決める (既定では何も借りない =
     // 従来の `alloc_tagged` と 1 バイトも変わらない)。
@@ -25499,6 +25570,25 @@ pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> Pf
     let free_before = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
     // task 279: この確保が追い出した expert の鍵を控える (借りる前に掃除する)。
     let _ = take_alloc_evicted();
+    // task 290: 借りたあとに `reserve` を残すため、足りない分を**先に**空ける。
+    // ここで空けた鍵も `take_alloc_evicted` が拾うので、終端で LRU へ戻る。
+    if let Some(free) = free_before {
+        let keep_free = l.total.saturating_add(reserve);
+        if keep_free > free {
+            let (rep, keys) = crate::model::expert_vram::emergency_free_chunks_keys(keep_free);
+            if !rep.is_empty() {
+                let n = keys.len();
+                note_alloc_evicted(keys);
+                eprintln!(
+                    "[pf-pool] 余白 {} MiB を残すため先に空けた (空き {} MiB → expert {} 本 / {})",
+                    reserve >> 20,
+                    free >> 20,
+                    n,
+                    rep.line()
+                );
+            }
+        }
+    }
     match DevBuffer::alloc_tagged(l.total, crate::mem_audit::TAG_OTHER) {
         Ok(b) => {
             let bytes = b.bytes();
@@ -25513,18 +25603,27 @@ pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> Pf
             PF_POOL_OWNED.with(|c| c.set(true));
             PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
             eprintln!(
-                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB / 追い出し {} 本)",
+                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB / 追い出し {} 本 / 余白 {} MiB)",
                 bytes >> 20,
                 n.tile,
                 n.nt_all,
                 free_before.map(|b| b >> 20).unwrap_or(0),
                 free_after.map(|b| b >> 20).unwrap_or(0),
-                evicted_n
+                evicted_n,
+                reserve >> 20
             );
             PfPoolGuard { owned: true }
         }
         Err(e) => {
             drop(slot);
+            // task 290: 先に空けた expert は、借りられなかったので呼び出し側が
+            // 終端で LRU へ戻せるように残す (PF_POOL_EVICTED は借用の前に空にしてある)。
+            let keys = take_alloc_evicted();
+            if !keys.is_empty() {
+                if let Ok(mut g) = PF_POOL_EVICTED.lock() {
+                    g.extend(keys);
+                }
+            }
             tracing::warn!("pf_pool: 作業域 {} MiB を借りられない: {e:#}", l.total >> 20);
             eprintln!(
                 "[pf-pool] 作業域 {} MiB を借りられない → 従来の確保",
@@ -39689,6 +39788,18 @@ mod tests {
         assert!(parse_keep_experts(Some("2"), true));
     }
 
+    /// task 290: `DENNO_ALLOC_FORCE_CHUNK` の真偽表。既定は on。
+    #[test]
+    fn alloc_force_chunk_env_truth_table() {
+        assert!(alloc_force_chunk_from_value(None), "未設定は既定 (on)");
+        for off in ["0", "off", "false", "no", " NO "] {
+            assert!(!alloc_force_chunk_from_value(Some(off)), "{off:?} が on");
+        }
+        for on in ["1", "on", "true", "yes"] {
+            assert!(alloc_force_chunk_from_value(Some(on)), "{on:?} が off");
+        }
+    }
+
     /// task 210: `DENNO_ATTN_MIRROR_FORGET` の真偽表。既定は on。
     #[test]
     fn mirror_forget_env_truth_table() {
@@ -52646,15 +52757,22 @@ pub struct GdnGgufUnit<'a> {
 //
 // 数値: `dno_matvec_f32_r` (固定の木で縮約) を使うので、CPU の逐次/FMA 経路
 // とは丸め順が違う (**ビット一致しない**)。決定論は保つ。`DENNO_GDN_BA_GPU=0`
-// で従来のホスト計算へ戻る。既定 off (lab の A/B で決める)。
+// で従来のホスト計算へ戻る。
+//
+// task 285: **既定 on** にした (lab t269c で短い decode -3.4%、14k の次 +2.6%、
+// md5 DIFF = 意図した丸め順の変更、errors 0、text 健全。t285a で再測)。
+// 当時 (task 269) は目標 8% に届かず既定 off のまま残っていたが、その後の
+// 265/271/275/278/279/282 で他の段が縮み、同じ 0.785 ms/token の相対価値が
+// 上がった。切り戻しは `DENNO_GDN_BA_GPU=0`。
 
-/// task 269: `DENNO_GDN_BA_GPU` の解釈 (純関数)。既定 off。
+/// task 269: `DENNO_GDN_BA_GPU` の解釈 (純関数)。**既定 on** (task 285)。
 ///
-/// `1` / `on` / `true` だけ on (取り違えを増やさない)。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ off。未設定・空・その他の
+/// 値は on (取り違えを増やさないため、真偽の判定はこの 4 語だけ)。
 pub fn parse_gdn_ba_gpu(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(str::trim),
-        Some("1") | Some("on") | Some("true") | Some("ON") | Some("True")
+    !matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
     )
 }
 
@@ -54436,6 +54554,57 @@ mod task184_tests {
         }
         for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true ")] {
             assert!(parse_dec_mix_injhost(raw), "raw={raw:?} が off になっている");
+        }
+    }
+
+    /// task 281: `DENNO_GEMV_V5_LANES` の真理値表 (純関数)。
+    ///
+    /// 既定は 8 (= これまでの `v5_lanes_div(per_unit, 8)` と同じ)。
+    /// 未設定・空・未知の値・数値でない値はすべて 8 に落ちる (事故で lane 数が
+    /// 動かないように、明示した 1/2/4/16/32 だけを受ける)。
+    #[test]
+    fn v5_lanes_cap_table() {
+        // task 285: 既定 (未設定・解釈できない値) は 32。
+        for raw in [None, Some(""), Some("  "), Some("x"), Some("0"), Some("off"), Some("64")] {
+            assert_eq!(parse_v5_lanes(raw), 32, "raw={raw:?}");
+        }
+        for (raw, want) in [
+            (Some("1"), 1usize),
+            (Some("2"), 2),
+            (Some("4"), 4),
+            (Some("8"), 8),
+            (Some("16"), 16),
+            (Some("32"), 32),
+            (Some(" 16 "), 16),
+        ] {
+            assert_eq!(parse_v5_lanes(raw), want, "raw={raw:?}");
+        }
+    }
+
+    /// task 281: lane 数を上げたときに計画が実際に変わる形と変わらない形。
+    ///
+    /// Q8_0 の `per_unit` は `nb/2 = n_in/64` なので、
+    /// k=6144 (96) は 8 -> 16 -> 32 と上がり、k=2560 (40) と k=1024 (16) は
+    /// 16 では 8 のまま (40 は 16 で割れない)。**block = 8 行 x lanes** なので
+    /// 上限 32 でも 256 スレッドに収まる。
+    #[test]
+    fn v5_lanes_shape_table() {
+        let cases: [(usize, usize, usize); 6] = [
+            // (k, cap, 期待 lanes)
+            (6144, 8, 8),
+            (6144, 16, 16),
+            (6144, 32, 32),
+            (2560, 16, 8),
+            (2560, 32, 8),
+            (1024, 16, 16),
+        ];
+        for (k, cap, want) in cases {
+            let per_unit = k / 64; // Q8_0: nb/2
+            let lanes = v5_lanes_div(per_unit, cap);
+            assert_eq!(lanes, want, "k={k} cap={cap}");
+            let block = 8 * lanes;
+            assert!(block <= 1024, "k={k} cap={cap} block={block}");
+            assert_eq!(per_unit % lanes, 0, "k={k} cap={cap}: 割り切れない");
         }
     }
 

@@ -79,6 +79,13 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         on: crate::cuda::dec_mix_upw_on,
     },
     GatePtx {
+        env: "DENNO_GDN_BA_GPU",
+        ptx: "kernels_elem.ptx",
+        entries: &["dno_matvec_bf16_r", "dno_matvec_f32_r"],
+        path_env: "",
+        on: crate::cuda::gdn_ba_gpu_on,
+    },
+    GatePtx {
         env: "DENNO_ATTN_FLASHDEC",
         ptx: "kernels_attn_dec.ptx",
         entries: &["dno_attn_flashdec", "dno_attn_flashdec_combine"],

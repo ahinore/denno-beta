@@ -4827,6 +4827,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     ///
     /// 戻り値の 3 番目は「大きい形を選んだか」。true のとき呼び出し側は、借りた
     /// 作業域のぶんに追い出した expert を prefill の終端で LRU へ戻す。
+    ///
+    /// 4 番目は「借りたあとに残す余白」(task 290)。プールの確保がこの余白を
+    /// 残すように、借りる前に expert を追い出す。
     #[cfg(feature = "cuda")]
     fn pf_pool_pick(
         &self,
@@ -4834,16 +4837,17 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         chunk: usize,
         hc: usize,
         lr: usize,
-    ) -> (crate::model::pf_pool::Need, usize, bool) {
+    ) -> (crate::model::pf_pool::Need, usize, bool, usize) {
         let base_tile = crate::model::exp_pf::lm_tile(nt_all);
         let base = self.pf_pool_need_for(nt_all, base_tile, chunk.min(nt_all), hc, lr);
         let cap = crate::model::pf_pool::pf_pool_bytes();
+        let reserve = self.pf_pool_reserve_for(nt_all);
         if !crate::model::pf_pool::pf_pool_big_on() {
-            return (base, cap, false);
+            return (base, cap, false, reserve);
         }
         let big_cap = crate::model::pf_pool::pf_pool_big_bytes();
         if big_cap <= cap {
-            return (base, cap, false);
+            return (base, cap, false, reserve);
         }
         let max_chunk = crate::model::pf_pool::big_chunk_max();
         // 2,048 以上のチャンクは GDN prefill の連鎖の上限撤廃 (task 270 の
@@ -4854,7 +4858,23 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         } else {
             max_chunk.min(crate::model::exp_pf::CHUNK_BALANCE_CAP)
         };
-        match crate::model::pf_pool::choose_big(&base, big_cap, max_chunk) {
+        // task 290: 借りてよい上限は**実空きから**決める。expert の LRU を
+        // 追い出して作れる分は「余白を残したうえで」使う。上限を固定値
+        // (4,864 MiB) にすると、モデルが大きいときにカードを 100% まで使い切り、
+        // prefill の後半の数 MiB の確保が断片化で落ちる (lab t286c の
+        // UD-Q4_K_XL 14k: 空き 3 MiB で 3 MiB の確保が error 2)。
+        let free = crate::cuda::dev_mem_mb().map(|(f, _)| (f as usize) << 20);
+        let evictable = crate::model::expert_vram::resident_bytes().min(big_cap);
+        let budget = crate::model::pf_pool::pool_budget(big_cap, free, evictable, reserve);
+        eprintln!(
+            "[pf-pool-big] 上限 (実空き {} MiB + 追い出せる expert {} MiB - 余白 {} MiB = {} MiB / 固定上限 {} MiB)",
+            free.map(|b| b >> 20).unwrap_or(0),
+            evictable >> 20,
+            reserve >> 20,
+            budget >> 20,
+            big_cap >> 20
+        );
+        match crate::model::pf_pool::choose_big(&base, budget, max_chunk) {
             Some((c, t, l)) if c != base.chunk || t != base.tile => {
                 let passes = nt_all.div_ceil(t.max(1));
                 let base_passes = nt_all.div_ceil(base.tile.max(1));
@@ -4873,9 +4893,34 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     tile: t,
                     ..base
                 };
-                (need, big_cap, true)
+                (need, big_cap, true, reserve)
             }
-            _ => (base, cap, false),
+            _ => (base, cap, false, reserve),
+        }
+    }
+
+    /// task 290: プールのあとに残す余白 (バイト)。
+    ///
+    /// 層優先の dev MoE が使えるモデルは、作業域がプールの中に収まるので余白は
+    /// 小さくてよい。使えないモデル (expert の型が IQ カーネル非対応 =
+    /// UD-Q4_K_XL など) はホスト経路がステージングを自前で確保するので、
+    /// 余白を広く取ってパス数を増やす (lab t286c の 14k は約 2.3 GB 足りなかった)。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_reserve_for(&self, nt_all: usize) -> usize {
+        let lw0 = &self.layers[0];
+        let dev_ok = lm_dev_moe_ok(
+            nt_all,
+            crate::model::exp_pf::pf_enabled(),
+            iq_expert_mode(lw0),
+            crate::model::exp_pf::stream_enabled(),
+            crate::model::exp_pf::stream_min_tok(),
+            pf_router_gpu_on(),
+            lw0.gate_inp.k() == self.p.n_embd,
+        );
+        if dev_ok {
+            crate::model::pf_pool::pf_pool_reserve_bytes()
+        } else {
+            crate::model::pf_pool::pf_pool_reserve_cpu_bytes()
         }
     }
 
@@ -4920,8 +4965,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 279: 借りられる量から (チャンク, タイル) を選ぶ。**大きい形は
         // プールを実際に借りられたときだけ**使う (借りられないと作業域が組めず、
         // t270a のように streaming が黙って落ちる)。落ちたら従来の形へ。
-        let (need, pool_cap, big) = self.pf_pool_pick(nt_all, chunk, hc, lr);
-        let _pool = crate::cuda::pf_pool_acquire_capped(&need, pool_cap);
+        let (need, pool_cap, big, reserve) = self.pf_pool_pick(nt_all, chunk, hc, lr);
+        let _pool = crate::cuda::pf_pool_acquire_capped(&need, pool_cap, reserve);
         let big = big && _pool.is_held();
         let (chunk, tile) = if _pool.is_held() {
             (need.chunk.max(1), need.tile)
@@ -5441,17 +5486,18 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // 戻す (借りた作業域だけでなく、代わりに追い出した在庫も返す)。
         // MoE はもう完了している (末尾の D2H が同期) ので、t265b のように
         // 実行中のカーネルと衝突しない。本数は借りた量に比例して有界。
-        if big {
-            let keys = crate::cuda::pf_pool_take_evicted();
-            if !keys.is_empty() {
-                let (n, bytes) = pf_restore_experts(&self.layers, &keys);
-                eprintln!(
-                    "[pf-pool] 大きい形で追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
-                    n,
-                    bytes >> 20,
-                    keys.len().saturating_sub(n)
-                );
-            }
+        // task 290: 借りられなかったときも、余白のために先に空けた expert が
+        // 残っているので戻す (借りた/借りないに関わらず同じ経路で返す)。
+        let keys = crate::cuda::pf_pool_take_evicted();
+        if !keys.is_empty() {
+            let (n, bytes) = pf_restore_experts(&self.layers, &keys);
+            eprintln!(
+                "[pf-pool] {}追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
+                if big { "大きい形で" } else { "余白の確保で" },
+                n,
+                bytes >> 20,
+                keys.len().saturating_sub(n)
+            );
         }
         // task 250: 作業域の外部予約を返す (LRU の上限がここで戻る)。
         drop(reserve_guard);
@@ -6345,6 +6391,27 @@ pub(crate) fn dec_exp_sumdev_enabled() -> bool {
     *ON.get_or_init(|| {
         dec_exp_sumdev_from_value(std::env::var("DENNO_DEC_EXP_SUMDEV").ok().as_deref())
     })
+}
+
+/// task 281/285: `DENNO_EXP_SCRATCH` の解釈 (純関数・テスト用)。
+///
+/// **既定 on** (task 285)。on では、sumdev 経路 (既定 on) が 1 度も読まない `h`
+/// (`nseg * e` = 実形で 40 KB) のゼロ埋めを毎層やらない。値は変わらない
+/// (h を使うのは sumdev が不成立のときだけで、その直前に確保する)。
+/// 実測は lab t281a/t281b: 48 層で 1.9 MB/token のゼロ埋めが消え、短い decode は
+/// -0.4% (ノイズ床 0.4% と同程度)、md5 SAME。明示的な偽値だけ切る。
+fn exp_scratch_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// [`exp_scratch_from_value`] をプロセスで 1 回だけ読む。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn exp_scratch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| exp_scratch_from_value(std::env::var("DENNO_EXP_SCRATCH").ok().as_deref()))
 }
 
 /// task 150: `DENNO_DECODE_CHAIN2_EXP` の値を解釈する (純関数・テスト用)。
@@ -10433,6 +10500,54 @@ fn expert_miss_flat_from_value(v: Option<&str>) -> bool {
     }
 }
 
+/// task 285: `DENNO_DEC_ROUTER_TOPK_FAST` の解釈 (純関数)。
+///
+/// decode の top-k を挿入法 ([`select_topk_into_fast`]) で選ぶか。**既定 on**。
+/// 選択規則は `select_nth_unstable_by` 版と同一 (値の降順・同値は小さい index・
+/// 出力は index 昇順) なので、値も選ばれる集合も 1 ビット変わらない。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+fn dec_router_topk_fast_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// テスト専用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static DEC_ROUTER_TOPK_FAST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: 挿入法の分岐が実際に通った回数 (「緑 = 発火の証拠」にしないため)。
+#[cfg(test)]
+static DEC_ROUTER_TOPK_FAST_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// task 285: decode の top-k に挿入法を使うか (`DENNO_DEC_ROUTER_TOPK_FAST`)。
+fn dec_router_topk_fast_on() -> bool {
+    match DEC_ROUTER_TOPK_FAST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        dec_router_topk_fast_from_value(std::env::var("DENNO_DEC_ROUTER_TOPK_FAST").ok().as_deref())
+    })
+}
+
+/// テスト専用: 上書きを設定する (`None` で env に戻す)。
+#[cfg(test)]
+fn set_dec_router_topk_fast_for_test(v: Option<bool>) {
+    DEC_ROUTER_TOPK_FAST_OVERRIDE.store(
+        match v {
+            Some(false) => 1,
+            Some(true) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
 static EXPERT_MISS_FLAT_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
@@ -11373,7 +11488,21 @@ fn moe_ffn_quant_impl(
     let expert_mask_il = iv.expert_mask(lw.il);
     let mut sel = match expert_mask_il {
         Some(m) => select_topk_mask(&probs, k, m),
-        None => select_topk(&probs, k),
+        None => {
+            // task 285: decode (1 行) の top-k は挿入法 (`select_topk_into_fast`)。
+            // 選択規則 (値の降順・同値は小さい index・出力は index 昇順) は
+            // `select_nth_unstable_by` 版と同一なので値は 1 ビットも変わらない。
+            // ne=512 / k=8 の相対マイクロベンチ (task 195) は 4.2 -> 0.68 us/行。
+            if dec_router_topk_fast_on() {
+                #[cfg(test)]
+                DEC_ROUTER_TOPK_FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut out = vec![0usize; k];
+                select_topk_into_fast(&probs, k, &mut out);
+                out
+            } else {
+                select_topk(&probs, k)
+            }
+        }
     };
     #[cfg(feature = "cuda")]
     crate::cuda::dec_kprof::note_since("topk", t_topk);
@@ -12748,7 +12877,15 @@ fn moe_experts_iq_gpu_batched(
     let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
     let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
     let s_alloc = q4ledger::sub(q4ledger::SUB_EXP_ALLOC);
-    let mut h = vec![0.0f32; devs.len() * e];
+    // task 281: `DENNO_EXP_SCRATCH` — sumdev (既定 on) の経路は `h` を 1 度も読まない
+    // ので、40 KB のゼロ埋めを毎層まるごと捨てない (48 層で 1.9 MB/token)。
+    // 値は変わらない (h を使うのは !sumdev のときだけ。使う直前に確保する)。
+    let scratch_on = exp_scratch_enabled();
+    let mut h: Vec<f32> = if scratch_on {
+        Vec::new()
+    } else {
+        vec![0.0f32; devs.len() * e]
+    };
     drop(s_alloc);
     // task 150 (`DENNO_DECODE_CHAIN2_EXP`): ミス (VRAM に載っていない expert) の寄与を
     // GPU の完了前に CPU で計算し、同期をその裏へ隠す。ミスの位置と id を先に作り、
@@ -12816,6 +12953,11 @@ fn moe_experts_iq_gpu_batched(
         }
         // 和のカーネル (PTX) が無い / 形が合わないときは**従来の寄与経路**へ落ちる
         // (per-expert 経路へは落とさない: そちらは IQ 型を CPU で回すので遅い)。
+    }
+    // task 281: `DENNO_EXP_SCRATCH` では `h` を遅延確保する (sumdev の経路は
+    // ここまで来ない = 40 KB のゼロ埋めをしない)。値は従来と同じ。
+    if scratch_on && h.len() < devs.len() * e {
+        h = vec![0.0f32; devs.len() * e];
     }
     let ran = if overlap {
         // 台帳の exp_iq 区間は取らない (同期が CPU ミスの後ろへ移るので、GPU の
@@ -20600,6 +20742,38 @@ mod tests {
         }
     }
 
+    /// task 281: `DENNO_EXP_SCRATCH` の真理値表。
+    ///
+    /// **既定 off** (未設定・空・未知の値は off)。明示的な真値だけ on。
+    /// on のときの数値は従来と 1 bit も変わらない (h のゼロ埋めをやめるだけ)。
+    #[test]
+    fn exp_scratch_gate_truth_table() {
+        // task 285: 既定 on (未設定・空・"  " は on)。明示的な偽値だけ off。
+        for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no"), Some(" 0 ")] {
+            assert!(!exp_scratch_from_value(v), "{v:?} が on になる");
+        }
+        for v in [None, Some(""), Some("  "), Some("1"), Some("on"), Some("ON"), Some(" true "), Some("yes")] {
+            assert!(exp_scratch_from_value(v), "{v:?} が on にならない");
+        }
+    }
+
+    /// task 285: `DENNO_DEC_ROUTER_TOPK_FAST` の真理値表 (既定 on・明示の偽値だけ off)。
+    #[test]
+    fn dec_router_topk_fast_truth_table() {
+        for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no"), Some(" 0 ")] {
+            assert!(
+                !dec_router_topk_fast_from_value(v),
+                "{v:?} が on になる"
+            );
+        }
+        for v in [None, Some(""), Some("1"), Some("on"), Some("true"), Some("yes")] {
+            assert!(
+                dec_router_topk_fast_from_value(v),
+                "{v:?} が on にならない"
+            );
+        }
+    }
+
     /// task 187: デバイス和のミラー (`dno_dec_exp_sum` と同じ順序) が、**ミスの無い
     /// 層では従来のホスト足し込みとビット一致**すること。
     ///
@@ -21308,6 +21482,71 @@ mod tests {
         assert!(
             FLAT_DECODE_REGIONS.load(std::sync::atomic::Ordering::Relaxed) > before,
             "平坦化の分岐が通っていない (カウンタが増えていない)"
+        );
+    }
+
+    /// task 285: decode の router top-k は挿入法 (`select_topk_into_fast`) と
+    /// `select_nth_unstable_by` 版で**選ばれる集合も MoE の出力もビット一致**する
+    /// こと。あわせて挿入法の分岐が実際に通ったことをカウンタで確かめる。
+    #[test]
+    #[cfg(feature = "par")]
+    fn dec_router_topk_fast_matches_select_nth() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let dir = TempDir::new("p285topk");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        let before = DEC_ROUTER_TOPK_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        set_dec_router_topk_fast_for_test(Some(false));
+        let slow = moe_ffn_quant_impl(
+            &p,
+            &lw,
+            &x,
+            None,
+            true,
+            Route::Cpu,
+            None,
+            true,
+            false,
+            false,
+            IvView::none(),
+        )
+        .expect("select_nth 版");
+        let mid = DEC_ROUTER_TOPK_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(mid, before, "off なのに挿入法の分岐が通った");
+
+        set_dec_router_topk_fast_for_test(Some(true));
+        let fast = moe_ffn_quant_impl(
+            &p,
+            &lw,
+            &x,
+            None,
+            true,
+            Route::Cpu,
+            None,
+            true,
+            false,
+            false,
+            IvView::none(),
+        )
+        .expect("挿入法");
+        assert!(
+            DEC_ROUTER_TOPK_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed) > mid,
+            "挿入法の分岐が通っていない (カウンタが増えていない)"
+        );
+        assert!(
+            slow.iter().any(|v| *v != 0.0),
+            "MoE の出力が全 0 (経路の生死が分からない)"
+        );
+        assert_bitwise_eq(&slow, &fast, "router top-k: 挿入法 vs select_nth");
+        set_dec_router_topk_fast_for_test(None);
+        assert!(
+            dec_router_topk_fast_on(),
+            "既定 (env 未設定・上書き解除) は on"
         );
     }
 
