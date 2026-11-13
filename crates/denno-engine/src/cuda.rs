@@ -10948,7 +10948,20 @@ fn pf_slot_prepare(
     if pinned && exp_pf::stream_src() == 0 {
         let cap = st.pin[s].as_ref().map(|p| p.bytes).unwrap_or(0);
         if cap < need {
-            st.pin[s] = Some(PinMem::alloc_flags(need.max(1), exp_pf::stream_wc())?);
+            // task 296: `DENNO_PF_PIN_GROW=1` では余裕を足して確保し、グループの
+            // 必要量が数 MB 揺れるたびの `cuMemHostAlloc` を避ける。
+            let want = if exp_pf::pin_grow() {
+                exp_pf::pin_grow_target(need, st.slot[s].cap)
+            } else {
+                need
+            }
+            .max(1);
+            // task 296: 確保し直しの回数と時間を診断で読めるようにする
+            // (`DENNO_PF_LM_DBG=1` の `[pf-lm-dbg] stream` 行)。
+            let t_pin = std::time::Instant::now();
+            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc())?);
+            pf_stream_t_add(6, t_pin.elapsed().as_nanos() as u64);
+            pf_stream_t_add(7, 1);
         }
     }
     Ok(PfSlotPlan {
@@ -10978,7 +10991,11 @@ fn pf_pump_in(
     items: &[(u16, [&[u8]; 3])],
     pinned: bool,
 ) -> Result<PfPump> {
+    // task 296: スロット準備 (配置の計算と pinned の確保) も pump の内側なので、
+    // 写しと分けて積む (診断 `[pf-lm-dbg] stream` の `prep`)。
+    let t_prep = std::time::Instant::now();
     let plan = pf_slot_prepare(st, g, items, pinned)?;
+    pf_stream_t_add(5, t_prep.elapsed().as_nanos() as u64);
     let s = plan.slot;
     let mut probe: Option<(usize, u64)> = None;
     let mut enq_ns = 0u64;
@@ -12759,7 +12776,11 @@ fn pf_tiny_htod(dst: CUdeviceptr, data: &[u8]) -> bool {
 thread_local! {
     /// task 233: 直近のストリーミング層の内訳 (ns)。`[pump, wait, table, launch, accum]`
     /// 診断用 (DENNO_PF_LM_DBG の 1 行に出す)。
-    static PF_STREAM_T: std::cell::RefCell<[u64; 5]> = const { std::cell::RefCell::new([0; 5]) };
+    ///
+    /// task 296: `[5]` = スロット準備 (`pf_slot_prepare` 全体)、
+    /// `[6]` = そのうち pinned バウンスの確保 (`cuMemHostAlloc`)、
+    /// `[7]` = pinned を確保し直した回数 (数そのもの)。
+    static PF_STREAM_T: std::cell::RefCell<[u64; 8]> = const { std::cell::RefCell::new([0; 8]) };
 }
 
 /// task 233: 直近のストリーミング層の内訳 (ms)。`[pump, wait, table, launch, accum]`
@@ -12774,6 +12795,28 @@ pub fn pf_stream_times_ms() -> [f64; 5] {
             v[4] as f64 / 1e6,
         ]
     })
+}
+
+/// task 296: ストリーミング層の残りの内訳 (ms)。
+///
+/// `[0]` = スロット準備の合計 (pump の内側。写しと積み込みは含まない)、
+/// `[1]` = そのうち pinned バウンスの確保、`[2]` = 確保し直した回数。
+pub fn pf_stream_extra_ms() -> [f64; 3] {
+    PF_STREAM_T.with(|c| {
+        let v = *c.borrow();
+        [v[5] as f64 / 1e6, v[6] as f64 / 1e6, v[7] as f64]
+    })
+}
+
+/// task 296: 診断カウンタだけを 0 に戻す (層ごとの差分を読む)。
+pub fn pf_stream_extra_reset() {
+    PF_STREAM_T.with(|c| {
+        if let Ok(mut v) = c.try_borrow_mut() {
+            v[5] = 0;
+            v[6] = 0;
+            v[7] = 0;
+        }
+    });
 }
 
 /// task 233: `&[u64]` をバイト列として見る (非同期コピー用)。
@@ -13007,7 +13050,8 @@ fn moe_experts_iq_pf_layer_stream_io(
     let host_x = host_in;
     let in_elems = ntok * n_in;
 
-    PF_STREAM_T.with(|c| *c.borrow_mut() = [0; 5]);
+    // task 296: 診断の残り 3 項目 (prep / pin / pin 回数) も層ごとに 0 から積む。
+    PF_STREAM_T.with(|c| *c.borrow_mut() = [0; 8]);
     let mut work = || -> Result<Option<u32>> {
         PF_SCRATCH.with(|cell| -> Result<Option<u32>> {
             let mut sc = cell.borrow_mut();

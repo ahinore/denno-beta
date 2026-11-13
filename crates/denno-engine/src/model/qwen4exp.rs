@@ -18020,9 +18020,15 @@ fn moe_ffn_quant_batch_lm_dev_at(
     mark(5);
     if dbg {
         let st = crate::cuda::pf_stream_times_ms();
+        let ex = crate::cuda::pf_stream_extra_ms();
+        let sum: f64 = st.iter().sum::<f64>() + ex[0] + ex[1];
+        // task 296: `prep` (スロット準備) と `pin` (pinned の確保し直し) を足した。
+        // `resid` = experts 段のうち上のどれでもない時間 (層の外の仕事)。
         eprintln!(
-            "[pf-lm-dbg] stream pump={:.1} wait={:.1} table={:.1} launch={:.1} accum={:.1} ms",
-            st[0], st[1], st[2], st[3], st[4]
+            "[pf-lm-dbg] stream pump={:.1} wait={:.1} table={:.1} launch={:.1} accum={:.1} \
+             prep={:.1} pin={:.1}ms x{} sum={:.1} resid={:.1} ms",
+            st[0], st[1], st[2], st[3], st[4], ex[0], ex[1], ex[2] as u64, sum,
+            ((ph[4] - ph[3]) - sum).max(0.0)
         );
         eprintln!(
             "[pf-lm-dbg] layer={} nt={} router={:.1} topk={:.1} plan={:.1} shared={:.1} \
