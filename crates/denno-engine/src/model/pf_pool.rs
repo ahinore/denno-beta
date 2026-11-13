@@ -599,6 +599,82 @@ pub fn big_chunk_max() -> usize {
     *N.get_or_init(|| big_chunk_from_value(std::env::var(PF_POOL_BIG_CHUNK_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_POOL_RESERVE_MB`: プールを借りたあとに残す空き (MiB、既定 1,024)。
+///
+/// task 290: 借りる上限を「実空き + 追い出せる expert - 余白」から決める。余白を
+/// 残さないと、借りた直後の空きが 100-200 MiB になり、prefill の後半で出る
+/// 数 MiB の確保 (attention のミラー・ssm のスクラッチ) が断片化で落ちる
+/// (lab t286c の UD-Q4_K_XL 14k は空き 3 MiB で 3 MiB の確保に失敗した)。
+pub const PF_POOL_RESERVE_MB_ENV: &str = "DENNO_PF_POOL_RESERVE_MB";
+
+/// [`PF_POOL_RESERVE_MB_ENV`] の既定 (MiB)。
+pub const DEFAULT_POOL_RESERVE_MB: usize = 1024;
+
+/// `DENNO_PF_POOL_RESERVE_CPU_MB`: 層優先の **dev MoE が使えない**モデルで
+/// プールのあとに残す空き (MiB、既定 3,072)。
+///
+/// expert の型が IQ カーネル非対応 (UD-Q4_K_XL など) だと、層優先の MoE は
+/// ホスト経路へ落ち、ステージング / 作業域を**プールとは別に**確保する。
+/// lab t286c の 14k では、この経路が借りた 4,779 MiB の上にさらに約 2.3 GB を
+/// 使ってカードを埋めた。余白を多めに取って、1 パスに固執せずパス数を増やす。
+pub const PF_POOL_RESERVE_CPU_MB_ENV: &str = "DENNO_PF_POOL_RESERVE_CPU_MB";
+
+/// [`PF_POOL_RESERVE_CPU_MB_ENV`] の既定 (MiB)。
+pub const DEFAULT_POOL_RESERVE_CPU_MB: usize = 3072;
+
+/// [`PF_POOL_RESERVE_MB_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
+pub fn pf_pool_reserve_mb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_POOL_RESERVE_MB),
+        None => DEFAULT_POOL_RESERVE_MB,
+    }
+}
+
+/// [`PF_POOL_RESERVE_CPU_MB_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
+pub fn pf_pool_reserve_cpu_mb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_POOL_RESERVE_CPU_MB),
+        None => DEFAULT_POOL_RESERVE_CPU_MB,
+    }
+}
+
+/// dev MoE が使えるモデルで残す余白 (バイト)。env はプロセスで 1 回だけ読む。
+pub fn pf_pool_reserve_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pf_pool_reserve_mb_from_value(std::env::var(PF_POOL_RESERVE_MB_ENV).ok().as_deref()) << 20
+    })
+}
+
+/// dev MoE が使えないモデルで残す余白 (バイト)。env はプロセスで 1 回だけ読む。
+pub fn pf_pool_reserve_cpu_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pf_pool_reserve_cpu_mb_from_value(std::env::var(PF_POOL_RESERVE_CPU_MB_ENV).ok().as_deref())
+            << 20
+    })
+}
+
+/// task 290: 借りてよい上限 = `min(cap, 実空き + 追い出せる expert - 余白)`。
+///
+/// `free == None` (実空きが読めない) のときは `cap` をそのまま返す (従来どおり)。
+/// 追い出した expert は prefill の終端で LRU へ戻すので、`evictable` は
+/// 「LRU に載っている量」まででよい (呼び出し側が `cap` で切る)。
+pub fn pool_budget(cap: usize, free: Option<usize>, evictable: usize, reserve: usize) -> usize {
+    match free {
+        None => cap,
+        Some(f) => cap.min(f.saturating_add(evictable).saturating_sub(reserve)),
+    }
+}
+
 /// 大きい計画の候補 (純関数)。戻り値は `(chunk, tile)` の並び。
 ///
 /// 並びは「MoE のパス数が少ない順 → チャンクが大きい順」。パス数は
@@ -932,5 +1008,103 @@ mod tests {
         assert_eq!(t, 3826);
         assert_eq!(c, 1913);
         assert!(fits(&l, DEFAULT_POOL_MB << 20), "total {} B", l.total);
+    }
+
+    // ----------------------------------------------------------------------
+    // task 290: 実空きと余白から借りる上限を決める
+    // ----------------------------------------------------------------------
+
+    /// 余白は 0 / 解析不能で既定、明示値はそのまま (両方の env)。
+    #[test]
+    fn reserve_defaults_and_parsing() {
+        assert_eq!(pf_pool_reserve_mb_from_value(None), DEFAULT_POOL_RESERVE_MB);
+        assert_eq!(
+            pf_pool_reserve_mb_from_value(Some("0")),
+            DEFAULT_POOL_RESERVE_MB
+        );
+        assert_eq!(
+            pf_pool_reserve_mb_from_value(Some("x")),
+            DEFAULT_POOL_RESERVE_MB
+        );
+        assert_eq!(pf_pool_reserve_mb_from_value(Some("2048")), 2048);
+        assert_eq!(
+            pf_pool_reserve_cpu_mb_from_value(None),
+            DEFAULT_POOL_RESERVE_CPU_MB
+        );
+        assert_eq!(
+            pf_pool_reserve_cpu_mb_from_value(Some("1")),
+            1,
+            "明示値は既定より小さくても使う (A/B 用)"
+        );
+        // CPU 経路の余白は dev MoE の余白より広い (実測の必要量が違う)。
+        assert!(DEFAULT_POOL_RESERVE_CPU_MB > DEFAULT_POOL_RESERVE_MB);
+    }
+
+    /// 上限は `実空き + 追い出せる expert - 余白` を `cap` で切ったもの。
+    #[test]
+    fn pool_budget_leaves_the_reserve() {
+        let cap = DEFAULT_POOL_BIG_MB << 20;
+        let free = Some(2919usize << 20);
+        let evictable = 4864usize << 20;
+        // UD-Q4_K_XL の 14k (lab t286c) 相当: 余白 3,072 MiB なら 1 パスは入らない。
+        let cpu = pool_budget(
+            cap,
+            free,
+            evictable,
+            DEFAULT_POOL_RESERVE_CPU_MB << 20,
+        );
+        assert_eq!(cpu, (2919 + 4864 - 3072) << 20);
+        assert!(cpu < (4779usize << 20), "1 パスが入ってしまう: {cpu}");
+        // dev MoE が使えるモデル (余白 1,024 MiB) なら上限は cap のまま。
+        let dev = pool_budget(cap, free, evictable, DEFAULT_POOL_RESERVE_MB << 20);
+        assert_eq!(dev, cap);
+        // 実空きが読めないときは従来どおり cap。
+        assert_eq!(pool_budget(cap, None, evictable, 0), cap);
+        // 追い出せる expert が無ければ空きから余白を引いた分だけ。
+        assert_eq!(pool_budget(cap, Some(4096 << 20), 0, 1024 << 20), 3072 << 20);
+        // 空きが余白未満なら 0 (= 借りない)。
+        assert_eq!(pool_budget(cap, Some(512 << 20), 0, 1024 << 20), 0);
+    }
+
+    /// 計画の判定: 1 パスが入らなければパス数を増やし、入らなければ借りない。
+    #[test]
+    fn plan_falls_back_to_more_passes_when_the_budget_is_small() {
+        let n = need();
+        // 候補はチャンクも下げるので、1 パスの**最小** (従来チャンク) で判定する。
+        let one_min = layout(
+            &Need {
+                chunk: n.chunk,
+                tile: n.nt_all,
+                ..n
+            },
+        )
+        .expect("1 パス")
+        .total;
+        let two_tile = n.nt_all.div_ceil(2);
+        let two_min = layout(
+            &Need {
+                chunk: n.chunk,
+                tile: two_tile,
+                ..n
+            },
+        )
+        .expect("2 パス")
+        .total;
+        assert!(two_min < one_min, "2 パスのほうが大きい: {two_min} vs {one_min}");
+        // 1 パスが入る上限なら 1 パス (チャンクは収まる中で大きいほう)。
+        let (_, t, l) = choose_big(&n, one_min, DEFAULT_BIG_CHUNK).expect("1 パスが入る");
+        assert_eq!(t, n.nt_all);
+        assert!(l.total <= one_min);
+        // 1 パスが入らない上限なら 2 パスへ落ちる (借りないのではなくパスを増やす)。
+        let (_, t2, l2) = choose_big(&n, one_min - 1, DEFAULT_BIG_CHUNK).expect("2 パスが入る");
+        assert_eq!(t2, two_tile);
+        assert_eq!(n.nt_all.div_ceil(t2), 2);
+        assert!(l2.total <= one_min - 1);
+        // 2 パスも入らない上限なら従来タイル (3 パス)。
+        let (_, t3, _) = choose_big(&n, two_min - 1, DEFAULT_BIG_CHUNK).expect("従来タイル");
+        assert_eq!(t3, n.tile);
+        // 従来タイルすら入らなければ借りない (fail open)。
+        let base_total = layout(&n).expect("従来").total;
+        assert!(choose_big(&n, base_total - 1, DEFAULT_BIG_CHUNK).is_none());
     }
 }

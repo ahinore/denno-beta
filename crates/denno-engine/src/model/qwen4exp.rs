@@ -4827,6 +4827,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     ///
     /// 戻り値の 3 番目は「大きい形を選んだか」。true のとき呼び出し側は、借りた
     /// 作業域のぶんに追い出した expert を prefill の終端で LRU へ戻す。
+    ///
+    /// 4 番目は「借りたあとに残す余白」(task 290)。プールの確保がこの余白を
+    /// 残すように、借りる前に expert を追い出す。
     #[cfg(feature = "cuda")]
     fn pf_pool_pick(
         &self,
@@ -4834,16 +4837,17 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         chunk: usize,
         hc: usize,
         lr: usize,
-    ) -> (crate::model::pf_pool::Need, usize, bool) {
+    ) -> (crate::model::pf_pool::Need, usize, bool, usize) {
         let base_tile = crate::model::exp_pf::lm_tile(nt_all);
         let base = self.pf_pool_need_for(nt_all, base_tile, chunk.min(nt_all), hc, lr);
         let cap = crate::model::pf_pool::pf_pool_bytes();
+        let reserve = self.pf_pool_reserve_for(nt_all);
         if !crate::model::pf_pool::pf_pool_big_on() {
-            return (base, cap, false);
+            return (base, cap, false, reserve);
         }
         let big_cap = crate::model::pf_pool::pf_pool_big_bytes();
         if big_cap <= cap {
-            return (base, cap, false);
+            return (base, cap, false, reserve);
         }
         let max_chunk = crate::model::pf_pool::big_chunk_max();
         // 2,048 以上のチャンクは GDN prefill の連鎖の上限撤廃 (task 270 の
@@ -4854,7 +4858,23 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         } else {
             max_chunk.min(crate::model::exp_pf::CHUNK_BALANCE_CAP)
         };
-        match crate::model::pf_pool::choose_big(&base, big_cap, max_chunk) {
+        // task 290: 借りてよい上限は**実空きから**決める。expert の LRU を
+        // 追い出して作れる分は「余白を残したうえで」使う。上限を固定値
+        // (4,864 MiB) にすると、モデルが大きいときにカードを 100% まで使い切り、
+        // prefill の後半の数 MiB の確保が断片化で落ちる (lab t286c の
+        // UD-Q4_K_XL 14k: 空き 3 MiB で 3 MiB の確保が error 2)。
+        let free = crate::cuda::dev_mem_mb().map(|(f, _)| (f as usize) << 20);
+        let evictable = crate::model::expert_vram::resident_bytes().min(big_cap);
+        let budget = crate::model::pf_pool::pool_budget(big_cap, free, evictable, reserve);
+        eprintln!(
+            "[pf-pool-big] 上限 (実空き {} MiB + 追い出せる expert {} MiB - 余白 {} MiB = {} MiB / 固定上限 {} MiB)",
+            free.map(|b| b >> 20).unwrap_or(0),
+            evictable >> 20,
+            reserve >> 20,
+            budget >> 20,
+            big_cap >> 20
+        );
+        match crate::model::pf_pool::choose_big(&base, budget, max_chunk) {
             Some((c, t, l)) if c != base.chunk || t != base.tile => {
                 let passes = nt_all.div_ceil(t.max(1));
                 let base_passes = nt_all.div_ceil(base.tile.max(1));
@@ -4873,9 +4893,34 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     tile: t,
                     ..base
                 };
-                (need, big_cap, true)
+                (need, big_cap, true, reserve)
             }
-            _ => (base, cap, false),
+            _ => (base, cap, false, reserve),
+        }
+    }
+
+    /// task 290: プールのあとに残す余白 (バイト)。
+    ///
+    /// 層優先の dev MoE が使えるモデルは、作業域がプールの中に収まるので余白は
+    /// 小さくてよい。使えないモデル (expert の型が IQ カーネル非対応 =
+    /// UD-Q4_K_XL など) はホスト経路がステージングを自前で確保するので、
+    /// 余白を広く取ってパス数を増やす (lab t286c の 14k は約 2.3 GB 足りなかった)。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_reserve_for(&self, nt_all: usize) -> usize {
+        let lw0 = &self.layers[0];
+        let dev_ok = lm_dev_moe_ok(
+            nt_all,
+            crate::model::exp_pf::pf_enabled(),
+            iq_expert_mode(lw0),
+            crate::model::exp_pf::stream_enabled(),
+            crate::model::exp_pf::stream_min_tok(),
+            pf_router_gpu_on(),
+            lw0.gate_inp.k() == self.p.n_embd,
+        );
+        if dev_ok {
+            crate::model::pf_pool::pf_pool_reserve_bytes()
+        } else {
+            crate::model::pf_pool::pf_pool_reserve_cpu_bytes()
         }
     }
 
@@ -4920,8 +4965,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 279: 借りられる量から (チャンク, タイル) を選ぶ。**大きい形は
         // プールを実際に借りられたときだけ**使う (借りられないと作業域が組めず、
         // t270a のように streaming が黙って落ちる)。落ちたら従来の形へ。
-        let (need, pool_cap, big) = self.pf_pool_pick(nt_all, chunk, hc, lr);
-        let _pool = crate::cuda::pf_pool_acquire_capped(&need, pool_cap);
+        let (need, pool_cap, big, reserve) = self.pf_pool_pick(nt_all, chunk, hc, lr);
+        let _pool = crate::cuda::pf_pool_acquire_capped(&need, pool_cap, reserve);
         let big = big && _pool.is_held();
         let (chunk, tile) = if _pool.is_held() {
             (need.chunk.max(1), need.tile)
@@ -5441,17 +5486,18 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // 戻す (借りた作業域だけでなく、代わりに追い出した在庫も返す)。
         // MoE はもう完了している (末尾の D2H が同期) ので、t265b のように
         // 実行中のカーネルと衝突しない。本数は借りた量に比例して有界。
-        if big {
-            let keys = crate::cuda::pf_pool_take_evicted();
-            if !keys.is_empty() {
-                let (n, bytes) = pf_restore_experts(&self.layers, &keys);
-                eprintln!(
-                    "[pf-pool] 大きい形で追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
-                    n,
-                    bytes >> 20,
-                    keys.len().saturating_sub(n)
-                );
-            }
+        // task 290: 借りられなかったときも、余白のために先に空けた expert が
+        // 残っているので戻す (借りた/借りないに関わらず同じ経路で返す)。
+        let keys = crate::cuda::pf_pool_take_evicted();
+        if !keys.is_empty() {
+            let (n, bytes) = pf_restore_experts(&self.layers, &keys);
+            eprintln!(
+                "[pf-pool] {}追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
+                if big { "大きい形で" } else { "余白の確保で" },
+                n,
+                bytes >> 20,
+                keys.len().saturating_sub(n)
+            );
         }
         // task 250: 作業域の外部予約を返す (LRU の上限がここで戻る)。
         drop(reserve_guard);

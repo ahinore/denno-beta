@@ -826,6 +826,44 @@ pub fn emergency_free_chunks_keys(request: usize) -> (EvictReport, Vec<ExpertKey
     }
 }
 
+/// task 290: [`emergency_free_chunks_keys`] の「確保が既に失敗した」版。
+///
+/// `cuMemGetInfo` の空きが要求以上でも断片化で `cuMemAlloc` は落ちる。その場合
+/// 不足分は 0 になるので、通常版は 1 本も空けられず諦めてしまう。こちらは
+/// **必ず 1 チャンク以上**空ける (lab t286c の UD-Q4_K_XL 14k: 空き 3 MiB で
+/// 3 MiB の確保が error 2)。cuda feature 無しでは何も解放しない。
+pub fn emergency_free_chunks_forced(request: usize) -> (EvictReport, Vec<ExpertKey>) {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::emergency_free_chunks_forced(request)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        (
+            EvictReport {
+                requested: request,
+                ..EvictReport::default()
+            },
+            Vec::new(),
+        )
+    }
+}
+
+/// task 290: LRU に載っている expert の実バイト数。
+///
+/// プールが「追い出して作れる余裕」の上限。ロックが取れない (expert の確保中)
+/// ときは 0 を返す (呼び出し側は実空きだけで判断する)。
+pub fn resident_bytes() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::resident_bytes()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// task 256: prefill の作業域を予約する (`DENNO_PREFILL_WORK_MB`、既定 0 = 予約しない)。
 ///
 /// 予約は「これから N バイトの作業域を確保する」という宣言で、確保そのものは
@@ -1492,6 +1530,16 @@ mod gpu {
     /// (`try_lock`)。その場合は 0 を返し、呼び出し側が CPU 経路へ落ちる。
     /// task 279: 追い出した鍵も返す (借りた作業域を返すときに expert を戻す)。
     pub fn emergency_free_chunks(request: usize) -> (EvictReport, Vec<ExpertKey>) {
+        emergency_free_chunks_inner(request, false)
+    }
+
+    /// task 290: 確保が**既に失敗した**あとの版。空きが要求以上に見えても
+    /// (断片化で落ちた) 冷たいチャンクを 1 本空けて実メモリを返す。
+    pub fn emergency_free_chunks_forced(request: usize) -> (EvictReport, Vec<ExpertKey>) {
+        emergency_free_chunks_inner(request, true)
+    }
+
+    fn emergency_free_chunks_inner(request: usize, force: bool) -> (EvictReport, Vec<ExpertKey>) {
         let mut rep = EvictReport {
             requested: request,
             ..EvictReport::default()
@@ -1522,13 +1570,18 @@ mod gpu {
         }
         if map.is_empty() {
             // slab に載っていない (per-expert 確保) なら、追い出しで実メモリが戻る。
-            let evicted = g.evict_until_free(request.saturating_sub(free));
+            let deficit = if force {
+                request.saturating_sub(free).max(1)
+            } else {
+                request.saturating_sub(free)
+            };
+            let evicted = g.evict_until_free(deficit);
             rep.experts = evicted.len();
             let keys: Vec<ExpertKey> = evicted.iter().map(|(k, _)| *k).collect();
             let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
             drop(evicted);
             drop(g);
-            let released = crate::model::expert_slab::release_empty(request.saturating_sub(free));
+            let released = crate::model::expert_slab::release_empty(deficit);
             rep.released = freed.saturating_add(released);
             return (rep, keys);
         }
@@ -1541,7 +1594,11 @@ mod gpu {
                 last_use: *last_use,
             })
             .collect();
-        let plan = crate::model::expert_slab::plan_eviction(&spans, free, request);
+        let plan = if force {
+            crate::model::expert_slab::plan_eviction_forced(&spans, free, request)
+        } else {
+            crate::model::expert_slab::plan_eviction(&spans, free, request)
+        };
         if plan.ids.is_empty() {
             return (rep, Vec::new());
         }
@@ -1594,6 +1651,20 @@ mod gpu {
         let up = one(ub)?;
         let down = one(db)?;
         Ok([gate, up, down])
+    }
+
+    /// task 290: LRU に載っている expert の実バイト数 (`try_lock`、取れなければ 0)。
+    ///
+    /// プールが「追い出して作れる余裕」の見積りに使う。ロック保持中 (expert の
+    /// 確保中) に待つと prefill の入口で詰まるので、取れないときは 0 にする。
+    pub fn resident_bytes() -> usize {
+        let Some(c) = CACHE.get() else {
+            return 0;
+        };
+        match c.try_lock() {
+            Ok(g) => g.used_bytes(),
+            Err(_) => 0,
+        }
     }
 
     /// (使用中バイト, 上限バイト)。未初期化なら `None`。
