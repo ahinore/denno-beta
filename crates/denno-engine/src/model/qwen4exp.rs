@@ -6934,8 +6934,17 @@ fn hc_mix_quant_fast(
             mix_kprof::mark(t, mix_kprof::INJ_APPLY);
             Ok(v)
         };
+        // task 282: 量子型の fused chain が走る見込みのときは、inject の GEMV を
+        // 「鎖を積んだあと・待つ前」へ回す (ホスト仕事が GPU の待ちに隠れる。
+        // 鎖が不発なら下の通常位置で計算し直す)。
+        let qchain_will = mix_gpu_enabled()
+            && mix_qchain_enabled()
+            && quant_gpu_ty_ok(down.ty())
+            && quant_gpu_ty_ok(up.ty());
         let mut inj_early = match inject {
-            Some(w) if mix_inj_early_enabled() && inj_is_cpu(w) => Some(do_inj(w)?),
+            Some(w) if mix_inj_early_enabled() && inj_is_cpu(w) && !qchain_will => {
+                Some(do_inj(w)?)
+            }
             _ => None,
         };
 
@@ -6987,6 +6996,16 @@ fn hc_mix_quant_fast(
             && quant_gpu_ty_ok(up.ty())
         {
             let mut m = kp_step!("mix_alloc", vec![0.0f32; e]);
+            // task 282: inject の GEMV は鎖を積んだあと・待つ前にホストで回す
+            // (GPU が遊んでいる間に済むので待ちに隠れる。値は従来と同じ)。
+            let mut inj_hidden: Option<Vec<f32>> = None;
+            let inj_already = inj_early.is_some();
+            let mut inj_hook = || -> anyhow::Result<()> {
+                if let (Some(w), false) = (inject, inj_already) {
+                    inj_hidden = Some(do_inj(w).map_err(|e| anyhow::anyhow!("{e}"))?);
+                }
+                Ok(())
+            };
             if crate::cuda::maybe_gpu_mix_q_chain_into(
                 down.uid(),
                 down.ty(),
@@ -7003,9 +7022,13 @@ fn hc_mix_quant_fast(
                 hp.hc,
                 xn,
                 &mut m,
+                Some(&mut inj_hook),
             ) {
                 MIX_QCHAIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 chain2_mixed = Some(m);
+                if inj_hidden.is_some() {
+                    inj_early = inj_hidden;
+                }
             }
         }
         let gpu_chain2 = chain2_mixed.is_some();
