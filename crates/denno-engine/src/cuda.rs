@@ -24101,27 +24101,33 @@ thread_local! {
 }
 
 /// `DENNO_F32_GEMM_PIN_D2H`: 1 MiB 以上の D2H を pinned 経由の非同期コピーに
-/// する (task 296、**既定 on**。`0` / `off` / `false` / `no` で従来の pageable)。
+/// する (task 296、既定 **off**)。
 ///
 /// 層優先 prefill ではこの関数の D2H が毎層・毎チャンク走る:
 /// router (3,826 x 512 = 7.8 MB/層) と PLE の key/value
 /// (3,826 x 320 + 3,826 x 2560 = 22 MB/チャンク x 96)。pageable の
 /// `cuMemcpyDtoH` は 1 枚 6 GB/s 前後しか出ないので、pinned へ非同期で落として
 /// からホストへ写す (デバイスから出るバイト列は同じ = 値は不変)。
+///
+/// lab t296c: 3,826 cold は base 3.41 / 既定 (両方 on) 3.24 で、内訳では
+/// `other` が -170 ms。ただしこの差は同時に on にした [`PIN_GROW_ENV`] の
+/// ぶんで、このゲート単独の差は見えていない (`ple` は 154 → 160 ms で不変)。
+/// 効いた証拠が無いので既定 off。
 pub const F32_GEMM_PIN_D2H_ENV: &str = "DENNO_F32_GEMM_PIN_D2H";
 
 /// この関数で pinned D2H を使う下限 (これ未満は従来の pageable)。
 pub(crate) const F32_GEMM_PIN_D2H_MIN: usize = 1 << 20;
 
-/// [`F32_GEMM_PIN_D2H_ENV`] の解釈 (明示的な偽値だけ off)。
+/// [`F32_GEMM_PIN_D2H_ENV`] の解釈 (明示的な真値だけ on)。
 pub(crate) fn f32_gemm_pin_d2h_from_value(v: Option<&str>) -> bool {
-    match v.map(str::trim) {
-        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
-        None => true,
-    }
+    let low = v.map(|s| s.trim().to_ascii_lowercase());
+    matches!(
+        low.as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
 }
 
-/// 大きい D2H を pinned 経由にするか (既定 on)。
+/// 大きい D2H を pinned 経由にするか (既定 off)。
 fn f32_gemm_pin_d2h_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -24323,13 +24329,13 @@ mod f32_d2h_pin_tests {
     /// task 296: 1 MiB 以上の D2H を pinned 経由にするゲートの真理値表。
     #[test]
     fn f32_gemm_pin_d2h_gate_truth_table() {
-        assert!(f32_gemm_pin_d2h_from_value(None), "未設定は既定 on");
-        assert!(f32_gemm_pin_d2h_from_value(Some("")));
+        assert!(!f32_gemm_pin_d2h_from_value(None), "未設定は既定 off");
+        assert!(!f32_gemm_pin_d2h_from_value(Some("")));
         assert!(f32_gemm_pin_d2h_from_value(Some("1")));
         assert!(f32_gemm_pin_d2h_from_value(Some(" on ")));
+        assert!(f32_gemm_pin_d2h_from_value(Some("True")));
         assert!(!f32_gemm_pin_d2h_from_value(Some("0")));
         assert!(!f32_gemm_pin_d2h_from_value(Some("off")));
-        assert!(!f32_gemm_pin_d2h_from_value(Some("False")));
         assert!(!f32_gemm_pin_d2h_from_value(Some("no")));
         // しきい値は 1 MiB (decode の小さい D2H は従来のまま = 挙動を変えない)。
         assert_eq!(F32_GEMM_PIN_D2H_MIN, 1 << 20);
