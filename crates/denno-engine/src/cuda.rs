@@ -29279,22 +29279,39 @@ pub enum MixGemv {
     Blk,
     /// 1 warp = 8 行 (`dno_mix_gemv_q8_0_r8`)。
     R8,
+    /// task 286: 既存の `dno_gemv_q8_0_v5` (`kernels_moe_v5.ptx`、GDN の
+    /// decode GEMV と同じ形)。**2 ブロック = 68 B を 17 ワードで読み**、
+    /// 次の対を先読みし、アキュムレータを 4 本に分ける。
+    ///
+    /// lab t286a の `[dec-kprof-avg]` (採否前の既定) で mix の GEMV は
+    /// down `rowblk` 31.8 us / up `r8` 39.8 us だった (3.48 MB を 109 / 87 GB/s)。
+    /// 同じ 3.48 MB を v5 形 (GDN の qkv) は 374 GB/s で読んでいる。
+    /// PTX は既にコミット済みなので、この経路は**ホスト側の切り替えだけ**。
+    V5,
 }
 
 /// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` の種別。
 ///
-/// - 未設定 / `1` / `both`: `(Blk, R8)` = 既定 (lab の採否後の形)
-/// - `0` / `off` / `false` : `(Old, Old)` = 切り戻し
+/// - 未設定 / `1` / `both` / `v5`: `(V5, V5)` = 既定 (lab t286b の採否後の形)
+/// - `0` / `off` / `false` : `(Old, Old)` = 切り戻し (task 266 より前)
+/// - `blk`                : `(Blk, R8)` = task 282 の形 (採否前の既定)
 /// - `down`               : `(Blk, Old)`
 /// - `up`                 : `(Old, R8)`
 /// - `seg`                : `(Seg, Seg)` = task 278 の seg_k をそのまま
+/// - `v5d` / `v5u`        : 片方向だけ v5 (A/B 用)
+/// - `ups`                : `(Blk, Seg)` = down は task 282 のまま、up だけ
+///   1 行 1 warp の A/B 用
 pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("0") | Some("off") | Some("false") | Some("no") => (MixGemv::Old, MixGemv::Old),
+        Some("blk") | Some("r8") => (MixGemv::Blk, MixGemv::R8),
         Some("down") => (MixGemv::Blk, MixGemv::Old),
         Some("up") => (MixGemv::Old, MixGemv::R8),
         Some("seg") => (MixGemv::Seg, MixGemv::Seg),
-        _ => (MixGemv::Blk, MixGemv::R8),
+        Some("v5d") => (MixGemv::V5, MixGemv::R8),
+        Some("v5u") => (MixGemv::Blk, MixGemv::V5),
+        Some("ups") => (MixGemv::Blk, MixGemv::Seg),
+        _ => (MixGemv::V5, MixGemv::V5),
     }
 }
 
@@ -29324,6 +29341,103 @@ pub fn mix_qk_layout() -> (usize, usize, usize, usize, usize) {
 
 /// task 282: 高速 GEMV の前置き (`[wptr_d][wptr_u][seg_d][seg_u]`) のバイト数。
 const MIX_QK_PROLOGUE: usize = 48;
+
+/// task 286: [`mix_v5_plan`] の形の部分だけを取り出した純関数。
+/// 返り値は `(lanes, rows_per_block, grid)`。形が合わなければ `None`。
+pub fn mix_v5_shape(n_in: usize, n_out: usize) -> Option<(usize, usize, u32)> {
+    if n_in == 0 || n_out == 0 || n_in % 32 != 0 {
+        return None;
+    }
+    let nb = n_in / 32;
+    if nb < 2 || nb % 2 != 0 {
+        return None;
+    }
+    let np = nb / 2;
+    let lanes = v5_lanes_div(np, 32);
+    if lanes == 0 {
+        return None;
+    }
+    let rows = if lanes >= 16 {
+        2
+    } else if lanes >= 8 {
+        4
+    } else {
+        (128 / lanes).max(1)
+    };
+    let block_dim = rows * lanes;
+    if block_dim == 0 || block_dim > 1024 {
+        return None;
+    }
+    Some((lanes, rows, n_out.div_ceil(rows) as u32))
+}
+
+/// task 286: mix の Q8_0 GEMV を v5 形 (`dno_gemv_q8_0_v5`) で回すときの
+/// 起動計画。形が合わない / PTX が無いときは `None` (呼び出し側は Blk/R8 へ)。
+///
+/// v5 の制約:
+/// - Q8_0 のみ。`nb = n_in / 32` が 2 以上かつ偶数 (2 ブロック = 68 B の対で読む)。
+/// - `lanes` は 2 の冪で `np = nb / 2` を割り切ること (レーンの担当区間が
+///   等分できること)。`lanes` は 1 も許す (`dno_v5_reduce` が空ループになる)。
+///
+/// 形の選び方 (lab の実測で決める): レーンが多いほど 1 行を 1 warp で読むので
+/// 行数が少ない down (n_out=320) は `lanes=32` / 2 行 1 ブロック (grid=n_out/2)。
+/// 行数が多い up (n_out=10,240) は `lanes=1` / 128 行 1 ブロック (grid=n_out/128)。
+pub fn mix_v5_plan(
+    ty: crate::kquant::GgmlType,
+    n_in: usize,
+    n_out: usize,
+) -> Option<MoeGemvPlan> {
+    use crate::kquant::GgmlType as T;
+    if ty != T::Q8_0 {
+        return None;
+    }
+    let (lanes, rows, grid) = mix_v5_shape(n_in, n_out)?;
+    let rb = gguf_row_bytes(ty, n_in)?;
+    Some(MoeGemvPlan {
+        f: gemv_v5_kernels()?.f[0],
+        rows_per_block: rows,
+        block_dim: (rows * lanes) as u32,
+        shmem: 0,
+        lanes,
+        rb,
+        grid,
+    })
+}
+
+/// task 286: [`mix_v5_plan`] の計画を 1 本積む (v5 は引数 8 本。`lanes=1` でも
+/// `rows_per_block` / `lanes` を渡す = 6 本で撃つと未定義値になる)。
+fn launch_mix_v5(
+    ctx: &CudaCtx,
+    plan: &MoeGemvPlan,
+    w: CUdeviceptr,
+    x: CUdeviceptr,
+    o: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+) -> Result<()> {
+    let (mut pw, mut px, mut po) = (w, x, o);
+    let (mut ni, mut no, mut rb) = (n_in as c_int, n_out as c_int, plan.rb as c_int);
+    let (mut rows, mut lanes) = (plan.rows_per_block as c_int, plan.lanes as c_int);
+    let mut args = [
+        &mut pw as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut po as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut no as *mut _ as *mut c_void,
+        &mut rb as *mut _ as *mut c_void,
+        &mut rows as *mut _ as *mut c_void,
+        &mut lanes as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        ctx.launch_async(
+            plan.f,
+            (plan.grid, 1, 1),
+            (plan.block_dim, 1, 1),
+            plan.shmem,
+            &mut args,
+        )
+    }
+}
 
 /// task 282: `[mix-qchain]` 行に出す高速 GEMV の発火回数。
 pub fn mix_qk_hits() -> u64 {
@@ -29465,12 +29579,25 @@ pub fn maybe_gpu_mix_q_chain_into(
         let rd = gguf_row_bytes(down_ty, k1);
         let ru = gguf_row_bytes(up_ty, n1);
         let kern = if q8 { seg_k_kernels() } else { None };
+        // task 286: v5 形 (既存 `dno_gemv_q8_0_v5`)。形が合わなければ下で落とす。
+        let v5_down = if want_down == MixGemv::V5 {
+            mix_v5_plan(down_ty, k1, n1)
+        } else {
+            None
+        };
+        let v5_up = if want_up == MixGemv::V5 {
+            mix_v5_plan(up_ty, n1, n2)
+        } else {
+            None
+        };
         let down_kind = match (want_down, kern, rd) {
+            (MixGemv::V5, _, _) if v5_down.is_some() => MixGemv::V5,
             (MixGemv::Blk, Some(k), Some(_)) if k.mix_rowblk.is_some() => MixGemv::Blk,
             (MixGemv::Seg, Some(k), Some(_)) if moe_batch_slot(down_ty).is_some() => MixGemv::Seg,
             _ => MixGemv::Old,
         };
         let up_kind = match (want_up, kern, ru) {
+            (MixGemv::V5, _, _) if v5_up.is_some() => MixGemv::V5,
             (MixGemv::R8, Some(k), Some(_)) if k.mix_r8.is_some() => MixGemv::R8,
             (MixGemv::Seg, Some(k), Some(_)) if moe_batch_slot(up_ty).is_some() => MixGemv::Seg,
             _ => MixGemv::Old,
@@ -29591,6 +29718,11 @@ pub fn maybe_gpu_mix_q_chain_into(
             let rb_d = rd.expect("形は検査済み");
             unsafe {
                 match down_kind {
+                    MixGemv::V5 => {
+                        // task 286: v5 形 (68 B の対読み + 先読み)。重みは生ポインタ。
+                        let plan = v5_down.as_ref().expect("検査済み");
+                        launch_mix_v5(ctx, plan, wd, xdev, dlo.ptr(), k1, n1)?;
+                    }
                     MixGemv::Blk => {
                         // 1 行 = 1 ブロック (256 スレッド)。k を 8 warp に分ける。
                         let f = kern.and_then(|k| k.mix_rowblk).expect("検査済み");
@@ -29660,7 +29792,11 @@ pub fn maybe_gpu_mix_q_chain_into(
             let rb_u = ru.expect("形は検査済み");
             let fk = kern.expect("検査済み");
             unsafe {
-                if up_kind == MixGemv::R8 {
+                if up_kind == MixGemv::V5 {
+                    // task 286: v5 形。n_in=320 (10 ブロック) は lanes=1 / 128 行。
+                    let plan = v5_up.as_ref().expect("検査済み");
+                    launch_mix_v5(ctx, plan, wu, dlo.ptr(), dout.ptr(), n1, n2)?;
+                } else if up_kind == MixGemv::R8 {
                     // 1 warp = 8 行。1 ブロック = 4 warp = 32 行。
                     let f = fk.mix_r8.expect("検査済み");
                     let mut pw = st.ptr() + off_wu as u64;
@@ -39306,9 +39442,14 @@ mod tests {
     /// `0` で旧 GEMV に戻り、`down` / `up` / `seg` で向きごとに選べる。
     #[test]
     fn mix_qk_gate_defaults_on() {
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Blk, MixGemv::R8), "未設定が既定");
-        assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::Blk, MixGemv::R8));
-        assert_eq!(mix_qk_from_value(Some(" on ")), (MixGemv::Blk, MixGemv::R8));
+        // task 286: 既定は v5 形 (lab t286b で採否)。
+        assert_eq!(mix_qk_from_value(None), (MixGemv::V5, MixGemv::V5), "未設定が既定");
+        assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::V5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some(" on ")), (MixGemv::V5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
+        // task 282 の形へ戻す逃げ道。
+        assert_eq!(mix_qk_from_value(Some("blk")), (MixGemv::Blk, MixGemv::R8));
+        assert_eq!(mix_qk_from_value(Some("R8")), (MixGemv::Blk, MixGemv::R8));
         assert_eq!(mix_qk_from_value(Some("0")), (MixGemv::Old, MixGemv::Old));
         assert_eq!(mix_qk_from_value(Some("off")), (MixGemv::Old, MixGemv::Old));
         assert_eq!(mix_qk_from_value(Some("false")), (MixGemv::Old, MixGemv::Old));
@@ -39316,6 +39457,37 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("down")), (MixGemv::Blk, MixGemv::Old));
         assert_eq!(mix_qk_from_value(Some(" UP ")), (MixGemv::Old, MixGemv::R8));
         assert_eq!(mix_qk_from_value(Some("seg")), (MixGemv::Seg, MixGemv::Seg));
+        // task 286: 片方向だけ v5 / up だけ seg の A/B。
+        assert_eq!(mix_qk_from_value(Some("V5D")), (MixGemv::V5, MixGemv::R8));
+        assert_eq!(mix_qk_from_value(Some("v5u")), (MixGemv::Blk, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
+        // 未知の値は既定へ (切り戻しは 0)。
+        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::V5, MixGemv::V5));
+    }
+
+    /// task 286: v5 形の起動計画。UD の mix の実形 (down 10240->320 / up 320->10240)
+    /// で「1 行 1 warp・2 行 1 ブロック」と「1 レーン 1 行・128 行 1 ブロック」に
+    /// なること、形が合わないときは None (Blk/R8 へ落ちる) を固定する。
+    #[test]
+    fn mix_v5_shape_matches_the_ud_mix() {
+        // down: k=10240 -> nb=320, np=160, lanes=32, 2 行/ブロック。
+        assert_eq!(mix_v5_shape(10240, 320), Some((32, 2, 160)));
+        // up: k=320 -> nb=10, np=5, lanes=1, 128 行/ブロック。
+        assert_eq!(mix_v5_shape(320, 10240), Some((1, 128, 80)));
+        // 2 ブロック未満 / 奇数ブロック / 端数は v5 に載せない。
+        assert_eq!(mix_v5_shape(32, 8), None, "nb=1");
+        assert_eq!(mix_v5_shape(96, 8), None, "nb=3 (奇数)");
+        assert_eq!(mix_v5_shape(0, 8), None);
+        assert_eq!(mix_v5_shape(10240, 0), None);
+        // ブロック次元は 1024 以下 (lanes=32 でも 64 スレッド)。
+        for (n_in, n_out) in [(10240usize, 320usize), (320, 10240), (2048, 64)] {
+            if let Some((l, r, g)) = mix_v5_shape(n_in, n_out) {
+                assert!(l * r <= 1024, "block_dim が 1024 を超えた: lanes={l} rows={r}");
+                assert!(g >= 1, "grid が 0");
+                assert!(l.is_power_of_two(), "lanes は 2 の冪: {l}");
+                assert_eq!((n_in / 32 / 2) % l, 0, "レーンが対を割り切る");
+            }
+        }
     }
     /// task 282: 前置きバッファのレイアウト (重みポインタ 2 本 / segment 表 2 枚 /
     /// 入力) が詰まっていて、seg 表と xn が 4 / 16 バイト整列であること。
