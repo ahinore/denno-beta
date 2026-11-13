@@ -4640,6 +4640,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     /// 候補を試し、[`crate::model::pf_pool::PF_POOL_BIG_MB_ENV`] に収まる最初の組を
     /// 返す。ゲート off / 候補なし / 上限が増えないときは従来の形を返す
     /// (呼び出し側はそのまま `pf_pool_acquire_capped` に渡す)。
+    ///
+    /// 戻り値の 3 番目は「大きい形を選んだか」。true のとき呼び出し側は、借りた
+    /// 作業域のぶんに追い出した expert を prefill の終端で LRU へ戻す。
     #[cfg(feature = "cuda")]
     fn pf_pool_pick(
         &self,
@@ -4647,16 +4650,16 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         chunk: usize,
         hc: usize,
         lr: usize,
-    ) -> (crate::model::pf_pool::Need, usize) {
+    ) -> (crate::model::pf_pool::Need, usize, bool) {
         let base_tile = crate::model::exp_pf::lm_tile(nt_all);
         let base = self.pf_pool_need_for(nt_all, base_tile, chunk.min(nt_all), hc, lr);
         let cap = crate::model::pf_pool::pf_pool_bytes();
         if !crate::model::pf_pool::pf_pool_big_on() {
-            return (base, cap);
+            return (base, cap, false);
         }
         let big_cap = crate::model::pf_pool::pf_pool_big_bytes();
         if big_cap <= cap {
-            return (base, cap);
+            return (base, cap, false);
         }
         let max_chunk = crate::model::pf_pool::big_chunk_max();
         // 2,048 以上のチャンクは GDN prefill の連鎖の上限撤廃 (task 270 の
@@ -4686,9 +4689,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     tile: t,
                     ..base
                 };
-                (need, big_cap)
+                (need, big_cap, true)
             }
-            _ => (base, cap),
+            _ => (base, cap, false),
         }
     }
 
@@ -4733,8 +4736,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 279: 借りられる量から (チャンク, タイル) を選ぶ。**大きい形は
         // プールを実際に借りられたときだけ**使う (借りられないと作業域が組めず、
         // t270a のように streaming が黙って落ちる)。落ちたら従来の形へ。
-        let (need, pool_cap) = self.pf_pool_pick(nt_all, chunk, hc, lr);
+        let (need, pool_cap, big) = self.pf_pool_pick(nt_all, chunk, hc, lr);
         let _pool = crate::cuda::pf_pool_acquire_capped(&need, pool_cap);
+        let big = big && _pool.is_held();
         let (chunk, tile) = if _pool.is_held() {
             (need.chunk.max(1), need.tile)
         } else {
@@ -5249,6 +5253,22 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         crate::cuda::pf_release();
         // task 265: 借りた作業域を expert に返す (ここでカードが expert に戻る)。
         drop(_pool);
+        // task 279: 大きい形で借りたときは、その確保が追い出した expert を LRU へ
+        // 戻す (借りた作業域だけでなく、代わりに追い出した在庫も返す)。
+        // MoE はもう完了している (末尾の D2H が同期) ので、t265b のように
+        // 実行中のカーネルと衝突しない。本数は借りた量に比例して有界。
+        if big {
+            let keys = crate::cuda::pf_pool_take_evicted();
+            if !keys.is_empty() {
+                let (n, bytes) = pf_restore_experts(&self.layers, &keys);
+                eprintln!(
+                    "[pf-pool] 大きい形で追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
+                    n,
+                    bytes >> 20,
+                    keys.len().saturating_sub(n)
+                );
+            }
+        }
         // task 250: 作業域の外部予約を返す (LRU の上限がここで戻る)。
         drop(reserve_guard);
         // task 242: 作業域のために追い出した expert を戻す (prefill の終端)。

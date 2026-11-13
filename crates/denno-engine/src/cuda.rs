@@ -3107,6 +3107,29 @@ pub fn evict_cap_bytes(need: usize, _tag: &'static str, chunk: usize, keep: bool
     Some(need.saturating_add(chunk))
 }
 
+// task 279: 直近の確保が expert を追い出したときの鍵 (借りた作業域を返す側で使う)。
+//
+// `DevBuffer::alloc_tagged` の追い出し経路が積む。**挙動は変えない** (控えるだけ)。
+// プール (`pf_pool_acquire_capped`) は自分の確保の前後でこれを読み書きするので、
+// 他の確保 (attention のミラーなど) が積んだ鍵は混ざらない。
+thread_local! {
+    static ALLOC_EVICTED: std::cell::RefCell<Vec<crate::model::expert_cache::ExpertKey>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// task 279: 追い出した鍵を控える (`alloc_tagged` の追い出し経路から)。
+fn note_alloc_evicted(keys: Vec<crate::model::expert_cache::ExpertKey>) {
+    if keys.is_empty() {
+        return;
+    }
+    ALLOC_EVICTED.with(|c| c.borrow_mut().extend(keys));
+}
+
+/// task 279: 控えた鍵を取り出す (取り出したら空にする)。
+pub fn take_alloc_evicted() -> Vec<crate::model::expert_cache::ExpertKey> {
+    ALLOC_EVICTED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
 pub struct DevBuffer {
     ptr: CUdeviceptr,
@@ -3164,7 +3187,11 @@ impl DevBuffer {
                 )
                 .is_some()
                 {
-                    let rep = crate::model::expert_vram::emergency_free_chunks(bytes);
+                    let (rep, evicted_keys) =
+                        crate::model::expert_vram::emergency_free_chunks_keys(bytes);
+                    // task 279: 追い出した鍵を控える (プールが借りた作業域を返すときに
+                    // expert を戻すため)。控えるだけで挙動は変えない。
+                    note_alloc_evicted(evicted_keys);
                     if rep.is_empty() {
                         // 空けられない (LRU のロックが取れない / 空チャンクが作れない)
                         // → 呼び出し側が小さいタイルか CPU 経路へ落ちる。
@@ -24507,6 +24534,23 @@ pub fn pf_res_park_load(i: usize, rows: usize, hc: usize, e: usize) -> bool {
 #[cfg(feature = "cuda")]
 static PF_POOL: std::sync::Mutex<Option<DevBuffer>> = std::sync::Mutex::new(None);
 
+/// task 279: プールの確保が追い出した expert の鍵 (`pf_pool_take_evicted` で取り出す)。
+///
+/// 借りた作業域を返したあと、呼び出し側がこれを LRU へ戻す (decode の作業集合を
+/// prefill 前の状態に戻す)。取り出したら空になる。
+#[cfg(feature = "cuda")]
+static PF_POOL_EVICTED: std::sync::Mutex<Vec<crate::model::expert_cache::ExpertKey>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// task 279: プールが追い出した expert の鍵を取り出す (取り出したら空)。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_take_evicted() -> Vec<crate::model::expert_cache::ExpertKey> {
+    match PF_POOL_EVICTED.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(feature = "cuda")]
 thread_local! {
     /// このスレッドの prefill で使う区画 (リクエストの先頭で組み直す)。
@@ -24588,6 +24632,10 @@ pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> Pf
         PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
         return not_held;
     }
+    // task 279: 前のリクエストの鍵を持ち越さない (借り直すときに必ず空から)。
+    if let Ok(mut g) = PF_POOL_EVICTED.lock() {
+        g.clear();
+    }
     let Some(ctx) = shared_ctx() else {
         return not_held;
     };
@@ -24604,21 +24652,29 @@ pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> Pf
         return not_held;
     }
     let free_before = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
+    // task 279: この確保が追い出した expert の鍵を控える (借りる前に掃除する)。
+    let _ = take_alloc_evicted();
     match DevBuffer::alloc_tagged(l.total, crate::mem_audit::TAG_OTHER) {
         Ok(b) => {
             let bytes = b.bytes();
             *slot = Some(b);
             drop(slot);
+            let evicted = take_alloc_evicted();
+            let evicted_n = evicted.len();
+            if let Ok(mut g) = PF_POOL_EVICTED.lock() {
+                *g = evicted;
+            }
             let free_after = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
             PF_POOL_OWNED.with(|c| c.set(true));
             PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
             eprintln!(
-                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB)",
+                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB / 追い出し {} 本)",
                 bytes >> 20,
                 n.tile,
                 n.nt_all,
                 free_before.map(|b| b >> 20).unwrap_or(0),
-                free_after.map(|b| b >> 20).unwrap_or(0)
+                free_after.map(|b| b >> 20).unwrap_or(0),
+                evicted_n
             );
             PfPoolGuard { owned: true }
         }
