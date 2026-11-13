@@ -10426,9 +10426,57 @@ fn task282_mix_gemv_kernels_are_wired() {
         audit.contains("\"DENNO_MIX_QK\""),
         "DENNO_MIX_QK が既定 on の台帳に無い"
     );
+    // task 286: 既定は v5 形 (`dno_gemv_q8_0_v5` = kernels_moe_v5.ptx) なので、
+    // 台帳もそちらを見る。task 282 の 2 本は `DENNO_MIX_QK=blk` で今も使う。
     assert!(
-        audit.contains("\"dno_mix_gemv_q8_0_r8\""),
-        "台帳のエントリに r8 が無い"
+        audit.contains("\"dno_gemv_q8_0_v5\""),
+        "台帳のエントリに v5 が無い"
+    );
+    assert!(
+        audit.contains("kernels_moe_v5.ptx"),
+        "台帳が v5 の PTX を見ていない"
+    );
+}
+
+// ===========================================================================
+// task 286: mix の GEMV を v5 形 (68 B の対読み + 先読み) で撃つ。
+//           PTX は kernels_moe_v5.ptx の既存エントリで、新しいカーネルは無い。
+//           形は cuda::mix_v5_shape が決め、引数は **8 本固定** (lanes=1 でも
+//           rows_per_block / lanes を渡す)。
+// ===========================================================================
+
+#[test]
+fn task286_mix_gemv_v5_is_wired() {
+    // カーネルは既存の v5 (GDN の decode GEMV と同じ ABI)。
+    assert_eq!(cu_kernel_nargs(MOE_V5_SRC, "dno_gemv_q8_0_v5"), 8);
+    assert!(
+        MOE_V5_SRC.contains("dno_v5_load17"),
+        "v5 の 68 B の対読みが無い"
+    );
+    assert!(
+        MOE_V5_SRC.contains("lane * per") && MOE_V5_SRC.contains("np / lanes"),
+        "v5 のレーン分割が変わった"
+    );
+    // cuda.rs: 形の決定 (純関数)・起動・v5 の関数ポインタ。
+    assert!(CUDA_RS.contains("pub fn mix_v5_shape("), "mix_v5_shape が無い");
+    assert!(CUDA_RS.contains("fn launch_mix_v5("), "launch_mix_v5 が無い");
+    assert!(
+        CUDA_RS.contains("gemv_v5_kernels()?.f[0]"),
+        "mix_v5_plan が v5 の Q8_0 を取っていない"
+    );
+    // 引数 8 本 (rows_per_block / lanes を落とさない)。
+    assert!(
+        CUDA_RS.contains("let (mut rows, mut lanes) = (plan.rows_per_block as c_int, plan.lanes as c_int);"),
+        "launch_mix_v5 が rows/lanes を渡していない"
+    );
+    // 既定は v5 両方向、`blk` で task 282 の形へ戻せる。
+    assert!(
+        CUDA_RS.contains("_ => (MixGemv::V5, MixGemv::V5),"),
+        "既定が v5 になっていない"
+    );
+    assert!(
+        CUDA_RS.contains("Some(\"blk\") | Some(\"r8\") => (MixGemv::Blk, MixGemv::R8)"),
+        "task 282 の形への切り戻しが無い"
     );
 }
 

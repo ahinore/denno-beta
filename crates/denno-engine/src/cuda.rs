@@ -29259,26 +29259,26 @@ pub enum MixGemv {
 
 /// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` の種別。
 ///
-/// - 未設定 / `1` / `both`: `(Blk, R8)` = 既定 (lab の採否後の形)
-/// - `0` / `off` / `false` : `(Old, Old)` = 切り戻し
+/// - 未設定 / `1` / `both` / `v5`: `(V5, V5)` = 既定 (lab t286b の採否後の形)
+/// - `0` / `off` / `false` : `(Old, Old)` = 切り戻し (task 266 より前)
+/// - `blk`                : `(Blk, R8)` = task 282 の形 (採否前の既定)
 /// - `down`               : `(Blk, Old)`
 /// - `up`                 : `(Old, R8)`
 /// - `seg`                : `(Seg, Seg)` = task 278 の seg_k をそのまま
-/// - `v5`                 : `(V5, V5)` = task 286 (v5 = 68 B の対読み)
 /// - `v5d` / `v5u`        : 片方向だけ v5 (A/B 用)
 /// - `ups`                : `(Blk, Seg)` = down は task 282 のまま、up だけ
-///   1 行 1 warp (ワープ数が 8 倍 = 並列度優先) の A/B 用
+///   1 行 1 warp の A/B 用
 pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("0") | Some("off") | Some("false") | Some("no") => (MixGemv::Old, MixGemv::Old),
+        Some("blk") | Some("r8") => (MixGemv::Blk, MixGemv::R8),
         Some("down") => (MixGemv::Blk, MixGemv::Old),
         Some("up") => (MixGemv::Old, MixGemv::R8),
         Some("seg") => (MixGemv::Seg, MixGemv::Seg),
-        Some("v5") => (MixGemv::V5, MixGemv::V5),
         Some("v5d") => (MixGemv::V5, MixGemv::R8),
         Some("v5u") => (MixGemv::Blk, MixGemv::V5),
         Some("ups") => (MixGemv::Blk, MixGemv::Seg),
-        _ => (MixGemv::Blk, MixGemv::R8),
+        _ => (MixGemv::V5, MixGemv::V5),
     }
 }
 
@@ -39409,9 +39409,14 @@ mod tests {
     /// `0` で旧 GEMV に戻り、`down` / `up` / `seg` で向きごとに選べる。
     #[test]
     fn mix_qk_gate_defaults_on() {
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Blk, MixGemv::R8), "未設定が既定");
-        assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::Blk, MixGemv::R8));
-        assert_eq!(mix_qk_from_value(Some(" on ")), (MixGemv::Blk, MixGemv::R8));
+        // task 286: 既定は v5 形 (lab t286b で採否)。
+        assert_eq!(mix_qk_from_value(None), (MixGemv::V5, MixGemv::V5), "未設定が既定");
+        assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::V5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some(" on ")), (MixGemv::V5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
+        // task 282 の形へ戻す逃げ道。
+        assert_eq!(mix_qk_from_value(Some("blk")), (MixGemv::Blk, MixGemv::R8));
+        assert_eq!(mix_qk_from_value(Some("R8")), (MixGemv::Blk, MixGemv::R8));
         assert_eq!(mix_qk_from_value(Some("0")), (MixGemv::Old, MixGemv::Old));
         assert_eq!(mix_qk_from_value(Some("off")), (MixGemv::Old, MixGemv::Old));
         assert_eq!(mix_qk_from_value(Some("false")), (MixGemv::Old, MixGemv::Old));
@@ -39419,13 +39424,12 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("down")), (MixGemv::Blk, MixGemv::Old));
         assert_eq!(mix_qk_from_value(Some(" UP ")), (MixGemv::Old, MixGemv::R8));
         assert_eq!(mix_qk_from_value(Some("seg")), (MixGemv::Seg, MixGemv::Seg));
-        // task 286: v5 形 (既存 `dno_gemv_q8_0_v5`) と、up だけ seg の A/B。
-        assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
+        // task 286: 片方向だけ v5 / up だけ seg の A/B。
         assert_eq!(mix_qk_from_value(Some("V5D")), (MixGemv::V5, MixGemv::R8));
         assert_eq!(mix_qk_from_value(Some("v5u")), (MixGemv::Blk, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
         // 未知の値は既定へ (切り戻しは 0)。
-        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::Blk, MixGemv::R8));
+        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::V5, MixGemv::V5));
     }
 
     /// task 286: v5 形の起動計画。UD の mix の実形 (down 10240->320 / up 320->10240)
