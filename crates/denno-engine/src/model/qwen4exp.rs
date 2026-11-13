@@ -7664,7 +7664,7 @@ fn ple_project_kv(
     Ok(())
 }
 
-/// task 300: `DENNO_PF_PLE_REUSE` — PLE の作業域を grow-only で使い回す (既定 off)。
+/// task 300: `DENNO_PF_PLE_REUSE` — PLE の作業域を grow-only で使い回す (既定 on)。
 ///
 /// 従来は PLE 層のたびに `back` (`nt × hc_dim`、14k のチャンクで 82 MB) と
 /// `key` / `value` (82 + 20 MB) を `vec![0.0; n]` で作り直し、さらに
@@ -7674,11 +7674,27 @@ fn ple_project_kv(
 /// 3 本とも**全要素を書き直す**ので、使い回してもデバイスへ渡るバイト列は同じ。
 pub const PLE_REUSE_ENV: &str = "DENNO_PF_PLE_REUSE";
 
-/// [`PLE_REUSE_ENV`] の解釈 (明示的な真値だけ on)。
+/// [`PLE_REUSE_ENV`] の既定値。
+///
+/// lab t300a (c18c505b7、depth8k、x0/base/pg/pr/pr0/base2) の実測:
+///
+/// | COND | c2000_cold r1 / r2 | c8000_cold (r1) |
+/// | --- | --- | --- |
+/// | base (両ゲート off) | 4.14 / 3.41 s | 10.09 s |
+/// | pg (PIN_GROW のみ) | 3.22 / 3.23 s | 8.30 s |
+/// | **pr (PIN_GROW + これ)** | **3.18 / 3.16 s** | **8.09 s** |
+/// | pr0 (これのみ) | 3.35 / 3.36 s | 8.28 s |
+/// | base2 | 3.40 / 3.41 s | 8.45 s |
+///
+/// 単独で -1.5%、PIN_GROW と合わせて -7.0% (3,826 cold)。14k も base2 比
+/// -4.3%、decode は全点 ±2% 以内、md5 は全 COND SAME。
+pub const DEFAULT_PLE_REUSE: bool = true;
+
+/// [`PLE_REUSE_ENV`] の解釈 (未設定・空は [`DEFAULT_PLE_REUSE`])。
 pub(crate) fn pf_ple_reuse_from_value(v: Option<&str>) -> bool {
-    match v.map(|s| s.trim().to_ascii_lowercase()) {
-        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PLE_REUSE,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
     }
 }
 
@@ -24401,9 +24417,9 @@ mod tests {
         /// - 返却した Vec は次の take でそのまま返ってくる (確保し直さない)。
         #[test]
         fn ple_reuse_scratch_contract() {
-            // ゲートの真理値表 (明示的な真値だけ on)。
-            assert!(!pf_ple_reuse_from_value(None));
-            assert!(!pf_ple_reuse_from_value(Some("")));
+            // ゲートの真理値表 (未設定・空は既定 on。明示的な偽値だけ off)。
+            assert!(pf_ple_reuse_from_value(None));
+            assert!(pf_ple_reuse_from_value(Some("")));
             assert!(!pf_ple_reuse_from_value(Some("0")));
             assert!(!pf_ple_reuse_from_value(Some("off")));
             assert!(pf_ple_reuse_from_value(Some("1")));
