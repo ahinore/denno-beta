@@ -7143,12 +7143,17 @@ fn moe_gemv_seg_run(jobs: &mut [SegJob<'_>], seg: &[u32], m_max: usize, x: &[f32
 
     SEG_SCRATCH.with(|cell| -> Result<()> {
         let mut sc = cell.borrow_mut();
+        // task 278: 旧経路の区間計測 (`DENNO_SEG_PROF`)。off は stamp が None。
+        let prof = crate::model::seg_prof::enabled();
+        let mut gpu_bytes = [0usize; 2];
         // 1. ポインタ表 / segment 表 / 入力 (すべて起動より前に H2D)
+        let _t_h2d = crate::model::seg_prof::stamp();
         for (i, job) in jobs.iter().enumerate() {
             MoeScratch::ensure_tagged(&mut sc.ptr[i], job.wptrs.len() * 8, crate::mem_audit::TAG_SEG)?;
             let pb = sc.ptr[i].as_ref().expect("確保済み");
             pb.copy_from(job.wptrs)?;
             dbg_htod(job.wptrs.len() * 8);
+            gpu_bytes[i] = job.row_bytes * job.n_out * nseg;
         }
         MoeScratch::ensure_tagged(&mut sc.seg, seg.len() * 4, crate::mem_audit::TAG_SEG)?;
         MoeScratch::ensure_tagged(&mut sc.x, x.len() * 4, crate::mem_audit::TAG_SEG)?;
@@ -7160,12 +7165,14 @@ fn moe_gemv_seg_run(jobs: &mut [SegJob<'_>], seg: &[u32], m_max: usize, x: &[f32
             xb.copy_from(x)?;
             dbg_htod(x.len() * 4);
         }
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_H2D, _t_h2d);
         for (i, job) in jobs.iter().enumerate() {
             MoeScratch::ensure_tagged(&mut sc.out[i], job.out.len() * 4, crate::mem_audit::TAG_SEG)?;
         }
         // 2. 起動 (job ごと。まだ同期しない)
         let seg_buf = sc.seg.as_ref().expect("確保済み");
         let x_buf = sc.x.as_ref().expect("確保済み");
+        let _ = seg_ev::record(0);
         unsafe {
             for (i, job) in jobs.iter().enumerate() {
                 let slot = moe_batch_slot(job.ty)
@@ -7190,6 +7197,7 @@ fn moe_gemv_seg_run(jobs: &mut [SegJob<'_>], seg: &[u32], m_max: usize, x: &[f32
                     &mut no as *mut _ as *mut c_void,
                     &mut rb as *mut _ as *mut c_void,
                 ];
+                let _t_launch = crate::model::seg_prof::stamp();
                 ctx.launch_async(
                     kernels.fns[slot],
                     plan.grid,
@@ -7197,16 +7205,37 @@ fn moe_gemv_seg_run(jobs: &mut [SegJob<'_>], seg: &[u32], m_max: usize, x: &[f32
                     plan.smem,
                     &mut args,
                 )?;
+                crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+                let _ = seg_ev::record(i + 1);
             }
             // 3. 同期は 1 回だけ (gate と up が同じ同期で終わる)
+            let _t_sync = crate::model::seg_prof::stamp();
             ctx.sync()?;
+            crate::model::seg_prof::add(crate::model::seg_prof::PH_SYNC, _t_sync);
+        }
+        if prof {
+            // 起動ごとの GPU 時間 (イベント)。1 本目 = gate、2 本目 = up。
+            for i in 0..jobs.len().min(2) {
+                if let Some(ns) = seg_ev::elapsed_ns(i, i + 1) {
+                    let g = if jobs.len() == 1 {
+                        crate::model::seg_prof::GP_DOWN
+                    } else if i == 0 {
+                        crate::model::seg_prof::GP_GATE
+                    } else {
+                        crate::model::seg_prof::GP_UP
+                    };
+                    crate::model::seg_prof::add_gpu(g, ns, gpu_bytes[i]);
+                }
+            }
         }
         // 4. D2H
+        let _t_d2h = crate::model::seg_prof::stamp();
         for (i, job) in jobs.iter_mut().enumerate() {
             let got: Vec<f32> = sc.out[i].as_ref().expect("確保済み").to_vec(job.out.len())?;
             dbg_d2h(job.out.len() * 4);
             job.out.copy_from_slice(&got);
         }
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_D2H, _t_d2h);
         Ok(())
     })
 }
@@ -7256,6 +7285,8 @@ pub fn moe_gemv_seg_pair(
             out: out_u,
         },
     ];
+    // task 278: 層の数を 1 回だけ数える (down の呼び出しと二重に数えない)。
+    crate::model::seg_prof::note_layer();
     moe_gemv_seg_run(&mut jobs, seg, m_max, x)?;
     Ok(true)
 }
@@ -7290,6 +7321,512 @@ pub fn moe_gemv_seg_one(
         out,
     }];
     moe_gemv_seg_run(&mut jobs, seg, m_max, x)?;
+    Ok(true)
+}
+
+// ===========================================================================
+// task 278: K 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層を **1 同期**で閉じる
+// ===========================================================================
+//
+// # なぜ要るか
+//
+// P43 の層一括経路 (`moe_gemv_seg_pair` + `moe_gemv_seg_one`) は 1 層で
+// 3 起動 / **2 同期**、その間にホストが
+//
+//   1. gate/up の結果 (2 x nseg x ff) を D2H
+//   2. `silu(g) * u` をホストで計算
+//   3. act (nseg x ff) を H2D
+//   4. down の結果 (nseg x e) を D2H
+//   5. 重み付き和をホストで計算
+//
+// をする。GPU はこのホスト仕事の間ずっと空く (実測 lab t268b: 1 層 0.84 ms の
+// うち sync 待ち 0.48 ms)。さらに prologue の小さな H2D が 1 層 7 回ある。
+//
+// # 何をするか
+//
+// 1 層を **5 起動 / 1 待ち / 1 D2H (e 要素だけ)** にする:
+//
+//   prologue 1 回の H2D (ポインタ表 3 + segment 表 2 + 重み + 入力)
+//   → gate → up → silu_mul → down → 重み付き和 → イベントで待つ → D2H(e)
+//
+// silu と和は `kernels_dec_epi.ptx` の既存カーネル (`dno_dec_silu_mul` /
+// `dno_dec_exp_sum`) を使う。和は `acc += w[t] * h[t*e+j]` を t の昇順に
+// 1 本のアキュムレータで回すので、**ミスの無い層では従来のホスト足し込みと
+// 同じ演算列** (-fmad=false)。silu だけは `expf` の実装が違うので 1 ulp 級の差が
+// 出る (速度優先。タスク 278 の規則で許容)。
+//
+// 待ちは `cuCtxSynchronize` ではなく **null ストリームに打ったイベント**で行う。
+// 文脈同期は背景の上げ直し (非ブロッキングストリーム) まで待つため、1 層 2 回の
+// 同期が「他人の転送の完了待ち」になっていた。イベントなら自分のカーネルだけを待つ。
+//
+// 失敗 (PTX 不在 / 型未対応 / 形が合わない) はすべて `Ok(false)` = 呼び出し側は
+// 旧経路へ落ちる (fail closed)。
+
+thread_local! {
+    /// 層を 1 同期で閉じる経路の作業域 (grow-only)。
+    static SEG_LAYER_SCRATCH: std::cell::RefCell<SegLayerScratch> =
+        std::cell::RefCell::new(SegLayerScratch::new());
+}
+
+/// [`moe_seg_layer_sum`] の作業域。すべて grow-only。
+struct SegLayerScratch {
+    /// prologue を詰めた 1 本のデバイスバッファ
+    stage: Option<DevBuffer>,
+    /// 同じ内容のホスト側バッファ (Vec<u8> を使い回す)
+    host: Vec<u8>,
+    /// gate の出力 (nseg x ff)
+    g: Option<DevBuffer>,
+    /// up の出力 (nseg x ff)
+    u: Option<DevBuffer>,
+    /// act = silu(g) * u (nseg x ff)
+    act: Option<DevBuffer>,
+    /// down の出力 (nseg x e)
+    h: Option<DevBuffer>,
+    /// 重み付き和の出力 (e)
+    out: Option<DevBuffer>,
+}
+
+impl SegLayerScratch {
+    fn new() -> Self {
+        SegLayerScratch {
+            stage: None,
+            host: Vec::new(),
+            g: None,
+            u: None,
+            act: None,
+            h: None,
+            out: None,
+        }
+    }
+}
+
+/// prof 用のイベント (null ストリーム)。`DENNO_SEG_PROF` off では何もしない。
+mod seg_ev {
+    use super::*;
+
+    thread_local! {
+        static EVS: std::cell::RefCell<Vec<CUevent>> = const { std::cell::RefCell::new(Vec::new()) };
+        static DEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// スロット `i` のイベントを用意する (初回だけ作る)。
+    fn slot(i: usize) -> Option<CUevent> {
+        if DEAD.with(|d| d.get()) {
+            return None;
+        }
+        let l = lib().ok()?;
+        let Some(create) = l.event_create else {
+            DEAD.with(|d| d.set(true));
+            return None;
+        };
+        EVS.with(|c| {
+            let mut v = c.borrow_mut();
+            while v.len() <= i {
+                let mut ev: CUevent = std::ptr::null_mut();
+                // 0 = CU_EVENT_DEFAULT (計時あり)
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    DEAD.with(|d| d.set(true));
+                    return None;
+                }
+                v.push(ev);
+            }
+            Some(v[i])
+        })
+    }
+
+    /// null ストリームの「いま」をイベントに打つ (**prof の on/off を見ない**)。
+    pub(super) fn record_raw(i: usize) -> bool {
+        let Some(ev) = slot(i) else { return false };
+        let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+            return false;
+        };
+        unsafe { rec(ev, std::ptr::null_mut()) == CUDA_SUCCESS }
+    }
+
+    /// prof が on のときだけイベントを打つ。
+    pub(super) fn record(i: usize) -> bool {
+        if !crate::model::seg_prof::enabled() {
+            return false;
+        }
+        record_raw(i)
+    }
+
+    /// イベント 1 本を待つ (文脈全体ではなく null ストリームの仕事だけ)。
+    pub(super) fn wait(i: usize) -> Result<()> {
+        let Some(ev) = slot(i) else {
+            return Ok(());
+        };
+        let Some(es) = lib().ok().and_then(|l| l.event_sync) else {
+            return Ok(());
+        };
+        check(unsafe { es(ev) }, "cuEventSynchronize (seg lay)")?;
+        Ok(())
+    }
+
+    /// 2 イベント間の ns (取れなければ `None`)。
+    pub(super) fn elapsed_ns(a: usize, b: usize) -> Option<u64> {
+        let (ea, eb) = (slot(a)?, slot(b)?);
+        let f = lib().ok().and_then(|l| l.event_elapsed_time)?;
+        let mut ms = 0.0f32;
+        if unsafe { f(&mut ms, ea, eb) } != CUDA_SUCCESS {
+            return None;
+        }
+        Some((ms.max(0.0) as f64 * 1e6) as u64)
+    }
+}
+
+/// ホストの `Vec<u8>` の一部へ `u64` の列を書く (prologue の詰め込み)。
+fn put_u64s(dst: &mut [u8], src: &[u64]) {
+    let bytes = std::mem::size_of_val(src);
+    debug_assert_eq!(dst.len(), bytes, "u64 列の長さ");
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst.as_mut_ptr(), bytes);
+    }
+}
+
+/// ホストの `Vec<u8>` の一部へ `u32` の列を書く。
+fn put_u32s(dst: &mut [u8], src: &[u32]) {
+    let bytes = std::mem::size_of_val(src);
+    debug_assert_eq!(dst.len(), bytes, "u32 列の長さ");
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst.as_mut_ptr(), bytes);
+    }
+}
+
+/// ホストの `Vec<u8>` の一部へ `f32` の列を書く。
+fn put_f32s(dst: &mut [u8], src: &[f32]) {
+    let bytes = std::mem::size_of_val(src);
+    debug_assert_eq!(dst.len(), bytes, "f32 列の長さ");
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst.as_mut_ptr(), bytes);
+    }
+}
+
+/// K 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層を **5 起動 / 1 待ち**で回す (task 278)。
+///
+/// - `pg` / `pu` / `pd`: segment ごとの重み先頭 (デバイスアドレス)
+/// - `seg_gu`: gate/up 用 segment 表 (`x_off = 0`、`out_off = s * ff`)
+/// - `seg_d`: down 用 segment 表 (`x_off = s * ff`、`out_off = s * e`)
+/// - `w`: ヒットの重み (segment 順、長さ `nseg`)
+/// - `out`: `e` 要素。**ヒットぶんの重み付き和**が入る (ミスは呼び出し側が足す)
+/// - `cpu_miss`: GPU を走らせている間に呼ぶ (ミス expert の CPU 計算)
+///
+/// `Ok(false)` は「この経路ではやらない」= 呼び出し側は旧経路へ (fail closed)。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_seg_layer_sum<F>(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    w: &[f32],
+    out: &mut [f32],
+    cpu_miss: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    use crate::model::expert_batch as eb;
+    let nseg = pg.len();
+    if nseg == 0 || pu.len() != nseg || pd.len() != nseg || w.len() != nseg {
+        return Ok(false);
+    }
+    if !seg_gu.len().is_multiple_of(4)
+        || !seg_d.len().is_multiple_of(4)
+        || seg_gu.len() / 4 != nseg
+        || seg_d.len() / 4 != nseg
+    {
+        return Ok(false);
+    }
+    if x.len() < n_in || out.len() < e || ff == 0 || e == 0 {
+        bail!(
+            "moe_seg_layer_sum: 入出力長が足りない (x={}/{n_in}, out={}/{e})",
+            x.len(),
+            out.len()
+        );
+    }
+    let (Some(rb_g), Some(rb_u), Some(rb_d)) = (
+        gguf_row_bytes(ty_g, n_in),
+        gguf_row_bytes(ty_u, n_in),
+        gguf_row_bytes(ty_d, ff),
+    ) else {
+        return Ok(false);
+    };
+    if rb_g != rb_u {
+        return Ok(false);
+    }
+    if !moe_gemv_seg_ready(ty_g, n_in) || !moe_gemv_seg_ready(ty_u, n_in) {
+        return Ok(false);
+    }
+    if !moe_gemv_seg_ready(ty_d, ff) {
+        return Ok(false);
+    }
+    let (Some(plan_gu), Some(plan_d)) = (
+        eb::seg_launch_plan(nseg, 1, ff, rb_g),
+        eb::seg_launch_plan(nseg, 1, e, rb_d),
+    ) else {
+        return Ok(false);
+    };
+    let Some(ctx) = shared_ctx() else {
+        return Ok(false);
+    };
+    let Some(kernels) = moe_batch_kernels() else {
+        return Ok(false);
+    };
+    // 語呂: silu と和は dec_epi の既存カーネル (PTX が無ければ旧経路へ)。
+    let Some(epi) = dec_epi_kernels() else {
+        return Ok(false);
+    };
+    let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
+        moe_batch_slot(ty_g),
+        moe_batch_slot(ty_u),
+        moe_batch_slot(ty_d),
+    ) else {
+        return Ok(false);
+    };
+    ctx.make_current()?;
+
+    let lay = eb::seg_stage_layout(nseg, n_in);
+    let ng = nseg * ff;
+    let nh = nseg * e;
+    let prof = crate::model::seg_prof::enabled();
+
+    SEG_LAYER_SCRATCH.with(|cell| -> Result<()> {
+        let mut sc = cell.borrow_mut();
+        let _t_alloc = crate::model::seg_prof::stamp();
+        MoeScratch::ensure_tagged(&mut sc.stage, lay.total, crate::mem_audit::TAG_SEG)?;
+        MoeScratch::ensure_tagged(&mut sc.g, ng * 4, crate::mem_audit::TAG_SEG)?;
+        MoeScratch::ensure_tagged(&mut sc.u, ng * 4, crate::mem_audit::TAG_SEG)?;
+        MoeScratch::ensure_tagged(&mut sc.act, ng * 4, crate::mem_audit::TAG_SEG)?;
+        MoeScratch::ensure_tagged(&mut sc.h, nh * 4, crate::mem_audit::TAG_SEG)?;
+        MoeScratch::ensure_tagged(&mut sc.out, e * 4, crate::mem_audit::TAG_SEG)?;
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_ALLOC, _t_alloc);
+
+        // 1. prologue を 1 本に詰めて **1 回の H2D** で送る。
+        let _t_tbl = crate::model::seg_prof::stamp();
+        if sc.host.len() < lay.total {
+            sc.host.resize(lay.total, 0);
+        }
+        put_u64s(&mut sc.host[lay.pg..lay.pg + nseg * 8], pg);
+        put_u64s(&mut sc.host[lay.pu..lay.pu + nseg * 8], pu);
+        put_u64s(&mut sc.host[lay.pd..lay.pd + nseg * 8], pd);
+        put_u32s(&mut sc.host[lay.sgu..lay.sgu + nseg * 16], seg_gu);
+        put_u32s(&mut sc.host[lay.sgd..lay.sgd + nseg * 16], seg_d);
+        put_f32s(&mut sc.host[lay.wt..lay.wt + nseg * 4], w);
+        put_f32s(&mut sc.host[lay.x..lay.x + n_in * 4], &x[..n_in]);
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_TABLE, _t_tbl);
+
+        let stage = sc.stage.as_ref().expect("確保済み");
+        let g = sc.g.as_ref().expect("確保済み");
+        let u = sc.u.as_ref().expect("確保済み");
+        let act = sc.act.as_ref().expect("確保済み");
+        let h = sc.h.as_ref().expect("確保済み");
+        let outb = sc.out.as_ref().expect("確保済み");
+        let _t_h2d = crate::model::seg_prof::stamp();
+        stage.copy_from(&sc.host[..lay.total])?;
+        dbg_htod(lay.total);
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_H2D, _t_h2d);
+
+        // 2. 5 起動を同じストリームに積む (待たない)。
+        let base = stage.ptr;
+        let _ = seg_ev::record(0); // gate の前
+        let mut pw = base + lay.pg as u64;
+        let mut px = base + lay.x as u64;
+        let mut po = g.ptr;
+        let mut ps = base + lay.sgu as u64;
+        let (mut ns, mut ni, mut no, mut rb) = (
+            nseg as c_int,
+            n_in as c_int,
+            ff as c_int,
+            rb_g as c_int,
+        );
+        let _t_launch = crate::model::seg_prof::stamp();
+        unsafe {
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut ns as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut no as *mut _ as *mut c_void,
+                &mut rb as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(
+                kernels.fns[slot_g],
+                plan_gu.grid,
+                plan_gu.block,
+                plan_gu.smem,
+                &mut args,
+            )?;
+        }
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+        let _ = seg_ev::record(1); // gate の後
+        let mut pw = base + lay.pu as u64;
+        let mut px = base + lay.x as u64;
+        let mut po = u.ptr;
+        let mut ps = base + lay.sgu as u64;
+        let _t_launch = crate::model::seg_prof::stamp();
+        unsafe {
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut ns as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut no as *mut _ as *mut c_void,
+                &mut rb as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(
+                kernels.fns[slot_u],
+                plan_gu.grid,
+                plan_gu.block,
+                plan_gu.smem,
+                &mut args,
+            )?;
+        }
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+        let _ = seg_ev::record(2); // up の後
+        let _t_launch = crate::model::seg_prof::stamp();
+        // 3. silu(g) * u (デバイスで閉じる)
+        unsafe {
+            let mut pg_p = g.ptr;
+            let mut pu_p = u.ptr;
+            let mut pa_p = act.ptr;
+            let mut n = ng as c_int;
+            let mut args = [
+                &mut pg_p as *mut _ as *mut c_void,
+                &mut pu_p as *mut _ as *mut c_void,
+                &mut pa_p as *mut _ as *mut c_void,
+                &mut n as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(
+                epi.silu,
+                ((ng as u32).div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+        let _ = seg_ev::record(3); // silu の後
+        // 4. down
+        let mut pw = base + lay.pd as u64;
+        let mut px = act.ptr;
+        let mut po = h.ptr;
+        let mut ps = base + lay.sgd as u64;
+        let (mut ns2, mut ni2, mut no2, mut rb2) = (
+            nseg as c_int,
+            ff as c_int,
+            e as c_int,
+            rb_d as c_int,
+        );
+        let _t_launch = crate::model::seg_prof::stamp();
+        unsafe {
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut ns2 as *mut _ as *mut c_void,
+                &mut ni2 as *mut _ as *mut c_void,
+                &mut no2 as *mut _ as *mut c_void,
+                &mut rb2 as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(
+                kernels.fns[slot_d],
+                plan_d.grid,
+                plan_d.block,
+                plan_d.smem,
+                &mut args,
+            )?;
+        }
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+        let _ = seg_ev::record(4); // down の後
+        // 5. 重み付き和 (h -> out, has_sh = 0)
+        let mut ph = h.ptr;
+        let mut pwv = base + lay.wt as u64;
+        let mut psh = h.ptr;
+        let mut sgw = 0.0f32;
+        let mut pout = outb.ptr;
+        let (mut e_c, mut ns3, mut has_sh) = (e as c_int, nseg as c_int, 0 as c_int);
+        let _t_launch = crate::model::seg_prof::stamp();
+        unsafe {
+            let mut args = [
+                &mut ph as *mut _ as *mut c_void,
+                &mut pwv as *mut _ as *mut c_void,
+                &mut psh as *mut _ as *mut c_void,
+                &mut sgw as *mut _ as *mut c_void,
+                &mut pout as *mut _ as *mut c_void,
+                &mut e_c as *mut _ as *mut c_void,
+                &mut ns3 as *mut _ as *mut c_void,
+                &mut has_sh as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(
+                epi.sum,
+                ((e as u32).div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+        // 和の後 (ここを待てば 5 起動ぶんが終わる)
+        let timed = seg_ev::record(5);
+
+        // 6. GPU を待つ間にミスの CPU 計算を走らせる (重ね打ち)。
+        let _t_miss = crate::model::seg_prof::stamp();
+        let miss_r = cpu_miss();
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_MISS, _t_miss);
+
+        // 7. 待ちは null ストリームのイベント 1 本だけ (文脈同期はしない)。
+        //    文脈同期 (cuCtxSynchronize) は背景の上げ直しまで待つので使わない。
+        let _t_sync = crate::model::seg_prof::stamp();
+        let sync_r = if timed {
+            seg_ev::wait(5)
+        } else if seg_ev::record_raw(6) {
+            seg_ev::wait(6)
+        } else {
+            // イベントが張れない環境では文脈同期へ (安全側)。
+            ctx.sync()
+        };
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_SYNC, _t_sync);
+        miss_r?;
+        sync_r?;
+
+        // 8. 結果 (e 要素) だけ戻す。
+        let _t_d2h = crate::model::seg_prof::stamp();
+        let got: Vec<f32> = outb.to_vec(e)?;
+        dbg_d2h(e * 4);
+        crate::model::seg_prof::add(crate::model::seg_prof::PH_D2H, _t_d2h);
+        out[..e].copy_from_slice(&got);
+
+        // 9. 計上 (GPU 時間はイベント、バイト数は segment x 行数 x 行長)。
+        if prof {
+            crate::model::seg_prof::note_layer();
+            let rb_gu = rb_g as u64 * ff as u64 * nseg as u64;
+            let rb_dn = rb_d as u64 * e as u64 * nseg as u64;
+            let one = |a: usize, b: usize, g: usize, bytes: u64| {
+                if let Some(ns) = seg_ev::elapsed_ns(a, b) {
+                    crate::model::seg_prof::add_gpu(g, ns, bytes as usize);
+                }
+            };
+            one(0, 1, crate::model::seg_prof::GP_GATE, rb_gu);
+            one(1, 2, crate::model::seg_prof::GP_UP, rb_gu);
+            one(2, 3, crate::model::seg_prof::GP_SILU, 0);
+            one(3, 4, crate::model::seg_prof::GP_DOWN, rb_dn);
+            one(4, 5, crate::model::seg_prof::GP_SUM, 0);
+        }
+        Ok(())
+    })?;
     Ok(true)
 }
 

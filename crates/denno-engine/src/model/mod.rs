@@ -33,6 +33,7 @@ pub mod qwen4exp_attn;
 pub mod qwen4exp_decode;
 pub mod qwen4exp_qsa;
 pub mod qwen4exp_ssm;
+pub mod seg_prof;
 pub mod start_warm;
 pub mod steer;
 

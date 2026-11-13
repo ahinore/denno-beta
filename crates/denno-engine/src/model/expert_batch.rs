@@ -53,6 +53,85 @@ pub fn batch_enabled() -> bool {
     *ON.get_or_init(|| batch_from_value(std::env::var(EXPERT_BATCH_ENV).ok().as_deref()))
 }
 
+/// task 278: 層を **1 同期**で閉じる新しい K 型経路 (`DENNO_SEG_LAYER`)。
+///
+/// 旧経路 (`moe_gemv_seg_pair` + `moe_gemv_seg_one`) は 1 層 3 起動 / 2 同期で、
+/// その間ホストが `silu` と足し込みをするため GPU が待つ。新経路は
+/// gate / up / silu / down / 重み付き和 を同じストリームに積み、**待ちは 1 回**、
+/// ホストへ返すのは `e` 要素だけ (153 KB -> 10 KB)。ミス expert は VRAM へ
+/// 上げずに CPU で計算し、その裏で GPU を走らせる。
+pub const SEG_LAYER_ENV: &str = "DENNO_SEG_LAYER";
+
+/// [`SEG_LAYER_ENV`] の解釈 (純関数)。**既定 off** (lab で採否を決めるまで)。
+pub fn seg_layer_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// 新経路が有効か (プロセスで 1 回だけ env を読む)。
+pub fn seg_layer_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| seg_layer_from_value(std::env::var(SEG_LAYER_ENV).ok().as_deref()))
+}
+
+// ---------------------------------------------------------------------------
+// task 278: 1 回の H2D に詰める prologue のレイアウト (純関数)
+// ---------------------------------------------------------------------------
+//
+// 旧経路は 1 層で 7 回の小さな同期 H2D を出していた (ポインタ表 3 本 +
+// segment 表 2 本 + 入力 + act)。毎回ドライバ往復 + 直前のカーネル待ちが乗る。
+// ここでは 1 本のホストバッファに詰め、**1 回の H2D** で送る。オフセットは
+// 8 バイト境界に揃える (`u64` のポインタ表を置くため)。
+
+/// prologue の 1 本バッファのレイアウト (バイト単位)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegStage {
+    /// gate のポインタ表 (`nseg` x u64)
+    pub pg: usize,
+    /// up のポインタ表
+    pub pu: usize,
+    /// down のポインタ表
+    pub pd: usize,
+    /// gate/up 用 segment 表 (`nseg` x 4 x u32)
+    pub sgu: usize,
+    /// down 用 segment 表
+    pub sgd: usize,
+    /// ヒットの重み (`nseg` x f32)
+    pub wt: usize,
+    /// 入力 (`n_in` x f32)
+    pub x: usize,
+    /// 全体のバイト数
+    pub total: usize,
+}
+
+/// `nseg` / `n_in` からレイアウトを決める。**純関数**。
+///
+/// `total` が 0 になるのは `nseg == 0` か `n_in == 0` のときだけで、呼び出し側は
+/// その形では起動しない (fail closed)。
+pub fn seg_stage_layout(nseg: usize, n_in: usize) -> SegStage {
+    let a8 = |v: usize| (v + 7) & !7usize;
+    let pg = 0usize;
+    let pu = a8(pg + nseg * 8);
+    let pd = a8(pu + nseg * 8);
+    let sgu = a8(pd + nseg * 8);
+    let sgd = a8(sgu + nseg * 16);
+    let wt = a8(sgd + nseg * 16);
+    let x = a8(wt + nseg * 4);
+    let total = a8(x + n_in * 4);
+    SegStage {
+        pg,
+        pu,
+        pd,
+        sgu,
+        sgd,
+        wt,
+        x,
+        total,
+    }
+}
+
 /// gate/up 用 segment 表 (`[eid, m=1, x_off=0, out_off=i*n_out]`)。
 ///
 /// gate と up は**同じ表**を使える: どちらも全 expert が同じ入力ベクトル x を
@@ -386,6 +465,50 @@ mod tests {
         assert!(!batch_from_value(Some("off")));
         assert!(!batch_from_value(Some("false")));
         assert!(!batch_from_value(Some(" 0 ")));
+    }
+
+    /// task 278: 新経路は**既定 off**。明示的な真値だけ on。
+    #[test]
+    fn seg_layer_gate_defaults_off() {
+        assert!(!seg_layer_from_value(None), "未設定は off (既定)");
+        assert!(!seg_layer_from_value(Some("")));
+        assert!(!seg_layer_from_value(Some("0")));
+        assert!(!seg_layer_from_value(Some("off")));
+        assert!(!seg_layer_from_value(Some("false")));
+        assert!(seg_layer_from_value(Some("1")));
+        assert!(seg_layer_from_value(Some("on")));
+        assert!(seg_layer_from_value(Some(" TRUE ")));
+    }
+
+    /// task 278: prologue の 1 本バッファのオフセットが重ならず 8 バイト境界。
+    #[test]
+    fn seg_stage_layout_is_packed_and_aligned() {
+        let (nseg, n_in) = (10usize, 2560usize);
+        let l = seg_stage_layout(nseg, n_in);
+        assert_eq!(l.pg, 0);
+        // 8 バイト境界 (u64 のポインタ表を置く)
+        for off in [l.pg, l.pu, l.pd, l.sgu, l.sgd, l.wt, l.x, l.total] {
+            assert_eq!(off % 8, 0, "offset {off} が 8 の倍数でない");
+        }
+        // 各ブロックがちょうど必要な長さを持ち、順に詰まっている
+        assert_eq!(l.pu, l.pg + nseg * 8);
+        assert_eq!(l.pd, l.pu + nseg * 8);
+        assert_eq!(l.sgu, l.pd + nseg * 8);
+        assert_eq!(l.sgd, l.sgu + nseg * 16);
+        assert_eq!(l.wt, l.sgd + nseg * 16);
+        assert_eq!(l.x, l.wt + nseg * 4);
+        assert_eq!(l.total, l.x + n_in * 4, "末尾に入力が収まる");
+        // 実形: 10 segment / x 2560 で 10 KB 台 (旧経路の 7 回のコピーと同じ量)
+        assert!(l.total > n_in * 4 && l.total < 12_000, "total={}", l.total);
+        // nseg = 1 でも壊れない (a8 = 8 バイト境界に揃える)
+        let one = seg_stage_layout(1, 8);
+        assert_eq!(one.pu, 8);
+        assert_eq!(one.pd, 16);
+        assert_eq!(one.sgu, 24);
+        assert_eq!(one.sgd, 40);
+        assert_eq!(one.wt, 56);
+        assert_eq!(one.x, 64, "nseg*4 = 4 の次を 8 に揃える");
+        assert_eq!(one.total, 96, "x の 32 バイト + 揃え");
     }
 
     // -----------------------------------------------------------------------
