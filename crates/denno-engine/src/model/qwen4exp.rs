@@ -6047,8 +6047,13 @@ pub fn mix_qchain_line() -> Option<String> {
     }
     let n = MIX_QCHAIN_HITS.load(std::sync::atomic::Ordering::Relaxed);
     let calls = MIX_QCHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    // task 282: 高速 GEMV (`DENNO_MIX_QK`) が実際に撃たれた回数も出す。
+    #[cfg(feature = "cuda")]
+    let qk = crate::cuda::mix_qk_hits();
+    #[cfg(not(feature = "cuda"))]
+    let qk = 0u64;
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6057,6 +6062,9 @@ pub fn mix_qchain_line() -> Option<String> {
 pub fn mix_qchain_reset() {
     MIX_QCHAIN_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
     MIX_QCHAIN_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    // task 282: 高速 GEMV の計数も同じ区切りで 0 に戻す。
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_qk_reset();
 }
 
 #[cfg(test)]
