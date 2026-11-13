@@ -132,6 +132,23 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_SEG_K_PTX",
         on: crate::model::expert_batch::seg_layer_enabled,
     },
+    // task 282: 量子型 mix の fused chain (down → silu → up → hc_mixed を 1 同期) と、
+    // その GEMV (1 行 1 ブロック / 1 warp 8 行)。どちらも既定 on で、PTX が
+    // 欠けると静かに旧 GEMV・旧ホスト経路へ落ちる (遅い) ので台帳に載せる。
+    GatePtx {
+        env: "DENNO_MIX_QCHAIN",
+        ptx: "kernels_mix_dev.ptx",
+        entries: &["dno_mix_lo_silu"],
+        path_env: "DENNO_MIX_DEV_PTX",
+        on: crate::model::qwen4exp::mix_qchain_gate_on,
+    },
+    GatePtx {
+        env: "DENNO_MIX_QK",
+        ptx: "kernels_seg_k.ptx",
+        entries: &["dno_mix_gemv_q8_0_r8", "dno_mix_gemv_q8_0_rowblk"],
+        path_env: "DENNO_SEG_K_PTX",
+        on: crate::cuda::mix_qk_gate_on,
+    },
     GatePtx {
         env: "DENNO_DEC_EXP_SUMDEV",
         ptx: "kernels_dec_epi.ptx",
