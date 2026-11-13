@@ -153,6 +153,30 @@ pub fn iq_v2_enabled() -> bool {
     *ON.get_or_init(|| iq_v2_from_value(std::env::var(EXPERT_IQ_V2_ENV).ok().as_deref()))
 }
 
+/// task 275: `DENNO_EXP_IQ_V3` — IQ2_S / IQ3_S のグリッド表を詰めた v3 カーネル
+/// (`kernels_exp_iq_v3.ptx`) で回す。**既定 off** (採否は lab で決める)。
+///
+/// v3 は v2 と同じ起動形・同じ segment 表で、変わるのは shared に置く表だけ:
+/// IQ2_S は 8 KB の u64 を 2 bit x 8 に詰めた 2 KB、IQ3_S は 4 KB の u64 のうち
+/// 使われている下位 32 bit だけの 2 KB (上位 32 bit は全 0 で誰も読まない)。
+/// 表の値と積の順は v2 と同じなので**値は v2 と一致する** (lab の md5 で確認)。
+/// PTX が無いときは v2 のまま (fail closed = 性能だけのゲート)。
+pub const EXPERT_IQ_V3_ENV: &str = "DENNO_EXP_IQ_V3";
+
+/// [`EXPERT_IQ_V3_ENV`] の解釈 (純関数)。`"1"` / `"true"` / `"on"` だけが真。
+pub fn iq_v3_from_value(v: Option<&str>) -> bool {
+    crate::model::expert_vram::flag_on(v)
+}
+
+/// v3 カーネルを使うか (プロセスで 1 回だけ env を読む)。
+pub fn iq_v3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| iq_v3_from_value(std::env::var(EXPERT_IQ_V3_ENV).ok().as_deref()))
+}
+
+/// v3 が差し替えるスロット (`kernels_exp_iq_v3.cu` にあるカーネルの型)。
+pub const IQ_V3_SLOTS: [usize; 2] = [0, 2];
+
 /// [`EXPERT_IQ_UPLOAD_ENV`] の解釈 (純関数)。未設定・数値でない値は既定値。
 pub fn upload_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim) {
@@ -281,6 +305,22 @@ pub fn note_gpu_layer(n: u32) {
     GPU_EXPERTS.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// task 261: 層一括 (旧 4 型) 経路が 1 層を GPU で完了した回数。
+static BATCH_OK: AtomicU64 = AtomicU64::new(0);
+
+/// task 261: 層一括経路が expert を載せられず per-expert 経路へ落ちた回数。
+static BATCH_BAIL: AtomicU64 = AtomicU64::new(0);
+
+/// 層一括経路が 1 層を回し切った。
+pub fn note_batch_ok() {
+    BATCH_OK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 層一括経路が途中で諦めた (1 本でも VRAM に載らなかった)。
+pub fn note_batch_bail() {
+    BATCH_BAIL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 上げ直し (H2D) を 1 本ぶん積む。
 pub fn note_upload() {
     UPLOADS.fetch_add(1, Ordering::Relaxed);
@@ -317,8 +357,17 @@ pub fn stats_line() -> Option<String> {
         None => "vram=-".to_string(),
     };
     let up_ms = UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
+    // task 261: 載らなかった理由の内訳 (`type` = カーネルが無い型 / `budget` =
+    // 予算に 1 本が入らない / `alloc` = 実メモリの確保に失敗)。
+    #[cfg(feature = "cuda")]
+    let (fb, fb_ty, fb_budget, fb_alloc) = crate::model::expert_vram::fallback_breakdown();
+    #[cfg(not(feature = "cuda"))]
+    let (fb, fb_ty, fb_budget, fb_alloc) = (0u64, 0u64, 0u64, 0u64);
+    // task 261: 旧 4 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層一括経路の当たり外れ。
+    let batch_ok = BATCH_OK.load(Ordering::Relaxed);
+    let batch_bail = BATCH_BAIL.load(Ordering::Relaxed);
     Some(format!(
-        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} {vram}",
+        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} batch_ok={batch_ok} batch_bail={batch_bail} fb={fb}(type={fb_ty} budget={fb_budget} alloc={fb_alloc}) {vram}",
         h as f64 / l as f64
     ))
 }
@@ -350,6 +399,8 @@ pub fn stats_reset() {
         &UPLOAD_LAYERS,
         &UPLOAD_N,
         &UPLOAD_LAYERS_NS,
+        &BATCH_OK,
+        &BATCH_BAIL,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -898,6 +949,98 @@ mod tests {
             assert_eq!(count(name), Some(8), "v2: {name} の引数の数が .cu と違う");
         }
         assert_eq!(count(SILU_KERNEL), Some(4), "v2: {SILU_KERNEL} の引数の数");
+    }
+
+    /// task 275: v3 ゲートは**既定 off** (`DENNO_EXP_IQ_V3`)。名前は .cu に在り、
+    /// v2 と同じ 8 引数であること (PTX があれば引数の数も見る)。
+    #[test]
+    fn v3_gate_and_kernel_names() {
+        assert!(!iq_v3_from_value(None));
+        assert!(!iq_v3_from_value(Some("")));
+        assert!(iq_v3_from_value(Some("1")));
+        assert!(iq_v3_from_value(Some("on")));
+        assert!(iq_v3_from_value(Some(" true ")));
+        assert!(!iq_v3_from_value(Some("0")));
+        assert!(!iq_v3_from_value(Some("off")));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let cu = std::fs::read_to_string(dir.join("kernels_exp_iq_v3.cu")).expect(".cu が読めない");
+        for i in IQ_V3_SLOTS {
+            let name = kernel_name(i).expect("slot");
+            let full = format!("{name}_v3");
+            assert!(cu.contains(&format!("__global__ void {full}(")), "{full} が .cu に無い");
+        }
+        // v3 が差し替えないスロットは v2 の名前のまま (取り違えの防止)。
+        for i in 0..SLOTS {
+            if IQ_V3_SLOTS.contains(&i) {
+                continue;
+            }
+            let name = kernel_name(i).expect("slot");
+            assert!(!cu.contains(&format!("__global__ void {name}_v3(")), "{name} は v3 の担当外");
+        }
+        // PTX があれば引数 8 本 (v1/v2 と同じ segment 表)。
+        let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq_v3.ptx")) else {
+            return;
+        };
+        for i in IQ_V3_SLOTS {
+            let name = format!("{}_v3", kernel_name(i).expect("slot"));
+            let head = format!(".visible .entry {name}(");
+            let j = ptx.find(&head).expect("v3 PTX に kernel が無い");
+            let rest = &ptx[j + head.len()..];
+            let end = rest.find(')').unwrap_or(rest.len());
+            assert_eq!(rest[..end].matches(".param").count(), 8, "{name} の引数の数");
+        }
+    }
+
+    /// .h の C 配列を数値列にする (0x.. / 10 進 / 接尾辞 u ull を食う)。
+    fn header_values(src: &str, name: &str) -> Vec<u64> {
+        let head = format!("{name}[");
+        let i = src.find(&head).unwrap_or_else(|| panic!("{name} が .h に無い"));
+        let open = src[i..].find('{').expect("{ が無い") + i;
+        let close = src[open..].find('}').expect("} が無い") + open;
+        let body = &src[open + 1..close];
+        let mut out = Vec::new();
+        for tok in body.split(',') {
+            let t = tok.trim().trim_end_matches("ull").trim_end_matches('u').trim();
+            if t.is_empty() {
+                continue;
+            }
+            let v = if let Some(h) = t.strip_prefix("0x") {
+                u64::from_str_radix(h, 16).expect("hex")
+            } else {
+                t.parse::<u64>().expect("dec")
+            };
+            out.push(v);
+        }
+        out
+    }
+
+    /// task 275: 詰めた表 (`dno_iq2s_grid2` / `dno_iq3s_grid32`) が元の表と
+    /// **同じ値**を与えること。GPU 無しで確かめられる部分をここで固定する。
+    #[test]
+    fn compact_tables_match_originals() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let h = std::fs::read_to_string(dir.join("kernels_exp_iq_tables.h")).expect(".h が読めない");
+        const LUT: [u64; 3] = [8, 25, 43];
+        let g = header_values(&h, "dno_iq2s_grid2");
+        let full = header_values(&h, "dno_iq2s_grid");
+        assert_eq!(g.len(), 1024);
+        assert_eq!(full.len(), 1024);
+        for i in 0..1024 {
+            for j in 0..8 {
+                let code = (g[i] >> (2 * j)) & 3;
+                let want = (full[i] >> (8 * j)) & 0xff;
+                assert_ne!(code, 3, "iq2s: code 3 が使われている (entry {i} j {j})");
+                assert_eq!(LUT[code as usize], want, "iq2s: entry {i} j {j}");
+            }
+        }
+        let g32 = header_values(&h, "dno_iq3s_grid32");
+        let full3 = header_values(&h, "dno_iq3s_grid");
+        assert_eq!(g32.len(), 512);
+        assert_eq!(full3.len(), 512);
+        for i in 0..512 {
+            assert_eq!(full3[i] >> 32, 0, "iq3s: 上位 32 bit が 0 でない (entry {i})");
+            assert_eq!(g32[i], full3[i] & 0xffff_ffff, "iq3s: entry {i}");
+        }
     }
 
     /// task 190: ヒット本数ごとの表はゲート off では空。
