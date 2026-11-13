@@ -25486,6 +25486,9 @@ impl Drop for PfPoolGuard {
         if self.owned {
             pf_pool_release();
         }
+        // task 297: prefill の終端で MoE の作業域も OS へ返す。使い回しが効くのは
+        // この prefill の中 (48 層) だけなので、decode のあいだ抱えない。
+        crate::model::qwen4exp::moe_scratch_release();
     }
 }
 

@@ -15628,8 +15628,10 @@ struct MoeScratch {
 
 impl MoeScratch {
     /// 必要な長さに合わせる (伸ばすときだけゼロ埋めが走る = 初回だけ)。
-    fn resize(&mut self, tot: usize, e: usize, ff: usize) {
-        self.xin.resize(tot * e, 0.0);
+    fn resize(&mut self, tot: usize, e: usize, ff: usize, need_x: bool) {
+        // task 291: 索引付き経路 (`DENNO_MOE_FLAT_IDX=1`) は gather をしないので
+        // `xin` を確保しない (確保すると毎層 300 MB 超のゼロ埋めが残る)。
+        self.xin.resize(if need_x { tot * e } else { 0 }, 0.0);
         self.act.resize(tot * ff, 0.0);
         self.up.resize(tot * ff, 0.0);
         self.h.resize(tot * e, 0.0);
@@ -15732,6 +15734,75 @@ fn moe_quant_all(
     }
 }
 
+/// task 291: タイル全体の活性 (`nt × n_in`、トークン順) を 1 回だけ int8 に量子化する。
+///
+/// gather をしない経路 (`DENNO_MOE_FLAT_IDX=1`) 用。トークンごとに独立なので、
+/// 行をいくつに割っても値は変わらない ([`moe_expert::quant_act_i8`] の外側ループは
+/// トークン)。量子化の結果は 1 トークンにつき 1 回だけ計算される
+/// (gather 経路は expert の数だけ同じ行を量子化し直していた)。
+fn moe_quant_tile(
+    src: &[f32],
+    nt: usize,
+    n_in: usize,
+    blk: usize,
+    q8: &mut Vec<i8>,
+    qsc: &mut Vec<f32>,
+    qgs: &mut Vec<f32>,
+) {
+    let nb = n_in / blk;
+    let ng = n_in / 32;
+    q8.resize(nt * n_in, 0);
+    qsc.resize(nt * nb, 0.0);
+    qgs.resize(nt * ng, 0.0);
+    if nt == 0 {
+        return;
+    }
+    let one = |(i, ((q, sc), gs)): (usize, ((&mut [i8], &mut [f32]), &mut [f32]))| {
+        let rows = q.len() / n_in;
+        let t0 = i * rows;
+        moe_expert::quant_act_i8(
+            &src[t0 * n_in..(t0 + rows) * n_in],
+            rows,
+            n_in,
+            blk,
+            q,
+            sc,
+            gs,
+        )
+        .expect("活性の量子化 (タイル)");
+    };
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        let per = nt.div_ceil(rayon::current_num_threads().max(1)).max(1);
+        q8.par_chunks_mut(per * n_in)
+            .zip(qsc.par_chunks_mut(per * nb))
+            .zip(qgs.par_chunks_mut(per * ng))
+            .enumerate()
+            .for_each(one);
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let _ = &one;
+        let rows = nt;
+        moe_expert::quant_act_i8(src, rows, n_in, blk, q8, qsc, qgs)
+            .expect("活性の量子化 (タイル)");
+    }
+}
+
+/// task 291: 選択 expert のバッチ GEMM で gather を省く (`DENNO_MOE_FLAT_IDX`、既定 off)。
+///
+/// on のとき、位相 A (gate/up) の活性は**タイル全体を 1 回だけ量子化**し、
+/// カーネルが expert ごとのトークン索引 (`VnniAct::tid`) で引く。
+/// 値は gather 経路と同じ (行ごとの量子化は行に依存しない) なので、
+/// 経路を切り替えても出力はビット一致する。
+fn moe_flat_idx_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("DENNO_MOE_FLAT_IDX").ok().as_deref(), Some("1"))
+    })
+}
+
 /// タスク表の `ahead` 個先のタスクが触る重みの行頭を先読みする。
 ///
 /// expert の重みは毎層 DRAM から cold で来る (実測 1 層あたり 86〜255 expert × 約 3 MB)。
@@ -15772,10 +15843,54 @@ fn moe_scratch_take() -> MoeScratch {
 }
 
 /// 返す。大きすぎるものは捨てる (巨大な層のあとメモリを抱え込まない)。
+///
+/// task 291: 上限を `DENNO_MOE_SCRATCH_KEEP_MB` で動かせるようにした (**既定 2048**)。
+///
+/// 実形 (tot = 3826 × 8 = 30,608、e 2560 / ff 640) の作業域は 782 MB で、旧固定値
+/// 512 MiB では毎層捨てられ、次の層で `vec![0.0; ...]` のゼロ埋めを払い直していた
+/// (lab t291a の実測 149 ms/層、prefill 全体で 7 s)。`=2048` にすると 48 層で
+/// 使い回して UD-Q4_K_XL の 3,826 cold prefill が -20.7% になる (lab t291a:
+/// 50.85 -> 40.30 s)。task 291 では target 30% に届かないため既定 off で置いたが、
+/// task 297 で target 20% に対して採否 yes になり **既定 2048** にした。
+/// `=512` で従来 (毎層捨てる) に戻せる。
+fn moe_scratch_keep_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        moe_scratch_keep_mb_from_value(std::env::var("DENNO_MOE_SCRATCH_KEEP_MB").ok().as_deref())
+            .saturating_mul(1024 * 1024)
+    })
+}
+
+/// task 297: `DENNO_MOE_SCRATCH_KEEP_MB` の解釈 (純関数)。未設定・数値でない値は
+/// 既定 2048 MiB。数値はそのまま (0 で毎層捨てる)。
+fn moe_scratch_keep_mb_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(MOE_SCRATCH_KEEP_MB_DEFAULT)
+}
+
+/// task 297: 作業域を使い回す上限の既定 (MiB)。
+pub(crate) const MOE_SCRATCH_KEEP_MB_DEFAULT: usize = 2048;
+
 fn moe_scratch_put(s: MoeScratch) {
-    const KEEP_BYTES: usize = 512 * 1024 * 1024;
     let mut g = MOE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
-    *g = if s.bytes() <= KEEP_BYTES { Some(s) } else { None };
+    *g = if s.bytes() <= moe_scratch_keep_bytes() {
+        Some(s)
+    } else {
+        None
+    };
+}
+
+/// task 297: prefill の終端で作業域を OS へ返す (持ち越さない)。
+///
+/// 使い回しが効くのは **1 回の prefill の中** (48 層 × 同じチャンク) だけで、
+/// prefill が終わったあとの decode には要らない。終端で持ち越すと実形で 782 MB を
+/// decode のあいだ抱えたままになり、長いプロンプトのあとの decode でページキャッシュを
+/// 圧迫する (lab t297b の既定モデル: warm short decode が +12%)。
+/// `MOE_SCRATCH` は `None` に戻すだけで、次の prefill は先頭で 1 回だけ確保し直す。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn moe_scratch_release() {
+    let mut g = MOE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    *g = None;
 }
 
 /// 選択 expert の FFN を「層全体の (expert, 行列, 行チャンク) を 1 本のタスク列に
@@ -15861,8 +15976,17 @@ fn moe_experts_flat(
     }
 
     // 2. 作業バッファ (層をまたいで使い回す) を必要な長さに合わせる。
+    //    task 291: 索引付き経路では gather をしないので `xin` を取らない。
+    let (g, u, d) = (&lw.gate_exps, &lw.up_exps, &lw.down_exps);
+    let (gty, uty, dty) = (g.ty, u.ty, d.ty);
+    let idx_mode = moe_flat_idx_on()
+        && vnni
+        && moe_expert::vnni_supported()
+        && moe_expert::vnni_act_block(gty).is_some()
+        && moe_expert::vnni_act_block(gty) == moe_expert::vnni_act_block(uty);
     let mut sc = moe_scratch_take();
-    sc.resize(tot, e, ff);
+    sc.resize(tot, e, ff, !idx_mode);
+    lap!("resize");
     let MoeScratch {
         mut xin,
         mut act,
@@ -15885,6 +16009,21 @@ fn moe_experts_flat(
     //    (expert 単位のままだと m 最大の expert が gather の straggler になる)。
     //    expert ごとに独立なコピーなので、分割しても値は変わらない。
     let (tok_max, tok_min) = (moe_tok_split_max(), moe_tok_split_min());
+    // task 291: 索引付き経路は gather の代わりに「expert → タイル内トークン番号」の
+    // 表だけを作る (活性はトークン順のまま、カーネルが索引で引く)。
+    let mut ids: Vec<u32> = Vec::new();
+    let mut off_t: Vec<usize> = Vec::new();
+    if idx_mode {
+        ids.reserve(tot);
+        off_t.reserve(n);
+        for pos in 0..n {
+            off_t.push(ids.len());
+            for &(t, _) in &by_expert[eid[pos]] {
+                ids.push(t as u32);
+            }
+        }
+        debug_assert_eq!(ids.len(), tot);
+    } else {
     {
         // (pos, チャンクの先頭トークン, 長さ)。expert 内のチャンクは連続。
         let mut gspec: Vec<(usize, usize, usize)> = Vec::new();
@@ -15920,11 +16059,10 @@ fn moe_experts_flat(
         #[cfg(not(feature = "par"))]
         parts.into_iter().enumerate().for_each(gather_one);
     }
+    }
     lap!("gather");
 
     // 4. 行列・入力・出力長の検証 (1 expert 1 行列につき 1 度だけ) とバイト列の切り出し
-    let (g, u, d) = (&lw.gate_exps, &lw.up_exps, &lw.down_exps);
-    let (gty, uty, dty) = (g.ty, u.ty, d.ty);
     let rb_g = moe_expert::row_bytes(gty, e).map_err(|err| one(format!("{}: {err}", g.name)))?;
     let rb_u = moe_expert::row_bytes(uty, e).map_err(|err| one(format!("{}: {err}", u.name)))?;
     let rb_d = moe_expert::row_bytes(dty, ff).map_err(|err| one(format!("{}: {err}", d.name)))?;
@@ -15934,15 +16072,24 @@ fn moe_experts_flat(
     for pos in 0..n {
         let m = ms[pos];
         let ei = eid[pos];
-        let xa = &xin[off_x[pos]..off_x[pos] + m * e];
         let ad = &act[off_a[pos]..off_a[pos] + m * ff];
         let bg = g.slice(ei)?;
-        moe_expert::check_gemm_matrix(gty, bg, e, ff, xa, m)
-            .map_err(|err| one(format!("{}: expert {ei}: {err}", g.name)))?;
         let bu = u.slice(ei)?;
-        moe_expert::check_gemm_matrix(uty, bu, e, ff, xa, m)
-            .map_err(|err| one(format!("{}: expert {ei}: {err}", u.name)))?;
         let bd = d.slice(ei)?;
+        if idx_mode {
+            // task 291: 活性はタイル全体 (トークン順) を索引で引くので、行の
+            // 連続スライスは無い。形状だけを検証する。
+            moe_expert::check_gemm_matrix_shape(gty, bg, e, ff, m)
+                .map_err(|err| one(format!("{}: expert {ei}: {err}", g.name)))?;
+            moe_expert::check_gemm_matrix_shape(uty, bu, e, ff, m)
+                .map_err(|err| one(format!("{}: expert {ei}: {err}", u.name)))?;
+        } else {
+            let xa = &xin[off_x[pos]..off_x[pos] + m * e];
+            moe_expert::check_gemm_matrix(gty, bg, e, ff, xa, m)
+                .map_err(|err| one(format!("{}: expert {ei}: {err}", g.name)))?;
+            moe_expert::check_gemm_matrix(uty, bu, e, ff, xa, m)
+                .map_err(|err| one(format!("{}: expert {ei}: {err}", u.name)))?;
+        }
         moe_expert::check_gemm_matrix(dty, bd, ff, e, ad, m)
             .map_err(|err| one(format!("{}: expert {ei}: {err}", d.name)))?;
         gs.push(bg);
@@ -15998,30 +16145,42 @@ fn moe_experts_flat(
     let use_g = blk_a.is_some() && blk_g == blk_a;
     let use_u = blk_a.is_some() && blk_u == blk_a;
     let use_d = vnni && blk_d.is_some();
+    // task 291: 索引付き経路ではタイル全体を 1 回だけ量子化する (gather 無し)。
+    let nt = out.len() / e.max(1);
     // expert ごとの先頭 (ブロック単位)。`off_x` は f32 要素単位なので割って使う。
     let mut off_s: Vec<usize> = Vec::with_capacity(n);
     let mut off_g: Vec<usize> = Vec::with_capacity(n);
     if let Some(blk) = blk_a {
-        let (nb, ng) = (e / blk, e / 32);
-        let (mut so, mut go) = (0usize, 0usize);
-        for &m in ms.iter() {
-            off_s.push(so);
-            off_g.push(go);
-            so += m * nb;
-            go += m * ng;
+        if idx_mode {
+            moe_quant_tile(&xs, nt, e, blk, &mut q8, &mut qsc, &mut qgs);
+        } else {
+            let (nb, ng) = (e / blk, e / 32);
+            let (mut so, mut go) = (0usize, 0usize);
+            for &m in ms.iter() {
+                off_s.push(so);
+                off_g.push(go);
+                so += m * nb;
+                go += m * ng;
+            }
+            moe_quant_all(&xin, &ms, &off_x, e, blk, tok_max, tok_min, &mut q8, &mut qsc, &mut qgs);
         }
-        moe_quant_all(&xin, &ms, &off_x, e, blk, tok_max, tok_min, &mut q8, &mut qsc, &mut qgs);
     }
     let nb_a = blk_a.map(|b| e / b).unwrap_or(0);
     let ng_a = e / 32;
 
     // 6. gate+up+silu 積 (行チャンクごとに 1 タスク)
+    //    索引付き経路で VNNI が受け取らなかったら記録して層を落とす (値が変わるため)。
+    let idx_bad = std::sync::atomic::AtomicBool::new(false);
     let run_a = |(i, t): (usize, &MoeTask)| {
         let pos = t.pos as usize;
         let (a, b) = (t.a as usize, t.b as usize);
         let (t0, t1) = (t.t0 as usize, t.t1 as usize);
         let m = t1 - t0;
-        let x = &xin[off_x[pos] + t0 * e..off_x[pos] + t1 * e];
+        let x: &[f32] = if idx_mode {
+            &[]
+        } else {
+            &xin[off_x[pos] + t0 * e..off_x[pos] + t1 * e]
+        };
         let dst_a = act_p.add(off_a[pos] + t0 * ff + a);
         let dst_u = up_p.add(off_a[pos] + t0 * ff + a);
         // 2〜4 個先のタスクの重みを先読みする (層のタスク表は expert ごとに cold)。
@@ -16038,15 +16197,30 @@ fn moe_experts_flat(
             m,
             n_in: e,
             blk: 0,
+            tid: &[],
         };
         if let Some(blk) = blk_a {
-            act_g = moe_expert::VnniAct {
-                q: &q8[off_x[pos] + t0 * e..off_x[pos] + t1 * e],
-                sc: &qsc[off_s[pos] + t0 * nb_a..off_s[pos] + t1 * nb_a],
-                gs: &qgs[off_g[pos] + t0 * ng_a..off_g[pos] + t1 * ng_a],
-                m,
-                n_in: e,
-                blk,
+            act_g = if idx_mode {
+                // task 291: 活性はタイル順のまま。この expert のトークンを索引で引く。
+                moe_expert::VnniAct {
+                    q: &q8[..nt * e],
+                    sc: &qsc[..nt * nb_a],
+                    gs: &qgs[..nt * ng_a],
+                    m,
+                    n_in: e,
+                    blk,
+                    tid: &ids[off_t[pos] + t0..off_t[pos] + t1],
+                }
+            } else {
+                moe_expert::VnniAct {
+                    q: &q8[off_x[pos] + t0 * e..off_x[pos] + t1 * e],
+                    sc: &qsc[off_s[pos] + t0 * nb_a..off_s[pos] + t1 * nb_a],
+                    gs: &qgs[off_g[pos] + t0 * ng_a..off_g[pos] + t1 * ng_a],
+                    m,
+                    n_in: e,
+                    blk,
+                    tid: &[],
+                }
             };
         }
         // task 95: `DENNO_EXP_KPROF=1` のとき、バッチ GEMM の型別記録が行列を
@@ -16062,8 +16236,16 @@ fn moe_experts_flat(
             ),
         ] {
             crate::model::exp_kprof::set_mat(mat);
-            if !(use_vnni && moe_expert::gemm_rows_vnni(ty, w, e, a, b, &act_g, dst, ff)) {
-                moe_expert::gemm_rows(ty, rb, w, e, a, b, x, m, dst, ff, true);
+            let used =
+                use_vnni && moe_expert::gemm_rows_vnni(ty, w, e, a, b, &act_g, dst, ff);
+            if !used {
+                if idx_mode {
+                    // 索引付き経路は活性の行が連続でないので f32 へ落とせない。
+                    // 前提は呼び出し前に検査済みなので、ここへ来たら層を落とす。
+                    idx_bad.store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    moe_expert::gemm_rows(ty, rb, w, e, a, b, x, m, dst, ff, true);
+                }
             }
         }
         // act の行 [a, b) を silu(act) * up で置き換える (このタスクが書いた行だけ)。
@@ -16089,6 +16271,12 @@ fn moe_experts_flat(
     #[cfg(not(feature = "par"))]
     {
         ta.iter().enumerate().for_each(run_a);
+    }
+    if idx_bad.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(one(format!(
+            "層 {}: 索引付き VNNI 経路の前提が崩れた (gemm_rows_vnni が受取拒否)",
+            lw.il
+        )));
     }
     lap!("phaseA");
 
@@ -16131,6 +16319,7 @@ fn moe_experts_flat(
                 gs: &qgs[off_gb[pos] + t0 * (ff / 32)..off_gb[pos] + t1 * (ff / 32)],
                 m,
                 n_in: ff,
+                tid: &[],
                 blk: blk_d.unwrap_or(32),
             };
             if moe_expert::gemm_rows_vnni(dty, ds[pos], ff, a, b, &act_d, dst.get(), e) {
@@ -18713,6 +18902,39 @@ mod tests {
         // 範囲外の index でも「ヒープだから None」を先に返す (呼び出し側は
         // 従来の同期経路へ落ち、そちらが index を弾く)。
         assert!(w.slice_mapped(n_expert).expect("ヒープは None").is_none());
+    }
+
+    /// task 297: prefill の終端で作業域を OS へ返す (`moe_scratch_release`)。
+    /// 保持されたままにすると decode のあいだ実形で 782 MB を抱える。
+    #[test]
+    fn moe_scratch_release_drops_retained_workspace() {
+        let _ = moe_scratch_take(); // 他のテストの残りを退避
+        moe_scratch_put(MoeScratch::default());
+        assert!(
+            MOE_SCRATCH.lock().unwrap().is_some(),
+            "put で保持されるはず (既定 2048 MiB)"
+        );
+        moe_scratch_release();
+        assert!(
+            MOE_SCRATCH.lock().unwrap().is_none(),
+            "release で None に戻るはず"
+        );
+        // 2 回呼んでも壊れない (prefill の終端が二重に走っても安全)
+        moe_scratch_release();
+        assert!(MOE_SCRATCH.lock().unwrap().is_none());
+    }
+
+    /// task 297: 作業域を使い回す上限の既定は 2048 MiB (`DENNO_MOE_SCRATCH_KEEP_MB` で
+    /// 動かせる)。実形の作業域 782 MB は 2048 に収まるので 48 層で使い回せる。
+    /// 512 を明示すると従来 (毎層捨てる) に戻る。
+    #[test]
+    fn moe_scratch_keep_mb_defaults_to_2048() {
+        assert_eq!(moe_scratch_keep_mb_from_value(None), 2048);
+        assert_eq!(MOE_SCRATCH_KEEP_MB_DEFAULT, 2048);
+        assert_eq!(moe_scratch_keep_mb_from_value(Some("512")), 512);
+        assert_eq!(moe_scratch_keep_mb_from_value(Some(" 0 ")), 0);
+        // 数値でない値は既定へ (壊れた env で作業域を毎層捨てない)
+        assert_eq!(moe_scratch_keep_mb_from_value(Some("x")), 2048);
     }
 
     #[test]
@@ -26724,6 +26946,104 @@ mod tests {
             for &mu in &[1usize, 2, 4, 8, 16, 32, 64, 120] {
                 run(&vec![mu; ne], &format!("m={mu}"));
             }
+        }
+
+        /// task 291: UD-Q4_K_XL の prefill 形 (ne=512 / k=8 / nt=3826) で
+        /// 選択 expert のバッチ経路を測る。既定の `moe_flat_schedule_microbench`
+        /// は VNNI を切って legacy と比べるためのものなので、こちらは
+        /// **本番と同じ VNNI の有無**を引数で切り替え、型別 (kprof) と
+        /// 呼び出し側 (router / shared 込み) の合計も見る。
+        ///
+        /// `RAYON_NUM_THREADS=16 cargo test --release -p denno-engine --features cuda \
+        ///   --lib moe_ud_prefill_microbench -- --ignored --nocapture --test-threads=1`
+        #[test]
+        #[ignore = "CPU の実測 (lab の ms/token は別)"]
+        fn moe_ud_prefill_microbench() {
+            gpu_gemm_off();
+            let _g = moe_test_guard();
+            // ne / nt / reps は env で縮められる (既定は実形)。
+            let envu = |k: &str, d: usize| -> usize {
+                std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+            };
+            let (n_in, n_ff) = (2560usize, 640usize);
+            let ne = envu("T291_NE", 512);
+            let k = envu("T291_K", 8);
+            let nt = envu("T291_NT", 3826);
+            let reps = envu("T291_REPS", 3);
+            let dir = TempDir::new("t291bench");
+            let path = write_expert_gguf_big(&dir, n_in, n_ff, ne);
+            let f = GgufFile::open(&path).expect("open");
+            let p = bench_params(n_in, n_ff, ne, k);
+            let lw = cache_test_layer(&f, &p);
+
+            // 実モデルと同じ散らばり: 1 トークン = k 個の expert を一様に選ぶ。
+            let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+            let mut weights = vec![0.0f32; nt * k];
+            for t in 0..nt {
+                for j in 0..k {
+                    let h = (t as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ (j as u64 + 1) * 0xbf58_476d_1ce4_e5b9;
+                    let ei = ((h >> 33) as usize) % ne;
+                    by_expert[ei].push((t, j));
+                    weights[t * k + j] = 0.125;
+                }
+            }
+            let xs: Vec<f32> = (0..nt * n_in)
+                .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.003)
+                .collect();
+            let tot_m: usize = by_expert.iter().map(|v| v.len()).sum();
+            let m_max = by_expert.iter().map(|v| v.len()).max().unwrap_or(0);
+            println!(
+                "threads={} ne={ne} k={k} nt={nt} tot_m={tot_m} mean_m={:.1} max_m={m_max} vnni_supported={} vnni_enabled={}",
+                rayon::current_num_threads(),
+                tot_m as f32 / ne as f32,
+                moe_expert::vnni_supported(),
+                moe_expert::vnni_enabled()
+            );
+
+            let mut out = vec![0.0f32; nt * n_in];
+            let mut best = [f64::INFINITY; 2];
+            for rep in 0..reps {
+                for (vi, &vnni) in [false, true].iter().enumerate() {
+                    for v in out.iter_mut() {
+                        *v = 0.0;
+                    }
+                    let t0 = std::time::Instant::now();
+                    crate::model::exp_kprof::reset();
+                    let got = moe_ffn_quant_batch_opts(
+                        &p,
+                        &lw,
+                        &xs,
+                        nt,
+                        None,
+                        MoeSchedule::Auto,
+                        vnni,
+                    )
+                    .expect("batch");
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    std::hint::black_box(&got);
+                    out.copy_from_slice(&got);
+                    if vnni {
+                        if let Some(l) = crate::model::exp_kprof::line() {
+                            println!("  kprof: {l}");
+                        }
+                    }
+                    best[vi] = best[vi].min(ms);
+                    if rep == 0 {
+                        println!(
+                            "  vnni={vnni}: {ms:.1} ms/layer ({:.2} ms/token, 48 層 {:.1} s)",
+                            ms / nt as f64,
+                            ms * 48.0 / 1e3
+                        );
+                    }
+                }
+            }
+            println!(
+                "min: vnni=0 {:.1} ms/layer ({:.2} ms/tok) | vnni=1 {:.1} ms/layer ({:.2} ms/tok)",
+                best[0],
+                best[0] / nt as f64,
+                best[1],
+                best[1] / nt as f64
+            );
         }
 
         /// バッチ GEMV は逐次版と同じ**入口**を通るので、融合カーネルを
