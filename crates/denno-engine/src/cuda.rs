@@ -24562,10 +24562,19 @@ pub fn pf_pool_len() -> usize {
 /// 二重に呼ばれたときは既存の区画を組み直すだけ (返すのは最初のガード)。
 #[cfg(feature = "cuda")]
 pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
+    pf_pool_acquire_capped(n, crate::model::pf_pool::pf_pool_bytes())
+}
+
+/// task 279: 上限を指定して借りる (大きい計画は `DENNO_PF_POOL_BIG_MB` を使う)。
+///
+/// 上限は `cap` だけで決まり、レイアウトは `n` (チャンク / タイル) から組む。
+/// 呼び出し側が選んだ大きい形がここで上限を超える / 確保できないときは
+/// `owned == false` を返し、呼び出し側は従来のチャンク・タイルへ戻す。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> PfPoolGuard {
     let not_held = PfPoolGuard { owned: false };
     // ゲート / しきい値 / 上限は純関数で決める (既定では何も借りない =
     // 従来の `alloc_tagged` と 1 バイトも変わらない)。
-    let cap = crate::model::pf_pool::pf_pool_bytes();
     let Some(l) = crate::model::pf_pool::borrow_plan(
         n,
         crate::model::pf_pool::pf_pool_on(),
