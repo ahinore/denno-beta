@@ -143,10 +143,15 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         on: crate::model::qwen4exp::mix_qchain_gate_on,
     },
     GatePtx {
+        // task 286: mix の GEMV の既定は **v5 形** (`dno_gemv_q8_0_v5`、
+        // GDN の decode GEMV と同じカーネル)。PTX が欠けると静かに task 282 の
+        // (Blk, R8) へ落ちて遅いので、既定が使うファイルを台帳に載せる。
+        // `DENNO_MIX_QK=blk` (task 282 の形) は kernels_seg_k.ptx で、そちらは
+        // 上の DENNO_SEG_LAYER の項目が見ている。
         env: "DENNO_MIX_QK",
-        ptx: "kernels_seg_k.ptx",
-        entries: &["dno_mix_gemv_q8_0_r8", "dno_mix_gemv_q8_0_rowblk"],
-        path_env: "DENNO_SEG_K_PTX",
+        ptx: "kernels_moe_v5.ptx",
+        entries: &["dno_gemv_q8_0_v5"],
+        path_env: "DENNO_GEMV_V5_PTX",
         on: crate::cuda::mix_qk_gate_on,
     },
     GatePtx {
