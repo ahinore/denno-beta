@@ -651,15 +651,19 @@ pub fn pin_grow_target(need: usize, slot_cap: usize) -> usize {
     }
 }
 
-/// [`PIN_GROW_ENV`] の解釈 (`1` / `on` / `true` / `yes` だけ on)。
+/// [`PIN_GROW_ENV`] の解釈 (明示的な偽値だけ off)。
+///
+/// lab t296a: 余裕なし (従来) は 3,826 cold で 3.37 s、余裕ありは 3.18 s
+/// (-5.6%、同じ run の base2 は 3.37)。pinned の確保し直しが 31 回/リクエスト、
+/// 255 ms あった (`[pf-lm-dbg] stream` の `pin=`)。
 pub fn pin_grow_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v.map(str::trim) {
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        None => true,
+    }
 }
 
-/// pinned バウンスを余裕つきで確保するか (既定 off)。
+/// pinned バウンスを余裕つきで確保するか (既定 on)。
 pub fn pin_grow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| pin_grow_from_value(std::env::var(PIN_GROW_ENV).ok().as_deref()))
@@ -2587,11 +2591,13 @@ mod tests {
             (stream_bytes() / 3) / stream_group() >= 2_500_000,
             "1 枚に既定のグループが載らない"
         );
-        // task 296: pinned バウンスの余裕つき確保 (既定 off)。
-        assert!(!pin_grow(), "既定は従来の必要量ちょうど");
-        assert!(!pin_grow_from_value(None));
-        assert!(!pin_grow_from_value(Some("")));
+        // task 296: pinned バウンスの余裕つき確保 (既定 on、明示的な偽値だけ off)。
+        assert!(pin_grow(), "既定は余裕つき (lab t296a で -5.6%)");
+        assert!(pin_grow_from_value(None));
+        assert!(pin_grow_from_value(Some("")));
         assert!(!pin_grow_from_value(Some("0")));
+        assert!(!pin_grow_from_value(Some("off")));
+        assert!(!pin_grow_from_value(Some("False")));
         assert!(pin_grow_from_value(Some("1")));
         assert!(pin_grow_from_value(Some(" on ")));
         assert!(pin_grow_from_value(Some("yes")));

@@ -24090,12 +24090,43 @@ pub fn maybe_gpu_mix_bf16_batch_into(
 struct F32GemmBatchSc {
     x: Option<DevBuffer>,
     out: Option<DevBuffer>,
+    /// task 296: 大きい D2H 用の pinned 置き場 (grow-only)。
+    pin: Option<PinMem>,
 }
 
 thread_local! {
     static F32_GEMM_BATCH_SC: std::cell::RefCell<F32GemmBatchSc> = const {
-        std::cell::RefCell::new(F32GemmBatchSc { x: None, out: None })
+        std::cell::RefCell::new(F32GemmBatchSc { x: None, out: None, pin: None })
     };
+}
+
+/// `DENNO_F32_GEMM_PIN_D2H`: 1 MiB 以上の D2H を pinned 経由の非同期コピーに
+/// する (task 296、**既定 on**。`0` / `off` / `false` / `no` で従来の pageable)。
+///
+/// 層優先 prefill ではこの関数の D2H が毎層・毎チャンク走る:
+/// router (3,826 x 512 = 7.8 MB/層) と PLE の key/value
+/// (3,826 x 320 + 3,826 x 2560 = 22 MB/チャンク x 96)。pageable の
+/// `cuMemcpyDtoH` は 1 枚 6 GB/s 前後しか出ないので、pinned へ非同期で落として
+/// からホストへ写す (デバイスから出るバイト列は同じ = 値は不変)。
+pub const F32_GEMM_PIN_D2H_ENV: &str = "DENNO_F32_GEMM_PIN_D2H";
+
+/// この関数で pinned D2H を使う下限 (これ未満は従来の pageable)。
+pub(crate) const F32_GEMM_PIN_D2H_MIN: usize = 1 << 20;
+
+/// [`F32_GEMM_PIN_D2H_ENV`] の解釈 (明示的な偽値だけ off)。
+pub(crate) fn f32_gemm_pin_d2h_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        None => true,
+    }
+}
+
+/// 大きい D2H を pinned 経由にするか (既定 on)。
+fn f32_gemm_pin_d2h_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        f32_gemm_pin_d2h_from_value(std::env::var(F32_GEMM_PIN_D2H_ENV).ok().as_deref())
+    })
 }
 
 /// task 182: `maybe_gpu_f32_gemm_batch_into` の入口に入った回数 (テスト専用)。
@@ -24218,7 +24249,7 @@ fn f32_gemm_batch_run(
     };
     let r = F32_GEMM_BATCH_SC.with(|cell| -> Result<()> {
         let mut s = cell.borrow_mut();
-        let F32GemmBatchSc { x: dx, out: dout } = &mut *s;
+        let F32GemmBatchSc { x: dx, out: dout, pin } = &mut *s;
         // task 209: デバイス入力のときは `x` の作業域 (と H2D) を丸ごと省く。
         let xp = match src {
             BatchIn::Host(xs) => {
@@ -24249,21 +24280,66 @@ fn f32_gemm_batch_run(
                 1,
             );
             ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
-            ctx.sync()?;
-            // D2H は同期コピーで `out` へ直接 (中間 Vec / pinned を作らない)。
-            check(
-                (lib.memcpy_dtoh)(
-                    out.as_mut_ptr() as *mut c_void,
-                    dout.ptr(),
-                    nt * n * 4,
-                ),
-                "cuMemcpyDtoH (f32 batch)",
-            )?;
+            let bytes = nt * n * 4;
+            // task 296: 大きい D2H は pinned へ非同期で落として 1 回の同期で待つ
+            // (pageable の同期コピーは 6 GB/s 前後しか出ない)。
+            if bytes >= F32_GEMM_PIN_D2H_MIN && f32_gemm_pin_d2h_on() {
+                Scratch::ensure_pin(pin, bytes)?;
+                let p = pin.as_ref().expect("ensure 済み");
+                check(
+                    (lib.memcpy_dtoh_async)(p.ptr, dout.ptr(), bytes, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (f32 batch pin)",
+                )?;
+                ctx.sync()?;
+                // pinned → `out` (デバイスから出たバイト列は従来と同じ)。
+                std::ptr::copy_nonoverlapping(
+                    p.ptr as *const u8,
+                    out.as_mut_ptr() as *mut u8,
+                    bytes,
+                );
+            } else {
+                ctx.sync()?;
+                // D2H は同期コピーで `out` へ直接 (中間 Vec / pinned を作らない)。
+                check(
+                    (lib.memcpy_dtoh)(
+                        out.as_mut_ptr() as *mut c_void,
+                        dout.ptr(),
+                        bytes,
+                    ),
+                    "cuMemcpyDtoH (f32 batch)",
+                )?;
+            }
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         Ok(())
     });
     r.is_ok()
+}
+
+#[cfg(test)]
+mod f32_d2h_pin_tests {
+    use super::*;
+
+    /// task 296: 1 MiB 以上の D2H を pinned 経由にするゲートの真理値表。
+    #[test]
+    fn f32_gemm_pin_d2h_gate_truth_table() {
+        assert!(f32_gemm_pin_d2h_from_value(None), "未設定は既定 on");
+        assert!(f32_gemm_pin_d2h_from_value(Some("")));
+        assert!(f32_gemm_pin_d2h_from_value(Some("1")));
+        assert!(f32_gemm_pin_d2h_from_value(Some(" on ")));
+        assert!(!f32_gemm_pin_d2h_from_value(Some("0")));
+        assert!(!f32_gemm_pin_d2h_from_value(Some("off")));
+        assert!(!f32_gemm_pin_d2h_from_value(Some("False")));
+        assert!(!f32_gemm_pin_d2h_from_value(Some("no")));
+        // しきい値は 1 MiB (decode の小さい D2H は従来のまま = 挙動を変えない)。
+        assert_eq!(F32_GEMM_PIN_D2H_MIN, 1 << 20);
+        // 3,826 トークンの router (3,826 x 512) と PLE の value (3,826 x 2560) が
+        // しきい値を超えること (= prefill の主な D2H が pinned 経路に入る)。
+        assert!(3826 * 512 * 4 >= F32_GEMM_PIN_D2H_MIN);
+        assert!(3826 * 2560 * 4 >= F32_GEMM_PIN_D2H_MIN);
+        // decode (1 トークン x 512) は入らない。
+        assert!(512 * 4 < F32_GEMM_PIN_D2H_MIN);
+    }
 }
 
 
