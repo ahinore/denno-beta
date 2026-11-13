@@ -26078,17 +26078,27 @@ pub fn pf_upload_res(res: &[f32]) -> bool {
 }
 
 /// task 154: デバイスの残差をホストへ戻す (`res` は [nt][hc][e])。
+///
+/// task 300: `DENNO_PF_PLE_REUSE` のときは一時 Vec を作らず `out` へ直接
+/// D2H する (`out` は 14k のチャンクで 82 MB あり、`to_vec` + `copy_from_slice`
+/// は同じ大きさの確保と写しをもう 1 回ぶん払っていた)。値は同じ。
 pub fn pf_download_res(out: &mut [f32]) -> bool {
+    let direct = crate::model::qwen4exp::pf_ple_reuse_on();
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.res.as_ref() {
-            Some(b) if b.bytes() >= out.len() * 4 => match b.to_vec::<f32>(out.len()) {
-                Ok(v) => {
-                    out.copy_from_slice(&v);
-                    true
+            Some(b) if b.bytes() >= out.len() * 4 => {
+                if direct {
+                    return b.to_slice(out).is_ok();
                 }
-                Err(_) => false,
-            },
+                match b.to_vec::<f32>(out.len()) {
+                    Ok(v) => {
+                        out.copy_from_slice(&v);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
             _ => false,
         }
     })

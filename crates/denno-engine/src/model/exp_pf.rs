@@ -655,15 +655,24 @@ pub fn pin_grow_target(need: usize, slot_cap: usize) -> usize {
 ///
 /// lab t296a / t296c: 余裕なし (従来) は 3,826 cold で 3.37 / 3.41 s、余裕ありは
 /// 3.18 / 3.24 s (-5.6% / -5.1%)。pinned の確保し直しが 31 回・255 ms あった
-/// (`[pf-lm-dbg] stream` の `pin=`)。**目標 (-8%) には届かない**ので既定 off
-/// (採否は REPORT_P296.md)。
+/// (`[pf-lm-dbg] stream` の `pin=`)。task 296 の目標 (-8%) には届かなかったので
+/// いったん既定 off にした (採否は REPORT_P296.md)。task 300 で既定 on へ。
+///
+/// [`PIN_GROW_ENV`] の解釈。未設定は [`DEFAULT_PIN_GROW`]。
 pub fn pin_grow_from_value(v: Option<&str>) -> bool {
-    let low = v.map(|s| s.trim().to_ascii_lowercase());
-    matches!(
-        low.as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PIN_GROW,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
 }
+
+/// [`PIN_GROW_ENV`] の既定値。
+///
+/// task 300: **true**。task 296 の lab t296c は同じ木で 3,826 cold prefill を
+/// 3.415 → 3.235 s (-5.3%、14k と decode は無傷、md5 全 SAME) にしたが、
+/// task 296 の目標 -8% に届かないので既定 off のまま残されていた。task 300 の
+/// 目標は -6% なので、そのまま採る (t300 の lab で測り直す)。
+pub const DEFAULT_PIN_GROW: bool = true;
 
 /// pinned バウンスを余裕つきで確保するか (既定 off)。
 pub fn pin_grow() -> bool {
@@ -2593,10 +2602,11 @@ mod tests {
             (stream_bytes() / 3) / stream_group() >= 2_500_000,
             "1 枚に既定のグループが載らない"
         );
-        // task 296: pinned バウンスの余裕つき確保 (既定 off。lab で -5.1%/-5.6%)。
-        assert!(!pin_grow(), "既定は従来の必要量ちょうど");
-        assert!(!pin_grow_from_value(None));
-        assert!(!pin_grow_from_value(Some("")));
+        // task 300: pinned バウンスの余裕つき確保は**既定 on** (task 296 の
+        // lab t296c で 3,826 cold -5.3%、14k と decode は無傷)。
+        assert!(pin_grow(), "既定は余裕つき確保 (task 300)");
+        assert!(pin_grow_from_value(None));
+        assert!(pin_grow_from_value(Some("")));
         assert!(!pin_grow_from_value(Some("0")));
         assert!(!pin_grow_from_value(Some("off")));
         assert!(!pin_grow_from_value(Some("False")));
