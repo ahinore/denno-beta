@@ -480,20 +480,23 @@ pub const PF_POOL_BIG_MB_ENV: &str = "DENNO_PF_POOL_BIG_MB";
 
 /// [`PF_POOL_BIG_MB_ENV`] の既定 (MiB)。
 ///
-/// 14k / タイル = 全トークン / チャンク 3,072 / TC のレイアウトが 4,522 MiB
-/// なので、task 265 が見つけた「prefill 中のプール外の確保 (attention のミラー) が
-/// 空き不足で 255 MiB のチャンクを追い出す」ぶんの余裕 (約 340 MiB) を足す。
+/// 14k / タイル = 全トークン / チャンク 2,047 / TC のレイアウトが 4,341 MiB
+/// (lab t279a の `[pf-pool-big]` は 4,094 MiB) なので、task 265 が見つけた
+/// 「prefill 中のプール外の確保 (attention のミラー) が空き不足で 255 MiB の
+/// チャンクを追い出す」ぶんの余裕を足す。
 pub const DEFAULT_POOL_BIG_MB: usize = 4864;
 
-/// `DENNO_PF_POOL_BIG_CHUNK`: 大きい計画で使うチャンクの上限 (トークン、既定 3,072)。
+/// `DENNO_PF_POOL_BIG_CHUNK`: 大きい計画で使うチャンクの上限 (トークン、既定 2,047)。
 ///
-/// 2,048 以上は GDN prefill のデバイス連鎖の境界を越えるので
-/// `DENNO_PF_CHAIN_BIG` (task 270) が前提。上限 4,096 は lab t270a/b で
-/// 連鎖が生きることを確認した最大。
+/// 既定を GDN prefill のデバイス連鎖の境界 (`GDN_CHUNK_MIN_TOKENS` = 2,048) の
+/// 手前に置いてある。境界を越えると `DENNO_PF_CHAIN_BIG` (task 270) が要り、
+/// lab t279a ではチャンク 2,047 (8.31 s) と 3,072 (8.46 s) で差が無かったので、
+/// 未確認の形を既定にしない。上限 4,096 は t270a/b で連鎖が生きることを
+/// 確認した最大 (明示指定 + `DENNO_PF_CHAIN_BIG=1` のときだけ到達する)。
 pub const PF_POOL_BIG_CHUNK_ENV: &str = "DENNO_PF_POOL_BIG_CHUNK";
 
 /// [`PF_POOL_BIG_CHUNK_ENV`] の既定 (トークン)。
-pub const DEFAULT_BIG_CHUNK: usize = 3072;
+pub const DEFAULT_BIG_CHUNK: usize = 2047;
 
 /// チャンクの上限 (これ以上は連鎖の形が未確認)。
 pub const MAX_BIG_CHUNK: usize = 4096;
@@ -608,9 +611,9 @@ pub fn big_candidates(
     if !tiles.contains(&base_tile) {
         tiles.push(base_tile);
     }
-    // チャンク: 上限 → 2 倍 → 従来。nt_all/2 を超えない。
+    // チャンク: 上限 → 2 倍 → 従来。どれも `hi_chunk` と nt_all/2 を超えない。
     let mut chunks: Vec<usize> = Vec::new();
-    for c in [hi_chunk, base_chunk.saturating_mul(2), base_chunk] {
+    for c in [hi_chunk, base_chunk.saturating_mul(2).min(hi_chunk), base_chunk] {
         let c = c.min(nt_all / 2).max(base_chunk);
         if !chunks.contains(&c) {
             chunks.push(c);
@@ -825,6 +828,7 @@ mod tests {
         assert_eq!(big_chunk_from_value(None), DEFAULT_BIG_CHUNK);
         assert_eq!(big_chunk_from_value(Some("0")), DEFAULT_BIG_CHUNK);
         assert_eq!(big_chunk_from_value(Some("4096")), 4096);
+        assert_eq!(big_chunk_from_value(None), 2047);
         // 上限 4,096 を超える指定は丸める (未確認の形を作らない)。
         assert_eq!(big_chunk_from_value(Some("8192")), MAX_BIG_CHUNK);
     }
@@ -832,14 +836,14 @@ mod tests {
     /// 候補は「パス数が少ない順 → チャンクが大きい順」で、従来のタイルも残る。
     #[test]
     fn big_candidates_reduce_passes_first() {
-        let c = big_candidates(14018, 1536, 5120, 3072);
+        let c = big_candidates(14018, 1536, 5120, 2047);
         // パス数を 1 にした組が先頭 (チャンクは大きい順)。
-        assert_eq!(c[0], (3072, 14018), "先頭が 1 パスでない: {c:?}");
+        assert_eq!(c[0], (2047, 14018), "先頭が 1 パスでない: {c:?}");
         assert_eq!(c[1], (1536, 14018));
         // そのあと 2 パス、最後に従来のタイル (3 パス)。
         let passes: Vec<usize> = c.iter().map(|&(_, t)| 14018usize.div_ceil(t)).collect();
         assert!(passes.windows(2).all(|w| w[0] <= w[1]), "パス数が単調でない: {passes:?}");
-        assert!(c.contains(&(3072, 5120)), "従来タイルが候補に無い: {c:?}");
+        assert!(c.contains(&(2047, 5120)), "従来タイルが候補に無い: {c:?}");
         assert_eq!(passes.last().copied(), Some(3));
         // 1 枚 (= 層優先の意味が消える) は作らない。
         assert!(c.iter().all(|&(ch, _)| ch * 2 <= 14018), "{c:?}");
@@ -856,13 +860,18 @@ mod tests {
     fn choose_big_only_when_the_cap_allows_it() {
         let n = need();
         let base_total = layout(&n).expect("レイアウト").total;
-        // task 265 の既定 (2,688 MiB) では従来の形のまま。
+        // task 265 の既定 (2,688 MiB) ではタイルが上がらない = パス数は 3 のまま。
         let same = choose_big(&n, DEFAULT_POOL_MB << 20, DEFAULT_BIG_CHUNK).expect("収まる");
-        assert_eq!((same.0, same.1), (n.chunk, n.tile));
-        assert_eq!(same.2.total, base_total);
-        // 4,864 MiB なら 1 パス + チャンク 3,072。
+        assert_eq!(same.1, n.tile, "タイルが上がっている: {same:?}");
+        assert_eq!(14018usize.div_ceil(same.1), 3);
+        assert!(same.2.total <= (DEFAULT_POOL_MB << 20));
+        // レイアウトの合計ちょうどでも従来の形が選べる (fail open の下限)。
+        let tight = choose_big(&n, base_total, DEFAULT_BIG_CHUNK).expect("収まる");
+        assert_eq!((tight.0, tight.1), (n.chunk, n.tile));
+        assert_eq!(tight.2.total, base_total);
+        // 4,864 MiB なら 1 パス + チャンク 2,047 (連鎖の境界の手前)。
         let big = choose_big(&n, DEFAULT_POOL_BIG_MB << 20, DEFAULT_BIG_CHUNK).expect("1 パス");
-        assert_eq!((big.0, big.1), (3072, 14018));
+        assert_eq!((big.0, big.1), (2047, 14018));
         assert!(big.2.total <= (DEFAULT_POOL_BIG_MB << 20));
         // 余裕 (task 265 の実測で 255 MiB の追い出しが起きた) を残す。
         assert!(
@@ -872,9 +881,9 @@ mod tests {
         );
         // 収まる組が無ければ None (呼び出し側は従来の形へ)。
         assert!(choose_big(&n, 1 << 20, DEFAULT_BIG_CHUNK).is_none());
-        // チャンクの上限を 2,047 に落とすと、1 パスのままチャンクだけ境界の手前。
-        let c2047 = choose_big(&n, DEFAULT_POOL_BIG_MB << 20, 2047).expect("1 パス");
-        assert_eq!((c2047.0, c2047.1), (2047, 14018));
+        // 上限を 1,536 に落とすと、1 パスのままチャンクは従来のまま。
+        let c1536 = choose_big(&n, DEFAULT_POOL_BIG_MB << 20, 1536).expect("1 パス");
+        assert_eq!((c1536.0, c1536.1), (1536, 14018));
     }
 
     /// 3,826 の大きい形 (チャンク 1,913) も既定のプールに収まる。
