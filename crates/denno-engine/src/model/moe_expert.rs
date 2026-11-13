@@ -4953,6 +4953,34 @@ pub(crate) fn check_gemm_matrix(
     Ok(rb)
 }
 
+/// task 291: 活性を索引で引く経路用の形状検証。
+///
+/// [`check_gemm_matrix`] から「`xs` の長さが `m * n_in`」の検査だけを外した形。
+/// 索引付き経路は活性の行が連続でない (タイル全体を `tid` で引く) ので、
+/// 呼び出し側が `tid` の範囲を別に検査する。
+pub(crate) fn check_gemm_matrix_shape(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    m: usize,
+) -> Result<usize> {
+    let rb = row_bytes(ty, n_in)?;
+    if n_out == 0 {
+        bail!("n_out が 0 (行が無い)");
+    }
+    if m == 0 {
+        bail!("m が 0 (トークンが無い)");
+    }
+    let want_b = n_out
+        .checked_mul(rb)
+        .ok_or_else(|| anyhow::anyhow!("1 expert のバイト数が usize を溢れる (n_out={})", n_out))?;
+    if blocks.len() != want_b {
+        bail!("blocks の長さ {} が n_out * row_bytes = {} と違う", blocks.len(), want_b);
+    }
+    Ok(rb)
+}
+
 /// テスト用: バッチ融合カーネルが実際に発火した回数 (スレッドローカル)。
 /// 「テストが緑」= 「融合経路が通った」ではないので、ゲートの通過を数える。
 /// テストは 1 本 1 スレッドで走るので、スレッドローカルなら他のテストと混ざらない
@@ -6998,18 +7026,25 @@ pub(crate) fn vnni_act_block(ty: GgmlType) -> Option<usize> {
 }
 
 /// 量子化済みの活性 (`m × n_in`)。[`quant_act_i8`] が埋める。
+///
+/// task 291: `tid` が空でなければ「活性はトークン順のタイル全体」を指し、
+/// 行 `t` は `tid[t]` 番目のトークンを使う (gather を省くための索引)。
+/// 空のときは従来どおり行 `t` = タイル内 `t` 番目 (expert ごとに詰め直した形)。
 #[derive(Clone, Copy)]
 pub(crate) struct VnniAct<'a> {
-    /// `m * n_in` の int8 (トークン優先、1 トークン = `n_in` 要素)
+    /// 索引なし: `m * n_in` の int8 (トークン優先、1 トークン = `n_in` 要素)
+    /// 索引あり: `ntok * n_in` の int8 (タイル全体、トークン優先)
     pub q: &'a [i8],
-    /// `m * (n_in / blk)` のスケール (`max|x| / 127`、0 のとき 1.0)
+    /// `(行 or トークン) * (n_in / blk)` のスケール (`max|x| / 127`、0 のとき 1.0)
     pub sc: &'a [f32],
-    /// `m * (n_in / 32)` の `Σ x` (量子化前の f32 の逐次和)
+    /// `(行 or トークン) * (n_in / 32)` の `Σ x` (量子化前の f32 の逐次和)
     pub gs: &'a [f32],
     pub m: usize,
     pub n_in: usize,
     /// 活性の量子化ブロック長 (Q4_K は 256、Q5_1 は 32)
     pub blk: usize,
+    /// task 291: 行 → タイル内トークン番号 (空 = 詰め直し済みの行をそのまま使う)
+    pub tid: &'a [u32],
 }
 
 /// 活性 `xs` (`m × n_in`、トークン優先) を int8 に量子化する。
@@ -7105,15 +7140,19 @@ pub(crate) fn vnni_calls() -> usize {
 /// 行ループの間ずっと L1 に載る。`total` は (行, トークン) ごとの f32 累計で、
 /// ブロックごとに `xd * (Σ q x) - dmin * (Σ m x)` を足す。
 ///
+/// task 291: `IDX` が真なら活性の行 `t` は `act.tid[t]` 番目のトークンを使う
+/// (gather を省いた形)。`q` / `sc` / `gs` はタイル全体 (トークン順) を指す。
+///
 /// # Safety
 ///
 /// - `blocks.len() == n_out * row_bytes(Q4K, n_in)` (`n_in % 256 == 0`)。
-/// - `act` は `quant_act_i8` を通した活性で、`blk == 256`・長さは型どおり。
+/// - `act` は `quant_act_i8` を通した活性で、`blk == 256`・長さは型どおり
+///   (`IDX` のときは `tid` の指すトークンが `q` の範囲内、は呼び出し側が保証)。
 /// - `out` は `m * stride` 要素以上の有効な領域を指し、`r0..r1` は `[0, n_out)` の分割。
 /// - 実行 CPU が AVX-512 (F/BW/VL/DQ/VNNI) を持つこと。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
-unsafe fn gemm_q4k_vnni(
+unsafe fn gemm_q4k_vnni<const IDX: bool>(
     blocks: &[u8],
     n_in: usize,
     r0: usize,
@@ -7142,6 +7181,7 @@ unsafe fn gemm_q4k_vnni(
     let xp = act.q.as_ptr();
     let scp = act.sc.as_ptr();
     let gp = act.gs.as_ptr();
+    let tidp = act.tid.as_ptr();
 
     /// 8 レーンの水平和 (既存 AVX2 カーネルと同じ順序)。
     #[inline]
@@ -7193,7 +7233,10 @@ unsafe fn gemm_q4k_vnni(
             let mnv = _mm256_loadu_ps(mnf.as_ptr());
             let tot = total.as_mut_ptr().add((r - r0) * m);
             for t in 0..m {
-                let xb = xp.add(t * n_in + b * 256);
+                // task 291: 索引ありは行ではなくトークン番号で活性を引く
+                // (gather をしない代わりに、`q`/`sc`/`gs` はタイル全体を指す)。
+                let ti = if IDX { *tidp.add(t) as usize } else { t };
+                let xb = xp.add(ti * n_in + b * 256);
                 let mut acc = _mm512_setzero_ps();
                 for j in 0..4usize {
                     let xv = _mm512_loadu_si512(xb.add(j * 64) as *const __m512i);
@@ -7202,9 +7245,9 @@ unsafe fn gemm_q4k_vnni(
                     acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dp), av[j], acc);
                 }
                 // 最小値項: dmin * Σ_g m_g * (Σ x)。
-                let gsv = _mm256_loadu_ps(gp.add(t * ng32 + b * 8));
+                let gsv = _mm256_loadu_ps(gp.add(ti * ng32 + b * 8));
                 let msum = hsum8(_mm256_mul_ps(mnv, gsv));
-                let xd = *scp.add(t * nb + b);
+                let xd = *scp.add(ti * nb + b);
                 *tot.add(t) += xd * hsum16(acc) - dmin * msum;
             }
             // 重みは毎層 cold: 数行先の行頭を L1 へ先読みする (残りは HW に任せる)。
@@ -7243,7 +7286,7 @@ unsafe fn gemm_q4k_vnni(
 /// [`gemm_q4k_vnni`] と同じ (Q5_1 は `n_in % 32 == 0` が [`row_bytes`] で保証される)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
-unsafe fn gemm_q5_1_vnni(
+unsafe fn gemm_q5_1_vnni<const IDX: bool>(
     blocks: &[u8],
     n_in: usize,
     r0: usize,
@@ -7272,6 +7315,7 @@ unsafe fn gemm_q5_1_vnni(
     let xp = act.q.as_ptr();
     let scp = act.sc.as_ptr();
     let gp = act.gs.as_ptr();
+    let tidp = act.tid.as_ptr();
 
     #[inline]
     #[target_feature(enable = "avx2,fma")]
@@ -7325,15 +7369,17 @@ unsafe fn gemm_q5_1_vnni(
                 );
                 let ai = (r - ra) * m;
                 for t in 0..m {
-                    let xv = _mm256_loadu_si256(xp.add(t * n_in + b * 32) as *const __m256i);
+                    // task 291: 索引ありはトークン番号で活性を引く。
+                    let ti = if IDX { *tidp.add(t) as usize } else { t };
+                    let xv = _mm256_loadu_si256(xp.add(ti * n_in + b * 32) as *const __m256i);
                     let dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qv, xv);
-                    let xd = *scp.add(t * nb + b);
+                    let xd = *scp.add(ti * nb + b);
                     let sv = _mm256_set1_ps(d * xd);
                     let o = ai + t;
                     let a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dp), sv, *acc.get_unchecked(o));
                     *acc.get_unchecked_mut(o) = a;
                     // gs は量子化前の Σ x なので xd を掛けない (掛けると最小値項が xd 倍に潰れる)。
-                    *ms.get_unchecked_mut(o) += mc * *gp.add(t * ng32 + b);
+                    *ms.get_unchecked_mut(o) += mc * *gp.add(ti * ng32 + b);
                 }
                 // 重みは毎層 cold: 数行先の同じブロック位置を L1 へ先読みする。
                 if r + PF_ROWS < re {
@@ -7379,8 +7425,23 @@ pub(crate) fn gemm_rows_vnni(
     }
     let nb = n_in / blk;
     let ng32 = n_in / 32;
-    if act.q.len() < act.m * n_in || act.sc.len() < act.m * nb || act.gs.len() < act.m * ng32 {
-        return false;
+    if act.tid.is_empty() {
+        if act.q.len() < act.m * n_in || act.sc.len() < act.m * nb || act.gs.len() < act.m * ng32 {
+            return false;
+        }
+    } else {
+        // task 291: 索引付き = 活性はトークン順のタイル全体。`tid` の各値が
+        // タイルのトークン数に収まっていることだけ見る (gather をしない)。
+        if act.tid.len() != act.m || act.q.len() % n_in != 0 {
+            return false;
+        }
+        let ntok = act.q.len() / n_in;
+        if act.sc.len() != ntok * nb || act.gs.len() != ntok * ng32 {
+            return false;
+        }
+        if act.tid.iter().any(|&i| i as usize >= ntok) {
+            return false;
+        }
     }
     let rb = match row_bytes(ty, n_in) {
         Ok(rb) => rb,
@@ -7404,10 +7465,18 @@ pub(crate) fn gemm_rows_vnni(
         unsafe {
             match ty {
                 GgmlType::Q4K => {
-                    gemm_q4k_vnni(blocks, n_in, r0, r1, act, out, stride);
+                    if act.tid.is_empty() {
+                        gemm_q4k_vnni::<false>(blocks, n_in, r0, r1, act, out, stride);
+                    } else {
+                        gemm_q4k_vnni::<true>(blocks, n_in, r0, r1, act, out, stride);
+                    }
                 }
                 GgmlType::Q5_1 => {
-                    gemm_q5_1_vnni(blocks, n_in, r0, r1, act, out, stride);
+                    if act.tid.is_empty() {
+                        gemm_q5_1_vnni::<false>(blocks, n_in, r0, r1, act, out, stride);
+                    } else {
+                        gemm_q5_1_vnni::<true>(blocks, n_in, r0, r1, act, out, stride);
+                    }
                 }
                 _ => return false,
             }
@@ -10101,6 +10170,82 @@ mod tests {
         out
     }
 
+    /// task 291: 索引付き VNNI (`VnniAct::tid`) は「トークンを詰め直した活性」と
+    /// **ビット一致**する。活性の量子化は行ごとに独立なので、タイル全体を 1 回
+    /// 量子化して索引で引いても、expert ごとに詰め直して量子化しても同じ値になる。
+    #[test]
+    fn vnni_indexed_rows_match_gathered_rows_bitwise() {
+        if !vnni_supported() {
+            eprintln!("skip vnni_indexed_rows_match_gathered_rows_bitwise: avx512vnni が無い");
+            return;
+        }
+        for (ty, n_in, n_out, blk) in [
+            (GgmlType::Q4K, 1024usize, 8usize, 256usize),
+            (GgmlType::Q5_1, 128usize, 6usize, 32usize),
+        ] {
+            let nt = 7usize;
+            let xs: Vec<f32> = (0..nt * n_in)
+                .map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0)
+                .collect();
+            let blocks = make_expert(ty, n_in, n_out, 3);
+            // タイル全体を 1 回だけ量子化する (索引付き経路と同じ形)。
+            let (q, sc, gs) = make_act(&xs, nt, n_in, blk);
+            // 2 expert にトークンを分ける (gather した並びはトークン昇順)。
+            let picks: [&[usize]; 2] = [&[0, 2, 3], &[1, 4, 5, 6]];
+            let mut indexed_all: Vec<Vec<f32>> = Vec::new();
+            let mut gathered_all: Vec<Vec<f32>> = Vec::new();
+            for sel in picks {
+                let m = sel.len();
+                // (a) 索引付き: タイルの量子化をそのまま引き、行 → トークン番号を渡す。
+                let tid: Vec<u32> = sel.iter().map(|&t| t as u32).collect();
+                let act_i = VnniAct {
+                    q: &q,
+                    sc: &sc,
+                    gs: &gs,
+                    m,
+                    n_in,
+                    blk,
+                    tid: &tid,
+                };
+                let mut got = vec![0f32; m * n_out];
+                assert!(
+                    gemm_rows_vnni(ty, &blocks, n_in, 0, n_out, &act_i, got.as_mut_ptr(), n_out),
+                    "{ty:?}: 索引付き VNNI が使われていない"
+                );
+                // (b) 詰め直し: トークンの行をコピーしてから量子化する (従来経路)。
+                let mut gath = Vec::with_capacity(m * n_in);
+                for &t in sel {
+                    gath.extend_from_slice(&xs[t * n_in..(t + 1) * n_in]);
+                }
+                let (qg, scg, gsg) = make_act(&gath, m, n_in, blk);
+                let act_g = VnniAct {
+                    q: &qg,
+                    sc: &scg,
+                    gs: &gsg,
+                    m,
+                    n_in,
+                    blk,
+                    tid: &[],
+                };
+                let mut want = vec![0f32; m * n_out];
+                assert!(
+                    gemm_rows_vnni(ty, &blocks, n_in, 0, n_out, &act_g, want.as_mut_ptr(), n_out),
+                    "{ty:?}: 詰め直し VNNI が使われていない"
+                );
+                assert!(
+                    got.iter().any(|v| *v != 0.0),
+                    "{ty:?}: 出力が全 0 (経路の生死が分からない)"
+                );
+                let gb: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+                let wb: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(gb, wb, "{ty:?}: 索引付きと詰め直しで値が違う (n_tok={m})");
+                indexed_all.push(got);
+                gathered_all.push(want);
+            }
+            assert_eq!(indexed_all.len(), gathered_all.len());
+        }
+    }
+
     /// `quant_act_i8` のスケール・丸め・グループ和を手計算と突き合わせる。
     #[test]
     fn quant_act_i8_scales_rounding_and_groups() {
@@ -10164,6 +10309,7 @@ mod tests {
                 m,
                 n_in,
                 blk,
+                tid: &[],
             };
             let mut got = vec![0f32; m * n_out];
             let before = vnni_calls();
@@ -10253,6 +10399,7 @@ mod tests {
             m: 1,
             n_in,
             blk: 256,
+            tid: &[],
         };
         let mut out = vec![0f32; n_out];
         for ty in [GgmlType::Q8_0, GgmlType::Q5K] {
@@ -10413,6 +10560,7 @@ mod tests {
                                     m,
                                     n_in: c.n_in,
                                     blk: c.blk,
+                                    tid: &[],
                                 };
                                 let used = gemm_rows_vnni(
                                     c.ty,
@@ -10574,6 +10722,7 @@ mod tests {
                         m,
                         n_in,
                         blk,
+                        tid: &[],
                     };
                     let used = gemm_rows_vnni(
                         ty,
@@ -12642,6 +12791,7 @@ mod exp_kprof_tests {
                 m,
                 n_in,
                 blk: 256,
+                tid: &[],
             };
             let mut got = vec![0f32; m * n_out];
             let used = gemm_rows_vnni(
