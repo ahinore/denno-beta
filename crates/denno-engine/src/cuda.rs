@@ -3090,6 +3090,28 @@ pub fn alloc_keep_experts() -> bool {
     })
 }
 
+/// task 290: `DENNO_ALLOC_FORCE_CHUNK` — 確保が失敗したあと、`cuMemGetInfo` の
+/// 空きが要求以上に見えても (断片化) 冷たいチャンクを 1 本空けて再試行する
+/// (**既定 on**。`0` / `off` / `false` / `no` で task 256 の従来動作に戻る)。
+///
+/// lab t286c の UD-Q4_K_XL 14k は「空き 3 MiB で 3 MiB の確保が error 2」で
+/// 落ちた。不足分が 0 なので `plan_eviction` が 1 本も選ばず、`emergency_free`
+/// も 0 を返して諦めていた。失敗後の再試行だけは空きを見ずに 1 本空ける。
+pub const ALLOC_FORCE_CHUNK_ENV: &str = "DENNO_ALLOC_FORCE_CHUNK";
+
+/// `DENNO_ALLOC_FORCE_CHUNK` の解釈 (純関数)。未設定・読めない値は既定 (on)。
+pub fn alloc_force_chunk_from_value(v: Option<&str>) -> bool {
+    parse_keep_experts(v, true)
+}
+
+/// 失敗後に 1 チャンク必ず空けるか (プロセスで 1 回だけ env を読む)。
+pub fn alloc_force_chunk() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        alloc_force_chunk_from_value(std::env::var(ALLOC_FORCE_CHUNK_ENV).ok().as_deref())
+    })
+}
+
 /// task 256: 確保 1 本が失敗したときに expert を追い出してよい上限 (バイト)。
 ///
 /// slab はチャンクが空にならないと実メモリを返さないので、上限はタグに
@@ -3187,8 +3209,11 @@ impl DevBuffer {
                 )
                 .is_some()
                 {
-                    let (rep, evicted_keys) =
-                        crate::model::expert_vram::emergency_free_chunks_keys(bytes);
+                    let (rep, evicted_keys) = if alloc_force_chunk() {
+                        crate::model::expert_vram::emergency_free_chunks_forced(bytes)
+                    } else {
+                        crate::model::expert_vram::emergency_free_chunks_keys(bytes)
+                    };
                     // task 279: 追い出した鍵を控える (プールが借りた作業域を返すときに
                     // expert を戻すため)。控えるだけで挙動は変えない。
                     note_alloc_evicted(evicted_keys);
@@ -25484,7 +25509,11 @@ pub fn pf_pool_len() -> usize {
 /// 二重に呼ばれたときは既存の区画を組み直すだけ (返すのは最初のガード)。
 #[cfg(feature = "cuda")]
 pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
-    pf_pool_acquire_capped(n, crate::model::pf_pool::pf_pool_bytes())
+    pf_pool_acquire_capped(
+        n,
+        crate::model::pf_pool::pf_pool_bytes(),
+        crate::model::pf_pool::pf_pool_reserve_bytes(),
+    )
 }
 
 /// task 279: 上限を指定して借りる (大きい計画は `DENNO_PF_POOL_BIG_MB` を使う)。
@@ -25492,8 +25521,17 @@ pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
 /// 上限は `cap` だけで決まり、レイアウトは `n` (チャンク / タイル) から組む。
 /// 呼び出し側が選んだ大きい形がここで上限を超える / 確保できないときは
 /// `owned == false` を返し、呼び出し側は従来のチャンク・タイルへ戻す。
+///
+/// task 290: 借りたあとに `reserve` バイトを残す。足りない分は**先に**チャンク
+/// 単位で expert を追い出しておく (確保の失敗経路に任せると、借りた直後の空きが
+/// 100-200 MiB になり、prefill の後半の数 MiB の確保が断片化で落ちる)。追い出した
+/// 鍵は [`PF_POOL_EVICTED`] に積み、呼び出し側が prefill の終端で LRU へ戻す。
 #[cfg(feature = "cuda")]
-pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> PfPoolGuard {
+pub fn pf_pool_acquire_capped(
+    n: &crate::model::pf_pool::Need,
+    cap: usize,
+    reserve: usize,
+) -> PfPoolGuard {
     let not_held = PfPoolGuard { owned: false };
     // ゲート / しきい値 / 上限は純関数で決める (既定では何も借りない =
     // 従来の `alloc_tagged` と 1 バイトも変わらない)。
@@ -25532,6 +25570,25 @@ pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> Pf
     let free_before = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
     // task 279: この確保が追い出した expert の鍵を控える (借りる前に掃除する)。
     let _ = take_alloc_evicted();
+    // task 290: 借りたあとに `reserve` を残すため、足りない分を**先に**空ける。
+    // ここで空けた鍵も `take_alloc_evicted` が拾うので、終端で LRU へ戻る。
+    if let Some(free) = free_before {
+        let keep_free = l.total.saturating_add(reserve);
+        if keep_free > free {
+            let (rep, keys) = crate::model::expert_vram::emergency_free_chunks_keys(keep_free);
+            if !rep.is_empty() {
+                let n = keys.len();
+                note_alloc_evicted(keys);
+                eprintln!(
+                    "[pf-pool] 余白 {} MiB を残すため先に空けた (空き {} MiB → expert {} 本 / {})",
+                    reserve >> 20,
+                    free >> 20,
+                    n,
+                    rep.line()
+                );
+            }
+        }
+    }
     match DevBuffer::alloc_tagged(l.total, crate::mem_audit::TAG_OTHER) {
         Ok(b) => {
             let bytes = b.bytes();
@@ -25546,18 +25603,27 @@ pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> Pf
             PF_POOL_OWNED.with(|c| c.set(true));
             PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
             eprintln!(
-                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB / 追い出し {} 本)",
+                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB / 追い出し {} 本 / 余白 {} MiB)",
                 bytes >> 20,
                 n.tile,
                 n.nt_all,
                 free_before.map(|b| b >> 20).unwrap_or(0),
                 free_after.map(|b| b >> 20).unwrap_or(0),
-                evicted_n
+                evicted_n,
+                reserve >> 20
             );
             PfPoolGuard { owned: true }
         }
         Err(e) => {
             drop(slot);
+            // task 290: 先に空けた expert は、借りられなかったので呼び出し側が
+            // 終端で LRU へ戻せるように残す (PF_POOL_EVICTED は借用の前に空にしてある)。
+            let keys = take_alloc_evicted();
+            if !keys.is_empty() {
+                if let Ok(mut g) = PF_POOL_EVICTED.lock() {
+                    g.extend(keys);
+                }
+            }
             tracing::warn!("pf_pool: 作業域 {} MiB を借りられない: {e:#}", l.total >> 20);
             eprintln!(
                 "[pf-pool] 作業域 {} MiB を借りられない → 従来の確保",
@@ -39720,6 +39786,18 @@ mod tests {
         // 読めない値は既定 (ここでは false)。
         assert!(!parse_keep_experts(Some("2"), false));
         assert!(parse_keep_experts(Some("2"), true));
+    }
+
+    /// task 290: `DENNO_ALLOC_FORCE_CHUNK` の真偽表。既定は on。
+    #[test]
+    fn alloc_force_chunk_env_truth_table() {
+        assert!(alloc_force_chunk_from_value(None), "未設定は既定 (on)");
+        for off in ["0", "off", "false", "no", " NO "] {
+            assert!(!alloc_force_chunk_from_value(Some(off)), "{off:?} が on");
+        }
+        for on in ["1", "on", "true", "yes"] {
+            assert!(alloc_force_chunk_from_value(Some(on)), "{on:?} が off");
+        }
     }
 
     /// task 210: `DENNO_ATTN_MIRROR_FORGET` の真偽表。既定は on。

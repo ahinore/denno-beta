@@ -501,6 +501,21 @@ pub fn plan_eviction(spans: &[ChunkSpan], free: usize, need: usize) -> EvictPlan
     out
 }
 
+/// task 290: 確保が**既に失敗した**あとの plan。`deficit` が 0 でも必ず 1 本選ぶ。
+///
+/// `cuMemGetInfo` の空きが要求以上でも、断片化していれば `cuMemAlloc` は失敗する
+/// (lab t286c の UD-Q4_K_XL 14k: 空き 3 MiB で 3 MiB の確保が error 2)。
+/// そのとき `deficit = need - free = 0` なので [`plan_eviction`] は 1 本も選ばず、
+/// 呼び出し側は「空けられない」と判断して諦めてしまう。失敗後の再試行では
+/// 空きを見ずに**冷たいチャンクを 1 本**空ける。
+pub fn plan_eviction_forced(spans: &[ChunkSpan], free: usize, need: usize) -> EvictPlan {
+    let p = plan_eviction(spans, free, need);
+    if !p.ids.is_empty() || spans.is_empty() {
+        return p;
+    }
+    plan_eviction(spans, free, free.saturating_add(1))
+}
+
 /// 先頭から合計が `deficit` 以上になるまでの本数 (必ず 1 本以上)。
 fn count_until(run: &[ChunkSpan], deficit: usize) -> usize {
     let mut sum = 0usize;
@@ -797,6 +812,35 @@ mod tests {
         let plan = plan_eviction(&apart, 0, 300 * mib);
         assert_eq!(plan.ids, vec![2, 1], "全体の冷たい順: {plan:?}");
         assert_eq!(plan.bytes, 512 * mib);
+    }
+
+    /// task 290: 確保が失敗したあとは、空きが要求以上に見えても 1 本は空ける。
+    #[test]
+    fn plan_eviction_forced_always_frees_one_chunk() {
+        let mib = 1usize << 20;
+        let span = |id: usize, addr_mib: usize, last_use: u64| ChunkSpan {
+            id,
+            addr: addr_mib * mib,
+            bytes: 256 * mib,
+            last_use,
+        };
+        let spans = vec![span(1, 0, 90), span(2, 4, 5), span(3, 8, 40)];
+        // 空き 3 MiB / 要求 3 MiB → 通常の plan は 1 本も選ばない (断片化で落ちた)。
+        assert_eq!(
+            plan_eviction(&spans, 3 * mib, 3 * mib),
+            EvictPlan::default()
+        );
+        let forced = plan_eviction_forced(&spans, 3 * mib, 3 * mib);
+        assert_eq!(forced.ids, vec![2], "一番冷たい 1 本: {forced:?}");
+        assert_eq!(forced.bytes, 256 * mib);
+        // 足りないときは通常の plan と同じ (2 本以上)。
+        let forced2 = plan_eviction_forced(&spans, 0, 300 * mib);
+        assert_eq!(forced2.ids.len(), 2, "{forced2:?}");
+        // チャンクが無ければ何もできない。
+        assert_eq!(
+            plan_eviction_forced(&[], 3 * mib, 3 * mib),
+            EvictPlan::default()
+        );
     }
 
     #[test]
