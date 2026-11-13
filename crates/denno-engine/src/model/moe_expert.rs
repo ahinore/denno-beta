@@ -7401,6 +7401,177 @@ unsafe fn gemm_q5_1_vnni<const IDX: bool>(
     }
 }
 
+/// Q5_1 の 2 ブロック (64 要素) の量子値を u8 の 512 ビットに組む。
+///
+/// レイアウトは [`gemm_q5_1_vnni`] の 1 ブロック版と同じ (要素 0..15 = 下位
+/// nibble、16..31 = 上位 nibble、5 ビット目は `qh`)。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512dq")]
+unsafe fn q5_1_pair_q(p: *const u8) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::*;
+    const BLK: usize = 24;
+    let mut v = [_mm256_setzero_si256(); 2];
+    for (j, slot) in v.iter_mut().enumerate() {
+        let b = p.add(j * BLK);
+        let qh = std::ptr::read_unaligned(b.add(4) as *const u32);
+        let qs = _mm_loadu_si128(b.add(8) as *const __m128i);
+        let lo = _mm_or_si128(
+            _mm_and_si128(qs, _mm_set1_epi8(0x0f)),
+            spread_hi_bits(qh as u16),
+        );
+        let hi = _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16::<4>(qs), _mm_set1_epi8(0x0f)),
+            spread_hi_bits((qh >> 16) as u16),
+        );
+        *slot = _mm256_set_m128i(hi, lo);
+    }
+    _mm512_inserti64x4(_mm512_castsi256_si512(v[0]), v[1], 1)
+}
+
+/// task 291: Q5_1 の 4 ブロック (128 要素) まとめ食い版 (`DENNO_Q51_BLK4`)。
+///
+/// 1 ブロック = 32 要素なので、旧 [`gemm_q5_1_vnni`] は **32 MAC ごとに水平加算**
+/// していた (256 ビット `vpdpbusd` 1 本 + 8 レーンの縮約 + 累積の読み書き)。
+/// ここでは 2 ブロックを 1 本の 512 ビット `vpdpbusd` に載せ、縮約を 128 要素に
+/// 1 回へ減らす。`d * xd` は 8 レーンごとに違うので、レーンへブロック単位で
+/// 配ってから掛ける (レーンは独立に f32 で掛けて最後に足すので、式は旧カーネルと
+/// 同じ `Σ_b d_b * xd_b * (Σ q x)`)。最小値項 `Σ_b m_b * (Σ x)` は 4 本まとめて
+/// スカラーで足す。
+///
+/// 前提は [`gemm_q5_1_vnni`] と同じ。加えて `nb % 4 == 0` (実形 640/32 = 20)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn gemm_q5_1_vnni4<const IDX: bool>(
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    act: &VnniAct<'_>,
+    out: *mut f32,
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 24;
+    /// 行タイル: acc が (行 × トークン) の `__m512` なので L1 に収める。
+    const RT: usize = 4;
+    const PF_ROWS: usize = 3;
+
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let ng32 = n_in / 32;
+    let rows = r1.saturating_sub(r0);
+    let m = act.m;
+    if rows == 0 || m == 0 {
+        return;
+    }
+    debug_assert_eq!(act.n_in, n_in, "gemm_q5_1_vnni4: 活性の n_in");
+    debug_assert_eq!(act.blk, 32, "gemm_q5_1_vnni4: 活性のブロック長");
+    let bp = blocks.as_ptr();
+    let xp = act.q.as_ptr();
+    let scp = act.sc.as_ptr();
+    let gp = act.gs.as_ptr();
+    let tidp = act.tid.as_ptr();
+    // レーンの割り当て: 前半 8 レーン = ブロック b0、後半 8 レーン = b0+1。
+    let i01 = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
+    let i23 = _mm512_setr_epi32(2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn hsum4(v: __m128) -> f32 {
+        let s = _mm_add_ps(v, _mm_movehl_ps(v, v));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    /// 16 レーンの水平和 (Q4_K カーネルと同じ順序)。
+    #[inline]
+    #[target_feature(enable = "avx2,fma,avx512f")]
+    unsafe fn hsum16(v: __m512) -> f32 {
+        let lo = _mm512_castps512_ps256(v);
+        let hi = _mm512_castps512_ps256(_mm512_shuffle_f32x4::<0b11_10_11_10>(v, v));
+        let s = _mm256_add_ps(lo, hi);
+        let s = _mm_add_ps(
+            _mm256_castps256_ps128(s),
+            _mm256_extractf128_ps::<1>(s),
+        );
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    let mut ra = r0;
+    while ra < r1 {
+        let re = (ra + RT).min(r1);
+        let rn = re - ra;
+        let mut acc = vec![_mm512_setzero_ps(); rn * m];
+        let mut ms = vec![0f32; rn * m];
+        for q in 0..(nb / 4) {
+            let b0 = q * 4;
+            for r in ra..re {
+                let p = bp.add(r * rb + b0 * BLK);
+                let qv01 = q5_1_pair_q(p);
+                let qv23 = q5_1_pair_q(p.add(2 * BLK));
+                let mut dv = [0f32; 4];
+                let mut mv = [0f32; 4];
+                for b in 0..4 {
+                    let pb = p.add(b * BLK);
+                    dv[b] = half::f16::from_bits(std::ptr::read_unaligned(pb as *const u16))
+                        .to_f32();
+                    mv[b] = half::f16::from_bits(std::ptr::read_unaligned(pb.add(2) as *const u16))
+                        .to_f32();
+                }
+                let dv4 = _mm_loadu_ps(dv.as_ptr());
+                let mv4 = _mm_loadu_ps(mv.as_ptr());
+                let ai = (r - ra) * m;
+                for t in 0..m {
+                    let ti = if IDX { *tidp.add(t) as usize } else { t };
+                    let xb = xp.add(ti * n_in + b0 * 32);
+                    let xa = _mm512_loadu_si512(xb as *const __m512i);
+                    let xc = _mm512_loadu_si512(xb.add(64) as *const __m512i);
+                    // 活性のスケールは 32 要素ごと (4 本まとめて読む)。
+                    let xd4 = _mm_loadu_ps(scp.add(ti * nb + b0));
+                    let s4 = _mm_mul_ps(dv4, xd4);
+                    let four = _mm512_broadcast_f32x4(s4);
+                    let sv01 = _mm512_permutexvar_ps(i01, four);
+                    let sv23 = _mm512_permutexvar_ps(i23, four);
+                    let dpa = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qv01, xa);
+                    let dpc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qv23, xc);
+                    let mut a = _mm512_mul_ps(_mm512_cvtepi32_ps(dpa), sv01);
+                    a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dpc), sv23, a);
+                    let o = ai + t;
+                    *acc.get_unchecked_mut(o) = _mm512_add_ps(*acc.get_unchecked(o), a);
+                    // 最小値項: Σ_b m_b * (Σ x)。gs は量子化前の 32 要素和。
+                    let g4 = _mm_loadu_ps(gp.add(ti * ng32 + b0));
+                    *ms.get_unchecked_mut(o) += hsum4(_mm_mul_ps(mv4, g4));
+                }
+                if r + PF_ROWS < re {
+                    let nx = bp.add((r + PF_ROWS) * rb + b0 * BLK);
+                    _mm_prefetch(nx as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(nx.add(64) as *const i8, _MM_HINT_T0);
+                }
+            }
+        }
+        for t in 0..m {
+            for r in ra..re {
+                let o = (r - ra) * m + t;
+                *out.add(t * stride + (r - r0)) =
+                    hsum16(*acc.get_unchecked(o)) + *ms.get_unchecked(o);
+            }
+        }
+        ra = re;
+    }
+}
+
+/// task 291: Q5_1 の 4 ブロック版を使うか (`DENNO_Q51_BLK4=0` で旧カーネル)。
+fn q5_1_blk4_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("DENNO_Q51_BLK4").ok().as_deref(), Some("0"))
+    })
+}
+
 /// VNNI 経路で行範囲 `r0..r1` を計算する。使えないときは `false` を返す
 /// (呼び出し側は [`gemm_rows`] の f32 経路へ落とす)。
 ///
@@ -7472,10 +7643,21 @@ pub(crate) fn gemm_rows_vnni(
                     }
                 }
                 GgmlType::Q5_1 => {
-                    if act.tid.is_empty() {
-                        gemm_q5_1_vnni::<false>(blocks, n_in, r0, r1, act, out, stride);
-                    } else {
-                        gemm_q5_1_vnni::<true>(blocks, n_in, r0, r1, act, out, stride);
+                    // task 291: 4 ブロックまとめ食い (縮約を 128 要素に 1 回)。
+                    let v4 = blk == 32 && nb % 4 == 0 && q5_1_blk4_on();
+                    match (act.tid.is_empty(), v4) {
+                        (true, false) => {
+                            gemm_q5_1_vnni::<false>(blocks, n_in, r0, r1, act, out, stride)
+                        }
+                        (false, false) => {
+                            gemm_q5_1_vnni::<true>(blocks, n_in, r0, r1, act, out, stride)
+                        }
+                        (true, true) => {
+                            gemm_q5_1_vnni4::<false>(blocks, n_in, r0, r1, act, out, stride)
+                        }
+                        (false, true) => {
+                            gemm_q5_1_vnni4::<true>(blocks, n_in, r0, r1, act, out, stride)
+                        }
                     }
                 }
                 _ => return false,
@@ -10293,7 +10475,8 @@ mod tests {
         }
         for (ty, n_in, n_out, blk) in [
             (GgmlType::Q4K, 512usize, 16usize, 256usize),
-            (GgmlType::Q5_1, 64usize, 512usize, 32usize),
+            // task 291: nb = 8 (4 ブロック版の経路) も参照式と突き合わせる。
+            (GgmlType::Q5_1, 256usize, 512usize, 32usize),
         ] {
             let m = 5usize;
             let blocks = make_expert(ty, n_in, n_out, 0);
