@@ -464,14 +464,33 @@ pub fn fits(l: &Layout, pool: usize) -> bool {
 // 収まる組が無い / 確保に失敗したときは呼び出し側が**従来のチャンクとタイル**へ
 // 戻す (リクエストは失敗させない)。
 
-/// `DENNO_PF_POOL_BIG=1`: 長いプロンプトで大きいタイル / チャンクを使う
-/// (task 279、**既定 off**)。
+/// `DENNO_PF_POOL_BIG`: 長いプロンプトで大きいタイル / チャンクを使う
+/// (task 279、**既定 on**。`0` / `off` / `false` / `no` で切る)。
+///
+/// # 実測 (lab t279c、sha 3796e6b25、depth8k、swift15-abl-IQ3_S)
+///
+/// base = 現在の int-auto 既定 (プール 2,688 MiB / タイル 5,120 / チャンク 1,536)。
+/// on = `DENNO_PF_POOL_BIG=1` (タイル = 全トークン = 1 パス / チャンク 2,047)。
+/// 各 COND は 2 回ずつ、先頭に捨て COND (`x0`)、末尾に base の繰り返し。
+///
+/// | 指標 | base | on | 差 |
+/// | --- | ---: | ---: | ---: |
+/// | 14,018 cold prefill | 16.76 / 16.80 s | 8.43 / 10.23 s | **-39 / -50%** |
+/// | 3,826 cold prefill | 3.33 / 3.65 s | 3.35 / 3.62 s | 差なし |
+/// | 短い decode | 19.4 ms/tok | 19.4 ms/tok | 0% |
+/// | 14k cold 後の decode | 20.8 / 20.4 | 19.5 / 20.4 | 悪化なし |
+/// | 14k turn2 の decode | 20.5 / 20.3 | 18.8 / 19.5 | 悪化なし |
+/// | 上げた expert 重み | 90.9 GB | 28.2 GB | -69% |
+///
+/// 14k の 1 パス版で借りるのは 4,094 MiB (base は 2,498 MiB)。その確保が
+/// 追い出した 783 本 (1,622 MiB) は prefill の終端で LRU へ戻すので、14k 後の
+/// ヒット率は 0.956 (base) 対 0.959 (on) で悪化しない。
 pub const PF_POOL_BIG_ENV: &str = "DENNO_PF_POOL_BIG";
 
-/// [`PF_POOL_BIG_ENV`] の既定。
-pub const DEFAULT_PF_POOL_BIG: bool = false;
+/// [`PF_POOL_BIG_ENV`] の既定 (task 279 の lab t279c で採用)。
+pub const DEFAULT_PF_POOL_BIG: bool = true;
 
-/// `DENNO_PF_POOL_BIG_MB`: 大きい計画のときに借りてよい上限 (MiB、既定 4,608)。
+/// `DENNO_PF_POOL_BIG_MB`: 大きい計画のときに借りてよい上限 (MiB、既定 4,864)。
 ///
 /// task 265 の既定 (2,688 MiB) はタイル 5,120 のレイアウト (約 2,498 MiB) に
 /// 合わせた値。パス数を 1 にすると `h` が 550 → 1,505 MiB、`act` が 200 → 547 MiB
@@ -501,11 +520,14 @@ pub const DEFAULT_BIG_CHUNK: usize = 2047;
 /// チャンクの上限 (これ以上は連鎖の形が未確認)。
 pub const MAX_BIG_CHUNK: usize = 4096;
 
-/// [`PF_POOL_BIG_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+/// [`PF_POOL_BIG_ENV`] の解釈 (純関数)。既定 on、**明示的な偽値だけ off**。
+///
+/// task 265 の 3 本 (`DENNO_PF_POOL` / `DENNO_PF_LM_LAYER` / `DENNO_PF_TC_EXP`) と
+/// 同じ規約にした (未設定・空・真値は on)。
 pub fn pf_pool_big_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -811,15 +833,16 @@ mod tests {
     // task 279: 大きいタイル / チャンクの選択
     // ----------------------------------------------------------------------
 
-    /// ゲートは明示的な真値だけ on (既定 off)。
+    /// ゲートは既定 on、明示的な偽値だけ off (task 265 の 3 本と同じ規約)。
     #[test]
-    fn big_gate_reads_only_explicit_true() {
-        for v in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no")] {
+    fn big_gate_is_on_unless_explicitly_off() {
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some(" NO ")] {
             assert!(!pf_pool_big_from_value(v), "big({v:?}) が on");
         }
-        for v in [Some("1"), Some("on"), Some("true"), Some(" yes ")] {
+        for v in [None, Some(""), Some("1"), Some("on"), Some("true"), Some(" yes ")] {
             assert!(pf_pool_big_from_value(v), "big({v:?}) が off");
         }
+        assert!(DEFAULT_PF_POOL_BIG, "既定は on (lab t279c で採用)");
         // 上限とチャンクの既定 (0 / 解析不能は既定)。
         assert_eq!(pf_pool_big_mb_from_value(None), DEFAULT_POOL_BIG_MB);
         assert_eq!(pf_pool_big_mb_from_value(Some("0")), DEFAULT_POOL_BIG_MB);
@@ -831,6 +854,17 @@ mod tests {
         assert_eq!(big_chunk_from_value(None), 2047);
         // 上限 4,096 を超える指定は丸める (未確認の形を作らない)。
         assert_eq!(big_chunk_from_value(Some("8192")), MAX_BIG_CHUNK);
+    }
+
+    /// テスト用の強制スイッチ (env を触らずに分岐を固定する)。
+    #[test]
+    fn big_force_switch_for_tests() {
+        set_big_force_on_for_test(Some(false));
+        assert!(!pf_pool_big_on());
+        set_big_force_on_for_test(Some(true));
+        assert!(pf_pool_big_on());
+        set_big_force_on_for_test(None);
+        assert!(pf_pool_big_on(), "env 未設定の既定は on");
     }
 
     /// 候補は「パス数が少ない順 → チャンクが大きい順」で、従来のタイルも残る。
