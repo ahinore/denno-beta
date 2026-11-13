@@ -10318,6 +10318,58 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy"), "targets_all に gdn_pf_wy が無い");
 }
 
+const SEG_K_SRC: &str = include_str!("../kernels/kernels_seg_k.cu");
+
+/// task 278: K 系の高速 GEMV (`kernels_seg_k.cu`) の配線。
+///
+/// GPU 無しでは走らせられないので、**ホストと .cu の契約**だけを固定する:
+/// カーネル名 4 本 / 引数の個数 / 起動形 (4 行 = 4 warp = 128 スレッド) /
+/// build_ptx.sh の target。数値は lab の `DENNO_EXPERT_GPU_CHECK=1` が見る。
+#[test]
+fn task278_seg_k_kernels_are_wired() {
+    for name in [
+        "dno_seg_gemv_k_q8_0",
+        "dno_seg_gemv_k_q5_1",
+        "dno_seg_gemv_k_q4k",
+        "dno_seg_gemv_k_q5k",
+    ] {
+        assert!(SEG_K_SRC.contains(name), "{name} が .cu に無い");
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+        assert_eq!(
+            cu_kernel_nargs(SEG_K_SRC, name),
+            8,
+            "{name}: 引数の個数がホストの起動と違う"
+        );
+    }
+    // 1 行 = 1 warp、1 ブロック = 4 行 (起動形は cuda.rs の 128 と一致)
+    assert!(SEG_K_SRC.contains("#define SK_ROWS 4"), "SK_ROWS が 4 でない");
+    assert!(SEG_K_SRC.contains("(t >> 5)"), "行の割り当てが warp 単位でない");
+    assert!(
+        SEG_K_SRC.contains("__shfl_down_sync(0xffffffffu, acc, 16)"),
+        "warp 縮約が無い"
+    );
+    // 共有メモリを使わない (smem 0 で起動する前提)
+    assert!(
+        !SEG_K_SRC.contains("__shared__"),
+        "共有メモリを使うと smem = 0 の起動と食い違う"
+    );
+    // build_ptx.sh: target が引ける + targets_all に入っている
+    assert!(
+        BUILD_PTX_SH.contains("seg_k)        echo \"kernels_seg_k.cu|fmad\""),
+        "build_ptx.sh の seg_k が無い"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(targets.contains("seg_k"), "targets_all に seg_k が無い");
+    // ホスト側のゲート名 (gate_audit の台帳に載せる前の固定)
+    assert!(CUDA_RS.contains("\"DENNO_SEG_K\""), "DENNO_SEG_K のゲートが無い");
+}
+
 // ===========================================================================
 // task 275: expert GEMV v3 (IQ2_S / IQ3_S の表を詰める) と
 //           decode mix の down+inject 版。
@@ -10412,3 +10464,4 @@ fn mix_dev3_down_inj_is_wired() {
         "targets_all に mix_dev3 が無い"
     );
 }
+

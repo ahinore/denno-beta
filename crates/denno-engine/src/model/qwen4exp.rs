@@ -11196,6 +11196,13 @@ fn moe_ffn_quant_impl(
     iv: IvView<'_>,
 ) -> Result<Vec<f32>> {
     let t_router = std::time::Instant::now();
+    // task 278: 層 0 の入口 = トークンの境目。`DENNO_SEG_PROF` の積算を 1 行で出す
+    // (off は分岐 1 回で `enabled()` の atomic load だけ)。
+    if lw.il == 0 {
+        if let Some(line) = crate::model::seg_prof::flush() {
+            eprintln!("{line}");
+        }
+    }
     let e = p.n_embd;
     let ne = p.n_expert;
     let k = p.n_expert_used;
@@ -11564,6 +11571,11 @@ fn moe_ffn_quant_impl(
             let iq_mode = crate::model::exp_iq::iq_gpu_enabled() && iq_expert_mode(lw);
             #[cfg(not(feature = "cuda"))]
             let iq_mode = false;
+            // task 278: K 型の層を 1 待ちで閉じる新経路 (`DENNO_SEG_LAYER`)。
+            #[cfg(feature = "cuda")]
+            let seg_mode = !iq_mode && crate::model::expert_batch::seg_layer_enabled();
+            #[cfg(not(feature = "cuda"))]
+            let seg_mode = false;
 
             // task 190 (`DENNO_DEC_MISS_FAST`): ミスの上げ直しを**層の前**に移す。
             // 上げた本はこの層の lookup でヒットになるので、CPU で計算せず GPU で回せる
@@ -11604,7 +11616,21 @@ fn moe_ffn_quant_impl(
             #[cfg(not(feature = "cuda"))]
             let iq_batched: Option<IqBatchOut> = None;
 
-            let batched = if use_gpu && !iq_mode {
+            // task 278: K 型の新経路。ヒットだけ GPU・ミスは CPU・和はデバイス。
+            // 1 本でも載っていなければ `Contribs(全て None)` で呼び出し側が CPU へ。
+            #[cfg(feature = "cuda")]
+            let seg_batched: Option<IqBatchOut> = if use_gpu && seg_mode {
+                moe_experts_seg_gpu_batched(lw, &sel, &weights, x, e, ff)?
+            } else {
+                None
+            };
+            #[cfg(not(feature = "cuda"))]
+            let seg_batched: Option<IqBatchOut> = None;
+            // task 278: IQ 経路と seg 経路は同じ `IqBatchOut` を返すので、後段の
+            // 足し込みを共有する (どちらも高々 1 つしか `Some` にならない)。
+            let fast_batched = iq_batched.or(seg_batched);
+
+            let batched = if use_gpu && !iq_mode && fast_batched.is_none() {
                 moe_experts_gpu_batched(lw, &sel, x, e, ff)?
             } else {
                 None
@@ -11614,7 +11640,7 @@ fn moe_ffn_quant_impl(
                 miss_pos,
                 miss_h,
                 hits,
-            }) = iq_batched
+            }) = fast_batched
             {
                 // task 187: ヒットぶんはデバイスで和にしてある (重み付き・選択順)。
                 // ミスだけホストで足す (ミスの無い層では従来の足し込みとビット一致)。
@@ -11630,7 +11656,7 @@ fn moe_ffn_quant_impl(
                         }
                     }
                 }
-            } else if let Some(IqBatchOut::Contribs(hs, hits)) = iq_batched {
+            } else if let Some(IqBatchOut::Contribs(hs, hits)) = fast_batched {
                 // GPU で回せた expert はその寄与、回せなかった expert は CPU で 3 行列。
                 // 足し込みは今までと同じ **expert index 昇順の逐次** (同じ位置で同じ重み)。
                 //
@@ -11766,7 +11792,7 @@ fn moe_ffn_quant_impl(
             // GPU に倒したトークンだけでなく CPU のトークンでも積む (載せないと
             // ヒット率が永久に 0 のままになる)。
             #[cfg(feature = "cuda")]
-            if vram_mode && iq_mode && !miss_fast_now {
+            if vram_mode && (iq_mode || seg_mode) && !miss_fast_now {
                 // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
                 let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
                 iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
@@ -12168,6 +12194,190 @@ fn moe_experts_gpu_batched(
         }
     }
     Ok(Some((hs, hits)))
+}
+
+/// task 278: K 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層を **1 待ち**で回す新経路。
+///
+/// 旧 [`moe_experts_gpu_batched`] との違い:
+///
+/// - ミス expert を VRAM へ**上げない**。ヒットだけを GPU の segment GEMV で回し、
+///   ミスは GPU の裏で CPU が計算する (8 スレッド)。1 本 3 MB の H2D と
+///   ホスト側の写し (1 本 0.25 ms 級) が消える。
+/// - `silu(g) * u` と重み付き和をデバイスで回し、ホストへは `e` 要素だけ返す。
+/// - 待ちは null ストリームのイベント 1 本 (文脈同期は背景の上げ直しまで待つ)。
+///
+/// 戻り値は [`IqBatchOut::Sum`] (ヒットぶんはデバイスで和、ミスは `miss_h`)。
+/// ヒットが 1 本も無ければ `Contribs(全て None)` = 呼び出し側が全部 CPU で回す。
+/// カーネル / PTX / 形が合わないときは `Ok(None)` = 旧経路へ (fail closed)。
+#[cfg(feature = "cuda")]
+fn moe_experts_seg_gpu_batched(
+    lw: &LayerW,
+    sel: &[usize],
+    weights: &[f32],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+) -> Result<Option<IqBatchOut>> {
+    use crate::model::expert_vram::ExpertShape;
+
+    if sel.is_empty() || weights.len() != sel.len() {
+        return Ok(None);
+    }
+    let shapes = [
+        ExpertShape {
+            ty: lw.gate_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.up_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.down_exps.ty,
+            k: ff,
+            n: e,
+        },
+    ];
+    // 1. 載っている expert だけ集める (H2D しない)。
+    let mut devs = Vec::with_capacity(sel.len());
+    let mut ids: Vec<u16> = Vec::with_capacity(sel.len());
+    let mut pos: Vec<usize> = Vec::with_capacity(sel.len());
+    let _t_lookup = crate::model::seg_prof::stamp();
+    let keys: Vec<ExpertKey> = sel
+        .iter()
+        .map(|&ei| ExpertKey {
+            layer: lw.il as u16,
+            expert: ei as u16,
+        })
+        .collect();
+    let got = expert_vram::lookup_many(&keys, shapes)
+        .map_err(|err| one(format!("層 {}: expert VRAM 参照 (seg): {err:#}", lw.il)))?;
+    for (t, g) in got.into_iter().enumerate() {
+        if let Some(dev) = g {
+            devs.push(dev);
+            ids.push(sel[t] as u16);
+            pos.push(t);
+        }
+    }
+    crate::model::seg_prof::add(crate::model::seg_prof::PH_LOOKUP, _t_lookup);
+    if pos.is_empty() {
+        // VRAM が初期化されていない (CUDA 無し / 予算 0) ときは旧経路へ。
+        // 従来のフォールバック契約 (CPU の per-expert 経路) をそのまま通す。
+        if expert_vram::cache_usage().is_none() {
+            return Ok(None);
+        }
+        // VRAM はあるが 1 本も載っていない層は CPU で回す (ここで上げ直すと
+        // 1 層 30 MB の H2D になる)。足し込みの口は IQ 経路と共通。
+        return Ok(Some(IqBatchOut::Contribs(vec![None; sel.len()], 0)));
+    }
+    let hits = devs.len() as u32;
+
+    // 2. prologue (表 + 入力) を組む。
+    let _t_tbl = crate::model::seg_prof::stamp();
+    let ptr_table = |m: ExpertMatrix| -> Vec<u64> { devs.iter().map(|d| d.ptr(m)).collect() };
+    let (pg, pu, pd) = (
+        ptr_table(ExpertMatrix::Gate),
+        ptr_table(ExpertMatrix::Up),
+        ptr_table(ExpertMatrix::Down),
+    );
+    let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
+    let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
+    let hw: Vec<f32> = pos.iter().map(|&t| weights[t]).collect();
+    crate::model::seg_prof::add(crate::model::seg_prof::PH_TABLE, _t_tbl);
+
+    // 3. ミスの位置と id (CPU 計算は GPU の裏で走らせる)。
+    let mut is_hit = vec![false; sel.len()];
+    for &t in pos.iter() {
+        is_hit[t] = true;
+    }
+    let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| !is_hit[t]).collect();
+    let miss_ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+    let mut miss_h = vec![0.0f32; miss_pos.len() * e];
+
+    // 4. gate / up / silu / down / 和 を 1 待ちで回す。
+    let mut sum = vec![0.0f32; e];
+    let _t_alloc = crate::model::seg_prof::stamp();
+    let ran = crate::cuda::moe_seg_layer_sum(
+        lw.gate_exps.ty,
+        lw.up_exps.ty,
+        lw.down_exps.ty,
+        &pg,
+        &pu,
+        &pd,
+        &seg_gu,
+        &seg_d,
+        x,
+        x.len(),
+        ff,
+        e,
+        &hw,
+        &mut sum,
+        || {
+            let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
+            // ミスは base と同じ 8 スレッド経路で計算する (1 expert を 1 スレッドで
+            // 逐次に回すと 1 本 0.15 ms がそのまま層に乗る)。
+            expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
+                .map_err(anyhow::Error::from)
+        },
+    )
+    .map_err(|err| one(format!("層 {}: seg 層一括 GEMV (sum): {err:#}", lw.il)))?;
+    crate::model::seg_prof::add(crate::model::seg_prof::PH_ALLOC, _t_alloc);
+    if !ran {
+        return Ok(None);
+    }
+    // 5. `DENNO_EXPERT_GPU_CHECK=1`: 全 expert を CPU で回した値と、この経路の
+    //    出力 (デバイスの和 + ホストのミス) を層ごとに 1 行で比べる。
+    //    新しい足し込み順 (ヒットを先に全部、ミスを後) になるので、
+    //    ミスの無い層ではビット一致、有る層では丸め差だけが出るはず。
+    if expert_vram::check_enabled() {
+        let mut got = sum.clone();
+        for (i, &t) in miss_pos.iter().enumerate() {
+            let pe = weights[t];
+            let v = &miss_h[i * e..(i + 1) * e];
+            for j in 0..e {
+                got[j] += pe * v[j];
+            }
+        }
+        let mut want = vec![0.0f32; e];
+        let mut act = vec![0.0f32; ff];
+        let mut up = vec![0.0f32; ff];
+        let mut h = vec![0.0f32; e];
+        for (t, &ei) in sel.iter().enumerate() {
+            lw.gate_exps.gemv(ei, x, &mut act)?;
+            silu_inplace(&mut act);
+            lw.up_exps.gemv(ei, x, &mut up)?;
+            for r in 0..ff {
+                act[r] *= up[r];
+            }
+            lw.down_exps.gemv(ei, &act, &mut h)?;
+            let pe = weights[t];
+            for j in 0..e {
+                want[j] += pe * h[j];
+            }
+        }
+        expert_vram::note_check(&got, &want);
+    }
+    Ok(Some(IqBatchOut::Sum {
+        sum,
+        miss_pos,
+        miss_h,
+        hits,
+    }))
+}
+
+/// task 278: 新経路のゲートが off / cuda 無しのときの入口。
+#[cfg(not(feature = "cuda"))]
+fn moe_experts_seg_gpu_batched(
+    _lw: &LayerW,
+    _sel: &[usize],
+    _weights: &[f32],
+    _x: &[f32],
+    _e: usize,
+    _ff: usize,
+) -> Result<Option<IqBatchOut>> {
+    Ok(None)
 }
 
 /// task 144: この層の 3 行列が全部 IQ カーネルで読める型か (かつゲートが on)。

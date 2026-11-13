@@ -118,6 +118,20 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_MOE_BATCH_PTX",
         on: crate::model::expert_batch::batch_enabled,
     },
+    // task 278: K 型の層を 1 待ちで閉じる経路 (既定 on)。高速版 GEMV の PTX が
+    // 欠けると旧 `kernels_moe_batch.ptx` へ静かに落ちる (遅い) ので台帳に載せる。
+    GatePtx {
+        env: "DENNO_SEG_LAYER",
+        ptx: "kernels_seg_k.ptx",
+        entries: &[
+            "dno_seg_gemv_k_q8_0",
+            "dno_seg_gemv_k_q5_1",
+            "dno_seg_gemv_k_q4k",
+            "dno_seg_gemv_k_q5k",
+        ],
+        path_env: "DENNO_SEG_K_PTX",
+        on: crate::model::expert_batch::seg_layer_enabled,
+    },
     GatePtx {
         env: "DENNO_DEC_EXP_SUMDEV",
         ptx: "kernels_dec_epi.ptx",
