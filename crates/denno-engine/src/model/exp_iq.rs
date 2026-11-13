@@ -165,7 +165,12 @@ pub const EXPERT_IQ_V3_ENV: &str = "DENNO_EXP_IQ_V3";
 
 /// [`EXPERT_IQ_V3_ENV`] の解釈 (純関数)。`"1"` / `"true"` / `"on"` だけが真。
 pub fn iq_v3_from_value(v: Option<&str>) -> bool {
-    crate::model::expert_vram::flag_on(v)
+    // tasks 269+275 adopted by the operator (2026-11-13): default on; only an
+    // explicit false value (0 / off / false / no) turns it off.
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
 }
 
 /// v3 カーネルを使うか (プロセスで 1 回だけ env を読む)。
@@ -955,8 +960,9 @@ mod tests {
     /// v2 と同じ 8 引数であること (PTX があれば引数の数も見る)。
     #[test]
     fn v3_gate_and_kernel_names() {
-        assert!(!iq_v3_from_value(None));
-        assert!(!iq_v3_from_value(Some("")));
+        // adopted 2026-11-13: default on, explicit false values turn it off.
+        assert!(iq_v3_from_value(None));
+        assert!(iq_v3_from_value(Some("")));
         assert!(iq_v3_from_value(Some("1")));
         assert!(iq_v3_from_value(Some("on")));
         assert!(iq_v3_from_value(Some(" true ")));

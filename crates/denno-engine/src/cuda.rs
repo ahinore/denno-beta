@@ -29030,9 +29030,11 @@ pub(crate) fn mix_dec_fold_on() -> bool {
 
 /// task 275: `DENNO_DEC_MIX_NORM_PAR` の解釈 (純関数)。`"1"` / `"true"` / `"on"` だけが真。
 fn parse_mix_norm_par(raw: Option<&str>) -> bool {
-    matches!(
+    // tasks 269+275 adopted by the operator (2026-11-13): default on; only an
+    // explicit false value (0 / off / false / no) turns it off.
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0" | "off" | "false" | "no")
     )
 }
 
