@@ -6347,15 +6347,17 @@ pub(crate) fn dec_exp_sumdev_enabled() -> bool {
     })
 }
 
-/// task 281: `DENNO_EXP_SCRATCH` の解釈 (純関数・テスト用)。
+/// task 281/285: `DENNO_EXP_SCRATCH` の解釈 (純関数・テスト用)。
 ///
-/// **既定 off**。on では、sumdev 経路 (既定 on) が 1 度も読まない `h`
+/// **既定 on** (task 285)。on では、sumdev 経路 (既定 on) が 1 度も読まない `h`
 /// (`nseg * e` = 実形で 40 KB) のゼロ埋めを毎層やらない。値は変わらない
 /// (h を使うのは sumdev が不成立のときだけで、その直前に確保する)。
+/// 実測は lab t281a/t281b: 48 層で 1.9 MB/token のゼロ埋めが消え、短い decode は
+/// -0.4% (ノイズ床 0.4% と同程度)、md5 SAME。明示的な偽値だけ切る。
 fn exp_scratch_from_value(v: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -10452,6 +10454,54 @@ fn expert_miss_flat_from_value(v: Option<&str>) -> bool {
     }
 }
 
+/// task 285: `DENNO_DEC_ROUTER_TOPK_FAST` の解釈 (純関数)。
+///
+/// decode の top-k を挿入法 ([`select_topk_into_fast`]) で選ぶか。**既定 on**。
+/// 選択規則は `select_nth_unstable_by` 版と同一 (値の降順・同値は小さい index・
+/// 出力は index 昇順) なので、値も選ばれる集合も 1 ビット変わらない。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+fn dec_router_topk_fast_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// テスト専用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static DEC_ROUTER_TOPK_FAST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: 挿入法の分岐が実際に通った回数 (「緑 = 発火の証拠」にしないため)。
+#[cfg(test)]
+static DEC_ROUTER_TOPK_FAST_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// task 285: decode の top-k に挿入法を使うか (`DENNO_DEC_ROUTER_TOPK_FAST`)。
+fn dec_router_topk_fast_on() -> bool {
+    match DEC_ROUTER_TOPK_FAST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        dec_router_topk_fast_from_value(std::env::var("DENNO_DEC_ROUTER_TOPK_FAST").ok().as_deref())
+    })
+}
+
+/// テスト専用: 上書きを設定する (`None` で env に戻す)。
+#[cfg(test)]
+fn set_dec_router_topk_fast_for_test(v: Option<bool>) {
+    DEC_ROUTER_TOPK_FAST_OVERRIDE.store(
+        match v {
+            Some(false) => 1,
+            Some(true) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
 static EXPERT_MISS_FLAT_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
@@ -11392,7 +11442,21 @@ fn moe_ffn_quant_impl(
     let expert_mask_il = iv.expert_mask(lw.il);
     let mut sel = match expert_mask_il {
         Some(m) => select_topk_mask(&probs, k, m),
-        None => select_topk(&probs, k),
+        None => {
+            // task 285: decode (1 行) の top-k は挿入法 (`select_topk_into_fast`)。
+            // 選択規則 (値の降順・同値は小さい index・出力は index 昇順) は
+            // `select_nth_unstable_by` 版と同一なので値は 1 ビットも変わらない。
+            // ne=512 / k=8 の相対マイクロベンチ (task 195) は 4.2 -> 0.68 us/行。
+            if dec_router_topk_fast_on() {
+                #[cfg(test)]
+                DEC_ROUTER_TOPK_FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut out = vec![0usize; k];
+                select_topk_into_fast(&probs, k, &mut out);
+                out
+            } else {
+                select_topk(&probs, k)
+            }
+        }
     };
     #[cfg(feature = "cuda")]
     crate::cuda::dec_kprof::note_since("topk", t_topk);
@@ -20471,11 +20535,29 @@ mod tests {
     /// on のときの数値は従来と 1 bit も変わらない (h のゼロ埋めをやめるだけ)。
     #[test]
     fn exp_scratch_gate_truth_table() {
-        for v in [None, Some(""), Some("  "), Some("0"), Some("off"), Some("false"), Some("no")] {
+        // task 285: 既定 on (未設定・空・"  " は on)。明示的な偽値だけ off。
+        for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no"), Some(" 0 ")] {
             assert!(!exp_scratch_from_value(v), "{v:?} が on になる");
         }
-        for v in [Some("1"), Some("on"), Some("ON"), Some(" true "), Some("yes")] {
+        for v in [None, Some(""), Some("  "), Some("1"), Some("on"), Some("ON"), Some(" true "), Some("yes")] {
             assert!(exp_scratch_from_value(v), "{v:?} が on にならない");
+        }
+    }
+
+    /// task 285: `DENNO_DEC_ROUTER_TOPK_FAST` の真理値表 (既定 on・明示の偽値だけ off)。
+    #[test]
+    fn dec_router_topk_fast_truth_table() {
+        for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no"), Some(" 0 ")] {
+            assert!(
+                !dec_router_topk_fast_from_value(v),
+                "{v:?} が on になる"
+            );
+        }
+        for v in [None, Some(""), Some("1"), Some("on"), Some("true"), Some("yes")] {
+            assert!(
+                dec_router_topk_fast_from_value(v),
+                "{v:?} が on にならない"
+            );
         }
     }
 
@@ -21187,6 +21269,71 @@ mod tests {
         assert!(
             FLAT_DECODE_REGIONS.load(std::sync::atomic::Ordering::Relaxed) > before,
             "平坦化の分岐が通っていない (カウンタが増えていない)"
+        );
+    }
+
+    /// task 285: decode の router top-k は挿入法 (`select_topk_into_fast`) と
+    /// `select_nth_unstable_by` 版で**選ばれる集合も MoE の出力もビット一致**する
+    /// こと。あわせて挿入法の分岐が実際に通ったことをカウンタで確かめる。
+    #[test]
+    #[cfg(feature = "par")]
+    fn dec_router_topk_fast_matches_select_nth() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let dir = TempDir::new("p285topk");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        let before = DEC_ROUTER_TOPK_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        set_dec_router_topk_fast_for_test(Some(false));
+        let slow = moe_ffn_quant_impl(
+            &p,
+            &lw,
+            &x,
+            None,
+            true,
+            Route::Cpu,
+            None,
+            true,
+            false,
+            false,
+            IvView::none(),
+        )
+        .expect("select_nth 版");
+        let mid = DEC_ROUTER_TOPK_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(mid, before, "off なのに挿入法の分岐が通った");
+
+        set_dec_router_topk_fast_for_test(Some(true));
+        let fast = moe_ffn_quant_impl(
+            &p,
+            &lw,
+            &x,
+            None,
+            true,
+            Route::Cpu,
+            None,
+            true,
+            false,
+            false,
+            IvView::none(),
+        )
+        .expect("挿入法");
+        assert!(
+            DEC_ROUTER_TOPK_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed) > mid,
+            "挿入法の分岐が通っていない (カウンタが増えていない)"
+        );
+        assert!(
+            slow.iter().any(|v| *v != 0.0),
+            "MoE の出力が全 0 (経路の生死が分からない)"
+        );
+        assert_bitwise_eq(&slow, &fast, "router top-k: 挿入法 vs select_nth");
+        set_dec_router_topk_fast_for_test(None);
+        assert!(
+            dec_router_topk_fast_on(),
+            "既定 (env 未設定・上書き解除) は on"
         );
     }
 

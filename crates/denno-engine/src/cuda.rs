@@ -52502,15 +52502,22 @@ pub struct GdnGgufUnit<'a> {
 //
 // 数値: `dno_matvec_f32_r` (固定の木で縮約) を使うので、CPU の逐次/FMA 経路
 // とは丸め順が違う (**ビット一致しない**)。決定論は保つ。`DENNO_GDN_BA_GPU=0`
-// で従来のホスト計算へ戻る。既定 off (lab の A/B で決める)。
+// で従来のホスト計算へ戻る。
+//
+// task 285: **既定 on** にした (lab t269c で短い decode -3.4%、14k の次 +2.6%、
+// md5 DIFF = 意図した丸め順の変更、errors 0、text 健全。t285a で再測)。
+// 当時 (task 269) は目標 8% に届かず既定 off のまま残っていたが、その後の
+// 265/271/275/278/279/282 で他の段が縮み、同じ 0.785 ms/token の相対価値が
+// 上がった。切り戻しは `DENNO_GDN_BA_GPU=0`。
 
-/// task 269: `DENNO_GDN_BA_GPU` の解釈 (純関数)。既定 off。
+/// task 269: `DENNO_GDN_BA_GPU` の解釈 (純関数)。**既定 on** (task 285)。
 ///
-/// `1` / `on` / `true` だけ on (取り違えを増やさない)。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ off。未設定・空・その他の
+/// 値は on (取り違えを増やさないため、真偽の判定はこの 4 語だけ)。
 pub fn parse_gdn_ba_gpu(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(str::trim),
-        Some("1") | Some("on") | Some("true") | Some("ON") | Some("True")
+    !matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
     )
 }
 
