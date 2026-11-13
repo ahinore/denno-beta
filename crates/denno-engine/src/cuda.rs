@@ -7463,7 +7463,15 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
             let path = seg_k_ptx_path();
             let mut image = match std::fs::read(&path) {
                 Ok(b) => b,
-                Err(_) => return None,
+                Err(e) => {
+                    // 既定 on のゲートなので、欠けたら**静かに**遅い方へ落ちる。
+                    // 1 行だけ大きく出す (gate_audit の監査と同じ趣旨)。
+                    eprintln!(
+                        "[seg-k] PTX が読めない ({}) : {e} → 旧カーネル (遅い) で回す",
+                        path.display()
+                    );
+                    return None;
+                }
             };
             image.push(0);
             let lib = lib().ok()?;
