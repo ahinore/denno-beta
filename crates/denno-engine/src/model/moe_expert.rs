@@ -7564,11 +7564,15 @@ unsafe fn gemm_q5_1_vnni4<const IDX: bool>(
     }
 }
 
-/// task 291: Q5_1 の 4 ブロック版を使うか (`DENNO_Q51_BLK4=0` で旧カーネル)。
+/// task 291: Q5_1 の 4 ブロック版を使うか (**既定 off**。`DENNO_Q51_BLK4=1` で on)。
+///
+/// lab t291b では on で UD-Q4_K_XL の 3,826 cold prefill が 40.3 -> 36.8 s
+/// (-8.6%)、down の位相が 152 -> 84 ms/層 (-44%、ローカル実測)。target の 30% には
+/// 届かないため採否規則で既定 off のまま置く (REPORT_P291)。
 fn q5_1_blk4_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(std::env::var("DENNO_Q51_BLK4").ok().as_deref(), Some("0"))
+        matches!(std::env::var("DENNO_Q51_BLK4").ok().as_deref(), Some("1"))
     })
 }
 

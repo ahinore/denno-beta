@@ -15702,19 +15702,20 @@ fn moe_scratch_take() -> MoeScratch {
 
 /// 返す。大きすぎるものは捨てる (巨大な層のあとメモリを抱え込まない)。
 ///
-/// task 291: 上限を `DENNO_MOE_SCRATCH_KEEP_MB` で動かせるようにした (既定 2048)。
-/// 旧固定値 512 MiB では実形 (tot = 3826 × 8 = 30,608、e 2560 / ff 640) の
-/// 作業域 **509 MB** が毎層捨てられ、次の層で `vec![0.0; ...]` のゼロ埋め
-/// (実測 90〜150 ms/層、prefill 全体で 4〜7 秒) を払い直していた。
-/// prefill は同じ大きさの作業域を 48 層続けて使うので、抱えても 2 GiB に収まる。
-/// `DENNO_MOE_SCRATCH_KEEP_MB=512` で旧挙動に戻せる (A/B 用)。
+/// task 291: 上限を `DENNO_MOE_SCRATCH_KEEP_MB` で動かせるようにした (**既定 512**)。
+///
+/// 実形 (tot = 3826 × 8 = 30,608、e 2560 / ff 640) の作業域は 782 MB で、旧固定値
+/// 512 MiB では毎層捨てられ、次の層で `vec![0.0; ...]` のゼロ埋めを払い直していた
+/// (lab t291a の実測 149 ms/層、prefill 全体で 7 s)。`=2048` にすると 48 層で
+/// 使い回して UD-Q4_K_XL の 3,826 cold prefill が -20.7% になるが、target の
+/// 30% には届かないため採否規則で既定 off のまま置く (REPORT_P291)。
 fn moe_scratch_keep_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("DENNO_MOE_SCRATCH_KEEP_MB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(2048)
+            .unwrap_or(512)
             .saturating_mul(1024 * 1024)
     })
 }
