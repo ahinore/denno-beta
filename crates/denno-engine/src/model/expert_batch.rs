@@ -60,13 +60,17 @@ pub fn batch_enabled() -> bool {
 /// gate / up / silu / down / 重み付き和 を同じストリームに積み、**待ちは 1 回**、
 /// ホストへ返すのは `e` 要素だけ (153 KB -> 10 KB)。ミス expert は VRAM へ
 /// 上げずに CPU で計算し、その裏で GPU を走らせる。
+///
+/// lab t278b/t278c (UD-Q4_K_XL) で採否 yes: decode 65.9 -> 33.0 / 65.5 -> 34.7
+/// ms/tok (-50% / -47%)、prefill +1.2〜1.8%、errors 0、md5 は a/b 同一
+/// (長文の 2 ターン目だけ丸め差で DIFF)。**既定 on**。
 pub const SEG_LAYER_ENV: &str = "DENNO_SEG_LAYER";
 
-/// [`SEG_LAYER_ENV`] の解釈 (純関数)。**既定 off** (lab で採否を決めるまで)。
+/// [`SEG_LAYER_ENV`] の解釈 (純関数)。**既定 on**、明示的な偽値だけ切る。
 pub fn seg_layer_from_value(v: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -467,17 +471,18 @@ mod tests {
         assert!(!batch_from_value(Some(" 0 ")));
     }
 
-    /// task 278: 新経路は**既定 off**。明示的な真値だけ on。
+    /// task 278: 新経路は lab の採否 (yes) で**既定 on**。明示的な偽値だけ切る。
     #[test]
-    fn seg_layer_gate_defaults_off() {
-        assert!(!seg_layer_from_value(None), "未設定は off (既定)");
-        assert!(!seg_layer_from_value(Some("")));
-        assert!(!seg_layer_from_value(Some("0")));
-        assert!(!seg_layer_from_value(Some("off")));
-        assert!(!seg_layer_from_value(Some("false")));
+    fn seg_layer_gate_defaults_on() {
+        assert!(seg_layer_from_value(None), "未設定は on (t278b/t278c で採否 yes)");
+        assert!(seg_layer_from_value(Some("")));
         assert!(seg_layer_from_value(Some("1")));
         assert!(seg_layer_from_value(Some("on")));
         assert!(seg_layer_from_value(Some(" TRUE ")));
+        assert!(!seg_layer_from_value(Some("0")));
+        assert!(!seg_layer_from_value(Some("off")));
+        assert!(!seg_layer_from_value(Some("false")));
+        assert!(!seg_layer_from_value(Some("NO")));
     }
 
     /// task 278: prologue の 1 本バッファのオフセットが重ならず 8 バイト境界。

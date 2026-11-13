@@ -11758,7 +11758,13 @@ fn moe_experts_seg_gpu_batched(
     }
     crate::model::seg_prof::add(crate::model::seg_prof::PH_LOOKUP, _t_lookup);
     if pos.is_empty() {
-        // 1 本も載っていない層は呼び出し側の CPU 経路へ (同期の無駄を避ける)。
+        // VRAM が初期化されていない (CUDA 無し / 予算 0) ときは旧経路へ。
+        // 従来のフォールバック契約 (CPU の per-expert 経路) をそのまま通す。
+        if expert_vram::cache_usage().is_none() {
+            return Ok(None);
+        }
+        // VRAM はあるが 1 本も載っていない層は CPU で回す (ここで上げ直すと
+        // 1 層 30 MB の H2D になる)。足し込みの口は IQ 経路と共通。
         return Ok(Some(IqBatchOut::Contribs(vec![None; sel.len()], 0)));
     }
     let hits = devs.len() as u32;
