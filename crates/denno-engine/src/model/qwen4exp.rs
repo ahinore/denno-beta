@@ -3870,6 +3870,15 @@ impl Qwen4Exp {
         // (エラーで抜けても Drop で戻る)。decode の間は抱えない。
         #[cfg(feature = "cuda")]
         let _pf_stream_guard = PfStreamGuard;
+        // task 270: チャンクを上げると prefill の作業域 (mix の res / scratch +
+        // MoE の行バッファ + staging) がそのぶん増える。`DENNO_PREFILL_WORK_MB`
+        // が指定されていれば、足りない分を expert の LRU から**チャンク単位で
+        // 先に**空けておく。途中の確保失敗で staging が取れず、streaming が
+        // 黙って落ちる (14k が 25 → 39 s になった t270a) のを防ぐ。drop で release。
+        #[cfg(feature = "cuda")]
+        let _pf_work = crate::model::expert_vram::reserve_work_area(
+            crate::model::expert_vram::prefill_work_bytes(),
+        );
         let layer_major = batch && self.attn.layer_major_safe();
         let logits = if layer_major {
             self.forward_prefill_batch_tapped(ctx, prefill_chunk_for(ctx.len()), tokens, on_layer, roles)?
@@ -4758,6 +4767,20 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         hc: usize,
         lr: usize,
     ) -> crate::cuda::PfPoolGuard {
+        let need = self.pf_pool_need_for(nt_all, tile, chunk, hc, lr);
+        crate::cuda::pf_pool_acquire(&need)
+    }
+
+    /// task 279: このリクエストの形 (チャンク / タイル) からレイアウトの材料を組む。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_need_for(
+        &self,
+        nt_all: usize,
+        tile: usize,
+        chunk: usize,
+        hc: usize,
+        lr: usize,
+    ) -> crate::model::pf_pool::Need {
         let e = self.p.n_embd;
         let ff = self.p.n_ff_exp;
         // tensor core の grouped GEMM がこのモデルで実際に使えるか (層 0 の型で判定)。
@@ -4776,7 +4799,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 ff,
                 e,
             );
-        crate::cuda::pf_pool_acquire(&crate::model::pf_pool::Need {
+        crate::model::pf_pool::Need {
             nt_all,
             tile,
             k: self.p.n_expert_used,
@@ -4790,7 +4813,68 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             tc,
             stage_bytes: crate::model::exp_pf::stream_bytes(),
             stage_slots: crate::cuda::PF_STAGE_SLOTS,
-        })
+        }
+    }
+
+    /// task 279: 借りられる量から (チャンク, タイル) を選ぶ (純関数の決定 + 上限)。
+    ///
+    /// `DENNO_PF_POOL_BIG=1` のとき、パス数 (= expert 重みの H2D 量) が減る順に
+    /// 候補を試し、[`crate::model::pf_pool::PF_POOL_BIG_MB_ENV`] に収まる最初の組を
+    /// 返す。ゲート off / 候補なし / 上限が増えないときは従来の形を返す
+    /// (呼び出し側はそのまま `pf_pool_acquire_capped` に渡す)。
+    ///
+    /// 戻り値の 3 番目は「大きい形を選んだか」。true のとき呼び出し側は、借りた
+    /// 作業域のぶんに追い出した expert を prefill の終端で LRU へ戻す。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_pick(
+        &self,
+        nt_all: usize,
+        chunk: usize,
+        hc: usize,
+        lr: usize,
+    ) -> (crate::model::pf_pool::Need, usize, bool) {
+        let base_tile = crate::model::exp_pf::lm_tile(nt_all);
+        let base = self.pf_pool_need_for(nt_all, base_tile, chunk.min(nt_all), hc, lr);
+        let cap = crate::model::pf_pool::pf_pool_bytes();
+        if !crate::model::pf_pool::pf_pool_big_on() {
+            return (base, cap, false);
+        }
+        let big_cap = crate::model::pf_pool::pf_pool_big_bytes();
+        if big_cap <= cap {
+            return (base, cap, false);
+        }
+        let max_chunk = crate::model::pf_pool::big_chunk_max();
+        // 2,048 以上のチャンクは GDN prefill の連鎖の上限撤廃 (task 270 の
+        // `DENNO_PF_CHAIN_BIG`) が前提。無いまま大きいチャンクを使うと ssm が
+        // 連鎖の外へ落ちる (task 197: 3.96 → 24.7 s)。
+        let max_chunk = if crate::cuda::chain_big_on() {
+            max_chunk
+        } else {
+            max_chunk.min(crate::model::exp_pf::CHUNK_BALANCE_CAP)
+        };
+        match crate::model::pf_pool::choose_big(&base, big_cap, max_chunk) {
+            Some((c, t, l)) if c != base.chunk || t != base.tile => {
+                let passes = nt_all.div_ceil(t.max(1));
+                let base_passes = nt_all.div_ceil(base.tile.max(1));
+                eprintln!(
+                    "[pf-pool-big] 形を上げた (チャンク {} → {} / タイル {} → {} = {} → {} パス / 作業域 {} MiB)",
+                    base.chunk,
+                    c,
+                    base.tile,
+                    t,
+                    base_passes,
+                    passes,
+                    l.total >> 20
+                );
+                let need = crate::model::pf_pool::Need {
+                    chunk: c,
+                    tile: t,
+                    ..base
+                };
+                (need, big_cap, true)
+            }
+            _ => (base, cap, false),
+        }
     }
 
     /// task 227: 層優先の常駐 prefill (`DENNO_PF_LM_LAYER=1`)。
@@ -4824,24 +4908,28 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let n_layer = self.p.n_layer;
         let chunk = chunk.max(1);
         let nt_all = ctx.len();
-        let ranges: Vec<(usize, usize)> = (0..nt_all)
-            .step_by(chunk)
-            .map(|s| (s, (s + chunk).min(nt_all)))
-            .collect();
         // 1 チャンクならチャンク優先と同じ (層優先にする意味が無い)。
-        if ranges.len() < 2 {
+        if nt_all.div_ceil(chunk) < 2 {
             return Ok(None);
         }
         // task 257/265: 作業域のプールをこのリクエストの形で組む (長い prefill の
         // あいだだけ expert から借りる)。ガードはこの関数のスコープに置くので、
         // どの早期撤退でも終端で返る。
-        let _pool = self.pf_pool_begin_for(
-            nt_all,
-            crate::model::exp_pf::lm_tile(nt_all),
-            chunk.min(nt_all),
-            hc,
-            lr,
-        );
+        // task 279: 借りられる量から (チャンク, タイル) を選ぶ。**大きい形は
+        // プールを実際に借りられたときだけ**使う (借りられないと作業域が組めず、
+        // t270a のように streaming が黙って落ちる)。落ちたら従来の形へ。
+        let (need, pool_cap, big) = self.pf_pool_pick(nt_all, chunk, hc, lr);
+        let _pool = crate::cuda::pf_pool_acquire_capped(&need, pool_cap);
+        let big = big && _pool.is_held();
+        let (chunk, tile) = if _pool.is_held() {
+            (need.chunk.max(1), need.tile)
+        } else {
+            (chunk, crate::model::exp_pf::lm_tile(nt_all))
+        };
+        let ranges: Vec<(usize, usize)> = (0..nt_all)
+            .step_by(chunk)
+            .map(|s| (s, (s + chunk).min(nt_all)))
+            .collect();
         if !crate::cuda::pf_begin(chunk.min(nt_all), hc, e, lr) {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
@@ -4893,7 +4981,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 3
             };
             // task 250: MoE をトークンで割るときは h / act もその行数で足りる。
-            let tile_rows = crate::model::exp_pf::lm_tile(nt_all).saturating_mul(k);
+            // task 279: 行数は選んだタイル (プールのレイアウトと同じ値) を使う。
+            let tile_rows = tile.saturating_mul(k);
             let act_rows = if act_terms == 1 {
                 tile_rows
             } else if crate::model::exp_pf::lm_group_local() {
@@ -5204,7 +5293,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             // task 250: トークンタイル (`DENNO_PF_LM_TILE`)。MoE の作業域
             // (h) はタイルの行数で取るので、14k でも 1.5 GB の連続確保が要らない。
             // 分割しないときは 1 回 (従来と同じ経路)。
-            let tile = crate::model::exp_pf::lm_tile(nt_all);
+            // task 279: プールが借りられたときは選んだタイル (パス数が最小) を使う。
             let mut ffn_dev = true;
             if tile >= nt_all {
                 ffn_dev = moe_ffn_quant_batch_lm_dev(
@@ -5346,6 +5435,22 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         crate::cuda::pf_release();
         // task 265: 借りた作業域を expert に返す (ここでカードが expert に戻る)。
         drop(_pool);
+        // task 279: 大きい形で借りたときは、その確保が追い出した expert を LRU へ
+        // 戻す (借りた作業域だけでなく、代わりに追い出した在庫も返す)。
+        // MoE はもう完了している (末尾の D2H が同期) ので、t265b のように
+        // 実行中のカーネルと衝突しない。本数は借りた量に比例して有界。
+        if big {
+            let keys = crate::cuda::pf_pool_take_evicted();
+            if !keys.is_empty() {
+                let (n, bytes) = pf_restore_experts(&self.layers, &keys);
+                eprintln!(
+                    "[pf-pool] 大きい形で追い出した expert を {} 本 ({} MiB) 戻した ({} 本は戻せず)",
+                    n,
+                    bytes >> 20,
+                    keys.len().saturating_sub(n)
+                );
+            }
+        }
         // task 250: 作業域の外部予約を返す (LRU の上限がここで戻る)。
         drop(reserve_guard);
         // task 242: 作業域のために追い出した expert を戻す (prefill の終端)。

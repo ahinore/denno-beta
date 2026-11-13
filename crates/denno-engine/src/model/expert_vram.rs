@@ -801,16 +801,28 @@ impl EvictReport {
 /// `request` は確保したいバイト数。不足分だけを、アドレスが連続するチャンクの
 /// 窓で空ける (`plan_eviction`)。cuda feature 無しでは何も解放しない。
 pub fn emergency_free_chunks(request: usize) -> EvictReport {
+    emergency_free_chunks_keys(request).0
+}
+
+/// task 279: [`emergency_free_chunks`] の「追い出した expert の鍵」も返す版。
+///
+/// 鍵は**古い順** (LRU の先頭から)。prefill の作業域を借りるために追い出した
+/// expert を、借りた作業域を返すときに戻すために使う (task 242 の
+/// `emergency_free_keys` と同じ契約)。cuda feature 無しでは何も解放しない。
+pub fn emergency_free_chunks_keys(request: usize) -> (EvictReport, Vec<ExpertKey>) {
     #[cfg(feature = "cuda")]
     {
         gpu::emergency_free_chunks(request)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        EvictReport {
-            requested: request,
-            ..EvictReport::default()
-        }
+        (
+            EvictReport {
+                requested: request,
+                ..EvictReport::default()
+            },
+            Vec::new(),
+        )
     }
 }
 
@@ -1478,19 +1490,20 @@ mod gpu {
     ///
     /// LRU のロックを持っているスレッド (expert のロード中) からは何もできない
     /// (`try_lock`)。その場合は 0 を返し、呼び出し側が CPU 経路へ落ちる。
-    pub fn emergency_free_chunks(request: usize) -> EvictReport {
+    /// task 279: 追い出した鍵も返す (借りた作業域を返すときに expert を戻す)。
+    pub fn emergency_free_chunks(request: usize) -> (EvictReport, Vec<ExpertKey>) {
         let mut rep = EvictReport {
             requested: request,
             ..EvictReport::default()
         };
         if request == 0 {
-            return rep;
+            return (rep, Vec::new());
         }
         let Some(c) = CACHE.get() else {
-            return rep;
+            return (rep, Vec::new());
         };
         let Ok(mut g) = c.try_lock() else {
-            return rep;
+            return (rep, Vec::new());
         };
         // 失敗直後なので、キャッシュ (64 MiB / 2 秒) ではなく実測を引く。
         let free = crate::cuda::dev_mem_mb()
@@ -1511,12 +1524,13 @@ mod gpu {
             // slab に載っていない (per-expert 確保) なら、追い出しで実メモリが戻る。
             let evicted = g.evict_until_free(request.saturating_sub(free));
             rep.experts = evicted.len();
+            let keys: Vec<ExpertKey> = evicted.iter().map(|(k, _)| *k).collect();
             let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
             drop(evicted);
             drop(g);
             let released = crate::model::expert_slab::release_empty(request.saturating_sub(free));
             rep.released = freed.saturating_add(released);
-            return rep;
+            return (rep, keys);
         }
         let spans: Vec<crate::model::expert_slab::ChunkSpan> = map
             .iter()
@@ -1529,14 +1543,16 @@ mod gpu {
             .collect();
         let plan = crate::model::expert_slab::plan_eviction(&spans, free, request);
         if plan.ids.is_empty() {
-            return rep;
+            return (rep, Vec::new());
         }
         let chunks_before = crate::model::expert_slab::chunk_count();
         let bytes_before = crate::model::expert_slab::stats().2;
         let mut evicted = Vec::new();
+        let mut keys: Vec<ExpertKey> = Vec::new();
         for id in &plan.ids {
-            if let Some((_, _, _, keys)) = map.remove(id) {
-                for k in keys {
+            if let Some((_, _, _, chunk_keys)) = map.remove(id) {
+                for k in chunk_keys {
+                    keys.push(k);
                     if let Some(v) = g.remove(&k) {
                         evicted.push(v);
                     }
@@ -1554,7 +1570,7 @@ mod gpu {
         if rep.released == 0 {
             rep.released = bytes_before.saturating_sub(bytes_after);
         }
-        rep
+        (rep, keys)
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。

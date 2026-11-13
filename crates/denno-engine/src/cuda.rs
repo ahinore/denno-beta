@@ -3107,6 +3107,29 @@ pub fn evict_cap_bytes(need: usize, _tag: &'static str, chunk: usize, keep: bool
     Some(need.saturating_add(chunk))
 }
 
+// task 279: 直近の確保が expert を追い出したときの鍵 (借りた作業域を返す側で使う)。
+//
+// `DevBuffer::alloc_tagged` の追い出し経路が積む。**挙動は変えない** (控えるだけ)。
+// プール (`pf_pool_acquire_capped`) は自分の確保の前後でこれを読み書きするので、
+// 他の確保 (attention のミラーなど) が積んだ鍵は混ざらない。
+thread_local! {
+    static ALLOC_EVICTED: std::cell::RefCell<Vec<crate::model::expert_cache::ExpertKey>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// task 279: 追い出した鍵を控える (`alloc_tagged` の追い出し経路から)。
+fn note_alloc_evicted(keys: Vec<crate::model::expert_cache::ExpertKey>) {
+    if keys.is_empty() {
+        return;
+    }
+    ALLOC_EVICTED.with(|c| c.borrow_mut().extend(keys));
+}
+
+/// task 279: 控えた鍵を取り出す (取り出したら空にする)。
+pub fn take_alloc_evicted() -> Vec<crate::model::expert_cache::ExpertKey> {
+    ALLOC_EVICTED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
 pub struct DevBuffer {
     ptr: CUdeviceptr,
@@ -3164,7 +3187,11 @@ impl DevBuffer {
                 )
                 .is_some()
                 {
-                    let rep = crate::model::expert_vram::emergency_free_chunks(bytes);
+                    let (rep, evicted_keys) =
+                        crate::model::expert_vram::emergency_free_chunks_keys(bytes);
+                    // task 279: 追い出した鍵を控える (プールが借りた作業域を返すときに
+                    // expert を戻すため)。控えるだけで挙動は変えない。
+                    note_alloc_evicted(evicted_keys);
                     if rep.is_empty() {
                         // 空けられない (LRU のロックが取れない / 空チャンクが作れない)
                         // → 呼び出し側が小さいタイルか CPU 経路へ落ちる。
@@ -24665,6 +24692,23 @@ pub fn pf_res_park_load(i: usize, rows: usize, hc: usize, e: usize) -> bool {
 #[cfg(feature = "cuda")]
 static PF_POOL: std::sync::Mutex<Option<DevBuffer>> = std::sync::Mutex::new(None);
 
+/// task 279: プールの確保が追い出した expert の鍵 (`pf_pool_take_evicted` で取り出す)。
+///
+/// 借りた作業域を返したあと、呼び出し側がこれを LRU へ戻す (decode の作業集合を
+/// prefill 前の状態に戻す)。取り出したら空になる。
+#[cfg(feature = "cuda")]
+static PF_POOL_EVICTED: std::sync::Mutex<Vec<crate::model::expert_cache::ExpertKey>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// task 279: プールが追い出した expert の鍵を取り出す (取り出したら空)。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_take_evicted() -> Vec<crate::model::expert_cache::ExpertKey> {
+    match PF_POOL_EVICTED.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(feature = "cuda")]
 thread_local! {
     /// このスレッドの prefill で使う区画 (リクエストの先頭で組み直す)。
@@ -24720,10 +24764,19 @@ pub fn pf_pool_len() -> usize {
 /// 二重に呼ばれたときは既存の区画を組み直すだけ (返すのは最初のガード)。
 #[cfg(feature = "cuda")]
 pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
+    pf_pool_acquire_capped(n, crate::model::pf_pool::pf_pool_bytes())
+}
+
+/// task 279: 上限を指定して借りる (大きい計画は `DENNO_PF_POOL_BIG_MB` を使う)。
+///
+/// 上限は `cap` だけで決まり、レイアウトは `n` (チャンク / タイル) から組む。
+/// 呼び出し側が選んだ大きい形がここで上限を超える / 確保できないときは
+/// `owned == false` を返し、呼び出し側は従来のチャンク・タイルへ戻す。
+#[cfg(feature = "cuda")]
+pub fn pf_pool_acquire_capped(n: &crate::model::pf_pool::Need, cap: usize) -> PfPoolGuard {
     let not_held = PfPoolGuard { owned: false };
     // ゲート / しきい値 / 上限は純関数で決める (既定では何も借りない =
     // 従来の `alloc_tagged` と 1 バイトも変わらない)。
-    let cap = crate::model::pf_pool::pf_pool_bytes();
     let Some(l) = crate::model::pf_pool::borrow_plan(
         n,
         crate::model::pf_pool::pf_pool_on(),
@@ -24736,6 +24789,10 @@ pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
         // 同じリクエストの中で 2 回目 (層優先 → チャンク優先の落ちなど)。
         PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
         return not_held;
+    }
+    // task 279: 前のリクエストの鍵を持ち越さない (借り直すときに必ず空から)。
+    if let Ok(mut g) = PF_POOL_EVICTED.lock() {
+        g.clear();
     }
     let Some(ctx) = shared_ctx() else {
         return not_held;
@@ -24753,21 +24810,29 @@ pub fn pf_pool_acquire(n: &crate::model::pf_pool::Need) -> PfPoolGuard {
         return not_held;
     }
     let free_before = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
+    // task 279: この確保が追い出した expert の鍵を控える (借りる前に掃除する)。
+    let _ = take_alloc_evicted();
     match DevBuffer::alloc_tagged(l.total, crate::mem_audit::TAG_OTHER) {
         Ok(b) => {
             let bytes = b.bytes();
             *slot = Some(b);
             drop(slot);
+            let evicted = take_alloc_evicted();
+            let evicted_n = evicted.len();
+            if let Ok(mut g) = PF_POOL_EVICTED.lock() {
+                *g = evicted;
+            }
             let free_after = dev_mem_mb().map(|(f, _)| f).map(|f| f << 20);
             PF_POOL_OWNED.with(|c| c.set(true));
             PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = Some(l));
             eprintln!(
-                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB)",
+                "[pf-pool] expert から作業域 {} MiB を借りた (タイル {} / {} トークン / 空き {} → {} MiB / 追い出し {} 本)",
                 bytes >> 20,
                 n.tile,
                 n.nt_all,
                 free_before.map(|b| b >> 20).unwrap_or(0),
-                free_after.map(|b| b >> 20).unwrap_or(0)
+                free_after.map(|b| b >> 20).unwrap_or(0),
+                evicted_n
             );
             PfPoolGuard { owned: true }
         }
@@ -38464,6 +38529,48 @@ mod tests {
         assert!(!gdn_pf_chain_shape_ok(&over, &wo, 1024, e, nk, nv, dk, dv, 4));
     }
 
+    /// task 270: `DENNO_PF_CHAIN_BIG` の真理値表と、大きい nt の連鎖の規則。
+    ///
+    /// 2048 以上の nt は task 197 まで連鎖が外れていた (単発 sigmoid の前提)。
+    /// v1/v2/v3 のスキャンは長さの上限を持たないので、ゲート + 形が揃えば通す。
+    #[test]
+    fn chain_big_env_and_nt_rule() {
+        assert!(!chain_big_from_value(None), "未設定は off");
+        for off in ["0", "off", "false", "no", "", "  "] {
+            assert!(!chain_big_from_value(Some(off)), "{off:?} で on になっている");
+        }
+        for on in ["1", "on", "true", "yes", " TRUE "] {
+            assert!(chain_big_from_value(Some(on)), "{on:?} で off になっている");
+        }
+        // v3/v2/v1 と同じ形 (dk = dv = 128 / d_conv = 4)。
+        let (nk, nv, dk, dv, d_conv) = (8usize, 24usize, 128usize, 128usize, 4usize);
+        let conv_dim = 2 * nk * dk + nv * dv;
+        for nt in [64usize, 512, 2047] {
+            assert!(
+                chain_nt_ok(nt, nk, nv, dk, dv, d_conv, conv_dim, false),
+                "nt={nt} が既定で落ちる"
+            );
+        }
+        for nt in [2048usize, 3072, 4096] {
+            assert!(
+                !chain_nt_ok(nt, nk, nv, dk, dv, d_conv, conv_dim, false),
+                "nt={nt} が既定 (big off) で通る"
+            );
+            assert!(
+                chain_nt_ok(nt, nk, nv, dk, dv, d_conv, conv_dim, true),
+                "nt={nt} が big on で落ちる"
+            );
+        }
+        // dk = 256 は v1/v2/v3 の前提外なので、big でも受けない。
+        let cd256 = 2 * nk * 256 + nv * 256;
+        assert!(!chain_nt_ok(3072, nk, nv, 256, 256, d_conv, cd256, true));
+        // 床より短い nt は big でも受けない。
+        assert!(!chain_nt_ok(63, nk, nv, dk, dv, d_conv, conv_dim, true));
+        // 実モデル形 (e = 2560 / dk = dv = 256) では 2048 以上が big でも落ちる
+        // (`gdn_pf_chain_shape_rules` の 2048 の assert と同じ理由)。
+        assert!(!chain_nt_ok(2048, 8, 24, 256, 256, 4, 10240, true));
+    }
+
     /// task 152: `DENNO_MIX_BF16` の真理値表。既定は off (lab の採否で決める)。
     #[test]
     fn mix_bf16_gate_truth_table() {
@@ -42838,6 +42945,72 @@ thread_local! {
         const { std::cell::RefCell::new(GdnPfChainBufs::empty()) };
 }
 
+/// task 270: `DENNO_PF_CHAIN_BIG` — GDN prefill の連鎖を `nt >= 2048` でも使う。
+///
+/// 既定 **off**。`DENNO_PF_CHUNK` を 2048 以上にしたときだけ意味がある。
+/// **明示的な真値だけ on** (未設定・`0`・空は off)。
+///
+/// なぜ要るか: 連鎖の判定は「単発 sigmoid スキャン (`dno_gdn_scan_sig`) が受ける
+/// `nt < GDN_CHUNK_MIN_TOKENS (2048)`」で切られていた (task 167)。task 197 で
+/// チャンク 2048 が +39.6% になったのは、この境界で連鎖が外れ、ssm が
+/// 3.96 → 24.7 s に落ちたため。その後 task 186/225/228 で v2/v3/WY の
+/// スキャンが入り、どれもトークン長の上限を持たない (状態はデバイス正本、
+/// トークンはカーネル内で順に進む)。よって形とカーネルが揃えば
+/// 2048 以上でも連鎖を使ってよい。
+pub const CHAIN_BIG_ENV: &str = "DENNO_PF_CHAIN_BIG";
+
+/// [`CHAIN_BIG_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+pub fn chain_big_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+#[cfg(test)]
+static CHAIN_BIG_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `DENNO_PF_CHAIN_BIG` が on か (プロセスで 1 回だけ env を読む)。
+pub fn chain_big_on() -> bool {
+    #[cfg(test)]
+    {
+        match CHAIN_BIG_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| chain_big_from_value(std::env::var(CHAIN_BIG_ENV).ok().as_deref()))
+}
+
+/// task 270: 連鎖が受ける `nt` の範囲 (純関数)。
+///
+/// - `nt < GDN_SIG_MIN_TOKENS`: 短すぎる (decode と同じ床)。
+/// - `nt < GDN_CHUNK_MIN_TOKENS (2048)`: 単発 sigmoid スキャンが受ける (従来)。
+/// - `nt >= 2048`: `big` (= `DENNO_PF_CHAIN_BIG`) が on で、上限の無いスキャンの
+///   形 (`gdn_pf2_ok` = dk = dv = 128 / d_conv = 4 / conv_dim 一致) が揃うときだけ。
+///
+/// `big` を引数にして、ゲートの env を触らずに規則をテストできるようにする。
+pub fn chain_nt_ok(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+    big: bool,
+) -> bool {
+    if nt < GDN_SIG_MIN_TOKENS {
+        return false;
+    }
+    if nt < GDN_CHUNK_MIN_TOKENS {
+        return true;
+    }
+    big && gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+}
+
 /// task 167: 連鎖の前提 (GPU を触らない純関数)。false なら従来経路へ。
 ///
 /// 形は「ssm 層 1 本ぶんの投影 3 本とスキャン」がそのままつながることを要求する:
@@ -42874,15 +43047,18 @@ pub fn gdn_pf_chain_shape_ok(
     if nt == 0 || e == 0 || nk == 0 || nv == 0 {
         return false;
     }
-    // 単発の sigmoid スキャンが受ける範囲 (decode と同じ境界)。
-    if nt < GDN_SIG_MIN_TOKENS || nt >= GDN_CHUNK_MIN_TOKENS {
+    let conv_dim = 2 * nk * dk + nv * dv;
+    let vd = nv * dv;
+    // 単発の sigmoid スキャンが受ける範囲 (decode と同じ境界) と、task 270 の
+    // 大きい nt (`DENNO_PF_CHAIN_BIG` + 上限の無いスキャンの形) の判定。
+    // task 197 ではここが 2048 で切れて連鎖が外れ、ssm が 3.96 → 24.7 s に落ちた
+    // (チャンク 2048 が +39.6%)。v1/v2/v3 のスキャンには長さの上限が無い。
+    if !chain_nt_ok(nt, nk, nv, dk, dv, d_conv, conv_dim, chain_big_on()) {
         return false;
     }
     if dk != dv || dk > 256 || d_conv != 4 {
         return false;
     }
-    let conv_dim = 2 * nk * dk + nv * dv;
-    let vd = nv * dv;
     let ok_ty = |w: &PfChainW<'_>| matches!(w.ty, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K);
     let pair_ok = if wq.is_fused() {
         // 連結済み: 1 本の行列の行範囲として qkv と gate が並んでいること。
@@ -45941,6 +46117,48 @@ pub fn gdn_pf_chain(
         // 旧 PTX (sig 未収録) では黙って従来経路へ (ラッチはしない)。
         return Ok(false);
     };
+    // task 270: スキャンカーネルを**投影より前**に選ぶ。`nt >= 2048` では単発
+    // sigmoid (`f_scan`) の前提外なので、v1/v2/v3/WY のどれも撃てなければ
+    // まだ何も書いていないここで降りる (呼び出し側は従来経路で計算し直す)。
+    // 既定の順は task 173/186/225/228 のまま: WY (opt-in) → v3 → v2 → v1。
+    let pf_scan_wy = if gdn_pf_wy_on() && gdn_pf_wy_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+        gdn_pf_wy_kernels()
+    } else {
+        None
+    };
+    let pf_scan_fast3 = if pf_scan_wy.is_none()
+        && gdn_pf3_on()
+        && gdn_pf3_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
+        gdn_pf3_kernels()
+    } else {
+        None
+    };
+    let pf_scan_fast2 = if pf_scan_fast3.is_none()
+        && gdn_pf2_on()
+        && gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
+        gdn_pf2_kernels()
+    } else {
+        None
+    };
+    let pf_scan_fast = if pf_scan_fast2.is_none()
+        && gdn_pf_fast_on()
+        && gdn_pf_fast_eligible(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
+        gdn_pf_kernels()
+    } else {
+        None
+    };
+    if nt >= GDN_CHUNK_MIN_TOKENS
+        && pf_scan_wy.is_none()
+        && pf_scan_fast3.is_none()
+        && pf_scan_fast2.is_none()
+        && pf_scan_fast.is_none()
+    {
+        // 状態は 1 つも触っていない (scratch のゼロ埋めだけ)。
+        return Ok(false);
+    }
     // 重みは 3 本とも「デバイスに載る」ことを先に確かめる。ここまでの失敗は
     // 状態を 1 つも触っていないので `Ok(false)` で従来経路に戻せる。
     let (wqkv, wgate, wo) = match (
@@ -46141,43 +46359,9 @@ pub fn gdn_pf_chain(
     // ---- GDN スキャン (状態はデバイス正本) ----------------------------------
     let (pst_conv, pst_ssm) =
         gdn_state_begin(kv, li, conv_st, ssm_st, conv_dim * cs, nv, dk * dv)?;
-    // task 173: レジスタ常駐 + 4 レーンのスキャンが使えるならそちらで回す
-    // (`DENNO_GDN_PF_FAST`)。形が合わない・PTX が無いときは従来カーネルへ
-    // fail closed (この時点でモデルの状態は 1 つも進んでいない)。
-    // task 186: v2 (ヘッドあたり 2 ブロック + RMS norm の分離)。既定 off。
-    // 形が合わない・PTX が無いときは v1 (従来のレジスタ常駐版) → CPU へ fail closed。
-    // task 225: v3 (1 ヘッド 4 ブロック x 8 レーン) が使えれば最優先。
-    // task 228: WY 形式のチャンク版 (`DENNO_PF_SCAN_WY`) が使えれば最優先。
-    // 既定 off。PTX が無い / opt-in できないときは None → v3 以降へ fail closed。
-    let pf_scan_wy = if gdn_pf_wy_on() && gdn_pf_wy_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
-        gdn_pf_wy_kernels()
-    } else {
-        None
-    };
-    let pf_scan_fast3 = if pf_scan_wy.is_none()
-        && gdn_pf3_on()
-        && gdn_pf3_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
-    {
-        gdn_pf3_kernels()
-    } else {
-        None
-    };
-    let pf_scan_fast2 = if pf_scan_fast3.is_none()
-        && gdn_pf2_on()
-        && gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
-    {
-        gdn_pf2_kernels()
-    } else {
-        None
-    };
-    let pf_scan_fast = if pf_scan_fast2.is_none()
-        && gdn_pf_fast_on()
-        && gdn_pf_fast_eligible(nt, nk, nv, dk, dv, d_conv, conv_dim)
-    {
-        gdn_pf_kernels()
-    } else {
-        None
-    };
+    // スキャンカーネルの選択 (`pf_scan_wy` / `pf_scan_fast3` / `pf_scan_fast2` /
+    // `pf_scan_fast`) は task 270 で**投影より前**へ移した (大きい nt で撃てる
+    // カーネルが無いときに、状態を進めずに降りるため)。
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();

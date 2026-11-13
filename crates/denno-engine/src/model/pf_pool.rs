@@ -438,6 +438,233 @@ pub fn fits(l: &Layout, pool: usize) -> bool {
     l.total <= pool
 }
 
+// ---------------------------------------------------------------------------
+// task 279: 長いプロンプトで「1 パスあたりのトークン数」とチャンクを上げる
+// ---------------------------------------------------------------------------
+//
+// # なぜ要るか
+//
+// 層優先 prefill の MoE は **層ごとに 1 回** で、トークンは `DENNO_PF_LM_TILE`
+// (既定 5,120) のタイルに割って回す。ミス expert の重みはタイルごとに VRAM へ
+// 上げ直すので、14,018 トークンは 3 パスになり、上げる量はほぼパス数に比例する
+// (lab t270b の台帳: 9 パスのとき 156.5 GB、stage_copy 6.06 s / ptrtab 8.48 s)。
+// パス数を減らすにはタイルを大きくするしかなく、その作業域 (`h` / `act`) は
+// expert の LRU から借りるしかない。task 265 のプール (長い prefill のあいだ
+// だけ借りて返す) がその形を用意したので、ここでは
+// **借りられる量からタイルとチャンクを選ぶ**。
+//
+// # 選び方 ([`choose_big`])
+//
+// 1. タイルはパス数が少ない順 (`nt_all`, `nt_all/2`, ... と `DENNO_PF_LM_TILE`
+//    まで)。パス数が expert の H2D 量を決めるので、まずこれを最大化する。
+// 2. そのタイルでチャンクを大きい順 (`DENNO_PF_POOL_BIG_CHUNK` から
+//    `DENNO_PF_CHUNK` まで)。チャンクは mix / attn / ssm の反復回数を減らす。
+// 3. レイアウトが上限 ([`PF_POOL_BIG_MB_ENV`]) に収まる最初の組を採る。
+//
+// 収まる組が無い / 確保に失敗したときは呼び出し側が**従来のチャンクとタイル**へ
+// 戻す (リクエストは失敗させない)。
+
+/// `DENNO_PF_POOL_BIG`: 長いプロンプトで大きいタイル / チャンクを使う
+/// (task 279、**既定 on**。`0` / `off` / `false` / `no` で切る)。
+///
+/// # 実測 (lab t279c、sha 3796e6b25、depth8k、swift15-abl-IQ3_S)
+///
+/// base = 現在の int-auto 既定 (プール 2,688 MiB / タイル 5,120 / チャンク 1,536)。
+/// on = `DENNO_PF_POOL_BIG=1` (タイル = 全トークン = 1 パス / チャンク 2,047)。
+/// 各 COND は 2 回ずつ、先頭に捨て COND (`x0`)、末尾に base の繰り返し。
+///
+/// | 指標 | base | on | 差 |
+/// | --- | ---: | ---: | ---: |
+/// | 14,018 cold prefill | 16.76 / 16.80 s | 8.43 / 10.23 s | **-39 / -50%** |
+/// | 3,826 cold prefill | 3.33 / 3.65 s | 3.35 / 3.62 s | 差なし |
+/// | 短い decode | 19.4 ms/tok | 19.4 ms/tok | 0% |
+/// | 14k cold 後の decode | 20.8 / 20.4 | 19.5 / 20.4 | 悪化なし |
+/// | 14k turn2 の decode | 20.5 / 20.3 | 18.8 / 19.5 | 悪化なし |
+/// | 上げた expert 重み | 90.9 GB | 28.2 GB | -69% |
+///
+/// 14k の 1 パス版で借りるのは 4,094 MiB (base は 2,498 MiB)。その確保が
+/// 追い出した 783 本 (1,622 MiB) は prefill の終端で LRU へ戻すので、14k 後の
+/// ヒット率は 0.956 (base) 対 0.959 (on) で悪化しない。
+pub const PF_POOL_BIG_ENV: &str = "DENNO_PF_POOL_BIG";
+
+/// [`PF_POOL_BIG_ENV`] の既定 (task 279 の lab t279c で採用)。
+pub const DEFAULT_PF_POOL_BIG: bool = true;
+
+/// `DENNO_PF_POOL_BIG_MB`: 大きい計画のときに借りてよい上限 (MiB、既定 4,864)。
+///
+/// task 265 の既定 (2,688 MiB) はタイル 5,120 のレイアウト (約 2,498 MiB) に
+/// 合わせた値。パス数を 1 にすると `h` が 550 → 1,505 MiB、`act` が 200 → 547 MiB
+/// 増えるので、そのぶんを上乗せした値。**実測で決める** (lab t279a/b)。
+pub const PF_POOL_BIG_MB_ENV: &str = "DENNO_PF_POOL_BIG_MB";
+
+/// [`PF_POOL_BIG_MB_ENV`] の既定 (MiB)。
+///
+/// 14k / タイル = 全トークン / チャンク 2,047 / TC のレイアウトが 4,341 MiB
+/// (lab t279a の `[pf-pool-big]` は 4,094 MiB) なので、task 265 が見つけた
+/// 「prefill 中のプール外の確保 (attention のミラー) が空き不足で 255 MiB の
+/// チャンクを追い出す」ぶんの余裕を足す。
+pub const DEFAULT_POOL_BIG_MB: usize = 4864;
+
+/// `DENNO_PF_POOL_BIG_CHUNK`: 大きい計画で使うチャンクの上限 (トークン、既定 2,047)。
+///
+/// 既定を GDN prefill のデバイス連鎖の境界 (`GDN_CHUNK_MIN_TOKENS` = 2,048) の
+/// 手前に置いてある。境界を越えると `DENNO_PF_CHAIN_BIG` (task 270) が要り、
+/// lab t279a ではチャンク 2,047 (8.31 s) と 3,072 (8.46 s) で差が無かったので、
+/// 未確認の形を既定にしない。上限 4,096 は t270a/b で連鎖が生きることを
+/// 確認した最大 (明示指定 + `DENNO_PF_CHAIN_BIG=1` のときだけ到達する)。
+pub const PF_POOL_BIG_CHUNK_ENV: &str = "DENNO_PF_POOL_BIG_CHUNK";
+
+/// [`PF_POOL_BIG_CHUNK_ENV`] の既定 (トークン)。
+pub const DEFAULT_BIG_CHUNK: usize = 2047;
+
+/// チャンクの上限 (これ以上は連鎖の形が未確認)。
+pub const MAX_BIG_CHUNK: usize = 4096;
+
+/// [`PF_POOL_BIG_ENV`] の解釈 (純関数)。既定 on、**明示的な偽値だけ off**。
+///
+/// task 265 の 3 本 (`DENNO_PF_POOL` / `DENNO_PF_LM_LAYER` / `DENNO_PF_TC_EXP`) と
+/// 同じ規約にした (未設定・空・真値は on)。
+pub fn pf_pool_big_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
+/// 大きい計画を使うか (プロセスで 1 回だけ env を読む)。
+pub fn pf_pool_big_on() -> bool {
+    #[cfg(test)]
+    {
+        let f = BIG_FORCE_ON.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_pool_big_from_value(std::env::var(PF_POOL_BIG_ENV).ok().as_deref()))
+}
+
+/// テスト用: `pf_pool_big_on()` を env 無しで固定する (`None` で解除)。
+#[cfg(test)]
+pub(crate) fn set_big_force_on_for_test(v: Option<bool>) {
+    BIG_FORCE_ON.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+static BIG_FORCE_ON: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// [`PF_POOL_BIG_MB_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
+pub fn pf_pool_big_mb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_POOL_BIG_MB),
+        None => DEFAULT_POOL_BIG_MB,
+    }
+}
+
+/// 大きい計画の借りる上限 (バイト)。env はプロセスで 1 回だけ読む。
+pub fn pf_pool_big_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pf_pool_big_mb_from_value(std::env::var(PF_POOL_BIG_MB_ENV).ok().as_deref()) << 20
+    })
+}
+
+/// [`PF_POOL_BIG_CHUNK_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
+pub fn big_chunk_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(|n| n.clamp(1, MAX_BIG_CHUNK))
+            .unwrap_or(DEFAULT_BIG_CHUNK),
+        None => DEFAULT_BIG_CHUNK,
+    }
+}
+
+/// 大きい計画のチャンク上限 (トークン)。env はプロセスで 1 回だけ読む。
+pub fn big_chunk_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| big_chunk_from_value(std::env::var(PF_POOL_BIG_CHUNK_ENV).ok().as_deref()))
+}
+
+/// 大きい計画の候補 (純関数)。戻り値は `(chunk, tile)` の並び。
+///
+/// 並びは「MoE のパス数が少ない順 → チャンクが大きい順」。パス数は
+/// `ceil(nt_all / tile)` で、expert 重みの H2D 量はほぼパス数に比例する。
+/// チャンクは `nt_all / 2` 以下に抑える (1 枚になると層優先の意味が消え、
+/// 呼び出し側がチャンク優先へ落ちる)。
+pub fn big_candidates(
+    nt_all: usize,
+    base_chunk: usize,
+    base_tile: usize,
+    max_chunk: usize,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if nt_all == 0 {
+        return out;
+    }
+    let base_tile = base_tile.clamp(1, nt_all);
+    let base_chunk = base_chunk.max(1);
+    let hi_chunk = max_chunk.clamp(1, MAX_BIG_CHUNK).max(base_chunk);
+    // タイル: パス数 1 から、`DENNO_PF_LM_TILE` (既定 5,120) まで。
+    let mut tiles: Vec<usize> = Vec::new();
+    let max_passes = nt_all.div_ceil(base_tile);
+    for p in 1..=max_passes {
+        let t = nt_all.div_ceil(p);
+        if t < base_tile {
+            break;
+        }
+        if tiles.last() != Some(&t) {
+            tiles.push(t);
+        }
+    }
+    if !tiles.contains(&base_tile) {
+        tiles.push(base_tile);
+    }
+    // チャンク: 上限 → 2 倍 → 従来。どれも `hi_chunk` と nt_all/2 を超えない。
+    let mut chunks: Vec<usize> = Vec::new();
+    for c in [hi_chunk, base_chunk.saturating_mul(2).min(hi_chunk), base_chunk] {
+        let c = c.min(nt_all / 2).max(base_chunk);
+        if !chunks.contains(&c) {
+            chunks.push(c);
+        }
+    }
+    for t in tiles {
+        for &c in &chunks {
+            out.push((c, t));
+        }
+    }
+    out
+}
+
+/// 上限 `cap` に収まる最良の `(chunk, tile, layout)` を選ぶ (純関数)。
+///
+/// 候補の順に試して**最初に収まった組**を返す (fail open = `None`)。
+pub fn choose_big(n: &Need, cap: usize, max_chunk: usize) -> Option<(usize, usize, Layout)> {
+    for (chunk, tile) in big_candidates(n.nt_all, n.chunk, n.tile, max_chunk) {
+        let cand = Need { chunk, tile, ..*n };
+        let Some(l) = layout(&cand) else {
+            continue;
+        };
+        if l.total <= cap {
+            return Some((chunk, tile, l));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +827,110 @@ mod tests {
         assert!(layout(&Need { tile: 0, ..need() }).is_none());
         assert!(layout(&Need { e: 0, ..need() }).is_none());
         assert!(layout(&Need { ff: usize::MAX, ..need() }).is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // task 279: 大きいタイル / チャンクの選択
+    // ----------------------------------------------------------------------
+
+    /// ゲートは既定 on、明示的な偽値だけ off (task 265 の 3 本と同じ規約)。
+    #[test]
+    fn big_gate_is_on_unless_explicitly_off() {
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some(" NO ")] {
+            assert!(!pf_pool_big_from_value(v), "big({v:?}) が on");
+        }
+        for v in [None, Some(""), Some("1"), Some("on"), Some("true"), Some(" yes ")] {
+            assert!(pf_pool_big_from_value(v), "big({v:?}) が off");
+        }
+        assert!(DEFAULT_PF_POOL_BIG, "既定は on (lab t279c で採用)");
+        // 上限とチャンクの既定 (0 / 解析不能は既定)。
+        assert_eq!(pf_pool_big_mb_from_value(None), DEFAULT_POOL_BIG_MB);
+        assert_eq!(pf_pool_big_mb_from_value(Some("0")), DEFAULT_POOL_BIG_MB);
+        assert_eq!(pf_pool_big_mb_from_value(Some("x")), DEFAULT_POOL_BIG_MB);
+        assert_eq!(pf_pool_big_mb_from_value(Some("5200")), 5200);
+        assert_eq!(big_chunk_from_value(None), DEFAULT_BIG_CHUNK);
+        assert_eq!(big_chunk_from_value(Some("0")), DEFAULT_BIG_CHUNK);
+        assert_eq!(big_chunk_from_value(Some("4096")), 4096);
+        assert_eq!(big_chunk_from_value(None), 2047);
+        // 上限 4,096 を超える指定は丸める (未確認の形を作らない)。
+        assert_eq!(big_chunk_from_value(Some("8192")), MAX_BIG_CHUNK);
+    }
+
+    /// テスト用の強制スイッチ (env を触らずに分岐を固定する)。
+    #[test]
+    fn big_force_switch_for_tests() {
+        set_big_force_on_for_test(Some(false));
+        assert!(!pf_pool_big_on());
+        set_big_force_on_for_test(Some(true));
+        assert!(pf_pool_big_on());
+        set_big_force_on_for_test(None);
+        assert!(pf_pool_big_on(), "env 未設定の既定は on");
+    }
+
+    /// 候補は「パス数が少ない順 → チャンクが大きい順」で、従来のタイルも残る。
+    #[test]
+    fn big_candidates_reduce_passes_first() {
+        let c = big_candidates(14018, 1536, 5120, 2047);
+        // パス数を 1 にした組が先頭 (チャンクは大きい順)。
+        assert_eq!(c[0], (2047, 14018), "先頭が 1 パスでない: {c:?}");
+        assert_eq!(c[1], (1536, 14018));
+        // そのあと 2 パス、最後に従来のタイル (3 パス)。
+        let passes: Vec<usize> = c.iter().map(|&(_, t)| 14018usize.div_ceil(t)).collect();
+        assert!(passes.windows(2).all(|w| w[0] <= w[1]), "パス数が単調でない: {passes:?}");
+        assert!(c.contains(&(2047, 5120)), "従来タイルが候補に無い: {c:?}");
+        assert_eq!(passes.last().copied(), Some(3));
+        // 1 枚 (= 層優先の意味が消える) は作らない。
+        assert!(c.iter().all(|&(ch, _)| ch * 2 <= 14018), "{c:?}");
+        // タイルの下限は `DENNO_PF_LM_TILE`。
+        assert!(c.iter().all(|&(_, t)| t >= 5120), "{c:?}");
+        // 3,826 (タイルが既に全トークン) はタイルを上げない。
+        let c2 = big_candidates(3826, 1536, 3826, 3072);
+        assert!(c2.iter().all(|&(_, t)| t == 3826), "{c2:?}");
+        assert_eq!(c2[0], (1913, 3826), "チャンクは nt/2 まで: {c2:?}");
+    }
+
+    /// 上限が増えないと 1 パスには上がらない (= 既定では従来と同じ形)。
+    #[test]
+    fn choose_big_only_when_the_cap_allows_it() {
+        let n = need();
+        let base_total = layout(&n).expect("レイアウト").total;
+        // task 265 の既定 (2,688 MiB) ではタイルが上がらない = パス数は 3 のまま。
+        let same = choose_big(&n, DEFAULT_POOL_MB << 20, DEFAULT_BIG_CHUNK).expect("収まる");
+        assert_eq!(same.1, n.tile, "タイルが上がっている: {same:?}");
+        assert_eq!(14018usize.div_ceil(same.1), 3);
+        assert!(same.2.total <= (DEFAULT_POOL_MB << 20));
+        // レイアウトの合計ちょうどでも従来の形が選べる (fail open の下限)。
+        let tight = choose_big(&n, base_total, DEFAULT_BIG_CHUNK).expect("収まる");
+        assert_eq!((tight.0, tight.1), (n.chunk, n.tile));
+        assert_eq!(tight.2.total, base_total);
+        // 4,864 MiB なら 1 パス + チャンク 2,047 (連鎖の境界の手前)。
+        let big = choose_big(&n, DEFAULT_POOL_BIG_MB << 20, DEFAULT_BIG_CHUNK).expect("1 パス");
+        assert_eq!((big.0, big.1), (2047, 14018));
+        assert!(big.2.total <= (DEFAULT_POOL_BIG_MB << 20));
+        // 余裕 (task 265 の実測で 255 MiB の追い出しが起きた) を残す。
+        assert!(
+            (DEFAULT_POOL_BIG_MB << 20) - big.2.total > (128 << 20),
+            "余裕 {} B",
+            (DEFAULT_POOL_BIG_MB << 20) - big.2.total
+        );
+        // 収まる組が無ければ None (呼び出し側は従来の形へ)。
+        assert!(choose_big(&n, 1 << 20, DEFAULT_BIG_CHUNK).is_none());
+        // 上限を 1,536 に落とすと、1 パスのままチャンクは従来のまま。
+        let c1536 = choose_big(&n, DEFAULT_POOL_BIG_MB << 20, 1536).expect("1 パス");
+        assert_eq!((c1536.0, c1536.1), (1536, 14018));
+    }
+
+    /// 3,826 の大きい形 (チャンク 1,913) も既定のプールに収まる。
+    #[test]
+    fn big_plan_for_three_point_eight_k_fits() {
+        let n = Need {
+            nt_all: 3826,
+            tile: 3826,
+            ..need()
+        };
+        let (c, t, l) = choose_big(&n, DEFAULT_POOL_BIG_MB << 20, DEFAULT_BIG_CHUNK).expect("収まる");
+        assert_eq!(t, 3826);
+        assert_eq!(c, 1913);
+        assert!(fits(&l, DEFAULT_POOL_MB << 20), "total {} B", l.total);
     }
 }
