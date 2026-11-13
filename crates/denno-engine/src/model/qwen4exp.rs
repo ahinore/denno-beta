@@ -6084,6 +6084,11 @@ pub fn mix_qchain_line() -> Option<String> {
     }
     let n = MIX_QCHAIN_HITS.load(std::sync::atomic::Ordering::Relaxed);
     let calls = MIX_QCHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    // task 282: ゲートが既定 on になったので、**1 度も呼ばれていない**モデル
+    // (mix が BF16 の既定モデルなど) では行を出さない (ログを 1 バイトも変えない)。
+    if calls == 0 {
+        return None;
+    }
     // task 282: 高速 GEMV (`DENNO_MIX_QK`) が実際に撃たれた回数も出す。
     #[cfg(feature = "cuda")]
     let qk = crate::cuda::mix_qk_hits();
@@ -6135,10 +6140,13 @@ mod mix_qchain_tests {
         }
     }
 
-    /// ゲートを明示的に切ったときだけ診断行を出さない (既定 on では出る)。
+    /// 呼び出しが 0 のときは行を出さない (既定 on でもログを変えない)。
+    /// ゲートが既定 on になったぶん、既定モデル (mix は BF16) では
+    /// `hc_mix_quant_fast` が 1 度も呼ばれないので行が出ない。
     #[test]
-    fn qchain_line_follows_the_gate() {
-        assert_eq!(mix_qchain_line().is_some(), mix_qchain_enabled());
+    fn qchain_line_is_quiet_without_calls() {
+        mix_qchain_reset();
+        assert!(mix_qchain_line().is_none(), "呼び出し 0 では行を出さない");
     }
 
     /// task 282: prefill のガードが立っている間は chain を使わない (decode 専用)。
