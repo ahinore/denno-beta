@@ -15844,23 +15844,32 @@ fn moe_scratch_take() -> MoeScratch {
 
 /// 返す。大きすぎるものは捨てる (巨大な層のあとメモリを抱え込まない)。
 ///
-/// task 291: 上限を `DENNO_MOE_SCRATCH_KEEP_MB` で動かせるようにした (**既定 512**)。
+/// task 291: 上限を `DENNO_MOE_SCRATCH_KEEP_MB` で動かせるようにした (**既定 2048**)。
 ///
 /// 実形 (tot = 3826 × 8 = 30,608、e 2560 / ff 640) の作業域は 782 MB で、旧固定値
 /// 512 MiB では毎層捨てられ、次の層で `vec![0.0; ...]` のゼロ埋めを払い直していた
 /// (lab t291a の実測 149 ms/層、prefill 全体で 7 s)。`=2048` にすると 48 層で
-/// 使い回して UD-Q4_K_XL の 3,826 cold prefill が -20.7% になるが、target の
-/// 30% には届かないため採否規則で既定 off のまま置く (REPORT_P291)。
+/// 使い回して UD-Q4_K_XL の 3,826 cold prefill が -20.7% になる (lab t291a:
+/// 50.85 -> 40.30 s)。task 291 では target 30% に届かないため既定 off で置いたが、
+/// task 297 で target 20% に対して採否 yes になり **既定 2048** にした。
+/// `=512` で従来 (毎層捨てる) に戻せる。
 fn moe_scratch_keep_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("DENNO_MOE_SCRATCH_KEEP_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(512)
+        moe_scratch_keep_mb_from_value(std::env::var("DENNO_MOE_SCRATCH_KEEP_MB").ok().as_deref())
             .saturating_mul(1024 * 1024)
     })
 }
+
+/// task 297: `DENNO_MOE_SCRATCH_KEEP_MB` の解釈 (純関数)。未設定・数値でない値は
+/// 既定 2048 MiB。数値はそのまま (0 で毎層捨てる)。
+fn moe_scratch_keep_mb_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(MOE_SCRATCH_KEEP_MB_DEFAULT)
+}
+
+/// task 297: 作業域を使い回す上限の既定 (MiB)。
+pub(crate) const MOE_SCRATCH_KEEP_MB_DEFAULT: usize = 2048;
 
 fn moe_scratch_put(s: MoeScratch) {
     let mut g = MOE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -18880,6 +18889,19 @@ mod tests {
         // 範囲外の index でも「ヒープだから None」を先に返す (呼び出し側は
         // 従来の同期経路へ落ち、そちらが index を弾く)。
         assert!(w.slice_mapped(n_expert).expect("ヒープは None").is_none());
+    }
+
+    /// task 297: 作業域を使い回す上限の既定は 2048 MiB (`DENNO_MOE_SCRATCH_KEEP_MB` で
+    /// 動かせる)。実形の作業域 782 MB は 2048 に収まるので 48 層で使い回せる。
+    /// 512 を明示すると従来 (毎層捨てる) に戻る。
+    #[test]
+    fn moe_scratch_keep_mb_defaults_to_2048() {
+        assert_eq!(moe_scratch_keep_mb_from_value(None), 2048);
+        assert_eq!(MOE_SCRATCH_KEEP_MB_DEFAULT, 2048);
+        assert_eq!(moe_scratch_keep_mb_from_value(Some("512")), 512);
+        assert_eq!(moe_scratch_keep_mb_from_value(Some(" 0 ")), 0);
+        // 数値でない値は既定へ (壊れた env で作業域を毎層捨てない)
+        assert_eq!(moe_scratch_keep_mb_from_value(Some("x")), 2048);
     }
 
     #[test]

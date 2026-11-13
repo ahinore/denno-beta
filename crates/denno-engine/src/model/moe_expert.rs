@@ -7564,16 +7564,25 @@ unsafe fn gemm_q5_1_vnni4<const IDX: bool>(
     }
 }
 
-/// task 291: Q5_1 の 4 ブロック版を使うか (**既定 off**。`DENNO_Q51_BLK4=1` で on)。
+/// task 291: Q5_1 の 4 ブロック版を使うか (**既定 on**。`DENNO_Q51_BLK4=0` で旧版)。
 ///
 /// lab t291b では on で UD-Q4_K_XL の 3,826 cold prefill が 40.3 -> 36.8 s
-/// (-8.6%)、down の位相が 152 -> 84 ms/層 (-44%、ローカル実測)。target の 30% には
-/// 届かないため採否規則で既定 off のまま置く (REPORT_P291)。
+/// (-8.6%)、down の位相が 152 -> 84 ms/層 (-44%、ローカル実測)。task 291 では
+/// target の 30% に届かないため既定 off で置いたが、task 297 で target 20% に
+/// 対して採否 yes になり **既定 on** にした。`=0` で旧カーネルへ戻せる。
 fn q5_1_blk4_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(std::env::var("DENNO_Q51_BLK4").ok().as_deref(), Some("1"))
+        q5_1_blk4_from_value(std::env::var("DENNO_Q51_BLK4").ok().as_deref())
     })
+}
+
+/// task 297: `DENNO_Q51_BLK4` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+fn q5_1_blk4_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim),
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
+    )
 }
 
 /// VNNI 経路で行範囲 `r0..r1` を計算する。使えないときは `false` を返す
@@ -10354,6 +10363,21 @@ mod tests {
             *o = acc as f32;
         }
         out
+    }
+
+    /// task 297: `DENNO_Q51_BLK4` の解釈。既定 (未設定) が on で、明示的な偽値だけが
+    /// 旧カーネルへ戻す。env は `OnceLock` で 1 回しか読まないので、判定は純関数で固定する。
+    #[test]
+    fn q5_1_blk4_gate_defaults_on() {
+        assert!(q5_1_blk4_from_value(None), "未設定は既定 on");
+        assert!(q5_1_blk4_from_value(Some("1")));
+        assert!(q5_1_blk4_from_value(Some("on")));
+        for off in ["0", "off", "false", "no", "", " 0 "] {
+            assert!(
+                !q5_1_blk4_from_value(Some(off)),
+                "{off:?} は off (旧カーネル) のはず"
+            );
+        }
     }
 
     /// task 291: 索引付き VNNI (`VnniAct::tid`) は「トークンを詰め直した活性」と
