@@ -191,8 +191,48 @@ pub(crate) fn set_fused_gemv_for_test(v: Option<bool>) {
     }, Ordering::Relaxed);
 }
 
-/// 行並列を立てる条件 (実測で決めた)。
+/// task 281: BF16 GEMV の行しきい値を n から決める (`DENNO_BF16_SMALLN_PAR`)。
 ///
+/// **既定 off** (0 = 従来 = 既定の門番 `PAR_MIN_ROWS` = 512 行に任せる)。
+/// on のとき、n が [`BF16_SMALLN_MAX`] 以下なら [`BF16_SMALLN_MIN_ROWS`] 行で
+/// rayon に割る。動機: GDN の `ssm_beta` / `ssm_alpha` は **BF16・n=96** で、
+/// 512 行の門番に掛からないため **単スレッド**だった (decode で 36 層 x
+/// 21.8 us = 0.78 ms/token、実測 22 GB/s。t269a の `[q4ledger] ssm` の cpu 列)。
+/// 行は独立・行内の d 昇順累積は不変なので、分割しても**値はビット一致**する。
+const BF16_SMALLN_MAX: usize = 256;
+/// 小 n のときに 1 タスクが受ける行数 (n=96 なら 12 タスク)。
+const BF16_SMALLN_MIN_ROWS: usize = 8;
+
+/// [`BF16_SMALLN_MAX`] 系の解釈 (純関数・テスト用)。明示的な真値だけ on。
+fn parse_bf16_smalln_par(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`parse_bf16_smalln_par`] をプロセスで 1 回だけ読む。
+fn bf16_smalln_par_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_bf16_smalln_par(std::env::var("DENNO_BF16_SMALLN_PAR").ok().as_deref())
+    })
+}
+
+/// BF16 GEMV の行しきい値 (0 = 既定の門番に任せる)。
+fn bf16_default_row_min(n: usize) -> usize {
+    if bf16_smalln_par_on()
+        && n > 0
+        && n <= BF16_SMALLN_MAX
+        && n % BF16_SMALLN_MIN_ROWS == 0
+    {
+        BF16_SMALLN_MIN_ROWS
+    } else {
+        0
+    }
+}
+
+/// 行並列を立てる条件 (実測で決めた)。
 /// - **行数が 8 以上**、または
 /// - **1 呼び出しの積和 (行数 × k) が 32768 以上** (行数 4 でも k が広ければ得)。
 ///
@@ -826,16 +866,27 @@ impl GgufLinear {
                 // two_row / row_par_min は Q8_0 / IQ4_XS と同じ形で伝える (カーネルは
                 // もともと複数行を交互に回すので 2 行指定の有無で経路は変わらない)。
                 if self.ty == GgmlType::Bf16 && bf16_fast_enabled() {
-                    return if row_par_min == 0 {
+                    // task 281: n が既定の門番 (512) 未満の BF16 GEMV は 1 本の
+                    // 鎖 (単スレッド) で走る。GDN の `ssm_beta` / `ssm_alpha` は
+                    // Fp32 ではなく **BF16・n=96 (491 KB/層)** で、decode では
+                    // 36 層ぶんこれが直列に効いていた (ssm 区間のホスト側
+                    // ≈21.8 us/層 = 0.78 ms/token、実測 22 GB/s)。
+                    // 行は独立なのでしきい値を下げても値はビット一致する。
+                    let row_min = if row_par_min == 0 {
+                        bf16_default_row_min(self.n)
+                    } else {
+                        row_par_min
+                    };
+                    return if row_min == 0 {
                         if two_row {
                             expert_gemv_bf16_2row(b, self.k, self.n, x, out)
                         } else {
                             expert_gemv_bf16(b, self.k, self.n, x, out)
                         }
                     } else if two_row {
-                        expert_gemv_bf16_min_2row(b, self.k, self.n, x, out, row_par_min)
+                        expert_gemv_bf16_min_2row(b, self.k, self.n, x, out, row_min)
                     } else {
-                        expert_gemv_bf16_min(b, self.k, self.n, x, out, row_par_min)
+                        expert_gemv_bf16_min(b, self.k, self.n, x, out, row_min)
                     };
                 }
                 // task 91: `two_row` / `row_par_min` の明示呼び出し (hc mix の decode
@@ -2677,6 +2728,36 @@ mod tests {
                 GgufLinear::from_slice(ty, k, n, &w).expect("GgufLinear")
             })
             .collect()
+    }
+
+    /// task 281: `DENNO_BF16_SMALLN_PAR` の真理値表としきい値の形。
+    ///
+    /// env を立てない既定では 0 (= 呼び出し側の門番 = `PAR_MIN_ROWS` 512 行) を
+    /// 返す。n=96 の beta/alpha が 8 行ずつに割れるのは on のときだけ。
+    #[test]
+    fn bf16_smalln_par_gate_and_thresholds() {
+        for v in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("no"),
+            Some("x"),
+        ] {
+            assert!(!parse_bf16_smalln_par(v), "{v:?} が on になる");
+        }
+        for v in [Some("1"), Some("on"), Some("ON"), Some(" true "), Some("yes")] {
+            assert!(parse_bf16_smalln_par(v), "{v:?} が on にならない");
+        }
+        // 既定 (env 無し) では従来の門番に任せる = 0。
+        assert_eq!(bf16_default_row_min(96), 0);
+        // 定数の関係: 小 n の門番は既定の門番より小さく、対象は n <= 256。
+        assert!(BF16_SMALLN_MIN_ROWS < PAR_MIN_ROWS);
+        assert!(BF16_SMALLN_MAX < PAR_MIN_ROWS);
+        assert_eq!(BF16_SMALLN_MIN_ROWS, 8);
+        assert_eq!(BF16_SMALLN_MAX, 256);
     }
 
     /// `DENNO_FUSED_GEMV` の真理値表。既定 on、明示的な偽値だけ off。
