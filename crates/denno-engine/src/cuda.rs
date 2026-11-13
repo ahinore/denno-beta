@@ -3090,6 +3090,28 @@ pub fn alloc_keep_experts() -> bool {
     })
 }
 
+/// task 290: `DENNO_ALLOC_FORCE_CHUNK` — 確保が失敗したあと、`cuMemGetInfo` の
+/// 空きが要求以上に見えても (断片化) 冷たいチャンクを 1 本空けて再試行する
+/// (**既定 on**。`0` / `off` / `false` / `no` で task 256 の従来動作に戻る)。
+///
+/// lab t286c の UD-Q4_K_XL 14k は「空き 3 MiB で 3 MiB の確保が error 2」で
+/// 落ちた。不足分が 0 なので `plan_eviction` が 1 本も選ばず、`emergency_free`
+/// も 0 を返して諦めていた。失敗後の再試行だけは空きを見ずに 1 本空ける。
+pub const ALLOC_FORCE_CHUNK_ENV: &str = "DENNO_ALLOC_FORCE_CHUNK";
+
+/// `DENNO_ALLOC_FORCE_CHUNK` の解釈 (純関数)。未設定・読めない値は既定 (on)。
+pub fn alloc_force_chunk_from_value(v: Option<&str>) -> bool {
+    parse_keep_experts(v, true)
+}
+
+/// 失敗後に 1 チャンク必ず空けるか (プロセスで 1 回だけ env を読む)。
+pub fn alloc_force_chunk() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        alloc_force_chunk_from_value(std::env::var(ALLOC_FORCE_CHUNK_ENV).ok().as_deref())
+    })
+}
+
 /// task 256: 確保 1 本が失敗したときに expert を追い出してよい上限 (バイト)。
 ///
 /// slab はチャンクが空にならないと実メモリを返さないので、上限はタグに
@@ -3187,8 +3209,11 @@ impl DevBuffer {
                 )
                 .is_some()
                 {
-                    let (rep, evicted_keys) =
-                        crate::model::expert_vram::emergency_free_chunks_forced(bytes);
+                    let (rep, evicted_keys) = if alloc_force_chunk() {
+                        crate::model::expert_vram::emergency_free_chunks_forced(bytes)
+                    } else {
+                        crate::model::expert_vram::emergency_free_chunks_keys(bytes)
+                    };
                     // task 279: 追い出した鍵を控える (プールが借りた作業域を返すときに
                     // expert を戻すため)。控えるだけで挙動は変えない。
                     note_alloc_evicted(evicted_keys);
@@ -39761,6 +39786,18 @@ mod tests {
         // 読めない値は既定 (ここでは false)。
         assert!(!parse_keep_experts(Some("2"), false));
         assert!(parse_keep_experts(Some("2"), true));
+    }
+
+    /// task 290: `DENNO_ALLOC_FORCE_CHUNK` の真偽表。既定は on。
+    #[test]
+    fn alloc_force_chunk_env_truth_table() {
+        assert!(alloc_force_chunk_from_value(None), "未設定は既定 (on)");
+        for off in ["0", "off", "false", "no", " NO "] {
+            assert!(!alloc_force_chunk_from_value(Some(off)), "{off:?} が on");
+        }
+        for on in ["1", "on", "true", "yes"] {
+            assert!(alloc_force_chunk_from_value(Some(on)), "{on:?} が off");
+        }
     }
 
     /// task 210: `DENNO_ATTN_MIRROR_FORGET` の真偽表。既定は on。
