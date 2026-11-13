@@ -15880,6 +15880,19 @@ fn moe_scratch_put(s: MoeScratch) {
     };
 }
 
+/// task 297: prefill の終端で作業域を OS へ返す (持ち越さない)。
+///
+/// 使い回しが効くのは **1 回の prefill の中** (48 層 × 同じチャンク) だけで、
+/// prefill が終わったあとの decode には要らない。終端で持ち越すと実形で 782 MB を
+/// decode のあいだ抱えたままになり、長いプロンプトのあとの decode でページキャッシュを
+/// 圧迫する (lab t297b の既定モデル: warm short decode が +12%)。
+/// `MOE_SCRATCH` は `None` に戻すだけで、次の prefill は先頭で 1 回だけ確保し直す。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn moe_scratch_release() {
+    let mut g = MOE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    *g = None;
+}
+
 /// 選択 expert の FFN を「層全体の (expert, 行列, 行チャンク) を 1 本のタスク列に
 /// して 1 回だけ並列化する」形で計算し、`out` に重み付きで足し込む (呼び出し側で
 /// ゼロ初期化済み)。
@@ -18889,6 +18902,26 @@ mod tests {
         // 範囲外の index でも「ヒープだから None」を先に返す (呼び出し側は
         // 従来の同期経路へ落ち、そちらが index を弾く)。
         assert!(w.slice_mapped(n_expert).expect("ヒープは None").is_none());
+    }
+
+    /// task 297: prefill の終端で作業域を OS へ返す (`moe_scratch_release`)。
+    /// 保持されたままにすると decode のあいだ実形で 782 MB を抱える。
+    #[test]
+    fn moe_scratch_release_drops_retained_workspace() {
+        let _ = moe_scratch_take(); // 他のテストの残りを退避
+        moe_scratch_put(MoeScratch::default());
+        assert!(
+            MOE_SCRATCH.lock().unwrap().is_some(),
+            "put で保持されるはず (既定 2048 MiB)"
+        );
+        moe_scratch_release();
+        assert!(
+            MOE_SCRATCH.lock().unwrap().is_none(),
+            "release で None に戻るはず"
+        );
+        // 2 回呼んでも壊れない (prefill の終端が二重に走っても安全)
+        moe_scratch_release();
+        assert!(MOE_SCRATCH.lock().unwrap().is_none());
     }
 
     /// task 297: 作業域を使い回す上限の既定は 2048 MiB (`DENNO_MOE_SCRATCH_KEEP_MB` で
