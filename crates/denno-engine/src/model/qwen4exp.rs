@@ -6279,6 +6279,25 @@ pub(crate) fn dec_exp_sumdev_enabled() -> bool {
     })
 }
 
+/// task 281: `DENNO_EXP_SCRATCH` の解釈 (純関数・テスト用)。
+///
+/// **既定 off**。on では、sumdev 経路 (既定 on) が 1 度も読まない `h`
+/// (`nseg * e` = 実形で 40 KB) のゼロ埋めを毎層やらない。値は変わらない
+/// (h を使うのは sumdev が不成立のときだけで、その直前に確保する)。
+fn exp_scratch_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`exp_scratch_from_value`] をプロセスで 1 回だけ読む。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn exp_scratch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| exp_scratch_from_value(std::env::var("DENNO_EXP_SCRATCH").ok().as_deref()))
+}
+
 /// task 150: `DENNO_DECODE_CHAIN2_EXP` の値を解釈する (純関数・テスト用)。
 /// **既定 on** で、明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
 fn decode_chain2_exp_from_value(v: Option<&str>) -> bool {
@@ -12655,7 +12674,15 @@ fn moe_experts_iq_gpu_batched(
     let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
     let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
     let s_alloc = q4ledger::sub(q4ledger::SUB_EXP_ALLOC);
-    let mut h = vec![0.0f32; devs.len() * e];
+    // task 281: `DENNO_EXP_SCRATCH` — sumdev (既定 on) の経路は `h` を 1 度も読まない
+    // ので、40 KB のゼロ埋めを毎層まるごと捨てない (48 層で 1.9 MB/token)。
+    // 値は変わらない (h を使うのは !sumdev のときだけ。使う直前に確保する)。
+    let scratch_on = exp_scratch_enabled();
+    let mut h: Vec<f32> = if scratch_on {
+        Vec::new()
+    } else {
+        vec![0.0f32; devs.len() * e]
+    };
     drop(s_alloc);
     // task 150 (`DENNO_DECODE_CHAIN2_EXP`): ミス (VRAM に載っていない expert) の寄与を
     // GPU の完了前に CPU で計算し、同期をその裏へ隠す。ミスの位置と id を先に作り、
@@ -12723,6 +12750,11 @@ fn moe_experts_iq_gpu_batched(
         }
         // 和のカーネル (PTX) が無い / 形が合わないときは**従来の寄与経路**へ落ちる
         // (per-expert 経路へは落とさない: そちらは IQ 型を CPU で回すので遅い)。
+    }
+    // task 281: `DENNO_EXP_SCRATCH` では `h` を遅延確保する (sumdev の経路は
+    // ここまで来ない = 40 KB のゼロ埋めをしない)。値は従来と同じ。
+    if scratch_on && h.len() < devs.len() * e {
+        h = vec![0.0f32; devs.len() * e];
     }
     let ran = if overlap {
         // 台帳の exp_iq 区間は取らない (同期が CPU ミスの後ろへ移るので、GPU の
@@ -20337,6 +20369,20 @@ mod tests {
         for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some(" OFF ")] {
             assert!(!dec_exp_sumdev_from_value(v), "{v:?} が on になる");
             assert!(!dec_shared_dev_from_value(v), "{v:?} が on になる");
+        }
+    }
+
+    /// task 281: `DENNO_EXP_SCRATCH` の真理値表。
+    ///
+    /// **既定 off** (未設定・空・未知の値は off)。明示的な真値だけ on。
+    /// on のときの数値は従来と 1 bit も変わらない (h のゼロ埋めをやめるだけ)。
+    #[test]
+    fn exp_scratch_gate_truth_table() {
+        for v in [None, Some(""), Some("  "), Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(!exp_scratch_from_value(v), "{v:?} が on になる");
+        }
+        for v in [Some("1"), Some("on"), Some("ON"), Some(" true "), Some("yes")] {
+            assert!(exp_scratch_from_value(v), "{v:?} が on にならない");
         }
     }
 
