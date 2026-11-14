@@ -31905,6 +31905,8 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        // task 307: 鎖の末尾に積むルータ GEMV の重み (同期の後まで生かす)。
+        let mut router_w: Option<GgufWRef> = None;
         // inject の出力は mixed の直後 (down の出力 dlo とは別領域)。
         let pinj = dm.ptr() + (e * 4) as CUdeviceptr;
         // task 299: この回は正規化をホストで済ませる (`dno_mix_norm` を撃たない)。
@@ -32129,6 +32131,9 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
                 let grid = (e.div_ceil(256).max(1) as u32, 1, 1);
                 ctx.launch_async(f_mixed, grid, (256, 1, 1), 0, &mut args3)?;
             }
+            // task 307: ルータ GEMV を鎖の末尾に 1 発積む (D2H は下の 1 本と
+            // 同じ同期でまとめる)。載らなければ 0 = 従来経路。
+            let _ = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
             // 6. D2H 1 本 (mixed[e] + inj[hc] は同じバッファに連続で置いてある)。
             let kp_cp = dec_kprof::op_begin(
                 || "D2H@a".to_string(),
@@ -32157,6 +32162,7 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
         } else {
             ctx.sync()?;
         }
+        drop(router_w);
         dec_kprof::step("mix_pack", || {
             let got = ho.as_slice::<f32>();
             mixed.copy_from_slice(&got[..e]);
