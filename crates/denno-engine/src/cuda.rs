@@ -23924,6 +23924,9 @@ pub fn maybe_gpu_router_gemv_begin(
         }
         ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
         ROUTER_SYNCED.with(|c| c.set(false));
+    } else {
+        // 印が無い回は「鎖の値」を使わない (前回の SYNCED が残っていても無効)。
+        ROUTER_SYNCED.with(|c| c.set(false));
     }
     let Some(ctx) = shared_ctx() else {
         return false;
