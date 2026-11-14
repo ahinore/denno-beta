@@ -15369,7 +15369,7 @@ mod pf_pin_tests {
         assert!(!pf_mixed_dev_only(a.as_ptr(), 2, 2));
     }
 
-    /// task 230: ゲートの解釈。v3 は task 244 で既定 on、MIXKEEP は既定 off。
+    /// task 230/317: ゲートの解釈。v3 は task 244、MIXKEEP は task 317 で既定 on。
     #[test]
     fn pf230_gate_values() {
         // v3: 未指定は on (task 244 t244a で採択)、明示的な偽値で off。
@@ -15380,13 +15380,52 @@ mod pf_pin_tests {
         for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
             assert!(pf_attn_v3_from_value(v), "v3 が on でない: {v:?}");
         }
-        // mixkeep: 既定 off のまま (task 232 で不採用)。
-        for v in [None, Some("0"), Some("off"), Some(""), Some("no")] {
+        // mixkeep: task 317 で既定 on (task 230/232 では off だった)。
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some("")] {
             assert!(!pf_mix_keep_from_value(v), "mixkeep が off でない: {v:?}");
         }
+        assert!(pf_mix_keep_from_value(None), "mixkeep の既定が on でない");
         for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
             assert!(pf_mix_keep_from_value(v), "mixkeep が on でない: {v:?}");
         }
+    }
+
+    /// task 317: `DENNO_PF_MIXKEEP_SSM` は既定 on (明示的な偽値だけ off)。
+    #[test]
+    fn pf317_mixkeep_ssm_gate_values() {
+        for v in [Some("0"), Some("off"), Some(""), Some("no")] {
+            assert!(!pf_mix_keep_ssm_from_value(v), "ssm mixkeep が off でない: {v:?}");
+        }
+        assert!(pf_mix_keep_ssm_from_value(None), "ssm mixkeep の既定が on でない");
+        for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
+            assert!(pf_mix_keep_ssm_from_value(v), "ssm mixkeep が on でない: {v:?}");
+        }
+        // 強制フラグは env より優先する (既定 = env)。
+        pf_mix_keep_ssm_set_for_test(2);
+        assert!(pf_mix_keep_ssm_on(), "強制 on が効いていない");
+        pf_mix_keep_ssm_set_for_test(1);
+        assert!(!pf_mix_keep_ssm_on(), "強制 off が効いていない");
+        pf_mix_keep_ssm_set_for_test(0);
+        crate::cuda::pf_reset_for_test();
+    }
+
+    /// task 317: 記録が合えばデバイスの `mixed` を指し、合わなければ `None`。
+    /// `DENNO_PF_MIXDEVIN` (既定 on) が off なら常に `None`。
+    #[test]
+    fn pf317_dev_in_ptr_needs_matching_mark() {
+        let a = [0.0f32; 8];
+        let b = [0.0f32; 8];
+        pf_dev_in_set_for_test(2);
+        pf_mixed_keep_dev(a.as_ptr(), 2, 4);
+        // 作業域が無いのでポインタは返らないが、記録の一致判定はここで効く。
+        assert!(pf_mixed_dev_only(a.as_ptr(), 2, 4));
+        assert!(!pf_mixed_dev_only(b.as_ptr(), 2, 4), "別ポインタが一致した");
+        assert!(!pf_mixed_dev_only(a.as_ptr(), 1, 4), "nt 違いが一致した");
+        pf_dev_in_set_for_test(1);
+        assert!(pf_mixed_dev_in_ptr(a.as_ptr(), 2, 4).is_none(), "devin off で返った");
+        pf_dev_in_set_for_test(0);
+        pf_mixed_mark_clear();
+        crate::cuda::pf_reset_for_test();
     }
 }
 
@@ -15433,20 +15472,21 @@ pub(crate) fn pf_dev_in_on() -> bool {
     *ON.get_or_init(|| pf_dev_in_from_value(std::env::var("DENNO_PF_MIXDEVIN").ok().as_deref()))
 }
 
-/// task 230: `DENNO_PF_MIXKEEP` の解釈 (純関数)。**既定 off**。
+/// task 230: `DENNO_PF_MIXKEEP` の解釈 (純関数)。**task 317 で既定 on**。
 ///
 /// on にすると、full attention 層の attn mix は `mixed` を D2H せず、直後の
 /// qkv がデバイスの `mixed` を直接読む (H2D 1 本と D2H 1 本を消す)。
 ///
-/// lab t230b (d9f3d10、14,018 cold prefill) では 240 回の full 層 mix のうち
-/// 120 回だけ常駐経路に乗り、mix 段 1,103.9 → 1,069.8 ms (-34 ms、D2H
-/// 13,780 → 12,058 MB、full の H2D 480 → 360 本 = -1.72 GB) と小さく、
-/// 全体は b0 27.40 s → 28.54 s (+4.2%)。目標の -4% に届かないので既定 off。
-/// md5 は全条件 SAME (同じバイト列をデバイスから読むだけで値は変えない)。
+/// task 230 の t230b (14,018 cold prefill) では mix 段 1,103.9 → 1,069.8 ms
+/// (-34 ms、D2H 13,780 → 12,058 MB、full の H2D 480 → 360 本 = -1.72 GB) と
+/// 小さく、全体はノイズ (b0 27.40 s → 28.54 s) だったので既定 off だった。
+/// task 317 (t317a) では ssm 層のぶん (`DENNO_PF_MIXKEEP_SSM`) と wy4 を
+/// 重ねた条件で 3,826 cold が 2.945 → 2.78 s (-5.4%)、full の H2D は
+/// 481.94 → 11.80 MB。値は変えない (md5 SAME)。
 pub(crate) fn pf_mix_keep_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
@@ -15459,7 +15499,7 @@ pub(crate) fn pf_mix_keep_set_for_test(v: u8) {
     PF_MIX_KEEP_FORCE.store(v, Ordering::Relaxed);
 }
 
-/// task 230: full 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP`、**既定 off**)。
+/// task 230: full 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP`、**task 317 で既定 on**)。
 pub(crate) fn pf_mix_keep_on() -> bool {
     #[cfg(test)]
     {
@@ -15471,6 +15511,52 @@ pub(crate) fn pf_mix_keep_on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| pf_mix_keep_from_value(std::env::var("DENNO_PF_MIXKEEP").ok().as_deref()))
+}
+
+/// task 317: `DENNO_PF_MIXKEEP_SSM` の解釈 (純関数)。**既定 on**。
+///
+/// on にすると、ssm 層の attn mix も `mixed` を D2H しない。直後の GDN 連鎖
+/// (`gdn_pf_chain`) がデバイスの `mixed` をそのまま GEMM の入力に読み、
+/// `b.x` への H2D も 1 本消える (値は同じバイト列)。
+///
+/// 連鎖が前提外でホスト経路へ落ちる場合 (型・形・ゲート) は、
+/// `SsmLayer::forward_batch_flat` が [`pf_mixed_restore_host`] でホストへ
+/// 埋め直してから計算する (古いバイト列を読まない)。
+///
+/// lab t317a (d59f6df54、depth8k): keep (MIXKEEP + これ) で mix 段の D2H が
+/// 1,880.56 → 0.00 MB、ssm の H2D が 1,575.34 → 164.92 MB、full の H2D が
+/// 481.94 → 11.80 MB。3,826 cold は base 2.94 s のまま (keep 単独 2.91 s)。
+/// md5 は全条件 SAME (値は変えない)。
+pub(crate) fn pf_mix_keep_ssm_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+static PF_MIX_KEEP_SSM_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用: ssm 側のゲートを強制する (0 = env に戻す)。
+#[cfg(test)]
+pub(crate) fn pf_mix_keep_ssm_set_for_test(v: u8) {
+    PF_MIX_KEEP_SSM_FORCE.store(v, Ordering::Relaxed);
+}
+
+/// task 317: ssm 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP_SSM`、**既定 on**)。
+pub(crate) fn pf_mix_keep_ssm_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_MIX_KEEP_SSM_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_mix_keep_ssm_from_value(std::env::var("DENNO_PF_MIXKEEP_SSM").ok().as_deref())
+    })
 }
 
 thread_local! {
@@ -47486,6 +47572,180 @@ fn gdn_pf_wy_kernels() -> Option<&'static GdnPfWyKernels> {
     .as_ref()
 }
 
+// ---------------------------------------------------------------------------
+// task 311: WY スキャンの v 列 4 分割版 (`DENNO_PF_SCAN_WY4`)
+// ---------------------------------------------------------------------------
+//
+// `dno_gdn_pf_wy32` は 1 ブロック = 1 ヘッドなので 48 ブロックしか立たず
+// (170 SM)、C = 8 では v3 より 11% 遅かった (t231a: scan_pf 392.8 vs 357.0 ms)。
+// `dno_gdn_pf_wy4` は v 列を 4 分割して 192 ブロックにする。状態は
+// dk x 32 列 = 16 KB で、共有メモリは 29,572 B (48 KB 既定の内側なので opt-in
+// 不要だが、実機の上限は念のため見る)。数値は wy32 と要素ごとに同じ順序。
+pub(crate) const GDN_PF_WY4_THREADS: usize = 256;
+/// v 列の分割数 (`blockIdx.y`)。dk = 128 を 32 列ずつに切る。
+pub(crate) const GDN_PF_WY4_BLOCKS: usize = 4;
+/// 1 ブロックが持つ v 列数 (カーネルの `WY4_DV`)。
+pub(crate) const GDN_PF_WY4_DV: usize = 32;
+/// カーネルの動的共有メモリ (float 数。`kernels_gdn_pf_wy4.cu` の WY4_TOTAL)。
+pub(crate) const GDN_PF_WY4_SMEM_FLOATS: usize = 7393;
+pub(crate) const GDN_PF_WY4_SMEM_BYTES: usize = GDN_PF_WY4_SMEM_FLOATS * 4;
+
+/// WY 系スキャン (wy32 / wy4) の PTX を読んでカーネルを掴む。
+///
+/// 3 本とも同じ 17 引数なので、ホストの起動 (`gdn_pf_wy_launch`) と norm を
+/// 共有する。違うのは PTX のパス・entry 名・動的共有メモリ・起動形状だけ。
+/// `require_attr` は「`func_set_attribute` が無い/失敗したら降りる」か
+/// (wy32 = true、48 KB 既定を超えるため必須。wy4 = false)。
+fn gdn_wy_load(
+    path: std::path::PathBuf,
+    entry: &'static [u8],
+    smem_bytes: usize,
+    tag: &'static str,
+    smem_limit: usize,
+    require_attr: bool,
+) -> Option<GdnPfWyKernels> {
+    let mut image = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "{tag} PTX が読めない ({}) : {e} → v3 のスキャンへ",
+                path.display()
+            );
+            return None;
+        }
+    };
+    image.push(0);
+    let lib = lib().ok()?;
+    let mut module: CUmodule = std::ptr::null_mut();
+    unsafe {
+        if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+            eprintln!("{tag} cuModuleLoadData 失敗 → v3 のスキャンへ");
+            return None;
+        }
+        let name = String::from_utf8_lossy(&entry[..entry.len() - 1]).to_string();
+        let mut scan: CUfunction = std::ptr::null_mut();
+        if (lib.module_get_function)(&mut scan, module, entry.as_ptr() as *const c_char)
+            != CUDA_SUCCESS
+        {
+            eprintln!("{tag} PTX に {name} が無い → v3 のスキャンへ");
+            return None;
+        }
+        // 実機の opt-in 上限 (CudaCtx 生成時に問い合わせ済み) を先に見る。
+        let limit = attn_pf_dynamic_smem_limit().min(smem_limit);
+        if smem_bytes > limit {
+            eprintln!(
+                "{tag} 動的 smem {smem_bytes} B がデバイスの上限 {limit} B を超える → v3 のスキャンへ"
+            );
+            return None;
+        }
+        match lib.func_set_attribute {
+            Some(fn_attr) => {
+                if (fn_attr)(
+                    scan,
+                    CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes as c_int,
+                ) != 0
+                {
+                    eprintln!("{tag} 動的 smem {smem_bytes} B の opt-in に失敗 → v3 のスキャンへ");
+                    return None;
+                }
+            }
+            None => {
+                if require_attr {
+                    eprintln!("{tag} func_set_attribute が無い → v3 のスキャンへ");
+                    return None;
+                }
+            }
+        }
+        log_kernel_attr(lib, scan, &name);
+        // 出力の gated RMS norm は v2 の PTX (同じ演算列) をそのまま使う。
+        let norm = gdn_pf2_kernels()?.norm;
+        Some(GdnPfWyKernels { module, scan, norm })
+    }
+}
+
+fn gdn_pf_wy4_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SCAN_WY4_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf_wy4.ptx"),
+    }
+}
+
+fn gdn_pf_wy4_kernels() -> Option<&'static GdnPfWyKernels> {
+    static K: OnceLock<Option<GdnPfWyKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        gdn_wy_load(
+            gdn_pf_wy4_ptx_path(),
+            b"dno_gdn_pf_wy4\0",
+            GDN_PF_WY4_SMEM_BYTES,
+            "[gdn-pf-wy4]",
+            GDN_PF_WY_SMEM_LIMIT,
+            false,
+        )
+    })
+    .as_ref()
+}
+
+
+#[cfg(test)]
+static WY4_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_gdn_pf_wy4_for_test(v: Option<bool>) {
+    WY4_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_PF_SCAN_WY4` の解釈 (純関数)。**task 317 で既定 on**。
+///
+/// task 311: wy4 単独では 3,826 -2.9% / 14k -4.3% で目標 -5% に届かず既定 off
+/// だった。task 317 (t317a) で ssm の mix D2H 除去 (`DENNO_PF_MIXKEEP_SSM`) と
+/// 重ねると 3,826 cold 2.945 → 2.78 s (-5.4%、2 ラウンドとも同値) になり、
+/// 採択して既定 on にした。scan_pf は 359 → 256 ms。
+pub(crate) fn gdn_pf_wy4_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// v 列 4 分割の WY スキャンを使うか (既定 off)。
+pub(crate) fn gdn_pf_wy4_on() -> bool {
+    #[cfg(test)]
+    {
+        match WY4_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf_wy4_from_value(std::env::var("DENNO_PF_SCAN_WY4").ok().as_deref()))
+}
+
+/// v 列 4 分割の前提 (純関数)。dk = dv = 128 / d_conv = 4 / dv が 4 で割れる。
+pub(crate) fn gdn_pf_wy4_ok(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) -> bool {
+    gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+        && dv == GDN_PF_WY4_BLOCKS * GDN_PF_WY4_DV
+}
+
 #[cfg(test)]
 static WY_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -47545,6 +47805,10 @@ pub(crate) fn gdn_pf_wy_ok(
 
 /// task 228: WY スキャンを撃つ (wy32 → v2 の norm の 2 起動)。引数の並びは
 /// カーネルの宣言順で、v2/v3 の launch と同じ (17 個)。
+///
+/// task 311: `vblocks` / `threads` / `smem_bytes` を引数にした。wy32 は
+/// (1, 512, 91,012)、wy4 は (4, 256, 29,572)。カーネルの引数は同じなので
+/// 起動形状だけが違う。
 #[allow(clippy::too_many_arguments)]
 fn gdn_pf_wy_launch(
     ctx: &CudaCtx,
@@ -47568,6 +47832,9 @@ fn gdn_pf_wy_launch(
     conv_dim: usize,
     eps: f32,
     q_scale: f32,
+    vblocks: usize,
+    threads: usize,
+    smem_bytes: u32,
 ) -> Result<()> {
     {
         let (mut pq, mut pb, mut pa) = (qkv, beta, alpha);
@@ -47595,13 +47862,13 @@ fn gdn_pf_wy_launch(
             &mut epsi as *mut _ as *mut c_void,
             &mut qsi as *mut _ as *mut c_void,
         ];
-        // 1 ブロック = 1 ヘッド (状態を共有メモリに置くので分割しない)。
+        // 1 ブロック = (1 ヘッド, v 列の 1/vblocks)。wy32 は 1 ヘッド全体。
         unsafe {
             ctx.launch_async(
                 fns.scan,
-                (nv as u32, 1, 1),
-                (GDN_PF_WY_THREADS as u32, 1, 1),
-                GDN_PF_WY_SMEM_BYTES as u32,
+                (nv as u32, vblocks as u32, 1),
+                (threads as u32, 1, 1),
+                smem_bytes,
                 &mut args,
             )?;
         }
@@ -47694,6 +47961,78 @@ mod pf228_wy_tests {
             GDN_PF_WY_SMEM_BYTES < 96 * 1024,
             "共有メモリの余裕が 3 KB 未満"
         );
+    }
+
+    /// task 311: 形のゲートは v2/v3 と同じ + dv が 4 分割できること。
+    #[test]
+    fn pf311_scan_wy4_shape_gate() {
+        let conv_dim = 2 * 16 * 128 + 48 * 128;
+        assert!(gdn_pf_wy4_ok(512, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf_wy4_ok(0, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf_wy4_ok(512, 16, 48, 128, 128, 3, conv_dim));
+        assert!(!gdn_pf_wy4_ok(512, 16, 48, 128, 128, 4, conv_dim + 1));
+        // dv が 4 * 32 でないときは撃たない (カーネルは 128 列前提)。
+        assert!(!gdn_pf_wy4_ok(512, 16, 48, 128, 64, 4, 2 * 16 * 128 + 48 * 64));
+        assert!(!gdn_pf_wy4_ok(512, 16, 48, 64, 64, 4, 2 * 16 * 64 + 48 * 64));
+    }
+
+    /// task 311/317: v 列 4 分割のゲートは既定 on (task 317 で採択)。
+    /// `DENNO_PF_SCAN_WY4=0` で切り戻せる。
+    #[test]
+    fn pf311_scan_wy4_gate_defaults() {
+        assert!(gdn_pf_wy4_from_value(None), "task 317 で既定 on");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!gdn_pf_wy4_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(gdn_pf_wy4_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        set_gdn_pf_wy4_for_test(Some(true));
+        assert!(gdn_pf_wy4_on());
+        set_gdn_pf_wy4_for_test(Some(false));
+        assert!(!gdn_pf_wy4_on());
+        set_gdn_pf_wy4_for_test(None);
+        assert!(gdn_pf_wy4_on(), "FORCE を戻したら既定 on (task 317)");
+    }
+
+    #[test]
+    fn pf311_scan_wy4_smem_matches_source() {
+        let src = include_str!("../kernels/kernels_gdn_pf_wy4.cu");
+        let mut get = |name: &str| -> usize {
+            let key = format!("#define {name} ");
+            for line in src.lines() {
+                if let Some(rest) = line.strip_prefix(&key) {
+                    return rest
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{name} が数値でない"));
+                }
+            }
+            panic!("{name} が .cu に無い");
+        };
+        assert_eq!(get("WY4_TOTAL"), GDN_PF_WY4_SMEM_FLOATS);
+        assert_eq!(get("WY4_DV"), GDN_PF_WY4_DV);
+        assert_eq!(get("WY4_THREADS"), GDN_PF_WY4_THREADS);
+        // 4 ブロックで 128 列を覆うこと (voff の取りこぼしを作らない)。
+        assert_eq!(GDN_PF_WY4_BLOCKS * GDN_PF_WY4_DV, 128);
+        // 29,572 B。48 KB 既定の内側なので opt-in は要らないが、上限も見る。
+        assert_eq!(GDN_PF_WY4_SMEM_BYTES, 29_572, "共有メモリのバイト数");
+        assert!(GDN_PF_WY4_SMEM_BYTES < 48 * 1024);
+        // (1) の conv は tid < 128 (q) と 128..256 (k) = 2 * DK スレッドが要る。
+        assert_eq!(GDN_PF_WY4_THREADS, 2 * 128);
+        // 共有メモリの区画が重ならないこと (並びは .cu の #define の順)。
+        let mut offs = Vec::new();
+        for name in [
+            "WY4_S", "WY4_KC", "WY4_QC", "WY4_VC", "WY4_DC", "WY4_PC", "WY4_QPC", "WY4_RDEC",
+            "WY4_AC", "WY4_GC", "WY4_LAM", "WY4_RL", "WY4_EG", "WY4_BC", "WY4_LL",
+        ] {
+            offs.push((name, get(name)));
+        }
+        for w in offs.windows(2) {
+            assert!(w[0].1 < w[1].1, "{} と {} の並びが逆", w[0].0, w[1].0);
+        }
+        // 最後の区画 (WY4_LL = 1 本) の終端が WY4_TOTAL。
+        assert_eq!(offs.last().unwrap().1 + 1, GDN_PF_WY4_SMEM_FLOATS);
     }
 }
 
@@ -48647,8 +48986,17 @@ pub fn gdn_pf_chain(
     // task 270: スキャンカーネルを**投影より前**に選ぶ。`nt >= 2048` では単発
     // sigmoid (`f_scan`) の前提外なので、v1/v2/v3/WY のどれも撃てなければ
     // まだ何も書いていないここで降りる (呼び出し側は従来経路で計算し直す)。
-    // 既定の順は task 173/186/225/228 のまま: WY (opt-in) → v3 → v2 → v1。
-    let pf_scan_wy = if gdn_pf_wy_on() && gdn_pf_wy_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+    // 既定の順は task 173/186/225/228/311 のまま: WY8 (opt-in) → WY4 (opt-in)
+    // → WY (opt-in) → v3 → v2 → v1。
+    let pf_scan_wy4 = if gdn_pf_wy4_on() && gdn_pf_wy4_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+        gdn_pf_wy4_kernels()
+    } else {
+        None
+    };
+    let pf_scan_wy = if pf_scan_wy4.is_none()
+        && gdn_pf_wy_on()
+        && gdn_pf_wy_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
         gdn_pf_wy_kernels()
     } else {
         None
@@ -48678,6 +49026,7 @@ pub fn gdn_pf_chain(
         None
     };
     if nt >= GDN_CHUNK_MIN_TOKENS
+        && pf_scan_wy4.is_none()
         && pf_scan_wy.is_none()
         && pf_scan_fast3.is_none()
         && pf_scan_fast2.is_none()
@@ -48759,17 +49108,35 @@ pub fn gdn_pf_chain(
     if ba_dev_req && ba_dev.is_none() {
         return Ok(false);
     }
+    // task 317: 直前の attn mix を D2H していなければ (`DENNO_PF_MIXKEEP_SSM`)、
+    // デバイスの `mixed` をそのまま入力にする。`b.x` への H2D 1 本 (nt × e × 4 B)
+    // が消えるだけで、値は同じバイト列。
+    let xdev = if pf_mix_keep_ssm_on() {
+        pf_mixed_dev_in_ptr(flat.as_ptr(), nt, e)
+    } else {
+        None
+    };
+    // 記録は「デバイスだけが正」なのに dev-in が取れない (作業域の形が合わない等)
+    // ときは、古いホストのバイト列を上げないように先に降ろす。降ろせなければ
+    // 何も書いていないここで要求を落とす (誤った値で走らせない)。
+    if xdev.is_none() && pf_mixed_dev_only(flat.as_ptr(), nt, e) {
+        if !pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, e) {
+            bail!("GDN 連鎖: D2H していない mixed の復元に失敗 (li={li})");
+        }
+    }
     gdn_pf_kprof::begin(gdn_pf_kprof::X_H2D);
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
         b.ensure(nt, e, conv_dim, vd, nv)?;
-        b.x.as_ref().unwrap().copy_from(flat)?;
+        if xdev.is_none() {
+            b.x.as_ref().unwrap().copy_from(flat)?;
+        }
         if ba_dev.is_none() {
             b.beta.as_ref().unwrap().copy_from(beta)?;
             b.alpha.as_ref().unwrap().copy_from(alpha)?;
         }
         Ok([
-            b.buf(0),
+            xdev.unwrap_or_else(|| b.buf(0)),
             b.buf(1),
             b.buf(2),
             b.buf(3),
@@ -48892,11 +49259,20 @@ pub fn gdn_pf_chain(
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();
-        if let Some(fns) = pf_scan_wy {
+        if let Some(fns) = pf_scan_wy4 {
             gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
             gdn_pf_wy_launch(
                 &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
                 ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+                GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY4_SMEM_BYTES as u32,
+            )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else if let Some(fns) = pf_scan_wy {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf_wy_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+                1, GDN_PF_WY_THREADS, GDN_PF_WY_SMEM_BYTES as u32,
             )?;
             gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
         } else if let Some(fns) = pf_scan_fast3 {
