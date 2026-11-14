@@ -10435,69 +10435,6 @@ fn task311_gdn_pf_wy4_kernel_is_wired() {
     );
 }
 
-/// task 311: v 列 8 分割版 (`kernels_gdn_pf_wy8.cu`) の配線。
-#[test]
-fn task311_gdn_pf_wy8_kernel_is_wired() {
-    let src = include_str!("../kernels/kernels_gdn_pf_wy8.cu");
-    assert!(src.contains("dno_gdn_pf_wy8"));
-    assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_wy8\\0\""),
-        "cuda.rs が dno_gdn_pf_wy8 を読んでいない"
-    );
-    assert_eq!(cu_kernel_nargs(src, "dno_gdn_pf_wy8"), 17, "引数の個数");
-    let define = |name: &str| -> usize {
-        src.lines()
-            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
-            .and_then(|r| r.trim().parse().ok())
-            .unwrap_or_else(|| panic!("{name} が無い"))
-    };
-    let (dk, dv, c) = (define("WY8_DK"), define("WY8_DV"), define("WY8_C"));
-    assert_eq!(dk, 128);
-    assert_eq!(dv * 8, dk, "8 分割で 128 列を覆っていない");
-    assert_eq!(define("WY8_THREADS"), 256);
-    let regions = [
-        ("WY8_S", dk * dv),
-        ("WY8_KC", c * dk),
-        ("WY8_QC", c * dk),
-        ("WY8_VC", c * dv),
-        ("WY8_DC", c * dv),
-        ("WY8_PC", c * dv),
-        ("WY8_QPC", c * dv),
-        ("WY8_RDEC", c * c),
-        ("WY8_AC", c * c),
-        ("WY8_GC", c * c),
-        ("WY8_LAM", c),
-        ("WY8_RL", c),
-        ("WY8_EG", c),
-        ("WY8_BC", c),
-        ("WY8_LL", 1),
-    ];
-    let mut at = 0usize;
-    for (name, size) in regions {
-        let lo = define(name);
-        assert_eq!(lo, at, "{name} の並びに隙間/重なりがある ({lo} != {at})");
-        at = lo + size;
-    }
-    assert_eq!(at, define("WY8_TOTAL"), "WY8_TOTAL と最後の領域");
-    assert!(
-        CUDA_RS.contains("pub(crate) const GDN_PF_WY8_SMEM_FLOATS: usize = 4833;"),
-        "Rust 側の smem 見積りが 4833 でない"
-    );
-    assert!(
-        CUDA_RS.contains("GDN_PF_WY8_BLOCKS, GDN_PF_WY8_THREADS, GDN_PF_WY8_SMEM_BYTES as u32,"),
-        "wy8 の呼び出しが (BLOCKS, THREADS, SMEM) を渡していない"
-    );
-    assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy8)  echo \"kernels_gdn_pf_wy8.cu|nofmad|compute_90\""),
-        "build_ptx.sh の gdn_pf_wy8 が nofmad/compute_90 でない"
-    );
-    let targets = BUILD_PTX_SH
-        .lines()
-        .find(|l| l.starts_with("targets_all="))
-        .unwrap_or("");
-    assert!(targets.contains("gdn_pf_wy8"), "targets_all に gdn_pf_wy8 が無い");
-}
-
 const SEG_K_SRC: &str = include_str!("../kernels/kernels_seg_k.cu");
 
 /// task 278: K 系の高速 GEMV (`kernels_seg_k.cu`) の配線。
