@@ -2302,6 +2302,19 @@ pub(crate) mod dec_full_dev {
         let qd = a.heads * a.dh;
         let kv_dim = a.kv_dim;
         let nkv = a.heads / a.group;
+        // task 319: この経路のホスト仕事の内訳 (`DENNO_GDN_DEC_KPROF` の
+        // `host step` 表に `fd_*` として出る)。off は `on()` の読み 1 回だけで
+        // Instant を取らない (数値経路は 1 つも変えない)。
+        let mut kp_t = std::time::Instant::now();
+        let kp_on = crate::cuda::dec_kprof::on();
+        macro_rules! kp_mark {
+            ($name:literal) => {
+                if kp_on {
+                    crate::cuda::dec_kprof::note_since($name, kp_t);
+                    kp_t = std::time::Instant::now();
+                }
+            };
+        }
 
         // 1) qkv GEMV: ホスト cur -> デバイス (D2H しない)
         Scratch::ensure(&mut st.qkv_in, a.qkv_k * 4)?;
@@ -2346,6 +2359,7 @@ pub(crate) mod dec_full_dev {
                 u.n,
             )?;
         }
+        kp_mark!("fd_qkv");
 
         // 2) q/k 正規化 + rope + gate 取り出し
         let kernels = dev_kernels()?;
@@ -2408,6 +2422,7 @@ pub(crate) mod dec_full_dev {
                 )?;
             }
         }
+        kp_mark!("fd_prep");
 
         // 3) KV ミラー 1 行を D2D で追記
         let (mkptr, mvptr) = mirror_append(
@@ -2421,11 +2436,13 @@ pub(crate) mod dec_full_dev {
             kv + (kv_dim * 4) as u64,
         )
         .ok_or_else(|| anyhow!("ミラーの 1 行追記ができない (全行シードが必要)"))?;
+        kp_mark!("fd_mirror");
 
         // 4) attention (デバイス入力・出力)
         let aptr = attn_launch(
             ctx, qout, mkptr, mvptr, a.len, kv_dim, a.heads, a.group, a.dh, a.scale,
         )?;
+        kp_mark!("fd_attn");
 
         // 5) 出力ゲート (デバイス)
         {
@@ -2447,6 +2464,7 @@ pub(crate) mod dec_full_dev {
                 )?;
             }
         }
+        kp_mark!("fd_gate");
 
         // 6) 出力投影 (デバイス入力)。既定は v4 (レーン数可変) — lab t177c で
         //    同じ形 (k=6144 Q8_0 / n=2560) が 51.2 -> 25.7 us。形が合わない・
@@ -2462,6 +2480,7 @@ pub(crate) mod dec_full_dev {
         Scratch::ensure(&mut st.out, a.wo_n * 4)?;
         let optr = st.out.as_ref().expect("ensure 済み").ptr();
         launch_plan(ctx, &plan_wo, w_wo.buf.ptr(), aptr, optr, a.wo_k, a.wo_n)?;
+        kp_mark!("fd_wo");
 
         // 7) D2H 2 本 + 1 回の同期
         Scratch::ensure_pin(&mut st.pin_out, a.wo_n * 4)?;
@@ -2481,7 +2500,9 @@ pub(crate) mod dec_full_dev {
                 )?;
             }
         }
+        kp_mark!("fd_d2h");
         ctx.sync()?;
+        kp_mark!("fd_sync");
         let out: Vec<f32> = st
             .pin_out
             .as_ref()
@@ -2496,6 +2517,7 @@ pub(crate) mod dec_full_dev {
             .to_vec();
         let k = kvh[..kv_dim].to_vec();
         let v = kvh[kv_dim..].to_vec();
+        kp_mark!("fd_tail");
         Ok(Out { out, k, v })
     }
 
@@ -19407,16 +19429,24 @@ pub fn shared_gemv_begin(x: &[f32], jobs: &[SharedGemvJob<'_>]) -> SharedPending
 // 数値: v5 は 4 本のアキュムレータで加算するので v3 とは丸め順が違う
 // (決定性は保つ)。切り戻しはこの env。
 
-/// task 310: `DENNO_DEC_SH_V5` の解釈 (純関数)。**既定 off**。
+/// task 310: `DENNO_DEC_SH_V5` の解釈 (純関数)。
 ///
 /// - `1` = gate / up / down の 3 本とも v5 を先に引く
 /// - `2` = gate / up だけ v5 (down は従来。k=640 では lane が 2 に落ちる形)
-/// - それ以外 (未設定・`0`・未知の値) = 従来 (v3 / v2)
+/// - 明示的な偽値 (`0` / `off` / `false` / `no` / 空) = 従来 (v3 / v2)
+/// - 未設定・その他の値 = **既定 2**
+///
+/// task 319 で既定を 2 にした (lab t310b / t316a / t316c の 3 ラウンドで
+/// 短い decode -2.4〜-2.7%、14k 後 -1.3〜-5.6%、prefill 不変、md5 SAME)。
+/// 戻すのは `DENNO_DEC_SH_V5=0`。
 fn parse_dec_sh_v5(raw: Option<&str>) -> u8 {
-    match raw.map(|s| s.trim()).as_deref() {
+    /// 既定 (未設定)。task 319 の採否。
+    const DEFAULT: u8 = 2;
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("1") => 1,
         Some("2") => 2,
-        _ => 0,
+        Some("") | Some("0") | Some("off") | Some("false") | Some("no") => 0,
+        _ => DEFAULT,
     }
 }
 
@@ -40927,17 +40957,21 @@ mod tests {
         }
     }
 
-    /// task 310: `DENNO_DEC_SH_V5` は `1` (3 本) / `2` (gate+up) の 2 段だけ。
+    /// task 310 / 319: `DENNO_DEC_SH_V5` は `1` (3 本) / `2` (gate+up) の 2 段だけ。
+    /// task 319 で既定を 2 にした (明示的な偽値だけが off)。
     #[test]
     fn dec_sh_v5_gate_truth_table() {
-        assert_eq!(parse_dec_sh_v5(None), 0, "未設定は既定 off");
-        for v in ["", "0", "off", "on", "true", "no", "3", "12"] {
+        assert_eq!(parse_dec_sh_v5(None), 2, "未設定は既定 2 (task 319 で採否)");
+        for v in ["", "0", "off", "false", "no", " 0 ", " OFF "] {
             assert_eq!(parse_dec_sh_v5(Some(v)), 0, "raw={v:?}");
         }
         assert_eq!(parse_dec_sh_v5(Some("1")), 1);
         assert_eq!(parse_dec_sh_v5(Some(" 1 ")), 1);
         assert_eq!(parse_dec_sh_v5(Some("2")), 2);
         assert_eq!(parse_dec_sh_v5(Some(" 2 ")), 2);
+        for v in ["on", "true", "yes", "3"] {
+            assert_eq!(parse_dec_sh_v5(Some(v)), 2, "未知は既定へ raw={v:?}");
+        }
     }
 
     /// task 307: `DENNO_ROUTER_IN_MIX` も明示的な偽値だけ off (既定 on)。
