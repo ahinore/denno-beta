@@ -40627,7 +40627,7 @@ mod tests {
     /// task 307: `DENNO_ROUTER_IN_MIX` も明示的な偽値だけ off (既定 on)。
     #[test]
     fn router_in_mix_gate_truth_table() {
-        assert!(parse_router_in_mix(None), "未設定は既定 on (lab t307b で採否)");
+        assert!(parse_router_in_mix(None), "未設定は既定 on (lab t307b / t307c で採否)");
         for v in ["0", "off", "false", "no"] {
             assert!(!parse_router_in_mix(Some(v)), "raw={v:?}");
         }

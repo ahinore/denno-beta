@@ -3699,7 +3699,8 @@ impl Qwen4Exp {
         if !(skip_routed && skip_shared) {
             let t_mix = std::time::Instant::now();
             // task 307: FFN mix の鎖 (down → up → hc_mixed) の末尾にルータ GEMV を
-            // 載せる (`DENNO_ROUTER_IN_MIX`・既定 off)。載れば router の H2D と
+            // 載せる (`DENNO_ROUTER_IN_MIX`・既定 on。lab t307c で採否)。載れば
+            // router の H2D と
             // 同期 1 回が消える。載らなければ従来どおり `gate_inp` の GEMV が
             // H2D + 起動 + D2H + 同期を行う (数値は同じ)。
             #[cfg(feature = "cuda")]
