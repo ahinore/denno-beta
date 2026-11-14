@@ -12793,14 +12793,15 @@ fn pf_expert_mode_from(k_gate: bool, stream: bool, k_types_ok: bool) -> bool {
     k_gate && stream && k_types_ok
 }
 
-/// task 318: `DENNO_PF_LM_K_DEV` の値の解釈 (純関数)。**既定 off**。
+/// task 318: `DENNO_PF_LM_K_DEV` の値の解釈 (純関数)。**既定 on** (t318c で採用)。
 ///
 /// on のとき、層優先のデバイス MoE (`moe_ffn_quant_batch_lm_dev_at`) の前提判定が
 /// `iq_expert_mode` ではなく `pf_expert_mode` になる。K 系 (UD-Q4_K_XL) は
 /// これが無いと全層がホストの mixed 経路へ落ち、mixed を丸ごと往復する。
+/// IQ 系では `pf_expert_mode` が `iq_expert_mode` を包含するので判定は変わらない。
 pub(crate) fn pf_lm_k_dev_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim) {
-        None | Some("") => false,
+        None | Some("") => true,
         Some(s) => !matches!(
             s.to_ascii_lowercase().as_str(),
             "0" | "off" | "false" | "no"
@@ -18675,11 +18676,11 @@ mod lm_dev_tests {
     /// task 233: 層優先のデバイス MoE の前提 (真理値表)。
     ///
     /// 1 つでも欠けたら `false` = 呼び出し側はホスト経路へ落ちる (値は同じ)。
-    /// task 318: `DENNO_PF_LM_K_DEV` の真理値表 (既定 off)。
+    /// task 318: `DENNO_PF_LM_K_DEV` の真理値表 (t318c で採用、既定 on)。
     #[test]
     fn pf_lm_k_dev_truth_table() {
-        assert!(!pf_lm_k_dev_from_value(None));
-        assert!(!pf_lm_k_dev_from_value(Some("")));
+        assert!(pf_lm_k_dev_from_value(None));
+        assert!(pf_lm_k_dev_from_value(Some("")));
         assert!(!pf_lm_k_dev_from_value(Some("0")));
         assert!(!pf_lm_k_dev_from_value(Some(" off ")));
         assert!(!pf_lm_k_dev_from_value(Some("FALSE")));
