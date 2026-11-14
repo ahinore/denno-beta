@@ -10166,7 +10166,12 @@ pub fn dec_miss_probe_line(mb: usize, src: Option<&[u8]>) -> Option<String> {
 struct ExpPfKernels {
     #[allow(dead_code)]
     module: CUmodule,
-    /// 型ごとの m 行 GEMV ([`crate::model::exp_pf::kernel_name`] の順)
+    /// task 309: K 系のモジュール (`kernels_exp_k_pf.ptx`)。読めなければ null で、
+    /// K 系のスロットは null のまま = その型は CPU 経路へ落ちる (fail closed)。
+    #[allow(dead_code)]
+    kmodule: CUmodule,
+    /// 型ごとの m 行 GEMV ([`crate::model::exp_pf::kernel_name`] の順)。
+    /// 0..IQ_SLOTS は IQ のモジュール、K_SLOT0.. は K のモジュールの関数。
     fns: [CUfunction; crate::model::exp_pf::SLOTS],
     /// silu(g) * u
     silu: CUfunction,
@@ -10191,6 +10196,17 @@ fn exp_pf_ptx_path() -> std::path::PathBuf {
         _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("kernels")
             .join("kernels_exp_iq_pf.ptx"),
+    }
+}
+
+/// PTX の置き場所。`DENNO_EXP_K_PF_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_exp_k_pf.ptx` (task 309 の K 系)。
+fn exp_k_pf_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_K_PF_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_k_pf.ptx"),
     }
 }
 
@@ -10222,7 +10238,11 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
             }
             let mut fns: [CUfunction; crate::model::exp_pf::SLOTS] =
                 [std::ptr::null_mut(); crate::model::exp_pf::SLOTS];
-            for (i, f) in fns.iter_mut().enumerate() {
+            for (i, f) in fns
+                .iter_mut()
+                .enumerate()
+                .take(crate::model::exp_pf::IQ_SLOTS)
+            {
                 let name = crate::model::exp_pf::kernel_name(i)?;
                 let mut cname = name.as_bytes().to_vec();
                 cname.push(0);
@@ -10234,6 +10254,49 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
                         return None;
                     }
                 }
+            }
+            // task 309: K 系 (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0) は別モジュール。
+            // 無くても IQ 系は動くので、失敗は 1 行だけ出して null のままにする
+            // (K 系の型は `moe_gemv_iq_pf_ready` が null を見て CPU へ落ちる)。
+            let mut kmodule: CUmodule = std::ptr::null_mut();
+            let kpath = exp_k_pf_ptx_path();
+            let mut k_ok = false;
+            match std::fs::read(&kpath) {
+                Ok(mut kimg) => {
+                    kimg.push(0);
+                    unsafe {
+                        if (lib.module_load_data)(&mut kmodule, kimg.as_ptr() as *const c_void)
+                            == CUDA_SUCCESS
+                        {
+                            k_ok = true;
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            if k_ok {
+                for i in crate::model::exp_pf::K_SLOT0..crate::model::exp_pf::SLOTS {
+                    let Some(name) = crate::model::exp_pf::kernel_name(i) else {
+                        continue;
+                    };
+                    let mut cname = name.as_bytes().to_vec();
+                    cname.push(0);
+                    unsafe {
+                        if (lib.module_get_function)(
+                            &mut fns[i],
+                            kmodule,
+                            cname.as_ptr() as *const c_char,
+                        ) != CUDA_SUCCESS
+                        {
+                            eprintln!("[exp-pf] K 系 PTX に {name} が無い → その型は CPU 経路へ");
+                        }
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[exp-pf] K 系 PTX が読めない ({}) → K 系の型は CPU 経路へ",
+                    kpath.display()
+                );
             }
             let mut silu: CUfunction = std::ptr::null_mut();
             let mut cname = crate::model::exp_pf::SILU_KERNEL.as_bytes().to_vec();
@@ -10262,6 +10325,7 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
             };
             Some(ExpPfKernels {
                 module,
+                kmodule,
                 fns,
                 silu,
                 accum,
@@ -10279,7 +10343,14 @@ pub fn moe_gemv_iq_pf_ready(ty: crate::kquant::GgmlType, k: usize) -> bool {
     if !crate::model::exp_pf::supported(ty) || crate::model::exp_pf::row_bytes(ty, k).is_none() {
         return false;
     }
-    exp_pf_kernels().is_some()
+    let Some(slot) = crate::model::exp_pf::slot(ty) else {
+        return false;
+    };
+    // task 309: K 系は専用のゲート (`DENNO_PF_EXP_K`) が要る。既定 off。
+    if crate::model::exp_pf::is_k_slot(slot) && !crate::model::exp_pf::k_enabled() {
+        return false;
+    }
+    exp_pf_kernels().is_some_and(|kernels| !kernels.fns[slot].is_null())
 }
 
 use crate::model::exp_pf;
@@ -10728,6 +10799,9 @@ struct PfStream {
     /// task 165: グループの通し番号 (層をまたいで増える。スロットの持ち主を
     /// 一意にするため。0 に戻すと前の層の完了イベントを誤認する)。
     next_g: u64,
+    /// task 309: この層の expert 型が K 系か。pinned バウンスの作り方
+    /// (`DENNO_PF_STREAM_WC` の既定) を型で変える。
+    k_mode: bool,
 }
 
 impl PfStream {
@@ -10738,6 +10812,7 @@ impl PfStream {
             up: None,
             probed: false,
             next_g: 0,
+            k_mode: false,
         }
     }
 }
@@ -11073,7 +11148,7 @@ fn pf_slot_prepare(
             // task 296: 確保し直しの回数と時間を診断で読めるようにする
             // (`DENNO_PF_LM_DBG=1` の `[pf-lm-dbg] stream` 行)。
             let t_pin = std::time::Instant::now();
-            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc())?);
+            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc_for(st.k_mode))?);
             pf_stream_t_add(6, t_pin.elapsed().as_nanos() as u64);
             pf_stream_t_add(7, 1);
         }
@@ -13138,6 +13213,9 @@ fn moe_experts_iq_pf_layer_stream_io(
     ) else {
         return Ok(None);
     };
+    // task 309: K 系の層か。pinned バウンスの作り方 (`DENNO_PF_STREAM_WC` の
+    // 既定) を型で変える (lab t309b: K 系は write-combined でないほうが速い)。
+    PF_STREAM.with(|c| c.borrow_mut().k_mode = exp_pf::is_k_slot(slot_g));
     let Some(ctx) = shared_ctx() else {
         return Ok(None);
     };
@@ -14044,6 +14122,226 @@ mod pf_exp_tc_tests {
             return;
         };
         for name in ["dno_exp_pf_iq2s", "dno_exp_pf_iq3xxs", "dno_exp_pf_iq3s", "dno_exp_pf_iq4xs"] {
+            assert_eq!(
+                ptx_entry_params(&text, name),
+                Some(9),
+                "{name} の引数の数 (ptx パーサの前提)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pf_exp_k_tests {
+    //! task 309: K 系 m 行カーネル (`kernels_exp_k_pf.cu`) の**索引**ミラー。
+    //!
+    //! カーネルの `kpf_w8_q4k` / `_q5k` / `_q6k` と、32 要素ブロックの
+    //! `dno_exp_k_pf_q5_1` / `_q8_0` の索引算術を `.cu` の行から 1 対 1 で写し、
+    //! CPU の参照 (`kquant::dequant_row_into`) と要素ごとに比べる。
+    //! 丸め順の一致ではなく**索引の取り違え**を落とすためのテスト
+    //! (型ごとに 1 行 512 要素 = Q4_K/Q5_K/Q6_K は 2 ブロック)。
+
+    use super::*;
+    use crate::kquant::{dequant_row_into, GgmlType};
+
+    /// .cu の `kpf_f16` と同じ式 (IEEE の f16 → f32)。
+    fn f16v(b: &[u8]) -> f32 {
+        let h = b[0] as u32 | ((b[1] as u32) << 8);
+        let sign = (h & 0x8000) << 16;
+        let exp = (h >> 10) & 0x1f;
+        let mut man = h & 0x3ff;
+        let bits = if exp == 0 {
+            if man == 0 {
+                sign
+            } else {
+                let mut e: i32 = -14;
+                while man & 0x400 == 0 {
+                    man <<= 1;
+                    e -= 1;
+                }
+                man &= 0x3ff;
+                sign | (((e + 127) as u32) << 23) | (man << 13)
+            }
+        } else if exp == 31 {
+            sign | 0x7f80_0000 | (man << 13)
+        } else {
+            sign | ((exp + 112) << 23) | (man << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    fn u32le(b: &[u8]) -> u32 {
+        b[0] as u32 | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
+    }
+
+    /// .cu の `kpf_scale_min_k4` と同じ式。
+    fn scale_min_k4(q: &[u8], j: usize) -> (u32, u32) {
+        if j < 4 {
+            ((q[j] & 63) as u32, (q[j + 4] & 63) as u32)
+        } else {
+            (
+                ((q[j + 4] & 0x0f) as u32) | (((q[j - 4] >> 6) as u32) << 4),
+                ((q[j + 4] >> 4) as u32) | (((q[j] >> 6) as u32) << 4),
+            )
+        }
+    }
+
+    /// カーネルが要素 `k` をどうデコードするか (lane と i を k から引く)。
+    fn mirror(ty: GgmlType, row: &[u8], k: usize) -> f32 {
+        match ty {
+            // 256 要素ブロック: lane = (k % 256) / 8、i = k % 8。
+            GgmlType::Q4K => {
+                let blk = &row[(k >> 8) * 144..];
+                let d = f16v(blk);
+                let dmin = f16v(&blk[2..]);
+                let lane = (k & 255) >> 3;
+                let i = k & 7;
+                let sb = lane >> 2;
+                let p = (lane & 3) << 3;
+                let (sc, mn) = scale_min_k4(&blk[4..16], sb);
+                let sh = if sb & 1 != 0 { 4 } else { 0 };
+                let q = (blk[16 + (sb >> 1) * 32 + p + i] as u32 >> sh) & 0x0f;
+                d * sc as f32 * q as f32 - dmin * mn as f32
+            }
+            GgmlType::Q5K => {
+                let blk = &row[(k >> 8) * 176..];
+                let d = f16v(blk);
+                let dmin = f16v(&blk[2..]);
+                let lane = (k & 255) >> 3;
+                let i = k & 7;
+                let sb = lane >> 2;
+                let p = (lane & 3) << 3;
+                let (sc, mn) = scale_min_k4(&blk[4..16], sb);
+                let sh = if sb & 1 != 0 { 4 } else { 0 };
+                let q = (blk[48 + (sb >> 1) * 32 + p + i] as u32 >> sh) & 0x0f;
+                let hb = (blk[16 + p + i] as u32 >> sb) & 1;
+                d * sc as f32 * (q + (hb << 4)) as f32 - dmin * mn as f32
+            }
+            GgmlType::Q6K => {
+                let blk = &row[(k >> 8) * 210..];
+                let d = f16v(&blk[208..]);
+                let lane = (k & 255) >> 3;
+                let i = k & 7;
+                let half = lane >> 4;
+                let o = (lane & 15) << 3;
+                let ch = o >> 5;
+                let l2 = o & 31;
+                let ql = &blk[half * 64 + if ch & 1 != 0 { 32 } else { 0 } + l2..];
+                let qh = &blk[128 + half * 32 + l2..];
+                let sc = &blk[192 + half * 8..];
+                let s = sc[2 * ch + if l2 >= 16 { 1 } else { 0 }] as i8 as f32;
+                let sh = if ch >= 2 { 4 } else { 0 };
+                let nib = (ql[i] as u32 >> sh) & 0x0f;
+                let h2 = (qh[i] as u32 >> (2 * ch)) & 3;
+                let q6 = (nib | (h2 << 4)) as i32 - 32;
+                d * s * q6 as f32
+            }
+            // 32 要素ブロック: レーン 1 本 = 1 ブロック (k % 32 が要素)。
+            GgmlType::Q5_1 => {
+                let blk = &row[(k >> 5) * 24..];
+                let d = f16v(blk);
+                let m = f16v(&blk[2..]);
+                let qh = u32le(&blk[4..]);
+                let e = k & 31;
+                let byte = blk[8 + (e & 15)] as u32;
+                let q = if e < 16 { byte & 0x0f } else { byte >> 4 };
+                let hb = (qh >> e) & 1;
+                d * (q + (hb << 4)) as f32 + m
+            }
+            GgmlType::Q8_0 => {
+                let blk = &row[(k >> 5) * 34..];
+                let d = f16v(blk);
+                d * (blk[2 + (k & 31)] as i8) as f32
+            }
+            _ => unreachable!("K 系 5 型だけ"),
+        }
+    }
+
+    /// 決定的な擬似乱数で 1 行ぶんのバイト列を作る。スケール欄 (f16) だけは
+    /// 有限の値に固定する (NaN/Inf を避ける。他は全ビット模様が有効)。
+    fn make_row(ty: GgmlType, n: usize, seed: u64) -> Vec<u8> {
+        let ts = ty.type_size();
+        let bs = ty.blck_size();
+        let mut v = vec![0u8; (n / bs) * ts];
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        for b in v.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        // f16 の 1.0 = 0x3C00 / 0.5 = 0x3800 / 0.25 = 0x3400 (リトルエンディアン)。
+        let put = |v: &mut [u8], off: usize, bytes: [u8; 2]| {
+            v[off] = bytes[0];
+            v[off + 1] = bytes[1];
+        };
+        for i in 0..(n / bs) {
+            let b = i * ts;
+            match ty {
+                GgmlType::Q4K | GgmlType::Q5K => {
+                    put(&mut v, b, [0x00, 0x3C]); // d = 1.0
+                    put(&mut v, b + 2, [0x00, 0x38]); // dmin = 0.5
+                }
+                GgmlType::Q6K => put(&mut v, b + 208, [0x00, 0x3C]), // d = 1.0
+                GgmlType::Q5_1 => {
+                    put(&mut v, b, [0x00, 0x3C]); // d = 1.0
+                    put(&mut v, b + 2, [0x00, 0x34]); // m = 0.25
+                }
+                GgmlType::Q8_0 => put(&mut v, b, [0x00, 0x3C]), // d = 1.0
+                _ => {}
+            }
+        }
+        v
+    }
+
+    /// 索引が参照と一致する (型ごとに 1 行 512 要素)。
+    #[test]
+    fn k_kernel_index_mirror_matches_cpu_reference() {
+        for (ty, seed) in [
+            (GgmlType::Q4K, 21u64),
+            (GgmlType::Q5K, 22),
+            (GgmlType::Q6K, 23),
+            (GgmlType::Q5_1, 24),
+            (GgmlType::Q8_0, 25),
+        ] {
+            let n = 512usize;
+            let row = make_row(ty, n, seed);
+            let mut r = vec![0.0f32; n];
+            dequant_row_into(ty, &row, &mut r);
+            let mut bad = 0usize;
+            let mut worst = 0.0f32;
+            for k in 0..n {
+                let g = mirror(ty, &row, k);
+                let d = (g - r[k]).abs();
+                let rel = d / r[k].abs().max(1e-3);
+                if !(rel <= 1e-6) {
+                    bad += 1;
+                    if bad <= 4 {
+                        eprintln!("[pf-k-test] {ty:?} k={k} mirror={g} ref={} rel={rel}", r[k]);
+                    }
+                }
+                worst = worst.max(rel);
+            }
+            assert_eq!(bad, 0, "{ty:?}: 索引が参照と違う要素 {bad} 個 (worst rel {worst})");
+        }
+    }
+
+    /// コミット済みの K 系 PTX があれば、5 本とも引数 9 個で載っていること
+    /// (ホストの起動形と ABI が合っていることの裏取り)。無いときは省略。
+    #[test]
+    fn ptx_entry_params_counts_the_committed_k_ptx() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_k_pf.ptx");
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            eprintln!("PTX が無いので省略: {}", p.display());
+            return;
+        };
+        for name in [
+            "dno_exp_k_pf_q4k",
+            "dno_exp_k_pf_q5k",
+            "dno_exp_k_pf_q6k",
+            "dno_exp_k_pf_q5_1",
+            "dno_exp_k_pf_q8_0",
+        ] {
             assert_eq!(
                 ptx_entry_params(&text, name),
                 Some(9),
@@ -27293,6 +27591,12 @@ pub(crate) fn pf_attn_dev_store(ptr: CUdeviceptr, nt: usize, e: usize) {
     PF_ATTN_DEV_OUT.with(|c| *c.borrow_mut() = Some((ptr, nt, e)));
 }
 
+/// task 308: 層出力がデバイスに残っているか (形が合うときだけ true)。
+/// 記録は消さない (直後の [`pf_combine_dev`] が `take` する)。
+pub(crate) fn pf_attn_dev_peek(nt: usize, e: usize) -> bool {
+    PF_ATTN_DEV_OUT.with(|c| matches!(&*c.borrow(), Some((_, dnt, de)) if *dnt == nt && *de == e))
+}
+
 fn pf_combine_core(
     bo: Option<&[f32]>,
     dev: Option<CUdeviceptr>,
@@ -28982,6 +29286,7 @@ pub(crate) const ATTN_PF3_BQ: usize = 64;
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
 /// (`k_cpu` / `v_cpu` は台帳を進めるためだけに渡す。既に積んであるので転送は起きない)。
+/// 前提の形。`keep_dev` のときは `out` を書かない (`out` は空でよい)。
 #[allow(clippy::too_many_arguments)]
 pub fn pf_full_out(
     cache_id: u64,
@@ -29005,6 +29310,9 @@ pub fn pf_full_out(
     fused_gate: bool,
     gate_off: usize,
     gate_ld: usize,
+    // task 308: 層出力をデバイスに残す (D2H しない)。直後の combine が
+    // `pf_attn_dev_store` の記録を読む (`DENNO_PF_FULL_DEVRES`)。
+    keep_dev: bool,
     out: &mut [f32],
 ) -> bool {
     pf2_set_nt(nt);
@@ -29021,7 +29329,7 @@ pub fn pf_full_out(
         && v_cpu.len() >= t_total * kv_dim
         && wo.k == qd
         && wo.n == e
-        && out.len() == nt * e;
+        && (keep_dev || out.len() == nt * e);
     if !ok_shape {
         pf2_note(1);
         return false;
@@ -29206,6 +29514,13 @@ pub fn pf_full_out(
             // 3. 出力投影 (同期しない) → 最後に 1 回だけ待って 1 回で戻す
             pf2_gemm(ctx, pw, pw_k, attb.ptr(), ob.ptr(), nt, qd, e)?;
             ctx.sync()?;
+            // task 308: 層出力をデバイスに残す。直後の combine が同じポインタを
+            // 読むので、D2H (層出力) と combine の H2D が 1 往復ぶん消える
+            // (`DENNO_PF_FULL_DEVRES`。呼び出し側が keep_dev を立てたときだけ)。
+            if keep_dev {
+                pf_attn_dev_store(ob.ptr(), nt, e);
+                return Ok(());
+            }
             // task 181: `DENNO_PF_D2H_DIRECT` は中間 Vec を作らない (値は同じ)。
             if pf_d2h_direct_on() {
                 ob.to_slice(&mut out[..nt * e])?;
@@ -47408,6 +47723,27 @@ mod pf225_gate_tests {
                 assert!(f(Some(v)), "{name}: {v:?} が off のまま");
             }
         }
+    }
+
+    /// task 308: full 層の出力をデバイスに残す契約。
+    ///
+    /// `pf_full_out` は `keep_dev` のとき `pf_attn_dev_store` を呼び、直後の
+    /// `pf_combine_dev` がその記録を `take` して読む。記録は形が合うときだけ
+    /// 有効で、層の入口の `pf_attn_dev_clear` で消える (前の層の出力を
+    /// 次の層が読まない)。デバイス確保は要らない。
+    #[test]
+    fn pf308_full_devres_store_peek_contract() {
+        pf_attn_dev_clear();
+        assert!(!pf_attn_dev_peek(4, 8), "記録が無いのに true");
+        pf_attn_dev_store(0x1000, 4, 8);
+        assert!(pf_attn_dev_peek(4, 8), "同じ形は true");
+        assert!(!pf_attn_dev_peek(4, 9), "e が違えば false");
+        assert!(!pf_attn_dev_peek(5, 8), "nt が違えば false");
+        // 要求が立っていないときの連鎖は記録を残さない (ssm / full 共通)。
+        pf_attn_dev_request(false);
+        pf_attn_dev_clear();
+        assert!(!pf_attn_dev_peek(4, 8), "clear のあとは false");
+        pf_attn_dev_clear();
     }
 
     /// 形のゲート。

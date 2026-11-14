@@ -12753,6 +12753,37 @@ fn iq_expert_mode(lw: &LayerW) -> bool {
         .all(|t| crate::model::exp_iq::supported(*t))
 }
 
+/// task 309: prefill の選択 expert を **GPU の m 行カーネルで回してよいか**。
+///
+/// IQ 系は従来どおり ([`iq_expert_mode`])。K 系 (Q4_K / Q5_K / Q6_K / Q5_1 /
+/// Q8_0) は `DENNO_PF_EXP_K=1` のときだけ、かつ**ストリーミング経路が使える
+/// ときだけ**真にする (K 系のカーネルはステージング領域の m 行カーネルにしか
+/// 無い。ストリーミングを切ると 1 本ずつ VRAM 常駐の expert だけを回す形になり、
+/// ミスが CPU に残って遅い)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn pf_expert_mode(lw: &LayerW) -> bool {
+    if iq_expert_mode(lw) {
+        return true;
+    }
+    pf_expert_mode_from(
+        crate::model::exp_pf::k_enabled(),
+        crate::model::exp_pf::stream_enabled(),
+        [
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+        ]
+        .iter()
+        .all(|t| crate::model::exp_pf::slot(*t).is_some()),
+    )
+}
+
+/// [`pf_expert_mode`] の純関数 (テスト用)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn pf_expert_mode_from(k_gate: bool, stream: bool, k_types_ok: bool) -> bool {
+    k_gate && stream && k_types_ok
+}
+
 /// task 150: ミスした expert の寄与を `dst` (`sel.len() * e`) へ直接書く。
 ///
 /// 1 expert の計算は [`expert_contribs_par`] と同じ [`ExpertW::gemv_seq`] を同じ順で
@@ -15291,6 +15322,40 @@ pub(crate) fn set_pf_attn_devres_for_test(v: Option<bool>) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// task 308: full 層の出力をデバイスに残す (`DENNO_PF_FULL_DEVRES`)
+// ---------------------------------------------------------------------------
+//
+// full 層の連鎖 (`DENNO_PF_FULL_FUSED`、既定 on) は出力投影までデバイスで
+// 回しているのに、最後に `[nt][e]` を D2H し、直後の combine が同じ `[nt][e]`
+// を H2D し直している (3,826 トークン・14 層で 1 往復 1.1 GB)。
+// `DENNO_PF_ATTN_DEVRES` は ssm 連鎖の出力にしか効いていなかったので、
+// full 層にも同じ道を通す。値は変わらない (combine は同じカーネル・同じ入力)。
+// lab t308a/t308b で目標内だったので**既定 on** (切り戻しは `=0`)。
+
+/// task 308: `DENNO_PF_FULL_DEVRES` の解釈 (純関数)。明示的な偽値だけ off。
+pub(crate) fn pf_full_devres_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+        None => true,
+    }
+}
+
+/// task 308: full 層の出力をデバイスに残すか (`DENNO_PF_FULL_DEVRES`、**既定 on**)。
+///
+/// 効くのは `DENNO_PF_ATTN_DEVRES` (既定 on) と平坦な活性の層優先 / 常駐経路
+/// だけ。`roles` を取るときは呼び出し側が要求を立てない (ホストの行が要る)。
+///
+/// lab t308b (depth8k): 3,826 cold は 1 ビットも変わらない (md5 全出力 SAME、
+/// t308a の `full` 単独 COND で確認)。台帳の h2d / d2h が 14k で
+/// 41,636.8 / 12,987.8 MB → 39,914.3 / 11,265.2 MB (-1.72 GB ずつ)。
+pub(crate) fn pf_full_devres_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_full_devres_from_value(std::env::var("DENNO_PF_FULL_DEVRES").ok().as_deref())
+    })
+}
+
 /// task 172: `DENNO_PF_SHARED_DEV` の解釈 (純関数)。明示的な真値だけ on。
 pub(crate) fn pf_shared_dev_from_value(v: Option<&str>) -> bool {
     pf_on_from_value(v)
@@ -15444,6 +15509,32 @@ pub(crate) fn pf_router_fast_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         pf_router_fast_from_value(std::env::var("DENNO_PF_ROUTER_FAST").ok().as_deref())
+    })
+}
+
+/// task 308: `DENNO_PF_LM_ROUTER_DEV` の解釈 (純関数)。明示的な偽値だけ off。
+///
+/// 層優先 prefill (既定経路) の MoE は、router の logits を GPU の f32 GEMM で
+/// 作ってから `[nt][n_expert]` を**ホストへ降ろし**、softmax と top-k を
+/// rayon で回していた。デバイスのカーネル (`dno_router_softmax_topk`、task 225)
+/// は既にあるので、タイル全トークンを 1 回で回して選んだ k 個だけを降ろす。
+pub(crate) fn pf_lm_router_dev_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+        None => true,
+    }
+}
+
+/// task 308: 層優先 prefill の router + top-k をデバイスでまとめて回すか
+/// (`DENNO_PF_LM_ROUTER_DEV`、**既定 on**。lab t308b で採用)。
+///
+/// lab t308b (depth8k、3,826 cold、2 ラウンド目の同一 COND): base 3.13 s →
+/// both 2.94 s (-6.1%)。台帳の d2h は 14k で 12,987.8 → 11,666.3 MB
+/// (probs の降ろしが消えた)。md5 は softmax の和の結合順だけで変わる。
+pub(crate) fn pf_lm_router_dev_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_lm_router_dev_from_value(std::env::var("DENNO_PF_LM_ROUTER_DEV").ok().as_deref())
     })
 }
 
@@ -16628,7 +16719,7 @@ fn moe_experts_iq_pf_batch(
     if by_expert.is_empty()
         || nt == 0
         || !crate::model::exp_pf::pf_enabled()
-        || !iq_expert_mode(lw)
+        || !pf_expert_mode(lw)
     {
         return Ok(None);
     }
@@ -16700,6 +16791,65 @@ fn moe_experts_iq_pf_batch(
                     crate::model::exp_pf::stream_pin(),
                     crate::model::exp_pf::stream_bytes() >> 20,
                 );
+            }
+        }
+        // task 309: 行の少ない expert は CPU に残す (重み 1 本 3 MB の転送が
+        // 計算より高い)。K 系のときだけ (IQ 系の既存の挙動は変えない)。
+        let min_rows = crate::model::exp_pf::k_min_rows();
+        let split = !iq_expert_mode(lw)
+            && crate::model::exp_pf::k_enabled()
+            && min_rows > 0
+            && by_expert.iter().any(|p| {
+                !p.is_empty() && !crate::model::exp_pf::k_expert_pays(p.len(), min_rows)
+            });
+        if split {
+            let mut gpu_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(by_expert.len());
+            let mut cpu_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(by_expert.len());
+            for picks in by_expert.iter() {
+                if !picks.is_empty() && !crate::model::exp_pf::k_expert_pays(picks.len(), min_rows) {
+                    gpu_be.push(Vec::new());
+                    cpu_be.push(picks.clone());
+                } else {
+                    gpu_be.push(picks.clone());
+                    cpu_be.push(Vec::new());
+                }
+            }
+            // GPU 側 (行のある expert が 1 本でもあれば回す)。戻り値は GPU に
+            // 回した expert 数で、`out` は GPU の加重和で**上書き**される。
+            let mut ran = 0u32;
+            let mut ok = true;
+            if gpu_be.iter().any(|p| !p.is_empty()) {
+                match iq_pf_stream_layer(
+                    lw,
+                    &gpu_be,
+                    &resident,
+                    weights,
+                    k,
+                    PfStreamTgt::Host { xs, out },
+                    nt,
+                    e,
+                    ff,
+                )? {
+                    Some(h) => ran = h,
+                    None => ok = false,
+                }
+            }
+            if ok {
+                // CPU 側の寄与を上に足す (flat は `out` へ加算する)。
+                moe_experts_flat(
+                    lw,
+                    &cpu_be,
+                    weights,
+                    k,
+                    xs,
+                    e,
+                    ff,
+                    MOE_FLAT_ROWS,
+                    out,
+                    moe_expert::vnni_enabled(),
+                    None,
+                )?;
+                return Ok(Some(ran));
             }
         }
         if let Some(gpu) = iq_pf_stream_layer(
@@ -18150,36 +18300,88 @@ fn moe_ffn_quant_batch_lm_dev_at(
     if skip_routed {
         return Ok(lm_decline("skip_routed"));
     }
-    // 1. ルータ (入力をデバイスから直接読む)。probs だけホストへ戻る。
-    let mut probs = vec![0.0f32; nt * ne];
-    if !crate::cuda::maybe_gpu_f32_gemm_batch_dev_into(
-        lw.gate_inp.uid(),
-        lw.gate_inp.blocks().as_slice(),
-        lw.gate_inp.k(),
-        lw.gate_inp.n(),
-        xs_dev,
-        nt,
-        &mut probs,
-        GgmlType::F32,
-    ) {
-        return Ok(lm_decline("router gemm"));
-    }
-    mark(0);
-    let sm_block = router_sm_block();
-    router_softmax_rows(&mut probs, ne, sm_block);
+    // 1. ルータ (入力をデバイスから直接読む)。
     let mut sels: Vec<usize> = vec![0; nt * k];
     let mut weights: Vec<f32> = vec![0.0; nt * k];
     let expert_mask = iv.expert_mask(lw.il);
-    router_topk_rows(
-        &mut probs,
-        ne,
-        k,
-        &mut sels,
-        &mut weights,
-        sm_block,
-        pf_router_fast_on(),
-        expert_mask,
-    );
+    // task 308: このタイル全体の router (logits → softmax → top-k → 再正規化) を
+    // デバイスで 1 回にまとめる (`DENNO_PF_LM_ROUTER_DEV`)。降りるのは選んだ
+    // k 個の index と重み、行ごとの選択和だけ (probs の `[nt][n_expert]` を
+    // ホストへ戻さない)。カーネルは task 225 のもの (`kernels_router225`)。
+    #[cfg(feature = "cuda")]
+    let mut router_rowsum: Option<f32> = None;
+    #[cfg(feature = "cuda")]
+    {
+        if pf_lm_router_dev_on()
+            && expert_mask.is_none()
+            && nt >= PF_ROUTER_GPU_MIN_TOK
+            && crate::cuda::pf_router_dev_ok(nt, ne, k)
+        {
+            let mut sel32 = vec![0u32; nt * k];
+            let mut rowsum = vec![0.0f32; nt];
+            if crate::cuda::pf_router_dev_topk(
+                lw.gate_inp.uid(),
+                lw.gate_inp.blocks().as_slice(),
+                lw.gate_inp.k(),
+                lw.gate_inp.n(),
+                Some(xs_dev),
+                None,
+                nt,
+                k,
+                &mut sel32,
+                &mut weights,
+                &mut rowsum,
+                GgmlType::F32,
+            ) {
+                for (i, v) in sel32.iter().enumerate() {
+                    sels[i] = *v as usize;
+                }
+                router_rowsum = rowsum.last().copied();
+                mark(0);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "[pf308] 層優先 router: logits + softmax + top-k をデバイスで 1 回 \
+                         (DENNO_PF_LM_ROUTER_DEV)"
+                    )
+                });
+            }
+        }
+    }
+    #[cfg(feature = "cuda")]
+    let router_dev_done = router_rowsum.is_some();
+    #[cfg(not(feature = "cuda"))]
+    let router_dev_done = false;
+    // ホスト経路の probs (デバイス経路では空のまま)。
+    let mut probs: Vec<f32> = Vec::new();
+    if !router_dev_done {
+        probs = vec![0.0f32; nt * ne];
+        if !crate::cuda::maybe_gpu_f32_gemm_batch_dev_into(
+            lw.gate_inp.uid(),
+            lw.gate_inp.blocks().as_slice(),
+            lw.gate_inp.k(),
+            lw.gate_inp.n(),
+            xs_dev,
+            nt,
+            &mut probs,
+            GgmlType::F32,
+        ) {
+            return Ok(lm_decline("router gemm"));
+        }
+        mark(0);
+        let sm_block = router_sm_block();
+        router_softmax_rows(&mut probs, ne, sm_block);
+        router_topk_rows(
+            &mut probs,
+            ne,
+            k,
+            &mut sels,
+            &mut weights,
+            sm_block,
+            pf_router_fast_on(),
+            expert_mask,
+        );
+    }
     mark(1);
     if emit_last {
         let tail = (nt - 1) * k;
@@ -18331,8 +18533,19 @@ fn moe_ffn_quant_batch_lm_dev_at(
     if let Some(r) = roles.as_deref_mut() {
         let t = nt - 1;
         let mut s = 0.0f32;
-        for j in 0..k {
-            s += probs[t * ne + sels[t * k + j]];
+        // task 308: デバイス経路は選択和をカーネルから受け取る
+        // (`rowsum` = 選んだ k 個の index 昇順の逐次和。ホストの下の和と同じ)。
+        #[cfg(feature = "cuda")]
+        let dev_sum = router_rowsum;
+        #[cfg(not(feature = "cuda"))]
+        let dev_sum: Option<f32> = None;
+        match dev_sum {
+            Some(v) => s = v,
+            None => {
+                for j in 0..k {
+                    s += probs[t * ne + sels[t * k + j]];
+                }
+            }
         }
         r.router = s;
         if sh_dev != 0 {
@@ -18443,6 +18656,25 @@ mod lm_dev_tests {
         );
         // 境界 (nt == min) は通す。
         assert!(lm_dev_moe_ok(512, true, true, true, 512, true, true));
+    }
+
+    /// task 309: K 系の prefill expert を GPU に回す前提 (真理値表)。
+    ///
+    /// ゲート・ストリーミング・型の 3 つが揃ったときだけ真。
+    #[test]
+    fn pf_expert_mode_k_truth_table() {
+        assert!(pf_expert_mode_from(true, true, true));
+        assert!(!pf_expert_mode_from(false, true, true), "ゲート off");
+        assert!(!pf_expert_mode_from(true, false, true), "ストリーミング off");
+        assert!(
+            !pf_expert_mode_from(true, true, false),
+            "型が K 系のカーネルに無い"
+        );
+        // task 309: lab t309b で採用して既定 on。
+        assert!(
+            crate::model::exp_pf::DEFAULT_K_ON,
+            "既定 off に戻っている"
+        );
     }
 }
 
@@ -23675,6 +23907,38 @@ mod tests {
             for v in ["1", "on", "true", "yes", " ON "] {
                 assert!(pf_attn_flat_from_value(Some(v)), "{v:?} が off のまま");
                 assert!(pf_attn_devres_from_value(Some(v)), "{v:?} が off のまま");
+            }
+        }
+
+        /// task 308: `DENNO_PF_FULL_DEVRES` は full 層の出力をデバイスに残す
+        /// (D2H と combine の H2D を消す)。lab t308b で採用して**既定 on**。
+        #[test]
+        fn pf_full_devres_gate_values() {
+            assert!(pf_full_devres_from_value(None), "未設定は on");
+            for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
+                assert!(!pf_full_devres_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_full_devres_from_value(Some(v)), "{v:?} が off のまま");
+            }
+            if std::env::var_os("DENNO_PF_FULL_DEVRES").is_none() {
+                assert!(pf_full_devres_on());
+            }
+        }
+
+        /// task 308: `DENNO_PF_LM_ROUTER_DEV` は層優先 MoE の router を
+        /// デバイスで 1 回にまとめる。lab t308b で採用して**既定 on**。
+        #[test]
+        fn pf_lm_router_dev_gate_values() {
+            assert!(pf_lm_router_dev_from_value(None), "未設定は on");
+            for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
+                assert!(!pf_lm_router_dev_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_lm_router_dev_from_value(Some(v)), "{v:?} が off のまま");
+            }
+            if std::env::var_os("DENNO_PF_LM_ROUTER_DEV").is_none() {
+                assert!(pf_lm_router_dev_on());
             }
         }
 
