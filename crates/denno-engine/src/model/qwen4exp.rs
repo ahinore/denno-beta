@@ -15281,20 +15281,24 @@ pub(crate) fn set_pf_attn_devres_for_test(v: Option<bool>) {
 // を H2D し直している (3,826 トークン・14 層で 1 往復 1.1 GB)。
 // `DENNO_PF_ATTN_DEVRES` は ssm 連鎖の出力にしか効いていなかったので、
 // full 層にも同じ道を通す。値は変わらない (combine は同じカーネル・同じ入力)。
-// 既定 off で入れ、lab で採否を決める。
+// lab t308a/t308b で目標内だったので**既定 on** (切り戻しは `=0`)。
 
-/// task 308: `DENNO_PF_FULL_DEVRES` の解釈 (純関数)。**明示的な真値だけ on**。
+/// task 308: `DENNO_PF_FULL_DEVRES` の解釈 (純関数)。明示的な偽値だけ off。
 pub(crate) fn pf_full_devres_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+        None => true,
+    }
 }
 
-/// task 308: full 層の出力をデバイスに残すか (`DENNO_PF_FULL_DEVRES`、既定 off)。
+/// task 308: full 層の出力をデバイスに残すか (`DENNO_PF_FULL_DEVRES`、**既定 on**)。
 ///
 /// 効くのは `DENNO_PF_ATTN_DEVRES` (既定 on) と平坦な活性の層優先 / 常駐経路
 /// だけ。`roles` を取るときは呼び出し側が要求を立てない (ホストの行が要る)。
+///
+/// lab t308b (depth8k): 3,826 cold は 1 ビットも変わらない (md5 全出力 SAME、
+/// t308a の `full` 単独 COND で確認)。台帳の h2d / d2h が 14k で
+/// 41,636.8 / 12,987.8 MB → 39,914.3 / 11,265.2 MB (-1.72 GB ずつ)。
 pub(crate) fn pf_full_devres_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -15458,21 +15462,25 @@ pub(crate) fn pf_router_fast_on() -> bool {
     })
 }
 
-/// task 308: `DENNO_PF_LM_ROUTER_DEV` の解釈 (純関数)。**明示的な真値だけ on**。
+/// task 308: `DENNO_PF_LM_ROUTER_DEV` の解釈 (純関数)。明示的な偽値だけ off。
 ///
 /// 層優先 prefill (既定経路) の MoE は、router の logits を GPU の f32 GEMM で
 /// 作ってから `[nt][n_expert]` を**ホストへ降ろし**、softmax と top-k を
 /// rayon で回していた。デバイスのカーネル (`dno_router_softmax_topk`、task 225)
 /// は既にあるので、タイル全トークンを 1 回で回して選んだ k 個だけを降ろす。
 pub(crate) fn pf_lm_router_dev_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+        None => true,
+    }
 }
 
 /// task 308: 層優先 prefill の router + top-k をデバイスでまとめて回すか
-/// (`DENNO_PF_LM_ROUTER_DEV`、既定 off。lab で採否を決める)。
+/// (`DENNO_PF_LM_ROUTER_DEV`、**既定 on**。lab t308b で採用)。
+///
+/// lab t308b (depth8k、3,826 cold、2 ラウンド目の同一 COND): base 3.13 s →
+/// both 2.94 s (-6.1%)。台帳の d2h は 14k で 12,987.8 → 11,666.3 MB
+/// (probs の降ろしが消えた)。md5 は softmax の和の結合順だけで変わる。
 pub(crate) fn pf_lm_router_dev_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -23775,27 +23783,26 @@ mod tests {
         }
 
         /// task 308: `DENNO_PF_FULL_DEVRES` は full 層の出力をデバイスに残す
-        /// (D2H と combine の H2D を消す)。**明示的な真値だけ on**。
+        /// (D2H と combine の H2D を消す)。lab t308b で採用して**既定 on**。
         #[test]
         fn pf_full_devres_gate_values() {
-            assert!(!pf_full_devres_from_value(None), "未設定は off");
+            assert!(pf_full_devres_from_value(None), "未設定は on");
             for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
                 assert!(!pf_full_devres_from_value(Some(v)), "{v:?} が on になった");
             }
             for v in ["1", "on", "true", "yes", " ON "] {
                 assert!(pf_full_devres_from_value(Some(v)), "{v:?} が off のまま");
             }
-            // 既定 (env 未設定) の `_on` も off。env は lab でしか立てない。
             if std::env::var_os("DENNO_PF_FULL_DEVRES").is_none() {
-                assert!(!pf_full_devres_on());
+                assert!(pf_full_devres_on());
             }
         }
 
         /// task 308: `DENNO_PF_LM_ROUTER_DEV` は層優先 MoE の router を
-        /// デバイスで 1 回にまとめる。**明示的な真値だけ on**。
+        /// デバイスで 1 回にまとめる。lab t308b で採用して**既定 on**。
         #[test]
         fn pf_lm_router_dev_gate_values() {
-            assert!(!pf_lm_router_dev_from_value(None), "未設定は off");
+            assert!(pf_lm_router_dev_from_value(None), "未設定は on");
             for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
                 assert!(!pf_lm_router_dev_from_value(Some(v)), "{v:?} が on になった");
             }
@@ -23803,7 +23810,7 @@ mod tests {
                 assert!(pf_lm_router_dev_from_value(Some(v)), "{v:?} が off のまま");
             }
             if std::env::var_os("DENNO_PF_LM_ROUTER_DEV").is_none() {
-                assert!(!pf_lm_router_dev_on());
+                assert!(pf_lm_router_dev_on());
             }
         }
 
