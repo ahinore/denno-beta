@@ -615,6 +615,43 @@ pub const DEFAULT_STREAM_PIN: usize = 1;
 /// (t165a の enq_s=9.53)。A/B 用にゲートは残す。
 pub const DEFAULT_STREAM_UT: bool = false;
 
+/// `DENNO_PF_STREAM_LOOKAHEAD`: 上げ専用スレッドへ **何グループ先まで** 依頼するか
+/// (task 320、既定 1 = task 165 のまま)。
+///
+/// 依頼を 1 つ先に限ると、計算スレッドが待つ `ev_up` は「1 反復ぶん前に
+/// 依頼したグループ」のもので、そのグループはまだ写し (1 グループ 約 3 ms) と
+/// DMA を終えていない。つまり写しがカーネルの裏に隠れず、直列のときと
+/// ほとんど変わらない (lab t320a: ut=1 で wall -5.0%、`up_wait` 405 → 1,112 ms)。
+/// 2 つ先まで依頼すると、待つグループは 2 反復前に依頼済みになり、写しは
+/// カーネルの裏に隠れる。
+///
+/// 上限はステージングの枚数 - 1 ([`crate::cuda`] の 3 枚 = 2)。
+/// 依頼が 2 つ先まで進むと 3 枚すべてが「上げ中」になり、スロットの再利用は
+/// 前のグループのカーネル完了 (`ev_use`) を待つ (正しさは変わらない)。
+pub const STREAM_LOOKAHEAD_ENV: &str = "DENNO_PF_STREAM_LOOKAHEAD";
+
+/// [`STREAM_LOOKAHEAD_ENV`] の既定値 (1 = 1 つ先だけ)。
+pub const DEFAULT_STREAM_LOOKAHEAD: usize = 1;
+
+/// 依頼を何グループ先まで出すか (純関数)。1..=2 に丸める。
+pub fn stream_lookahead_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_STREAM_LOOKAHEAD;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.clamp(1, 2),
+        Err(_) => DEFAULT_STREAM_LOOKAHEAD,
+    }
+}
+
+/// 依頼を何グループ先まで出すか (プロセスで 1 回だけ env を読む)。
+pub fn stream_lookahead() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        stream_lookahead_from_value(std::env::var(STREAM_LOOKAHEAD_ENV).ok().as_deref())
+    })
+}
+
 /// [`STREAM_WC_ENV`] の既定値 (true = write-combined のバウンス)。
 ///
 /// lab t165b: グループ 64 で 14k cold が 100.01 s (wc=0) → 95.06 s (wc=1)、
@@ -2718,6 +2755,15 @@ mod tests {
         assert!(stream_ut_from_value(true, Some("1")));
         assert!(!stream_ut_from_value(true, Some("0")));
         assert!(!stream_ut_from_value(true, Some("off")));
+        // task 320: 依頼の先読み数 (1..=2 に丸める。既定 1 = 従来)。
+        assert_eq!(stream_lookahead_from_value(None), DEFAULT_STREAM_LOOKAHEAD);
+        assert_eq!(stream_lookahead_from_value(Some("")), DEFAULT_STREAM_LOOKAHEAD);
+        assert_eq!(stream_lookahead_from_value(Some("1")), 1);
+        assert_eq!(stream_lookahead_from_value(Some("2")), 2);
+        assert_eq!(stream_lookahead_from_value(Some("0")), 1, "0 は下限へ");
+        assert_eq!(stream_lookahead_from_value(Some("9")), 2, "上限は 2 (3 枚)");
+        assert_eq!(stream_lookahead_from_value(Some("x")), DEFAULT_STREAM_LOOKAHEAD);
+        assert_eq!(stream_lookahead_from_value(Some(" 2 ")), 2);
         // task 165: write-combined のバウンスは明示的な真値だけ on。
         assert!(!stream_wc_from_value(false, Some("1")), "stream off なら動かない");
         assert_eq!(stream_wc_from_value(true, None), DEFAULT_STREAM_WC);

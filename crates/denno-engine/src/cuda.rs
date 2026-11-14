@@ -13537,14 +13537,17 @@ fn moe_experts_iq_pf_layer_stream_io(
                 let mut st = cell.borrow_mut();
                 pf_take_group_ids(&mut st.next_g, bounds.len())
             });
+            // task 320: 上げ専用スレッドへ何グループ先まで依頼するか。
+            // 1 つ先だけだと、待つグループの写しがまだ終わっておらず隠れない。
+            let look = if ut { exp_pf::stream_lookahead() } else { 0 };
             for (gi, &(a, b)) in bounds.iter().enumerate() {
                 let g = base_g + gi as u64;
                 let items = &items_of[gi];
-                // (a0) ut 経路: このグループと 1 つ先までを先に依頼する
-                //      (計算スレッドがグループ g のカーネルを積む間に、
-                //       上げスレッドが g+1 の写しと積み込みを進める)。
+                // (a0) ut 経路: このグループから `look` 個先までを先に依頼する
+                //      (計算スレッドがグループ g のカーネルを積む間に、上げスレッドが
+                //       g+1 以降の写しと積み込みを進める)。
                 if ut {
-                    while submitted <= gi + 1 && submitted < bounds.len() {
+                    while submitted <= gi + look && submitted < bounds.len() {
                         let k = submitted;
                         if !items_of[k].is_empty() {
                             let first = !probe_sent;

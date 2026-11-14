@@ -10769,3 +10769,46 @@ fn task317_ssm_mix_keep_is_wired() {
         "復元が host 経路の後ろにある (古いバイト列で計算する)"
     );
 }
+
+/// task 320: prefill の expert 上げ (pinned 写し + DMA) をカーネルの裏へ隠す配線。
+///
+/// - 依頼の先読み数 `DENNO_PF_STREAM_LOOKAHEAD` が exp_pf にあり、1..=2 に丸める
+///   (ステージングは 3 枚なので 2 つ先が上限)
+/// - ストリーミングの依頼ループが `gi + look` を使う (1 つ先に固定されていない)。
+///   1 つ先だけだと、待つグループの写しが 1 反復ぶんしか先行せず隠れない
+///   (lab t320a: ut=1 で `up_wait` 405 → 1,112 ms、wall -5.0%)
+/// - 上限がステージングの枚数と食い違わない (`PF_STAGE_SLOTS` = 3)。
+#[test]
+fn task320_upload_thread_lookahead_is_wired() {
+    assert!(
+        EXP_PF_SRC.contains("pub const STREAM_LOOKAHEAD_ENV: &str = \"DENNO_PF_STREAM_LOOKAHEAD\";"),
+        "先読みの env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn stream_lookahead()"),
+        "先読みの読み出しが無い"
+    );
+    let f = EXP_PF_SRC
+        .split("pub fn stream_lookahead_from_value(")
+        .nth(1)
+        .expect("stream_lookahead_from_value が無い");
+    assert!(f.contains(".clamp(1, 2)"), "1..=2 に丸めていない");
+    // 依頼ループ: 先読みをゲートから取る。
+    assert!(
+        CUDA_RS.contains("let look = if ut { exp_pf::stream_lookahead() } else { 0 };"),
+        "依頼ループが先読みをゲートから取っていない"
+    );
+    assert!(
+        CUDA_RS.contains("while submitted <= gi + look && submitted < bounds.len() {"),
+        "依頼ループが 1 つ先に固定されたまま"
+    );
+    assert!(
+        !CUDA_RS.contains("while submitted <= gi + 1 && submitted < bounds.len() {"),
+        "旧い 1 つ先のループが残っている"
+    );
+    // ステージングの枚数 (3) と上限 (2) の対応。
+    assert!(
+        CUDA_RS.contains("pub(crate) const PF_STAGE_SLOTS: usize = 3;"),
+        "ステージングの枚数が変わった (先読みの上限 2 を見直すこと)"
+    );
+}
