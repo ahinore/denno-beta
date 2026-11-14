@@ -790,8 +790,11 @@ pub fn pf_enabled() -> bool {
 /// [`pf_enabled`] が同じ条件で立つ)。既定は lab の採否で決める。
 pub const K_ENV: &str = "DENNO_PF_EXP_K";
 
-/// 既定値 (task 309 の最初の commit では off。lab の結果で on にする)。
-pub const DEFAULT_K_ON: bool = false;
+/// 既定値 (**on**。lab t309b で採用)。
+///
+/// t309b (UD-Q4_K_XL、depth8k、PROFILE=1) の採否の数字は REPORT_P309.md。
+/// `DENNO_PF_EXP_K=0` で従来の CPU 経路へ戻せる。
+pub const DEFAULT_K_ON: bool = true;
 
 /// [`K_ENV`] の解釈 (純関数)。`iq_on` が false なら常に false。
 /// 明示的な偽値 (`0` / `off` / `false`) だけが偽で、未設定は [`DEFAULT_K_ON`]。
@@ -958,6 +961,40 @@ pub fn stream_wc() -> bool {
             std::env::var(STREAM_WC_ENV).ok().as_deref(),
         )
     })
+}
+
+/// task 309: 層の expert 型が K 系のときの既定も込めた解釈 (純関数)。
+///
+/// 明示値 (`DENNO_PF_STREAM_WC`) はそのまま。**未設定のときだけ**型で変える:
+/// IQ 系は従来どおり write-combined (lab t165b: probe 53.5 GB/s)、
+/// K 系は通常の pinned (lab t309b: UD-Q4_K_XL の 3,826 cold が 17.0 s 対
+/// write-combined の 29.6 s。WC だとホスト側の写しが 4.3 GB/s で頭打ち)。
+pub fn stream_wc_for_from(v: Option<&str>, pf_on: bool, is_k: bool) -> bool {
+    if !pf_on {
+        return false;
+    }
+    match v.map(str::trim) {
+        None | Some("") => !is_k,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// このモードの write-combined 既定 (プロセスで 1 回だけ env を読む)。
+pub fn stream_wc_for(is_k: bool) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON_K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let init = || {
+        stream_wc_for_from(
+            std::env::var(STREAM_WC_ENV).ok().as_deref(),
+            stream_enabled(),
+            is_k,
+        )
+    };
+    if is_k {
+        *ON_K.get_or_init(init)
+    } else {
+        *ON.get_or_init(init)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2365,8 +2402,16 @@ mod tests {
         assert!(!k_from_value(true, Some("0")));
         assert!(!k_from_value(true, Some("off")));
         assert!(!k_from_value(true, Some("false")));
-        assert!(!DEFAULT_K_ON, "既定 on のまま lab に出している");
-        assert!(!k_enabled(), "env 未設定の既定が off でない");
+        // task 309: lab t309b で採用して既定 on (IQ ゲートが前提なので、
+        // env 未設定でも `DENNO_EXPERT_IQ_GPU=1` が無ければ k_enabled() は false)。
+        assert!(DEFAULT_K_ON, "既定 off に戻っている");
+        assert!(k_from_value(true, None), "未設定は既定 (on) でない");
+        // write-combined の既定は型で変わる (K 系は通常 pinned)。
+        assert!(!stream_wc_for_from(None, true, true), "K 系の既定が WC");
+        assert!(stream_wc_for_from(None, true, false), "IQ 系の既定が WC でない");
+        assert!(stream_wc_for_from(Some("1"), true, true), "明示値は型より優先");
+        assert!(!stream_wc_for_from(Some("0"), true, false), "明示値は型より優先");
+        assert!(!stream_wc_for_from(None, false, false), "ストリーミング off");
         // 行数の床 (純関数)。
         assert_eq!(k_min_rows_from_value(None), DEFAULT_K_MIN_ROWS);
         assert_eq!(k_min_rows_from_value(Some("")), DEFAULT_K_MIN_ROWS);

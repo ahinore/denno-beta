@@ -10685,6 +10685,9 @@ struct PfStream {
     /// task 165: グループの通し番号 (層をまたいで増える。スロットの持ち主を
     /// 一意にするため。0 に戻すと前の層の完了イベントを誤認する)。
     next_g: u64,
+    /// task 309: この層の expert 型が K 系か。pinned バウンスの作り方
+    /// (`DENNO_PF_STREAM_WC` の既定) を型で変える。
+    k_mode: bool,
 }
 
 impl PfStream {
@@ -10695,6 +10698,7 @@ impl PfStream {
             up: None,
             probed: false,
             next_g: 0,
+            k_mode: false,
         }
     }
 }
@@ -11030,7 +11034,7 @@ fn pf_slot_prepare(
             // task 296: 確保し直しの回数と時間を診断で読めるようにする
             // (`DENNO_PF_LM_DBG=1` の `[pf-lm-dbg] stream` 行)。
             let t_pin = std::time::Instant::now();
-            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc())?);
+            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc_for(st.k_mode))?);
             pf_stream_t_add(6, t_pin.elapsed().as_nanos() as u64);
             pf_stream_t_add(7, 1);
         }
@@ -13095,6 +13099,9 @@ fn moe_experts_iq_pf_layer_stream_io(
     ) else {
         return Ok(None);
     };
+    // task 309: K 系の層か。pinned バウンスの作り方 (`DENNO_PF_STREAM_WC` の
+    // 既定) を型で変える (lab t309b: K 系は write-combined でないほうが速い)。
+    PF_STREAM.with(|c| c.borrow_mut().k_mode = exp_pf::is_k_slot(slot_g));
     let Some(ctx) = shared_ctx() else {
         return Ok(None);
     };

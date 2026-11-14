@@ -18528,10 +18528,10 @@ mod lm_dev_tests {
             !pf_expert_mode_from(true, true, false),
             "型が K 系のカーネルに無い"
         );
-        // 既定 (env 未設定) は off。
+        // task 309: lab t309b で採用して既定 on。
         assert!(
-            !crate::model::exp_pf::k_enabled(),
-            "既定が on のまま lab に出している"
+            crate::model::exp_pf::DEFAULT_K_ON,
+            "既定 off に戻っている"
         );
     }
 }
