@@ -4257,9 +4257,12 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     Some(LayerKind::FullAttn) => crate::cuda::pf_mix_keep_on(),
                     // task 317: ssm 層は直後の GDN 連鎖 (`gdn_pf_chain`) が
                     // デバイスの `mixed` を読む (`DENNO_PF_MIXKEEP_SSM`)。
-                    // 連鎖に乗らない層は `forward_batch_flat` が復元してから
-                    // ホスト経路で計算する。
-                    Some(LayerKind::Ssm) => crate::cuda::pf_mix_keep_ssm_on(),
+                    // 連鎖自体が off の環境では D2H を飛ばさない (飛ばすと
+                    // 復元の D2H が 1 本増えるだけ)。連鎖に乗らない層は
+                    // `forward_batch_flat` が復元してからホスト経路で計算する。
+                    Some(LayerKind::Ssm) => {
+                        crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()
+                    }
                     None => false,
                 }
         }
@@ -19295,6 +19298,13 @@ mod tests {
             !Qwen4Exp::pf_mix_keep_layer(true, 128, None),
             "層種別なしで keep"
         );
+        // 連鎖が off (`DENNO_GDN_PF_CHAIN=0`) なら D2H を飛ばさない
+        // (飛ばすと復元の D2H が 1 本増えるだけ)。
+        set_pf_gdn_chain_for_test(Some(false));
+        assert!(!Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::Ssm)));
+        set_pf_gdn_chain_for_test(Some(true));
+        assert!(Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::Ssm)));
+        set_pf_gdn_chain_for_test(None);
         // dev-in off (`DENNO_PF_MIXDEVIN=0`) は常に D2H。
         cuda::pf_dev_in_set_for_test(1);
         assert!(!Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::Ssm)));

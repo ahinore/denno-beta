@@ -7934,7 +7934,7 @@ fn pf230_gates_are_wired_and_defaults_set() {
     // task 317: ゲートは層種別ごと (full = MIXKEEP、ssm = MIXKEEP_SSM)。
     assert!(
         QWEN_SRC.contains("Some(LayerKind::FullAttn) => crate::cuda::pf_mix_keep_on()")
-            && QWEN_SRC.contains("Some(LayerKind::Ssm) => crate::cuda::pf_mix_keep_ssm_on()"),
+            && QWEN_SRC.contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
         "MIXKEEP の層種別の切り分けが無い"
     );
     assert!(
@@ -10740,8 +10740,8 @@ fn task317_ssm_mix_keep_is_wired() {
     );
     // 判定は層種別ごと (full = MIXKEEP、ssm = MIXKEEP_SSM)。
     assert!(
-        QWEN4EXP_RS.contains("Some(LayerKind::Ssm) => crate::cuda::pf_mix_keep_ssm_on()"),
-        "ssm 層の keep 判定が無い"
+        QWEN4EXP_RS.contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
+        "ssm 層の keep 判定が無い (連鎖が off の環境で D2H を飛ばすと無駄)"
     );
     // 層優先の経路も keep を通る (D2H 固定のままなら発火しない)。
     let lm = QWEN4EXP_RS
