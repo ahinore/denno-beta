@@ -3545,6 +3545,12 @@ impl DevBuffer {
     pub fn to_slice<T: Copy>(&self, out: &mut [T]) -> Result<()> {
         let bytes = std::mem::size_of_val(out);
         assert!(bytes <= self.bytes, "DevBuffer::to_slice: size overflow");
+        // task 318: 1 MiB 以上の同期 D2H は pinned バウンス経由 (`DENNO_PF_PIN_STAGE`)。
+        // pageable の D2H はこのホストで 1-3 GB/s しか出ない。
+        // 失敗 (pinned が取れない / 転送エラー) は従来経路で丸ごとやり直す。
+        if bytes > 0 && matches!(self.to_slice_pinned(out), Ok(true)) {
+            return Ok(());
+        }
         if bytes > 0 {
             // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
             let kp = dec_kprof::op_begin(|| "D2H".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
@@ -3564,6 +3570,11 @@ impl DevBuffer {
     pub fn copy_from<T: Copy>(&self, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
         assert!(bytes <= self.bytes, "DevBuffer::copy_from: size overflow");
+        // task 318: 1 MiB 以上の同期 H2D は pinned バウンス経由 (`DENNO_PF_PIN_STAGE`)。
+        // 失敗 (pinned が取れない / 転送エラー) は従来経路で丸ごとやり直す。
+        if bytes > 0 && matches!(self.copy_from_pinned(data), Ok(true)) {
+            return Ok(());
+        }
         let dbg = launch_dbg::note(|| format!("H2D ptr={:#x} bytes={bytes}", self.ptr));
         // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
         let kp = dec_kprof::op_begin(|| "H2D".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
@@ -3613,6 +3624,51 @@ impl DevBuffer {
         res?;
         launch_dbg::sync(dbg)?;
         Ok(())
+    }
+
+    /// task 318: pinned バウンス経由の同期 H2D (`DENNO_PF_PIN_STAGE=1`)。
+    ///
+    /// pageable の `cuMemcpyHtoD` はこのホストで 1-2 GB/s しか出ない (P309 §7.4)。
+    /// ホストの配列を pinned に写してから DMA すると、44 MB の残差 1 本が
+    /// 20-40 ms → 5-6 ms になる。`Ok(false)` は「ゲートが off / 用意できない」で、
+    /// 呼び出し側は従来の pageable 経路へ落ちる。
+    pub fn copy_from_pinned<T: Copy>(&self, data: &[T]) -> Result<bool> {
+        let bytes = std::mem::size_of_val(data);
+        assert!(bytes <= self.bytes, "DevBuffer::copy_from_pinned: size overflow");
+        if bytes == 0 {
+            return Ok(true);
+        }
+        let Some(pin) = pf_pin_stage(bytes)? else {
+            return Ok(false);
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, pin as *mut u8, bytes);
+            check(
+                (lib()?.memcpy_htod)(self.ptr, pin as *const c_void, bytes),
+                "cuMemcpyHtoD (pin stage)",
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// task 318: pinned バウンス経由の同期 D2H (`DENNO_PF_PIN_STAGE=1`)。
+    pub fn to_slice_pinned<T: Copy>(&self, out: &mut [T]) -> Result<bool> {
+        let bytes = std::mem::size_of_val(out);
+        assert!(bytes <= self.bytes, "DevBuffer::to_slice_pinned: size overflow");
+        if bytes == 0 {
+            return Ok(true);
+        }
+        let Some(pin) = pf_pin_stage(bytes)? else {
+            return Ok(false);
+        };
+        unsafe {
+            check(
+                (lib()?.memcpy_dtoh)(pin, self.ptr, bytes),
+                "cuMemcpyDtoH (pin stage)",
+            )?;
+            std::ptr::copy_nonoverlapping(pin as *const u8, out.as_mut_ptr() as *mut u8, bytes);
+        }
+        Ok(true)
     }
 
     /// s141b (Task B7c): 既存バッファへ**デバイスから**上書きコピー (D2D・同期)。
@@ -14980,6 +15036,72 @@ impl PinMem {
     fn as_mut_slice<T>(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.bytes / std::mem::size_of::<T>()) }
     }
+}
+
+/// task 318: `DENNO_PF_PIN_STAGE` の値の解釈 (純関数)。
+///
+/// `1` / `true` / `yes` / `on` (と未知の値) を on、`0` / `false` / `no` / `off` /
+/// 空文字を off にする。既定は off (env が無いとき)。
+pub fn pf_pin_stage_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            !matches!(t.as_str(), "0" | "false" | "no" | "off" | "")
+        }
+    }
+}
+
+/// pinned バウンスを使う転送サイズの下限 / 上限 (1 MiB ..= 256 MiB)。
+const PF_PIN_MIN_BYTES: usize = 1 << 20;
+const PF_PIN_MAX_BYTES: usize = 256 << 20;
+
+/// 層ループの同期 H2D / D2H を pinned バウンス経由にするか。
+fn pf_pin_stage_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_pin_stage_from_value(std::env::var("DENNO_PF_PIN_STAGE").ok().as_deref())
+    })
+}
+
+thread_local! {
+    /// task 318: 層ループの同期コピー用の pinned バウンス (grow-only)。
+    static PF_PIN_STAGE: std::cell::RefCell<Option<PinMem>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// pinned バウンスを `bytes` 以上に育てて先頭ポインタを返す。
+///
+/// ゲートが off、または確保に失敗したら `Ok(None)` (呼び出し側は pageable 経路へ)。
+fn pf_pin_stage(bytes: usize) -> Result<Option<*mut c_void>> {
+    if !pf_pin_stage_on() {
+        return Ok(None);
+    }
+    // 小さい転送は写しの固定費が勝つ。大きすぎる転送はスレッドごとの pinned が
+    // 効きすぎる (14 本の rayon で 2 GB 級) ので、その窓の外は従来経路。
+    if !(PF_PIN_MIN_BYTES..=PF_PIN_MAX_BYTES).contains(&bytes) {
+        return Ok(None);
+    }
+    PF_PIN_STAGE.with(|c| {
+        let mut s = c.borrow_mut();
+        if s.as_ref().map(|p| p.bytes >= bytes).unwrap_or(false) {
+            return Ok(s.as_ref().map(|p| p.ptr));
+        }
+        match PinMem::alloc(bytes) {
+            Ok(p) => {
+                let ptr = p.ptr;
+                *s = Some(p);
+                Ok(Some(ptr))
+            }
+            Err(e) => {
+                // メモリが足りない等。以後は pageable で回す (数値は同じ)。
+                tracing::info!("[pf] pinned バウンスを確保できない ({bytes} B): {e:#}");
+                *s = None;
+                Ok(None)
+            }
+        }
+    })
 }
 
 impl Drop for PinMem {
@@ -26418,6 +26540,8 @@ pub fn pf_res_park_ensure(slots: usize, rows: usize, hc: usize, e: usize) -> boo
 
 /// 残差を退避域 `i` へ D2D で写す (`rows` 行ぶん)。
 pub fn pf_res_park_save(i: usize, rows: usize, hc: usize, e: usize) -> bool {
+    // task 318: `other` の中の D2D を分けて数える。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_RES_PARK);
     let bytes = rows.saturating_mul(hc).saturating_mul(e).saturating_mul(4);
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
@@ -26442,6 +26566,8 @@ pub fn pf_res_park_save(i: usize, rows: usize, hc: usize, e: usize) -> bool {
 
 /// 退避域 `i` から残差へ D2D で戻す (`rows` 行ぶん)。
 pub fn pf_res_park_load(i: usize, rows: usize, hc: usize, e: usize) -> bool {
+    // task 318: `other` の中の D2D を分けて数える。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_RES_PARK);
     let bytes = rows.saturating_mul(hc).saturating_mul(e).saturating_mul(4);
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
@@ -26834,6 +26960,8 @@ pub fn pf_lm_ensure(nt: usize, e: usize, hc: usize, chunk: usize) -> bool {
 /// task 233: 直前の `pf_mix` の出力 (`d.mixed`) を置き場の `start` 行目へ D2D で写す。
 #[cfg(feature = "cuda")]
 pub fn pf_lm_park_mixed(start: usize, nt: usize, e: usize) -> bool {
+    // task 318: `other` の中の D2D を分けて数える。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_LM_PARK);
     let bytes = nt.saturating_mul(e).saturating_mul(4);
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
@@ -26900,6 +27028,8 @@ pub fn pf_lm_ffn_ptr(nt: usize, e: usize) -> Option<CUdeviceptr> {
 /// task 233: チャンク `i` の inject (`d.inj`) を置き場へ D2D で退避する。
 #[cfg(feature = "cuda")]
 pub fn pf_lm_inj_save(i: usize, rows: usize, hc: usize) -> bool {
+    // task 318: `other` の中の D2D を分けて数える。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_INJ);
     let bytes = rows.saturating_mul(hc).saturating_mul(4);
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
@@ -26931,6 +27061,8 @@ pub fn pf_lm_inj_save(i: usize, rows: usize, hc: usize) -> bool {
 /// task 233: 置き場の inject を `d.inj` へ D2D で戻す (combine の直前)。
 #[cfg(feature = "cuda")]
 pub fn pf_lm_inj_load(i: usize, rows: usize, hc: usize) -> bool {
+    // task 318: `other` の中の D2D を分けて数える。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_INJ);
     let bytes = rows.saturating_mul(hc).saturating_mul(4);
     PF_LM.with(|lc| -> bool {
         let l = lc.borrow();
@@ -26997,10 +27129,18 @@ pub fn pf_lm_release() {
 
 /// task 154: チャンクの残差 (`[nt][hc][e]`) をデバイスへ置く。
 pub fn pf_upload_res(res: &[f32]) -> bool {
+    // task 318: `other` の中の残差の往復を分けて数える (バイト数も付く)。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_RES_UP);
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.res.as_ref() {
-            Some(b) if b.bytes() >= res.len() * 4 => b.copy_from(res).is_ok(),
+            Some(b) if b.bytes() >= res.len() * 4 => {
+                // task 318: `DENNO_PF_PIN_STAGE` では pinned 経由 (速い)。失敗したら従来へ。
+                match b.copy_from_pinned(res) {
+                    Ok(true) => true,
+                    _ => b.copy_from(res).is_ok(),
+                }
+            }
             _ => false,
         }
     })
@@ -27012,11 +27152,17 @@ pub fn pf_upload_res(res: &[f32]) -> bool {
 /// D2H する (`out` は 14k のチャンクで 82 MB あり、`to_vec` + `copy_from_slice`
 /// は同じ大きさの確保と写しをもう 1 回ぶん払っていた)。値は同じ。
 pub fn pf_download_res(out: &mut [f32]) -> bool {
+    // task 318: `other` の中の残差の往復を分けて数える。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_RES_UP);
     let direct = crate::model::qwen4exp::pf_ple_reuse_on();
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.res.as_ref() {
             Some(b) if b.bytes() >= out.len() * 4 => {
+                // task 318: `DENNO_PF_PIN_STAGE` では pinned 経由 (速い)。失敗したら従来へ。
+                if let Ok(true) = b.to_slice_pinned(out) {
+                    return true;
+                }
                 if direct {
                     return b.to_slice(out).is_ok();
                 }
@@ -27076,6 +27222,11 @@ pub fn pf_take_mixed(out: &mut [f32]) -> bool {
         let d = cell.borrow();
         match d.mixed.as_ref() {
             Some(b) if b.bytes() >= out.len() * 4 => {
+                // task 318: `DENNO_PF_PIN_STAGE` では pinned 経由 (速い)。失敗したら従来へ。
+                match b.to_slice_pinned(out) {
+                    Ok(true) => return true,
+                    _ => {}
+                }
                 if pf_d2h_direct_on() {
                     // task 181: 中間 Vec を作らず直接 D2H (値は同じ)。
                     return b.to_slice(out).is_ok();
@@ -27718,7 +27869,13 @@ fn pf_combine_core(
                 let Some(dbo) = d.bo.as_ref() else {
                     return Err("作業域が無い (bo)".into());
                 };
-                dbo.copy_from(b).map_err(|e| format!("bo H2D: {e:#}"))?;
+                // task 318: `DENNO_PF_PIN_STAGE` では pinned 経由 (速い)。
+                match dbo.copy_from_pinned(b) {
+                    Ok(true) => {}
+                    _ => {
+                        dbo.copy_from(b).map_err(|e| format!("bo H2D: {e:#}"))?;
+                    }
+                }
                 dbo.ptr()
             }
             (None, Some(p)) => p,
@@ -56440,5 +56597,38 @@ mod task204_tests {
             Some(MIX_UP_NARGS),
             "upw の PTX 引数数が {MIX_UP_NARGS} でない"
         );
+    }
+}
+
+#[cfg(test)]
+mod task318_tests {
+    use super::*;
+
+    /// `DENNO_PF_PIN_STAGE` の真理値表。**既定は off** (明示した真値だけ on)。
+    #[test]
+    fn pin_stage_truth_table() {
+        assert!(!pf_pin_stage_from_value(None));
+        assert!(!pf_pin_stage_from_value(Some("")));
+        assert!(!pf_pin_stage_from_value(Some("0")));
+        assert!(!pf_pin_stage_from_value(Some("off")));
+        assert!(!pf_pin_stage_from_value(Some(" no ")));
+        assert!(!pf_pin_stage_from_value(Some("FALSE")));
+        assert!(pf_pin_stage_from_value(Some("1")));
+        assert!(pf_pin_stage_from_value(Some("on")));
+        assert!(pf_pin_stage_from_value(Some("true")));
+        assert!(pf_pin_stage_from_value(Some("yes")));
+    }
+
+    /// 副区間の名前と添字が 1 対 1 で揃っている (台帳の列がずれない)。
+    #[test]
+    fn ledger_sub_names_for_task318() {
+        use crate::model::q4ledger as q;
+        assert_eq!(q::SUB_NAMES[q::SUB_RES_UP], "res_up");
+        assert_eq!(q::SUB_NAMES[q::SUB_RES_PARK], "res_park");
+        assert_eq!(q::SUB_NAMES[q::SUB_INJ], "inj");
+        assert_eq!(q::SUB_NAMES[q::SUB_LM_PARK], "lm_park");
+        assert_eq!(q::SUB_NAMES.len(), q::SUB_N);
+        assert!(q::SUB_RES_UP < q::SUB_N);
+        assert!(q::SUB_LM_PARK < q::SUB_N);
     }
 }

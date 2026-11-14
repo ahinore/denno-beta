@@ -530,6 +530,7 @@ pub fn note_sync(t: Option<Instant>) {
 pub fn note_h2d(bytes: usize, t: Option<Instant>) {
     let Some(t) = t else { return };
     sub_bytes(true, bytes);
+    xfer_dbg(true, bytes);
     let r = &ROWS[cur()];
     r.h2d_calls.fetch_add(1, Ordering::Relaxed);
     r.h2d_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -542,6 +543,7 @@ pub fn note_h2d(bytes: usize, t: Option<Instant>) {
 pub fn note_d2h(bytes: usize, t: Option<Instant>) {
     let Some(t) = t else { return };
     sub_bytes(false, bytes);
+    xfer_dbg(false, bytes);
     let r = &ROWS[cur()];
     r.d2h_calls.fetch_add(1, Ordering::Relaxed);
     r.d2h_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -660,8 +662,20 @@ pub const SUB_EXP_PRO: usize = 27;
 pub const SUB_COMBINE: usize = 28;
 /// task 254: `other` の中の mix の D2H (`pf_take_mixed`。層ごとに 14 MB)。
 pub const SUB_MIXD2H: usize = 29;
+/// task 318: 残差のホスト往復 (`pf_upload_res` / `pf_download_res` / 1 行の D2H)。
+///
+/// 層優先 prefill の残差はデバイスに載ったまま層を回るが、PLE 層と最終ミキサの
+/// 前後でホストへ往復する。pageable の同期コピーなので、ここが `other` の
+/// 未分類ぶんの正体かをバイト数で見るために分けた。
+pub const SUB_RES_UP: usize = 30;
+/// task 318: 残差の退避域の出し入れ (`pf_res_park_load` / `pf_res_park_save`。D2D)。
+pub const SUB_RES_PARK: usize = 31;
+/// task 318: inject の退避域の出し入れ (`pf_lm_inj_save` / `pf_lm_inj_load`。D2D)。
+pub const SUB_INJ: usize = 32;
+/// task 318: MoE の mixed を置き場へ写す (`pf_lm_park_mixed`。D2D)。
+pub const SUB_LM_PARK: usize = 33;
 /// 副区間の数。
-pub const SUB_N: usize = 30;
+pub const SUB_N: usize = 34;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -694,6 +708,10 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "exp_pro",
     "combine",
     "mixd2h",
+    "res_up",
+    "res_park",
+    "inj",
+    "lm_park",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
@@ -711,6 +729,32 @@ static SUB_D2H_CALLS: [[AtomicU64; SUB_N]; N] = [const { [const { AtomicU64::new
 
 /// 副区間を開いていないことを表す番兵。
 const NO_SUB: usize = usize::MAX;
+
+/// task 318: 転送 1 回ごとに 1 行を stderr へ (`DENNO_PF_XFER_DBG=1`、診断用)。
+///
+/// `[q4ledger-pf]` は区間ごとの**合計**しか出さないので、`other` の 5.6 GB が
+/// どの呼び出しから来ているかを読むには 1 回ずつの記録が要る。行は
+/// `[xfer] H2D <bytes> item=<区間> sub=<副区間>` で、サイズの並びから
+/// 呼び出し元 (残差 1 本 / chunk 1 枚 / 活性 1 枚) が分かる。
+fn xfer_dbg(is_h2d: bool, bytes: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("DENNO_PF_XFER_DBG").is_some()) {
+        return;
+    }
+    let sub = CUR_SUB.with(|c| c.get());
+    let sub = if sub == NO_SUB || sub >= SUB_N {
+        "-"
+    } else {
+        SUB_NAMES[sub]
+    };
+    eprintln!(
+        "[xfer] {} {} item={} sub={}",
+        if is_h2d { "H2D" } else { "D2H" },
+        bytes,
+        NAMES[cur().min(N - 1)],
+        sub
+    );
+}
 
 thread_local! {
     /// いま開いている副区間 (ネストは「内側が勝つ」= 最も内側に積む)。
@@ -1057,7 +1101,21 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
             }
             sum += ns;
             let mark = if nested.contains(&i) { "*" } else { "" };
-            parts.push(format!("{}{}={:.1}", SUB_NAMES[i], mark, ms(ns)));
+            // task 318: その副区間が動かした H2D / D2H も添える (0 の向きは省く)。
+            let (hb, hc) = sub_bytes_of(p, i, true);
+            let (db, dc) = sub_bytes_of(p, i, false);
+            let tr = if hb == 0 && db == 0 {
+                String::new()
+            } else {
+                format!(
+                    " [h={:.1}M/{} d={:.1}M/{}]",
+                    hb as f64 / 1e6,
+                    hc,
+                    db as f64 / 1e6,
+                    dc
+                )
+            };
+            parts.push(format!("{}{}={:.1}{}", SUB_NAMES[i], mark, ms(ns), tr));
         }
         if parts.is_empty() {
             continue;

@@ -5386,7 +5386,11 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             // 分割しないときは 1 回 (従来と同じ経路)。
             // task 279: プールが借りられたときは選んだタイル (パス数が最小) を使う。
             let mut ffn_dev = true;
+            // task 318: 台帳の `experts` 区間に載せる。フォールバック
+            // (`moe_ffn_quant_batch_tapped`) は内部で同じ区間を開くので、ここだけ
+            // 無いとデバイス経路の MoE が `other` に混ざって読めなくなる。
             if tile >= nt_all {
+                let _l = q4ledger::enter(q4ledger::EXPERTS);
                 ffn_dev = moe_ffn_quant_batch_lm_dev(
                     &self.p,
                     lw,
@@ -5400,16 +5404,20 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 while t0 < nt_all {
                     let nt = tile.min(nt_all - t0);
                     let last = t0 + nt == nt_all;
-                    if !moe_ffn_quant_batch_lm_dev_at(
-                        &self.p,
-                        lw,
-                        t0,
-                        nt_all,
-                        nt,
-                        roles.as_deref_mut(),
-                        last,
-                        iv,
-                    )? {
+                    let ok = {
+                        let _l = q4ledger::enter(q4ledger::EXPERTS);
+                        moe_ffn_quant_batch_lm_dev_at(
+                            &self.p,
+                            lw,
+                            t0,
+                            nt_all,
+                            nt,
+                            roles.as_deref_mut(),
+                            last,
+                            iv,
+                        )?
+                    };
+                    if !ok {
                         ffn_dev = false;
                         break;
                     }
@@ -12803,6 +12811,31 @@ fn pf_expert_mode_from(k_gate: bool, stream: bool, k_types_ok: bool) -> bool {
     k_gate && stream && k_types_ok
 }
 
+/// task 318: `DENNO_PF_LM_K_DEV` の値の解釈 (純関数)。**既定 on** (t318c で採用)。
+///
+/// on のとき、層優先のデバイス MoE (`moe_ffn_quant_batch_lm_dev_at`) の前提判定が
+/// `iq_expert_mode` ではなく `pf_expert_mode` になる。K 系 (UD-Q4_K_XL) は
+/// これが無いと全層がホストの mixed 経路へ落ち、mixed を丸ごと往復する。
+/// IQ 系では `pf_expert_mode` が `iq_expert_mode` を包含するので判定は変わらない。
+pub(crate) fn pf_lm_k_dev_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => true,
+        Some(s) => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
+}
+
+/// ゲートの実値 (1 回だけ読む)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn pf_lm_k_dev_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_lm_k_dev_from_value(std::env::var("DENNO_PF_LM_K_DEV").ok().as_deref())
+    })
+}
+
 /// task 150: ミスした expert の寄与を `dst` (`sel.len() * e`) へ直接書く。
 ///
 /// 1 expert の計算は [`expert_contribs_par`] と同じ [`ExpertW::gemv_seq`] を同じ順で
@@ -18294,10 +18327,21 @@ fn moe_ffn_quant_batch_lm_dev_at(
             ph[i] = t_dbg.elapsed().as_secs_f64() * 1e3;
         }
     };
+    // task 318: 層優先のデバイス MoE は IQ 系だけでなく **K 系 (UD-Q4_K_XL) でも
+    // 回せる**。ここが `iq_expert_mode` のままだと UD は全 48 層が
+    // `moe_ffn_quant_batch_tapped` (ホストの mixed 経路) へ落ち、層ごとに
+    // mixed を丸ごと往復していた (lab t318a: 14k で 143.5 MB x 2 x 48 層 =
+    // 13.8 GB、`[xfer] item=other sub=-`)。expert の m 行カーネルは
+    // ストリーミング経路のものなので、`pf_expert_mode` (IQ or K) が正しい判定。
+    let expert_gpu = if pf_lm_k_dev_on() {
+        pf_expert_mode(lw)
+    } else {
+        iq_expert_mode(lw)
+    };
     if !lm_dev_moe_ok(
         nt,
         crate::model::exp_pf::pf_enabled(),
-        iq_expert_mode(lw),
+        expert_gpu,
         crate::model::exp_pf::stream_enabled(),
         crate::model::exp_pf::stream_min_tok(),
         pf_router_gpu_on(),
@@ -18305,7 +18349,12 @@ fn moe_ffn_quant_batch_lm_dev_at(
     ) {
         return Ok(lm_decline("gate"));
     }
-    let Some(xs_dev) = crate::cuda::pf_lm_mixed_ptr(tok0, nt_all, e) else {
+    // task 318: `start = tok0` から **このタイルの `nt` 行** ぶんの先頭を取る。
+    // ここが `nt_all` だと 2 枚目以降のタイルで「置き場の末尾を越える」ので
+    // `None` になり、14k のようなタイル分割時に dev MoE が丸ごと落ちていた
+    // (lab t318b: 14k が `理由: mixed ptr` で全層フォールバックし、ストリームが
+    //  98 GB → 147 GB に増えた)。
+    let Some(xs_dev) = crate::cuda::pf_lm_mixed_ptr(tok0, nt, e) else {
         return Ok(lm_decline("mixed ptr"));
     };
     let Some(out_base) = crate::cuda::pf_lm_ffn_ptr(nt_all, e) else {
@@ -18645,6 +18694,21 @@ mod lm_dev_tests {
     /// task 233: 層優先のデバイス MoE の前提 (真理値表)。
     ///
     /// 1 つでも欠けたら `false` = 呼び出し側はホスト経路へ落ちる (値は同じ)。
+    /// task 318: `DENNO_PF_LM_K_DEV` の真理値表 (t318c で採用、既定 on)。
+    #[test]
+    fn pf_lm_k_dev_truth_table() {
+        assert!(pf_lm_k_dev_from_value(None));
+        assert!(pf_lm_k_dev_from_value(Some("")));
+        assert!(!pf_lm_k_dev_from_value(Some("0")));
+        assert!(!pf_lm_k_dev_from_value(Some(" off ")));
+        assert!(!pf_lm_k_dev_from_value(Some("FALSE")));
+        assert!(!pf_lm_k_dev_from_value(Some("no")));
+        assert!(pf_lm_k_dev_from_value(Some("1")));
+        assert!(pf_lm_k_dev_from_value(Some("on")));
+        assert!(pf_lm_k_dev_from_value(Some("true")));
+        assert!(pf_lm_k_dev_from_value(Some("yes")));
+    }
+
     #[test]
     fn lm_dev_moe_gate_truth_table() {
         assert!(lm_dev_moe_ok(4096, true, true, true, 512, true, true));
