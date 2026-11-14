@@ -15369,7 +15369,7 @@ mod pf_pin_tests {
         assert!(!pf_mixed_dev_only(a.as_ptr(), 2, 2));
     }
 
-    /// task 230: ゲートの解釈。v3 は task 244 で既定 on、MIXKEEP は既定 off。
+    /// task 230/317: ゲートの解釈。v3 は task 244、MIXKEEP は task 317 で既定 on。
     #[test]
     fn pf230_gate_values() {
         // v3: 未指定は on (task 244 t244a で採択)、明示的な偽値で off。
@@ -15380,21 +15380,23 @@ mod pf_pin_tests {
         for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
             assert!(pf_attn_v3_from_value(v), "v3 が on でない: {v:?}");
         }
-        // mixkeep: 既定 off のまま (task 232 で不採用)。
-        for v in [None, Some("0"), Some("off"), Some(""), Some("no")] {
+        // mixkeep: task 317 で既定 on (task 230/232 では off だった)。
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some("")] {
             assert!(!pf_mix_keep_from_value(v), "mixkeep が off でない: {v:?}");
         }
+        assert!(pf_mix_keep_from_value(None), "mixkeep の既定が on でない");
         for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
             assert!(pf_mix_keep_from_value(v), "mixkeep が on でない: {v:?}");
         }
     }
 
-    /// task 317: `DENNO_PF_MIXKEEP_SSM` は既定 off (明示的な真値だけ on)。
+    /// task 317: `DENNO_PF_MIXKEEP_SSM` は既定 on (明示的な偽値だけ off)。
     #[test]
     fn pf317_mixkeep_ssm_gate_values() {
-        for v in [None, Some("0"), Some("off"), Some(""), Some("no")] {
+        for v in [Some("0"), Some("off"), Some(""), Some("no")] {
             assert!(!pf_mix_keep_ssm_from_value(v), "ssm mixkeep が off でない: {v:?}");
         }
+        assert!(pf_mix_keep_ssm_from_value(None), "ssm mixkeep の既定が on でない");
         for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
             assert!(pf_mix_keep_ssm_from_value(v), "ssm mixkeep が on でない: {v:?}");
         }
@@ -15470,20 +15472,21 @@ pub(crate) fn pf_dev_in_on() -> bool {
     *ON.get_or_init(|| pf_dev_in_from_value(std::env::var("DENNO_PF_MIXDEVIN").ok().as_deref()))
 }
 
-/// task 230: `DENNO_PF_MIXKEEP` の解釈 (純関数)。**既定 off**。
+/// task 230: `DENNO_PF_MIXKEEP` の解釈 (純関数)。**task 317 で既定 on**。
 ///
 /// on にすると、full attention 層の attn mix は `mixed` を D2H せず、直後の
 /// qkv がデバイスの `mixed` を直接読む (H2D 1 本と D2H 1 本を消す)。
 ///
-/// lab t230b (d9f3d10、14,018 cold prefill) では 240 回の full 層 mix のうち
-/// 120 回だけ常駐経路に乗り、mix 段 1,103.9 → 1,069.8 ms (-34 ms、D2H
-/// 13,780 → 12,058 MB、full の H2D 480 → 360 本 = -1.72 GB) と小さく、
-/// 全体は b0 27.40 s → 28.54 s (+4.2%)。目標の -4% に届かないので既定 off。
-/// md5 は全条件 SAME (同じバイト列をデバイスから読むだけで値は変えない)。
+/// task 230 の t230b (14,018 cold prefill) では mix 段 1,103.9 → 1,069.8 ms
+/// (-34 ms、D2H 13,780 → 12,058 MB、full の H2D 480 → 360 本 = -1.72 GB) と
+/// 小さく、全体はノイズ (b0 27.40 s → 28.54 s) だったので既定 off だった。
+/// task 317 (t317a) では ssm 層のぶん (`DENNO_PF_MIXKEEP_SSM`) と wy4 を
+/// 重ねた条件で 3,826 cold が 2.945 → 2.78 s (-5.4%)、full の H2D は
+/// 481.94 → 11.80 MB。値は変えない (md5 SAME)。
 pub(crate) fn pf_mix_keep_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
@@ -15496,7 +15499,7 @@ pub(crate) fn pf_mix_keep_set_for_test(v: u8) {
     PF_MIX_KEEP_FORCE.store(v, Ordering::Relaxed);
 }
 
-/// task 230: full 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP`、**既定 off**)。
+/// task 230: full 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP`、**task 317 で既定 on**)。
 pub(crate) fn pf_mix_keep_on() -> bool {
     #[cfg(test)]
     {
@@ -15510,7 +15513,7 @@ pub(crate) fn pf_mix_keep_on() -> bool {
     *ON.get_or_init(|| pf_mix_keep_from_value(std::env::var("DENNO_PF_MIXKEEP").ok().as_deref()))
 }
 
-/// task 317: `DENNO_PF_MIXKEEP_SSM` の解釈 (純関数)。**既定 off**。
+/// task 317: `DENNO_PF_MIXKEEP_SSM` の解釈 (純関数)。**既定 on**。
 ///
 /// on にすると、ssm 層の attn mix も `mixed` を D2H しない。直後の GDN 連鎖
 /// (`gdn_pf_chain`) がデバイスの `mixed` をそのまま GEMM の入力に読み、
@@ -15519,10 +15522,15 @@ pub(crate) fn pf_mix_keep_on() -> bool {
 /// 連鎖が前提外でホスト経路へ落ちる場合 (型・形・ゲート) は、
 /// `SsmLayer::forward_batch_flat` が [`pf_mixed_restore_host`] でホストへ
 /// 埋め直してから計算する (古いバイト列を読まない)。
+///
+/// lab t317a (d59f6df54、depth8k): keep (MIXKEEP + これ) で mix 段の D2H が
+/// 1,880.56 → 0.00 MB、ssm の H2D が 1,575.34 → 164.92 MB、full の H2D が
+/// 481.94 → 11.80 MB。3,826 cold は base 2.94 s のまま (keep 単独 2.91 s)。
+/// md5 は全条件 SAME (値は変えない)。
 pub(crate) fn pf_mix_keep_ssm_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
@@ -15535,7 +15543,7 @@ pub(crate) fn pf_mix_keep_ssm_set_for_test(v: u8) {
     PF_MIX_KEEP_SSM_FORCE.store(v, Ordering::Relaxed);
 }
 
-/// task 317: ssm 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP_SSM`、**既定 off**)。
+/// task 317: ssm 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP_SSM`、**既定 on**)。
 pub(crate) fn pf_mix_keep_ssm_on() -> bool {
     #[cfg(test)]
     {
@@ -47697,12 +47705,15 @@ pub(crate) fn set_gdn_pf_wy4_for_test(v: Option<bool>) {
     );
 }
 
-/// `DENNO_PF_SCAN_WY4` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+/// `DENNO_PF_SCAN_WY4` の解釈 (純関数)。**task 317 で既定 on**。
 ///
-/// task 311: 既定 off (t311a/b/c で -2.9%/-4.3%、目標 -5% に届かず)。
+/// task 311: wy4 単独では 3,826 -2.9% / 14k -4.3% で目標 -5% に届かず既定 off
+/// だった。task 317 (t317a) で ssm の mix D2H 除去 (`DENNO_PF_MIXKEEP_SSM`) と
+/// 重ねると 3,826 cold 2.945 → 2.78 s (-5.4%、2 ラウンドとも同値) になり、
+/// 採択して既定 on にした。scan_pf は 359 → 256 ms。
 pub(crate) fn gdn_pf_wy4_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -47965,10 +47976,11 @@ mod pf228_wy_tests {
         assert!(!gdn_pf_wy4_ok(512, 16, 48, 64, 64, 4, 2 * 16 * 64 + 48 * 64));
     }
 
-    /// task 311: v 列 4 分割のゲートは既定 off。`DENNO_PF_SCAN_WY4=0` で切り戻せる。
+    /// task 311/317: v 列 4 分割のゲートは既定 on (task 317 で採択)。
+    /// `DENNO_PF_SCAN_WY4=0` で切り戻せる。
     #[test]
     fn pf311_scan_wy4_gate_defaults() {
-        assert!(!gdn_pf_wy4_from_value(None), "未設定の既定は off");
+        assert!(gdn_pf_wy4_from_value(None), "task 317 で既定 on");
         for v in ["0", "off", "false", "no", "", " off "] {
             assert!(!gdn_pf_wy4_from_value(Some(v)), "{v:?} が on になった");
         }
@@ -47980,7 +47992,7 @@ mod pf228_wy_tests {
         set_gdn_pf_wy4_for_test(Some(false));
         assert!(!gdn_pf_wy4_on());
         set_gdn_pf_wy4_for_test(None);
-        assert!(!gdn_pf_wy4_on(), "FORCE を戻したら既定 off");
+        assert!(gdn_pf_wy4_on(), "FORCE を戻したら既定 on (task 317)");
     }
 
     #[test]

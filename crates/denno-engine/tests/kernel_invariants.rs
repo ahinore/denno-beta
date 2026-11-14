@@ -7876,13 +7876,19 @@ fn pf230_v3_softmax_stays_within_bf16_rounding() {
     );
 }
 
-/// v3 が既定 on (task 244)、MIXKEEP が既定 off で、`pf_full_out` と mix の D2H に
+/// v3 が既定 on (task 244)、MIXKEEP も既定 on (task 317) で、`pf_full_out` と mix の D2H に
 /// 配線されていること。
 #[test]
 fn pf230_gates_are_wired_and_defaults_set() {
     for (fname, var, default_on) in [
         ("pub(crate) fn pf_attn_v3_from_value(", "DENNO_PF_ATTN_V3", true),
-        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP", false),
+        // task 317: MIXKEEP は ssm 側 (`DENNO_PF_MIXKEEP_SSM`) と重ねて採択。
+        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP", true),
+        (
+            "pub(crate) fn pf_mix_keep_ssm_from_value(",
+            "DENNO_PF_MIXKEEP_SSM",
+            true,
+        ),
     ] {
         let at = CUDA_RS.find(fname).unwrap_or_else(|| panic!("{fname} が無い"));
         let body = &CUDA_RS[at..];
