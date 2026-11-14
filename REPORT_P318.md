@@ -203,3 +203,20 @@ t318c の md5 は 4 本とも DIFF: `c2000_cold d6cec0ff → e7103f57`、
    台帳の `experts` 区間を層ループの中で開くため (`[q4ledger-pf]` の
    `experts` 行には出る)。表示の整理は次のタスクでよい。
 3. 次の山は 14k の `experts` 19.7 s (GPU busy 16.4) と sync 3.8 s。
+
+## 9. 続き (7/n): copy_from_dev のサイズ上限 assert を戻した
+
+`git diff int-auto..br318 -- crates/denno-engine/src/cuda.rs` で、`impl DevBuffer` の
+`copy_from_dev` から `assert!(bytes <= self.bytes, "DevBuffer::copy_from_dev: size overflow");`
+が削除のみで消えていた (task 318 の変更とは無関係。int-auto 側には残っている)。
+`let bytes = len * std::mem::size_of::<f32>();` の直後に戻した。戻した後の差分は
+この 1 行だけで、cuda.rs の int-auto との差分に `copy_from_dev` の assert 欠落は無い。
+数値には影響しない (assert は不変条件の検査のみ)。
+
+関門の実測値 (`CARGO_TARGET_DIR=/tmp/t318`、release + cuda):
+
+- `--lib -- --test-threads=1`: 1215 passed / 0 failed / 102 ignored (11.1 s)
+- `--test kernel_invariants`: 97 passed / 0 failed (0.13 s)
+
+既知の赤 (qwen4exp_decode spec_batch_stops_at_eos、qwen4exp_params の validate 2 件)
+はこの run では出ていない。
