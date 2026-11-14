@@ -30453,6 +30453,80 @@ fn mix_norm_par_on() -> bool {
     })
 }
 
+/// task 299: mix の grouped RMS 正規化をホストで済ませるか
+/// (`DENNO_MIX_NORM_HOST`)。**既定 off** (採否は lab で決める)。
+///
+/// 既定経路 (`DENNO_DEC_MIX_NORM_PAR` on) は正規化を `dno_mix_norm`
+/// (grid = hc = 4、256 スレッド) で回す。台帳の実測は 1 呼び出し 6.5 us で、
+/// 動かすバイト数は 40 KB しかない = **起動と占有**で決まっている。
+/// x は H2D する直前にホストにあり、gamma も同じ長さでホストにあるので、
+/// H2D する中身を「正規化済みの x」に差し替えれば同じ計算をホストで済ませられ、
+/// 起動 1 本と GPU の 6.5 us が消える (ホスト側は 1 パス増えるだけ)。
+///
+/// 丸め順が変わる (二乗和を 8 本の累積器で足す) ので値はビット一致しない。
+fn mix_norm_host_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_mix_norm_host(std::env::var("DENNO_MIX_NORM_HOST").ok().as_deref()))
+}
+
+/// [`mix_norm_host_on`] の解釈 (純関数。`1` / `on` / `true` だけが真)。
+fn parse_mix_norm_host(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// task 299: ホスト正規化の経路に入れる形か。
+///
+/// 正規化を消すと inject の入力 (正規化済み x) も消えるので、inject を down の
+/// epilogue で回す版 (`dno_mix_down_bf16_inj`) が選べるときだけ入る。
+fn mix_norm_host_ready(hc: usize, down_thr: u32) -> bool {
+    mix_norm_host_on()
+        && mix_norm_par_on()
+        && hc >= 1
+        && hc <= 4
+        && down_thr >= 256
+        && mix_dev3_kernels().is_some()
+}
+
+/// task 299: `x[hc][e]` の grouped RMS 正規化 (`out = (x * inv) * gamma`) をホストで。
+///
+/// 要素ごとの式は `dno_mix_norm` と同じ (`__fmul_rn` / `__fadd_rn` 相当の
+/// 丸め)。二乗和だけは 8 本の累積器で足す (順序は固定 = 決定性は保つ)。
+/// `out` は `x` と別でも同一でもよい (縮約が終わるまで書かない)。
+fn mix_norm_host_into(x: &[f32], gamma: &[f32], e: usize, hc: usize, eps: f32, out: &mut [f32]) {
+    debug_assert_eq!(x.len(), e.saturating_mul(hc), "x は [hc][e]");
+    debug_assert_eq!(gamma.len(), x.len(), "gamma は [hc][e]");
+    debug_assert!(out.len() >= x.len(), "out が [hc][e] より短い");
+    for s in 0..hc {
+        let xs = &x[s * e..(s + 1) * e];
+        let mut acc = [0f32; 8];
+        let mut i = 0usize;
+        while i + 8 <= e {
+            for (j, a) in acc.iter_mut().enumerate() {
+                let v = xs[i + j];
+                *a += v * v;
+            }
+            i += 8;
+        }
+        let mut tail = 0f32;
+        while i < e {
+            tail += xs[i] * xs[i];
+            i += 1;
+        }
+        let ss = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+            + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+            + tail;
+        let inv = 1.0f32 / (ss / e as f32 + eps).sqrt();
+        let g = &gamma[s * e..(s + 1) * e];
+        let o = &mut out[s * e..(s + 1) * e];
+        for ((d, &v), &w) in o.iter_mut().zip(xs.iter()).zip(g.iter()) {
+            *d = (v * inv) * w;
+        }
+    }
+}
+
 /// task 204: gate+up 融合の可否 (純関数・テスト用)。
 ///
 /// 畳めるのは「ゲートが on」かつ「gate と up の量子型が同じ」かつ「行長が同じで 0 でない」
@@ -31189,11 +31263,17 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
         },
         None => None,
     };
-    let wpg = match mix_norm_weight(norm) {
-        Ok(p) => p,
-        Err(err) => {
-            mix_gpu_broken_once(&format!("chain3 norm 重みの常駐に失敗: {err:#}"));
-            return false;
+    let wpg = if mix_norm_host_ready(hc, down_thr) {
+        // task 299: 正規化をホストで済ませる回は norm を撃たないので、重みの
+        // 常駐 (指紋 16 点 + mutex) も要らない。
+        0
+    } else {
+        match mix_norm_weight(norm) {
+            Ok(p) => p,
+            Err(err) => {
+                mix_gpu_broken_once(&format!("chain3 norm 重みの常駐に失敗: {err:#}"));
+                return false;
+            }
         }
     };
     let Some(lib) = lib().ok() else {
@@ -31235,8 +31315,14 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
         // inject の出力は mixed の直後 (down の出力 dlo とは別領域)。
         let pinj = dm.ptr() + (e * 4) as CUdeviceptr;
+        // task 299: この回は正規化をホストで済ませる (`dno_mix_norm` を撃たない)。
+        let norm_host = mix_norm_host_ready(hc, down_thr);
         dec_kprof::step("mix_h2d_pack", || {
-            hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x)
+            if norm_host {
+                mix_norm_host_into(x, norm, e, hc, eps, &mut hx.as_mut_slice::<f32>()[..k1]);
+            } else {
+                hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x);
+            }
         });
         let kp_cp = dec_kprof::op_begin(
             || "H2D@a".to_string(),
@@ -31271,25 +31357,29 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
             } else {
                 None
             };
+            // task 299: `norm_host` のときは正規化済みの x を上げてあるので撃たない。
+            debug_assert!(!norm_host || down_inj.is_some(), "norm_host は down_inj 経路が前提");
             if down_inj.is_some() {
                 // 1. grouped RMS 正規化だけ (grid = hc = ブロックごとに 1 ストリーム)。
                 //    inject は 3. の down の epilogue で回す (x は読み取りのみ)。
-                let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());
-                let (mut ec, mut epsc) = (e as c_int, eps);
-                let mut args = [
-                    &mut px as *mut _ as *mut c_void,
-                    &mut pg as *mut _ as *mut c_void,
-                    &mut po as *mut _ as *mut c_void,
-                    &mut ec as *mut _ as *mut c_void,
-                    &mut epsc as *mut _ as *mut c_void,
-                ];
-                ctx.launch_async(
-                    f_dev.norm,
-                    (hc as u32, 1, 1),
-                    (THREADS as u32, 1, 1),
-                    0,
-                    &mut args,
-                )?;
+                if !norm_host {
+                    let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());
+                    let (mut ec, mut epsc) = (e as c_int, eps);
+                    let mut args = [
+                        &mut px as *mut _ as *mut c_void,
+                        &mut pg as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ec as *mut _ as *mut c_void,
+                        &mut epsc as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(
+                        f_dev.norm,
+                        (hc as u32, 1, 1),
+                        (THREADS as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
             } else if let Some(f_fold) = folded {
                 let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());
                 let (mut pw, mut pi) = (
@@ -54573,6 +54663,46 @@ mod task184_tests {
         // 実効ゲートは lab t184a の採否で既定 on。切るのは明示的な偽値。
         assert!(mix_dec_dev_enabled(), "DENNO_MIX_DEC_DEV が既定 off に戻っている");
         assert_eq!(MIX_DEC_DEV_DEFAULT, true);
+    }
+
+    /// `DENNO_MIX_NORM_HOST` の真理値表 (task 299)。
+    #[test]
+    fn mix_norm_host_truth_table() {
+        for raw in [None, Some(""), Some("  "), Some("0"), Some("off"), Some("false"), Some("no"), Some("yes"), Some("x")] {
+            assert!(!parse_mix_norm_host(raw), "raw={raw:?} が on になっている");
+        }
+        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true ")] {
+            assert!(parse_mix_norm_host(raw), "raw={raw:?} が off になっている");
+        }
+    }
+
+    /// task 299: ホスト正規化は `dno_mix_norm` と同じ要素式・同じ決定性。
+    #[test]
+    fn mix_norm_host_matches_reference_and_is_deterministic() {
+        let (e, hc, eps) = (8usize, 2usize, 1e-6f32);
+        let x: Vec<f32> = (0..e * hc).map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0).collect();
+        let gamma: Vec<f32> = (0..e * hc).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let mut got = vec![0f32; e * hc];
+        mix_norm_host_into(&x, &gamma, e, hc, eps, &mut got);
+        for s in 0..hc {
+            let xs = &x[s * e..(s + 1) * e];
+            // 参照は逐次二乗和 (`tensor::rmsnorm` と同じ順)。
+            let ss = xs.iter().map(|v| v * v).sum::<f32>() / e as f32;
+            let inv = 1.0 / (ss + eps).sqrt();
+            for i in 0..e {
+                let want = xs[i] * inv * gamma[s * e + i];
+                let g = got[s * e + i];
+                assert!(
+                    (g - want).abs() <= 1e-5 + 1e-5 * want.abs(),
+                    "s={s} i={i}: {g} vs {want}"
+                );
+            }
+        }
+        let mut again = vec![0f32; e * hc];
+        mix_norm_host_into(&x, &gamma, e, hc, eps, &mut again);
+        assert_eq!(got, again, "同じ入力で値が動いた (決定性が無い)");
+        // 二乗和が 8 本の累積器なので、逐次和とは最下位ビットが違いうる。
+        // 「ほぼ同じ」であることは上で見ている。
     }
 
     /// norm 重みの指紋は「内容が変われば変わる」。常駐の載せ替え判定に使う。
