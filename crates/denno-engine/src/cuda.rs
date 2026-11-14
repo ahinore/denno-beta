@@ -46584,6 +46584,80 @@ pub(crate) const GDN_PF_WY4_DV: usize = 32;
 pub(crate) const GDN_PF_WY4_SMEM_FLOATS: usize = 7393;
 pub(crate) const GDN_PF_WY4_SMEM_BYTES: usize = GDN_PF_WY4_SMEM_FLOATS * 4;
 
+/// WY 系スキャン (wy32 / wy4 / wy8) の PTX を読んでカーネルを掴む。
+///
+/// 3 本とも同じ 17 引数なので、ホストの起動 (`gdn_pf_wy_launch`) と norm を
+/// 共有する。違うのは PTX のパス・entry 名・動的共有メモリ・起動形状だけ。
+/// `require_attr` は「`func_set_attribute` が無い/失敗したら降りる」か
+/// (wy32 = true、48 KB 既定を超えるため必須。wy4/wy8 = false)。
+fn gdn_wy_load(
+    path: std::path::PathBuf,
+    entry: &'static [u8],
+    smem_bytes: usize,
+    tag: &'static str,
+    smem_limit: usize,
+    require_attr: bool,
+) -> Option<GdnPfWyKernels> {
+    let mut image = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "{tag} PTX が読めない ({}) : {e} → v3 のスキャンへ",
+                path.display()
+            );
+            return None;
+        }
+    };
+    image.push(0);
+    let lib = lib().ok()?;
+    let mut module: CUmodule = std::ptr::null_mut();
+    unsafe {
+        if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+            eprintln!("{tag} cuModuleLoadData 失敗 → v3 のスキャンへ");
+            return None;
+        }
+        let name = String::from_utf8_lossy(&entry[..entry.len() - 1]).to_string();
+        let mut scan: CUfunction = std::ptr::null_mut();
+        if (lib.module_get_function)(&mut scan, module, entry.as_ptr() as *const c_char)
+            != CUDA_SUCCESS
+        {
+            eprintln!("{tag} PTX に {name} が無い → v3 のスキャンへ");
+            return None;
+        }
+        // 実機の opt-in 上限 (CudaCtx 生成時に問い合わせ済み) を先に見る。
+        let limit = attn_pf_dynamic_smem_limit().min(smem_limit);
+        if smem_bytes > limit {
+            eprintln!(
+                "{tag} 動的 smem {smem_bytes} B がデバイスの上限 {limit} B を超える → v3 のスキャンへ"
+            );
+            return None;
+        }
+        match lib.func_set_attribute {
+            Some(fn_attr) => {
+                if (fn_attr)(
+                    scan,
+                    CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes as c_int,
+                ) != 0
+                {
+                    eprintln!("{tag} 動的 smem {smem_bytes} B の opt-in に失敗 → v3 のスキャンへ");
+                    return None;
+                }
+            }
+            None => {
+                if require_attr {
+                    eprintln!("{tag} func_set_attribute が無い → v3 のスキャンへ");
+                    return None;
+                }
+            }
+        }
+        log_kernel_attr(lib, scan, &name);
+        // 出力の gated RMS norm は v2 の PTX (同じ演算列) をそのまま使う。
+        let norm = gdn_pf2_kernels()?.norm;
+        Some(GdnPfWyKernels { module, scan, norm })
+    }
+}
+
 fn gdn_pf_wy4_ptx_path() -> std::path::PathBuf {
     match std::env::var("DENNO_PF_SCAN_WY4_PTX") {
         Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
@@ -46596,65 +46670,99 @@ fn gdn_pf_wy4_ptx_path() -> std::path::PathBuf {
 fn gdn_pf_wy4_kernels() -> Option<&'static GdnPfWyKernels> {
     static K: OnceLock<Option<GdnPfWyKernels>> = OnceLock::new();
     K.get_or_init(|| {
-        let path = gdn_pf_wy4_ptx_path();
-        let mut image = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!(
-                    "[gdn-pf-wy4] PTX が読めない ({}) : {e} → v3 のスキャンへ",
-                    path.display()
-                );
-                return None;
-            }
-        };
-        image.push(0);
-        let lib = lib().ok()?;
-        let mut module: CUmodule = std::ptr::null_mut();
-        unsafe {
-            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
-                eprintln!("[gdn-pf-wy4] cuModuleLoadData 失敗 → v3 のスキャンへ");
-                return None;
-            }
-            let mut scan: CUfunction = std::ptr::null_mut();
-            if (lib.module_get_function)(
-                &mut scan,
-                module,
-                b"dno_gdn_pf_wy4\0".as_ptr() as *const c_char,
-            ) != CUDA_SUCCESS
-            {
-                eprintln!("[gdn-pf-wy4] PTX に dno_gdn_pf_wy4 が無い → v3 のスキャンへ");
-                return None;
-            }
-            // 29,572 B は 48 KB 既定の内側。opt-in は要らないが、実機の上限が
-            // それより小さい場合だけ降りる (CudaCtx 生成時の問い合わせ)。
-            let limit = attn_pf_dynamic_smem_limit();
-            if GDN_PF_WY4_SMEM_BYTES > limit {
-                eprintln!(
-                    "[gdn-pf-wy4] 動的 smem {} B がデバイスの上限 {limit} B を超える → v3 のスキャンへ",
-                    GDN_PF_WY4_SMEM_BYTES
-                );
-                return None;
-            }
-            if let Some(fn_attr) = lib.func_set_attribute {
-                let ok = (fn_attr)(
-                    scan,
-                    CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    GDN_PF_WY4_SMEM_BYTES as c_int,
-                ) == 0;
-                if !ok {
-                    eprintln!(
-                        "[gdn-pf-wy4] 動的 smem {GDN_PF_WY4_SMEM_BYTES} B の opt-in に失敗 → v3 のスキャンへ"
-                    );
-                    return None;
-                }
-            }
-            log_kernel_attr(lib, scan, "dno_gdn_pf_wy4");
-            // 出力の gated RMS norm は v2 の PTX (同じ演算列) をそのまま使う。
-            let norm = gdn_pf2_kernels()?.norm;
-            Some(GdnPfWyKernels { module, scan, norm })
-        }
+        gdn_wy_load(
+            gdn_pf_wy4_ptx_path(),
+            b"dno_gdn_pf_wy4\0",
+            GDN_PF_WY4_SMEM_BYTES,
+            "[gdn-pf-wy4]",
+            GDN_PF_WY_SMEM_LIMIT,
+            false,
+        )
     })
     .as_ref()
+}
+
+/// task 311: v 列 8 分割 (384 ブロック) 版。
+pub(crate) const GDN_PF_WY8_THREADS: usize = 256;
+pub(crate) const GDN_PF_WY8_BLOCKS: usize = 8;
+pub(crate) const GDN_PF_WY8_DV: usize = 16;
+/// カーネルの動的共有メモリ (float 数。`kernels_gdn_pf_wy8.cu` の WY8_TOTAL)。
+pub(crate) const GDN_PF_WY8_SMEM_FLOATS: usize = 4833;
+pub(crate) const GDN_PF_WY8_SMEM_BYTES: usize = GDN_PF_WY8_SMEM_FLOATS * 4;
+
+fn gdn_pf_wy8_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SCAN_WY8_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf_wy8.ptx"),
+    }
+}
+
+fn gdn_pf_wy8_kernels() -> Option<&'static GdnPfWyKernels> {
+    static K: OnceLock<Option<GdnPfWyKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        gdn_wy_load(
+            gdn_pf_wy8_ptx_path(),
+            b"dno_gdn_pf_wy8\0",
+            GDN_PF_WY8_SMEM_BYTES,
+            "[gdn-pf-wy8]",
+            GDN_PF_WY_SMEM_LIMIT,
+            false,
+        )
+    })
+    .as_ref()
+}
+
+#[cfg(test)]
+static WY8_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_gdn_pf_wy8_for_test(v: Option<bool>) {
+    WY8_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_PF_SCAN_WY8` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn gdn_pf_wy8_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// v 列 8 分割の WY スキャンを使うか (既定 off)。
+pub(crate) fn gdn_pf_wy8_on() -> bool {
+    #[cfg(test)]
+    {
+        match WY8_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf_wy8_from_value(std::env::var("DENNO_PF_SCAN_WY8").ok().as_deref()))
+}
+
+/// v 列 8 分割の前提 (純関数)。
+pub(crate) fn gdn_pf_wy8_ok(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) -> bool {
+    gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) && dv == GDN_PF_WY8_BLOCKS * GDN_PF_WY8_DV
 }
 
 #[cfg(test)]
@@ -46957,6 +47065,42 @@ mod pf228_wy_tests {
         // dv が 4 * 32 でないときは撃たない (カーネルは 128 列前提)。
         assert!(!gdn_pf_wy4_ok(512, 16, 48, 128, 64, 4, 2 * 16 * 128 + 48 * 64));
         assert!(!gdn_pf_wy4_ok(512, 16, 48, 64, 64, 4, 2 * 16 * 64 + 48 * 64));
+    }
+
+    /// task 311: v 列 8 分割のゲートも既定 off。
+    #[test]
+    fn pf311_scan_wy8_gate_defaults() {
+        assert!(!gdn_pf_wy8_from_value(None), "未設定の既定は off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!gdn_pf_wy8_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(gdn_pf_wy8_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        set_gdn_pf_wy8_for_test(Some(true));
+        assert!(gdn_pf_wy8_on());
+        set_gdn_pf_wy8_for_test(None);
+        assert!(!gdn_pf_wy8_on());
+    }
+
+    /// task 311: 8 分割の形のゲートと定数。
+    #[test]
+    fn pf311_scan_wy8_shape_and_smem() {
+        let conv_dim = 2 * 16 * 128 + 48 * 128;
+        assert!(gdn_pf_wy8_ok(512, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf_wy8_ok(0, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf_wy8_ok(512, 16, 48, 128, 64, 4, 2 * 16 * 128 + 48 * 64));
+        assert_eq!(GDN_PF_WY8_BLOCKS * GDN_PF_WY8_DV, 128);
+        assert_eq!(GDN_PF_WY8_SMEM_BYTES, 19_332);
+        let src = include_str!("../kernels/kernels_gdn_pf_wy8.cu");
+        let mut total = 0usize;
+        for line in src.lines() {
+            if let Some(rest) = line.strip_prefix("#define WY8_TOTAL ") {
+                total = rest.trim().parse().expect("WY8_TOTAL が数値でない");
+            }
+        }
+        assert_eq!(total, GDN_PF_WY8_SMEM_FLOATS, "WY8_TOTAL と Rust 側が違う");
+        assert_eq!(total, 4833);
     }
 
     /// task 311: 共有メモリの見積りと分割の定数が .cu と一致する。
@@ -47951,9 +48095,17 @@ pub fn gdn_pf_chain(
     // task 270: スキャンカーネルを**投影より前**に選ぶ。`nt >= 2048` では単発
     // sigmoid (`f_scan`) の前提外なので、v1/v2/v3/WY のどれも撃てなければ
     // まだ何も書いていないここで降りる (呼び出し側は従来経路で計算し直す)。
-    // 既定の順は task 173/186/225/228/311 のまま: WY4 (opt-in) → WY (opt-in)
-    // → v3 → v2 → v1。
-    let pf_scan_wy4 = if gdn_pf_wy4_on() && gdn_pf_wy4_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+    // 既定の順は task 173/186/225/228/311 のまま: WY8 (opt-in) → WY4 (opt-in)
+    // → WY (opt-in) → v3 → v2 → v1。
+    let pf_scan_wy8 = if gdn_pf_wy8_on() && gdn_pf_wy8_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+        gdn_pf_wy8_kernels()
+    } else {
+        None
+    };
+    let pf_scan_wy4 = if pf_scan_wy8.is_none()
+        && gdn_pf_wy4_on()
+        && gdn_pf_wy4_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
         gdn_pf_wy4_kernels()
     } else {
         None
@@ -47991,6 +48143,7 @@ pub fn gdn_pf_chain(
         None
     };
     if nt >= GDN_CHUNK_MIN_TOKENS
+        && pf_scan_wy8.is_none()
         && pf_scan_wy4.is_none()
         && pf_scan_wy.is_none()
         && pf_scan_fast3.is_none()
@@ -48206,7 +48359,15 @@ pub fn gdn_pf_chain(
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();
-        if let Some(fns) = pf_scan_wy4 {
+        if let Some(fns) = pf_scan_wy8 {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf_wy_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+                GDN_PF_WY8_BLOCKS, GDN_PF_WY8_THREADS, GDN_PF_WY8_SMEM_BYTES as u32,
+            )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else if let Some(fns) = pf_scan_wy4 {
             gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
             gdn_pf_wy_launch(
                 &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
