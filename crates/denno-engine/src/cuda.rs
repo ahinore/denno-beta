@@ -54705,6 +54705,32 @@ mod task184_tests {
         // 「ほぼ同じ」であることは上で見ている。
     }
 
+    /// task 299: ホスト正規化のコスト (実形 e=2560 / hc=4)。
+    /// `cargo test --release -p denno-engine --features cuda --lib -- --ignored
+    /// --nocapture bench_mix_norm_host_into`。
+    #[test]
+    #[ignore]
+    fn bench_mix_norm_host_into() {
+        let (e, hc) = (2560usize, 4usize);
+        let x: Vec<f32> = (0..e * hc).map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0).collect();
+        let gamma: Vec<f32> = vec![0.75f32; e * hc];
+        let mut out = vec![0f32; e * hc];
+        let n = 2000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            mix_norm_host_into(&x, &gamma, e, hc, 1e-6, &mut out);
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        // 比較: いまの pack がやっている素のコピー。
+        let t2 = std::time::Instant::now();
+        for _ in 0..n {
+            out.copy_from_slice(&x);
+        }
+        let us2 = t2.elapsed().as_secs_f64() * 1e6 / n as f64;
+        eprintln!("[bench299] mix_norm_host_into {us:.2} us/call (素のコピー {us2:.2} us/call)");
+        assert!(out[0].is_finite());
+    }
+
     /// norm 重みの指紋は「内容が変われば変わる」。常駐の載せ替え判定に使う。
     #[test]
     fn mix_norm_fingerprint_tracks_content() {
