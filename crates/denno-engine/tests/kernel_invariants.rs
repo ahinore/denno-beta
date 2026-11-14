@@ -10301,9 +10301,11 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
         "Rust 側の smem 見積りが .cu の WY_TOTAL と違う"
     );
     // 1 ブロック = 1 ヘッド (grid の y を使わない) / スレッド数は #define と同じ。
+    // task 311: 起動形状は `gdn_pf_wy_launch` の引数になったので、呼び出し側が
+    // wy32 の形 (vblocks=1 / 512 / 91,012 B) を渡していることを見る。
     assert!(
-        CUDA_RS.contains("(nv as u32, 1, 1),\n                (GDN_PF_WY_THREADS as u32, 1, 1),"),
-        "WY スキャンの grid / block が (nv, 1) / 512 でない"
+        CUDA_RS.contains("1, GDN_PF_WY_THREADS, GDN_PF_WY_SMEM_BYTES as u32,"),
+        "WY (wy32) の呼び出しが vblocks=1 / GDN_PF_WY_THREADS / WY_SMEM でない"
     );
     assert!(
         CUDA_RS.contains("pub(crate) const GDN_PF_WY_THREADS: usize = 512;"),
@@ -10334,10 +10336,108 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy"), "targets_all に gdn_pf_wy が無い");
 }
 
+/// task 311: WY スキャンの v 列 4 分割版 (`kernels_gdn_pf_wy4.cu`) の配線。
+///
+/// 値の一致は lab の md5 (wy32 と一致するか) と `gdn/wy.rs` の CPU 参照の担当。
+/// ここでは **ホストと .cu の契約** (カーネル名 / 引数の個数 / 分割数 / smem /
+/// 起動形 / build_ptx.sh) だけを固定する。
+#[test]
+fn task311_gdn_pf_wy4_kernel_is_wired() {
+    let src = include_str!("../kernels/kernels_gdn_pf_wy4.cu");
+    assert!(src.contains("dno_gdn_pf_wy4"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_wy4\\0\""),
+        "cuda.rs が dno_gdn_pf_wy4 を読んでいない"
+    );
+    for line in [
+        "#define WY4_DK 128",
+        "#define WY4_DV 32",
+        "#define WY4_C 8",
+        "#define WY4_THREADS 256",
+        "#define WY4_WARPS 8",
+        "#define WY4_DCONV 4",
+        "#define WY4_CS 3",
+    ] {
+        assert!(src.contains(line), "{line} が無い");
+    }
+    // 引数は wy32 と同じ 17 個 (並びも同じ)。ホストの起動を共有する前提。
+    assert_eq!(
+        cu_kernel_nargs(src, "dno_gdn_pf_wy4"),
+        17,
+        "引数の個数が wy32 と違う"
+    );
+    let define = |name: &str| -> usize {
+        src.lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"))
+    };
+    let dk = define("WY4_DK");
+    let dv = define("WY4_DV");
+    let c = define("WY4_C");
+    let total = define("WY4_TOTAL");
+    // 4 ブロックでヘッドの 128 列を覆う。
+    assert_eq!(dk, 128);
+    assert_eq!(dv * 4, dk, "4 分割で 128 列を覆っていない");
+    // 共有メモリの並びが重ならないこと。
+    let regions = [
+        ("WY4_S", dk * dv),
+        ("WY4_KC", c * dk),
+        ("WY4_QC", c * dk),
+        ("WY4_VC", c * dv),
+        ("WY4_DC", c * dv),
+        ("WY4_PC", c * dv),
+        ("WY4_QPC", c * dv),
+        ("WY4_RDEC", c * c),
+        ("WY4_AC", c * c),
+        ("WY4_GC", c * c),
+        ("WY4_LAM", c),
+        ("WY4_RL", c),
+        ("WY4_EG", c),
+        ("WY4_BC", c),
+        ("WY4_LL", 1),
+    ];
+    let mut at = 0usize;
+    for (name, size) in regions {
+        let lo = define(name);
+        assert_eq!(lo, at, "{name} の並びに隙間/重なりがある ({lo} != {at})");
+        at = lo + size;
+    }
+    assert_eq!(at, total, "WY4_TOTAL が最後の領域の終端と違う");
+    assert!(total * 4 < 48 * 1024, "48 KB 既定を超える");
+    // ホスト側の定数と呼び出し。
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF_WY4_SMEM_FLOATS: usize = 7393;"),
+        "GDN_PF_WY4_SMEM_FLOATS が 7393 でない"
+    );
+    assert!(
+        CUDA_RS.contains("GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY4_SMEM_BYTES as u32,"),
+        "wy4 の呼び出しが (BLOCKS, THREADS, SMEM) を渡していない"
+    );
+    assert_eq!(total, 7393, "WY4_TOTAL と Rust 側の見積りが違う");
+    // バリアはチャンク内 8 個 + プロローグ 1 個まで。
+    assert!(
+        src.matches("__syncthreads()").count() <= 10,
+        "バリアが多すぎる"
+    );
+    // build_ptx.sh の target。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy4)  echo \"kernels_gdn_pf_wy4.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf_wy4 が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gdn_pf_wy4"),
+        "targets_all に gdn_pf_wy4 が無い"
+    );
+}
+
 const SEG_K_SRC: &str = include_str!("../kernels/kernels_seg_k.cu");
 
 /// task 278: K 系の高速 GEMV (`kernels_seg_k.cu`) の配線。
-///
 /// GPU 無しでは走らせられないので、**ホストと .cu の契約**だけを固定する:
 /// カーネル名 4 本 / 引数の個数 / 起動形 (4 行 = 4 warp = 128 スレッド) /
 /// build_ptx.sh の target。数値は lab の `DENNO_EXPERT_GPU_CHECK=1` が見る。
