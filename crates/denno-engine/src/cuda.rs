@@ -6407,14 +6407,15 @@ fn gdn_dec_v4_lanes_cap() -> usize {
     })
 }
 
-/// task 307: `DENNO_GGUF_GEMV_V5` の解釈 (純関数)。**既定 off**。
+/// task 307: `DENNO_GGUF_GEMV_V5` の解釈 (純関数)。**既定 on** (task 307 で採否。
+/// lab t307a/b で full 行の gpu 1.19 → 1.03 ms/token、md5 SAME)。
 ///
-/// 明示的な真値 (`1` / `on` / `true`) のときだけ、dense の gguf GEMV
-/// ([`maybe_gpu_gguf_gemv_into`]) も v5 の計画を先に試す。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ切る。on のときは
+/// dense の gguf GEMV ([`maybe_gpu_gguf_gemv_into`]) も v5 の計画を先に試す。
 fn parse_gguf_gemv_v5(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -23722,14 +23723,15 @@ thread_local! {
     static ROUTER_PENDING_N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// task 307: `DENNO_ROUTER_IN_MIX` の解釈 (純関数)。**既定 off**。
+/// task 307: `DENNO_ROUTER_IN_MIX` の解釈 (純関数)。**既定 on** (task 307 で採否。
+/// lab t307b で router 行 1.15 → 0.18 ms/token、decode -2.0%、md5 SAME)。
 ///
-/// 明示的な真値 (`1` / `on` / `true`) のときだけ、FFN mix の鎖 (down → up →
-/// hc_mixed) の末尾にルータ GEMV を積み、D2H と同期を鎖の 1 回にまとめる。
+/// FFN mix の鎖 (down → up → hc_mixed) の末尾にルータ GEMV を積み、D2H と同期を
+/// 鎖の 1 回にまとめる。明示的な偽値だけ off。
 fn parse_router_in_mix(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -31049,7 +31051,8 @@ fn mix_norm_par_on() -> bool {
 }
 
 /// task 299: mix の grouped RMS 正規化をホストで済ませるか
-/// (`DENNO_MIX_NORM_HOST`)。**既定 off** (採否は lab で決める)。
+/// (`DENNO_MIX_NORM_HOST`)。**task 307 で既定 on** (lab t299b で mix 行
+/// -0.22 ms/token、t307b で decode -1.3%・md5 SAME 2 回)。明示的な偽値だけ off。
 ///
 /// 既定経路 (`DENNO_DEC_MIX_NORM_PAR` on) は正規化を `dno_mix_norm`
 /// (grid = hc = 4、256 スレッド) で回す。台帳の実測は 1 呼び出し 6.5 us で、
@@ -31064,11 +31067,11 @@ fn mix_norm_host_on() -> bool {
     *ON.get_or_init(|| parse_mix_norm_host(std::env::var("DENNO_MIX_NORM_HOST").ok().as_deref()))
 }
 
-/// [`mix_norm_host_on`] の解釈 (純関数。`1` / `on` / `true` だけが真)。
+/// [`mix_norm_host_on`] の解釈 (純関数。**明示的な偽値だけ off** = 既定 on)。
 fn parse_mix_norm_host(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -40282,14 +40285,14 @@ mod tests {
     use super::*;
     use crate::tensor;
 
-    /// task 307: `DENNO_GGUF_GEMV_V5` は明示的な真値だけ on (既定 off)。
+    /// task 307: `DENNO_GGUF_GEMV_V5` は明示的な偽値だけ off (既定 on)。
     #[test]
     fn gguf_gemv_v5_gate_truth_table() {
-        assert!(!parse_gguf_gemv_v5(None), "未設定は既定 off");
-        for v in ["", "0", "off", "false", "no", "2", "yes"] {
+        assert!(parse_gguf_gemv_v5(None), "未設定は既定 on (lab t307a/b で採否)");
+        for v in ["0", "off", "false", "no"] {
             assert!(!parse_gguf_gemv_v5(Some(v)), "raw={v:?}");
         }
-        for v in ["1", "on", "true", " ON ", " TRUE "] {
+        for v in ["", "1", "on", "true", " ON ", " TRUE ", "yes"] {
             assert!(parse_gguf_gemv_v5(Some(v)), "raw={v:?}");
         }
     }
@@ -40306,14 +40309,14 @@ mod tests {
         }
     }
 
-    /// task 307: `DENNO_ROUTER_IN_MIX` も明示的な真値だけ on。
+    /// task 307: `DENNO_ROUTER_IN_MIX` も明示的な偽値だけ off (既定 on)。
     #[test]
     fn router_in_mix_gate_truth_table() {
-        assert!(!parse_router_in_mix(None), "未設定は既定 off");
-        for v in ["", "0", "off", "false", "no", "2"] {
+        assert!(parse_router_in_mix(None), "未設定は既定 on (lab t307b で採否)");
+        for v in ["0", "off", "false", "no"] {
             assert!(!parse_router_in_mix(Some(v)), "raw={v:?}");
         }
-        for v in ["1", "on", "true", " ON ", " TRUE "] {
+        for v in ["", "1", "on", "true", " ON ", " TRUE ", "yes"] {
             assert!(parse_router_in_mix(Some(v)), "raw={v:?}");
         }
     }
@@ -55330,13 +55333,13 @@ mod task184_tests {
         assert_eq!(MIX_DEC_DEV_DEFAULT, true);
     }
 
-    /// `DENNO_MIX_NORM_HOST` の真理値表 (task 299)。
+    /// `DENNO_MIX_NORM_HOST` の真理値表 (task 299 / task 307 で既定 on)。
     #[test]
     fn mix_norm_host_truth_table() {
-        for raw in [None, Some(""), Some("  "), Some("0"), Some("off"), Some("false"), Some("no"), Some("yes"), Some("x")] {
+        for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
             assert!(!parse_mix_norm_host(raw), "raw={raw:?} が on になっている");
         }
-        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true ")] {
+        for raw in [None, Some(""), Some("  "), Some("1"), Some("on"), Some("TRUE"), Some(" true "), Some("yes"), Some("x")] {
             assert!(parse_mix_norm_host(raw), "raw={raw:?} が off になっている");
         }
     }
