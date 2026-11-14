@@ -7876,13 +7876,19 @@ fn pf230_v3_softmax_stays_within_bf16_rounding() {
     );
 }
 
-/// v3 が既定 on (task 244)、MIXKEEP が既定 off で、`pf_full_out` と mix の D2H に
+/// v3 が既定 on (task 244)、MIXKEEP も既定 on (task 317) で、`pf_full_out` と mix の D2H に
 /// 配線されていること。
 #[test]
 fn pf230_gates_are_wired_and_defaults_set() {
     for (fname, var, default_on) in [
         ("pub(crate) fn pf_attn_v3_from_value(", "DENNO_PF_ATTN_V3", true),
-        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP", false),
+        // task 317: MIXKEEP は ssm 側 (`DENNO_PF_MIXKEEP_SSM`) と重ねて採択。
+        ("pub(crate) fn pf_mix_keep_from_value(", "DENNO_PF_MIXKEEP", true),
+        (
+            "pub(crate) fn pf_mix_keep_ssm_from_value(",
+            "DENNO_PF_MIXKEEP_SSM",
+            true,
+        ),
     ] {
         let at = CUDA_RS.find(fname).unwrap_or_else(|| panic!("{fname} が無い"));
         let body = &CUDA_RS[at..];
@@ -7925,9 +7931,11 @@ fn pf230_gates_are_wired_and_defaults_set() {
             && QWEN_SRC.contains("crate::cuda::pf_mixed_keep_dev(mixed_flat.as_ptr(), nt, e);"),
         "mix の D2H を飛ばす分岐が無い"
     );
+    // task 317: ゲートは層種別ごと (full = MIXKEEP、ssm = MIXKEEP_SSM)。
     assert!(
-        QWEN_SRC.contains("&& matches!(kind, Some(LayerKind::FullAttn))"),
-        "MIXKEEP が full 層に限定されていない"
+        QWEN_SRC.contains("Some(LayerKind::FullAttn) => crate::cuda::pf_mix_keep_on()")
+            && QWEN_SRC.contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
+        "MIXKEEP の層種別の切り分けが無い"
     );
     assert!(
         CUDA_RS.contains("let xptr = match pf2_dev_x(x, nt, e) {")
@@ -10301,9 +10309,11 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
         "Rust 側の smem 見積りが .cu の WY_TOTAL と違う"
     );
     // 1 ブロック = 1 ヘッド (grid の y を使わない) / スレッド数は #define と同じ。
+    // task 311: 起動形状は `gdn_pf_wy_launch` の引数になったので、呼び出し側が
+    // wy32 の形 (vblocks=1 / 512 / 91,012 B) を渡していることを見る。
     assert!(
-        CUDA_RS.contains("(nv as u32, 1, 1),\n                (GDN_PF_WY_THREADS as u32, 1, 1),"),
-        "WY スキャンの grid / block が (nv, 1) / 512 でない"
+        CUDA_RS.contains("1, GDN_PF_WY_THREADS, GDN_PF_WY_SMEM_BYTES as u32,"),
+        "WY (wy32) の呼び出しが vblocks=1 / GDN_PF_WY_THREADS / WY_SMEM でない"
     );
     assert!(
         CUDA_RS.contains("pub(crate) const GDN_PF_WY_THREADS: usize = 512;"),
@@ -10334,10 +10344,108 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy"), "targets_all に gdn_pf_wy が無い");
 }
 
+/// task 311: WY スキャンの v 列 4 分割版 (`kernels_gdn_pf_wy4.cu`) の配線。
+///
+/// 値の一致は lab の md5 (wy32 と一致するか) と `gdn/wy.rs` の CPU 参照の担当。
+/// ここでは **ホストと .cu の契約** (カーネル名 / 引数の個数 / 分割数 / smem /
+/// 起動形 / build_ptx.sh) だけを固定する。
+#[test]
+fn task311_gdn_pf_wy4_kernel_is_wired() {
+    let src = include_str!("../kernels/kernels_gdn_pf_wy4.cu");
+    assert!(src.contains("dno_gdn_pf_wy4"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_wy4\\0\""),
+        "cuda.rs が dno_gdn_pf_wy4 を読んでいない"
+    );
+    for line in [
+        "#define WY4_DK 128",
+        "#define WY4_DV 32",
+        "#define WY4_C 8",
+        "#define WY4_THREADS 256",
+        "#define WY4_WARPS 8",
+        "#define WY4_DCONV 4",
+        "#define WY4_CS 3",
+    ] {
+        assert!(src.contains(line), "{line} が無い");
+    }
+    // 引数は wy32 と同じ 17 個 (並びも同じ)。ホストの起動を共有する前提。
+    assert_eq!(
+        cu_kernel_nargs(src, "dno_gdn_pf_wy4"),
+        17,
+        "引数の個数が wy32 と違う"
+    );
+    let define = |name: &str| -> usize {
+        src.lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"))
+    };
+    let dk = define("WY4_DK");
+    let dv = define("WY4_DV");
+    let c = define("WY4_C");
+    let total = define("WY4_TOTAL");
+    // 4 ブロックでヘッドの 128 列を覆う。
+    assert_eq!(dk, 128);
+    assert_eq!(dv * 4, dk, "4 分割で 128 列を覆っていない");
+    // 共有メモリの並びが重ならないこと。
+    let regions = [
+        ("WY4_S", dk * dv),
+        ("WY4_KC", c * dk),
+        ("WY4_QC", c * dk),
+        ("WY4_VC", c * dv),
+        ("WY4_DC", c * dv),
+        ("WY4_PC", c * dv),
+        ("WY4_QPC", c * dv),
+        ("WY4_RDEC", c * c),
+        ("WY4_AC", c * c),
+        ("WY4_GC", c * c),
+        ("WY4_LAM", c),
+        ("WY4_RL", c),
+        ("WY4_EG", c),
+        ("WY4_BC", c),
+        ("WY4_LL", 1),
+    ];
+    let mut at = 0usize;
+    for (name, size) in regions {
+        let lo = define(name);
+        assert_eq!(lo, at, "{name} の並びに隙間/重なりがある ({lo} != {at})");
+        at = lo + size;
+    }
+    assert_eq!(at, total, "WY4_TOTAL が最後の領域の終端と違う");
+    assert!(total * 4 < 48 * 1024, "48 KB 既定を超える");
+    // ホスト側の定数と呼び出し。
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF_WY4_SMEM_FLOATS: usize = 7393;"),
+        "GDN_PF_WY4_SMEM_FLOATS が 7393 でない"
+    );
+    assert!(
+        CUDA_RS.contains("GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY4_SMEM_BYTES as u32,"),
+        "wy4 の呼び出しが (BLOCKS, THREADS, SMEM) を渡していない"
+    );
+    assert_eq!(total, 7393, "WY4_TOTAL と Rust 側の見積りが違う");
+    // バリアはチャンク内 8 個 + プロローグ 1 個まで。
+    assert!(
+        src.matches("__syncthreads()").count() <= 10,
+        "バリアが多すぎる"
+    );
+    // build_ptx.sh の target。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy4)  echo \"kernels_gdn_pf_wy4.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf_wy4 が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gdn_pf_wy4"),
+        "targets_all に gdn_pf_wy4 が無い"
+    );
+}
+
 const SEG_K_SRC: &str = include_str!("../kernels/kernels_seg_k.cu");
 
 /// task 278: K 系の高速 GEMV (`kernels_seg_k.cu`) の配線。
-///
 /// GPU 無しでは走らせられないので、**ホストと .cu の契約**だけを固定する:
 /// カーネル名 4 本 / 引数の個数 / 起動形 (4 行 = 4 warp = 128 スレッド) /
 /// build_ptx.sh の target。数値は lab の `DENNO_EXPERT_GPU_CHECK=1` が見る。
@@ -10591,3 +10699,73 @@ fn mix_dev3_down_inj_is_wired() {
     );
 }
 
+
+/// task 317: ssm 層の attn mix を D2H しない経路の配線。
+///
+/// - ゲート `DENNO_PF_MIXKEEP_SSM` (既定 off)
+/// - `gdn_pf_chain` が「D2H していない」記録を見て `b.x` への H2D を飛ばす
+/// - 連鎖に乗らなかった層は `forward_batch_flat` がホストへ埋め直す
+///   (古いバイト列で計算しない)
+/// - 層優先の経路も同じ判定を通る (task 317 まで D2H 固定だった)
+#[test]
+fn task317_ssm_mix_keep_is_wired() {
+    assert!(
+        CUDA_RS.contains("pub(crate) fn pf_mix_keep_ssm_on()"),
+        "ゲートの実体が無い"
+    );
+    assert!(
+        CUDA_RS.contains("DENNO_PF_MIXKEEP_SSM"),
+        "env 名が無い"
+    );
+    // gdn_pf_chain: 記録があれば x を H2D しない。
+    let chain = CUDA_RS
+        .split("pub fn gdn_pf_chain(")
+        .nth(1)
+        .expect("gdn_pf_chain が無い");
+    assert!(
+        chain.contains("let xdev = if pf_mix_keep_ssm_on() {"),
+        "gdn_pf_chain がゲートを見ていない"
+    );
+    assert!(
+        chain.contains("pf_mixed_dev_in_ptr(flat.as_ptr(), nt, e)"),
+        "gdn_pf_chain がデバイスの mixed を引いていない"
+    );
+    assert!(
+        chain.contains("if xdev.is_none() {"),
+        "gdn_pf_chain の x H2D が条件付きでない"
+    );
+    assert!(
+        chain.contains("xdev.unwrap_or_else(|| b.buf(0))"),
+        "gdn_pf_chain がデバイスの mixed を使っていない"
+    );
+    // 判定は層種別ごと (full = MIXKEEP、ssm = MIXKEEP_SSM)。
+    assert!(
+        QWEN4EXP_RS.contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
+        "ssm 層の keep 判定が無い (連鎖が off の環境で D2H を飛ばすと無駄)"
+    );
+    // 層優先の経路も keep を通る (D2H 固定のままなら発火しない)。
+    let lm = QWEN4EXP_RS
+        .split("fn forward_prefill_batch_resident_lm(")
+        .nth(1)
+        .expect("forward_prefill_batch_resident_lm が無い");
+    assert!(
+        lm.contains("if Self::pf_mix_keep_layer(flat_attn, nt, self.p.layer_kind(il).ok()) {"),
+        "層優先の attn mix が keep を通っていない"
+    );
+    // 落ちたときの埋め直し (D2H) が host 経路の前に在る。
+    assert!(
+        QWEN4EXP_SSM_RS.contains("crate::cuda::pf_mixed_restore_host(h, nt, e)"),
+        "連鎖に乗らなかったときの復元が無い"
+    );
+    let flat_fn = QWEN4EXP_SSM_RS
+        .split("pub fn forward_batch_flat(")
+        .nth(1)
+        .expect("forward_batch_flat が無い");
+    let chain_at = flat_fn.find("forward_batch_chain(flat, nt)").expect("連鎖の呼び出しが無い");
+    let restore_at = flat_fn.find("pf_mixed_restore_host(h, nt, e)").expect("復元が無い");
+    let host_qkv_at = flat_fn.find("gemv_batch_split(flat, nt").expect("host qkv が無い");
+    assert!(
+        chain_at < restore_at && restore_at < host_qkv_at,
+        "復元が host 経路の後ろにある (古いバイト列で計算する)"
+    );
+}

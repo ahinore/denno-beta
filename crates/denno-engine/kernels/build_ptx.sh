@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy gdn_pf_wy4 exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -198,6 +198,9 @@ spec() {
         # チャンク内の演算を CPU 参照 (gdn/wy.rs) と同じ順で書いてあるので
         # -fmad=false (1 演算 1 丸め)。arch は v2/v3 と同じ compute_90。
         gdn_pf_wy)   echo "kernels_gdn_pf_wy.cu|nofmad|compute_90" ;;
+        # task 311: 同じ WY を v 列で 4 分割した版 (192 ブロック)。
+        # 数値は wy32 と同じ順序なので -fmad=false / compute_90 も同じ。
+        gdn_pf_wy4)  echo "kernels_gdn_pf_wy4.cu|nofmad|compute_90" ;;
         # task 218: 残差の平均の記録 (加算) とステアリング (引き算 / 射影)。
         # 加算は要素ごとに t 昇順、適用は h - alpha*v / h - alpha*(h.vhat)*vhat で、
         # ホスト側の実装と同じ演算列にするため -fmad=false (明示 __*_rn のみ)。
