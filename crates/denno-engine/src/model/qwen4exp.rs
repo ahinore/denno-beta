@@ -4464,7 +4464,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 // 3.1 PLE 注入 (層 1 のみ)。conv 履歴はトークン順に進める。
                 // ホストで回すので、この層だけ res を往復する。
                 if let Some(pw) = &lw.ple {
-                    let mut back = vec![0.0f32; nt * hc_dim];
+                    // task 300: `DENNO_PF_PLE_REUSE` では res の往復バッファを使い回す。
+                    let (mut back, back_reused) = pf_ple_back_take(nt * hc_dim);
                     if !crate::cuda::pf_download_res(&mut back) {
                         Self::pf_bail("PLE 層の res の D2H に失敗")?;
                     }
@@ -4539,6 +4540,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     if !crate::cuda::pf_upload_res(&back) {
                         Self::pf_bail("PLE 層の res の H2D に失敗")?;
                     }
+                    // task 300: 往復バッファを返す。
+                    pf_ple_back_return(back, back_reused);
                 }
 
                 // 3.2-3.4 attention 入口 (デバイス mix) → attn (CPU) → combine (デバイス)
@@ -5150,7 +5153,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
                 // 1.1 PLE 注入 (層 1 のみ)。ホストで回すので、この層だけ往復する。
                 if let Some(pw) = &lw.ple {
-                    let mut back = vec![0.0f32; nt * hc_dim];
+                    // task 300: `DENNO_PF_PLE_REUSE` では res の往復バッファを使い回す。
+                    let (mut back, back_reused) = pf_ple_back_take(nt * hc_dim);
                     if !crate::cuda::pf_download_res(&mut back) {
                         Self::pf_bail("PLE 層の res の D2H に失敗")?;
                     }
@@ -5220,6 +5224,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     if !crate::cuda::pf_upload_res(&back) {
                         Self::pf_bail("PLE 層の res の H2D に失敗")?;
                     }
+                    // task 300: 往復バッファを返す。
+                    pf_ple_back_return(back, back_reused);
                 }
                 // 1.2 attention 入口 (デバイス mix) → attn → combine
                 let t_mix = std::time::Instant::now();
@@ -7658,6 +7664,113 @@ fn ple_project_kv(
     Ok(())
 }
 
+/// task 300: `DENNO_PF_PLE_REUSE` — PLE の作業域を grow-only で使い回す (既定 on)。
+///
+/// 従来は PLE 層のたびに `back` (`nt × hc_dim`、14k のチャンクで 82 MB) と
+/// `key` / `value` (82 + 20 MB) を `vec![0.0; n]` で作り直し、さらに
+/// `pf_download_res` が同じ大きさの一時 Vec をもう 1 本作って写していた。
+/// 32 MB を超える確保は glibc が mmap で出し入れするので、チャンクごとに
+/// 数万ページのマイナーフォルトが戻る (`[exp-ram-probe] prefill minflt=58 万`)。
+/// 3 本とも**全要素を書き直す**ので、使い回してもデバイスへ渡るバイト列は同じ。
+pub const PLE_REUSE_ENV: &str = "DENNO_PF_PLE_REUSE";
+
+/// [`PLE_REUSE_ENV`] の既定値。
+///
+/// lab t300a (c18c505b7、depth8k、x0/base/pg/pr/pr0/base2) の実測:
+///
+/// | COND | c2000_cold r1 / r2 | c8000_cold (r1) |
+/// | --- | --- | --- |
+/// | base (両ゲート off) | 4.14 / 3.41 s | 10.09 s |
+/// | pg (PIN_GROW のみ) | 3.22 / 3.23 s | 8.30 s |
+/// | **pr (PIN_GROW + これ)** | **3.18 / 3.16 s** | **8.09 s** |
+/// | pr0 (これのみ) | 3.35 / 3.36 s | 8.28 s |
+/// | base2 | 3.40 / 3.41 s | 8.45 s |
+///
+/// 単独で -1.5%、PIN_GROW と合わせて -7.0% (3,826 cold)。14k も base2 比
+/// -4.3%、decode は全点 ±2% 以内、md5 は全 COND SAME。
+pub const DEFAULT_PLE_REUSE: bool = true;
+
+/// [`PLE_REUSE_ENV`] の解釈 (未設定・空は [`DEFAULT_PLE_REUSE`])。
+pub(crate) fn pf_ple_reuse_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PLE_REUSE,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// PLE の作業域を使い回すか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_ple_reuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_ple_reuse_from_value(std::env::var(PLE_REUSE_ENV).ok().as_deref()))
+}
+
+thread_local! {
+    /// task 300: PLE の res 往復バッファ (`nt × hc_dim`)。grow-only。
+    static PLE_BACK_BUF: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// task 300: PLE の射影バッファ (`key` / `value`)。grow-only。
+    static PLE_KV_BUF: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// task 300: PLE の res バッファを取る。2 つ目の戻り値が「使い回しか」。
+fn pf_ple_back_take(len: usize) -> (Vec<f32>, bool) {
+    pf_ple_back_take_with(len, pf_ple_reuse_on())
+}
+
+/// task 300: [`pf_ple_back_take`] の実体 (テストから直接叩けるように分けた)。
+fn pf_ple_back_take_with(len: usize, reuse: bool) -> (Vec<f32>, bool) {
+    if !reuse || len == 0 {
+        return (vec![0.0f32; len], false);
+    }
+    let mut v = PLE_BACK_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if v.len() < len {
+        v.resize(len, 0.0);
+    }
+    v.truncate(len);
+    (v, true)
+}
+
+/// task 300: 使い回した res バッファを返す。
+fn pf_ple_back_return(v: Vec<f32>, reused: bool) {
+    if reused {
+        PLE_BACK_BUF.with(|c| *c.borrow_mut() = v);
+    }
+}
+
+/// task 300: PLE の `key` / `value` を取る (`len_k` / `len_v` に切り詰める)。
+fn pf_ple_kv_take(len_k: usize, len_v: usize) -> ((Vec<f32>, Vec<f32>), bool) {
+    pf_ple_kv_take_with(len_k, len_v, pf_ple_reuse_on())
+}
+
+/// task 300: [`pf_ple_kv_take`] の実体 (テストから直接叩けるように分けた)。
+fn pf_ple_kv_take_with(
+    len_k: usize,
+    len_v: usize,
+    reuse: bool,
+) -> ((Vec<f32>, Vec<f32>), bool) {
+    if !reuse || len_k == 0 {
+        return ((vec![0.0f32; len_k], vec![0.0f32; len_v]), false);
+    }
+    let (mut k, mut v) = PLE_KV_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if k.len() < len_k {
+        k.resize(len_k, 0.0);
+    }
+    if v.len() < len_v {
+        v.resize(len_v, 0.0);
+    }
+    k.truncate(len_k);
+    v.truncate(len_v);
+    ((k, v), true)
+}
+
+/// task 300: 使い回した `key` / `value` を返す。
+fn pf_ple_kv_return(kv: (Vec<f32>, Vec<f32>), reused: bool) {
+    if reused {
+        PLE_KV_BUF.with(|c| *c.borrow_mut() = kv);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ple_inject_batch(
     p: &Qwen4ExpParams,
@@ -7760,8 +7873,8 @@ fn ple_inject_batch_flat(
         flat.extend_from_slice(r);
     }
     pf_ple_kprof::add(pf_ple_kprof::FLAT, t_flat);
-    let mut key = vec![0.0f32; nt * hc_dim];
-    let mut value = vec![0.0f32; nt * e];
+    // task 300: `DENNO_PF_PLE_REUSE` では射影バッファを使い回す (全要素を書き直す)。
+    let ((mut key, mut value), kv_reused) = pf_ple_kv_take(nt * hc_dim, nt * e);
     ple_project_kv(pw, &flat, nt, e, &mut key, &mut value, pf_ple_kprof::t0())?;
     let t_tok = pf_ple_kprof::t0();
     let mut sc = PleInjScratch::take(hc_dim);
@@ -7794,6 +7907,8 @@ fn ple_inject_batch_flat(
         }
     }
     sc.put();
+    // task 300: 射影バッファを返す。
+    pf_ple_kv_return((key, value), kv_reused);
     pf_ple_kprof::add(pf_ple_kprof::TOK, t_tok);
     // チャンク終端で履歴を線形 (先頭が最古) に戻す。他の経路 (decode の 1 トークン
     // 注入) は線形前提なので、ここで戻さないと経路をまたいだときに履歴がずれる。
@@ -7868,8 +7983,8 @@ fn ple_inject_batch_par(
         flat.extend_from_slice(r);
     }
     pf_ple_kprof::add(pf_ple_kprof::FLAT, t_flat);
-    let mut key = vec![0.0f32; nt * hc_dim];
-    let mut value = vec![0.0f32; nt * e];
+    // task 300: `DENNO_PF_PLE_REUSE` では射影バッファを使い回す (全要素を書き直す)。
+    let ((mut key, mut value), kv_reused) = pf_ple_kv_take(nt * hc_dim, nt * e);
     ple_project_kv(pw, &flat, nt, e, &mut key, &mut value, pf_ple_kprof::t0())?;
 
     // 作業域 (grow-only): win = (hist + nt) 行、gated = nt 行。
@@ -8056,6 +8171,8 @@ fn ple_inject_batch_par(
         b.0 = win;
         b.1 = gated;
     });
+    // task 300: 射影バッファを返す。
+    pf_ple_kv_return((key, value), kv_reused);
     pf_ple_kprof::add(pf_ple_kprof::ALL, t_all);
     pf_ple_kprof::note_call(nt);
     pf_ple_kprof::emit();
@@ -18209,9 +18326,15 @@ fn moe_ffn_quant_batch_lm_dev_at(
     mark(5);
     if dbg {
         let st = crate::cuda::pf_stream_times_ms();
+        let ex = crate::cuda::pf_stream_extra_ms();
+        let sum: f64 = st.iter().sum::<f64>() + ex[0] + ex[1];
+        // task 296: `prep` (スロット準備) と `pin` (pinned の確保し直し) を足した。
+        // `resid` = experts 段のうち上のどれでもない時間 (層の外の仕事)。
         eprintln!(
-            "[pf-lm-dbg] stream pump={:.1} wait={:.1} table={:.1} launch={:.1} accum={:.1} ms",
-            st[0], st[1], st[2], st[3], st[4]
+            "[pf-lm-dbg] stream pump={:.1} wait={:.1} table={:.1} launch={:.1} accum={:.1} \
+             prep={:.1} pin={:.1}ms x{} sum={:.1} resid={:.1} ms",
+            st[0], st[1], st[2], st[3], st[4], ex[0], ex[1], ex[2] as u64, sum,
+            ((ph[4] - ph[3]) - sum).max(0.0)
         );
         eprintln!(
             "[pf-lm-dbg] layer={} nt={} router={:.1} topk={:.1} plan={:.1} shared={:.1} \
@@ -24506,6 +24629,63 @@ mod tests {
                 assert_eq!(want, got, "チャンク {c} の conv 履歴がビット不一致");
             }
             crate::ple::set_pf_ple_par_for_test(None);
+        }
+
+        /// task 300: PLE の作業域使い回しの契約。
+        ///
+        /// - ゲート off (`reuse=false`) は毎回 `len` ちょうどの新しい Vec を返す。
+        /// - on は grow-only の使い回しで、**返る長さは常に `len` ちょうど**
+        ///   (大きいチャンクの後で小さいチャンクが来ても切り詰める)。
+        /// - 返却した Vec は次の take でそのまま返ってくる (確保し直さない)。
+        #[test]
+        fn ple_reuse_scratch_contract() {
+            // ゲートの真理値表 (未設定・空は既定 on。明示的な偽値だけ off)。
+            assert!(pf_ple_reuse_from_value(None));
+            assert!(pf_ple_reuse_from_value(Some("")));
+            assert!(!pf_ple_reuse_from_value(Some("0")));
+            assert!(!pf_ple_reuse_from_value(Some("off")));
+            assert!(pf_ple_reuse_from_value(Some("1")));
+            assert!(pf_ple_reuse_from_value(Some(" on ")));
+            assert!(pf_ple_reuse_from_value(Some("TRUE")));
+
+            // off: 毎回新しい Vec (長さはちょうど)。
+            let (a, r) = pf_ple_back_take_with(8, false);
+            assert!(!r);
+            assert_eq!(a.len(), 8);
+            let (b, r) = pf_ple_back_take_with(4, false);
+            assert!(!r);
+            assert_eq!(b.len(), 4);
+
+            // on: 返却 → 次の take で同じ容量を再利用。
+            let (mut v, r) = pf_ple_back_take_with(8, true);
+            assert!(r);
+            assert_eq!(v.len(), 8);
+            v.fill(7.0);
+            let ptr = v.as_ptr();
+            pf_ple_back_return(v, true);
+            let (v2, r2) = pf_ple_back_take_with(4, true);
+            assert!(r2);
+            assert_eq!(v2.len(), 4, "長さは要求どおりに切り詰める");
+            assert_eq!(v2.as_ptr(), ptr, "同じ領域を使い回す");
+            // 使い回しでも中身は古い値が残っている (呼び出し側が全要素を書く契約)。
+            assert_eq!(v2[0].to_bits(), 7.0f32.to_bits());
+            pf_ple_back_return(v2, true);
+
+            // key / value も同じ契約 (長さはそれぞれ独立)。
+            let ((k, vl), r3) = pf_ple_kv_take_with(6, 3, true);
+            assert!(r3);
+            assert_eq!((k.len(), vl.len()), (6, 3));
+            let kp = k.as_ptr();
+            pf_ple_kv_return((k, vl), true);
+            let ((k2, vl2), r4) = pf_ple_kv_take_with(5, 2, true);
+            assert!(r4);
+            assert_eq!((k2.len(), vl2.len()), (5, 2));
+            assert_eq!(k2.as_ptr(), kp, "key も同じ領域を使い回す");
+            pf_ple_kv_return((k2, vl2), true);
+            // 0 長は使い回さない (呼び出し側の空スライスを壊さない)。
+            let ((k3, v3), r5) = pf_ple_kv_take_with(0, 0, true);
+            assert!(!r5);
+            assert!(k3.is_empty() && v3.is_empty());
         }
 
         /// task 195: 並列版 (`ple_inject_batch_par`) も逐次版とビット一致すること。
