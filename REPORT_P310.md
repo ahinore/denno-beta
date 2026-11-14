@@ -200,8 +200,11 @@ merge で長い文脈の丸めが動いた可能性がある。**監督は 307 �
   → 95 passed / 0 failed。
 - 既知の赤 (`qwen4exp_decode spec_batch_stops_at_eos`、`qwen4exp_params` の
   validate 2 件) は踏んでいない。
-- 注意: `model::pf_host::tests::nested_stage_guard_counts_once` が 1 回だけ落ちた
-  (単独実行と再実行では緑。この task の変更とは無関係の順序依存)。
+- 注意: `model::pf_host::tests::nested_stage_guard_counts_once` が 4 回中 2 回落ちた
+  (同じツリーで 4 回中 2 回は緑、単独実行は 3/3 緑)。中身は `sleep(1 ms)` 2 回の
+  壁時計を `2 ms <= wall < 3 ms` で見る**時間の assert** で、ホストが混んでいると
+  超える。int-auto (`d6f914e97`) の worktree でも 2 回とも緑だったが、このテストは
+  この task の変更 (既定 off のゲート) と無関係。
 
 ## 7. GPU で確認してほしいこと
 
