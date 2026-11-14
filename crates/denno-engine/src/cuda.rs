@@ -2202,13 +2202,65 @@ pub(crate) mod dec_full_dev {
     }
 
     /// 1 層をデバイスで回す。`None` = この回は従来経路。
+    /// task 307: `DENNO_FULL_DEC_DBG` の解釈 (純関数)。**既定 off**。
+    ///
+    /// on のときだけ、この経路の呼び出し回数と「従来経路へ落ちた理由」を
+    /// 256 回ごとに 1 行で出す (数値・経路は 1 つも変えない)。
+    fn dbg_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            !matches!(
+                std::env::var("DENNO_FULL_DEC_DBG")
+                    .ok()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .as_deref(),
+                None | Some("") | Some("0") | Some("off") | Some("false") | Some("no")
+            )
+        })
+    }
+
+    /// 落ちた理由の数え上げ (0=gate, 1=shape, 2=ctx, 3=mirror, 4=plan, 5=その他)。
+    static FULL_DEC_FAIL: [std::sync::atomic::AtomicU64; 6] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+    static FULL_DEC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// 理由コードを 1 つ数え、256 回ごとに集計を出す。
+    fn dbg_note(idx: usize) {
+        if !dbg_on() {
+            return;
+        }
+        use std::sync::atomic::Ordering as AO;
+        let calls = FULL_DEC_CALLS.fetch_add(1, AO::Relaxed) + 1;
+        FULL_DEC_FAIL[idx].fetch_add(1, AO::Relaxed);
+        if calls % 256 == 1 {
+            let f: Vec<u64> = FULL_DEC_FAIL.iter().map(|c| c.load(AO::Relaxed)).collect();
+            eprintln!(
+                "[full-dec-dbg] calls={calls} gate={} shape={} ctx={} mirror={} plan={} other={}",
+                f[0], f[1], f[2], f[3], f[4], f[5]
+            );
+        }
+    }
+
+    /// 内部エラーの文言から理由コードを選ぶ。
+    fn dbg_reason(msg: &str) -> usize {
+        if msg.contains("ミラー") {
+            3
+        } else if msg.contains("plan") || msg.contains("GEMV") {
+            4
+        } else {
+            5
+        }
+    }
+
     pub(crate) fn forward(a: &Call<'_>) -> Option<Out> {
         if !on() {
+            dbg_note(0);
             return None;
         }
         // GPU attention のゲートを従来経路と揃える (無効なら CPU へ落ちるので
         // ここで何もせず None を返す)。
         if !cuda_enabled() || !gpu_attention_enabled() || !q4_gpu_attn_enabled() {
+            dbg_note(0);
             return None;
         }
         // task 179: 従来経路は `len < q4_gpu_attn_min()` (既定 64) で CPU へ
@@ -2217,24 +2269,30 @@ pub(crate) mod dec_full_dev {
         // (丸め順は CPU と違う。attention は P17g から緩和済みの契約)。
         // `DENNO_FULL_DEC_ATTN_MIN` で下限を戻せる。
         if a.len < full_dec_attn_min() {
+            dbg_note(0);
             return None;
         }
         if !a.ok_shape() {
+            dbg_note(1);
             note_fallback("形が合わない");
             return None;
         }
         let Some(ctx) = chain_ctx() else {
+            dbg_note(2);
             note_fallback("chain_ctx が無い");
             return None;
         };
         if let Err(e) = ctx.make_current() {
+            dbg_note(2);
             note_fallback(&format!("cuCtxSetCurrent: {e:#}"));
             return None;
         }
         match ST.with(|cell| forward_inner(&ctx, a, &mut cell.borrow_mut())) {
             Ok(v) => Some(v),
             Err(e) => {
-                note_fallback(&format!("{e:#}"));
+                let msg = format!("{e:#}");
+                dbg_note(dbg_reason(&msg));
+                note_fallback(&msg);
                 None
             }
         }
@@ -3642,6 +3700,8 @@ impl Drop for DevBuffer {
 /// [`CudaCtx::moe_gemv_dev_with`] から切り出した**選択だけ**の部分で、
 /// デバイスメモリには触らない。task 124 の重ね打ち経路
 /// ([`shared_gemv_begin`]) と同じカーネル・同じ引数を組むために共有する。
+/// task 307: 計画を控えておけるように Copy にした (共有 expert の層ごとキャッシュ)。
+#[derive(Clone, Copy)]
 struct MoeGemvPlan {
     f: CUfunction,
     /// 1 ブロックが受け持つ行数
@@ -4981,6 +5041,26 @@ impl CudaCtx {
         out: &mut [f32],
         mode: GemvKernelMode,
     ) -> Result<bool> {
+        self.moe_gemv_dev_with_pref(ty, dev_w, x, n_in, n_out, out, mode, false)
+    }
+
+    /// task 307 (`DENNO_GGUF_GEMV_V5`): dense の gguf GEMV も v5 を先に試す版。
+    ///
+    /// `prefer_v5` が真なら `plan_moe_gemv_v5` を先に引き、形が合わなければ
+    /// 従来どおり `plan_moe_gemv` (v3 / v2) へ落ちる。カーネル・引数・丸め順は
+    /// v5 のものがそのまま使われる (v3 / v2 とは加算順が違う = 丸めが変わる)。
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemv_dev_with_pref(
+        &self,
+        ty: crate::kquant::GgmlType,
+        dev_w: &DevBuffer,
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+        mode: GemvKernelMode,
+        prefer_v5: bool,
+    ) -> Result<bool> {
         let bs = ty.blck_size();
         if n_in == 0 || n_out == 0 || n_in % bs != 0 {
             bail!("moe_gemv_dev: 形状が不正 (n_in={n_in}, n_out={n_out}, block={bs})");
@@ -4994,7 +5074,17 @@ impl CudaCtx {
         // カーネルの選択 (従来は `pick_moe_kernels` が先頭、fp16/v3 の選択が
         // 引数検査の後だった。PTX を読む順序だけが変わり、選ばれるカーネル・
         // 引数・丸め順は 1 つも変わらない)。
-        let Some(plan) = self.plan_moe_gemv(ty, n_in, n_out, mode)? else {
+        // task 307: `prefer_v5` のときだけ v5 の計画を先に引く (形が合わなければ
+        // 従来の選択へ落ちる)。
+        let plan_v5 = if prefer_v5 {
+            self.plan_moe_gemv_v5(ty, n_in, n_out)
+        } else {
+            None
+        };
+        let Some(plan) = (match plan_v5 {
+            Some(p) => Some(p),
+            None => self.plan_moe_gemv(ty, n_in, n_out, mode)?,
+        }) else {
             return Ok(false);
         };
         let MoeGemvPlan {
@@ -6315,6 +6405,29 @@ fn gdn_dec_v4_lanes_cap() -> usize {
     *L.get_or_init(|| {
         parse_gdn_dec_v4_lanes(std::env::var("DENNO_GDN_DEC_GEMV_LANES").ok().as_deref())
     })
+}
+
+/// task 307: `DENNO_GGUF_GEMV_V5` の解釈 (純関数)。**既定 off**。
+///
+/// 明示的な真値 (`1` / `on` / `true`) のときだけ、dense の gguf GEMV
+/// ([`maybe_gpu_gguf_gemv_into`]) も v5 の計画を先に試す。
+fn parse_gguf_gemv_v5(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// task 307: dense の gguf GEMV を v5 で回すか (env から 1 回だけ読む)。
+///
+/// 動機 (lab t299b の `[dec-kprof-avg]` full 表): full 層の q8_0 GEMV が
+/// v5 (26 us) と v3 (49 us) に分かれていて、v3 側は**ホスト経路へ落ちた層**の
+/// `GgufLinear::gemv` → `maybe_gpu_gguf_gemv_into` → `moe_gemv_dev` が選ぶ
+/// v3 だった (`gemv_kernel_mode()` は v5 を知らない)。同じ重み・同じ形でも
+/// 入口が違うだけで 1.9 倍の差が出る。
+pub(crate) fn gguf_gemv_v5_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gguf_gemv_v5(std::env::var("DENNO_GGUF_GEMV_V5").ok().as_deref()))
 }
 
 /// decode GEMV が使うカーネル一式を env から決める (`moe_gemv_dev` と
@@ -18054,6 +18167,9 @@ fn gguf_registry() -> &'static std::sync::Mutex<GgufReg> {
 /// 使用中 (pin) の uid でも外す: 呼ぶ側は「その重みをもう使わない」と分かっている
 /// 前提 (`GgufLinear` の `Drop`)。進行中の GEMV がある状態で呼んではいけない。
 pub fn gguf_unregister(uid: u64) -> u64 {
+    // task 307: 控えている `&'static GpuGgufW` が解放され得るので世代を進める
+    // (共有 expert のキャッシュは世代が変わったら丸ごと捨てる)。
+    GGUF_REG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let reg = gguf_registry();
     let Ok(mut g) = reg.lock() else {
         return 0;
@@ -18762,6 +18878,115 @@ pub fn shared_gemv_begin(x: &[f32], jobs: &[SharedGemvJob<'_>]) -> SharedPending
 ///
 /// `Ok` 以外の経路 (型・PTX・確保・形) は空のハンドルを返す = 呼び出し側は
 /// 従来の 2 段経路へ落ちる (fail closed)。
+// ---------------------------------------------------------------------------
+// task 307: 共有 expert の plan / 常駐重みのキャッシュ (`DENNO_SH_BEGIN_CACHE`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t299b の `[q4ledger]`): `shared` 行 0.63-0.68 ms/token のうち
+// `sh_begin` が 0.45-0.48 で、その中身は毎層 3 本の `weights_for_gguf`
+// (登録簿の mutex + LRU の touch/pin と、消費後の unpin 3 本) と plan の作り直し。
+// uid の組は層ごとに固定なので、最初の 1 回で作った計画と重み参照を控える。
+
+/// task 307: `DENNO_SH_BEGIN_CACHE` の解釈 (純関数)。**既定 off**。
+///
+/// 明示的な真値 (`1` / `on` / `true`) のときだけ、共有 expert の計画と常駐重みを
+/// 層ごとに控える。
+fn parse_sh_begin_cache(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// task 307: 共有 expert の計画と常駐重みを層ごとに控えるか。
+fn sh_begin_cache_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_sh_begin_cache(std::env::var("DENNO_SH_BEGIN_CACHE").ok().as_deref()))
+}
+
+/// task 307: 重みの登録簿から 1 本でも外されたら増える世代。
+///
+/// [`GGUF_REG_GEN`] が変わったら、控えている `&'static GpuGgufW` は解放済みに
+/// なり得るのでキャッシュを丸ごと捨てる (`gguf_unregister` が増やす)。
+static GGUF_REG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// キャッシュ 1 本ぶん (層 = uid の組ごと)。
+struct ShCacheEntry {
+    /// 控えたときの登録簿の世代
+    gen: u64,
+    /// (uid, k, n, ty) x 3 (gate / up / down)。形が変わったら作り直す。
+    shapes: [(u64, usize, usize, crate::kquant::GgmlType); 3],
+    plans: [MoeGemvPlan; 3],
+    /// **握り続ける**重み (pin が立ったまま = 退避されない)
+    pins: [GgufWRef; 3],
+}
+
+thread_local! {
+    /// task 307: 層ごとの計画キャッシュ (`DENNO_SH_BEGIN_CACHE`)。
+    static SH_CACHE: std::cell::RefCell<Vec<ShCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// task 307: uid の組でキャッシュを引く。無ければ `None`。
+///
+/// 戻り値は (計画 3 本, 重みのデバイスポインタ 3 本)。形が登録時と違えば
+/// その項目を捨てて `None` を返す (呼び出し側は従来経路で作り直す)。
+fn sh_cache_lookup(
+    jobs: &[&SharedGemvJob<'_>; 3],
+) -> Option<([MoeGemvPlan; 3], [CUdeviceptr; 3])> {
+    let gen = GGUF_REG_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    SH_CACHE.with(|cell| {
+        let mut v = cell.borrow_mut();
+        let i = v.iter().position(|e| {
+            e.gen == gen && jobs.iter().enumerate().all(|(j, job)| e.shapes[j].0 == job.uid)
+        })?;
+        let e = &v[i];
+        let shapes_ok = jobs.iter().enumerate().all(|(j, job)| {
+            let (k, n, ty) = (e.shapes[j].1, e.shapes[j].2, e.shapes[j].3);
+            k == job.k && n == job.n && ty == job.ty
+        });
+        if !shapes_ok {
+            v.remove(i);
+            return None;
+        }
+        Some((e.plans, [e.pins[0].buf.ptr, e.pins[1].buf.ptr, e.pins[2].buf.ptr]))
+    })
+}
+
+/// task 307: キャッシュへ 1 本入れる (既にあれば置き換え)。
+fn sh_cache_insert(jobs: &[&SharedGemvJob<'_>; 3], plans: &[MoeGemvPlan], pins: Vec<GgufWRef>) {
+    if pins.len() != 3 {
+        return;
+    }
+    let mut it = pins.into_iter();
+    let (Some(p0), Some(p1), Some(p2)) = (it.next(), it.next(), it.next()) else {
+        return;
+    };
+    let gen = GGUF_REG_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    let entry = ShCacheEntry {
+        gen,
+        shapes: [
+            (jobs[0].uid, jobs[0].k, jobs[0].n, jobs[0].ty),
+            (jobs[1].uid, jobs[1].k, jobs[1].n, jobs[1].ty),
+            (jobs[2].uid, jobs[2].k, jobs[2].n, jobs[2].ty),
+        ],
+        plans: [plans[0], plans[1], plans[2]],
+        pins: [p0, p1, p2],
+    };
+    SH_CACHE.with(|cell| {
+        let mut v = cell.borrow_mut();
+        // 世代が変わっていたら丸ごと捨ててから入れる。
+        if v.iter().any(|e| e.gen != gen) {
+            v.clear();
+        }
+        if v.len() >= 256 {
+            v.remove(0);
+        }
+        v.push(entry);
+    });
+}
+
+/// task 187: shared expert の 4 発 (gate/up/silu/down) をサイドストリームへ積む。
 pub fn shared_expert_begin(
     x: &[f32],
     gate: &SharedGemvJob<'_>,
@@ -18811,35 +19036,56 @@ pub fn shared_expert_begin(
     };
     let mode = gemv_kernel_mode();
     let jobs: [&SharedGemvJob<'_>; 3] = [gate, up, down];
-    let mut plans = Vec::with_capacity(3);
-    let mut pins = Vec::with_capacity(3);
-    let mut uploaded = false;
+    // task 307: 形の門番 (キャッシュ経路でも同じ条件を通す)。
     for j in jobs {
         if j.k % j.ty.blck_size() != 0 {
             return SharedPending::none();
         }
-        let plan = match ctx.plan_moe_gemv(j.ty, j.k, j.n, mode) {
-            Ok(Some(p)) => p,
-            _ => return SharedPending::none(),
-        };
-        let existed = gguf_registry()
-            .lock()
-            .map(|g| g.map.contains_key(&j.uid))
-            .unwrap_or(false);
-        let w = match weights_for_gguf(j.uid, j.ty, j.blocks, j.k, j.n) {
-            Ok(w) => w,
-            Err(_) => return SharedPending::none(),
-        };
-        if w.buf.bytes() != j.n.saturating_mul(plan.rb) {
-            return SharedPending::none();
+    }
+    let mut plans: Vec<MoeGemvPlan> = Vec::with_capacity(3);
+    let mut pins: Vec<GgufWRef> = Vec::with_capacity(3);
+    let mut wptrs: [CUdeviceptr; 3] = [0; 3];
+    let mut uploaded = false;
+    let mut cached = false;
+    if sh_begin_cache_on() {
+        if let Some((p, w)) = sh_cache_lookup(&jobs) {
+            plans.extend_from_slice(&p);
+            wptrs = w;
+            cached = true;
         }
-        uploaded |= !existed;
-        plans.push(plan);
-        pins.push(w);
+    }
+    if !cached {
+        for j in jobs {
+            let plan = match ctx.plan_moe_gemv(j.ty, j.k, j.n, mode) {
+                Ok(Some(p)) => p,
+                _ => return SharedPending::none(),
+            };
+            let existed = gguf_registry()
+                .lock()
+                .map(|g| g.map.contains_key(&j.uid))
+                .unwrap_or(false);
+            let w = match weights_for_gguf(j.uid, j.ty, j.blocks, j.k, j.n) {
+                Ok(w) => w,
+                Err(_) => return SharedPending::none(),
+            };
+            if w.buf.bytes() != j.n.saturating_mul(plan.rb) {
+                return SharedPending::none();
+            }
+            uploaded |= !existed;
+            wptrs[plans.len()] = w.buf.ptr;
+            plans.push(plan);
+            pins.push(w);
+        }
+        // task 307: 控えておく (握り続ける = 以後この経路は plan も登録簿も触らない)。
+        // 所有権はキャッシュへ移す (この回の in-flight 中もキャッシュが生かす)。
+        if sh_begin_cache_on() {
+            sh_cache_insert(&jobs, &plans, pins);
+            pins = Vec::new();
+        }
     }
     SHARED_OVERLAP.with(|cell| {
         let mut s = cell.borrow_mut();
-        match shared_expert_enqueue(&mut s, ctx, l, x, &jobs, &plans, &pins, uploaded, epi) {
+        match shared_expert_enqueue(&mut s, ctx, l, x, &jobs, &plans, &wptrs, uploaded, epi) {
             Ok(()) => {
                 s.pins = pins;
                 s.in_flight = 1;
@@ -18867,7 +19113,7 @@ fn shared_expert_enqueue(
     x: &[f32],
     jobs: &[&SharedGemvJob<'_>; 3],
     plans: &[MoeGemvPlan],
-    pins: &[GgufWRef],
+    wptrs: &[CUdeviceptr; 3],
     uploaded: bool,
     epi: &DecEpiKernels,
 ) -> Result<()> {
@@ -18920,8 +19166,8 @@ fn shared_expert_enqueue(
         bail!("cuMemcpyHtoDAsync (shared x) が失敗");
     }
     // gate → up → silu*up → down (すべて同じサイドストリーム)。
-    ctx.launch_moe_gemv_on(&plans[0], pins[0].buf.ptr, dx, dg, gate.k, gate.n, stream)?;
-    ctx.launch_moe_gemv_on(&plans[1], pins[1].buf.ptr, dx, du, up.k, up.n, stream)?;
+    ctx.launch_moe_gemv_on(&plans[0], wptrs[0], dx, dg, gate.k, gate.n, stream)?;
+    ctx.launch_moe_gemv_on(&plans[1], wptrs[1], dx, du, up.k, up.n, stream)?;
     unsafe {
         let (mut pg, mut pu, mut pa, mut pn) = (
             dg as *mut c_void,
@@ -18946,7 +19192,7 @@ fn shared_expert_enqueue(
             &mut args,
         )?;
     }
-    ctx.launch_moe_gemv_on(&plans[2], pins[2].buf.ptr, dact, dout, down.k, down.n, stream)?;
+    ctx.launch_moe_gemv_on(&plans[2], wptrs[2], dact, dout, down.k, down.n, stream)?;
     if unsafe { (l.memcpy_dtoh_async)(po, dout, down.n * 4, stream) } != CUDA_SUCCESS {
         bail!("cuMemcpyDtoHAsync (shared down) が失敗");
     }
@@ -19182,7 +19428,18 @@ pub fn maybe_gpu_gguf_gemv_into(
             return false;
         }
     };
-    match ctx.moe_gemv_dev(ty, &w.buf, x, k, n, out) {
+    // task 307: `DENNO_GGUF_GEMV_V5` のときは v5 の計画を先に試す
+    // (形が合わなければ従来どおり v3 / v2)。オフでは 1 つも変わらない。
+    match ctx.moe_gemv_dev_with_pref(
+        ty,
+        &w.buf,
+        x,
+        k,
+        n,
+        out,
+        gemv_kernel_mode(),
+        gguf_gemv_v5_on(),
+    ) {
         Ok(true) => {
             set_last_linear_ran_on_gpu(true);
             if prof {
@@ -23465,6 +23722,166 @@ thread_local! {
     static ROUTER_PENDING_N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// task 307: `DENNO_ROUTER_IN_MIX` の解釈 (純関数)。**既定 off**。
+///
+/// 明示的な真値 (`1` / `on` / `true`) のときだけ、FFN mix の鎖 (down → up →
+/// hc_mixed) の末尾にルータ GEMV を積み、D2H と同期を鎖の 1 回にまとめる。
+fn parse_router_in_mix(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// task 307: ルータ GEMV を mix の鎖に載せるか (env から 1 回だけ読む)。
+///
+/// 動機 (lab t299b の `[q4ledger]`): router 行は 1.08 ms/token で、内訳は
+/// gpu 0.64 / sync 0.63 / cpu 0.39。mix の鎖は同じ層で既に 1 回同期している
+/// (mix 行の sync) ので、ルータ GEMV をその鎖の末尾に積めば、起動の往復と
+/// 同期 1 回 (層あたり 5〜6 us) が消える。入力は鎖の中間バッファ `dm`
+/// (= `mixed` のデバイスコピー) をそのまま読むので H2D も消える。
+pub fn router_in_mix_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_router_in_mix(std::env::var("DENNO_ROUTER_IN_MIX").ok().as_deref()))
+}
+
+/// task 307: 次の mix の鎖にルータ GEMV を載せるための控え。
+struct RouterArm {
+    uid: u64,
+    /// ルータ重みのホスト生バイト (F32)。**同じ層・同じトークンの mix の中で
+    /// 消費する** 前提で借りる (モデルの重みは mix の間ずっと生きている)。
+    ptr: *const u8,
+    len: usize,
+    k: usize,
+    n: usize,
+    layer: usize,
+    pos: u64,
+}
+
+thread_local! {
+    static ROUTER_ARM: std::cell::RefCell<Option<RouterArm>> =
+        const { std::cell::RefCell::new(None) };
+    /// task 307: mix の鎖が作った logits の (uid, k, n)。0 = 無し。
+    static ROUTER_FILLED: std::cell::Cell<(u64, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+    /// task 307: `ROUTER_FILLED` の中身はもう同期済みか (finish で待たない)。
+    static ROUTER_SYNCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// task 307: この層の FFN mix の鎖にルータ GEMV を載せる (decode の層入口で呼ぶ)。
+///
+/// `false` = 載せない (ゲート off・形が合わない)。載らなかった場合は従来どおり
+/// `maybe_gpu_router_gemv_begin` が H2D + 起動 + D2H を行う (数値は同じ).
+pub fn router_in_mix_arm(uid: u64, bytes: &[u8], k: usize, n: usize) -> bool {
+    if !router_in_mix_on() {
+        return false;
+    }
+    if k == 0 || n == 0 || bytes.len() != k.saturating_mul(n).saturating_mul(4) {
+        return false;
+    }
+    ROUTER_ARM.with(|c| {
+        *c.borrow_mut() = Some(RouterArm {
+            uid,
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+            k,
+            n,
+            layer: dec_kprof::cur_layer(),
+            pos: dec_kprof::cur_pos(),
+        })
+    });
+    true
+}
+
+/// task 307: トークンの入口でルータの控えを落とす (層 0 の入口で呼ぶ)。
+///
+/// 前のトークンの `ROUTER_FILLED` / 控えが残っていても、次のトークンでは
+/// 必ず「mix の鎖が作った値」だけを使う。
+pub fn router_in_mix_token_start() {
+    if !router_in_mix_on() {
+        return;
+    }
+    ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+    ROUTER_SYNCED.with(|c| c.set(false));
+    ROUTER_ARM.with(|c| {
+        let _ = c.borrow_mut().take();
+    });
+}
+
+/// task 307: mix の鎖の末尾にルータ GEMV を 1 発積む (鎖の中から呼ぶ)。
+///
+/// 戻り値は積んだ出力行数 (0 = 積んでいない)。`x` は鎖の中間バッファ
+/// (= `mixed` のデバイスコピー) で、`k` と一致するときだけ積む。
+fn router_in_mix_enqueue(
+    ctx: &CudaCtx,
+    x_dev: CUdeviceptr,
+    k: usize,
+    w_keep: &mut Option<GgufWRef>,
+) -> usize {
+    let Some(job) = ROUTER_ARM.with(|c| c.borrow_mut().take()) else {
+        return 0;
+    };
+    if job.k != k || job.layer != dec_kprof::cur_layer() || job.pos != dec_kprof::cur_pos() {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(job.ptr, job.len) };
+    let w = match weights_for_f32(job.uid, bytes, job.k, job.n) {
+        Ok(w) => w,
+        Err(_) => return 0,
+    };
+    let f_seq = matvec_f32_fn(ctx);
+    let f_red = matvec_f32_r_fn(ctx);
+    let use_reduce = router_gpu_reduce_enabled() && router_use_reduce_kernel(job.k, job.n, f_red.is_some());
+    let Some(f) = (if use_reduce { f_red } else { f_seq }) else {
+        return 0;
+    };
+    let thr: u32 = if use_reduce { 256 } else { 1 };
+    let Ok(l) = lib() else {
+        return 0;
+    };
+    let r = ROUTER_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let RouterScratch { out: dout, ho, .. } = &mut *s;
+        Scratch::ensure(dout, job.n * 4)?;
+        Scratch::ensure_pin(ho, job.n * 4)?;
+        let dout = dout.as_ref().expect("ensure 済み");
+        let mut po = dout.ptr();
+        let mut pw = w.buf.ptr;
+        let mut ph = x_dev;
+        let (mut kc, mut nc) = (job.k as c_int, job.n as c_int);
+        let mut args = [
+            &mut ph as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, (job.n as u32, 1, 1), (thr, 1, 1), 0, &mut args)?;
+            let ho = ho.as_ref().expect("ensure 済み");
+            check(
+                (l.memcpy_dtoh_async)(
+                    ho.ptr,
+                    dout.ptr(),
+                    job.n * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (router in mix)",
+            )?;
+        }
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            *w_keep = Some(w);
+            ROUTER_FILLED.with(|c| c.set((job.uid, job.k, job.n)));
+            job.n
+        }
+        Err(_) => 0,
+    }
+}
+
 /// task 69 / 192: ルータ (f32・m=1) の GEMV を **同期せずに** 積む。
 ///
 /// `maybe_gpu_router_gemv_into` の前半。`true` を返したら、呼び出し側は別の
@@ -23492,6 +23909,21 @@ pub fn maybe_gpu_router_gemv_begin(
         || n > i32::MAX as usize
     {
         return false;
+    }
+    // task 307: mix の鎖 (`DENNO_ROUTER_IN_MIX`) がこの層の logits を既に作って
+    // いて、鎖の同期でホストへ届いていれば、ここでは何も積まない。uid / k / n が
+    // 違えば (別の層の残り) 捨てて従来経路へ。
+    let filled = ROUTER_FILLED.with(|c| c.get());
+    if filled.0 != 0 {
+        if filled == (uid, k, n) {
+            // 使い切り (次の層・次のトークンで古い logits を使わない)。
+            ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+            ROUTER_SYNCED.with(|c| c.set(true));
+            ROUTER_PENDING_N.with(|c| c.set(n));
+            return true;
+        }
+        ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+        ROUTER_SYNCED.with(|c| c.set(false));
     }
     let Some(ctx) = shared_ctx() else {
         return false;
@@ -23621,6 +24053,24 @@ pub fn maybe_gpu_router_gemv_finish(out: &mut [f32]) -> bool {
     use std::sync::atomic::Ordering as AO;
     let n = ROUTER_PENDING_N.with(|c| c.replace(0));
     if n == 0 || out.len() != n {
+        return false;
+    }
+    // task 307: mix の鎖が積んで、その同期で既に届いている場合 (待たない)。
+    if ROUTER_SYNCED.with(|c| c.replace(false)) {
+        ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+        let r = ROUTER_SC.with(|cell| -> Result<()> {
+            let s = cell.borrow();
+            let ho = s
+                .ho
+                .as_ref()
+                .ok_or_else(|| anyhow!("router scratch が無い (mix の鎖を飛ばした)"))?;
+            out.copy_from_slice(&ho.as_slice::<f32>()[..n]);
+            Ok(())
+        });
+        if r.is_ok() {
+            set_last_linear_ran_on_gpu(true);
+            return true;
+        }
         return false;
     }
     let Some(ctx) = shared_ctx() else {
@@ -29433,6 +29883,8 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
             1,
         );
         let mut s = cell.borrow_mut();
+        // task 307: 鎖の末尾に積むルータ GEMV の重み (同期の後まで生かす)。
+        let mut router_w: Option<GgufWRef> = None;
         let MixGpuScratch {
             x: dx,
             lo: dlo,
@@ -29519,6 +29971,9 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
                 0,
                 &mut args3,
             )?;
+            // task 307: ルータ GEMV を鎖の末尾に 1 発積む (D2H は下の mixed と
+            // 同じ 1 回の同期でまとめる)。載らなければ 0 = 従来経路。
+            let _ = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
             let kp_cp = dec_kprof::op_begin(
                 || "D2H@a".to_string(),
                 (0, 0, 0),
@@ -29534,6 +29989,7 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
+        drop(router_w);
         dec_kprof::step("mix_pack", || {
             out.copy_from_slice(&ho.as_slice::<f32>()[..e])
         });
@@ -39816,6 +40272,70 @@ mod q4_attn_tests {
 mod tests {
     use super::*;
     use crate::tensor;
+
+    /// task 307: `DENNO_GGUF_GEMV_V5` は明示的な真値だけ on (既定 off)。
+    #[test]
+    fn gguf_gemv_v5_gate_truth_table() {
+        assert!(!parse_gguf_gemv_v5(None), "未設定は既定 off");
+        for v in ["", "0", "off", "false", "no", "2", "yes"] {
+            assert!(!parse_gguf_gemv_v5(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", " TRUE "] {
+            assert!(parse_gguf_gemv_v5(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 307: `DENNO_SH_BEGIN_CACHE` も明示的な真値だけ on。
+    #[test]
+    fn sh_begin_cache_gate_truth_table() {
+        assert!(!parse_sh_begin_cache(None), "未設定は既定 off");
+        for v in ["", "0", "off", "false", "no", "2"] {
+            assert!(!parse_sh_begin_cache(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", " TRUE "] {
+            assert!(parse_sh_begin_cache(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 307: `DENNO_ROUTER_IN_MIX` も明示的な真値だけ on。
+    #[test]
+    fn router_in_mix_gate_truth_table() {
+        assert!(!parse_router_in_mix(None), "未設定は既定 off");
+        for v in ["", "0", "off", "false", "no", "2"] {
+            assert!(!parse_router_in_mix(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", " TRUE "] {
+            assert!(parse_router_in_mix(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 307: 共有 expert のキャッシュは、空のときは必ず外れる
+    /// (初回は従来経路で作る = 値は 1 つも変わらない)。
+    #[test]
+    fn sh_cache_lookup_misses_on_empty_cache() {
+        SH_CACHE.with(|c| c.borrow_mut().clear());
+        let blocks: [u8; 0] = [];
+        let jobs = [
+            SharedGemvJob { uid: 11, ty: crate::kquant::GgmlType::Q8_0, blocks: &blocks, k: 2560, n: 640 },
+            SharedGemvJob { uid: 12, ty: crate::kquant::GgmlType::Q8_0, blocks: &blocks, k: 2560, n: 640 },
+            SharedGemvJob { uid: 13, ty: crate::kquant::GgmlType::Q8_0, blocks: &blocks, k: 640, n: 2560 },
+        ];
+        let refs: [&SharedGemvJob<'_>; 3] = [&jobs[0], &jobs[1], &jobs[2]];
+        assert!(sh_cache_lookup(&refs).is_none(), "空のキャッシュで当たった");
+    }
+
+    /// task 307: ルータの「鎖で作った」印は uid / k / n が揃ったときだけ使う。
+    /// (GPU 無しでも通る範囲: 印の付け替えと取り消しの規則だけを固定する。)
+    #[test]
+    fn router_filled_matches_only_the_same_shape() {
+        ROUTER_FILLED.with(|c| c.set((7u64, 2560usize, 512usize)));
+        let filled = ROUTER_FILLED.with(|c| c.get());
+        assert_eq!(filled, (7, 2560, 512));
+        assert_ne!(filled, (8, 2560, 512), "uid が違えば使わない");
+        assert_ne!(filled, (7, 2560, 640), "n が違えば使わない");
+        ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+        ROUTER_SYNCED.with(|c| c.set(false));
+    }
 
     /// task 278: 高速版 GEMV のゲートは既定 on、明示的な偽値だけ切る。
     #[test]

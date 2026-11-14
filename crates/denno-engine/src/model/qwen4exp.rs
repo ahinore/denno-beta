@@ -3561,6 +3561,12 @@ impl Qwen4Exp {
         // task 177: 診断 (`DENNO_GDN_DEC_KPROF`) が mix の表に層番号を出すため。
         #[cfg(feature = "cuda")]
         crate::cuda::dec_kprof::set_layer(il);
+        // task 307: 層 0 の入口 = トークンの境目。前のトークンのルータの控えを落とす
+        // (`DENNO_ROUTER_IN_MIX` の印が次のトークンへ漏れないように)。
+        #[cfg(feature = "cuda")]
+        if il == 0 {
+            crate::cuda::router_in_mix_token_start();
+        }
         let lw = &self.layers[il];
         // task 155: 購読者が居ないフックは**呼び出しごと**飛ばす。`None` は
         // 「このランでは誰も層の中間値を見ない」= decode の通常経路。
@@ -3692,6 +3698,19 @@ impl Qwen4Exp {
         let skip_shared = iv.block_off(il, IvBlock::Shared);
         if !(skip_routed && skip_shared) {
             let t_mix = std::time::Instant::now();
+            // task 307: FFN mix の鎖 (down → up → hc_mixed) の末尾にルータ GEMV を
+            // 載せる (`DENNO_ROUTER_IN_MIX`・既定 off)。載れば router の H2D と
+            // 同期 1 回が消える。載らなければ従来どおり `gate_inp` の GEMV が
+            // H2D + 起動 + D2H + 同期を行う (数値は同じ)。
+            #[cfg(feature = "cuda")]
+            if gdn_gpu_win::active() && lw.gate_inp.router_gpu_ok() {
+                let _ = crate::cuda::router_in_mix_arm(
+                    lw.gate_inp.uid(),
+                    lw.gate_inp.blocks().as_slice(),
+                    lw.gate_inp.k(),
+                    lw.gate_inp.n(),
+                );
+            }
             let (cur, inject) = {
                 // task 138: 台帳の区間 (mix)。
                 let _l = q4ledger::enter(q4ledger::MIX);
