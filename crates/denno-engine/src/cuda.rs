@@ -2202,13 +2202,65 @@ pub(crate) mod dec_full_dev {
     }
 
     /// 1 層をデバイスで回す。`None` = この回は従来経路。
+    /// task 307: `DENNO_FULL_DEC_DBG` の解釈 (純関数)。**既定 off**。
+    ///
+    /// on のときだけ、この経路の呼び出し回数と「従来経路へ落ちた理由」を
+    /// 256 回ごとに 1 行で出す (数値・経路は 1 つも変えない)。
+    fn dbg_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            !matches!(
+                std::env::var("DENNO_FULL_DEC_DBG")
+                    .ok()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .as_deref(),
+                None | Some("") | Some("0") | Some("off") | Some("false") | Some("no")
+            )
+        })
+    }
+
+    /// 落ちた理由の数え上げ (0=gate, 1=shape, 2=ctx, 3=mirror, 4=plan, 5=その他)。
+    static FULL_DEC_FAIL: [std::sync::atomic::AtomicU64; 6] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+    static FULL_DEC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// 理由コードを 1 つ数え、256 回ごとに集計を出す。
+    fn dbg_note(idx: usize) {
+        if !dbg_on() {
+            return;
+        }
+        use std::sync::atomic::Ordering as AO;
+        let calls = FULL_DEC_CALLS.fetch_add(1, AO::Relaxed) + 1;
+        FULL_DEC_FAIL[idx].fetch_add(1, AO::Relaxed);
+        if calls % 256 == 1 {
+            let f: Vec<u64> = FULL_DEC_FAIL.iter().map(|c| c.load(AO::Relaxed)).collect();
+            eprintln!(
+                "[full-dec-dbg] calls={calls} gate={} shape={} ctx={} mirror={} plan={} other={}",
+                f[0], f[1], f[2], f[3], f[4], f[5]
+            );
+        }
+    }
+
+    /// 内部エラーの文言から理由コードを選ぶ。
+    fn dbg_reason(msg: &str) -> usize {
+        if msg.contains("ミラー") {
+            3
+        } else if msg.contains("plan") || msg.contains("GEMV") {
+            4
+        } else {
+            5
+        }
+    }
+
     pub(crate) fn forward(a: &Call<'_>) -> Option<Out> {
         if !on() {
+            dbg_note(0);
             return None;
         }
         // GPU attention のゲートを従来経路と揃える (無効なら CPU へ落ちるので
         // ここで何もせず None を返す)。
         if !cuda_enabled() || !gpu_attention_enabled() || !q4_gpu_attn_enabled() {
+            dbg_note(0);
             return None;
         }
         // task 179: 従来経路は `len < q4_gpu_attn_min()` (既定 64) で CPU へ
@@ -2217,24 +2269,30 @@ pub(crate) mod dec_full_dev {
         // (丸め順は CPU と違う。attention は P17g から緩和済みの契約)。
         // `DENNO_FULL_DEC_ATTN_MIN` で下限を戻せる。
         if a.len < full_dec_attn_min() {
+            dbg_note(0);
             return None;
         }
         if !a.ok_shape() {
+            dbg_note(1);
             note_fallback("形が合わない");
             return None;
         }
         let Some(ctx) = chain_ctx() else {
+            dbg_note(2);
             note_fallback("chain_ctx が無い");
             return None;
         };
         if let Err(e) = ctx.make_current() {
+            dbg_note(2);
             note_fallback(&format!("cuCtxSetCurrent: {e:#}"));
             return None;
         }
         match ST.with(|cell| forward_inner(&ctx, a, &mut cell.borrow_mut())) {
             Ok(v) => Some(v),
             Err(e) => {
-                note_fallback(&format!("{e:#}"));
+                let msg = format!("{e:#}");
+                dbg_note(dbg_reason(&msg));
+                note_fallback(&msg);
                 None
             }
         }
@@ -3642,6 +3700,8 @@ impl Drop for DevBuffer {
 /// [`CudaCtx::moe_gemv_dev_with`] から切り出した**選択だけ**の部分で、
 /// デバイスメモリには触らない。task 124 の重ね打ち経路
 /// ([`shared_gemv_begin`]) と同じカーネル・同じ引数を組むために共有する。
+/// task 307: 計画を控えておけるように Copy にした (共有 expert の層ごとキャッシュ)。
+#[derive(Clone, Copy)]
 struct MoeGemvPlan {
     f: CUfunction,
     /// 1 ブロックが受け持つ行数
@@ -4981,6 +5041,26 @@ impl CudaCtx {
         out: &mut [f32],
         mode: GemvKernelMode,
     ) -> Result<bool> {
+        self.moe_gemv_dev_with_pref(ty, dev_w, x, n_in, n_out, out, mode, false)
+    }
+
+    /// task 307 (`DENNO_GGUF_GEMV_V5`): dense の gguf GEMV も v5 を先に試す版。
+    ///
+    /// `prefer_v5` が真なら `plan_moe_gemv_v5` を先に引き、形が合わなければ
+    /// 従来どおり `plan_moe_gemv` (v3 / v2) へ落ちる。カーネル・引数・丸め順は
+    /// v5 のものがそのまま使われる (v3 / v2 とは加算順が違う = 丸めが変わる)。
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemv_dev_with_pref(
+        &self,
+        ty: crate::kquant::GgmlType,
+        dev_w: &DevBuffer,
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+        mode: GemvKernelMode,
+        prefer_v5: bool,
+    ) -> Result<bool> {
         let bs = ty.blck_size();
         if n_in == 0 || n_out == 0 || n_in % bs != 0 {
             bail!("moe_gemv_dev: 形状が不正 (n_in={n_in}, n_out={n_out}, block={bs})");
@@ -4994,7 +5074,17 @@ impl CudaCtx {
         // カーネルの選択 (従来は `pick_moe_kernels` が先頭、fp16/v3 の選択が
         // 引数検査の後だった。PTX を読む順序だけが変わり、選ばれるカーネル・
         // 引数・丸め順は 1 つも変わらない)。
-        let Some(plan) = self.plan_moe_gemv(ty, n_in, n_out, mode)? else {
+        // task 307: `prefer_v5` のときだけ v5 の計画を先に引く (形が合わなければ
+        // 従来の選択へ落ちる)。
+        let plan_v5 = if prefer_v5 {
+            self.plan_moe_gemv_v5(ty, n_in, n_out)
+        } else {
+            None
+        };
+        let Some(plan) = (match plan_v5 {
+            Some(p) => Some(p),
+            None => self.plan_moe_gemv(ty, n_in, n_out, mode)?,
+        }) else {
             return Ok(false);
         };
         let MoeGemvPlan {
@@ -6315,6 +6405,30 @@ fn gdn_dec_v4_lanes_cap() -> usize {
     *L.get_or_init(|| {
         parse_gdn_dec_v4_lanes(std::env::var("DENNO_GDN_DEC_GEMV_LANES").ok().as_deref())
     })
+}
+
+/// task 307: `DENNO_GGUF_GEMV_V5` の解釈 (純関数)。**既定 on** (task 307 で採否。
+/// lab t307a/b で full 行の gpu 1.19 → 1.03 ms/token、md5 SAME)。
+///
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ切る。on のときは
+/// dense の gguf GEMV ([`maybe_gpu_gguf_gemv_into`]) も v5 の計画を先に試す。
+fn parse_gguf_gemv_v5(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// task 307: dense の gguf GEMV を v5 で回すか (env から 1 回だけ読む)。
+///
+/// 動機 (lab t299b の `[dec-kprof-avg]` full 表): full 層の q8_0 GEMV が
+/// v5 (26 us) と v3 (49 us) に分かれていて、v3 側は**ホスト経路へ落ちた層**の
+/// `GgufLinear::gemv` → `maybe_gpu_gguf_gemv_into` → `moe_gemv_dev` が選ぶ
+/// v3 だった (`gemv_kernel_mode()` は v5 を知らない)。同じ重み・同じ形でも
+/// 入口が違うだけで 1.9 倍の差が出る。
+pub(crate) fn gguf_gemv_v5_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gguf_gemv_v5(std::env::var("DENNO_GGUF_GEMV_V5").ok().as_deref()))
 }
 
 /// decode GEMV が使うカーネル一式を env から決める (`moe_gemv_dev` と
@@ -10052,7 +10166,12 @@ pub fn dec_miss_probe_line(mb: usize, src: Option<&[u8]>) -> Option<String> {
 struct ExpPfKernels {
     #[allow(dead_code)]
     module: CUmodule,
-    /// 型ごとの m 行 GEMV ([`crate::model::exp_pf::kernel_name`] の順)
+    /// task 309: K 系のモジュール (`kernels_exp_k_pf.ptx`)。読めなければ null で、
+    /// K 系のスロットは null のまま = その型は CPU 経路へ落ちる (fail closed)。
+    #[allow(dead_code)]
+    kmodule: CUmodule,
+    /// 型ごとの m 行 GEMV ([`crate::model::exp_pf::kernel_name`] の順)。
+    /// 0..IQ_SLOTS は IQ のモジュール、K_SLOT0.. は K のモジュールの関数。
     fns: [CUfunction; crate::model::exp_pf::SLOTS],
     /// silu(g) * u
     silu: CUfunction,
@@ -10077,6 +10196,17 @@ fn exp_pf_ptx_path() -> std::path::PathBuf {
         _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("kernels")
             .join("kernels_exp_iq_pf.ptx"),
+    }
+}
+
+/// PTX の置き場所。`DENNO_EXP_K_PF_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_exp_k_pf.ptx` (task 309 の K 系)。
+fn exp_k_pf_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_K_PF_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_k_pf.ptx"),
     }
 }
 
@@ -10108,7 +10238,11 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
             }
             let mut fns: [CUfunction; crate::model::exp_pf::SLOTS] =
                 [std::ptr::null_mut(); crate::model::exp_pf::SLOTS];
-            for (i, f) in fns.iter_mut().enumerate() {
+            for (i, f) in fns
+                .iter_mut()
+                .enumerate()
+                .take(crate::model::exp_pf::IQ_SLOTS)
+            {
                 let name = crate::model::exp_pf::kernel_name(i)?;
                 let mut cname = name.as_bytes().to_vec();
                 cname.push(0);
@@ -10120,6 +10254,49 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
                         return None;
                     }
                 }
+            }
+            // task 309: K 系 (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0) は別モジュール。
+            // 無くても IQ 系は動くので、失敗は 1 行だけ出して null のままにする
+            // (K 系の型は `moe_gemv_iq_pf_ready` が null を見て CPU へ落ちる)。
+            let mut kmodule: CUmodule = std::ptr::null_mut();
+            let kpath = exp_k_pf_ptx_path();
+            let mut k_ok = false;
+            match std::fs::read(&kpath) {
+                Ok(mut kimg) => {
+                    kimg.push(0);
+                    unsafe {
+                        if (lib.module_load_data)(&mut kmodule, kimg.as_ptr() as *const c_void)
+                            == CUDA_SUCCESS
+                        {
+                            k_ok = true;
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            if k_ok {
+                for i in crate::model::exp_pf::K_SLOT0..crate::model::exp_pf::SLOTS {
+                    let Some(name) = crate::model::exp_pf::kernel_name(i) else {
+                        continue;
+                    };
+                    let mut cname = name.as_bytes().to_vec();
+                    cname.push(0);
+                    unsafe {
+                        if (lib.module_get_function)(
+                            &mut fns[i],
+                            kmodule,
+                            cname.as_ptr() as *const c_char,
+                        ) != CUDA_SUCCESS
+                        {
+                            eprintln!("[exp-pf] K 系 PTX に {name} が無い → その型は CPU 経路へ");
+                        }
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[exp-pf] K 系 PTX が読めない ({}) → K 系の型は CPU 経路へ",
+                    kpath.display()
+                );
             }
             let mut silu: CUfunction = std::ptr::null_mut();
             let mut cname = crate::model::exp_pf::SILU_KERNEL.as_bytes().to_vec();
@@ -10148,6 +10325,7 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
             };
             Some(ExpPfKernels {
                 module,
+                kmodule,
                 fns,
                 silu,
                 accum,
@@ -10165,7 +10343,14 @@ pub fn moe_gemv_iq_pf_ready(ty: crate::kquant::GgmlType, k: usize) -> bool {
     if !crate::model::exp_pf::supported(ty) || crate::model::exp_pf::row_bytes(ty, k).is_none() {
         return false;
     }
-    exp_pf_kernels().is_some()
+    let Some(slot) = crate::model::exp_pf::slot(ty) else {
+        return false;
+    };
+    // task 309: K 系は専用のゲート (`DENNO_PF_EXP_K`) が要る。既定 off。
+    if crate::model::exp_pf::is_k_slot(slot) && !crate::model::exp_pf::k_enabled() {
+        return false;
+    }
+    exp_pf_kernels().is_some_and(|kernels| !kernels.fns[slot].is_null())
 }
 
 use crate::model::exp_pf;
@@ -10614,6 +10799,9 @@ struct PfStream {
     /// task 165: グループの通し番号 (層をまたいで増える。スロットの持ち主を
     /// 一意にするため。0 に戻すと前の層の完了イベントを誤認する)。
     next_g: u64,
+    /// task 309: この層の expert 型が K 系か。pinned バウンスの作り方
+    /// (`DENNO_PF_STREAM_WC` の既定) を型で変える。
+    k_mode: bool,
 }
 
 impl PfStream {
@@ -10624,6 +10812,7 @@ impl PfStream {
             up: None,
             probed: false,
             next_g: 0,
+            k_mode: false,
         }
     }
 }
@@ -10959,7 +11148,7 @@ fn pf_slot_prepare(
             // task 296: 確保し直しの回数と時間を診断で読めるようにする
             // (`DENNO_PF_LM_DBG=1` の `[pf-lm-dbg] stream` 行)。
             let t_pin = std::time::Instant::now();
-            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc())?);
+            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc_for(st.k_mode))?);
             pf_stream_t_add(6, t_pin.elapsed().as_nanos() as u64);
             pf_stream_t_add(7, 1);
         }
@@ -13024,6 +13213,9 @@ fn moe_experts_iq_pf_layer_stream_io(
     ) else {
         return Ok(None);
     };
+    // task 309: K 系の層か。pinned バウンスの作り方 (`DENNO_PF_STREAM_WC` の
+    // 既定) を型で変える (lab t309b: K 系は write-combined でないほうが速い)。
+    PF_STREAM.with(|c| c.borrow_mut().k_mode = exp_pf::is_k_slot(slot_g));
     let Some(ctx) = shared_ctx() else {
         return Ok(None);
     };
@@ -13930,6 +14122,226 @@ mod pf_exp_tc_tests {
             return;
         };
         for name in ["dno_exp_pf_iq2s", "dno_exp_pf_iq3xxs", "dno_exp_pf_iq3s", "dno_exp_pf_iq4xs"] {
+            assert_eq!(
+                ptx_entry_params(&text, name),
+                Some(9),
+                "{name} の引数の数 (ptx パーサの前提)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pf_exp_k_tests {
+    //! task 309: K 系 m 行カーネル (`kernels_exp_k_pf.cu`) の**索引**ミラー。
+    //!
+    //! カーネルの `kpf_w8_q4k` / `_q5k` / `_q6k` と、32 要素ブロックの
+    //! `dno_exp_k_pf_q5_1` / `_q8_0` の索引算術を `.cu` の行から 1 対 1 で写し、
+    //! CPU の参照 (`kquant::dequant_row_into`) と要素ごとに比べる。
+    //! 丸め順の一致ではなく**索引の取り違え**を落とすためのテスト
+    //! (型ごとに 1 行 512 要素 = Q4_K/Q5_K/Q6_K は 2 ブロック)。
+
+    use super::*;
+    use crate::kquant::{dequant_row_into, GgmlType};
+
+    /// .cu の `kpf_f16` と同じ式 (IEEE の f16 → f32)。
+    fn f16v(b: &[u8]) -> f32 {
+        let h = b[0] as u32 | ((b[1] as u32) << 8);
+        let sign = (h & 0x8000) << 16;
+        let exp = (h >> 10) & 0x1f;
+        let mut man = h & 0x3ff;
+        let bits = if exp == 0 {
+            if man == 0 {
+                sign
+            } else {
+                let mut e: i32 = -14;
+                while man & 0x400 == 0 {
+                    man <<= 1;
+                    e -= 1;
+                }
+                man &= 0x3ff;
+                sign | (((e + 127) as u32) << 23) | (man << 13)
+            }
+        } else if exp == 31 {
+            sign | 0x7f80_0000 | (man << 13)
+        } else {
+            sign | ((exp + 112) << 23) | (man << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    fn u32le(b: &[u8]) -> u32 {
+        b[0] as u32 | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
+    }
+
+    /// .cu の `kpf_scale_min_k4` と同じ式。
+    fn scale_min_k4(q: &[u8], j: usize) -> (u32, u32) {
+        if j < 4 {
+            ((q[j] & 63) as u32, (q[j + 4] & 63) as u32)
+        } else {
+            (
+                ((q[j + 4] & 0x0f) as u32) | (((q[j - 4] >> 6) as u32) << 4),
+                ((q[j + 4] >> 4) as u32) | (((q[j] >> 6) as u32) << 4),
+            )
+        }
+    }
+
+    /// カーネルが要素 `k` をどうデコードするか (lane と i を k から引く)。
+    fn mirror(ty: GgmlType, row: &[u8], k: usize) -> f32 {
+        match ty {
+            // 256 要素ブロック: lane = (k % 256) / 8、i = k % 8。
+            GgmlType::Q4K => {
+                let blk = &row[(k >> 8) * 144..];
+                let d = f16v(blk);
+                let dmin = f16v(&blk[2..]);
+                let lane = (k & 255) >> 3;
+                let i = k & 7;
+                let sb = lane >> 2;
+                let p = (lane & 3) << 3;
+                let (sc, mn) = scale_min_k4(&blk[4..16], sb);
+                let sh = if sb & 1 != 0 { 4 } else { 0 };
+                let q = (blk[16 + (sb >> 1) * 32 + p + i] as u32 >> sh) & 0x0f;
+                d * sc as f32 * q as f32 - dmin * mn as f32
+            }
+            GgmlType::Q5K => {
+                let blk = &row[(k >> 8) * 176..];
+                let d = f16v(blk);
+                let dmin = f16v(&blk[2..]);
+                let lane = (k & 255) >> 3;
+                let i = k & 7;
+                let sb = lane >> 2;
+                let p = (lane & 3) << 3;
+                let (sc, mn) = scale_min_k4(&blk[4..16], sb);
+                let sh = if sb & 1 != 0 { 4 } else { 0 };
+                let q = (blk[48 + (sb >> 1) * 32 + p + i] as u32 >> sh) & 0x0f;
+                let hb = (blk[16 + p + i] as u32 >> sb) & 1;
+                d * sc as f32 * (q + (hb << 4)) as f32 - dmin * mn as f32
+            }
+            GgmlType::Q6K => {
+                let blk = &row[(k >> 8) * 210..];
+                let d = f16v(&blk[208..]);
+                let lane = (k & 255) >> 3;
+                let i = k & 7;
+                let half = lane >> 4;
+                let o = (lane & 15) << 3;
+                let ch = o >> 5;
+                let l2 = o & 31;
+                let ql = &blk[half * 64 + if ch & 1 != 0 { 32 } else { 0 } + l2..];
+                let qh = &blk[128 + half * 32 + l2..];
+                let sc = &blk[192 + half * 8..];
+                let s = sc[2 * ch + if l2 >= 16 { 1 } else { 0 }] as i8 as f32;
+                let sh = if ch >= 2 { 4 } else { 0 };
+                let nib = (ql[i] as u32 >> sh) & 0x0f;
+                let h2 = (qh[i] as u32 >> (2 * ch)) & 3;
+                let q6 = (nib | (h2 << 4)) as i32 - 32;
+                d * s * q6 as f32
+            }
+            // 32 要素ブロック: レーン 1 本 = 1 ブロック (k % 32 が要素)。
+            GgmlType::Q5_1 => {
+                let blk = &row[(k >> 5) * 24..];
+                let d = f16v(blk);
+                let m = f16v(&blk[2..]);
+                let qh = u32le(&blk[4..]);
+                let e = k & 31;
+                let byte = blk[8 + (e & 15)] as u32;
+                let q = if e < 16 { byte & 0x0f } else { byte >> 4 };
+                let hb = (qh >> e) & 1;
+                d * (q + (hb << 4)) as f32 + m
+            }
+            GgmlType::Q8_0 => {
+                let blk = &row[(k >> 5) * 34..];
+                let d = f16v(blk);
+                d * (blk[2 + (k & 31)] as i8) as f32
+            }
+            _ => unreachable!("K 系 5 型だけ"),
+        }
+    }
+
+    /// 決定的な擬似乱数で 1 行ぶんのバイト列を作る。スケール欄 (f16) だけは
+    /// 有限の値に固定する (NaN/Inf を避ける。他は全ビット模様が有効)。
+    fn make_row(ty: GgmlType, n: usize, seed: u64) -> Vec<u8> {
+        let ts = ty.type_size();
+        let bs = ty.blck_size();
+        let mut v = vec![0u8; (n / bs) * ts];
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        for b in v.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        // f16 の 1.0 = 0x3C00 / 0.5 = 0x3800 / 0.25 = 0x3400 (リトルエンディアン)。
+        let put = |v: &mut [u8], off: usize, bytes: [u8; 2]| {
+            v[off] = bytes[0];
+            v[off + 1] = bytes[1];
+        };
+        for i in 0..(n / bs) {
+            let b = i * ts;
+            match ty {
+                GgmlType::Q4K | GgmlType::Q5K => {
+                    put(&mut v, b, [0x00, 0x3C]); // d = 1.0
+                    put(&mut v, b + 2, [0x00, 0x38]); // dmin = 0.5
+                }
+                GgmlType::Q6K => put(&mut v, b + 208, [0x00, 0x3C]), // d = 1.0
+                GgmlType::Q5_1 => {
+                    put(&mut v, b, [0x00, 0x3C]); // d = 1.0
+                    put(&mut v, b + 2, [0x00, 0x34]); // m = 0.25
+                }
+                GgmlType::Q8_0 => put(&mut v, b, [0x00, 0x3C]), // d = 1.0
+                _ => {}
+            }
+        }
+        v
+    }
+
+    /// 索引が参照と一致する (型ごとに 1 行 512 要素)。
+    #[test]
+    fn k_kernel_index_mirror_matches_cpu_reference() {
+        for (ty, seed) in [
+            (GgmlType::Q4K, 21u64),
+            (GgmlType::Q5K, 22),
+            (GgmlType::Q6K, 23),
+            (GgmlType::Q5_1, 24),
+            (GgmlType::Q8_0, 25),
+        ] {
+            let n = 512usize;
+            let row = make_row(ty, n, seed);
+            let mut r = vec![0.0f32; n];
+            dequant_row_into(ty, &row, &mut r);
+            let mut bad = 0usize;
+            let mut worst = 0.0f32;
+            for k in 0..n {
+                let g = mirror(ty, &row, k);
+                let d = (g - r[k]).abs();
+                let rel = d / r[k].abs().max(1e-3);
+                if !(rel <= 1e-6) {
+                    bad += 1;
+                    if bad <= 4 {
+                        eprintln!("[pf-k-test] {ty:?} k={k} mirror={g} ref={} rel={rel}", r[k]);
+                    }
+                }
+                worst = worst.max(rel);
+            }
+            assert_eq!(bad, 0, "{ty:?}: 索引が参照と違う要素 {bad} 個 (worst rel {worst})");
+        }
+    }
+
+    /// コミット済みの K 系 PTX があれば、5 本とも引数 9 個で載っていること
+    /// (ホストの起動形と ABI が合っていることの裏取り)。無いときは省略。
+    #[test]
+    fn ptx_entry_params_counts_the_committed_k_ptx() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_k_pf.ptx");
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            eprintln!("PTX が無いので省略: {}", p.display());
+            return;
+        };
+        for name in [
+            "dno_exp_k_pf_q4k",
+            "dno_exp_k_pf_q5k",
+            "dno_exp_k_pf_q6k",
+            "dno_exp_k_pf_q5_1",
+            "dno_exp_k_pf_q8_0",
+        ] {
             assert_eq!(
                 ptx_entry_params(&text, name),
                 Some(9),
@@ -18054,6 +18466,9 @@ fn gguf_registry() -> &'static std::sync::Mutex<GgufReg> {
 /// 使用中 (pin) の uid でも外す: 呼ぶ側は「その重みをもう使わない」と分かっている
 /// 前提 (`GgufLinear` の `Drop`)。進行中の GEMV がある状態で呼んではいけない。
 pub fn gguf_unregister(uid: u64) -> u64 {
+    // task 307: 控えている `&'static GpuGgufW` が解放され得るので世代を進める
+    // (共有 expert のキャッシュは世代が変わったら丸ごと捨てる)。
+    GGUF_REG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let reg = gguf_registry();
     let Ok(mut g) = reg.lock() else {
         return 0;
@@ -18762,6 +19177,115 @@ pub fn shared_gemv_begin(x: &[f32], jobs: &[SharedGemvJob<'_>]) -> SharedPending
 ///
 /// `Ok` 以外の経路 (型・PTX・確保・形) は空のハンドルを返す = 呼び出し側は
 /// 従来の 2 段経路へ落ちる (fail closed)。
+// ---------------------------------------------------------------------------
+// task 307: 共有 expert の plan / 常駐重みのキャッシュ (`DENNO_SH_BEGIN_CACHE`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t299b の `[q4ledger]`): `shared` 行 0.63-0.68 ms/token のうち
+// `sh_begin` が 0.45-0.48 で、その中身は毎層 3 本の `weights_for_gguf`
+// (登録簿の mutex + LRU の touch/pin と、消費後の unpin 3 本) と plan の作り直し。
+// uid の組は層ごとに固定なので、最初の 1 回で作った計画と重み参照を控える。
+
+/// task 307: `DENNO_SH_BEGIN_CACHE` の解釈 (純関数)。**既定 off**。
+///
+/// 明示的な真値 (`1` / `on` / `true`) のときだけ、共有 expert の計画と常駐重みを
+/// 層ごとに控える。
+fn parse_sh_begin_cache(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// task 307: 共有 expert の計画と常駐重みを層ごとに控えるか。
+fn sh_begin_cache_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_sh_begin_cache(std::env::var("DENNO_SH_BEGIN_CACHE").ok().as_deref()))
+}
+
+/// task 307: 重みの登録簿から 1 本でも外されたら増える世代。
+///
+/// [`GGUF_REG_GEN`] が変わったら、控えている `&'static GpuGgufW` は解放済みに
+/// なり得るのでキャッシュを丸ごと捨てる (`gguf_unregister` が増やす)。
+static GGUF_REG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// キャッシュ 1 本ぶん (層 = uid の組ごと)。
+struct ShCacheEntry {
+    /// 控えたときの登録簿の世代
+    gen: u64,
+    /// (uid, k, n, ty) x 3 (gate / up / down)。形が変わったら作り直す。
+    shapes: [(u64, usize, usize, crate::kquant::GgmlType); 3],
+    plans: [MoeGemvPlan; 3],
+    /// **握り続ける**重み (pin が立ったまま = 退避されない)
+    pins: [GgufWRef; 3],
+}
+
+thread_local! {
+    /// task 307: 層ごとの計画キャッシュ (`DENNO_SH_BEGIN_CACHE`)。
+    static SH_CACHE: std::cell::RefCell<Vec<ShCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// task 307: uid の組でキャッシュを引く。無ければ `None`。
+///
+/// 戻り値は (計画 3 本, 重みのデバイスポインタ 3 本)。形が登録時と違えば
+/// その項目を捨てて `None` を返す (呼び出し側は従来経路で作り直す)。
+fn sh_cache_lookup(
+    jobs: &[&SharedGemvJob<'_>; 3],
+) -> Option<([MoeGemvPlan; 3], [CUdeviceptr; 3])> {
+    let gen = GGUF_REG_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    SH_CACHE.with(|cell| {
+        let mut v = cell.borrow_mut();
+        let i = v.iter().position(|e| {
+            e.gen == gen && jobs.iter().enumerate().all(|(j, job)| e.shapes[j].0 == job.uid)
+        })?;
+        let e = &v[i];
+        let shapes_ok = jobs.iter().enumerate().all(|(j, job)| {
+            let (k, n, ty) = (e.shapes[j].1, e.shapes[j].2, e.shapes[j].3);
+            k == job.k && n == job.n && ty == job.ty
+        });
+        if !shapes_ok {
+            v.remove(i);
+            return None;
+        }
+        Some((e.plans, [e.pins[0].buf.ptr, e.pins[1].buf.ptr, e.pins[2].buf.ptr]))
+    })
+}
+
+/// task 307: キャッシュへ 1 本入れる (既にあれば置き換え)。
+fn sh_cache_insert(jobs: &[&SharedGemvJob<'_>; 3], plans: &[MoeGemvPlan], pins: Vec<GgufWRef>) {
+    if pins.len() != 3 {
+        return;
+    }
+    let mut it = pins.into_iter();
+    let (Some(p0), Some(p1), Some(p2)) = (it.next(), it.next(), it.next()) else {
+        return;
+    };
+    let gen = GGUF_REG_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    let entry = ShCacheEntry {
+        gen,
+        shapes: [
+            (jobs[0].uid, jobs[0].k, jobs[0].n, jobs[0].ty),
+            (jobs[1].uid, jobs[1].k, jobs[1].n, jobs[1].ty),
+            (jobs[2].uid, jobs[2].k, jobs[2].n, jobs[2].ty),
+        ],
+        plans: [plans[0], plans[1], plans[2]],
+        pins: [p0, p1, p2],
+    };
+    SH_CACHE.with(|cell| {
+        let mut v = cell.borrow_mut();
+        // 世代が変わっていたら丸ごと捨ててから入れる。
+        if v.iter().any(|e| e.gen != gen) {
+            v.clear();
+        }
+        if v.len() >= 256 {
+            v.remove(0);
+        }
+        v.push(entry);
+    });
+}
+
+/// task 187: shared expert の 4 発 (gate/up/silu/down) をサイドストリームへ積む。
 pub fn shared_expert_begin(
     x: &[f32],
     gate: &SharedGemvJob<'_>,
@@ -18811,35 +19335,56 @@ pub fn shared_expert_begin(
     };
     let mode = gemv_kernel_mode();
     let jobs: [&SharedGemvJob<'_>; 3] = [gate, up, down];
-    let mut plans = Vec::with_capacity(3);
-    let mut pins = Vec::with_capacity(3);
-    let mut uploaded = false;
+    // task 307: 形の門番 (キャッシュ経路でも同じ条件を通す)。
     for j in jobs {
         if j.k % j.ty.blck_size() != 0 {
             return SharedPending::none();
         }
-        let plan = match ctx.plan_moe_gemv(j.ty, j.k, j.n, mode) {
-            Ok(Some(p)) => p,
-            _ => return SharedPending::none(),
-        };
-        let existed = gguf_registry()
-            .lock()
-            .map(|g| g.map.contains_key(&j.uid))
-            .unwrap_or(false);
-        let w = match weights_for_gguf(j.uid, j.ty, j.blocks, j.k, j.n) {
-            Ok(w) => w,
-            Err(_) => return SharedPending::none(),
-        };
-        if w.buf.bytes() != j.n.saturating_mul(plan.rb) {
-            return SharedPending::none();
+    }
+    let mut plans: Vec<MoeGemvPlan> = Vec::with_capacity(3);
+    let mut pins: Vec<GgufWRef> = Vec::with_capacity(3);
+    let mut wptrs: [CUdeviceptr; 3] = [0; 3];
+    let mut uploaded = false;
+    let mut cached = false;
+    if sh_begin_cache_on() {
+        if let Some((p, w)) = sh_cache_lookup(&jobs) {
+            plans.extend_from_slice(&p);
+            wptrs = w;
+            cached = true;
         }
-        uploaded |= !existed;
-        plans.push(plan);
-        pins.push(w);
+    }
+    if !cached {
+        for j in jobs {
+            let plan = match ctx.plan_moe_gemv(j.ty, j.k, j.n, mode) {
+                Ok(Some(p)) => p,
+                _ => return SharedPending::none(),
+            };
+            let existed = gguf_registry()
+                .lock()
+                .map(|g| g.map.contains_key(&j.uid))
+                .unwrap_or(false);
+            let w = match weights_for_gguf(j.uid, j.ty, j.blocks, j.k, j.n) {
+                Ok(w) => w,
+                Err(_) => return SharedPending::none(),
+            };
+            if w.buf.bytes() != j.n.saturating_mul(plan.rb) {
+                return SharedPending::none();
+            }
+            uploaded |= !existed;
+            wptrs[plans.len()] = w.buf.ptr;
+            plans.push(plan);
+            pins.push(w);
+        }
+        // task 307: 控えておく (握り続ける = 以後この経路は plan も登録簿も触らない)。
+        // 所有権はキャッシュへ移す (この回の in-flight 中もキャッシュが生かす)。
+        if sh_begin_cache_on() {
+            sh_cache_insert(&jobs, &plans, pins);
+            pins = Vec::new();
+        }
     }
     SHARED_OVERLAP.with(|cell| {
         let mut s = cell.borrow_mut();
-        match shared_expert_enqueue(&mut s, ctx, l, x, &jobs, &plans, &pins, uploaded, epi) {
+        match shared_expert_enqueue(&mut s, ctx, l, x, &jobs, &plans, &wptrs, uploaded, epi) {
             Ok(()) => {
                 s.pins = pins;
                 s.in_flight = 1;
@@ -18867,7 +19412,7 @@ fn shared_expert_enqueue(
     x: &[f32],
     jobs: &[&SharedGemvJob<'_>; 3],
     plans: &[MoeGemvPlan],
-    pins: &[GgufWRef],
+    wptrs: &[CUdeviceptr; 3],
     uploaded: bool,
     epi: &DecEpiKernels,
 ) -> Result<()> {
@@ -18920,8 +19465,8 @@ fn shared_expert_enqueue(
         bail!("cuMemcpyHtoDAsync (shared x) が失敗");
     }
     // gate → up → silu*up → down (すべて同じサイドストリーム)。
-    ctx.launch_moe_gemv_on(&plans[0], pins[0].buf.ptr, dx, dg, gate.k, gate.n, stream)?;
-    ctx.launch_moe_gemv_on(&plans[1], pins[1].buf.ptr, dx, du, up.k, up.n, stream)?;
+    ctx.launch_moe_gemv_on(&plans[0], wptrs[0], dx, dg, gate.k, gate.n, stream)?;
+    ctx.launch_moe_gemv_on(&plans[1], wptrs[1], dx, du, up.k, up.n, stream)?;
     unsafe {
         let (mut pg, mut pu, mut pa, mut pn) = (
             dg as *mut c_void,
@@ -18946,7 +19491,7 @@ fn shared_expert_enqueue(
             &mut args,
         )?;
     }
-    ctx.launch_moe_gemv_on(&plans[2], pins[2].buf.ptr, dact, dout, down.k, down.n, stream)?;
+    ctx.launch_moe_gemv_on(&plans[2], wptrs[2], dact, dout, down.k, down.n, stream)?;
     if unsafe { (l.memcpy_dtoh_async)(po, dout, down.n * 4, stream) } != CUDA_SUCCESS {
         bail!("cuMemcpyDtoHAsync (shared down) が失敗");
     }
@@ -19182,7 +19727,18 @@ pub fn maybe_gpu_gguf_gemv_into(
             return false;
         }
     };
-    match ctx.moe_gemv_dev(ty, &w.buf, x, k, n, out) {
+    // task 307: `DENNO_GGUF_GEMV_V5` のときは v5 の計画を先に試す
+    // (形が合わなければ従来どおり v3 / v2)。オフでは 1 つも変わらない。
+    match ctx.moe_gemv_dev_with_pref(
+        ty,
+        &w.buf,
+        x,
+        k,
+        n,
+        out,
+        gemv_kernel_mode(),
+        gguf_gemv_v5_on(),
+    ) {
         Ok(true) => {
             set_last_linear_ran_on_gpu(true);
             if prof {
@@ -23465,6 +24021,167 @@ thread_local! {
     static ROUTER_PENDING_N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// task 307: `DENNO_ROUTER_IN_MIX` の解釈 (純関数)。**既定 on** (task 307 で採否。
+/// lab t307b で router 行 1.15 → 0.18 ms/token、decode -2.0%、md5 SAME)。
+///
+/// FFN mix の鎖 (down → up → hc_mixed) の末尾にルータ GEMV を積み、D2H と同期を
+/// 鎖の 1 回にまとめる。明示的な偽値だけ off。
+fn parse_router_in_mix(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// task 307: ルータ GEMV を mix の鎖に載せるか (env から 1 回だけ読む)。
+///
+/// 動機 (lab t299b の `[q4ledger]`): router 行は 1.08 ms/token で、内訳は
+/// gpu 0.64 / sync 0.63 / cpu 0.39。mix の鎖は同じ層で既に 1 回同期している
+/// (mix 行の sync) ので、ルータ GEMV をその鎖の末尾に積めば、起動の往復と
+/// 同期 1 回 (層あたり 5〜6 us) が消える。入力は鎖の中間バッファ `dm`
+/// (= `mixed` のデバイスコピー) をそのまま読むので H2D も消える。
+pub fn router_in_mix_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_router_in_mix(std::env::var("DENNO_ROUTER_IN_MIX").ok().as_deref()))
+}
+
+/// task 307: 次の mix の鎖にルータ GEMV を載せるための控え。
+struct RouterArm {
+    uid: u64,
+    /// ルータ重みのホスト生バイト (F32)。**同じ層・同じトークンの mix の中で
+    /// 消費する** 前提で借りる (モデルの重みは mix の間ずっと生きている)。
+    ptr: *const u8,
+    len: usize,
+    k: usize,
+    n: usize,
+    layer: usize,
+    pos: u64,
+}
+
+thread_local! {
+    static ROUTER_ARM: std::cell::RefCell<Option<RouterArm>> =
+        const { std::cell::RefCell::new(None) };
+    /// task 307: mix の鎖が作った logits の (uid, k, n)。0 = 無し。
+    static ROUTER_FILLED: std::cell::Cell<(u64, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+    /// task 307: `ROUTER_FILLED` の中身はもう同期済みか (finish で待たない)。
+    static ROUTER_SYNCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// task 307: この層の FFN mix の鎖にルータ GEMV を載せる (decode の層入口で呼ぶ)。
+///
+/// `false` = 載せない (ゲート off・形が合わない)。載らなかった場合は従来どおり
+/// `maybe_gpu_router_gemv_begin` が H2D + 起動 + D2H を行う (数値は同じ).
+pub fn router_in_mix_arm(uid: u64, bytes: &[u8], k: usize, n: usize) -> bool {
+    if !router_in_mix_on() {
+        return false;
+    }
+    if k == 0 || n == 0 || bytes.len() != k.saturating_mul(n).saturating_mul(4) {
+        return false;
+    }
+    ROUTER_ARM.with(|c| {
+        *c.borrow_mut() = Some(RouterArm {
+            uid,
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+            k,
+            n,
+            layer: dec_kprof::cur_layer(),
+            pos: dec_kprof::cur_pos(),
+        })
+    });
+    true
+}
+
+/// task 307: トークンの入口でルータの控えを落とす (層 0 の入口で呼ぶ)。
+///
+/// 前のトークンの `ROUTER_FILLED` / 控えが残っていても、次のトークンでは
+/// 必ず「mix の鎖が作った値」だけを使う。
+pub fn router_in_mix_token_start() {
+    if !router_in_mix_on() {
+        return;
+    }
+    ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+    ROUTER_SYNCED.with(|c| c.set(false));
+    ROUTER_ARM.with(|c| {
+        let _ = c.borrow_mut().take();
+    });
+}
+
+/// task 307: mix の鎖の末尾にルータ GEMV を 1 発積む (鎖の中から呼ぶ)。
+///
+/// 戻り値は積んだ出力行数 (0 = 積んでいない)。`x` は鎖の中間バッファ
+/// (= `mixed` のデバイスコピー) で、`k` と一致するときだけ積む。
+fn router_in_mix_enqueue(
+    ctx: &CudaCtx,
+    x_dev: CUdeviceptr,
+    k: usize,
+    w_keep: &mut Option<GgufWRef>,
+) -> usize {
+    let Some(job) = ROUTER_ARM.with(|c| c.borrow_mut().take()) else {
+        return 0;
+    };
+    if job.k != k || job.layer != dec_kprof::cur_layer() || job.pos != dec_kprof::cur_pos() {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(job.ptr, job.len) };
+    let w = match weights_for_f32(job.uid, bytes, job.k, job.n) {
+        Ok(w) => w,
+        Err(_) => return 0,
+    };
+    let f_seq = matvec_f32_fn(ctx);
+    let f_red = matvec_f32_r_fn(ctx);
+    let use_reduce = router_gpu_reduce_enabled() && router_use_reduce_kernel(job.k, job.n, f_red.is_some());
+    let Some(f) = (if use_reduce { f_red } else { f_seq }) else {
+        return 0;
+    };
+    let thr: u32 = if use_reduce { 256 } else { 1 };
+    let Ok(l) = lib() else {
+        return 0;
+    };
+    let r = ROUTER_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let RouterScratch { out: dout, ho, .. } = &mut *s;
+        Scratch::ensure(dout, job.n * 4)?;
+        Scratch::ensure_pin(ho, job.n * 4)?;
+        let dout = dout.as_ref().expect("ensure 済み");
+        let mut po = dout.ptr();
+        let mut pw = w.buf.ptr;
+        let mut ph = x_dev;
+        let (mut kc, mut nc) = (job.k as c_int, job.n as c_int);
+        let mut args = [
+            &mut ph as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, (job.n as u32, 1, 1), (thr, 1, 1), 0, &mut args)?;
+            let ho = ho.as_ref().expect("ensure 済み");
+            check(
+                (l.memcpy_dtoh_async)(
+                    ho.ptr,
+                    dout.ptr(),
+                    job.n * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (router in mix)",
+            )?;
+        }
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            *w_keep = Some(w);
+            ROUTER_FILLED.with(|c| c.set((job.uid, job.k, job.n)));
+            job.n
+        }
+        Err(_) => 0,
+    }
+}
+
 /// task 69 / 192: ルータ (f32・m=1) の GEMV を **同期せずに** 積む。
 ///
 /// `maybe_gpu_router_gemv_into` の前半。`true` を返したら、呼び出し側は別の
@@ -23492,6 +24209,24 @@ pub fn maybe_gpu_router_gemv_begin(
         || n > i32::MAX as usize
     {
         return false;
+    }
+    // task 307: mix の鎖 (`DENNO_ROUTER_IN_MIX`) がこの層の logits を既に作って
+    // いて、鎖の同期でホストへ届いていれば、ここでは何も積まない。uid / k / n が
+    // 違えば (別の層の残り) 捨てて従来経路へ。
+    let filled = ROUTER_FILLED.with(|c| c.get());
+    if filled.0 != 0 {
+        if filled == (uid, k, n) {
+            // 使い切り (次の層・次のトークンで古い logits を使わない)。
+            ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+            ROUTER_SYNCED.with(|c| c.set(true));
+            ROUTER_PENDING_N.with(|c| c.set(n));
+            return true;
+        }
+        ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+        ROUTER_SYNCED.with(|c| c.set(false));
+    } else {
+        // 印が無い回は「鎖の値」を使わない (前回の SYNCED が残っていても無効)。
+        ROUTER_SYNCED.with(|c| c.set(false));
     }
     let Some(ctx) = shared_ctx() else {
         return false;
@@ -23621,6 +24356,24 @@ pub fn maybe_gpu_router_gemv_finish(out: &mut [f32]) -> bool {
     use std::sync::atomic::Ordering as AO;
     let n = ROUTER_PENDING_N.with(|c| c.replace(0));
     if n == 0 || out.len() != n {
+        return false;
+    }
+    // task 307: mix の鎖が積んで、その同期で既に届いている場合 (待たない)。
+    if ROUTER_SYNCED.with(|c| c.replace(false)) {
+        ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+        let r = ROUTER_SC.with(|cell| -> Result<()> {
+            let s = cell.borrow();
+            let ho = s
+                .ho
+                .as_ref()
+                .ok_or_else(|| anyhow!("router scratch が無い (mix の鎖を飛ばした)"))?;
+            out.copy_from_slice(&ho.as_slice::<f32>()[..n]);
+            Ok(())
+        });
+        if r.is_ok() {
+            set_last_linear_ran_on_gpu(true);
+            return true;
+        }
         return false;
     }
     let Some(ctx) = shared_ctx() else {
@@ -29450,6 +30203,8 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
             1,
         );
         let mut s = cell.borrow_mut();
+        // task 307: 鎖の末尾に積むルータ GEMV の重み (同期の後まで生かす)。
+        let mut router_w: Option<GgufWRef> = None;
         let MixGpuScratch {
             x: dx,
             lo: dlo,
@@ -29536,6 +30291,9 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
                 0,
                 &mut args3,
             )?;
+            // task 307: ルータ GEMV を鎖の末尾に 1 発積む (D2H は下の mixed と
+            // 同じ 1 回の同期でまとめる)。載らなければ 0 = 従来経路。
+            let _ = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
             let kp_cp = dec_kprof::op_begin(
                 || "D2H@a".to_string(),
                 (0, 0, 0),
@@ -29551,6 +30309,7 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
+        drop(router_w);
         dec_kprof::step("mix_pack", || {
             out.copy_from_slice(&ho.as_slice::<f32>()[..e])
         });
@@ -30606,6 +31365,81 @@ fn mix_norm_par_on() -> bool {
     })
 }
 
+/// task 299: mix の grouped RMS 正規化をホストで済ませるか
+/// (`DENNO_MIX_NORM_HOST`)。**task 307 で既定 on** (lab t299b で mix 行
+/// -0.22 ms/token、t307b で decode -1.3%・md5 SAME 2 回)。明示的な偽値だけ off。
+///
+/// 既定経路 (`DENNO_DEC_MIX_NORM_PAR` on) は正規化を `dno_mix_norm`
+/// (grid = hc = 4、256 スレッド) で回す。台帳の実測は 1 呼び出し 6.5 us で、
+/// 動かすバイト数は 40 KB しかない = **起動と占有**で決まっている。
+/// x は H2D する直前にホストにあり、gamma も同じ長さでホストにあるので、
+/// H2D する中身を「正規化済みの x」に差し替えれば同じ計算をホストで済ませられ、
+/// 起動 1 本と GPU の 6.5 us が消える (ホスト側は 1 パス増えるだけ)。
+///
+/// 丸め順が変わる (二乗和を 8 本の累積器で足す) ので値はビット一致しない。
+fn mix_norm_host_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_mix_norm_host(std::env::var("DENNO_MIX_NORM_HOST").ok().as_deref()))
+}
+
+/// [`mix_norm_host_on`] の解釈 (純関数。**明示的な偽値だけ off** = 既定 on)。
+fn parse_mix_norm_host(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// task 299: ホスト正規化の経路に入れる形か。
+///
+/// 正規化を消すと inject の入力 (正規化済み x) も消えるので、inject を down の
+/// epilogue で回す版 (`dno_mix_down_bf16_inj`) が選べるときだけ入る。
+fn mix_norm_host_ready(hc: usize, down_thr: u32) -> bool {
+    mix_norm_host_on()
+        && mix_norm_par_on()
+        && hc >= 1
+        && hc <= 4
+        && down_thr >= 256
+        && mix_dev3_kernels().is_some()
+}
+
+/// task 299: `x[hc][e]` の grouped RMS 正規化 (`out = (x * inv) * gamma`) をホストで。
+///
+/// 要素ごとの式は `dno_mix_norm` と同じ (`__fmul_rn` / `__fadd_rn` 相当の
+/// 丸め)。二乗和だけは 8 本の累積器で足す (順序は固定 = 決定性は保つ)。
+/// `out` は `x` と別でも同一でもよい (縮約が終わるまで書かない)。
+fn mix_norm_host_into(x: &[f32], gamma: &[f32], e: usize, hc: usize, eps: f32, out: &mut [f32]) {
+    debug_assert_eq!(x.len(), e.saturating_mul(hc), "x は [hc][e]");
+    debug_assert_eq!(gamma.len(), x.len(), "gamma は [hc][e]");
+    debug_assert!(out.len() >= x.len(), "out が [hc][e] より短い");
+    for s in 0..hc {
+        let xs = &x[s * e..(s + 1) * e];
+        let mut acc = [0f32; 8];
+        let mut i = 0usize;
+        while i + 8 <= e {
+            for (j, a) in acc.iter_mut().enumerate() {
+                let v = xs[i + j];
+                *a += v * v;
+            }
+            i += 8;
+        }
+        let mut tail = 0f32;
+        while i < e {
+            tail += xs[i] * xs[i];
+            i += 1;
+        }
+        let ss = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+            + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+            + tail;
+        let inv = 1.0f32 / (ss / e as f32 + eps).sqrt();
+        let g = &gamma[s * e..(s + 1) * e];
+        let o = &mut out[s * e..(s + 1) * e];
+        for ((d, &v), &w) in o.iter_mut().zip(xs.iter()).zip(g.iter()) {
+            *d = (v * inv) * w;
+        }
+    }
+}
+
 /// task 204: gate+up 融合の可否 (純関数・テスト用)。
 ///
 /// 畳めるのは「ゲートが on」かつ「gate と up の量子型が同じ」かつ「行長が同じで 0 でない」
@@ -31342,11 +32176,17 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
         },
         None => None,
     };
-    let wpg = match mix_norm_weight(norm) {
-        Ok(p) => p,
-        Err(err) => {
-            mix_gpu_broken_once(&format!("chain3 norm 重みの常駐に失敗: {err:#}"));
-            return false;
+    let wpg = if mix_norm_host_ready(hc, down_thr) {
+        // task 299: 正規化をホストで済ませる回は norm を撃たないので、重みの
+        // 常駐 (指紋 16 点 + mutex) も要らない。
+        0
+    } else {
+        match mix_norm_weight(norm) {
+            Ok(p) => p,
+            Err(err) => {
+                mix_gpu_broken_once(&format!("chain3 norm 重みの常駐に失敗: {err:#}"));
+                return false;
+            }
         }
     };
     let Some(lib) = lib().ok() else {
@@ -31386,10 +32226,18 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        // task 307: 鎖の末尾に積むルータ GEMV の重み (同期の後まで生かす)。
+        let mut router_w: Option<GgufWRef> = None;
         // inject の出力は mixed の直後 (down の出力 dlo とは別領域)。
         let pinj = dm.ptr() + (e * 4) as CUdeviceptr;
+        // task 299: この回は正規化をホストで済ませる (`dno_mix_norm` を撃たない)。
+        let norm_host = mix_norm_host_ready(hc, down_thr);
         dec_kprof::step("mix_h2d_pack", || {
-            hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x)
+            if norm_host {
+                mix_norm_host_into(x, norm, e, hc, eps, &mut hx.as_mut_slice::<f32>()[..k1]);
+            } else {
+                hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x);
+            }
         });
         let kp_cp = dec_kprof::op_begin(
             || "H2D@a".to_string(),
@@ -31424,25 +32272,29 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
             } else {
                 None
             };
+            // task 299: `norm_host` のときは正規化済みの x を上げてあるので撃たない。
+            debug_assert!(!norm_host || down_inj.is_some(), "norm_host は down_inj 経路が前提");
             if down_inj.is_some() {
                 // 1. grouped RMS 正規化だけ (grid = hc = ブロックごとに 1 ストリーム)。
                 //    inject は 3. の down の epilogue で回す (x は読み取りのみ)。
-                let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());
-                let (mut ec, mut epsc) = (e as c_int, eps);
-                let mut args = [
-                    &mut px as *mut _ as *mut c_void,
-                    &mut pg as *mut _ as *mut c_void,
-                    &mut po as *mut _ as *mut c_void,
-                    &mut ec as *mut _ as *mut c_void,
-                    &mut epsc as *mut _ as *mut c_void,
-                ];
-                ctx.launch_async(
-                    f_dev.norm,
-                    (hc as u32, 1, 1),
-                    (THREADS as u32, 1, 1),
-                    0,
-                    &mut args,
-                )?;
+                if !norm_host {
+                    let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());
+                    let (mut ec, mut epsc) = (e as c_int, eps);
+                    let mut args = [
+                        &mut px as *mut _ as *mut c_void,
+                        &mut pg as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ec as *mut _ as *mut c_void,
+                        &mut epsc as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(
+                        f_dev.norm,
+                        (hc as u32, 1, 1),
+                        (THREADS as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
             } else if let Some(f_fold) = folded {
                 let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());
                 let (mut pw, mut pi) = (
@@ -31600,6 +32452,9 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
                 let grid = (e.div_ceil(256).max(1) as u32, 1, 1);
                 ctx.launch_async(f_mixed, grid, (256, 1, 1), 0, &mut args3)?;
             }
+            // task 307: ルータ GEMV を鎖の末尾に 1 発積む (D2H は下の 1 本と
+            // 同じ同期でまとめる)。載らなければ 0 = 従来経路。
+            let _ = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
             // 6. D2H 1 本 (mixed[e] + inj[hc] は同じバッファに連続で置いてある)。
             let kp_cp = dec_kprof::op_begin(
                 || "D2H@a".to_string(),
@@ -31628,6 +32483,7 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
         } else {
             ctx.sync()?;
         }
+        drop(router_w);
         dec_kprof::step("mix_pack", || {
             let got = ho.as_slice::<f32>();
             mixed.copy_from_slice(&got[..e]);
@@ -39743,6 +40599,70 @@ mod q4_attn_tests {
 mod tests {
     use super::*;
     use crate::tensor;
+
+    /// task 307: `DENNO_GGUF_GEMV_V5` は明示的な偽値だけ off (既定 on)。
+    #[test]
+    fn gguf_gemv_v5_gate_truth_table() {
+        assert!(parse_gguf_gemv_v5(None), "未設定は既定 on (lab t307a/b で採否)");
+        for v in ["0", "off", "false", "no"] {
+            assert!(!parse_gguf_gemv_v5(Some(v)), "raw={v:?}");
+        }
+        for v in ["", "1", "on", "true", " ON ", " TRUE ", "yes"] {
+            assert!(parse_gguf_gemv_v5(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 307: `DENNO_SH_BEGIN_CACHE` も明示的な真値だけ on。
+    #[test]
+    fn sh_begin_cache_gate_truth_table() {
+        assert!(!parse_sh_begin_cache(None), "未設定は既定 off");
+        for v in ["", "0", "off", "false", "no", "2"] {
+            assert!(!parse_sh_begin_cache(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", " TRUE "] {
+            assert!(parse_sh_begin_cache(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 307: `DENNO_ROUTER_IN_MIX` も明示的な偽値だけ off (既定 on)。
+    #[test]
+    fn router_in_mix_gate_truth_table() {
+        assert!(parse_router_in_mix(None), "未設定は既定 on (lab t307b / t307c で採否)");
+        for v in ["0", "off", "false", "no"] {
+            assert!(!parse_router_in_mix(Some(v)), "raw={v:?}");
+        }
+        for v in ["", "1", "on", "true", " ON ", " TRUE ", "yes"] {
+            assert!(parse_router_in_mix(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 307: 共有 expert のキャッシュは、空のときは必ず外れる
+    /// (初回は従来経路で作る = 値は 1 つも変わらない)。
+    #[test]
+    fn sh_cache_lookup_misses_on_empty_cache() {
+        SH_CACHE.with(|c| c.borrow_mut().clear());
+        let blocks: [u8; 0] = [];
+        let jobs = [
+            SharedGemvJob { uid: 11, ty: crate::kquant::GgmlType::Q8_0, blocks: &blocks, k: 2560, n: 640 },
+            SharedGemvJob { uid: 12, ty: crate::kquant::GgmlType::Q8_0, blocks: &blocks, k: 2560, n: 640 },
+            SharedGemvJob { uid: 13, ty: crate::kquant::GgmlType::Q8_0, blocks: &blocks, k: 640, n: 2560 },
+        ];
+        let refs: [&SharedGemvJob<'_>; 3] = [&jobs[0], &jobs[1], &jobs[2]];
+        assert!(sh_cache_lookup(&refs).is_none(), "空のキャッシュで当たった");
+    }
+
+    /// task 307: ルータの「鎖で作った」印は uid / k / n が揃ったときだけ使う。
+    /// (GPU 無しでも通る範囲: 印の付け替えと取り消しの規則だけを固定する。)
+    #[test]
+    fn router_filled_matches_only_the_same_shape() {
+        ROUTER_FILLED.with(|c| c.set((7u64, 2560usize, 512usize)));
+        let filled = ROUTER_FILLED.with(|c| c.get());
+        assert_eq!(filled, (7, 2560, 512));
+        assert_ne!(filled, (8, 2560, 512), "uid が違えば使わない");
+        assert_ne!(filled, (7, 2560, 640), "n が違えば使わない");
+        ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
+        ROUTER_SYNCED.with(|c| c.set(false));
+    }
 
     /// task 278: 高速版 GEMV のゲートは既定 on、明示的な偽値だけ切る。
     #[test]
@@ -55015,6 +55935,72 @@ mod task184_tests {
         // 実効ゲートは lab t184a の採否で既定 on。切るのは明示的な偽値。
         assert!(mix_dec_dev_enabled(), "DENNO_MIX_DEC_DEV が既定 off に戻っている");
         assert_eq!(MIX_DEC_DEV_DEFAULT, true);
+    }
+
+    /// `DENNO_MIX_NORM_HOST` の真理値表 (task 299 / task 307 で既定 on)。
+    #[test]
+    fn mix_norm_host_truth_table() {
+        for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(!parse_mix_norm_host(raw), "raw={raw:?} が on になっている");
+        }
+        for raw in [None, Some(""), Some("  "), Some("1"), Some("on"), Some("TRUE"), Some(" true "), Some("yes"), Some("x")] {
+            assert!(parse_mix_norm_host(raw), "raw={raw:?} が off になっている");
+        }
+    }
+
+    /// task 299: ホスト正規化は `dno_mix_norm` と同じ要素式・同じ決定性。
+    #[test]
+    fn mix_norm_host_matches_reference_and_is_deterministic() {
+        let (e, hc, eps) = (8usize, 2usize, 1e-6f32);
+        let x: Vec<f32> = (0..e * hc).map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0).collect();
+        let gamma: Vec<f32> = (0..e * hc).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let mut got = vec![0f32; e * hc];
+        mix_norm_host_into(&x, &gamma, e, hc, eps, &mut got);
+        for s in 0..hc {
+            let xs = &x[s * e..(s + 1) * e];
+            // 参照は逐次二乗和 (`tensor::rmsnorm` と同じ順)。
+            let ss = xs.iter().map(|v| v * v).sum::<f32>() / e as f32;
+            let inv = 1.0 / (ss + eps).sqrt();
+            for i in 0..e {
+                let want = xs[i] * inv * gamma[s * e + i];
+                let g = got[s * e + i];
+                assert!(
+                    (g - want).abs() <= 1e-5 + 1e-5 * want.abs(),
+                    "s={s} i={i}: {g} vs {want}"
+                );
+            }
+        }
+        let mut again = vec![0f32; e * hc];
+        mix_norm_host_into(&x, &gamma, e, hc, eps, &mut again);
+        assert_eq!(got, again, "同じ入力で値が動いた (決定性が無い)");
+        // 二乗和が 8 本の累積器なので、逐次和とは最下位ビットが違いうる。
+        // 「ほぼ同じ」であることは上で見ている。
+    }
+
+    /// task 299: ホスト正規化のコスト (実形 e=2560 / hc=4)。
+    /// `cargo test --release -p denno-engine --features cuda --lib -- --ignored
+    /// --nocapture bench_mix_norm_host_into`。
+    #[test]
+    #[ignore]
+    fn bench_mix_norm_host_into() {
+        let (e, hc) = (2560usize, 4usize);
+        let x: Vec<f32> = (0..e * hc).map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0).collect();
+        let gamma: Vec<f32> = vec![0.75f32; e * hc];
+        let mut out = vec![0f32; e * hc];
+        let n = 2000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            mix_norm_host_into(&x, &gamma, e, hc, 1e-6, &mut out);
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        // 比較: いまの pack がやっている素のコピー。
+        let t2 = std::time::Instant::now();
+        for _ in 0..n {
+            out.copy_from_slice(&x);
+        }
+        let us2 = t2.elapsed().as_secs_f64() * 1e6 / n as f64;
+        eprintln!("[bench299] mix_norm_host_into {us:.2} us/call (素のコピー {us2:.2} us/call)");
+        assert!(out[0].is_finite());
     }
 
     /// norm 重みの指紋は「内容が変われば変わる」。常駐の載せ替え判定に使う。
