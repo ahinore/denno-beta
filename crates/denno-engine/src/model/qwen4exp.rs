@@ -5368,7 +5368,11 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             // 分割しないときは 1 回 (従来と同じ経路)。
             // task 279: プールが借りられたときは選んだタイル (パス数が最小) を使う。
             let mut ffn_dev = true;
+            // task 318: 台帳の `experts` 区間に載せる。フォールバック
+            // (`moe_ffn_quant_batch_tapped`) は内部で同じ区間を開くので、ここだけ
+            // 無いとデバイス経路の MoE が `other` に混ざって読めなくなる。
             if tile >= nt_all {
+                let _l = q4ledger::enter(q4ledger::EXPERTS);
                 ffn_dev = moe_ffn_quant_batch_lm_dev(
                     &self.p,
                     lw,
@@ -5382,16 +5386,20 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 while t0 < nt_all {
                     let nt = tile.min(nt_all - t0);
                     let last = t0 + nt == nt_all;
-                    if !moe_ffn_quant_batch_lm_dev_at(
-                        &self.p,
-                        lw,
-                        t0,
-                        nt_all,
-                        nt,
-                        roles.as_deref_mut(),
-                        last,
-                        iv,
-                    )? {
+                    let ok = {
+                        let _l = q4ledger::enter(q4ledger::EXPERTS);
+                        moe_ffn_quant_batch_lm_dev_at(
+                            &self.p,
+                            lw,
+                            t0,
+                            nt_all,
+                            nt,
+                            roles.as_deref_mut(),
+                            last,
+                            iv,
+                        )?
+                    };
+                    if !ok {
                         ffn_dev = false;
                         break;
                     }
@@ -18322,7 +18330,12 @@ fn moe_ffn_quant_batch_lm_dev_at(
     ) {
         return Ok(lm_decline("gate"));
     }
-    let Some(xs_dev) = crate::cuda::pf_lm_mixed_ptr(tok0, nt_all, e) else {
+    // task 318: `start = tok0` から **このタイルの `nt` 行** ぶんの先頭を取る。
+    // ここが `nt_all` だと 2 枚目以降のタイルで「置き場の末尾を越える」ので
+    // `None` になり、14k のようなタイル分割時に dev MoE が丸ごと落ちていた
+    // (lab t318b: 14k が `理由: mixed ptr` で全層フォールバックし、ストリームが
+    //  98 GB → 147 GB に増えた)。
+    let Some(xs_dev) = crate::cuda::pf_lm_mixed_ptr(tok0, nt, e) else {
         return Ok(lm_decline("mixed ptr"));
     };
     let Some(out_base) = crate::cuda::pf_lm_ffn_ptr(nt_all, e) else {
