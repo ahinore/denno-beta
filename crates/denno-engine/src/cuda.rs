@@ -3677,6 +3677,7 @@ impl DevBuffer {
     /// なのでビットは D2H+H2D と同一。
     pub fn copy_from_dev(&self, src: CUdeviceptr, len: usize) -> Result<()> {
         let bytes = len * std::mem::size_of::<f32>();
+        assert!(bytes <= self.bytes, "DevBuffer::copy_from_dev: size overflow");
         let dbg = launch_dbg::note(|| {
             format!("D2D dst={:#x} src={src:#x} bytes={bytes}", self.ptr)
         });
