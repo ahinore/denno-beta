@@ -621,6 +621,65 @@ pub const DEFAULT_STREAM_UT: bool = false;
 /// probe 27.3 → 53.5 GB/s。t165c でも 95.31 s で再現。
 pub const DEFAULT_STREAM_WC: bool = true;
 
+/// `DENNO_PF_PIN_GROW`: pinned バウンスを「必要量ちょうど」ではなく余裕を足して
+/// 確保する (task 296、既定 off)。
+///
+/// 従来は 1 グループに必要なバイト数 `need` ちょうどで `cuMemHostAlloc` する。
+/// グループの必要量は expert の本数で数 MB 刻みに変わるので、前より 1 バイトでも
+/// 大きいグループが来ると **そのスロットの pinned を確保し直す**
+/// (`cuMemHostFree` + `cuMemHostAlloc`)。3,826 cold prefill の MoE 段には
+/// 写しでも DMA でも説明できない ~0.7 s が残っており、その候補がこれ
+/// (`DENNO_PF_LM_DBG=1` の `pin=` と `x回数` で読む)。
+///
+/// `=1` で [`PF_PIN_GROW_ENV`] の余裕つき確保、未設定 / `0` で従来どおり。
+pub const PIN_GROW_ENV: &str = "DENNO_PF_PIN_GROW";
+
+/// 余裕の付け方 (純関数)。`need` に +25% (最低 16 MiB) を足し、8 MiB へ切り上げる。
+/// 上限はステージング 1 枚 (`slot_cap`) で、それを超えるなら `need` のまま。
+pub fn pin_grow_target(need: usize, slot_cap: usize) -> usize {
+    if need == 0 {
+        return 0;
+    }
+    const Q: usize = 8 << 20;
+    let head = (need / 4).max(16 << 20);
+    let want = need.saturating_add(head);
+    let want = want.div_ceil(Q).saturating_mul(Q);
+    if slot_cap > need {
+        want.min(slot_cap)
+    } else {
+        need
+    }
+}
+
+/// [`PIN_GROW_ENV`] の解釈 (明示的な真値だけ on)。
+///
+/// lab t296a / t296c: 余裕なし (従来) は 3,826 cold で 3.37 / 3.41 s、余裕ありは
+/// 3.18 / 3.24 s (-5.6% / -5.1%)。pinned の確保し直しが 31 回・255 ms あった
+/// (`[pf-lm-dbg] stream` の `pin=`)。task 296 の目標 (-8%) には届かなかったので
+/// いったん既定 off にした (採否は REPORT_P296.md)。task 300 で既定 on へ。
+///
+/// [`PIN_GROW_ENV`] の解釈。未設定は [`DEFAULT_PIN_GROW`]。
+pub fn pin_grow_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PIN_GROW,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// [`PIN_GROW_ENV`] の既定値。
+///
+/// task 300: **true**。task 296 の lab t296c は同じ木で 3,826 cold prefill を
+/// 3.415 → 3.235 s (-5.3%、14k と decode は無傷、md5 全 SAME) にしたが、
+/// task 296 の目標 -8% に届かないので既定 off のまま残されていた。task 300 の
+/// 目標は -6% なので、そのまま採る (t300 の lab で測り直す)。
+pub const DEFAULT_PIN_GROW: bool = true;
+
+/// pinned バウンスを余裕つきで確保するか (既定 off)。
+pub fn pin_grow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pin_grow_from_value(std::env::var(PIN_GROW_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_STREAM_SPLIT`: ステージングの写しと H2D を何分割して重ねるか (task 239)。
 ///
 /// 従来 (1) は「グループ全体を pinned へ写す → 非同期 H2D を 1 回積む → 完了を待つ」
@@ -2543,6 +2602,26 @@ mod tests {
             (stream_bytes() / 3) / stream_group() >= 2_500_000,
             "1 枚に既定のグループが載らない"
         );
+        // task 300: pinned バウンスの余裕つき確保は**既定 on** (task 296 の
+        // lab t296c で 3,826 cold -5.3%、14k と decode は無傷)。
+        assert!(pin_grow(), "既定は余裕つき確保 (task 300)");
+        assert!(pin_grow_from_value(None));
+        assert!(pin_grow_from_value(Some("")));
+        assert!(!pin_grow_from_value(Some("0")));
+        assert!(!pin_grow_from_value(Some("off")));
+        assert!(!pin_grow_from_value(Some("False")));
+        assert!(pin_grow_from_value(Some("1")));
+        assert!(pin_grow_from_value(Some(" on ")));
+        assert!(pin_grow_from_value(Some("yes")));
+        // 余裕は +25% (最低 16 MiB) を 8 MiB へ切り上げ、ステージング 1 枚で頭打ち。
+        assert_eq!(pin_grow_target(0, 1 << 30), 0);
+        assert_eq!(pin_grow_target(64 << 20, 1 << 30), 80 << 20);
+        assert_eq!(pin_grow_target(8 << 20, 1 << 30), 24 << 20, "最低 16 MiB の余裕");
+        assert_eq!(pin_grow_target(160 << 20, 170 << 20), 170 << 20, "上限で切る");
+        assert_eq!(pin_grow_target(200 << 20, 170 << 20), 200 << 20, "上限が足りない");
+        // 余裕の目的: 64 MiB を頼んだあと 72 MiB を頼んでも確保し直さない。
+        let t = pin_grow_target(64 << 20, 1 << 30);
+        assert!(t >= 72 << 20, "±数 MB の揺れを吸収しない: {t}");
     }
 
     /// ホストが読む名前が .cu のカーネル名と一致する (実機でしか分からない
