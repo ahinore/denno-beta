@@ -1,11 +1,12 @@
-ADOPT: yes t319a t319b
+ADOPT: yes t319a t319b t319c
 
 # REPORT P319 — IQ3_S decode: near miss を回収。shared v5 (`DENNO_DEC_SH_V5=2`) を既定 on に (-2.7% / -2.4%)
 
 branch: br319 = int-auto `6465bf554` + **br310 を merge** (`d7103e021` = `DENNO_DEC_SH_V5` の実装。
 int-auto に無く、測るのに要った。br316 には入っていたが int-auto には未 merge) + 最後に
-int-auto `0d3cd40da` (merge: br320) を merge。lab 2 ラウンド: **t319a** (`a0c729c5d`、5 COND) /
-**t319b** (`a0c729c5d`、6 COND、診断付き)。数値はすべて GPU ラボの実測。
+int-auto `0d3cd40da` (merge: br320) を merge。lab 3 ラウンド: **t319a** (`a0c729c5d`、5 COND) /
+**t319b** (`a0c729c5d`、6 COND、診断付き) / **t319c** (`e7439b3aa` = 最終ツリー、5 COND、
+`DENNO_FULL_DEC_ATTN_MIN` で dev 経路を切る比較付き)。数値はすべて GPU ラボの実測。
 
 ## 0. 結論 (3 行)
 
@@ -20,8 +21,10 @@ int-auto `0d3cd40da` (merge: br320) を merge。lab 2 ラウンド: **t319a** (`
 3. 次の山も測った (P316 §8 の申し送り): full 層 dev 経路のホスト仕事は **1 層 39-49 us**。
    内訳は `fd_qkv` 8.4-10.4 / `fd_mirror` 7.1-9.1 / `fd_attn` 7.1-8.8 / `fd_prep` 5.3-8.0 /
    `fd_wo` 3.6-4.1 / `fd_gate` 3.4-4.0 / `fd_d2h` 2.9-3.6 / `fd_tail` 0.9-1.0 us で、
-   **どれも 2% を取れる大きさが無い** (12 層で 0.5 ms/token、しかも短い文脈では
-   dev 経路は **44% の層だけ**)。失敗理由は 100% が `mirror` (KV ミラーの全行シード待ち)。
+   **どれも 2% を取れる大きさが無い** (12 層で 0.5 ms/token)。しかも短い文脈では
+   dev 経路は **44% の層だけ**で、失敗理由は 100% が `mirror` (KV ミラーの全行シード待ち)。
+   **t319c で dev 経路を切ると短い decode +3.8% / 14k +5.0%** なので、この取りこぼしは
+   **推定 4% 級** = 次タスクの本命 (計器はこの commit の `fd_*` と `DENNO_FULL_DEC_DBG`)。
 
 ## 1. 前提の測り直し (Do 1): 現在の int-auto の per-stage
 
@@ -124,19 +127,45 @@ VERDICT baseline toss errors 0 text ok
 - prefill: c2000_cold 2.79 / 2.79 -> 2.78 / 2.78、c8000_cold 6.78 / 6.76 -> 6.76 / 6.77 = 不変。
 - md5 は 6 COND x 2 ラウンド全部 SAME。テキスト (A): `**B-tree** (specifically, the **B+ tree) is
   the fundamental data structure used by most modern relational databases` — base と同一。
-- この回は load_before 3.13 で全体がわずかに揺れた (base2 の r1 が 1.89) が、a2 の 4 対 4 は
-  まだ分離している (base 側の最良 1.86 > sh2 側の最悪 1.84 ではない: 1.84 が 1 本だけある。
-  中央値で読む)。
+- この回は load_before 3.13 で全体がわずかに揺れた (base2 の r1 が 1.89、sh2 の r2 が 1.84)。
+  4 対 4 の中央値では -2.4% で、t319a の -2.7% と同じ向き・同じ大きさ。
 
-### 3.3 まとめ (採否の判定)
+### 3.3 t319c (`e7439b3aa` = 最終ツリー、5 COND、load_before 2.15) — 最終確認と dev 経路の値打ち
 
-| 指標 | t319a | t319b | 判定 |
-| --- | --- | --- | --- |
-| 短い decode (a2、2 ラウンドの中央値) | -2.7% | -2.4% | **規則 (2% 以上) を満たす** |
-| 14k 後の decode (c8000_turn2) | -2.0% | -2.0% | 悪化なし |
-| 2k 後の decode (c2000_turn2) | -1.0% | -1.5% | 悪化なし |
-| prefill (c2000_cold / c8000_cold) | +0.0% / +0.0% | +0.0% / 0.0% | 悪化なし (1% 以内) |
-| md5 / errors / text | SAME / 0 / ok | SAME / 0 / ok | 健全 |
+COND = toss(`SH_V5=0`) / base(`SH_V5=0`) / sh2(既定) / nodev(`SH_V5=0` +
+`DENNO_FULL_DEC_ATTN_MIN=1000000` = full 層の dev 経路を**全部切る**) / base2(`SH_V5=0`)。
+int-auto `0d3cd40da` (br320) を merge した後のツリーで、**採った既定のまま**測った回。
+
+| cond | a2 r1 / r2 | c2000_turn2 r1 / r2 | c8000_turn2 (r1) | prefill c2k_cold / c8k_cold | md5 |
+| --- | --- | --- | --- | --- | --- |
+| base | 1.87 / 1.86 | 1.97 / 1.96 | 2.01 | 2.63 / 6.67 | SAME |
+| sh2 | **1.82 / 1.81** | 1.94 / 1.94 | **1.99** | 2.63 / 6.68 | SAME |
+| nodev | 1.94 / 1.94 | 2.05 / 2.05 | 2.11 | 2.64 / 6.67 | SAME |
+| base2 | 1.87 / 1.86 | 1.95 / 1.99 | 2.02 | 2.64 / 6.69 | SAME |
+
+```text
+VERDICT base  vs toss OK decode +0.0% prefill +0.8% md5 SAME errors 0
+VERDICT sh2   vs toss OK decode -1.8% prefill +0.0% md5 SAME errors 0
+VERDICT nodev vs toss OK decode +1.6% prefill +0.0% md5 SAME errors 0
+VERDICT base2 vs toss OK decode +0.0% prefill +0.0% md5 SAME errors 0
+VERDICT baseline toss errors 0 text ok
+```
+
+- **a2 の中央値: base 1.865 / base2 1.865 に対して sh2 1.815 = -2.7%** (3 ラウンド目の再現)。
+  14k 後 2.01 -> 1.99、prefill 不変 (この回は c2000_cold が 2.63 と速い回だったが全 COND 同値)。
+- **`nodev` (dev 経路を全部切る) は base より +3.8% (短い) / +5.0% (14k) 遅い** =
+  full 層の dev 経路は短い文脈でも得。つまり 4.1 の 56% の取りこぼしは損。
+- この回の md5 も 5 COND x 2 ラウンド全部 SAME。
+
+### 3.4 まとめ (採否の判定)
+
+| 指標 | t319a | t319b | t319c (最終ツリー) | 判定 |
+| --- | --- | --- | --- | --- |
+| 短い decode (a2、2 ラウンドの中央値) | -2.7% | -2.4% | -2.7% | **規則 (2% 以上) を満たす** |
+| 14k 後の decode (c8000_turn2) | -2.0% | -2.0% | -1.2% | 悪化なし |
+| 2k 後の decode (c2000_turn2) | -1.0% | -1.5% | -1.2% | 悪化なし |
+| prefill (c2000_cold / c8000_cold) | +0.0% / +0.0% | +0.0% / 0.0% | 0.0% / +0.1% | 悪化なし (1% 以内) |
+| md5 / errors / text | SAME / 0 / ok | SAME / 0 / ok | SAME / 0 / ok | 健全 |
 
 ## 4. full 層のホスト内訳 (P316 §8 の「80 us の正体」)
 
@@ -170,16 +199,21 @@ VERDICT baseline toss errors 0 text ok
 - `DENNO_FULL_DEC_DBG=1` の数え上げ (t319b diag): `calls=1537 gate=0 shape=0 ctx=0
   mirror=1537 plan=0 other=0` = **失敗理由は 100% が `mirror`** (KV ミラーの
   「全行シードが要る」)。band 3800 / 14000 では 768/768 が dev 経路。
-- **これが得か損かは未計測**。短い文脈では CPU 経路のほうが安い可能性がある
-  (dev 経路の固定費は 1 層 ~190-200 us で、`fd_sync` 68 us を含む)。
-  ledger の `full` は両経路の混合で 122 us/層 (P310)。次タスクで
-  `DENNO_Q4_ATTN_MIRROR_MB` を振るか、ミラーのシードを 1 トークン目以外でも
-  安く済ませる手を入れて比べるのが筋。
+- **これは損。** t319c の `nodev` (`DENNO_FULL_DEC_ATTN_MIN=1000000` で dev 経路を全部切る) は
+  base より **短い decode +3.8% (1.86 -> 1.94)、14k +5.0% (2.01 -> 2.11)** 遅い。
+  dev 経路は短い文脈でも得なので、56% が従来経路に落ちているのは取りこぼし。
+  線形に外挿すると (1.94 = 100% CPU、1.86 = 56% CPU) 0% CPU で **~1.78 = さらに -4.3%** (推定。
+  外挿なので幅を持たせるなら -3〜-5%)。**次タスクの本命**。
+- 次の一手: `q4_attn_mirror_prepare` が「全行シード」を要求する理由 (cap 成長 /
+  `state.len[layer] = 0` / エントリ drop / LRU 退避) を 1 トークン目以外でも特定し、
+  ミラーを 1 行追記で維持できるようにする。計器はこの commit の `fd_*` (dev 側) と
+  `DENNO_FULL_DEC_DBG=1` (理由の数え上げ)、`DENNO_FULL_DEC_ATTN_MIN` (切り分け)。
 
 ## 5. 採否 (task の規則)
 
-- 短い decode **-2.7% (t319a) / -2.4% (t319b)** = 2 ラウンドの中央値で 2% 超。
-  14k 後 -2.0%、prefill 不変、他に 1% 超の悪化なし、errors 0、md5 SAME、テキスト健全。
+- 短い decode **-2.7% (t319a) / -2.4% (t319b) / -2.7% (t319c = 最終ツリー)** = 3 ラウンドとも
+  2 ラウンドの中央値で 2% 超。14k 後 -1.2〜-2.0%、2k 後 -1.0〜-1.5%、prefill 不変、
+  他に 1% 超の悪化なし、errors 0、md5 SAME、テキスト健全。
   → **ADOPT: yes。`DENNO_DEC_SH_V5` の既定を 2 にした** (この commit)。
 - 切り戻し: `DENNO_DEC_SH_V5=0` (従来の v3/v2)。`=1` (down も v5) は P310 の実測で
   `=2` よりわずかに悪いので既定にしない。
@@ -187,10 +221,12 @@ VERDICT baseline toss errors 0 text ok
 ## 6. 数値の扱い
 
 - v5 GEMV は 4 アキュムレータで加算するので v3 とは丸め順が違う (決定性は保つ)。
-  実測の md5 は t319a / t319b の全 COND・全ラウンドで SAME。よって「丸めは変わったが
-  出力トークンは変わらなかった」。
-- 効果の読み方: ラボ集計の decode 中央値は 0.1 ms/tok 刻みで、しかも文脈の違う要求を混ぜる。
-  **同じプロンプトの warm a2 の秒**と 14k 後の秒で読んだ。床は base/base2 の 0.3%。
+  実測の md5 は t319a / t319b / t319c の全 COND・全ラウンドで SAME。よって「丸めは
+  変わったが出力トークンは変わらなかった」。
+- 効果の読み方: ラボ集計の decode 中央値は 0.1 ms/tok 刻みで、しかも文脈の違う要求を混ぜる
+  (この 3 回では 17.0-17.2 で差が出ない)。**同じプロンプトの warm a2 の秒**と 14k 後の秒で
+  読んだ。床は base / base2 の 0-0.3%。t319b は load_before 3.13 で 1 本だけ 1.84 が出たが、
+  中央値では -2.4%。
 - 測っていない数字は書いていない。推定は「推定」と書いた。
 
 ## 7. テスト
