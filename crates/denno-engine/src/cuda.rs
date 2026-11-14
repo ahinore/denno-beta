@@ -49104,6 +49104,14 @@ pub fn gdn_pf_chain(
     } else {
         None
     };
+    // 記録は「デバイスだけが正」なのに dev-in が取れない (作業域の形が合わない等)
+    // ときは、古いホストのバイト列を上げないように先に降ろす。降ろせなければ
+    // 何も書いていないここで要求を落とす (誤った値で走らせない)。
+    if xdev.is_none() && pf_mixed_dev_only(flat.as_ptr(), nt, e) {
+        if !pf_mixed_restore_host(flat.as_ptr() as *mut f32, nt, e) {
+            bail!("GDN 連鎖: D2H していない mixed の復元に失敗 (li={li})");
+        }
+    }
     gdn_pf_kprof::begin(gdn_pf_kprof::X_H2D);
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
