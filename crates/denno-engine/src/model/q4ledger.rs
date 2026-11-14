@@ -858,7 +858,10 @@ pub fn line(tok: usize, wall_ns: u64) -> Vec<String> {
     // 「他の副区間の内側にも入る」もの。
     let nested = [SUB_DEQUANT];
     let sub_ms = |ns: u64| ns as f64 / 1e6 / d;
-    for &p in &[MIX, ROUTER, SHARED, FULL, SSM, EXPERTS, HEAD, OTHER] {
+    // task 299: `EXPERT` (7) も出す。decode の sum 経路は内側で `enter(EXPERT)` を
+    // 開くので、副区間 (exp_lookup / exp_miss / exp_sum ...) は EXPERTS ではなく
+    // こちらに積まれる。ここを出さないと「experts 行の cpu の中身」が読めない。
+    for &p in &[MIX, ROUTER, SHARED, FULL, SSM, EXPERTS, EXPERT, HEAD, OTHER] {
         let mut parts: Vec<String> = Vec::new();
         let mut sum = 0u64;
         for i in 0..SUB_N {
