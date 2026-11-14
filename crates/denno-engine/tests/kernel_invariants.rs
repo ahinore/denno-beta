@@ -10775,3 +10775,97 @@ fn task317_ssm_mix_keep_is_wired() {
         "復元が host 経路の後ろにある (古いバイト列で計算する)"
     );
 }
+
+/// task 320: prefill の expert 上げ (pinned 写し + DMA) をカーネルの裏へ隠す配線。
+///
+/// - 依頼の先読み数 `DENNO_PF_STREAM_LOOKAHEAD` が exp_pf にあり、1..=2 に丸める
+///   (ステージングは 3 枚なので 2 つ先が上限)
+/// - ストリーミングの依頼ループが `gi + look` を使う (1 つ先に固定されていない)。
+///   1 つ先だけだと、待つグループの写しが 1 反復ぶんしか先行せず隠れない
+///   (lab t320a: ut=1 で `up_wait` 405 → 1,112 ms、wall -5.0%)
+/// - 上限がステージングの枚数と食い違わない (`PF_STAGE_SLOTS` = 3)。
+#[test]
+fn task320_upload_thread_lookahead_is_wired() {
+    assert!(
+        EXP_PF_SRC.contains("pub const STREAM_LOOKAHEAD_ENV: &str = \"DENNO_PF_STREAM_LOOKAHEAD\";"),
+        "先読みの env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn stream_lookahead()"),
+        "先読みの読み出しが無い"
+    );
+    let f = EXP_PF_SRC
+        .split("pub fn stream_lookahead_from_value(")
+        .nth(1)
+        .expect("stream_lookahead_from_value が無い");
+    assert!(f.contains(".clamp(1, 2)"), "1..=2 に丸めていない");
+    // 依頼ループ: 先読みをゲートから取る。
+    assert!(
+        CUDA_RS.contains("let look = if ut { exp_pf::stream_lookahead() } else { 0 };"),
+        "依頼ループが先読みをゲートから取っていない"
+    );
+    assert!(
+        CUDA_RS.contains("while submitted <= gi + look && submitted < bounds.len() {"),
+        "依頼ループが 1 つ先に固定されたまま"
+    );
+    assert!(
+        !CUDA_RS.contains("while submitted <= gi + 1 && submitted < bounds.len() {"),
+        "旧い 1 つ先のループが残っている"
+    );
+    // ステージングの枚数 (3) と上限 (2) の対応。
+    assert!(
+        CUDA_RS.contains("pub(crate) const PF_STAGE_SLOTS: usize = 3;"),
+        "ステージングの枚数が変わった (先読みの上限 2 を見直すこと)"
+    );
+}
+
+/// task 320: 分離モード (`DENNO_PF_UP_DECOUPLE`) の順序。
+///
+/// - ホストが待つイベントが「pinned を前回読んだ DMA」(pin_ev) に切り替わる
+/// - カーネル完了 (VRAM ステージングの再利用) はホストではなく
+///   `cuStreamWaitEvent` で上げストリームに守らせる
+/// - その待ちは**写しの後・DMA の前**に入る (写しをカーネルの裏に入れるのが目的。
+///   逆にすると直列のままで、lab t320a の -5.0% から動かない)
+#[test]
+fn task320_up_decouple_orders_copy_before_stream_wait() {
+    assert!(
+        EXP_PF_SRC.contains("pub const UP_DECOUPLE_ENV: &str = \"DENNO_PF_UP_DECOUPLE\";"),
+        "env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn up_decouple_on()"),
+        "ゲートの実体が無い"
+    );
+    // 依頼に pin_ev が載る。
+    assert!(
+        CUDA_RS.contains("let pin_ev = if exp_pf::up_decouple_on() && st.slot[s].used {"),
+        "依頼が pin の再利用イベントを組んでいない"
+    );
+    assert!(CUDA_RS.contains("    pin_ev: usize,"), "依頼の欄が無い");
+    // ワーカー: ホスト待ちの切り替え。
+    assert!(
+        CUDA_RS.contains("let host_ev = if decouple { job.pin_ev } else { job.wait_ev };"),
+        "ホスト待ちが分離モードで切り替わっていない"
+    );
+    // 順序: 写し → cuStreamWaitEvent → DMA。
+    let run = CUDA_RS
+        .split("fn pf_up_run(")
+        .nth(1)
+        .expect("pf_up_run が無い");
+    let copy_at = run.find("pf_copy_into_pin(job.pin, &job.parts)").expect("写しが無い");
+    let wait_at = run
+        .find("cuStreamWaitEvent (stage reuse/上げスレッド)")
+        .expect("ストリーム待ちが無い");
+    let dma_at = run
+        .find("cuMemcpyHtoDAsync (stage/上げスレッド)")
+        .expect("DMA が無い");
+    assert!(copy_at < wait_at, "ストリーム待ちが写しより前にある");
+    assert!(wait_at < dma_at, "ストリーム待ちが DMA より後ろにある");
+    assert!(
+        run.split("cuStreamWaitEvent (stage reuse/上げスレッド)")
+            .nth(1)
+            .expect("待ちの後ろが無い")
+            .contains("cuMemcpyHtoDAsync (stage/上げスレッド)"),
+        "DMA が待ちの後ろに無い"
+    );
+}
