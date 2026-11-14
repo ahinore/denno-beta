@@ -12785,6 +12785,30 @@ fn pf_expert_mode_from(k_gate: bool, stream: bool, k_types_ok: bool) -> bool {
     k_gate && stream && k_types_ok
 }
 
+/// task 318: `DENNO_PF_LM_K_DEV` の値の解釈 (純関数)。**既定 off**。
+///
+/// on のとき、層優先のデバイス MoE (`moe_ffn_quant_batch_lm_dev_at`) の前提判定が
+/// `iq_expert_mode` ではなく `pf_expert_mode` になる。K 系 (UD-Q4_K_XL) は
+/// これが無いと全層がホストの mixed 経路へ落ち、mixed を丸ごと往復する。
+pub(crate) fn pf_lm_k_dev_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => false,
+        Some(s) => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
+}
+
+/// ゲートの実値 (1 回だけ読む)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn pf_lm_k_dev_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_lm_k_dev_from_value(std::env::var("DENNO_PF_LM_K_DEV").ok().as_deref())
+    })
+}
+
 /// task 150: ミスした expert の寄与を `dst` (`sel.len() * e`) へ直接書く。
 ///
 /// 1 expert の計算は [`expert_contribs_par`] と同じ [`ExpertW::gemv_seq`] を同じ順で
@@ -18276,10 +18300,21 @@ fn moe_ffn_quant_batch_lm_dev_at(
             ph[i] = t_dbg.elapsed().as_secs_f64() * 1e3;
         }
     };
+    // task 318: 層優先のデバイス MoE は IQ 系だけでなく **K 系 (UD-Q4_K_XL) でも
+    // 回せる**。ここが `iq_expert_mode` のままだと UD は全 48 層が
+    // `moe_ffn_quant_batch_tapped` (ホストの mixed 経路) へ落ち、層ごとに
+    // mixed を丸ごと往復していた (lab t318a: 14k で 143.5 MB x 2 x 48 層 =
+    // 13.8 GB、`[xfer] item=other sub=-`)。expert の m 行カーネルは
+    // ストリーミング経路のものなので、`pf_expert_mode` (IQ or K) が正しい判定。
+    let expert_gpu = if pf_lm_k_dev_on() {
+        pf_expert_mode(lw)
+    } else {
+        iq_expert_mode(lw)
+    };
     if !lm_dev_moe_ok(
         nt,
         crate::model::exp_pf::pf_enabled(),
-        iq_expert_mode(lw),
+        expert_gpu,
         crate::model::exp_pf::stream_enabled(),
         crate::model::exp_pf::stream_min_tok(),
         pf_router_gpu_on(),
@@ -18627,6 +18662,21 @@ mod lm_dev_tests {
     /// task 233: 層優先のデバイス MoE の前提 (真理値表)。
     ///
     /// 1 つでも欠けたら `false` = 呼び出し側はホスト経路へ落ちる (値は同じ)。
+    /// task 318: `DENNO_PF_LM_K_DEV` の真理値表 (既定 off)。
+    #[test]
+    fn pf_lm_k_dev_truth_table() {
+        assert!(!pf_lm_k_dev_from_value(None));
+        assert!(!pf_lm_k_dev_from_value(Some("")));
+        assert!(!pf_lm_k_dev_from_value(Some("0")));
+        assert!(!pf_lm_k_dev_from_value(Some(" off ")));
+        assert!(!pf_lm_k_dev_from_value(Some("FALSE")));
+        assert!(!pf_lm_k_dev_from_value(Some("no")));
+        assert!(pf_lm_k_dev_from_value(Some("1")));
+        assert!(pf_lm_k_dev_from_value(Some("on")));
+        assert!(pf_lm_k_dev_from_value(Some("true")));
+        assert!(pf_lm_k_dev_from_value(Some("yes")));
+    }
+
     #[test]
     fn lm_dev_moe_gate_truth_table() {
         assert!(lm_dev_moe_ok(4096, true, true, true, 512, true, true));
