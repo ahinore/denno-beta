@@ -2227,7 +2227,23 @@ impl FullAttn {
         }
         let kb = self.cache.k(layer)?;
         let vb = self.cache.v(layer)?;
-        let mut flat_out = vec![0f32; nt * e];
+        // task 308: 層出力をデバイスに残す (`DENNO_PF_FULL_DEVRES`)。呼び出し側が
+        // 「combine がデバイスを読む」と決めたときだけ。D2H の代わりに
+        // 出力バッファのポインタを記録し、直後の combine がそのまま読む。
+        let keep_dev =
+            crate::cuda::pf_attn_dev_requested() && crate::model::qwen4exp::pf_full_devres_on();
+        // 分岐が実際に発火した証拠を lab のログに 1 回だけ出す。
+        if keep_dev {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!("[pf308] full 層の出力をデバイスに残す (DENNO_PF_FULL_DEVRES)");
+            });
+        }
+        let mut flat_out = if keep_dev {
+            Vec::new()
+        } else {
+            vec![0f32; nt * e]
+        };
         let done = crate::cuda::pf_full_out(
             cache_id,
             n_layer,
@@ -2248,6 +2264,7 @@ impl FullAttn {
             gate_src.is_some(),
             gate_src.map(|g| g.1).unwrap_or(0),
             gate_src.map(|g| g.4).unwrap_or(0),
+            keep_dev,
             &mut flat_out,
         );
         if !done {
@@ -2258,6 +2275,12 @@ impl FullAttn {
         if self.pos < base + nt {
             self.pos = base + nt;
         }
+        // task 308: デバイスに残した (空の Vec が「combine はデバイスを読む」の印)。
+        // 記録が無いまま空を返すと combine が落ちるので、契約をここで確かめる。
+        debug_assert!(
+            !keep_dev || crate::cuda::pf_attn_dev_peek(nt, e),
+            "keep_dev なのに層出力の記録が無い"
+        );
         Ok(Some(flat_out))
     }
 }
