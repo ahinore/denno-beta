@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy exp_iq_tc exp_iq_v3 mix_dev3 seg_k)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -62,6 +62,9 @@ spec() {
         # 1 行 = 1 warp で回す版。数値契約は CPU とビット一致しない (丸め順が
         # 変わる) ので FMA を許可する。決定的ではある (木の形が固定)。
         seg_k)        echo "kernels_seg_k.cu|fmad" ;;
+        # task 309: K 系 (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0) の prefill m 行
+        # expert GEMV。数値契約は無い (1 行を 32 レーンで分割) ので FMA を許可する。
+        exp_k_pf)     echo "kernels_exp_k_pf.cu|fmad" ;;
         # task 275: IQ2_S / IQ3_S のグリッド表を詰めた版 (IQ2_S は 2 bit x 8、
         # IQ3_S は下位 32 bit だけ)。表の値も積の順も v2 と同じなので FMA を許可する。
         exp_iq_v3)    echo "kernels_exp_iq_v3.cu|fmad" ;;

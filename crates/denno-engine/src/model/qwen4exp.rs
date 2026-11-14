@@ -12734,6 +12734,37 @@ fn iq_expert_mode(lw: &LayerW) -> bool {
         .all(|t| crate::model::exp_iq::supported(*t))
 }
 
+/// task 309: prefill の選択 expert を **GPU の m 行カーネルで回してよいか**。
+///
+/// IQ 系は従来どおり ([`iq_expert_mode`])。K 系 (Q4_K / Q5_K / Q6_K / Q5_1 /
+/// Q8_0) は `DENNO_PF_EXP_K=1` のときだけ、かつ**ストリーミング経路が使える
+/// ときだけ**真にする (K 系のカーネルはステージング領域の m 行カーネルにしか
+/// 無い。ストリーミングを切ると 1 本ずつ VRAM 常駐の expert だけを回す形になり、
+/// ミスが CPU に残って遅い)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn pf_expert_mode(lw: &LayerW) -> bool {
+    if iq_expert_mode(lw) {
+        return true;
+    }
+    pf_expert_mode_from(
+        crate::model::exp_pf::k_enabled(),
+        crate::model::exp_pf::stream_enabled(),
+        [
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+        ]
+        .iter()
+        .all(|t| crate::model::exp_pf::slot(*t).is_some()),
+    )
+}
+
+/// [`pf_expert_mode`] の純関数 (テスト用)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn pf_expert_mode_from(k_gate: bool, stream: bool, k_types_ok: bool) -> bool {
+    k_gate && stream && k_types_ok
+}
+
 /// task 150: ミスした expert の寄与を `dst` (`sel.len() * e`) へ直接書く。
 ///
 /// 1 expert の計算は [`expert_contribs_par`] と同じ [`ExpertW::gemv_seq`] を同じ順で
@@ -16669,7 +16700,7 @@ fn moe_experts_iq_pf_batch(
     if by_expert.is_empty()
         || nt == 0
         || !crate::model::exp_pf::pf_enabled()
-        || !iq_expert_mode(lw)
+        || !pf_expert_mode(lw)
     {
         return Ok(None);
     }
@@ -16741,6 +16772,65 @@ fn moe_experts_iq_pf_batch(
                     crate::model::exp_pf::stream_pin(),
                     crate::model::exp_pf::stream_bytes() >> 20,
                 );
+            }
+        }
+        // task 309: 行の少ない expert は CPU に残す (重み 1 本 3 MB の転送が
+        // 計算より高い)。K 系のときだけ (IQ 系の既存の挙動は変えない)。
+        let min_rows = crate::model::exp_pf::k_min_rows();
+        let split = !iq_expert_mode(lw)
+            && crate::model::exp_pf::k_enabled()
+            && min_rows > 0
+            && by_expert.iter().any(|p| {
+                !p.is_empty() && !crate::model::exp_pf::k_expert_pays(p.len(), min_rows)
+            });
+        if split {
+            let mut gpu_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(by_expert.len());
+            let mut cpu_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(by_expert.len());
+            for picks in by_expert.iter() {
+                if !picks.is_empty() && !crate::model::exp_pf::k_expert_pays(picks.len(), min_rows) {
+                    gpu_be.push(Vec::new());
+                    cpu_be.push(picks.clone());
+                } else {
+                    gpu_be.push(picks.clone());
+                    cpu_be.push(Vec::new());
+                }
+            }
+            // GPU 側 (行のある expert が 1 本でもあれば回す)。戻り値は GPU に
+            // 回した expert 数で、`out` は GPU の加重和で**上書き**される。
+            let mut ran = 0u32;
+            let mut ok = true;
+            if gpu_be.iter().any(|p| !p.is_empty()) {
+                match iq_pf_stream_layer(
+                    lw,
+                    &gpu_be,
+                    &resident,
+                    weights,
+                    k,
+                    PfStreamTgt::Host { xs, out },
+                    nt,
+                    e,
+                    ff,
+                )? {
+                    Some(h) => ran = h,
+                    None => ok = false,
+                }
+            }
+            if ok {
+                // CPU 側の寄与を上に足す (flat は `out` へ加算する)。
+                moe_experts_flat(
+                    lw,
+                    &cpu_be,
+                    weights,
+                    k,
+                    xs,
+                    e,
+                    ff,
+                    MOE_FLAT_ROWS,
+                    out,
+                    moe_expert::vnni_enabled(),
+                    None,
+                )?;
+                return Ok(Some(ran));
             }
         }
         if let Some(gpu) = iq_pf_stream_layer(
@@ -18547,6 +18637,25 @@ mod lm_dev_tests {
         );
         // 境界 (nt == min) は通す。
         assert!(lm_dev_moe_ok(512, true, true, true, 512, true, true));
+    }
+
+    /// task 309: K 系の prefill expert を GPU に回す前提 (真理値表)。
+    ///
+    /// ゲート・ストリーミング・型の 3 つが揃ったときだけ真。
+    #[test]
+    fn pf_expert_mode_k_truth_table() {
+        assert!(pf_expert_mode_from(true, true, true));
+        assert!(!pf_expert_mode_from(false, true, true), "ゲート off");
+        assert!(!pf_expert_mode_from(true, false, true), "ストリーミング off");
+        assert!(
+            !pf_expert_mode_from(true, true, false),
+            "型が K 系のカーネルに無い"
+        );
+        // task 309: lab t309b で採用して既定 on。
+        assert!(
+            crate::model::exp_pf::DEFAULT_K_ON,
+            "既定 off に戻っている"
+        );
     }
 }
 

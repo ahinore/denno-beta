@@ -722,19 +722,35 @@ pub const WARPS: usize = 4;
 
 /// このスロットの 1 block あたりの出力行数。
 ///
-/// 256 要素ブロックの型 (スロット 0..=3) は 1 warp = 2 行で 8 行 / block、
-/// IQ4_NL / Q2_0 (4..=5) は 1 行で 4 行 / block (重み 32/64 要素をレジスタに
+/// 256 要素ブロックの型 (IQ のスロット 0..=3、K の Q4_K / Q5_K / Q6_K) は
+/// 1 warp = 2 行で 8 行 / block、32 要素ブロックの型 (IQ4_NL / Q2_0 と
+/// K の Q5_1 / Q8_0) は 1 行で 4 行 / block (重み 32/64 要素をレジスタに
 /// 持つので 2 行ぶんは入らない)。
 pub fn tile_of(slot: usize) -> usize {
-    if slot <= 3 {
+    if slot <= 3 || (K_SLOT0..K_SLOT0 + 3).contains(&slot) {
         WARPS * OUT_PER_WARP
     } else {
         WARPS
     }
 }
 
-/// カーネルのスロット数 (型の数)。
-pub const SLOTS: usize = 6;
+/// IQ 系 (`kernels_exp_iq_pf.cu`) のスロット数。
+pub const IQ_SLOTS: usize = 6;
+
+/// K 系 (`kernels_exp_k_pf.cu`) のスロット数
+/// (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0、task 309)。
+pub const K_SLOTS: usize = 5;
+
+/// K 系の最初のスロット。これ以上は `kernels_exp_k_pf.ptx` のカーネル。
+pub const K_SLOT0: usize = IQ_SLOTS;
+
+/// カーネルのスロット数 (IQ 6 + K 5)。
+pub const SLOTS: usize = IQ_SLOTS + K_SLOTS;
+
+/// K 系のスロットか (PTX のモジュールが違う)。
+pub fn is_k_slot(slot: usize) -> bool {
+    slot >= K_SLOT0
+}
 
 /// 既定で有効か (タスクの採否で決める)。
 ///
@@ -764,6 +780,71 @@ pub fn pf_enabled() -> bool {
             std::env::var(EXPERT_IQ_PF_ENV).ok().as_deref(),
         )
     })
+}
+
+/// `DENNO_PF_EXP_K=1`: prefill の選択 expert を **K 系の型**
+/// (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0) でも GPU の m 行カーネル
+/// (`kernels_exp_k_pf.cu`) で回す (task 309)。
+///
+/// **`DENNO_EXPERT_IQ_GPU=1` が前提** (VRAM 常駐の LRU とストリーミングを使うため。
+/// [`pf_enabled`] が同じ条件で立つ)。既定は lab の採否で決める。
+pub const K_ENV: &str = "DENNO_PF_EXP_K";
+
+/// 既定値 (**on**。lab t309b で採用)。
+///
+/// t309b (UD-Q4_K_XL、depth8k、PROFILE=1) の採否の数字は REPORT_P309.md。
+/// `DENNO_PF_EXP_K=0` で従来の CPU 経路へ戻せる。
+pub const DEFAULT_K_ON: bool = true;
+
+/// [`K_ENV`] の解釈 (純関数)。`iq_on` が false なら常に false。
+/// 明示的な偽値 (`0` / `off` / `false`) だけが偽で、未設定は [`DEFAULT_K_ON`]。
+pub fn k_from_value(iq_on: bool, v: Option<&str>) -> bool {
+    if !iq_on {
+        return false;
+    }
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_K_ON,
+        Some(s) => crate::model::expert_vram::flag_on(Some(s)) || !matches!(s, "0" | "off" | "false"),
+    }
+}
+
+/// K 系のゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn k_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        k_from_value(
+            crate::model::exp_iq::iq_gpu_enabled(),
+            std::env::var(K_ENV).ok().as_deref(),
+        )
+    })
+}
+
+/// `DENNO_PF_EXP_K_MIN_ROWS`: 1 expert を GPU に回すのに要る最小の行数 (既定 8)。
+///
+/// これ未満の expert は **CPU のまま**回す (重み 1 本 3 MB の転送が計算より
+/// 高い。1 チャンクの expert 平均は実形で 20 行前後)。`0` で床を外す。
+pub const K_MIN_ROWS_ENV: &str = "DENNO_PF_EXP_K_MIN_ROWS";
+
+/// [`K_MIN_ROWS_ENV`] の既定値。
+pub const DEFAULT_K_MIN_ROWS: usize = 8;
+
+/// [`K_MIN_ROWS_ENV`] の解釈 (純関数)。
+pub fn k_min_rows_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) if !s.is_empty() => s.parse().unwrap_or(DEFAULT_K_MIN_ROWS),
+        _ => DEFAULT_K_MIN_ROWS,
+    }
+}
+
+/// 1 expert を GPU に回す最小行数 (プロセスで 1 回だけ env を読む)。
+pub fn k_min_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| k_min_rows_from_value(std::env::var(K_MIN_ROWS_ENV).ok().as_deref()))
+}
+
+/// この expert の行数を GPU に回すか (純関数。`min_rows = 0` は全部 GPU)。
+pub fn k_expert_pays(rows: usize, min_rows: usize) -> bool {
+    rows > 0 && rows >= min_rows
 }
 
 fn env_usize(key: &str, dflt: usize) -> usize {
@@ -880,6 +961,40 @@ pub fn stream_wc() -> bool {
             std::env::var(STREAM_WC_ENV).ok().as_deref(),
         )
     })
+}
+
+/// task 309: 層の expert 型が K 系のときの既定も込めた解釈 (純関数)。
+///
+/// 明示値 (`DENNO_PF_STREAM_WC`) はそのまま。**未設定のときだけ**型で変える:
+/// IQ 系は従来どおり write-combined (lab t165b: probe 53.5 GB/s)、
+/// K 系は通常の pinned (lab t309b: UD-Q4_K_XL の 3,826 cold が 17.0 s 対
+/// write-combined の 29.6 s。WC だとホスト側の写しが 4.3 GB/s で頭打ち)。
+pub fn stream_wc_for_from(v: Option<&str>, pf_on: bool, is_k: bool) -> bool {
+    if !pf_on {
+        return false;
+    }
+    match v.map(str::trim) {
+        None | Some("") => !is_k,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// このモードの write-combined 既定 (プロセスで 1 回だけ env を読む)。
+pub fn stream_wc_for(is_k: bool) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON_K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let init = || {
+        stream_wc_for_from(
+            std::env::var(STREAM_WC_ENV).ok().as_deref(),
+            stream_enabled(),
+            is_k,
+        )
+    };
+    if is_k {
+        *ON_K.get_or_init(init)
+    } else {
+        *ON.get_or_init(init)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1259,18 @@ pub fn dma_probe_on() -> bool {
 
 /// 型 → カーネルのスロット (decode の `kernels_exp_iq` と同じ順)。
 pub fn slot(ty: GgmlType) -> Option<usize> {
-    crate::model::exp_iq::slot(ty)
+    if let Some(s) = crate::model::exp_iq::slot(ty) {
+        return Some(s);
+    }
+    // task 309: K 系 (prefill のバッチ用。`DENNO_PF_EXP_K` で有効になる)。
+    Some(match ty {
+        GgmlType::Q4K => K_SLOT0,
+        GgmlType::Q5K => K_SLOT0 + 1,
+        GgmlType::Q6K => K_SLOT0 + 2,
+        GgmlType::Q5_1 => K_SLOT0 + 3,
+        GgmlType::Q8_0 => K_SLOT0 + 4,
+        _ => return None,
+    })
 }
 
 /// この型を m 行カーネルで読めるか。
@@ -1173,6 +1299,12 @@ pub fn kernel_name(slot: usize) -> Option<&'static str> {
         3 => "dno_exp_pf_iq4xs",
         4 => "dno_exp_pf_iq4nl",
         5 => "dno_exp_pf_q2_0",
+        // task 309: K 系 (`kernels_exp_k_pf.cu`)。PTX は別モジュール。
+        6 => "dno_exp_k_pf_q4k",
+        7 => "dno_exp_k_pf_q5k",
+        8 => "dno_exp_k_pf_q6k",
+        9 => "dno_exp_k_pf_q5_1",
+        10 => "dno_exp_k_pf_q8_0",
         _ => return None,
     })
 }
@@ -2219,6 +2351,80 @@ mod tests {
         assert!(launch_plan(4, 1, 642).is_none());
     }
 
+    /// task 309: K 系のスロット・カーネル名・起動形 (UD-Q4_K_XL の実形)。
+    #[test]
+    fn k_slots_names_and_plans() {
+        use crate::kquant::GgmlType as T;
+        assert_eq!(slot(T::Q4K), Some(K_SLOT0));
+        assert_eq!(slot(T::Q5K), Some(K_SLOT0 + 1));
+        assert_eq!(slot(T::Q6K), Some(K_SLOT0 + 2));
+        assert_eq!(slot(T::Q5_1), Some(K_SLOT0 + 3));
+        assert_eq!(slot(T::Q8_0), Some(K_SLOT0 + 4));
+        // IQ 系のスロットは動かない (既存のカーネル名と一致)。
+        assert_eq!(slot(T::IQ3S), Some(2));
+        assert_eq!(kernel_name(2), Some("dno_exp_pf_iq3s"));
+        assert_eq!(kernel_name(5), Some("dno_exp_pf_q2_0"));
+        assert_eq!(kernel_name(6), Some("dno_exp_k_pf_q4k"));
+        assert_eq!(kernel_name(7), Some("dno_exp_k_pf_q5k"));
+        assert_eq!(kernel_name(8), Some("dno_exp_k_pf_q6k"));
+        assert_eq!(kernel_name(9), Some("dno_exp_k_pf_q5_1"));
+        assert_eq!(kernel_name(10), Some("dno_exp_k_pf_q8_0"));
+        assert_eq!(kernel_name(SLOTS), None, "スロットの外は名前を持たない");
+        assert!(is_k_slot(K_SLOT0) && is_k_slot(SLOTS - 1) && !is_k_slot(IQ_SLOTS - 1));
+        // 256 要素ブロックの型は 8 行 / block、32 要素ブロックの型は 4 行 / block。
+        assert_eq!(tile_of(K_SLOT0), 8, "Q4_K");
+        assert_eq!(tile_of(K_SLOT0 + 2), 8, "Q6_K");
+        assert_eq!(tile_of(K_SLOT0 + 3), 4, "Q5_1");
+        assert_eq!(tile_of(K_SLOT0 + 4), 4, "Q8_0");
+        // UD-Q4_K_XL の形: gate/up は k=2560 → n=640、down は k=640 → n=2560。
+        let g = launch_plan(slot(T::Q4K).unwrap(), 200, 640).expect("gate の形");
+        assert_eq!(g.grid, (80, 200, 1));
+        assert_eq!(g.block, (128, 1, 1));
+        let d = launch_plan(slot(T::Q5_1).unwrap(), 200, 2560).expect("down の形");
+        assert_eq!(d.grid, (640, 200, 1));
+        // k の割り切り: Q4_K は 256 の倍数だけ、Q5_1 は 32 の倍数だけ。
+        assert!(row_bytes(T::Q4K, 2560).is_some());
+        assert!(row_bytes(T::Q4K, 640).is_none(), "down を Q4_K で読んではいけない");
+        assert_eq!(row_bytes(T::Q5_1, 640), Some(480));
+        assert_eq!(row_bytes(T::Q8_0, 2560), Some(2720));
+        assert_eq!(row_bytes(T::Q6K, 2560), Some(2100));
+    }
+
+    /// task 309: K 系のゲートは IQ ゲートの内側・既定 off・明示の真値だけ on。
+    #[test]
+    fn k_gate_truth_table() {
+        assert!(!k_from_value(false, Some("1")), "IQ ゲート off なら動かない");
+        assert!(!k_from_value(false, None));
+        assert_eq!(k_from_value(true, None), DEFAULT_K_ON);
+        assert_eq!(k_from_value(true, Some("")), DEFAULT_K_ON);
+        assert!(k_from_value(true, Some("1")));
+        assert!(k_from_value(true, Some("on")));
+        assert!(!k_from_value(true, Some("0")));
+        assert!(!k_from_value(true, Some("off")));
+        assert!(!k_from_value(true, Some("false")));
+        // task 309: lab t309b で採用して既定 on (IQ ゲートが前提なので、
+        // env 未設定でも `DENNO_EXPERT_IQ_GPU=1` が無ければ k_enabled() は false)。
+        assert!(DEFAULT_K_ON, "既定 off に戻っている");
+        assert!(k_from_value(true, None), "未設定は既定 (on) でない");
+        // write-combined の既定は型で変わる (K 系は通常 pinned)。
+        assert!(!stream_wc_for_from(None, true, true), "K 系の既定が WC");
+        assert!(stream_wc_for_from(None, true, false), "IQ 系の既定が WC でない");
+        assert!(stream_wc_for_from(Some("1"), true, true), "明示値は型より優先");
+        assert!(!stream_wc_for_from(Some("0"), true, false), "明示値は型より優先");
+        assert!(!stream_wc_for_from(None, false, false), "ストリーミング off");
+        // 行数の床 (純関数)。
+        assert_eq!(k_min_rows_from_value(None), DEFAULT_K_MIN_ROWS);
+        assert_eq!(k_min_rows_from_value(Some("")), DEFAULT_K_MIN_ROWS);
+        assert_eq!(k_min_rows_from_value(Some("16")), 16);
+        assert_eq!(k_min_rows_from_value(Some("0")), 0);
+        assert_eq!(k_min_rows_from_value(Some("x")), DEFAULT_K_MIN_ROWS);
+        assert_eq!(DEFAULT_K_MIN_ROWS, 8);
+        assert!(!k_expert_pays(7, 8), "床未満は CPU");
+        assert!(k_expert_pays(8, 8));
+        assert!(!k_expert_pays(0, 0), "行の無い expert は回さない");
+        assert!(k_expert_pays(3, 0), "床 0 は全部 GPU");
+    }
+
     /// ゲートは `DENNO_EXPERT_IQ_GPU=1` の内側だけ。既定は [`DEFAULT_ON`]。
     #[test]
     fn gate_needs_iq_and_parses_values() {
@@ -2630,14 +2836,23 @@ mod tests {
     fn kernel_names_exist_in_cu_source() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
         let cu = std::fs::read_to_string(dir.join("kernels_exp_iq_pf.cu")).expect(".cu が読めない");
+        // task 309: K 系は別ファイル (別モジュール)。
+        let kcu = std::fs::read_to_string(dir.join("kernels_exp_k_pf.cu"))
+            .expect("kernels_exp_k_pf.cu が読めない");
         for i in 0..SLOTS {
             let name = kernel_name(i).expect("slot");
-            // 256 要素ブロックの 4 型はマクロ `PF_KERNEL_256(名前, デコード)` で
-            // 生成するので、どちらの書き方でも受ける。
+            let src = if is_k_slot(i) { &kcu } else { &cu };
+            let file = if is_k_slot(i) {
+                "kernels_exp_k_pf.cu"
+            } else {
+                "kernels_exp_iq_pf.cu"
+            };
+            // 256 要素ブロックの型はマクロで生成するので、どちらの書き方でも受ける。
             assert!(
-                cu.contains(&format!("__global__ void {name}("))
-                    || cu.contains(&format!("PF_KERNEL_256({name},")),
-                "{name} が kernels_exp_iq_pf.cu に無い"
+                src.contains(&format!("__global__ void {name}("))
+                    || src.contains(&format!("PF_KERNEL_256({name},"))
+                    || src.contains(&format!("KPF_KERNEL_256({name},")),
+                "{name} が {file} に無い"
             );
         }
         assert!(
@@ -2653,6 +2868,9 @@ mod tests {
         assert!(cu.contains("#define PF_OUTS 2"), "PF_OUTS が 2 でない");
         assert!(cu.contains("#define PF_WARPS 4"), "PF_WARPS が 4 でない");
         assert_eq!(ROWS_PER_LAUNCH, 16);
+        assert!(kcu.contains("#define PF_MR 16"), "K 系の PF_MR が 16 でない");
+        assert!(kcu.contains("#define PF_OUTS 2"), "K 系の PF_OUTS が 2 でない");
+        assert!(kcu.contains("#define PF_WARPS 4"), "K 系の PF_WARPS が 4 でない");
         // 生成規則 (build_ptx.sh の exp_iq_pf) と cuda.rs が読む名前が同じこと。
         let sh = std::fs::read_to_string(dir.join("build_ptx.sh")).expect("build_ptx.sh");
         assert!(
@@ -2663,6 +2881,15 @@ mod tests {
             sh.contains("targets_all=(") && sh.contains(" exp_iq_pf"),
             "build_ptx.sh の targets_all に exp_iq_pf が無い"
         );
+        // task 309: K 系も同じ規則で生成する。
+        assert!(
+            sh.contains("exp_k_pf)") && sh.contains("kernels_exp_k_pf.cu|fmad"),
+            "build_ptx.sh に exp_k_pf の規則が無い"
+        );
+        assert!(
+            sh.contains(" exp_k_pf)"),
+            "build_ptx.sh の targets_all に exp_k_pf が無い"
+        );
     }
 
     /// コミット済みの PTX が .cu と同じ引数の数を持つ (ABI の取り違えは実機で
@@ -2670,25 +2897,33 @@ mod tests {
     #[test]
     fn committed_ptx_has_expected_params() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
-        let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq_pf.ptx")) else {
-            // PTX 未生成のツリーでは何も言えない (カーネル無し = CPU へ落ちるだけ)。
-            return;
-        };
-        let count = |name: &str| -> Option<usize> {
+        let count = |ptx: &str, name: &str| -> Option<usize> {
             let head = format!(".visible .entry {name}(");
             let i = ptx.find(&head)?;
             let rest = &ptx[i + head.len()..];
             let end = rest.find(')').unwrap_or(rest.len());
             Some(rest[..end].matches(".param").count())
         };
-        for i in 0..SLOTS {
+        let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq_pf.ptx")) else {
+            // PTX 未生成のツリーでは何も言えない (カーネル無し = CPU へ落ちるだけ)。
+            return;
+        };
+        for i in 0..IQ_SLOTS {
             let name = kernel_name(i).expect("slot");
-            assert_eq!(count(name), Some(9), "{name} の引数の数が .cu と違う");
+            assert_eq!(count(&ptx, name), Some(9), "{name} の引数の数が .cu と違う");
         }
-        assert_eq!(count(SILU_KERNEL), Some(4), "{SILU_KERNEL} の引数の数");
+        assert_eq!(count(&ptx, SILU_KERNEL), Some(4), "{SILU_KERNEL} の引数の数");
         // accum は task 151 でホスト側の足し込みに戻したので**現状未使用**。
         // PTX には残っていて、ABI (引数の数) だけを固定する。
-        assert_eq!(count(ACCUM_KERNEL), Some(7), "{ACCUM_KERNEL} の引数の数");
+        assert_eq!(count(&ptx, ACCUM_KERNEL), Some(7), "{ACCUM_KERNEL} の引数の数");
+        // task 309: K 系の PTX (未生成なら省略)。
+        let Ok(kptx) = std::fs::read_to_string(dir.join("kernels_exp_k_pf.ptx")) else {
+            return;
+        };
+        for i in K_SLOT0..SLOTS {
+            let name = kernel_name(i).expect("slot");
+            assert_eq!(count(&kptx, name), Some(9), "{name} の引数の数が .cu と違う");
+        }
     }
 
     /// task 151: 診断の併合と取り出し (`DENNO_EXPERT_GPU_CHECK=1` の prefill 版)。
