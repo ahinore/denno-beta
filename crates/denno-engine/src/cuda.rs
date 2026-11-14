@@ -15388,6 +15388,43 @@ mod pf_pin_tests {
             assert!(pf_mix_keep_from_value(v), "mixkeep が on でない: {v:?}");
         }
     }
+
+    /// task 317: `DENNO_PF_MIXKEEP_SSM` は既定 off (明示的な真値だけ on)。
+    #[test]
+    fn pf317_mixkeep_ssm_gate_values() {
+        for v in [None, Some("0"), Some("off"), Some(""), Some("no")] {
+            assert!(!pf_mix_keep_ssm_from_value(v), "ssm mixkeep が off でない: {v:?}");
+        }
+        for v in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
+            assert!(pf_mix_keep_ssm_from_value(v), "ssm mixkeep が on でない: {v:?}");
+        }
+        // 強制フラグは env より優先する (既定 = env)。
+        pf_mix_keep_ssm_set_for_test(2);
+        assert!(pf_mix_keep_ssm_on(), "強制 on が効いていない");
+        pf_mix_keep_ssm_set_for_test(1);
+        assert!(!pf_mix_keep_ssm_on(), "強制 off が効いていない");
+        pf_mix_keep_ssm_set_for_test(0);
+        crate::cuda::pf_reset_for_test();
+    }
+
+    /// task 317: 記録が合えばデバイスの `mixed` を指し、合わなければ `None`。
+    /// `DENNO_PF_MIXDEVIN` (既定 on) が off なら常に `None`。
+    #[test]
+    fn pf317_dev_in_ptr_needs_matching_mark() {
+        let a = [0.0f32; 8];
+        let b = [0.0f32; 8];
+        pf_dev_in_set_for_test(2);
+        pf_mixed_keep_dev(a.as_ptr(), 2, 4);
+        // 作業域が無いのでポインタは返らないが、記録の一致判定はここで効く。
+        assert!(pf_mixed_dev_only(a.as_ptr(), 2, 4));
+        assert!(!pf_mixed_dev_only(b.as_ptr(), 2, 4), "別ポインタが一致した");
+        assert!(!pf_mixed_dev_only(a.as_ptr(), 1, 4), "nt 違いが一致した");
+        pf_dev_in_set_for_test(1);
+        assert!(pf_mixed_dev_in_ptr(a.as_ptr(), 2, 4).is_none(), "devin off で返った");
+        pf_dev_in_set_for_test(0);
+        pf_mixed_mark_clear();
+        crate::cuda::pf_reset_for_test();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -15471,6 +15508,47 @@ pub(crate) fn pf_mix_keep_on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| pf_mix_keep_from_value(std::env::var("DENNO_PF_MIXKEEP").ok().as_deref()))
+}
+
+/// task 317: `DENNO_PF_MIXKEEP_SSM` の解釈 (純関数)。**既定 off**。
+///
+/// on にすると、ssm 層の attn mix も `mixed` を D2H しない。直後の GDN 連鎖
+/// (`gdn_pf_chain`) がデバイスの `mixed` をそのまま GEMM の入力に読み、
+/// `b.x` への H2D も 1 本消える (値は同じバイト列)。
+///
+/// 連鎖が前提外でホスト経路へ落ちる場合 (型・形・ゲート) は、
+/// `SsmLayer::forward_batch_flat` が [`pf_mixed_restore_host`] でホストへ
+/// 埋め直してから計算する (古いバイト列を読まない)。
+pub(crate) fn pf_mix_keep_ssm_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+static PF_MIX_KEEP_SSM_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用: ssm 側のゲートを強制する (0 = env に戻す)。
+#[cfg(test)]
+pub(crate) fn pf_mix_keep_ssm_set_for_test(v: u8) {
+    PF_MIX_KEEP_SSM_FORCE.store(v, Ordering::Relaxed);
+}
+
+/// task 317: ssm 層の attn mix を D2H しないか (`DENNO_PF_MIXKEEP_SSM`、**既定 off**)。
+pub(crate) fn pf_mix_keep_ssm_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_MIX_KEEP_SSM_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_mix_keep_ssm_from_value(std::env::var("DENNO_PF_MIXKEEP_SSM").ok().as_deref())
+    })
 }
 
 thread_local! {
@@ -49018,17 +49096,27 @@ pub fn gdn_pf_chain(
     if ba_dev_req && ba_dev.is_none() {
         return Ok(false);
     }
+    // task 317: 直前の attn mix を D2H していなければ (`DENNO_PF_MIXKEEP_SSM`)、
+    // デバイスの `mixed` をそのまま入力にする。`b.x` への H2D 1 本 (nt × e × 4 B)
+    // が消えるだけで、値は同じバイト列。
+    let xdev = if pf_mix_keep_ssm_on() {
+        pf_mixed_dev_in_ptr(flat.as_ptr(), nt, e)
+    } else {
+        None
+    };
     gdn_pf_kprof::begin(gdn_pf_kprof::X_H2D);
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
         b.ensure(nt, e, conv_dim, vd, nv)?;
-        b.x.as_ref().unwrap().copy_from(flat)?;
+        if xdev.is_none() {
+            b.x.as_ref().unwrap().copy_from(flat)?;
+        }
         if ba_dev.is_none() {
             b.beta.as_ref().unwrap().copy_from(beta)?;
             b.alpha.as_ref().unwrap().copy_from(alpha)?;
         }
         Ok([
-            b.buf(0),
+            xdev.unwrap_or_else(|| b.buf(0)),
             b.buf(1),
             b.buf(2),
             b.buf(3),

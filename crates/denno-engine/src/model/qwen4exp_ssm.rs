@@ -706,6 +706,21 @@ impl SsmLayer {
                 return Ok(rows);
             }
         }
+        // task 317: 直前の mix を D2H していない (`DENNO_PF_MIXKEEP_SSM`) のに
+        // 連鎖に乗らなかったときは、ホスト経路の前にデバイスから埋め直す
+        // (連鎖の入口で落ちた場合は状態も進んでいない)。埋め直せなければ落とす。
+        #[cfg(feature = "cuda")]
+        {
+            let h = flat.as_ptr() as *mut f32;
+            if crate::cuda::pf_mixed_dev_only(h as *const f32, nt, e)
+                && !crate::cuda::pf_mixed_restore_host(h, nt, e)
+            {
+                bail!(
+                    "SsmLayer::forward_batch_flat: mixed の復元 (D2H) に失敗 (li={}) → 要求を落とす",
+                    self.il
+                );
+            }
+        }
 
         // task 72: qkv と z、beta と alpha をそれぞれ 1 回のバッチ GEMV にまとめる。
         // トークンごとの値は個別に呼んだ場合と同じ (行の独立)。

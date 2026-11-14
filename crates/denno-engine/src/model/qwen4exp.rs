@@ -4248,11 +4248,20 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         {
             // `DENNO_PF_MIXDEVIN=0` のときは qkv がデバイスを読まないので、
             // D2H を飛ばしてはいけない (ホストが古いバイト列になる)。
-            crate::cuda::pf_mix_keep_on()
-                && crate::cuda::pf_dev_in_on()
+            crate::cuda::pf_dev_in_on()
                 && flat_attn
                 && nt >= 64
-                && matches!(kind, Some(LayerKind::FullAttn))
+                && match kind {
+                    // task 230: full 層は直後の qkv (`pf_full_qkv` / v3) が
+                    // デバイスの `mixed` を直接読める。
+                    Some(LayerKind::FullAttn) => crate::cuda::pf_mix_keep_on(),
+                    // task 317: ssm 層は直後の GDN 連鎖 (`gdn_pf_chain`) が
+                    // デバイスの `mixed` を読む (`DENNO_PF_MIXKEEP_SSM`)。
+                    // 連鎖に乗らない層は `forward_batch_flat` が復元してから
+                    // ホスト経路で計算する。
+                    Some(LayerKind::Ssm) => crate::cuda::pf_mix_keep_ssm_on(),
+                    None => false,
+                }
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -5249,6 +5258,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
                 // 1.2 attention 入口 (デバイス mix) → attn → combine
                 let t_mix = std::time::Instant::now();
+                let flat_attn = pf_attn_flat_on();
                 {
                     let _l = q4ledger::enter(q4ledger::MIX);
                     if !crate::cuda::pf_mix(
@@ -5265,14 +5275,19 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         Self::pf_bail("attn mix の連鎖に失敗")?;
                     }
                     let mixed = &mut attn_buf.as_mut_slice()[..nt * e];
-                    if !crate::cuda::pf_take_mixed(mixed) {
-                        Self::pf_bail("attn mix の mixed D2H に失敗")?;
+                    // task 317: full 層 (task 230) と ssm 層 (`MIXKEEP_SSM`) は
+                    // 直後の attn がデバイスの `mixed` を読めるので D2H しない。
+                    if Self::pf_mix_keep_layer(flat_attn, nt, self.p.layer_kind(il).ok()) {
+                        crate::cuda::pf_mixed_keep_dev(mixed.as_ptr(), nt, e);
+                    } else {
+                        if !crate::cuda::pf_take_mixed(mixed) {
+                            Self::pf_bail("attn mix の mixed D2H に失敗")?;
+                        }
+                        crate::cuda::pf_mixed_mark(mixed.as_ptr(), nt, e);
                     }
-                    crate::cuda::pf_mixed_mark(mixed.as_ptr(), nt, e);
                 }
                 q4prof::add(&q4prof::MIX, t_mix);
                 let mixed_attn: &[f32] = &attn_buf.as_slice()[..nt * e];
-                let flat_attn = pf_attn_flat_on();
                 let attn_dev = flat_attn && pf_attn_devres_on() && roles.is_none();
                 let curs: Vec<Vec<f32>> = if flat_attn {
                     Vec::new()
@@ -19244,6 +19259,48 @@ fn expert_gemv_cached_seq(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task 317: keep の判定は層種別ごとのゲートに従う (full = `DENNO_PF_MIXKEEP`、
+    /// ssm = `DENNO_PF_MIXKEEP_SSM`)。dev-in が off・平坦でない・短いチャンクは
+    /// 常に D2H (ホストが正) に戻す。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pf317_mix_keep_layer_per_kind() {
+        use crate::cuda;
+        cuda::pf_dev_in_set_for_test(2);
+        cuda::pf_mix_keep_set_for_test(1);
+        cuda::pf_mix_keep_ssm_set_for_test(1);
+        // 両方 off: どちらも D2H する。
+        assert!(!Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::FullAttn)));
+        assert!(!Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::Ssm)));
+        // full だけ on。
+        cuda::pf_mix_keep_set_for_test(2);
+        assert!(Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::FullAttn)));
+        assert!(!Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::Ssm)));
+        // ssm だけ on (task 317 の追加ぶん)。
+        cuda::pf_mix_keep_set_for_test(1);
+        cuda::pf_mix_keep_ssm_set_for_test(2);
+        assert!(!Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::FullAttn)));
+        assert!(Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::Ssm)));
+        // 前提 (平坦・nt >= 64・層種別が分かる) が欠けたら D2H。
+        assert!(
+            !Qwen4Exp::pf_mix_keep_layer(false, 128, Some(LayerKind::Ssm)),
+            "平坦でないのに keep"
+        );
+        assert!(
+            !Qwen4Exp::pf_mix_keep_layer(true, 63, Some(LayerKind::Ssm)),
+            "短い nt で keep"
+        );
+        assert!(
+            !Qwen4Exp::pf_mix_keep_layer(true, 128, None),
+            "層種別なしで keep"
+        );
+        // dev-in off (`DENNO_PF_MIXDEVIN=0`) は常に D2H。
+        cuda::pf_dev_in_set_for_test(1);
+        assert!(!Qwen4Exp::pf_mix_keep_layer(true, 128, Some(LayerKind::Ssm)));
+        cuda::pf_dev_in_set_for_test(0);
+        cuda::pf_mix_keep_ssm_set_for_test(0);
+    }
 
     /// `cuda` feature の有無で GPU GEMM を切る (無いビルドでは何もしない)。
     ///
