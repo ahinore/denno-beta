@@ -10812,3 +10812,54 @@ fn task320_upload_thread_lookahead_is_wired() {
         "ステージングの枚数が変わった (先読みの上限 2 を見直すこと)"
     );
 }
+
+/// task 320: 分離モード (`DENNO_PF_UP_DECOUPLE`) の順序。
+///
+/// - ホストが待つイベントが「pinned を前回読んだ DMA」(pin_ev) に切り替わる
+/// - カーネル完了 (VRAM ステージングの再利用) はホストではなく
+///   `cuStreamWaitEvent` で上げストリームに守らせる
+/// - その待ちは**写しの後・DMA の前**に入る (写しをカーネルの裏に入れるのが目的。
+///   逆にすると直列のままで、lab t320a の -5.0% から動かない)
+#[test]
+fn task320_up_decouple_orders_copy_before_stream_wait() {
+    assert!(
+        EXP_PF_SRC.contains("pub const UP_DECOUPLE_ENV: &str = \"DENNO_PF_UP_DECOUPLE\";"),
+        "env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn up_decouple_on()"),
+        "ゲートの実体が無い"
+    );
+    // 依頼に pin_ev が載る。
+    assert!(
+        CUDA_RS.contains("let pin_ev = if exp_pf::up_decouple_on() && st.slot[s].used {"),
+        "依頼が pin の再利用イベントを組んでいない"
+    );
+    assert!(CUDA_RS.contains("    pin_ev: usize,"), "依頼の欄が無い");
+    // ワーカー: ホスト待ちの切り替え。
+    assert!(
+        CUDA_RS.contains("let host_ev = if decouple { job.pin_ev } else { job.wait_ev };"),
+        "ホスト待ちが分離モードで切り替わっていない"
+    );
+    // 順序: 写し → cuStreamWaitEvent → DMA。
+    let run = CUDA_RS
+        .split("fn pf_up_run(")
+        .nth(1)
+        .expect("pf_up_run が無い");
+    let copy_at = run.find("pf_copy_into_pin(job.pin, &job.parts)").expect("写しが無い");
+    let wait_at = run
+        .find("cuStreamWaitEvent (stage reuse/上げスレッド)")
+        .expect("ストリーム待ちが無い");
+    let dma_at = run
+        .find("cuMemcpyHtoDAsync (stage/上げスレッド)")
+        .expect("DMA が無い");
+    assert!(copy_at < wait_at, "ストリーム待ちが写しより前にある");
+    assert!(wait_at < dma_at, "ストリーム待ちが DMA より後ろにある");
+    assert!(
+        run.split("cuStreamWaitEvent (stage reuse/上げスレッド)")
+            .nth(1)
+            .expect("待ちの後ろが無い")
+            .contains("cuMemcpyHtoDAsync (stage/上げスレッド)"),
+        "DMA が待ちの後ろに無い"
+    );
+}

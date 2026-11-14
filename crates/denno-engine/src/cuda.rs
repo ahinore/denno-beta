@@ -12142,6 +12142,9 @@ struct PfUpJob {
     stream: usize,
     /// このスロットを前回読んだ計算の完了イベント (未使用なら 0)。
     wait_ev: usize,
+    /// task 320: このスロットの pinned を前回読んだ DMA の完了イベント
+    /// (分離モードだけ。未使用なら 0)。ホストはこれだけを待って写す。
+    pin_ev: usize,
     /// このグループの H2D 完了を知らせるイベント。
     up_ev: usize,
     /// 最初の 1 グループだけ、同期して実 H2D を測る。
@@ -12345,6 +12348,18 @@ fn pf_submit_group(
             } else {
                 0
             };
+            // task 320: 分離モードでは、ワーカーが**ホストで待つ**のは
+            // 「このスロットの pinned を前回読んだ DMA の完了」だけにする
+            // (カーネルの完了は上げストリームの待ちで GPU に守らせる)。
+            let pin_ev = if exp_pf::up_decouple_on() && st.slot[s].used {
+                st.slot[s]
+                    .ev_up
+                    .as_ref()
+                    .map(|e| e.0 as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let up_ev = st.slot[s]
                 .ev_up
                 .as_ref()
@@ -12362,6 +12377,7 @@ fn pf_submit_group(
                 parts: plan.parts,
                 stream,
                 wait_ev,
+                pin_ev,
                 up_ev,
                 probe,
             })?;
@@ -12427,14 +12443,22 @@ fn pf_up_run(
 ) -> Result<()> {
     let l = lib()?;
     // 1. このスロットを前回読んだ計算の完了を待つ。
-    if job.wait_ev != 0 {
+    //
+    // task 320 (分離モード): ホストで待つのは「pinned を前回読んだ DMA の完了」
+    // だけにする。カーネルの完了 (スロットの再利用) は待たず、DMA を積む前に
+    // 上げストリームへ `cuStreamWaitEvent` で入れる。カーネルを待つと
+    // 写しがカーネルの裏に入らず、直列のときと変わらない (lab t320a:
+    // ut=1 でも wall -5.0%、`up_wait` 405 → 1,112 ms)。
+    let decouple = exp_pf::up_decouple_on();
+    let host_ev = if decouple { job.pin_ev } else { job.wait_ev };
+    if host_ev != 0 {
         let Some(es) = l.event_sync else {
             bail!("cuEventSynchronize が無い");
         };
         let t = std::time::Instant::now();
         unsafe {
             check(
-                es(job.wait_ev as CUevent),
+                es(host_ev as CUevent),
                 "cuEventSynchronize (stage reuse/上げスレッド)",
             )?;
         }
@@ -12444,6 +12468,23 @@ fn pf_up_run(
     let t_copy = std::time::Instant::now();
     pf_copy_into_pin(job.pin, &job.parts);
     *copy_ns = t_copy.elapsed().as_nanos() as u64;
+    // 2.5 task 320 (分離モード): VRAM のステージングを前回読んだカーネルの
+    //     完了を上げストリームの待ちとして入れる (ホストは止めない)。
+    if decouple && job.wait_ev != 0 && job.need > 0 {
+        let Some(sw) = l.stream_wait_event else {
+            bail!("cuStreamWaitEvent が無い");
+        };
+        unsafe {
+            check(
+                sw(
+                    job.stream as CUstream,
+                    job.wait_ev as CUevent,
+                    0,
+                ),
+                "cuStreamWaitEvent (stage reuse/上げスレッド)",
+            )?;
+        }
+    }
     // 3. 非同期 H2D を積み、完了イベントを記録する。
     let t_enq = std::time::Instant::now();
     if job.need > 0 {

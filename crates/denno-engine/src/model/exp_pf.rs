@@ -607,13 +607,27 @@ pub const DEFAULT_STREAM_GROUP: usize = 64;
 /// [`STREAM_PIN_ENV`] の既定値 (1 = pinned バウンス + 非同期)。
 pub const DEFAULT_STREAM_PIN: usize = 1;
 
-/// [`STREAM_UT_ENV`] の既定値 (false = task 162 と同じ直列経路)。
+/// [`STREAM_UT_ENV`] の既定値 (task 320: **on**。`0` / `off` / `false` で直列経路)。
 ///
-/// task 165: **lab t165a で既定 off** (ut=1 は 14k cold 102.10 s、ut=0 は
-/// 99.97 s)。写しと DMA は同じメモリ帯域を食うので、スレッドを分けても
-/// 速くならず、DMA を 1 本しか積めないため enq が前の DMA の完了を待つ
-/// (t165a の enq_s=9.53)。A/B 用にゲートは残す。
-pub const DEFAULT_STREAM_UT: bool = false;
+/// task 165: 当時は既定 off だった (lab t165a、層優先になる前のチャンク優先で
+/// ut=1 は 14k cold 102.10 s、ut=0 は 99.97 s)。当時は写しと DMA が同じ
+/// 帯域を食ううえ、依頼が 1 グループ先だけだったため隠れなかった。
+///
+/// task 320 で層優先 + グループ 64 + 3 枚のステージングの経路で測り直した
+/// (lab t320a / t320b、depth8k、比較は同じ run の base/base2):
+///
+/// | 条件 | 3,826 cold | 14k cold | decode |
+/// | --- | --- | --- | --- |
+/// | t320a ut=1 (load 4.7) | 2.891 s (対 base 3.112 / base2 2.818) | 7.30 s (対 base 8.56 / base2 8.72) | 17.1 (base 17.1) |
+/// | t320b ut=1 (load 1.9) | **2.642 s (対 base 2.776 / base2 2.791)** | 6.77 s (対 base 6.80 / base2 6.84) | 17.3 (base 17.1) |
+/// | t320b ut=1 + 先読み 2 | 2.647 s | 6.75 s | 17.4 |
+///
+/// 3,826 は 2 ラウンドの中央値で **-4.9%** (t320b、負荷の高い t320a でも -5%)。
+/// 14k は負荷の高い run で -14.7%、空いている run では -0.4% (床は DDR 帯域)。
+/// decode は 17.1-17.4 で 0.1 ms の刻み幅の範囲 (差は経路の外)。
+/// `exposed_host` は 1,402 → 1,270 ms、`stage_copy` はワーカーへ移り
+/// (`up_wait` 405 → 1,112 ms)、`gpu_busy` は 1,364 → 1,376 ms で変わらない。
+pub const DEFAULT_STREAM_UT: bool = true;
 
 /// `DENNO_PF_STREAM_LOOKAHEAD`: 上げ専用スレッドへ **何グループ先まで** 依頼するか
 /// (task 320、既定 1 = task 165 のまま)。
@@ -650,6 +664,30 @@ pub fn stream_lookahead() -> usize {
     *N.get_or_init(|| {
         stream_lookahead_from_value(std::env::var(STREAM_LOOKAHEAD_ENV).ok().as_deref())
     })
+}
+
+/// `DENNO_PF_UP_DECOUPLE=1`: 上げ専用スレッドのホスト待ちを「pinned を前回
+/// 読んだ DMA の完了」だけにし、VRAM ステージングの再利用待ち (カーネルの完了) は
+/// 上げストリームの `cuStreamWaitEvent` として GPU に守らせる (task 320、既定 off)。
+///
+/// 既定 (off) ではワーカーがカーネルの完了をホストで待つので、写しは常に
+/// 「前のグループのカーネルが終わってから」始まる。1 グループの内訳は
+/// 写し 3.1 ms / DMA 2.5 ms (競合時 3.2) / カーネル 4.0 ms で、直列に近い
+/// 並びだと壁時計は 3 つの和になる (lab t320b: 3,826 cold で
+/// wall 2,644 = gpu_busy 1,376 + exposed 1,268、ut=1 のまま)。
+/// 分離すると写しがカーネルの裏に入り、壁時計は「カーネル」と「転送」の
+/// 大きいほうに近づく (推定)。
+pub const UP_DECOUPLE_ENV: &str = "DENNO_PF_UP_DECOUPLE";
+
+/// [`UP_DECOUPLE_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn up_decouple_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// ホスト待ちを DMA の完了だけにするか (プロセスで 1 回だけ env を読む)。
+pub fn up_decouple_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| up_decouple_from_value(std::env::var(UP_DECOUPLE_ENV).ok().as_deref()))
 }
 
 /// [`STREAM_WC_ENV`] の既定値 (true = write-combined のバウンス)。
@@ -1979,7 +2017,7 @@ pub fn stats_line() -> Option<String> {
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} group={} min_tok={} \
              chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
@@ -1993,6 +2031,7 @@ pub fn stats_line() -> Option<String> {
             stream_pin(),
             u8::from(stream_wc()),
             u8::from(stream_ut()),
+            u8::from(up_decouple_on()),
             stream_group(),
             stream_min_tok(),
             stream_chunk_bytes() >> 10,
@@ -2764,6 +2803,12 @@ mod tests {
         assert_eq!(stream_lookahead_from_value(Some("9")), 2, "上限は 2 (3 枚)");
         assert_eq!(stream_lookahead_from_value(Some("x")), DEFAULT_STREAM_LOOKAHEAD);
         assert_eq!(stream_lookahead_from_value(Some(" 2 ")), 2);
+        // task 320: 分離モードは明示的な真値だけ on。
+        assert!(!up_decouple_from_value(None));
+        assert!(!up_decouple_from_value(Some("0")));
+        assert!(!up_decouple_from_value(Some("")));
+        assert!(up_decouple_from_value(Some("1")));
+        assert!(up_decouple_from_value(Some("yes")));
         // task 165: write-combined のバウンスは明示的な真値だけ on。
         assert!(!stream_wc_from_value(false, Some("1")), "stream off なら動かない");
         assert_eq!(stream_wc_from_value(true, None), DEFAULT_STREAM_WC);
