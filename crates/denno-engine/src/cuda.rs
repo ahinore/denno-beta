@@ -26838,6 +26838,12 @@ pub(crate) fn pf_attn_dev_store(ptr: CUdeviceptr, nt: usize, e: usize) {
     PF_ATTN_DEV_OUT.with(|c| *c.borrow_mut() = Some((ptr, nt, e)));
 }
 
+/// task 308: 層出力がデバイスに残っているか (形が合うときだけ true)。
+/// 記録は消さない (直後の [`pf_combine_dev`] が `take` する)。
+pub(crate) fn pf_attn_dev_peek(nt: usize, e: usize) -> bool {
+    PF_ATTN_DEV_OUT.with(|c| matches!(&*c.borrow(), Some((_, dnt, de)) if *dnt == nt && *de == e))
+}
+
 fn pf_combine_core(
     bo: Option<&[f32]>,
     dev: Option<CUdeviceptr>,
@@ -28527,6 +28533,7 @@ pub(crate) const ATTN_PF3_BQ: usize = 64;
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
 /// (`k_cpu` / `v_cpu` は台帳を進めるためだけに渡す。既に積んであるので転送は起きない)。
+/// 前提の形。`keep_dev` のときは `out` を書かない (`out` は空でよい)。
 #[allow(clippy::too_many_arguments)]
 pub fn pf_full_out(
     cache_id: u64,
@@ -28550,6 +28557,9 @@ pub fn pf_full_out(
     fused_gate: bool,
     gate_off: usize,
     gate_ld: usize,
+    // task 308: 層出力をデバイスに残す (D2H しない)。直後の combine が
+    // `pf_attn_dev_store` の記録を読む (`DENNO_PF_FULL_DEVRES`)。
+    keep_dev: bool,
     out: &mut [f32],
 ) -> bool {
     pf2_set_nt(nt);
@@ -28566,7 +28576,7 @@ pub fn pf_full_out(
         && v_cpu.len() >= t_total * kv_dim
         && wo.k == qd
         && wo.n == e
-        && out.len() == nt * e;
+        && (keep_dev || out.len() == nt * e);
     if !ok_shape {
         pf2_note(1);
         return false;
@@ -28751,6 +28761,13 @@ pub fn pf_full_out(
             // 3. 出力投影 (同期しない) → 最後に 1 回だけ待って 1 回で戻す
             pf2_gemm(ctx, pw, pw_k, attb.ptr(), ob.ptr(), nt, qd, e)?;
             ctx.sync()?;
+            // task 308: 層出力をデバイスに残す。直後の combine が同じポインタを
+            // 読むので、D2H (層出力) と combine の H2D が 1 往復ぶん消える
+            // (`DENNO_PF_FULL_DEVRES`。呼び出し側が keep_dev を立てたときだけ)。
+            if keep_dev {
+                pf_attn_dev_store(ob.ptr(), nt, e);
+                return Ok(());
+            }
             // task 181: `DENNO_PF_D2H_DIRECT` は中間 Vec を作らない (値は同じ)。
             if pf_d2h_direct_on() {
                 ob.to_slice(&mut out[..nt * e])?;
@@ -46786,6 +46803,27 @@ mod pf225_gate_tests {
                 assert!(f(Some(v)), "{name}: {v:?} が off のまま");
             }
         }
+    }
+
+    /// task 308: full 層の出力をデバイスに残す契約。
+    ///
+    /// `pf_full_out` は `keep_dev` のとき `pf_attn_dev_store` を呼び、直後の
+    /// `pf_combine_dev` がその記録を `take` して読む。記録は形が合うときだけ
+    /// 有効で、層の入口の `pf_attn_dev_clear` で消える (前の層の出力を
+    /// 次の層が読まない)。デバイス確保は要らない。
+    #[test]
+    fn pf308_full_devres_store_peek_contract() {
+        pf_attn_dev_clear();
+        assert!(!pf_attn_dev_peek(4, 8), "記録が無いのに true");
+        pf_attn_dev_store(0x1000, 4, 8);
+        assert!(pf_attn_dev_peek(4, 8), "同じ形は true");
+        assert!(!pf_attn_dev_peek(4, 9), "e が違えば false");
+        assert!(!pf_attn_dev_peek(5, 8), "nt が違えば false");
+        // 要求が立っていないときの連鎖は記録を残さない (ssm / full 共通)。
+        pf_attn_dev_request(false);
+        pf_attn_dev_clear();
+        assert!(!pf_attn_dev_peek(4, 8), "clear のあとは false");
+        pf_attn_dev_clear();
     }
 
     /// 形のゲート。
