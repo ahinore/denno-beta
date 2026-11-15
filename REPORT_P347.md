@@ -62,6 +62,11 @@ branch: **br347** = int-auto `6c19792cf` (merge: br342) から。br342 は既に
   なるので採らなかった。
 - `denno_build_info{build_sha,version}` — `build.rs` が `git rev-parse --short=12 HEAD`
   を `DENNO_BUILD_SHA` として渡す (git が無ければ "unknown")。
+  注意: 載るのは**パッケージを最後にビルドした時点の HEAD**。cargo はパッケージ外
+  (REPORT など) だけが変わったときは `build.rs` を再実行しないので、その場合 1
+  コミット古い SHA になり得る。ラボはコミットごとにビルドするので、ラボが測る
+  バイナリでは一致する (確認: `build.rs` を touch して再ビルドすると、そのときの
+  HEAD `79c60c446f5d` がバイナリに入り、古い `59068438c22a` は消えた)。
 - ゲート: `DENNO_METRICS` (既定 on。`0`/`false`/`no` で off)、
   `DENNO_MODELS_OWNED_BY` (既定 on)。
 
@@ -240,6 +245,10 @@ cargo test --release -p denno-cli --features denno-engine/cuda -- --test-threads
 ```
 
 `CARGO_TARGET_DIR=/tmp/t347`。
+
+追加の ad-hoc 検証 (`/tmp/hermes-verify-*.sh`、実行後に削除): ビルドが通り、
+25 本の系列名と `owned_by` と `DENNO_BUILD_SHA` (= そのときの HEAD) が
+バイナリに入っていること、metrics の 4 テストが個別に ok であることを確認した。
 
 ## 7. GPU で確認してほしいこと
 
