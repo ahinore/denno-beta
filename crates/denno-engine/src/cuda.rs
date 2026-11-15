@@ -32391,15 +32391,18 @@ fn mix_inj3_ptx_path() -> std::path::PathBuf {
     }
 }
 
-/// [`MIX_INJ3_KERNEL_NAME`] の解釈 (純関数)。既定 off、明示的な真値だけ on。
+/// [`MIX_INJ3_KERNEL_NAME`] の解釈 (純関数)。**明示的な偽値だけ off** = 既定 on。
+///
+/// lab t327a で採否 yes (14k 後の decode -2.6%、短い decode -0.9%、prefill ±0、
+/// md5 は全 COND SAME)。`0` / `off` / `false` / `no` で epilogue 版へ戻る。
 fn parse_dec_mix_injsep(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
-/// task 327: inject を追加ブロックで回すか (`DENNO_DEC_MIX_INJSEP`・既定 off)。
+/// task 327: inject を追加ブロックで回すか (`DENNO_DEC_MIX_INJSEP`・既定 on)。
 fn mix_injsep_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| parse_dec_mix_injsep(std::env::var("DENNO_DEC_MIX_INJSEP").ok().as_deref()))
@@ -57139,20 +57142,19 @@ mod task204_tests {
         assert!(parse_dec_onevnt(Some("on")));
     }
 
-    /// task 327: `DENNO_DEC_MIX_INJSEP` の真理値表。既定は off
-    /// (既定 on にするのは lab の採否が出てから)。
+    /// task 327: `DENNO_DEC_MIX_INJSEP` の真理値表。**既定 on** (lab t327a で採否 yes)。
+    /// 明示的な偽値だけ epilogue 版へ戻す。
     #[test]
     fn dec_mix_injsep_truth_table() {
-        assert!(!parse_dec_mix_injsep(None), "既定は off");
+        assert!(parse_dec_mix_injsep(None), "既定は on");
         assert!(!parse_dec_mix_injsep(Some("0")));
         assert!(!parse_dec_mix_injsep(Some("off")));
         assert!(!parse_dec_mix_injsep(Some("false")));
-        assert!(!parse_dec_mix_injsep(Some("")));
-        assert!(!parse_dec_mix_injsep(Some("2")), "未知の値は off (fail closed)");
+        assert!(!parse_dec_mix_injsep(Some(" NO ")), "前後の空白と大文字を許す");
+        assert!(parse_dec_mix_injsep(Some("")));
+        assert!(parse_dec_mix_injsep(Some("2")), "未知の値は既定 (on) のまま");
         assert!(parse_dec_mix_injsep(Some("1")));
         assert!(parse_dec_mix_injsep(Some("on")));
-        assert!(parse_dec_mix_injsep(Some(" TRUE ")), "前後の空白と大文字を許す");
-        assert!(parse_dec_mix_injsep(Some("yes")));
     }
 
     /// task 327: 収録済みの `kernels_mix_inj3.ptx` の引数が 10 本であることを固定する
