@@ -32410,6 +32410,103 @@ pub(crate) fn mix_dev3_loaded() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// task 327: inject を down の**追加ブロック**で回す版 (`kernels_mix_inj3.cu`)。
+//
+// task 275 の `dno_mix_down_bf16_inj` は inject を `blockIdx.x < hc` の 4 ブロックの
+// **epilogue** で回すので、その 4 ブロックだけ「down の行 (7.6 us) + inject (4.7 us)」
+// を直列に払う (実測 12.1-12.3 us。P323 の t323d)。inject は down の出力を読まない
+// ので、grid = n + hc にして inject を後ろのブロックへ移せば down と同じ時刻に始まり、
+// 7.6 us の裏へ隠れる。**値はビット一致** (同じ木・同じ刻み。行の割り当てだけが違う)。
+//
+// ゲート `DENNO_DEC_MIX_INJSEP` (既定 off)。
+// ---------------------------------------------------------------------------
+
+/// inject を追加ブロックで回す版のカーネル名。
+const MIX_INJ3_KERNEL_NAME: &str = "dno_mix_down_bf16_inj3";
+
+/// その引数の数 (x, w, out, k, n, inv_hc, wi, inj, ki, hc)。
+const MIX_INJ3_NARGS: usize = 10;
+
+struct MixInj3Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixInj3Kernels {}
+unsafe impl Sync for MixInj3Kernels {}
+
+static MIX_INJ3_KERNELS: OnceLock<Option<MixInj3Kernels>> = OnceLock::new();
+
+fn mix_inj3_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_INJ3_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_inj3.ptx"),
+    }
+}
+
+/// [`MIX_INJ3_KERNEL_NAME`] の解釈 (純関数)。**明示的な偽値だけ off** = 既定 on。
+///
+/// lab t327a で採否 yes (14k 後の decode -2.6%、短い decode -0.9%、prefill ±0、
+/// md5 は全 COND SAME)。`0` / `off` / `false` / `no` で epilogue 版へ戻る。
+fn parse_dec_mix_injsep(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// task 327: inject を追加ブロックで回すか (`DENNO_DEC_MIX_INJSEP`・既定 on)。
+fn mix_injsep_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_dec_mix_injsep(std::env::var("DENNO_DEC_MIX_INJSEP").ok().as_deref()))
+}
+
+/// inject を追加ブロックで回す版のカーネルを取得する
+/// (初回だけ PTX を読む。失敗は `None` を焼き付ける → epilogue 版へ)。
+fn mix_inj3_kernels() -> Option<&'static MixInj3Kernels> {
+    MIX_INJ3_KERNELS
+        .get_or_init(|| {
+            let path = mix_inj3_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_INJ3_KERNEL_NAME) != Some(MIX_INJ3_NARGS) {
+                eprintln!(
+                    "[mix-inj3] PTX の引数が {MIX_INJ3_NARGS} 本でない → epilogue 版へ。\
+                     `bash build_ptx.sh mix_inj3` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_INJ3_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-inj3] PTX に {MIX_INJ3_KERNEL_NAME} が無い → epilogue 版へ");
+                    return None;
+                }
+                Some(MixInj3Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+// ---------------------------------------------------------------------------
 // task 192: mix の up 投影 (BF16) を 1 warp = 1 行で回す `kernels_mix_up.cu`。
 //
 // lab t192a の mix 表: `dno_matvec_bf16_r` (up、10,240 行 x k=320) が 14.0 us
@@ -33138,6 +33235,14 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
                 }
             }
             // 3. down + lo_apply (silu 込み) → lo はデバイスに残る。
+            // task 327: inject を「追加ブロック」(grid = n + hc) で回す版が使えるか。
+            // inject の無い層 (wpj = None) は grid = n のままで、epilogue 版と同じ
+            // (inject のブロックを撃たない)。
+            let inj3 = if down_inj.is_some() && wpj.is_some() && mix_injsep_on() {
+                mix_inj3_kernels().map(|k| k.f)
+            } else {
+                None
+            };
             if let Some(f_di) = down_inj {
                 // task 275: inject を同じ起動の epilogue で回す (blockIdx.x < hc)。
                 let (mut ph, mut pw, mut po) = (dx.ptr(), wp1, dlo.ptr());
@@ -33160,7 +33265,12 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
                     &mut kic as *mut _ as *mut c_void,
                     &mut hcc2 as *mut _ as *mut c_void,
                 ];
-                ctx.launch_async(f_di, (n1 as u32, 1, 1), (down_thr, 1, 1), 0, &mut args)?;
+                // task 327: `inj3` があるときは inject の行を後ろの hc ブロックへ出す。
+                let (f_di, gx) = match inj3 {
+                    Some(f3) => (f3, n1 as u32 + hc as u32),
+                    None => (f_di, n1 as u32),
+                };
+                ctx.launch_async(f_di, (gx, 1, 1), (down_thr, 1, 1), 0, &mut args)?;
             } else {
                 let (mut ph, mut pw, mut po) = (dx.ptr(), wp1, dlo.ptr());
                 let (mut kc, mut nc) = (k1 as c_int, n1 as c_int);
@@ -57086,6 +57196,40 @@ mod task204_tests {
         assert!(!parse_dec_onevnt(Some("off")));
         assert!(parse_dec_onevnt(Some("1")));
         assert!(parse_dec_onevnt(Some("on")));
+    }
+
+    /// task 327: `DENNO_DEC_MIX_INJSEP` の真理値表。**既定 on** (lab t327a で採否 yes)。
+    /// 明示的な偽値だけ epilogue 版へ戻す。
+    #[test]
+    fn dec_mix_injsep_truth_table() {
+        assert!(parse_dec_mix_injsep(None), "既定は on");
+        assert!(!parse_dec_mix_injsep(Some("0")));
+        assert!(!parse_dec_mix_injsep(Some("off")));
+        assert!(!parse_dec_mix_injsep(Some("false")));
+        assert!(!parse_dec_mix_injsep(Some(" NO ")), "前後の空白と大文字を許す");
+        assert!(parse_dec_mix_injsep(Some("")));
+        assert!(parse_dec_mix_injsep(Some("2")), "未知の値は既定 (on) のまま");
+        assert!(parse_dec_mix_injsep(Some("1")));
+        assert!(parse_dec_mix_injsep(Some("on")));
+    }
+
+    /// task 327: 収録済みの `kernels_mix_inj3.ptx` の引数が 10 本であることを固定する
+    /// (古い PTX を読んで黙って別の行を書くのを防ぐ)。PTX がまだ無いときは省略。
+    #[test]
+    fn ptx_entry_params_counts_the_committed_mix_inj3_ptx() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_inj3.ptx");
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            eprintln!("PTX が無いので省略: {}", p.display());
+            return;
+        };
+        assert_eq!(
+            ptx_entry_params(&text, MIX_INJ3_KERNEL_NAME),
+            Some(MIX_INJ3_NARGS),
+            "{} の引数の数 (ptx パーサの前提)",
+            MIX_INJ3_KERNEL_NAME
+        );
     }
 
     /// task 204: 融合の倍の表を載せてもレイアウトが 8 バイト整列で重ならない。
