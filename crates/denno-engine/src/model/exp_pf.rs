@@ -720,6 +720,29 @@ pub fn up_gpuwait_on() -> bool {
     *ON.get_or_init(|| up_gpuwait_from_value(std::env::var(UP_GPUWAIT_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_STREAM_NOSYNC=1`: 層優先 MoE の出力がデバイスのままのとき、
+/// 層の終端で `cuCtxSynchronize` しない (task 324、既定 off)。
+///
+/// # なぜ要るか
+///
+/// 層の終端の同期は「最後のグループのカーネル + 累積」が終わるまでホストを
+/// 止める。その間 GPU は遊び、次の層の attention はその後でしか積まれない。
+/// 待たなくても、次の層のホスト側の書き込みは同期コピー (`cuMemcpyHtoD` /
+/// `cuMemcpyDtoH`) なので、既定ストリームの前の仕事を待つ = 順序は保たれる。
+/// 出力をホストへ戻す経路 (`PfStreamIo::Host`) は従来どおり待つ。
+pub const STREAM_NOSYNC_ENV: &str = "DENNO_PF_STREAM_NOSYNC";
+
+/// [`STREAM_NOSYNC_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn stream_nosync_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 層の終端で同期しないか (プロセスで 1 回だけ env を読む)。
+pub fn stream_nosync_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| stream_nosync_from_value(std::env::var(STREAM_NOSYNC_ENV).ok().as_deref()))
+}
+
 /// [`STREAM_WC_ENV`] の既定値 (true = write-combined のバウンス)。
 ///
 /// lab t165b: グループ 64 で 14k cold が 100.01 s (wc=0) → 95.06 s (wc=1)、
@@ -1790,6 +1813,8 @@ static STREAM_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 static STREAM_USE_NS: AtomicU64 = AtomicU64::new(0);
 /// task 324: H2D の完了を**計算ストリーム**に待たせたグループ数 (ゲートの発火の証拠)。
 static STREAM_GPUWAIT: AtomicU64 = AtomicU64::new(0);
+/// task 324: 層の終端で同期を省いた回数 (ゲートの発火の証拠)。
+static STREAM_NOSYNC: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
 static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 上げの回数 (グループ数)。
@@ -1898,6 +1923,11 @@ pub fn note_stream_use_ns(ns: u64) {
 /// task 324: H2D の完了を計算ストリーム (`cuStreamWaitEvent`) に待たせた。
 pub fn note_stream_gpuwait() {
     STREAM_GPUWAIT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// task 324: 層の終端で同期を省いた (デバイス出力のまま次へ渡した)。
+pub fn note_stream_nosync() {
+    STREAM_NOSYNC.fetch_add(1, Ordering::Relaxed);
 }
 
 /// task 162: ストリーミングで 1 層を GPU に載せた。
@@ -2054,7 +2084,7 @@ pub fn stats_line() -> Option<String> {
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} gpuw={} group={} min_tok={} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} gpuw={} nsync={} group={} min_tok={} \
              chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
@@ -2070,6 +2100,7 @@ pub fn stats_line() -> Option<String> {
             u8::from(stream_ut()),
             u8::from(up_decouple_on()),
             STREAM_GPUWAIT.load(Ordering::Relaxed),
+            STREAM_NOSYNC.load(Ordering::Relaxed),
             stream_group(),
             stream_min_tok(),
             stream_chunk_bytes() >> 10,
@@ -2116,6 +2147,7 @@ pub fn stats_reset() {
         &STREAM_READY_NS,
         &STREAM_SLOT_NS,
         &STREAM_GPUWAIT,
+        &STREAM_NOSYNC,
         &STREAM_ROWS,
         &STREAM_GROUPS,
         &STREAM_SPILL,
@@ -2856,6 +2888,12 @@ mod tests {
         assert!(up_gpuwait_from_value(Some("1")));
         assert!(up_gpuwait_from_value(Some(" on ")), "前後の空白は無視する");
         assert!(up_gpuwait_from_value(Some("yes")));
+        // task 324: 層の終端の同期を省くゲート (同じく明示的な真値だけ on)。
+        assert!(!stream_nosync_from_value(None));
+        assert!(!stream_nosync_from_value(Some("")));
+        assert!(!stream_nosync_from_value(Some("false")));
+        assert!(stream_nosync_from_value(Some("1")));
+        assert!(stream_nosync_from_value(Some(" true ")));
         // task 165: write-combined のバウンスは明示的な真値だけ on。
         assert!(!stream_wc_from_value(false, Some("1")), "stream off なら動かない");
         assert_eq!(stream_wc_from_value(true, None), DEFAULT_STREAM_WC);

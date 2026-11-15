@@ -13945,9 +13945,17 @@ fn moe_experts_iq_pf_layer_stream_io(
                 exp_pf::note_kernel_ns(t_k.elapsed().as_nanos() as u64);
                 // task 254: 累積カーネルの完了待ちと D2H を項目別に積む。
                 let t_sync = std::time::Instant::now();
-                ctx.sync()?;
-                exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
-                pf_host::add_ns(pf_host::SYNC, t_sync.elapsed().as_nanos() as u64);
+                // task 324: 出力が置き場 (デバイス) のままなら待たない。次の層の
+                // カーネルは同じストリームの後ろに積まれ、ホストが書く表は同期
+                // コピーが前のカーネルを待つので順序は保たれる。
+                let nosync = host_out.is_none() && exp_pf::stream_nosync_on();
+                if nosync {
+                    exp_pf::note_stream_nosync();
+                } else {
+                    ctx.sync()?;
+                    exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
+                    pf_host::add_ns(pf_host::SYNC, t_sync.elapsed().as_nanos() as u64);
+                }
                 if let (Some(b), Some(o)) = (oacc, host_out.as_mut()) {
                     let t_d2h = std::time::Instant::now();
                     b.to_slice(&mut o[..ntok * e])?;

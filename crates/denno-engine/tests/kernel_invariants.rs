@@ -10889,8 +10889,8 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
     assert!(EXP_PF_SRC.contains("pub fn up_gpuwait_on()"), "ゲートの実体が無い");
     // 発火の証拠が台帳に載る (gpuw=<本数>)。
     assert!(
-        EXP_PF_SRC.contains("dec={} gpuw={} group={}"),
-        "台帳に gpuw= が無い"
+        EXP_PF_SRC.contains("dec={} gpuw={} nsync={} group={}"),
+        "台帳に gpuw= / nsync= が無い"
     );
     assert!(
         EXP_PF_SRC.contains("pub fn note_stream_gpuwait()"),
@@ -10926,4 +10926,23 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
     let body = &def[..def.find("\n}").expect("本体の終わりが無い")];
     assert!(body.contains("stream_wait_event"), "cuStreamWaitEvent を呼んでいない");
     assert!(!body.contains("event_sync"), "ホストで待っている");
+    // task 324 (2): 層の終端の同期は**デバイス出力のときだけ**省く。
+    assert!(
+        EXP_PF_SRC.contains("pub const STREAM_NOSYNC_ENV: &str = \"DENNO_PF_STREAM_NOSYNC\";"),
+        "nosync の env 名が無い"
+    );
+    assert!(EXP_PF_SRC.contains("nsync={}"), "台帳に nsync= が無い");
+    let acc = CUDA_RS
+        .split("let nosync = host_out.is_none() && exp_pf::stream_nosync_on();")
+        .nth(1)
+        .expect("nosync の判定が無い");
+    assert!(acc.contains("exp_pf::note_stream_nosync();"), "発火の計数が無い");
+    assert!(
+        acc.contains("ctx.sync()?"),
+        "同期の経路が消えている (既定 off で従来どおり待つこと)"
+    );
+    assert!(
+        !CUDA_RS.contains("let nosync = exp_pf::stream_nosync_on();"),
+        "ホスト出力の経路まで同期を省いている"
+    );
 }
