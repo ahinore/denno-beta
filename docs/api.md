@@ -237,5 +237,46 @@ tools + stream の場合、生成中の `<tool_call>` block は block 単位で�
 
 ## その他
 
-- `GET /v1/models`: serve 中のモデルID と context_length
+- `GET /v1/models`: serve 中のモデルID と context_length。各要素に `"owned_by": "denno"` が付く (task 347。`DENNO_MODELS_OWNED_BY=0` で従来の形)
 - `GET /health`: `{"status": "ok"}`
+
+## GET /metrics (Prometheus)
+
+serve_flash (`denno flash-serve`、本番 8098) の Prometheus text format 0.0.4。
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`。
+ゲートは `DENNO_METRICS` (既定 on)。`0` / `false` / `no` で経路ごと消える (404)。
+
+- スクレイプは**読み取りスレッド**が答えるので、生成中でも待たされない
+- decode / prefill のホットループはロックも確保もしない (atomic の加算だけ)
+- `model_name` ラベルは serve 中のモデル名。`le` のバケットは全ヒストグラム共通で
+  `0.05 0.1 0.25 0.5 1 2 4 8 16 32 64 128 +Inf` 秒
+- 系列名は vLLM の reader がそのまま読めるように vLLM と同じ (`vllm:` 接頭辞)。
+  vLLM に対応する名前が無いものだけ `denno_` を付ける
+
+| 名前 | 型 | 意味 |
+| --- | --- | --- |
+| `vllm:prompt_tokens_total` | counter | 処理したプロンプトのトークン数 (`usage.input_tokens` の積算) |
+| `vllm:generation_tokens_total` | counter | 生成したトークン数 (`usage.output_tokens` の積算) |
+| `vllm:request_success_total` | counter | 終端まで走ったリクエスト数 (失敗も含む。失敗は次で分かる) |
+| `vllm:request_failure_total` | counter | 生成が途中で失敗したリクエスト数 |
+| `vllm:num_requests_running` | gauge | いま生成中のリクエスト数 (0 か 1) |
+| `vllm:num_requests_waiting` | gauge | 待ち行列の長さ。denno は 1 本ずつ処理するので常に 0 (待ちはソケットの backlog) |
+| `vllm:time_to_first_token_seconds` | histogram | リクエスト受付から最初の 1 トークンまでの秒 |
+| `vllm:e2e_request_latency_seconds` | histogram | リクエスト全体の秒 (tokenize + prefill + decode) |
+| `vllm:inter_token_latency_seconds` | histogram | トークン間隔の平均 (1 リクエスト 1 サンプル。out < 2 は記録しない) |
+| `vllm:request_prefill_time_seconds` | histogram | prefill の秒 (prefix cache で再利用した前置きは含まない) |
+| `vllm:prefix_cache_queries_total` | counter | prefix cache を引いたトークン数 (= プロンプトのトークン数) |
+| `vllm:prefix_cache_hits_total` | counter | うち再利用できたトークン数 |
+| `vllm:prompt_tokens_cached_total` | counter | 再利用したトークン数 (= `prefix_cache_hits_total` と同じ) |
+| `vllm:num_preemptions_total` | counter | 先取りの回数。denno は 1 スロットで先取りしないので常に 0 |
+| `vllm:kv_cache_usage_perc` | gauge | 文脈の使用率 (いまの文脈長 / `max_ctx`、0..1) |
+| `vllm:cache_config_info` | gauge | 常に 1。ラベル `kv_cache_size_tokens` に `max_ctx` |
+| `denno_last_decode_ms_per_token` | gauge | 直前のリクエストの decode 速度 (ms/token) |
+| `denno_last_prefill_tokens_per_second` | gauge | 直前のリクエストの prefill 速度 (トークン/秒) |
+| `denno_expert_vram_hit_rate` | gauge | 直前のリクエストの expert の VRAM ヒット率 (0..1) |
+| `denno_expert_disk_read_bytes_total` | counter | プロセスがストレージから読んだバイト (`/proc/self/io` の `read_bytes`。expert の重みが主。ページキャッシュに載ったぶんは増えない) |
+| `denno_expert_vram_used_bytes` | gauge | VRAM に常駐している expert のバイト数 |
+| `denno_expert_vram_budget_bytes` | gauge | expert の VRAM 予算 (実効上限) |
+| `denno_expert_ram_tier_bytes` | gauge | ホスト RAM tier に常駐している expert のバイト数 |
+| `denno_expert_ram_tier_experts` | gauge | ホスト RAM tier の expert 本数 |
+| `denno_build_info` | gauge | 常に 1。ラベル `build_sha` (短縮 SHA) と `version` |

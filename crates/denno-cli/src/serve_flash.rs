@@ -52,6 +52,10 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+// task 347: Prometheus `/metrics` の計器と本文の組み立て。
+#[path = "serve_metrics.rs"]
+mod metrics;
+
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
@@ -1052,6 +1056,9 @@ impl Flash {
         let _iv_pin = iv::pin_request();
         // 生成中の印 (`POST /v1/abort` はこの間だけ効く)。始めに古い停止要求を捨てる。
         let _gen = GenGuard::enter();
+        // task 347: `num_requests_running` とリクエスト全体の時計 (TTFT / e2e)。
+        let _running = metrics::RunningGuard::enter();
+        let t_req = Instant::now();
         // task 218: `DENNO_STEER_RECORD` のときは 1 リクエストごとに平均を保存する
         // (停止は不要。プロセスが落ちても直前のリクエストまでが残る)。
         let _steer_flush = SteerFlushGuard;
@@ -1370,6 +1377,9 @@ impl Flash {
         let mut spec_accepted = 0usize;
         let mut spec_offered = 0usize;
         let t2 = Instant::now();
+        // task 347: 最初の 1 トークンが出た時刻 (TTFT / inter-token)。
+        // ホットループでは分岐 1 回と `Option` の代入だけで、ロックも確保もしない。
+        let mut t_first: Option<Instant> = None;
         // task 153: decode の窓で CUDA イベントの時系列を取る (`DENNO_Q4_TLINE`)。
         // off では atomic load 1 回で、イベントは 1 本も打たない。
         q4ledger::tline_begin();
@@ -1450,6 +1460,13 @@ impl Flash {
                     ) {
                         break 'gen;
                     }
+                }
+                // task 347: 最初の 1 トークン (TTFT)。分岐 1 回だけで、
+                // ヒストグラムへの加算もリクエストあたり 1 回しかしない。
+                if t_first.is_none() && !out.is_empty() {
+                    let now = Instant::now();
+                    t_first = Some(now);
+                    metrics::note_first_token((now - t_req).as_secs_f64());
                 }
                 if t_on {
                     if let Some(t0) = t_step {
@@ -1542,6 +1559,12 @@ impl Flash {
             if !ok {
                 break;
             }
+            // task 347: 最初の 1 トークン (TTFT)。分岐 1 回だけ。
+            if t_first.is_none() {
+                let now = Instant::now();
+                t_first = Some(now);
+                metrics::note_first_token((now - t_req).as_secs_f64());
+            }
             let t_step = t_on.then(Instant::now);
             let pos = dec.tokens().len() as u32;
             // task 123: engine 側失敗の注入 (cfg(test) のみ。本番では存在しない)。
@@ -1612,6 +1635,43 @@ impl Flash {
             t_prefill * 1e3 / (n_prompt - reused).max(1) as f64,
             t_decode * 1e3 / out.len().max(1) as f64
         );
+        // task 347: `/metrics` の計器 (リクエスト終端 = ホットループの外)。
+        // ゲート off なら atomic load 1 回だけで、以下のサンプルは走らない。
+        if metrics::enabled() {
+            let e2e = t_req.elapsed().as_secs_f64();
+            let n_out = out.len();
+            let inter = match t_first {
+                Some(t) if n_out >= 2 => {
+                    // decode 窓の終わり (t2 から) から最初の 1 トークンまでを引く。
+                    let span = t2.elapsed().saturating_sub(t - t2);
+                    Some(span.as_secs_f64() / (n_out - 1) as f64)
+                }
+                _ => None,
+            };
+            // expert の VRAM ヒット率 (直前のリクエスト)。
+            let (lookups, hits) = denno_engine::model::exp_iq::lookups_hits();
+            if lookups > 0 {
+                metrics::record_expert_vram(Some(hits.min(lookups) as f64 / lookups as f64));
+            }
+            // VRAM / RAM tier のゲージとディスク読み (ここでだけロックを取る)。
+            metrics::sample_tiers();
+            metrics::sample_disk_reads();
+            metrics::record_request(&metrics::ReqSample {
+                prompt_tokens: n_prompt as u64,
+                reused_tokens: reused as u64,
+                output_tokens: n_out as u64,
+                prefill_secs: t_prefill,
+                e2e_secs: e2e,
+                inter_token_secs: inter,
+                decode_ms_per_token: if n_out > 0 {
+                    Some(t_decode * 1e3 / n_out as f64)
+                } else {
+                    None
+                },
+                failed: failed.is_some(),
+                ctx_tokens: dec.tokens().len() as u64,
+            });
+        }
         // P109: `DENNO_SPEC_STATS=1` のときだけ spec ステップの受理率を 1 行出す
         // (恒久診断。env 未指定では何も出さない。加算だけなので出力は変わらない)。
         if spec_on && env_flag("DENNO_SPEC_STATS") {
@@ -1835,6 +1895,19 @@ fn send_text(stream: &mut TcpStream, status: &str, s: &str) -> Result<()> {
     Ok(())
 }
 
+/// task 347: Prometheus の exposition (text format 0.0.4)。
+fn send_metrics(stream: &mut TcpStream, body: &str) -> Result<()> {
+    head(
+        stream,
+        "200 OK",
+        "text/plain; version=0.0.4; charset=utf-8",
+        &format!("Content-Length: {}\r\n", body.len()),
+    )?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
 fn sse_event(stream: &mut TcpStream, name: &str, data: &Value) -> Result<()> {
     write!(stream, "event: {name}\ndata: {}\n\n", data)?;
     stream.flush()?;
@@ -1843,13 +1916,23 @@ fn sse_event(stream: &mut TcpStream, name: &str, data: &Value) -> Result<()> {
 
 /// GET の固定応答。P51 でテレメトリ経路を足したときに既存の応答が変わって
 /// いないことをテストで固定するため、JSON 組み立てをここへ切り出してある。
+///
+/// task 347: sparkDash (vLLM の reader) が「denno のエンジン」と判別できるように
+/// `/v1/models` の要素へ `owned_by: "denno"` を足す (`DENNO_MODELS_OWNED_BY=0` で
+/// 従来の形に戻る)。他のフィールドは変えない。
 fn get_static(path: &str, name: &str) -> Option<Value> {
     match path {
         "/health" | "/healthz" => Some(json!({"ok": true, "model": name})),
-        "/v1/models" => Some(json!({"object": "list", "data": [{
-            "id": name, "object": "model", "type": "model",
-            "display_name": name, "created_at": "2026-10-27T00:00:00Z"
-        }]})),
+        "/v1/models" => {
+            let mut m = json!({
+                "id": name, "object": "model", "type": "model",
+                "display_name": name, "created_at": "2026-10-27T00:00:00Z"
+            });
+            if metrics::enabled_from_value(std::env::var(metrics::ENV_OWNED_BY).ok().as_deref()) {
+                m["owned_by"] = json!("denno");
+            }
+            Some(json!({"object": "list", "data": [m]}))
+        }
         _ => None,
     }
 }
@@ -2539,6 +2622,11 @@ fn handle_req(
             return send_json(&mut stream, "200 OK", &v);
         }
     }
+    // task 347: Prometheus `/metrics`。ゲート off (`DENNO_METRICS=0`) のときは
+    // 経路ごと無い (下の 404 に落ちる)。
+    if req.method == "GET" && path == "/metrics" && metrics::enabled() {
+        return send_metrics(&mut stream, &metrics::render());
+    }
     // GET /v1/limits — 生成上限の問い合わせ。ビューワが値をハードコードせずに
     // ここから読む (取得できないクライアント側の既定は 4096)。
     if req.method == "GET" && path == "/v1/limits" {
@@ -2930,6 +3018,18 @@ fn spawn_acceptor(listener: TcpListener) -> std::sync::mpsc::Receiver<std::io::R
                     }
                     return;
                 }
+                // task 347: `/metrics` は**読み取りスレッドで即答**する。生成中でも
+                // スクレイプが待たされない (計器は atomic だけなのでロック不要)。
+                if req.method == "GET"
+                    && req.path.split('?').next() == Some("/metrics")
+                    && metrics::enabled()
+                {
+                    let mut stream = stream;
+                    if let Err(e) = send_metrics(&mut stream, &metrics::render()) {
+                        eprintln!("[flash] metrics の応答に失敗: {e:#}");
+                    }
+                    return;
+                }
                 let _ = tx.send(Ok((stream, r, req)));
             });
         }
@@ -2938,6 +3038,9 @@ fn spawn_acceptor(listener: TcpListener) -> std::sync::mpsc::Receiver<std::io::R
 }
 
 pub fn run(cfg: FlashConfig) -> Result<()> {
+    // task 347: `/metrics` のゲート (既定 on) と、`model_name` ラベルの材料。
+    metrics::init_from_env();
+    metrics::set_model(&cfg.name, cfg.max_ctx);
     // task 271: SIGTERM でも使用回数を失わない (保存してから終了する)。
     // モデルの読み込みより前に仕掛ける (読み込み中の停止でも 1 回は走る)。
     spawn_sigterm_saver();
@@ -3181,6 +3284,15 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         flash.batch,
         chunk
     );
+    // task 347: 起動直後の VRAM / RAM tier のゲージとディスク読みを 1 回サンプル。
+    metrics::sample_tiers();
+    metrics::sample_disk_reads();
+    eprintln!(
+        "[flash] metrics: {} (GET /metrics, {}={})",
+        if metrics::enabled() { "on" } else { "off" },
+        metrics::ENV_ON,
+        if metrics::enabled() { "既定" } else { "0" }
+    );
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("{addr} を listen できない"))?;
@@ -3314,14 +3426,16 @@ mod flash_tests {
         let (mut srv, mut cli) = loopback();
         send_json(&mut srv, "200 OK", &get_static("/v1/models", "m").unwrap()).unwrap();
         drop(srv);
+        // task 347: `owned_by: "denno"` が付く (既定)。他のフィールドは変えない。
         assert_eq!(
             read_all(&mut cli),
             concat!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
                 "Access-Control-Allow-Origin: *\r\nConnection: close\r\n",
-                "Content-Length: 124\r\n\r\n",
+                "Content-Length: 143\r\n\r\n",
                 "{\"data\":[{\"created_at\":\"2026-10-27T00:00:00Z\",\"display_name\":\"m\",",
-                "\"id\":\"m\",\"object\":\"model\",\"type\":\"model\"}],\"object\":\"list\"}"
+                "\"id\":\"m\",\"object\":\"model\",\"owned_by\":\"denno\",\"type\":\"model\"}],",
+                "\"object\":\"list\"}"
             )
         );
     }

@@ -2260,3 +2260,101 @@ fn steer_subtract_changes_the_text() {
     assert_eq!(g2.text, g0.text, "解除してもテキストが戻らない");
     std::env::remove_var("DENNO_STEER_DIR");
 }
+
+// ---------------------------------------------------------------------------
+// task 347: Prometheus /metrics
+// ---------------------------------------------------------------------------
+
+/// `/metrics` の 1 サンプルの値を名前で引く (ラベルは無視)。
+fn metric_value(text: &str, name: &str) -> f64 {
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let head = line.split(' ').next().unwrap_or("");
+        if head.split('{').next().unwrap_or("") == name {
+            return line
+                .rsplit(' ')
+                .next()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(f64::NAN);
+        }
+    }
+    panic!("{name} が /metrics に無い");
+}
+
+/// task 347: `/metrics` が HTTP で返り、カウンタが 2 リクエストの usage と一致する。
+#[test]
+fn metrics_endpoint_counts_match_reply_usage() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new("flash-metrics");
+    let mut flash = build_flash(&dir);
+    super::metrics::set_enabled(true);
+    super::metrics::set_model("synth", 128);
+
+    // GET /metrics が Prometheus の Content-Type で返る。
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/metrics", ""));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(
+        resp.contains("Content-Type: text/plain; version=0.0.4"),
+        "Content-Type が違う: {resp}"
+    );
+    assert!(resp.contains("vllm:prompt_tokens_total{model_name="), "{resp}");
+
+    let before = super::metrics::render();
+    let p0 = metric_value(&before, "vllm:prompt_tokens_total");
+    let g0 = metric_value(&before, "vllm:generation_tokens_total");
+
+    let mut prompt_sum = 0u64;
+    let mut out_sum = 0u64;
+    for content in ["hi", "hi again"] {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+        })
+        .to_string();
+        let resp = http_roundtrip(&mut flash, &http_req("POST", "/v1/messages", &body));
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        let v = http_json(&resp);
+        prompt_sum += v["usage"]["input_tokens"].as_u64().expect("input_tokens");
+        out_sum += v["usage"]["output_tokens"].as_u64().expect("output_tokens");
+    }
+    assert!(prompt_sum > 0 && out_sum > 0, "usage が 0");
+
+    let after = super::metrics::render();
+    let p1 = metric_value(&after, "vllm:prompt_tokens_total");
+    let g1 = metric_value(&after, "vllm:generation_tokens_total");
+    assert_eq!(
+        (p1 - p0) as u64,
+        prompt_sum,
+        "prompt_tokens_total の増分が usage と違う"
+    );
+    assert_eq!(
+        (g1 - g0) as u64,
+        out_sum,
+        "generation_tokens_total の増分が usage と違う"
+    );
+
+    // 履歴 (ヒストグラム) と直近の速度が入っている。
+    assert!(
+        metric_value(&after, "vllm:time_to_first_token_seconds_count") >= 2.0,
+        "TTFT のサンプルが 2 本未満"
+    );
+    assert_eq!(
+        metric_value(&after, "vllm:e2e_request_latency_seconds_count"),
+        metric_value(&after, "vllm:time_to_first_token_seconds_count"),
+        "e2e と TTFT のサンプル数が違う"
+    );
+    assert!(metric_value(&after, "denno_last_decode_ms_per_token") > 0.0);
+    assert!(metric_value(&after, "denno_last_prefill_tokens_per_second") > 0.0);
+    // kv_cache_usage_perc は 0..1。
+    let used = metric_value(&after, "vllm:kv_cache_usage_perc");
+    assert!((0.0..=1.0).contains(&used), "kv_cache_usage_perc={used}");
+
+    // /v1/models に owned_by: "denno"。
+    let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/models", ""));
+    let v = http_json(&resp);
+    assert_eq!(v["data"][0]["owned_by"], "denno", "{v}");
+}
