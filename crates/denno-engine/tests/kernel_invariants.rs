@@ -10969,3 +10969,115 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
         "旧い呼び出しが残っている"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 333: `理由: stream` の内訳と、写しを計算スレッドへ落とす再試行
+// ---------------------------------------------------------------------------
+
+/// task 333: ストリーミングが `Ok(None)` を返す門に**名前**が付いていて、
+/// 層優先 dev MoE の 1 行 (`[pf-lm] 層 N: dev MoE を諦めた`) に内訳が出ること。
+///
+/// task 328 は 3 ラウンドとも `理由: stream` だけで、ステージングの確保なのか
+/// 上げスレッドなのかを切り分けられなかった。ここは**配線**の固定で、
+/// 分岐の発火そのものは GPU でしか取れない (REPORT にそう書く)。
+#[test]
+fn t333_stream_decline_names_the_gate() {
+    for (why, what) in [
+        ("\"dead\"", "PF_DEAD"),
+        ("\"shape\"", "形の不整合"),
+        ("\"type\"", "カーネルの型"),
+        ("\"slot\"", "スロットの型"),
+        ("\"ctx\"", "コンテキスト"),
+        ("\"kernels\"", "カーネル表"),
+        ("\"accum\"", "累積カーネル"),
+        ("\"current\"", "cuCtxSetCurrent"),
+        ("\"row_bytes\"", "行のバイト数"),
+        ("\"shared_table\"", "共有 expert の行表"),
+        ("\"host_missing\"", "ホスト側の区間"),
+        ("\"no_bytes\"", "0 バイトの expert"),
+        ("\"no_miss\"", "全 expert が常駐"),
+        ("\"stage\"", "ステージングの確保"),
+        ("\"bounds\"", "グループ分け"),
+        ("\"group_rows\"", "グループ局所の行数"),
+        ("\"seg_local\"", "相対化した seg"),
+        ("\"no_upload\"", "上げスレッドが居ない"),
+        ("\"ptr_table\"", "ポインタ表の不一致"),
+    ] {
+        assert!(
+            CUDA_RS.contains(&format!("pf_stream_skip({why})")),
+            "{what} ({why}) に理由の名前が付いていない"
+        );
+    }
+    // 層の入口で理由を消す (前の層 / 前の試行の理由を残さない)。
+    assert!(
+        CUDA_RS.contains("pf_stream_why_set(\"\");"),
+        "試行の入口で理由を 0 に戻していない"
+    );
+    // 層優先 dev MoE の 1 行に内訳が乗る。
+    assert!(QWEN_SRC.contains("fn lm_decline_detail()"), "内訳が無い");
+    assert!(
+        QWEN_SRC.contains("let why = crate::cuda::pf_stream_why();"),
+        "cuda 側の理由を読んでいない"
+    );
+    assert!(
+        QWEN_SRC.contains("\"[pf-lm] 層 {il}: dev MoE を諦めた (理由: {}{}) → CPU (タイル {} 単位)\""),
+        "[pf-lm] の 1 行に内訳が入っていない"
+    );
+}
+
+/// task 333: `DENNO_PF_STREAM_RETRY` の再試行が、同じカーネルのまま
+/// **転送の担い手だけ**を替えること (数値経路は変えない)。
+#[test]
+fn t333_stream_retry_swaps_only_the_transfer_owner() {
+    assert!(
+        EXP_PF_SRC.contains("pub const STREAM_RETRY_ENV: &str = \"DENNO_PF_STREAM_RETRY\";"),
+        "env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn stream_retry_pays(why: &str) -> bool {"),
+        "再試行の可否が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("matches!(why, \"no_upload\" | \"ptr_table\")"),
+        "再試行する門が転送系に限られていない"
+    );
+    // 1 グループでも計算した後 (`out` を触った後) は再試行しない。
+    assert!(
+        CUDA_RS.contains("\"no_upload_late\""),
+        "書いた後の門に別名が無い (二重加算になる)"
+    );
+    assert!(
+        CUDA_RS.contains("\"ptr_table_late\""),
+        "書いた後の門に別名が無い (二重加算になる)"
+    );
+    assert!(
+        CUDA_RS.contains("let mut wrote = false;"),
+        "書いたかどうかの追跡が無い"
+    );
+    assert!(
+        CUDA_RS.contains("wrote = true;"),
+        "カーネルを積んだ後に印を付けていない"
+    );
+    // 直列の再試行は「上げスレッドを使わない」だけを変える。
+    assert!(
+        CUDA_RS.contains("let ut = !serial && pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;"),
+        "serial が ut の判定に入っていない"
+    );
+    assert!(
+        QWEN_SRC.contains("r = run(&mut tgt, true);"),
+        "直列の再試行が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("crate::model::exp_pf::stream_retry_pays(why)"),
+        "再試行の可否をゲートに繋いでいない"
+    );
+    // 発火の台帳 (lab の [exp-pf-stream] に retry= が出る)。
+    assert!(
+        EXP_PF_SRC.contains("pub fn note_stream_retry()"),
+        "発火の台帳が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("retry={}"),
+        "[exp-pf-stream] に retry= が出ない"
+    );
+}

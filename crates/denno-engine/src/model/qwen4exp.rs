@@ -5436,8 +5436,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 // 停止 → 以後すべて CPU で 209 s になる (lab t257a の実測)。
                 if lm_fallback == 0 {
                     eprintln!(
-                        "[pf-lm] 層 {il}: dev MoE を諦めた (理由: {}) → CPU (タイル {} 単位)",
+                        "[pf-lm] 層 {il}: dev MoE を諦めた (理由: {}{}) → CPU (タイル {} 単位)",
                         lm_decline_reason(),
+                        lm_decline_detail(),
                         tile
                     );
                 }
@@ -17130,6 +17131,7 @@ fn iq_pf_stream_layer(
 ) -> Result<Option<u32>> {
     let ne = by_expert.len();
     if ne == 0 || nt == 0 || k == 0 || weights.len() < nt * k {
+        crate::cuda::pf_stream_why_set("args");
         return Ok(None);
     }
     // task 227: 転送経路の素の速度を 1 回だけ測る (診断。既定 off)。
@@ -17212,18 +17214,23 @@ fn iq_pf_stream_layer(
         }
     }
     if entries.is_empty() {
+        crate::cuda::pf_stream_why_set("entries");
         return Ok(None);
     }
     let plan = crate::model::exp_pf::build_plan(by_expert, &pick);
     if plan.total_rows == 0 || plan.nseg() != entries.len() {
+        crate::cuda::pf_stream_why_set("plan");
         return Ok(None);
     }
     // 全 expert が GPU に載るので、行表に穴は無い (穴があれば従来経路へ)。
     let Some(prow) = crate::model::exp_pf::row_table_full(by_expert, &plan, k, nt) else {
+        crate::cuda::pf_stream_why_set("row_table");
         return Ok(None);
     };
     crate::model::pf_host::mark(t_plan, crate::model::pf_host::PLAN);
-    let r = match tgt {
+    // task 333: `serial` = 上げスレッドを使わずこのスレッドで写す (再試行用)。
+    let mut tgt = tgt;
+    let mut run = |tgt: &mut PfStreamTgt<'_>, serial: bool| match tgt {
         PfStreamTgt::Host { xs, out } => crate::cuda::moe_experts_iq_pf_layer_stream(
             lw.gate_exps.ty,
             lw.up_exps.ty,
@@ -17241,30 +17248,46 @@ fn iq_pf_stream_layer(
             &weights[..nt * k],
             crate::model::exp_pf::stream_group(),
             out,
+            serial,
         ),
-        PfStreamTgt::Dev { xs, out, sh, sh_w } => {
-            crate::cuda::moe_experts_iq_pf_layer_stream_dev(
-                lw.gate_exps.ty,
-                lw.up_exps.ty,
-                lw.down_exps.ty,
-                &entries,
-                &plan.seg,
-                &plan.rows,
-                xs,
-                e,
-                ff,
-                e,
-                nt,
-                k,
-                &prow,
-                &weights[..nt * k],
-                crate::model::exp_pf::stream_group(),
-                sh,
-                sh_w,
-                out,
-            )
-        }
+        PfStreamTgt::Dev {
+            xs,
+            out,
+            sh,
+            sh_w,
+        } => crate::cuda::moe_experts_iq_pf_layer_stream_dev(
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+            &entries,
+            &plan.seg,
+            &plan.rows,
+            *xs,
+            e,
+            ff,
+            e,
+            nt,
+            k,
+            &prow,
+            &weights[..nt * k],
+            crate::model::exp_pf::stream_group(),
+            *sh,
+            sh_w,
+            *out,
+            serial,
+        ),
     };
+    let mut r = run(&mut tgt, false);
+    // task 333: 上げスレッドが居ない / 表の対応が合わない、で落ちたときは
+    // **1 回だけ** 写しをこのスレッドへ落としてやり直す (従来は層ごと CPU へ
+    // 落ちていた)。数値経路は同じカーネル・同じ順序で、変わるのは転送の担い手だけ。
+    if matches!(r, Ok(None)) {
+        let why = crate::cuda::pf_stream_why();
+        if crate::model::exp_pf::stream_retry() && crate::model::exp_pf::stream_retry_pays(why) {
+            crate::model::exp_pf::note_stream_retry();
+            r = run(&mut tgt, true);
+        }
+    }
     r.map_err(|err| one(format!("層 {}: expert streaming: {err:#}", lw.il)))
 }
 
@@ -18322,6 +18345,20 @@ fn lm_decline(reason: &'static str) -> bool {
 #[cfg(feature = "cuda")]
 fn lm_decline_reason() -> &'static str {
     LM_DECLINE.with(|c| c.get())
+}
+
+/// task 333: `理由: stream` のときの内訳 (ストリーミングが落ちた門)。
+///
+/// task 328 は `理由: stream` だけで、ステージングの確保なのか上げスレッドなのかが
+/// 分からなかった。空 = 内訳なし (stream 以外の理由)。
+#[cfg(feature = "cuda")]
+fn lm_decline_detail() -> String {
+    let why = crate::cuda::pf_stream_why();
+    if lm_decline_reason() == "stream" && !why.is_empty() {
+        format!(" / stream: {why}")
+    } else {
+        String::new()
+    }
 }
 
 fn moe_ffn_quant_batch_lm_dev_at(
