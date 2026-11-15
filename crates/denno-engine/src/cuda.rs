@@ -32212,6 +32212,39 @@ fn dec_mix_upmix_on() -> bool {
     *ON.get_or_init(|| parse_dec_mix_upmix(std::env::var("DENNO_DEC_MIX_UPMIX").ok().as_deref()))
 }
 
+/// task 342: decode の mix 本線 (chain3) の `hc_mixed` のブロック幅
+/// (`DENNO_DEC_MIX_HCBLK`、既定 32)。切り戻しは `DENNO_DEC_MIX_HCBLK=256`。
+///
+/// なぜ効くか: `dno_hc_mixed_f32` は **1 出力 1 スレッド**で、出力ごとに
+/// `dno_expf` を hc 回 (= 4 回) 呼ぶ。`dno_expf` は glibc expf のビット一致
+/// 実装で **double** (fp64) の FMA/乗算を使う。RTX 5090 の fp64 は fp32 の
+/// 1/64 (SM あたり 2 レーン) なので、fp64 の warp 命令 1 本は約 16 サイクル。
+/// 既定だった grid = ceil(e/256) = 10 ブロック (e = 2560) では **10 SM にしか
+/// 載らず**、1 SM あたり 8 warp × 36 fp64 命令 = 288 命令 = 約 4,600 サイクル
+/// (3 us 超) が fp64 の床になっていた。
+/// ブロック幅を 32 にすると 80 ブロック = 80 SM に散り、床は 1/8 になる。
+///
+/// **値はビット一致**: 1 出力を計算するスレッドの式も s 昇順の加算順も
+/// カーネル側のままで、どのブロックがそのスレッドを持つかだけが変わる。
+/// 実測 (lab t342a/b/c、各 2 ラウンド): `dno_hc_mixed_f32` 5.8 -> 3.9 us/窓、
+/// mix 段の gpu 2.71-2.75 -> 2.61-2.64 ms/token (-3〜-4%)、decode 中央値 -0.5%。
+pub const DEC_MIX_HCBLK_ENV: &str = "DENNO_DEC_MIX_HCBLK";
+
+/// [`DEC_MIX_HCBLK_ENV`] の解釈 (純関数)。32..=1024 の 32 の倍数だけ受け付け、
+/// それ以外 (未設定・数でない・範囲外) は 32 (task 342 の採否後の既定)。
+pub fn parse_dec_mix_hcblk(raw: Option<&str>) -> usize {
+    match raw.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(v) if v >= 32 && v <= 1024 && v % 32 == 0 => v,
+        _ => 32,
+    }
+}
+
+/// task 342: `hc_mixed` のブロック幅 (`DENNO_DEC_MIX_HCBLK`)。
+fn dec_mix_hcblk() -> usize {
+    static ON: OnceLock<usize> = OnceLock::new();
+    *ON.get_or_init(|| parse_dec_mix_hcblk(std::env::var(DEC_MIX_HCBLK_ENV).ok().as_deref()))
+}
+
 /// hc 方向を畳んだ norm+inject を使うか (`DENNO_MIX_DEC_FOLD`)。
 pub(crate) fn mix_dec_fold_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -33436,8 +33469,9 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
                     &mut hcc as *mut _ as *mut c_void,
                     &mut invc2 as *mut _ as *mut c_void,
                 ];
-                let grid = (e.div_ceil(256).max(1) as u32, 1, 1);
-                ctx.launch_async(f_mixed, grid, (256, 1, 1), 0, &mut args3)?;
+                let hcblk = dec_mix_hcblk();
+                let grid = (e.div_ceil(hcblk).max(1) as u32, 1, 1);
+                ctx.launch_async(f_mixed, grid, (hcblk as u32, 1, 1), 0, &mut args3)?;
             }
             // task 307: ルータ GEMV を鎖の末尾に 1 発積む (D2H は下の 1 本と
             // 同じ同期でまとめる)。載らなければ 0 = 従来経路。
@@ -57047,6 +57081,50 @@ mod task184_tests {
         // 違う長さも別。
         let b: Vec<f32> = a[..39].to_vec();
         assert_ne!(fa, mix_norm_fingerprint(&b, b.as_ptr() as usize));
+    }
+
+    /// task 342: `DENNO_DEC_MIX_HCBLK` は 32..=1024 の 32 の倍数だけ受け付け、
+    /// それ以外は既定の 32 (hc_mixed のブロック幅。採否後の既定 = 32)。
+    #[test]
+    fn dec_mix_hcblk_truth_table() {
+        for (raw, want) in [
+            (None, 32),
+            (Some(""), 32),
+            (Some("0"), 32),
+            (Some("16"), 32),
+            (Some("33"), 32),
+            (Some("1000"), 32),
+            (Some("-32"), 32),
+            (Some("abc"), 32),
+            (Some("32"), 32),
+            (Some(" 64 "), 64),
+            (Some("128"), 128),
+            (Some("256"), 256),
+            (Some("1024"), 1024),
+        ] {
+            assert_eq!(parse_dec_mix_hcblk(raw), want, "raw={raw:?}");
+        }
+    }
+
+    /// task 342: ブロック幅を変えても 1 出力の計算式は変わらない (どのスレッドが
+    /// その出力を持つかだけ)。`d = blockIdx*blockDim + threadIdx` が全単射に
+    /// なることを実形 e=2560 で数える。
+    #[test]
+    fn hcblk_covers_every_output_once() {
+        for blk in [32usize, 64, 128, 256] {
+            let e = 2560usize;
+            let grid = e.div_ceil(blk);
+            let mut seen = vec![0u8; e];
+            for b in 0..grid {
+                for t in 0..blk {
+                    let d = b * blk + t;
+                    if d < e {
+                        seen[d] += 1;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&c| c == 1), "blk={blk} で重複か欠けがある");
+        }
     }
 
     /// v5 のレーン決定: レーンの担当単位 (ブロック対 / スーパーブロック) を
