@@ -8373,6 +8373,8 @@ static EXP_IQ_KERNELS: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 static EXP_IQ_KERNELS_V2: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 /// task 275: v3 (`kernels_exp_iq_v3.ptx`)。IQ2_S / IQ3_S のスロットだけを持つ。
 static EXP_IQ_KERNELS_V3: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
+/// task 342: v4 (`kernels_exp_iq_v4.ptx`)。v3 と同じ 2 スロット (先読みを深くした版)。
+static EXP_IQ_KERNELS_V4: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 /// task 275: decode 用の合成 (v2 か v1 に v3 のスロットを重ねたもの)。
 static EXP_IQ_KERNELS_DECODE: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 
@@ -8481,6 +8483,7 @@ fn load_exp_iq_slots(
     path: &std::path::Path,
     tag: &str,
     slots: &[usize],
+    suffix: &str,
 ) -> Option<ExpIqKernels> {
     let mut image = match std::fs::read(path) {
         Ok(b) => b,
@@ -8507,13 +8510,13 @@ fn load_exp_iq_slots(
         let Some(name) = crate::model::exp_iq::kernel_name(i) else {
             return None;
         };
-        let mut cname = format!("{name}_v3").into_bytes();
+        let mut cname = format!("{name}{suffix}").into_bytes();
         cname.push(0);
         unsafe {
             if (lib.module_get_function)(&mut fns[i], module, cname.as_ptr() as *const c_char)
                 != CUDA_SUCCESS
             {
-                eprintln!("[exp-iq] {tag}: PTX に {name}_v3 が無い → v2 のまま");
+                eprintln!("[exp-iq] {tag}: PTX に {name}{suffix} が無い → v2 のまま");
                 return None;
             }
         }
@@ -8533,6 +8536,32 @@ fn exp_iq_kernels_v3() -> Option<&'static ExpIqKernels> {
                 &exp_iq_v3_ptx_path(),
                 "v3",
                 &crate::model::exp_iq::IQ_V3_SLOTS,
+                "_v3",
+            )
+        })
+        .as_ref()
+}
+
+/// task 342: v4 の PTX の置き場所 (`DENNO_EXP_IQ_V4_PTX` で差し替え可)。
+fn exp_iq_v4_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_IQ_V4_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_v4.ptx"),
+    }
+}
+
+/// task 342: v4 カーネル (無ければ `None` = v3/v2 のまま)。
+/// メタデータの先読みを深くしただけで、値は v3 とビット一致。
+fn exp_iq_kernels_v4() -> Option<&'static ExpIqKernels> {
+    EXP_IQ_KERNELS_V4
+        .get_or_init(|| {
+            load_exp_iq_slots(
+                &exp_iq_v4_ptx_path(),
+                "v4",
+                &crate::model::exp_iq::IQ_V4_SLOTS,
+                "_v4",
             )
         })
         .as_ref()
@@ -8545,6 +8574,8 @@ fn exp_iq_kernels_v3() -> Option<&'static ExpIqKernels> {
 /// task 275: `DENNO_EXP_IQ_V3=1` かつ v3 の PTX が読めたときは、v3 が持つスロット
 /// (`IQ_V3_SLOTS`) だけ v3 の関数で置き換える。PTX のモジュールはそれぞれの
 /// `OnceLock` がプロセス終了まで保持するので、ハンドルは有効なまま。
+/// task 342: `DENNO_EXP_IQ_V4=1` かつ v4 の PTX が読めたときは v4 を優先する
+/// (同じスロット。v4 は v3 と同じ値で、メタデータの先読みだけ深い)。
 fn exp_iq_kernels_decode() -> Option<&'static ExpIqKernels> {
     EXP_IQ_KERNELS_DECODE
         .get_or_init(|| {
@@ -8563,6 +8594,15 @@ fn exp_iq_kernels_decode() -> Option<&'static ExpIqKernels> {
                     for &i in crate::model::exp_iq::IQ_V3_SLOTS.iter() {
                         if !v3.fns[i].is_null() {
                             k.fns[i] = v3.fns[i];
+                        }
+                    }
+                }
+            }
+            if crate::model::exp_iq::iq_v4_enabled() {
+                if let Some(v4) = exp_iq_kernels_v4() {
+                    for &i in crate::model::exp_iq::IQ_V4_SLOTS.iter() {
+                        if !v4.fns[i].is_null() {
+                            k.fns[i] = v4.fns[i];
                         }
                     }
                 }
