@@ -2360,8 +2360,8 @@ fn expert_ram_prepare(f: &GgufFile, layers: &[LayerW]) -> Result<()> {
     }
     // task 325: `DENNO_PF_PREAD` の読み口。常に開いておく (4 本の open だけ)。
     // 有効化は prefill の写しの側 (`DENNO_PF_PREAD=1` + 開けたパート) が決める。
-    let parts: Vec<std::path::PathBuf> = (0..f.part_count())
-        .filter_map(|i| f.path_at(i).map(|p| p.to_path_buf()))
+    let parts: Vec<Option<std::path::PathBuf>> = (0..f.part_count())
+        .map(|i| f.path_at(i).map(|p| p.to_path_buf()))
         .collect();
     crate::model::exp_pf::install_parts(parts);
     // 診断用の範囲 (probe の mincore / page cache の drop)。tier の有無に依らず覚える。

@@ -14737,7 +14737,7 @@ mod pf_stream_tests {
             let mut f = std::fs::File::create(&path).expect("create");
             f.write_all(&src).expect("write");
         }
-        exp_pf::install_parts(vec![path.clone()]);
+        exp_pf::install_parts(vec![Some(path.clone())]);
         let opened = exp_pf::parts_open();
         // (pinned 内オフセット, 転送元) を 3 本。1 本はファイル無し (RAM tier 相当)。
         let a_off = 4096u64;

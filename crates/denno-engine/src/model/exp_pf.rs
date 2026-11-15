@@ -1365,12 +1365,37 @@ pub fn ra_groups() -> usize {
 /// `DENNO_PF_PREAD=1`: ミス expert の写しを `read_at` にする。
 pub const PREAD_ENV: &str = "DENNO_PF_PREAD";
 
-/// [`PREAD_ENV`] の既定値。
-pub const DEFAULT_PREAD: bool = false;
+/// [`PREAD_ENV`] の既定値。**task 325 の lab t325a で採用して on**。
+///
+/// `mmap` をフォールトしながらの memcpy は 1 回の I/O が 128 KB (readahead) に
+/// なる。GGUF のパートから `read_at` で直接 pinned へ読むと 1 回が 1-4 MB に
+/// なり、同じホストで 1 回目の読みが速い (lab t325a、UD-Q4_K_XL、depth8k、
+/// すべて同じ run の baseline との比較):
+///
+/// | 条件 | 3,826 cold (2 ラウンド) | `copy_s` (44.4 GB) | 実速度 | 14k cold |
+/// | --- | --- | --- | --- | --- |
+/// | b0t (baseline) | 14.74 / 12.78 s | 10.47 s | 4.2 GB/s | 29.03 s |
+/// | **pread (14 本)** | **10.97 / 11.37 s** | **7.70 s** | **5.8 GB/s** | 27.12 s |
+/// | pread + 32 本 | 10.28 / 11.33 s | 7.20 s | 6.2 GB/s | 26.79 s |
+/// | b1 (baseline の repeat) | 14.88 / 14.72 s | 11.15 s | 4.0 GB/s | 32.98 s |
+///
+/// 3,826 は中央値で -19% (b0t) / -25% (b1)。14k は copy が page cache 律速
+/// (9 GB/s) なので差が出ず、壁時計は -6.6% (b0t) / -18% (b1) で悪化しない。
+/// md5 は c2000_cold / c8000_cold が全 COND で同一 (バイト列は変えない)。
 
-/// [`PREAD_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+/// [`PREAD_ENV`] の既定値。
+pub const DEFAULT_PREAD: bool = true;
+
+/// [`PREAD_ENV`] の解釈 (純関数)。未設定は既定 (on)、`0` 系だけが偽。
 pub fn pread_from_value(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PREAD,
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => true,
+            "0" | "off" | "false" | "no" => false,
+            _ => DEFAULT_PREAD,
+        },
+    }
 }
 
 /// `read_at` 経路を使うか (プロセスで 1 回だけ env を読む)。
@@ -1453,10 +1478,17 @@ static PARTS: std::sync::OnceLock<Vec<Option<std::sync::Arc<std::fs::File>>>> =
     std::sync::OnceLock::new();
 
 /// GGUF のパートを開いて覚える (2 回目以降は捨てる)。
-pub fn install_parts(paths: Vec<std::path::PathBuf>) {
+///
+/// **添字はパート番号そのもの**。開けなかったパートは `None` を残す
+/// (詰めると別のパートを読む事故になる)。
+pub fn install_parts(paths: Vec<Option<std::path::PathBuf>>) {
     let files: Vec<Option<std::sync::Arc<std::fs::File>>> = paths
         .iter()
-        .map(|p| std::fs::File::open(p).ok().map(std::sync::Arc::new))
+        .map(|p| {
+            p.as_ref()
+                .and_then(|p| std::fs::File::open(p).ok())
+                .map(std::sync::Arc::new)
+        })
         .collect();
     let opened = files.iter().filter(|f| f.is_some()).count();
     if PARTS.set(files).is_ok() && pread_on() {
@@ -2454,17 +2486,19 @@ mod tests {
         assert_eq!(ra_groups_from_value(Some("x")), 0, "解析不能は既定");
     }
 
-    /// task 325: `DENNO_PF_PREAD` は明示的な真値だけ on。
+    /// task 325: `DENNO_PF_PREAD` は既定 on、`0` 系だけが偽。
     #[test]
     fn pread_gate_truth_table() {
-        assert!(!pread_from_value(None));
-        assert!(!pread_from_value(Some("")));
+        assert!(pread_from_value(None), "未設定は既定 (on)");
+        assert!(pread_from_value(Some("")), "空も既定 (on)");
         assert!(!pread_from_value(Some("0")));
         assert!(!pread_from_value(Some("off")));
+        assert!(!pread_from_value(Some("false")));
+        assert!(!pread_from_value(Some("no")));
         assert!(pread_from_value(Some("1")));
         assert!(pread_from_value(Some("on")));
-        assert!(pread_from_value(Some("true")));
-        assert!(pread_from_value(Some("yes")));
+        assert!(pread_from_value(Some("ON")));
+        assert!(pread_from_value(Some("x")), "解析不能は既定 (on)");
     }
 
     /// task 325: `DENNO_PF_PREAD_KB` の丸めと既定。
