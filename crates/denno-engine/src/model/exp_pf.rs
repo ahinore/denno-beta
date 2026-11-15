@@ -1421,6 +1421,289 @@ pub fn lm_layer_on() -> bool {
 /// (診断専用・既定 off)。測るのは `[pf-probe]` の 1 行群で、数値経路は変えない。
 pub const DMA_PROBE_ENV: &str = "DENNO_PF_DMA_PROBE";
 
+// ---------------------------------------------------------------------------
+// task 325: 1 回目の読み (mmap → pinned) を速くする 2 本
+// ---------------------------------------------------------------------------
+//
+// REPORT_P321 の実測: UD-Q4_K_XL の 1 パスは 52.4 GB / 20.2 s = 2.6 GB/s、
+// 2 パスは 98.5 GB / 10.9 s = 9.0 GB/s (2 枚目は page cache)。つまり速さを
+// 決めているのは **冷えたページの 1 回目の読み**で、これは写しスレッドが
+// mmap をフォールトしながら memcpy しているため。候補は 2 つ:
+//
+// - `DENNO_PF_RA_GROUPS=n`: 写しの外 (専用スレッド) から、n グループ先の
+//   mmap 範囲へ `MADV_WILLNEED` を投げる。フォールトは 128 KB ずつなので、
+//   先読みを別スレッドから重ねると同時に飛ぶ I/O が増える (仮説)。
+// - `DENNO_PF_PREAD=1`: フォールトをやめ、`read_at` で GGUF のパートから
+//   pinned へ直接読む。1 回の長さは `DENNO_PF_PREAD_KB` (既定 4096 KiB)。
+//   フォールトの 1.1M 回のトラップと 128 KB の readahead を消せる (仮説)。
+//
+// どちらも**バイト列は変えない** (同じ範囲を同じ順に置くだけ)。既定 off。
+
+/// [`RA_GROUPS_ENV`] の既定値 (0 = 先読みしない)。
+pub const DEFAULT_RA_GROUPS: usize = 0;
+
+/// 先読みを何グループ先まで投げるか。
+pub const RA_GROUPS_ENV: &str = "DENNO_PF_RA_GROUPS";
+
+/// [`RA_GROUPS_ENV`] の解釈 (純関数)。0..=64 に丸める。未設定・解析不能は既定。
+pub fn ra_groups_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_RA_GROUPS;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.min(64),
+        Err(_) => DEFAULT_RA_GROUPS,
+    }
+}
+
+/// 先読みのグループ数 (プロセスで 1 回だけ env を読む)。
+pub fn ra_groups() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| ra_groups_from_value(std::env::var(RA_GROUPS_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_PREAD=1`: ミス expert の写しを `read_at` にする。
+pub const PREAD_ENV: &str = "DENNO_PF_PREAD";
+
+/// [`PREAD_ENV`] の既定値。**task 325 の lab t325a で採用して on**。
+///
+/// `mmap` をフォールトしながらの memcpy は 1 回の I/O が 128 KB (readahead) に
+/// なる。GGUF のパートから `read_at` で直接 pinned へ読むと 1 回が 1-4 MB に
+/// なり、同じホストで 1 回目の読みが速い (lab t325a、UD-Q4_K_XL、depth8k、
+/// すべて同じ run の baseline との比較):
+///
+/// | 条件 | 3,826 cold (2 ラウンド) | `copy_s` (44.4 GB) | 実速度 | 14k cold |
+/// | --- | --- | --- | --- | --- |
+/// | b0t (baseline) | 14.74 / 12.78 s | 10.47 s | 4.2 GB/s | 29.03 s |
+/// | **pread (14 本)** | **10.97 / 11.37 s** | **7.70 s** | **5.8 GB/s** | 27.12 s |
+/// | pread + 32 本 | 10.28 / 11.33 s | 7.20 s | 6.2 GB/s | 26.79 s |
+/// | b1 (baseline の repeat) | 14.88 / 14.72 s | 11.15 s | 4.0 GB/s | 32.98 s |
+///
+/// 3,826 は中央値で -19% (b0t) / -25% (b1)。14k は copy が page cache 律速
+/// (9 GB/s) なので差が出ず、壁時計は -6.6% (b0t) / -18% (b1) で悪化しない。
+/// md5 は c2000_cold / c8000_cold が全 COND で同一 (バイト列は変えない)。
+
+/// [`PREAD_ENV`] の既定値。
+pub const DEFAULT_PREAD: bool = true;
+
+/// [`PREAD_ENV`] の解釈 (純関数)。未設定は既定 (on)、`0` 系だけが偽。
+pub fn pread_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PREAD,
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => true,
+            "0" | "off" | "false" | "no" => false,
+            _ => DEFAULT_PREAD,
+        },
+    }
+}
+
+/// `read_at` 経路を使うか (プロセスで 1 回だけ env を読む)。
+pub fn pread_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pread_from_value(std::env::var(PREAD_ENV).ok().as_deref()))
+}
+
+/// 1 回の `read_at` の長さ (KiB)。
+pub const PREAD_KB_ENV: &str = "DENNO_PF_PREAD_KB";
+
+/// [`PREAD_KB_ENV`] の既定値 (4 MiB)。
+pub const DEFAULT_PREAD_KB: usize = 4096;
+
+/// [`PREAD_KB_ENV`] の解釈 (純関数)。64..=65536 KiB に丸める。
+pub fn pread_kb_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_PREAD_KB;
+    };
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => n.clamp(64, 65536),
+        _ => DEFAULT_PREAD_KB,
+    }
+}
+
+/// 1 回の `read_at` の長さ (バイト)。
+pub fn pread_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| pread_kb_from_value(std::env::var(PREAD_KB_ENV).ok().as_deref()) << 10)
+}
+
+/// `len` バイトを `blk` ずつに切った (転送元の中のオフセット, 長さ) の列。
+///
+/// 端数は最後の 1 個に寄せる (合計は必ず `len`)。切る位置が違うだけで、
+/// 書くバイト列は 1 回読みと同一。
+pub fn pread_blocks(len: usize, blk: usize) -> Vec<(usize, usize)> {
+    let blk = blk.max(1);
+    let mut out = Vec::with_capacity(len.div_ceil(blk));
+    let mut at = 0usize;
+    while at < len {
+        let n = blk.min(len - at);
+        out.push((at, n));
+        at += n;
+    }
+    out
+}
+
+/// `DENNO_PF_PREAD_THREADS`: pread の写し専用のスレッド数 (既定 0 = rayon の
+/// 共有プール = 14 本)。`read_at` は同期なので、デバイスがレイテンシ律速なら
+/// 本数を増やすと同時に飛ぶ I/O が増える (仮説)。
+pub const PREAD_THREADS_ENV: &str = "DENNO_PF_PREAD_THREADS";
+
+/// [`PREAD_THREADS_ENV`] の既定値 (0 = 共有プール)。
+pub const DEFAULT_PREAD_THREADS: usize = 0;
+
+/// [`PREAD_THREADS_ENV`] の解釈 (純関数)。0..=64 に丸める。
+pub fn pread_threads_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_PREAD_THREADS;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.min(64),
+        Err(_) => DEFAULT_PREAD_THREADS,
+    }
+}
+
+/// pread 専用プールのスレッド数 (プロセスで 1 回だけ env を読む)。
+pub fn pread_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pread_threads_from_value(std::env::var(PREAD_THREADS_ENV).ok().as_deref())
+    })
+}
+
+/// パート番号ごとの読み口 (pread 経路だけが使う)。
+///
+/// モデルの構築時に 1 回だけ開く。開けなかったパートは `None` で、その
+/// パートを含む区間は従来どおり memcpy へ落ちる (fail open)。
+static PARTS: std::sync::OnceLock<Vec<Option<std::sync::Arc<std::fs::File>>>> =
+    std::sync::OnceLock::new();
+
+/// GGUF のパートを開いて覚える (2 回目以降は捨てる)。
+///
+/// **添字はパート番号そのもの**。開けなかったパートは `None` を残す
+/// (詰めると別のパートを読む事故になる)。
+pub fn install_parts(paths: Vec<Option<std::path::PathBuf>>) {
+    let files: Vec<Option<std::sync::Arc<std::fs::File>>> = paths
+        .iter()
+        .map(|p| {
+            p.as_ref()
+                .and_then(|p| std::fs::File::open(p).ok())
+                .map(std::sync::Arc::new)
+        })
+        .collect();
+    let opened = files.iter().filter(|f| f.is_some()).count();
+    if PARTS.set(files).is_ok() && pread_on() {
+        eprintln!("[pf-pread] 読み口: {opened} パートを開いた (DENNO_PF_PREAD=1)");
+    }
+}
+
+/// パートが 1 本でも開けているか (診断用)。
+pub fn parts_open() -> usize {
+    PARTS
+        .get()
+        .map(|v| v.iter().filter(|f| f.is_some()).count())
+        .unwrap_or(0)
+}
+
+/// `part` の `off` から `dst` (長さ `len`) を読み切る。成功したら true。
+///
+/// 失敗 (開けていない / 短読み / エラー) は false を返し、呼び出し側は
+/// memcpy へ落ちる。**部分的な書き込みは残る**が、そのあと memcpy が同じ
+/// 範囲を上書きするので中身は正しい。
+///
+/// # Safety
+/// `dst` は `len` バイト書ける領域を指すこと。区間は呼び出し側が重複させない。
+pub unsafe fn read_part_ptr(part: u32, off: u64, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(Some(f)) = PARTS.get().and_then(|v| v.get(part as usize)) else {
+        PREAD_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    };
+    let buf = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut done = 0usize;
+        while done < len {
+            match f.read_at(&mut buf[done..], off + done as u64) {
+                Ok(0) => {
+                    PREAD_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                Ok(n) => done += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    PREAD_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (buf, off);
+        PREAD_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    PREAD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PREAD_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+static PREAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREAD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREAD_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `[exp-pf-stream]` の末尾へ足す pread の台帳 (発火していなければ空)。
+pub fn pread_stats() -> String {
+    let calls = PREAD_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let fail = PREAD_FAIL.load(std::sync::atomic::Ordering::Relaxed);
+    if calls == 0 && fail == 0 {
+        return String::new();
+    }
+    let mb = PREAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+    format!(" pread_MB={mb:.1} pread_calls={calls} pread_fail={fail}")
+}
+
+/// pread の台帳を 0 に戻す。
+pub fn pread_stats_reset() {
+    for c in [&PREAD_BYTES, &PREAD_CALLS, &PREAD_FAIL] {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 先読みの台帳 (グループ数 / madvise したバイト / その時間)。
+static RA_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RA_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RA_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 先読み 1 グループぶんを積む (診断用)。
+pub fn note_ra_job(bytes: usize, ns: u64) {
+    RA_JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RA_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    RA_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `[exp-pf-stream]` の末尾へ足す先読みの台帳 (発火していなければ空)。
+pub fn ra_stats() -> String {
+    let jobs = RA_JOBS.load(std::sync::atomic::Ordering::Relaxed);
+    if jobs == 0 {
+        return String::new();
+    }
+    let mb = RA_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+    let s = RA_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+    format!(" ra_groups={jobs} ra_MB={mb:.1} ra_s={s:.2}")
+}
+
+/// 先読みの台帳を 0 に戻す。
+pub fn ra_stats_reset() {
+    for c in [&RA_JOBS, &RA_BYTES, &RA_NS] {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+
 /// `DENNO_PF_DMA_PROBE` の解釈 (純関数)。**明示的な真値だけ on**。
 pub fn dma_probe_from_value(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
@@ -2211,6 +2494,9 @@ pub fn stats_line() -> Option<String> {
                 out.push_str(&format!(" tab_async_calls={calls} tab_async_ok={oks}"));
             }
         }
+        // task 325: 1 回目の読みの経路 (pread / 先読み) が発火したかの台帳。
+        out.push_str(&pread_stats());
+        out.push_str(&ra_stats());
     }
     Some(out)
 }
@@ -2259,6 +2545,9 @@ pub fn stats_reset() {
     // task 254: 表の非同期 H2D の累計もリクエスト単位にする。
     #[cfg(feature = "cuda")]
     crate::cuda::pf_tab_counts_reset();
+    // task 325: 1 回目の読みの台帳もリクエスト単位にする。
+    pread_stats_reset();
+    ra_stats_reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -2347,6 +2636,75 @@ pub fn upload_budget_experts() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task 325: `DENNO_PF_RA_GROUPS` の真理値表 (未設定は off)。
+    #[test]
+    fn ra_groups_gate_truth_table() {
+        assert_eq!(ra_groups_from_value(None), 0);
+        assert_eq!(ra_groups_from_value(Some("")), 0);
+        assert_eq!(ra_groups_from_value(Some("0")), 0);
+        assert_eq!(ra_groups_from_value(Some("1")), 1);
+        assert_eq!(ra_groups_from_value(Some(" 3 ")), 3);
+        assert_eq!(ra_groups_from_value(Some("999")), 64, "上限 64");
+        assert_eq!(ra_groups_from_value(Some("x")), 0, "解析不能は既定");
+    }
+
+    /// task 325: `DENNO_PF_PREAD` は既定 on、`0` 系だけが偽。
+    #[test]
+    fn pread_gate_truth_table() {
+        assert!(pread_from_value(None), "未設定は既定 (on)");
+        assert!(pread_from_value(Some("")), "空も既定 (on)");
+        assert!(!pread_from_value(Some("0")));
+        assert!(!pread_from_value(Some("off")));
+        assert!(!pread_from_value(Some("false")));
+        assert!(!pread_from_value(Some("no")));
+        assert!(pread_from_value(Some("1")));
+        assert!(pread_from_value(Some("on")));
+        assert!(pread_from_value(Some("ON")));
+        assert!(pread_from_value(Some("x")), "解析不能は既定 (on)");
+    }
+
+    /// task 325: `DENNO_PF_PREAD_KB` の丸めと既定。
+    #[test]
+    fn pread_kb_rounds_and_defaults() {
+        assert_eq!(pread_kb_from_value(None), DEFAULT_PREAD_KB);
+        assert_eq!(pread_kb_from_value(Some("")), DEFAULT_PREAD_KB);
+        assert_eq!(pread_kb_from_value(Some("0")), DEFAULT_PREAD_KB);
+        assert_eq!(pread_kb_from_value(Some("1")), 64, "下限 64 KiB");
+        assert_eq!(pread_kb_from_value(Some("1024")), 1024);
+        assert_eq!(pread_kb_from_value(Some("999999")), 65536, "上限 64 MiB");
+        assert_eq!(pread_kb_from_value(Some("x")), DEFAULT_PREAD_KB);
+    }
+
+    /// task 325: `DENNO_PF_PREAD_THREADS` の丸めと既定 (0 = 共有プール)。
+    #[test]
+    fn pread_threads_rounds_and_defaults() {
+        assert_eq!(pread_threads_from_value(None), 0);
+        assert_eq!(pread_threads_from_value(Some("")), 0);
+        assert_eq!(pread_threads_from_value(Some("0")), 0);
+        assert_eq!(pread_threads_from_value(Some("32")), 32);
+        assert_eq!(pread_threads_from_value(Some("999")), 64, "上限 64");
+        assert_eq!(pread_threads_from_value(Some("x")), 0);
+    }
+
+    /// task 325: 塊に切っても合計は元の長さで、隙間も重なりも無い。
+    #[test]
+    fn pread_blocks_cover_exactly() {
+        for (len, blk) in [(0usize, 64usize), (1, 64), (63, 64), (64, 64), (65, 64), (1000, 300)] {
+            let v = pread_blocks(len, blk);
+            let total: usize = v.iter().map(|&(_, n)| n).sum();
+            assert_eq!(total, len, "len={len} blk={blk}");
+            let mut at = 0usize;
+            for (off, n) in v {
+                assert_eq!(off, at, "隙間か重なりがある (len={len} blk={blk})");
+                assert!(n > 0 && n <= blk.max(1));
+                at += n;
+            }
+            assert_eq!(at, len);
+        }
+        // 0 バイトは 0 個 (空の区間を作らない)。
+        assert!(pread_blocks(0, 4096).is_empty());
+    }
 
     fn by_expert_fixture() -> Vec<Vec<(usize, usize)>> {
         // expert 0: 3 行、1: 0 行、2: 5 行、3: 1 行、4: 2 行

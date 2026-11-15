@@ -10902,6 +10902,10 @@ struct PfStream {
     /// task 309: この層の expert 型が K 系か。pinned バウンスの作り方
     /// (`DENNO_PF_STREAM_WC` の既定) を型で変える。
     k_mode: bool,
+    /// task 325: スロットごとの pinned が write-combined か (確保したときの
+    /// 実際の値)。WC のメモリへ `read_at` で書くと極端に遅いので、
+    /// pread 経路はこのフラグが偽のスロットだけを使う。
+    pin_wc: [bool; PF_STAGE_SLOTS],
 }
 
 impl PfStream {
@@ -10913,6 +10917,7 @@ impl PfStream {
             probed: false,
             next_g: 0,
             k_mode: false,
+            pin_wc: [false; PF_STAGE_SLOTS],
         }
     }
 }
@@ -11026,6 +11031,9 @@ struct PfPump {
 struct PfHostRange {
     ptr: usize,
     len: usize,
+    /// task 325: mmap のときの (GGUF パート番号, ファイル内絶対オフセット)。
+    /// RAM tier の区間は `None` (ファイルに無い)。
+    src: Option<(u32, u64)>,
 }
 
 impl PfHostRange {
@@ -11033,6 +11041,16 @@ impl PfHostRange {
         PfHostRange {
             ptr: b.as_ptr() as usize,
             len: b.len(),
+            src: None,
+        }
+    }
+
+    /// task 325: ファイル範囲も持つ版 (`read_at` 経路が使う)。
+    fn of_src(b: &[u8], src: (u32, u64)) -> Self {
+        PfHostRange {
+            ptr: b.as_ptr() as usize,
+            len: b.len(),
+            src: Some(src),
         }
     }
 }
@@ -11041,26 +11059,86 @@ impl PfHostRange {
 ///
 /// 計算スレッド (従来経路) と上げ専用スレッド (task 165) が同じ関数を使う
 /// (どちらもデバイスへ渡るバイト列は同じ)。
-fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)]) {
+///
+/// task 325: `pread` が真なら、ファイル範囲を持つ区間は `read_at` で直接
+/// pinned へ読む (`DENNO_PF_PREAD`)。読めなかった区間だけ memcpy へ落ちる。
+fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool) {
+    // task 325: pread のときは「塊」を単位に仕事を作る (1 つの区間を
+    // `DENNO_PF_PREAD_KB` ずつに切り、並列度を上げる)。
+    let mut tasks: Vec<(usize, Option<(u32, u64)>, usize, usize)> = Vec::new();
+    if pread {
+        let blk = exp_pf::pread_bytes().max(1);
+        for &(off, r) in parts {
+            if r.len == 0 {
+                continue;
+            }
+            match r.src {
+                Some(s) => {
+                    // task 325: 1 区間を `DENNO_PF_PREAD_KB` ずつに切る。
+                    for (at, n) in exp_pf::pread_blocks(r.len, blk) {
+                        tasks.push((off + at, Some((s.0, s.1 + at as u64)), r.ptr + at, n));
+                    }
+                }
+                None => tasks.push((off, None, r.ptr, r.len)),
+            }
+        }
+    } else {
+        for &(off, r) in parts {
+            tasks.push((off, None, r.ptr, r.len));
+        }
+    }
+    let work = |&(off, src, ptr, len): &(usize, Option<(u32, u64)>, usize, usize)| {
+        let dst = (pin_base + off) as *mut u8;
+        if let Some((part, at)) = src {
+            // SAFETY: 区間は互いに重ならず、`pin_base` は `need` バイト以上ある。
+            if unsafe { exp_pf::read_part_ptr(part, at, dst, len) } {
+                return;
+            }
+        }
+        // SAFETY: 同上。転送元は mmap (この層の処理が終わるまで有効)。
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr as *const u8, dst, len);
+        }
+    };
     #[cfg(feature = "par")]
     {
         use rayon::prelude::*;
-        parts.par_iter().for_each(|&(off, r)| unsafe {
-            std::ptr::copy_nonoverlapping(r.ptr as *const u8, (pin_base + off) as *mut u8, r.len);
-        });
+        // task 325: pread 専用のスレッド数を指定されたら、その本数のプールで回す
+        // (`read_at` は同期なので、同時に飛ぶ I/O の本数 = スレッド数)。
+        let nt = exp_pf::pread_threads();
+        if pread && nt > 0 {
+            if let Some(pool) = pf_pread_pool(nt) {
+                pool.install(|| tasks.par_iter().for_each(work));
+                return;
+            }
+        }
+        tasks.par_iter().for_each(work);
     }
     #[cfg(not(feature = "par"))]
     {
-        for &(off, r) in parts {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    r.ptr as *const u8,
-                    (pin_base + off) as *mut u8,
-                    r.len,
-                );
-            }
-        }
+        tasks.iter().for_each(work);
     }
+}
+
+/// task 325: pread 専用の rayon プール (スレッド数ごとに 1 個だけ作る)。
+#[cfg(feature = "par")]
+fn pf_pread_pool(nt: usize) -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    static NT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let first = NT.swap(nt, std::sync::atomic::Ordering::Relaxed) == 0;
+    if !first {
+        // 2 本目以降の違う本数は無視する (プロセスで 1 個)。
+        return POOL.get().and_then(|p| p.as_ref());
+    }
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(nt)
+            .thread_name(|i| format!("pf-pread-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// task 239: pinned の `[start, start + len)` だけを写す (分割 DMA 用)。
@@ -11072,6 +11150,7 @@ fn pf_copy_into_pin_range(
     parts: &[(usize, PfHostRange)],
     start: usize,
     len: usize,
+    pread: bool,
 ) {
     let end = start.saturating_add(len);
     let mut sub: Vec<(usize, PfHostRange)> = Vec::with_capacity(parts.len());
@@ -11087,12 +11166,94 @@ fn pf_copy_into_pin_range(
             PfHostRange {
                 ptr: r.ptr + (s - off),
                 len: e - s,
+                // task 325: 切り出した先頭のファイル位置へずらす。
+                src: r.src.map(|(part, at)| (part, at + (s - off) as u64)),
             },
         ));
     }
     if !sub.is_empty() {
-        pf_copy_into_pin(pin_base, &sub);
+        pf_copy_into_pin(pin_base, &sub, pread);
     }
+}
+
+// ---------------------------------------------------------------------------
+// task 325: グループを跨いだ先読み (`DENNO_PF_RA_GROUPS`)
+// ---------------------------------------------------------------------------
+//
+// 写しスレッドは mmap をフォールトしながら memcpy するので、1 スレッドあたり
+// 128 KB ずつしか I/O が飛ばない。**写しの外**の専用スレッドから、n グループ
+// 先の範囲へ `MADV_WILLNEED` を投げて page cache を先に埋める。投げるだけ
+// (戻りを待たない) なので、写しは従来どおりで、フォールトが当たったときには
+// ページが載っている、という狙い。**中身は変えない** (助言だけ)。
+
+/// `MADV_WILLNEED` を投げる (範囲をページ境界へ丸める)。投げたら true。
+fn pf_madvise_willneed(ptr: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const MADV_WILLNEED: i32 = 3; // linux/mman-common.h
+        extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        let a = ptr & !4095usize;
+        let b = (ptr + len + 4095) & !4095usize;
+        // SAFETY: mmap の範囲 (または RAM tier の領域) を指す。madvise は
+        // 中身を変えない。範囲外を指さないよう呼び出し側が同じ区間を渡す。
+        unsafe { madvise(a as *mut core::ffi::c_void, b - a, MADV_WILLNEED) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ptr, len);
+        false
+    }
+}
+
+/// 先読みの依頼口 (深さ 1。埋まっていたら投げない = 先へ行き過ぎない)。
+static PF_RA_TX: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Vec<(usize, usize)>>>> =
+    std::sync::OnceLock::new();
+
+fn pf_ra_sender() -> Option<&'static std::sync::mpsc::SyncSender<Vec<(usize, usize)>>> {
+    PF_RA_TX
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(usize, usize)>>(1);
+            std::thread::Builder::new()
+                .name("pf-ra".to_string())
+                .spawn(move || {
+                    while let Ok(v) = rx.recv() {
+                        let t = std::time::Instant::now();
+                        let mut bytes = 0usize;
+                        for (ptr, len) in v {
+                            if pf_madvise_willneed(ptr, len) {
+                                bytes += len;
+                            }
+                        }
+                        exp_pf::note_ra_job(bytes, t.elapsed().as_nanos() as u64);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// 1 グループぶんの先読みを依頼する (計算も写しもブロックしない)。
+fn pf_ra_submit(items: &[PfItem<'_>]) {
+    let Some(tx) = pf_ra_sender() else { return };
+    let mut v: Vec<(usize, usize)> = Vec::with_capacity(items.len() * 3);
+    for it in items {
+        for b in &it.1 {
+            if !b.is_empty() {
+                v.push((b.as_ptr() as usize, b.len()));
+            }
+        }
+    }
+    if v.is_empty() {
+        return;
+    }
+    // 深さ 1 がいっぱいなら先読みは既に先行している (投げない)。
+    let _ = tx.try_send(v);
 }
 
 /// 1 グループぶんのスロット準備 (確保と配置)。
@@ -11106,6 +11267,8 @@ struct PfSlotPlan {
     lens: Vec<[usize; 3]>,
     /// pinned 内の (オフセット, 転送元) をステージングと同じ並びで並べたもの。
     parts: Vec<(usize, PfHostRange)>,
+    /// task 325: このグループの写しを `read_at` で行うか。
+    pread: bool,
 }
 
 /// H2D 用の非ブロッキングストリームとイベントを用意する (初回だけ)。
@@ -11160,13 +11323,14 @@ fn pf_up_stream(st: &mut PfStream) -> Result<usize> {
 fn pf_slot_prepare(
     st: &mut PfStream,
     g: u64,
-    items: &[(u16, [&[u8]; 3])],
+    items: &[PfItem<'_>],
     pinned: bool,
 ) -> Result<PfSlotPlan> {
     let s = (g as usize) % PF_STAGE_SLOTS;
     let mut lens: Vec<[usize; 3]> = Vec::with_capacity(items.len());
     let mut need = 0usize;
-    for (_, b) in items {
+    for it in items {
+        let b = &it.1;
         let l = [b[0].len(), b[1].len(), b[2].len()];
         need += l
             .iter()
@@ -11226,10 +11390,16 @@ fn pf_slot_prepare(
     //    置き場所 (parts) は 3 経路とも要るので常に作る。
     let mut parts: Vec<(usize, PfHostRange)> = Vec::with_capacity(items.len() * 3);
     let mut cursor = 0usize;
-    for (i, (_, b)) in items.iter().enumerate() {
+    for (i, it) in items.iter().enumerate() {
+        let b = &it.1;
         for m in 0..3 {
             if !b[m].is_empty() {
-                parts.push((cursor, PfHostRange::of(b[m])));
+                // task 325: mmap の区間はファイル位置も持たせる (pread 用)。
+                let r = match it.2 {
+                    Some(s) => PfHostRange::of_src(b[m], s[m]),
+                    None => PfHostRange::of(b[m]),
+                };
+                parts.push((cursor, r));
             }
             cursor += pf_stage_align_up(lens[i][m]);
         }
@@ -11248,17 +11418,28 @@ fn pf_slot_prepare(
             // task 296: 確保し直しの回数と時間を診断で読めるようにする
             // (`DENNO_PF_LM_DBG=1` の `[pf-lm-dbg] stream` 行)。
             let t_pin = std::time::Instant::now();
-            st.pin[s] = Some(PinMem::alloc_flags(want, exp_pf::stream_wc_for(st.k_mode))?);
+            let wc = exp_pf::stream_wc_for(st.k_mode);
+            st.pin[s] = Some(PinMem::alloc_flags(want, wc)?);
+            st.pin_wc[s] = wc;
             pf_stream_t_add(6, t_pin.elapsed().as_nanos() as u64);
             pf_stream_t_add(7, 1);
         }
     }
+    // task 325: pread は「pinned バウンスがあって、write-combined でない」
+    // スロットだけ使う (WC への read(2) は極端に遅い)。パートが開けていない
+    // ときも memcpy へ落ちる (read_part_ptr が false を返す)。
+    let pread = pinned
+        && exp_pf::stream_src() == 0
+        && exp_pf::pread_on()
+        && !st.pin_wc[s]
+        && st.pin[s].is_some();
     Ok(PfSlotPlan {
         slot: s,
         ptrs,
         need,
         lens,
         parts,
+        pread,
     })
 }
 
@@ -11277,7 +11458,7 @@ fn pf_slot_prepare(
 fn pf_pump_in(
     st: &mut PfStream,
     g: u64,
-    items: &[(u16, [&[u8]; 3])],
+    items: &[PfItem<'_>],
     pinned: bool,
 ) -> Result<PfPump> {
     // task 296: スロット準備 (配置の計算と pinned の確保) も pump の内側なので、
@@ -11334,7 +11515,7 @@ fn pf_pump_in(
                 // 従来: 全部写してから **グループ全体を 1 回の非同期コピーで積む**。
                 // 行列ごとに分けると 1 グループ 96 回になり、`cuMemcpyHtoDAsync` の
                 // 呼び出し固定費が DMA の実時間を上回る (lab t162a)。
-                pf_copy_into_pin(pin_ptr as usize, &plan.parts);
+                pf_copy_into_pin(pin_ptr as usize, &plan.parts, plan.pread);
                 copy_ns = t_copy.elapsed().as_nanos() as u64;
                 if plan.need > 0 {
                     unsafe {
@@ -11362,7 +11543,7 @@ fn pf_pump_in(
                         i += 1;
                     }
                     let t = std::time::Instant::now();
-                    pf_copy_into_pin(pin_ptr as usize, &plan.parts[done..i]);
+                    pf_copy_into_pin(pin_ptr as usize, &plan.parts[done..i], plan.pread);
                     copy_ns += t.elapsed().as_nanos() as u64;
                     done = i;
                     unsafe {
@@ -11435,7 +11616,8 @@ fn pf_pump_in(
         let t_copy = std::time::Instant::now();
         let buf = st.slot[s].buf.as_ref().expect("確保済み");
         let mut cursor = 0usize;
-        for (i, (_, b)) in items.iter().enumerate() {
+        for (i, it) in items.iter().enumerate() {
+            let b = &it.1;
             for m in 0..3 {
                 if !b[m].is_empty() {
                     buf.copy_from_at(cursor, b[m])?;
@@ -12278,6 +12460,8 @@ struct PfUpJob {
     up_ev: usize,
     /// 最初の 1 グループだけ、同期して実 H2D を測る。
     probe: bool,
+    /// task 325: 写しを `read_at` で行うか (`DENNO_PF_PREAD`)。
+    pread: bool,
 }
 
 // SAFETY: 転送元は mmap 済みの expert 重みで、依頼を出した計算スレッドが
@@ -12451,7 +12635,7 @@ fn pf_up_ensure() {
 /// グループ `g` の上げを専用スレッドへ依頼する (戻り値はデバイスポインタ表)。
 fn pf_submit_group(
     g: u64,
-    items: &[(u16, [&[u8]; 3])],
+    items: &[PfItem<'_>],
     probe: bool,
 ) -> Result<Option<Vec<[u64; 3]>>> {
     pf_up_ensure();
@@ -12501,6 +12685,7 @@ fn pf_submit_group(
             up.submit(PfUpJob {
                 g,
                 need: plan.need,
+                pread: plan.pread,
                 dst: base,
                 pin,
                 parts: plan.parts,
@@ -12603,7 +12788,7 @@ fn pf_up_run(
     }
     // 2. pinned へ写す (計算スレッドと同じ並列写し)。
     let t_copy = std::time::Instant::now();
-    pf_copy_into_pin(job.pin, &job.parts);
+    pf_copy_into_pin(job.pin, &job.parts, job.pread);
     *copy_ns = t_copy.elapsed().as_nanos() as u64;
     // 2.5 task 320 (分離モード): VRAM のステージングを前回読んだカーネルの
     //     完了を上げストリームの待ちとして入れる (ホストは止めない)。
@@ -13065,11 +13250,18 @@ unsafe fn pf_launch_group_tc(
 ///
 /// `dev` は VRAM 常駐 (ヒット) のポインタ、`host` はミスのホストバイト列。
 /// どちらか一方だけが `Some`。
+///
+/// `src` は task 325: `host` が mmap のときの (GGUF パート番号, ファイル内
+/// 絶対オフセット)。RAM tier の区間は `None`。
 pub struct PfStreamEntry<'a> {
     pub expert: u16,
     pub dev: Option<[u64; 3]>,
     pub host: Option<[&'a [u8]; 3]>,
+    pub src: Option<[(u32, u64); 3]>,
 }
+
+/// task 325: 写しの依頼 1 本 (expert 番号, ホストのバイト列, ファイル位置)。
+pub type PfItem<'a> = (u16, [&'a [u8]; 3], Option<[(u32, u64); 3]>);
 
 thread_local! {
     /// task 233: 小さな表 (グループごとのポインタ表) を**非同期で**積むための
@@ -13688,12 +13880,13 @@ fn moe_experts_iq_pf_layer_stream_io(
             let pu_tab = sc.pu.as_ref().expect("確保済み");
             let pd_tab = sc.pd.as_ref().expect("確保済み");
             // グループごとのミス (plan 順) と必要バイト。依頼を先に出せるよう先に作る。
-            let items_of: Vec<Vec<(u16, [&[u8]; 3])>> = bounds
+            // task 325: ファイル位置 (`src`) も一緒に運ぶ (pread 経路が使う)。
+            let items_of: Vec<Vec<PfItem<'_>>> = bounds
                 .iter()
                 .map(|&(a, b)| {
                     entries[a..b]
                         .iter()
-                        .filter_map(|en| en.host.map(|h| (en.expert, h)))
+                        .filter_map(|en| en.host.map(|h| (en.expert, h, en.src)))
                         .collect()
                 })
                 .collect();
@@ -13701,7 +13894,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                 .iter()
                 .map(|it| {
                     it.iter()
-                        .map(|(_, h)| h.iter().map(|b| pf_stage_align_up(b.len())).sum::<usize>())
+                        .map(|it| it.1.iter().map(|b| pf_stage_align_up(b.len())).sum::<usize>())
                         .sum::<usize>()
                 })
                 .collect();
@@ -13729,9 +13922,18 @@ fn moe_experts_iq_pf_layer_stream_io(
             // task 320: 上げ専用スレッドへ何グループ先まで依頼するか。
             // 1 つ先だけだと、待つグループの写しがまだ終わっておらず隠れない。
             let look = if ut { exp_pf::stream_lookahead() } else { 0 };
+            // task 325: 写しの外から何グループ先を先読みするか。
+            let ra = exp_pf::ra_groups();
             for (gi, &(a, b)) in bounds.iter().enumerate() {
                 let g = base_g + gi as u64;
                 let items = &items_of[gi];
+                // task 325: n グループ先のページを別スレッドで先に読ませる
+                // (写しは従来どおり。間に合えばフォールトが page cache に当たる)。
+                if ra > 0 {
+                    if let Some(next) = items_of.get(gi + ra) {
+                        pf_ra_submit(next);
+                    }
+                }
                 // (a0) ut 経路: このグループから `look` 個先までを先に依頼する
                 //      (計算スレッドがグループ g のカーネルを積む間に、上げスレッドが
                 //       g+1 以降の写しと積み込みを進める)。
@@ -14591,6 +14793,7 @@ mod pf_stream_tests {
                 PfHostRange {
                     ptr: src.as_ptr() as usize,
                     len: 16,
+                    src: None,
                 },
             ),
             (
@@ -14598,6 +14801,7 @@ mod pf_stream_tests {
                 PfHostRange {
                     ptr: unsafe { src.as_ptr().add(16) } as usize,
                     len: 20,
+                    src: None,
                 },
             ),
             (
@@ -14605,19 +14809,20 @@ mod pf_stream_tests {
                 PfHostRange {
                     ptr: unsafe { src.as_ptr().add(36) } as usize,
                     len: 12,
+                    src: None,
                 },
             ),
         ];
         let need = 80usize;
         // 従来: 1 回で全部写す。
         let mut one = vec![0xAAu8; need];
-        pf_copy_into_pin(one.as_mut_ptr() as usize, &parts);
+        pf_copy_into_pin(one.as_mut_ptr() as usize, &parts, false);
         // 分割: 24 バイトずつ (区間の境界と隙間をまたぐ)。
         let mut split = vec![0xAAu8; need];
         let mut off = 0usize;
         while off < need {
             let len = (need - off).min(24);
-            pf_copy_into_pin_range(split.as_mut_ptr() as usize, &parts, off, len);
+            pf_copy_into_pin_range(split.as_mut_ptr() as usize, &parts, off, len, false);
             off += len;
         }
         assert_eq!(one, split, "分割で pinned の中身が変わった");
@@ -14633,6 +14838,69 @@ mod pf_stream_tests {
         assert_eq!(&split[64..76], &src[36..48]);
     }
 
+    /// task 325: `DENNO_PF_PREAD` の写しが memcpy と 1 バイトも変わらないこと。
+    ///
+    /// 本物のファイルを 1 本作り、`read_at` 経路と memcpy 経路の出力を比べる。
+    /// パートが開けない環境では read_at が false を返して memcpy へ落ちるので、
+    /// このテストは「どちらの経路でも同じ」ことを保証する。
+    #[test]
+    fn pread_copy_is_byte_identical_to_memcpy() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("pf325_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("part.gguf");
+        // 64 KiB + 端数の擬似乱数 (0 を含む)。
+        let n = 64 * 1024 + 17;
+        let src: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            f.write_all(&src).expect("write");
+        }
+        exp_pf::install_parts(vec![Some(path.clone())]);
+        let opened = exp_pf::parts_open();
+        // (pinned 内オフセット, 転送元) を 3 本。1 本はファイル無し (RAM tier 相当)。
+        let a_off = 4096u64;
+        let b_off = 20000u64;
+        let c_off = 64000u64;
+        let a_len = 8192usize;
+        let b_len = 12345usize;
+        let c_len = 1024usize;
+        let local = vec![0x5Au8; 777];
+        let parts = vec![
+            (
+                0usize,
+                PfHostRange::of_src(&src[a_off as usize..a_off as usize + a_len], (0, a_off)),
+            ),
+            (
+                a_len,
+                PfHostRange::of_src(&src[b_off as usize..b_off as usize + b_len], (0, b_off)),
+            ),
+            (
+                a_len + b_len,
+                PfHostRange::of_src(&src[c_off as usize..c_off as usize + c_len], (0, c_off)),
+            ),
+            (a_len + b_len + c_len, PfHostRange::of(&local)),
+        ];
+        let need = a_len + b_len + c_len + local.len();
+        let mut plain = vec![0xEEu8; need];
+        pf_copy_into_pin(plain.as_mut_ptr() as usize, &parts, false);
+        let mut pre = vec![0xEEu8; need];
+        pf_copy_into_pin(pre.as_mut_ptr() as usize, &parts, true);
+        assert_eq!(plain, pre, "pread と memcpy で pinned の中身が変わった");
+        assert_eq!(&pre[..a_len], &src[a_off as usize..a_off as usize + a_len]);
+        assert_eq!(
+            &pre[a_len..a_len + b_len],
+            &src[b_off as usize..b_off as usize + b_len]
+        );
+        assert_eq!(
+            &pre[a_len + b_len..a_len + b_len + c_len],
+            &src[c_off as usize..c_off as usize + c_len]
+        );
+        assert_eq!(&pre[a_len + b_len + c_len..], &local[..], "ファイル無しは memcpy");
+        let _ = opened; // パートが開けなくてもフォールバックで一致する
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GPU が無い (このコンテナ) ときは起動前に `Ok(None)` を返し、`out` を
     /// 1 要素も書かない (呼び出し側は従来経路をそのまま回せる)。
     #[test]
@@ -14642,6 +14910,7 @@ mod pf_stream_tests {
             expert: 3,
             dev: None,
             host: Some([host.as_slice(), host.as_slice(), host.as_slice()]),
+            src: None,
         }];
         let seg = [1u32, 0, 0, 0];
         let rows = [0u32];
