@@ -196,25 +196,13 @@ extern "C" __global__ void dno_mix_down_bf16_inj3(
         (const unsigned short*)(wi + (size_t)g * (size_t)ki * 2u);
     float acc = 0.0f;
     if (act) {
-        // task 327 (t327b の実測: inj3 は 10.3-10.6 us で down 単体の 7.6 us より
-        // 長い = inject の**ロードが直列**で律速)。実形状 (hc*e = 4 x 2560 =
-        // 10,240) では 40 本のロードを先に全部出して MLP を上げる。加算の順は
-        // generic 経路と 1 要素ずつ同じ (acc に i 昇順で足す) ので**ビット一致**。
-        if (ki == 10240) {
-            float v[40];
-#pragma unroll
-            for (int i = 0; i < 40; ++i) {
-                v[i] = __uint_as_float((unsigned int)rowp[tid + i * 256] << 16);
-            }
-#pragma unroll
-            for (int i = 0; i < 40; ++i) {
-                acc = __fadd_rn(acc, __fmul_rn(v[i], x[tid + i * 256]));
-            }
-        } else {
-            for (int i = tid; i < ki; i += 256) {
-                const float wv = __uint_as_float((unsigned int)rowp[i] << 16);
-                acc = __fadd_rn(acc, __fmul_rn(wv, x[i]));
-            }
+        // task 327: 3/n で「40 本のロードを先に出す」版を試したが、lab t327c の
+        // 実測で kernel は 10.4 us のまま (2/n の 10.2-10.6 と同値) で、mix の
+        // stage も 3.36-3.41 ms/token と変わらなかった。効果 0 なので generic の
+        // ループへ戻す (nvcc が元からロードをまとめていたと読める)。
+        for (int i = tid; i < ki; i += 256) {
+            const float wv = __uint_as_float((unsigned int)rowp[i] << 16);
+            acc = __fadd_rn(acc, __fmul_rn(wv, x[i]));
         }
     }
     const float s = dno_mix3_reduce256(acc, act, ired);
