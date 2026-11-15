@@ -26828,6 +26828,33 @@ fn pf_sync_own_stream() -> Result<()> {
     Ok(())
 }
 
+/// task 334: 段の終端の待ち。`DENNO_PF_STAGE_NOSYNC` が on なら**待たない**。
+///
+/// 待たなくても、次の段は同じ (レガシー既定) ストリームへの非同期起動か、
+/// 同じストリームの同期コピーなので、ストリーム順で前のカーネルを待つ。
+/// ホストが結果を読む経路は必ず同期コピーを通る。ステアリングのように
+/// ホストが直後に読む経路 (`pf_steer_*`) はこの関数を使わない。
+fn pf_stage_sync_maybe(ctx: &CudaCtx) -> Result<Option<std::time::Instant>> {
+    if crate::model::exp_pf::stage_nosync_on() {
+        return Ok(None);
+    }
+    pf_stage_sync(ctx)
+}
+
+/// task 334: prefill の attention 連鎖 (full / ssm / shared) の段の終端。
+/// `DENNO_PF_ATTN_NOSYNC` が on なら**待たない**。
+///
+/// 待った直後にホストが読むのは同期コピー (`to_slice` / `to_vec`) で落とした
+/// 結果だけで、そのコピー自体が同じストリームの前のカーネルを待つ。デバイスに
+/// 残す経路 (`kept_dev`) は次の段が同じストリームのカーネル。よって待たなくても
+/// 値は変わらない。段ごとの壁時計 (`phase_ns`) は「起動だけ」の値になる。
+fn pf_chain_sync(ctx: &CudaCtx) -> Result<()> {
+    if crate::model::exp_pf::attn_nosync_on() {
+        return Ok(());
+    }
+    ctx.sync()
+}
+
 /// task 189: mix / combine の同期。ゲートが on なら自ストリームだけを待つ。
 ///
 /// 戻り値は「別ストリームを待った時間」を測るための `Instant` (ゲート off / 計測
@@ -27728,6 +27755,45 @@ pub fn pf_take_mixed(out: &mut [f32]) -> bool {
 /// F32 はそのままのバイト列を置く (1 本 40 KB)。
 static PF_F32_W: OnceLock<Mutex<std::collections::HashMap<u64, DevBuffer>>> = OnceLock::new();
 
+/// task 334: mix の norm (`gamma`) のデバイス常駐表。
+///
+/// 従来は `pf_mix` のたびに `d.gamma` へホストから上げ直していた。14k の層優先
+/// prefill は 48 層 × 7 チャンク × 2 mix = 672 回で、1 回 40 KB。**バイト数は
+/// 小さいが、`cuMemcpyHtoD` は同じストリームの前のカーネルを待つ同期コピー**
+/// なので、待ちを外した木ではこれが新しい直列点になる (推定)。
+///
+/// 鍵は「ホスト配列の先頭ポインタ + 長さ」。層の重みはロード時に 1 回確保されて
+/// プロセスの寿命まで動かないので、同じアドレスに別の norm が来ることはない。
+/// 念のため先頭 4 要素も鍵に混ぜる。表が上限に達したら**何もせず従来経路**
+/// (d.gamma へ同期コピー) に落ちる — 使用中の DevBuffer を解放しない。
+fn pf_norm_dev(norm: &[f32]) -> Option<CUdeviceptr> {
+    /// 表の上限 (48 層 × 2 本 = 96 本 + 予備)。1 本 40 KB なので 20 MiB 未満。
+    const MAX: usize = 512;
+    if !crate::model::exp_pf::mix_gamma_cache_on() || norm.len() < 4 {
+        return None;
+    }
+    static REG: OnceLock<Mutex<Vec<(u64, usize, u32, DevBuffer)>>> = OnceLock::new();
+    let head = norm[0].to_bits() ^ norm[1].to_bits().rotate_left(7)
+        ^ norm[2].to_bits().rotate_left(13)
+        ^ norm[3].to_bits().rotate_left(19);
+    let key = (norm.as_ptr() as u64, norm.len(), head);
+    let reg = REG.get_or_init(|| Mutex::new(Vec::new()));
+    let mut v = reg.lock().ok()?;
+    if let Some((_, _, _, b)) = v
+        .iter()
+        .find(|(p, n, h, _)| *p == key.0 && *n == key.1 && *h == key.2)
+    {
+        return Some(b.ptr());
+    }
+    if v.len() >= MAX {
+        return None;
+    }
+    let b = DevBuffer::from_slice(norm).ok()?;
+    let p = b.ptr();
+    v.push((key.0, key.1, key.2, b));
+    Some(p)
+}
+
 /// 常駐した重み 1 本の種類 (どの GEMM カーネルで叩くか)。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PfWKind {
@@ -27946,11 +28012,27 @@ pub fn pf_mix(
         ) else {
             return Err("作業域が無い".into());
         };
-        gamma.copy_from(norm).map_err(|e| format!("norm H2D: {e:#}"))?;
+        // task 334: norm (gamma) は層の定数なので、デバイス常駐表から取れたら
+        // H2D しない (`DENNO_PF_MIX_GAMMA_CACHE`)。取れないときは従来どおり
+        // `d.gamma` へ同期コピー (同じバイト列)。
+        let pnorm = match pf_norm_dev(norm) {
+            Some(p) => p,
+            None => {
+                gamma.copy_from(norm).map_err(|e| format!("norm H2D: {e:#}"))?;
+                gamma.ptr()
+            }
+        };
         let inv_hc = 1.0f32 / hc as f32;
         let mut rows = (nt * hc) as i32;
-        let (mut pr, mut px, mut pl, mut pg, mut pm, mut pj, mut pw) =
-            (res.ptr(), xn.ptr(), lo.ptr(), gate.ptr(), mixed.ptr(), inj.ptr(), gamma.ptr());
+        let (mut pr, mut px, mut pl, mut pg, mut pm, mut pj, mut pw) = (
+            res.ptr(),
+            xn.ptr(),
+            lo.ptr(),
+            gate.ptr(),
+            mixed.ptr(),
+            inj.ptr(),
+            pnorm,
+        );
         // 1. grouped RMS norm (res → xn)
         pf_mix_kprof::begin(pf_mix_kprof::NORM);
         {
@@ -28252,7 +28334,8 @@ pub fn pf_mix(
         }
         pf_mix_kprof::end(pf_mix_kprof::INJ);
         // task 189: 同期は `DENNO_PF_MIX_STAGE` で自ストリームだけにできる。
-        let t_other = pf_stage_sync(ctx).map_err(|e| format!("sync: {e:#}"))?;
+        // task 334: `DENNO_PF_STAGE_NOSYNC` なら待たない (次の段は同じストリーム)。
+        let t_other = pf_stage_sync_maybe(ctx).map_err(|e| format!("sync: {e:#}"))?;
         pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t_other);
         pf_mix_kprof::collect();
         Ok(())
@@ -28374,7 +28457,8 @@ fn pf_combine_core(
                 .map_err(|e| format!("combine launch: {e:#}"))?;
         }
         // task 189: mix と同じく、expert upload の別ストリームを待たない。
-        let t_other = pf_stage_sync(ctx).map_err(|e| format!("sync: {e:#}"))?;
+        // task 334: `DENNO_PF_STAGE_NOSYNC` なら待たない (次の段は同じストリーム)。
+        let t_other = pf_stage_sync_maybe(ctx).map_err(|e| format!("sync: {e:#}"))?;
         pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t_other);
         pf_mix_kprof::collect();
         Ok(())
@@ -29509,7 +29593,9 @@ pub fn pf_full_qkv(
                 )?;
             }
         }
-        ctx.sync()?;
+        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (直後の `to_slice` が
+        // 同じストリームの完了を待つ同期 D2H)。
+        pf_chain_sync(&ctx)?;
         // 4. k / v だけ戻す (ホストの KV が正)
         //    task 181: `DENNO_PF_D2H_DIRECT` なら中間 Vec を作らず caller の
         //    バッファへ直接 D2H する (値は同じ。毎チャンク 2 x 1 MB の確保を消す)。
@@ -29844,7 +29930,9 @@ pub fn pf_full_qkv_fused(
                 ctx.launch_async(kr3.gather, (nt as u32, 1, 1), (kv as u32, 1, 1), 0, &mut args)?;
             }
         }
-        ctx.sync()?;
+        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (直後の `to_slice` が
+        // 同じストリームの完了を待つ同期 D2H)。
+        pf_chain_sync(&ctx)?;
         // 5. k / v だけ戻す (ホストの KV が正。値は従来経路と同じ)
         if pf_d2h_direct_on() {
             kdb.to_slice(&mut k_out[..nt * kv])?;
@@ -30234,7 +30322,9 @@ pub fn pf_full_out(
             }
             // 3. 出力投影 (同期しない) → 最後に 1 回だけ待って 1 回で戻す
             pf2_gemm(ctx, pw, pw_k, attb.ptr(), ob.ptr(), nt, qd, e)?;
-            ctx.sync()?;
+            // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (直後の D2H / combine は
+            // 同じストリーム)。
+            pf_chain_sync(ctx)?;
             // task 308: 層出力をデバイスに残す。直後の combine が同じポインタを
             // 読むので、D2H (層出力) と combine の H2D が 1 往復ぶん消える
             // (`DENNO_PF_FULL_DEVRES`。呼び出し側が keep_dev を立てたときだけ)。
@@ -30457,7 +30547,9 @@ fn pf_shared_impl(
             SharedOut::Dev(p) => *p,
         };
         pf2_gemm_shared(ctx, pd, pd_k, swb.ptr(), dst, nt, sff, e)?;
-        ctx.sync()?;
+        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (ホスト出力は同期 D2H、
+        // デバイス出力は同じストリームの後続が読む)。
+        pf_chain_sync(ctx)?;
         if let SharedOut::Host(o) = out {
             let shb = d.sh.as_ref().expect("ensure 済み");
             // task 181: ホストへは**呼び出し側のバッファへ直接**戻す
@@ -49898,7 +49990,8 @@ pub fn gdn_pf_chain(
         }
         // 段ごとの壁時計を意味のある値にするため、ここで 1 回だけ待つ
         // (1 チャンク = 1 段 40 ms 級なので、同期の固定費は無視できる)。
-        ctx.sync()?;
+        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (次は同じストリーム)。
+        pf_chain_sync(&ctx)?;
         phase_ns[0] = t_ph.elapsed().as_nanos() as u64;
     }
 
@@ -50000,7 +50093,8 @@ pub fn gdn_pf_chain(
             }
             gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
         }
-        ctx.sync()?;
+        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (out_proj は同じストリーム)。
+        pf_chain_sync(&ctx)?;
         phase_ns[1] = t_ph.elapsed().as_nanos() as u64;
     }
 
@@ -50031,7 +50125,8 @@ pub fn gdn_pf_chain(
             t0 += m;
         }
         // out_proj の完了待ちもこの段に含める (台帳の行を「発行だけ」にしない)。
-        ctx.sync()?;
+        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (ホストは同期 D2H で読む)。
+        pf_chain_sync(&ctx)?;
     }
     phase_ns[2] = t_out.elapsed().as_nanos() as u64;
 

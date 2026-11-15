@@ -8686,10 +8686,18 @@ fn pf_mix_stage_sync_uses_an_event() {
     );
     // mix と combine の両方がこの同期を通る (片方だけだと待ちが残る)。
     // task 218: 残差の平均の加算 / ステアリングの 2 本も同じ同期を通る (計 4)。
+    // task 334: mix / combine は `pf_stage_sync_maybe` (ゲート付きの入り口) を
+    // 通り、そこから `pf_stage_sync` を呼ぶ。steer の 2 本は直呼びのまま
+    // (ホストが直後に読むので、待ちを外してはいけない)。
     assert_eq!(
         CUDA_RS.matches("pf_stage_sync(ctx)").count(),
-        4,
-        "pf_mix / pf_combine (+ task 218 の steer 2 本) が pf_stage_sync を通っていない"
+        3,
+        "steer 2 本 + `pf_stage_sync_maybe` の中の 1 本"
+    );
+    assert_eq!(
+        CUDA_RS.matches("pf_stage_sync_maybe(ctx)").count(),
+        2,
+        "pf_mix / pf_combine がゲート付きの同期を通っていない"
     );
     // 計測器 (DENNO_PF_MIX_KPROF) は段の前後にイベントを打っている。
     for k in [

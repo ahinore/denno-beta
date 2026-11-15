@@ -767,6 +767,93 @@ pub fn stream_nosync_on() -> bool {
     *ON.get_or_init(|| stream_nosync_from_value(std::env::var(STREAM_NOSYNC_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_STAGE_NOSYNC=1`: prefill の mix / combine の終端でホストが待たない
+/// (task 334、既定 off)。
+///
+/// # なぜ要るか (lab t329b の台帳、UD-Q4_K_XL の 14k cold、1 サンプル)
+///
+/// 14k は 96 層 × 7 チャンク = 672 チャンク層で、`other` 5,169 ms のうち
+/// **combine の待ちが 1,668 ms** (672 回 × 2.5 ms)。`mix` も 870 ms (672 回 ×
+/// 1.3 ms) を待ちに使っている。`cuCtxSynchronize` は**文脈の全ストリーム**を
+/// 待つので、上げ専用スレッドの非同期 H2D (non-blocking ストリーム) まで毎回
+/// 吸い付ける。GPU は 21.5 s 動いていて壁は 27.7 s、差の 6.1 s がこの露出。
+///
+/// # なぜ外してよいか
+///
+/// 段の終端でホストが待たなくても、次の段は
+/// - 同じ (レガシー既定) ストリームへの非同期起動、または
+/// - 同じストリームの**同期**コピー (`cuMemcpyHtoD` / `cuMemcpyDtoH`)
+///
+/// のどちらかで、どちらもストリーム順で前のカーネルの完了を待つ。ホストが
+/// デバイスの結果を読む経路は必ず同期コピーを通る (`pf_take_mixed` /
+/// `pf_download_res` / KV の `to_slice`) ので、古いバイト列は読まない。
+/// 数値には触らない (バイト列も丸め順も同じ)。
+pub const STAGE_NOSYNC_ENV: &str = "DENNO_PF_STAGE_NOSYNC";
+
+/// [`STAGE_NOSYNC_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn stage_nosync_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// mix / combine の終端で待たないか (プロセスで 1 回だけ env を読む)。
+pub fn stage_nosync_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| stage_nosync_from_value(std::env::var(STAGE_NOSYNC_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_ATTN_NOSYNC=1`: prefill の attention 連鎖 (full 層 / ssm 層 / shared) の
+/// **段の終端**でホストが待たない (task 334、既定 off)。
+///
+/// # なぜ要るか (lab t329b の台帳、UD-Q4_K_XL の 14k cold、1 サンプル)
+///
+/// 672 チャンク層の待ちは `ssm` 1,556 ms (756 回) / `full` 637 ms (168 回) /
+/// `other` 1,674 ms / `mix` 870 ms で、合計 5.98 s。壁 27.7 s のうち GPU が
+/// 21.5 s しか動いていない差がこれ。
+///
+/// ssm の連鎖は 1 チャンク層につき 3 回 (`投影` / `スキャン` / `out_proj`) 待つ。
+/// もともと「段ごとの壁時計を意味のある値にするため」に置かれたもので、
+/// 待った直後にホストが読むのは**同期コピーで落とした結果**か、`out_proj` の
+/// 出力をそのまま combine に渡すデバイス経路だけ。full 層の 3 本も
+/// 「待ってから `to_slice` で D2H」の形で、`to_slice` 自体がストリーム順。
+///
+/// # 数値
+///
+/// 待つ位置を消すだけで、起動するカーネルも引数もバイト列も変えない。
+pub const ATTN_NOSYNC_ENV: &str = "DENNO_PF_ATTN_NOSYNC";
+
+/// [`ATTN_NOSYNC_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn attn_nosync_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// attention 連鎖の段の終端で待たないか (プロセスで 1 回だけ env を読む)。
+pub fn attn_nosync_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| attn_nosync_from_value(std::env::var(ATTN_NOSYNC_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_MIX_GAMMA_CACHE=1`: mix の norm (`gamma`) をデバイスに常駐させる
+/// (task 334、既定 off)。
+///
+/// 14k の層優先 prefill は 48 層 × 7 チャンク × 2 mix = 672 回、mix のたびに
+/// 40 KB を `cuMemcpyHtoD` で上げ直していた。同期コピーなので、そのストリームに
+/// 積まれた前のカーネルを待つ = 段の待ちを外した木では新しい直列点になる
+/// (推定)。norm は層の定数なので、1 回上げて使い回せば同じバイト列になる。
+pub const MIX_GAMMA_CACHE_ENV: &str = "DENNO_PF_MIX_GAMMA_CACHE";
+
+/// [`MIX_GAMMA_CACHE_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn mix_gamma_cache_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// mix の norm を常駐させるか (プロセスで 1 回だけ env を読む)。
+pub fn mix_gamma_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_gamma_cache_from_value(std::env::var(MIX_GAMMA_CACHE_ENV).ok().as_deref())
+    })
+}
+
 /// `DENNO_PF_STREAM_FIRST_G=<n>`: 層の**先頭グループ**の expert 数を n 本に絞る
 /// (task 324、既定 0 = 絞らない。`DENNO_PF_UP_GPUWAIT=1` のときだけ効く)。
 ///
@@ -3020,6 +3107,41 @@ mod tests {
         assert!(k_expert_pays(8, 8));
         assert!(!k_expert_pays(0, 0), "行の無い expert は回さない");
         assert!(k_expert_pays(3, 0), "床 0 は全部 GPU");
+    }
+
+    /// task 334: 段の終端の待ちを外す 2 本のゲート。**既定 off**、明示の真値だけ on。
+    ///
+    /// どちらも待つ位置を消すだけで、起動するカーネルも引数もバイト列も変えない
+    /// (数値は不変)。既定 off なので、lab で採るまで本番の木は 1 バイトも変わらない。
+    #[test]
+    fn stage_nosync_gate_truth_table() {
+        assert!(!stage_nosync_from_value(None), "未設定は既定 off");
+        assert!(!stage_nosync_from_value(Some("")), "空は off");
+        assert!(!stage_nosync_from_value(Some("0")));
+        assert!(!stage_nosync_from_value(Some("off")));
+        assert!(!stage_nosync_from_value(Some("false")));
+        assert!(!stage_nosync_from_value(Some("no")));
+        assert!(stage_nosync_from_value(Some("1")));
+        assert!(stage_nosync_from_value(Some("on")));
+        assert!(stage_nosync_from_value(Some(" on ")), "前後の空白は許す");
+        assert!(stage_nosync_from_value(Some("true")));
+        assert!(stage_nosync_from_value(Some("yes")));
+        assert_eq!(STAGE_NOSYNC_ENV, "DENNO_PF_STAGE_NOSYNC");
+        // attention 連鎖のほうも同じ規約 (別のゲート名)。
+        assert!(!attn_nosync_from_value(None), "未設定は既定 off");
+        assert!(!attn_nosync_from_value(Some("0")));
+        assert!(!attn_nosync_from_value(Some("off")));
+        assert!(attn_nosync_from_value(Some("1")));
+        assert!(attn_nosync_from_value(Some("on")));
+        assert_eq!(ATTN_NOSYNC_ENV, "DENNO_PF_ATTN_NOSYNC");
+        assert_ne!(STAGE_NOSYNC_ENV, ATTN_NOSYNC_ENV, "2 本は独立に切れること");
+        // norm (gamma) の常駐。
+        assert!(!mix_gamma_cache_from_value(None), "未設定は既定 off");
+        assert!(!mix_gamma_cache_from_value(Some("0")));
+        assert!(!mix_gamma_cache_from_value(Some("off")));
+        assert!(mix_gamma_cache_from_value(Some("1")));
+        assert!(mix_gamma_cache_from_value(Some("on")));
+        assert_eq!(MIX_GAMMA_CACHE_ENV, "DENNO_PF_MIX_GAMMA_CACHE");
     }
 
     /// ゲートは `DENNO_EXPERT_IQ_GPU=1` の内側だけ。既定は [`DEFAULT_ON`]。
