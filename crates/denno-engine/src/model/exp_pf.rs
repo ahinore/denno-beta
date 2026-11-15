@@ -690,6 +690,36 @@ pub fn up_decouple_on() -> bool {
     *ON.get_or_init(|| up_decouple_from_value(std::env::var(UP_DECOUPLE_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_UP_GPUWAIT=1`: 計算スレッドがグループの H2D 完了を**ホストで待たず**、
+/// 計算ストリームに `cuStreamWaitEvent` として入れる (task 324、既定 off)。
+///
+/// # なぜ要るか (lab t320c の台帳、3,826 cold、既定 ut=1)
+///
+/// 転送は写しが床 (22.65 GB / 1.08 s = 21 GB/s、DDR 律速) で、MoE のカーネルは
+/// 同じ区間に 598 ms ある。ところが計算スレッドはグループごとに
+/// `cuEventSynchronize(ev_up)` で H2D の完了を待ってからカーネルを積むので、
+/// 待っているあいだ GPU は遊び、カーネルは転送の**後ろ**に直列に付く
+/// (wall 2,604 = gpu_busy 1,375 + exposed 1,228、うち `up_wait` 1,111)。
+///
+/// 待ちを GPU の後ろへ送ると、GPU は前のグループの転送完了で自分から走り出し、
+/// 計算スレッドは次の依頼を積み続けられる。壁時計は「転送」と「カーネル」の
+/// 大きいほう (推定 1.1 s) に近づく。
+///
+/// 依頼 (`PfUpJob`) の H2D は**積まれた後**でないと `cuStreamWaitEvent` が
+/// 古い記録を見るので、`ready` (ワーカーが ev_up を記録した) まではホストで待つ。
+pub const UP_GPUWAIT_ENV: &str = "DENNO_PF_UP_GPUWAIT";
+
+/// [`UP_GPUWAIT_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn up_gpuwait_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// グループの H2D 完了を計算ストリームの待ちにするか (プロセスで 1 回だけ env を読む)。
+pub fn up_gpuwait_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| up_gpuwait_from_value(std::env::var(UP_GPUWAIT_ENV).ok().as_deref()))
+}
+
 /// [`STREAM_WC_ENV`] の既定値 (true = write-combined のバウンス)。
 ///
 /// lab t165b: グループ 64 で 14k cold が 100.01 s (wc=0) → 95.06 s (wc=1)、
@@ -1758,6 +1788,8 @@ static STREAM_READY_NS: AtomicU64 = AtomicU64::new(0);
 static STREAM_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 /// task 233: スロット再利用前の「計算完了イベント」待ち (診断。今まで台帳に出ていなかった)。
 static STREAM_USE_NS: AtomicU64 = AtomicU64::new(0);
+/// task 324: H2D の完了を**計算ストリーム**に待たせたグループ数 (ゲートの発火の証拠)。
+static STREAM_GPUWAIT: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
 static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 上げの回数 (グループ数)。
@@ -1861,6 +1893,11 @@ pub fn note_stream_group(
 /// task 233: スロット再利用前の計算完了待ちの時間を積む (診断)。
 pub fn note_stream_use_ns(ns: u64) {
     STREAM_USE_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// task 324: H2D の完了を計算ストリーム (`cuStreamWaitEvent`) に待たせた。
+pub fn note_stream_gpuwait() {
+    STREAM_GPUWAIT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// task 162: ストリーミングで 1 層を GPU に載せた。
@@ -2017,7 +2054,7 @@ pub fn stats_line() -> Option<String> {
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} group={} min_tok={} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} gpuw={} group={} min_tok={} \
              chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
@@ -2032,6 +2069,7 @@ pub fn stats_line() -> Option<String> {
             u8::from(stream_wc()),
             u8::from(stream_ut()),
             u8::from(up_decouple_on()),
+            STREAM_GPUWAIT.load(Ordering::Relaxed),
             stream_group(),
             stream_min_tok(),
             stream_chunk_bytes() >> 10,
@@ -2077,6 +2115,7 @@ pub fn stats_reset() {
         &STREAM_ENQ_NS,
         &STREAM_READY_NS,
         &STREAM_SLOT_NS,
+        &STREAM_GPUWAIT,
         &STREAM_ROWS,
         &STREAM_GROUPS,
         &STREAM_SPILL,
@@ -2809,6 +2848,14 @@ mod tests {
         assert!(!up_decouple_from_value(Some("")));
         assert!(up_decouple_from_value(Some("1")));
         assert!(up_decouple_from_value(Some("yes")));
+        // task 324: H2D の完了を計算ストリームに待たせるゲートも明示的な真値だけ on。
+        assert!(!up_gpuwait_from_value(None));
+        assert!(!up_gpuwait_from_value(Some("0")));
+        assert!(!up_gpuwait_from_value(Some("")));
+        assert!(!up_gpuwait_from_value(Some("off")));
+        assert!(up_gpuwait_from_value(Some("1")));
+        assert!(up_gpuwait_from_value(Some(" on ")), "前後の空白は無視する");
+        assert!(up_gpuwait_from_value(Some("yes")));
         // task 165: write-combined のバウンスは明示的な真値だけ on。
         assert!(!stream_wc_from_value(false, Some("1")), "stream off なら動かない");
         assert_eq!(stream_wc_from_value(true, None), DEFAULT_STREAM_WC);

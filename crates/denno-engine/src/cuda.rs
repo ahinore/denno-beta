@@ -12150,6 +12150,35 @@ fn pf_wait_up_in(st: &mut PfStream, g: u64, pinned: bool) -> Result<u64> {
     Ok(t.elapsed().as_nanos() as u64)
 }
 
+/// グループ `g` の H2D 完了を**計算ストリームの待ち**として入れる (task 324)。
+///
+/// ホストはここで止まらない。カーネルは同じ (既定) ストリームに積むので、
+/// DMA が終わったグループから順に GPU が走る。ホストが待つのは
+/// [`pf_wait_ready`] (ワーカーが ev_up を記録したこと) だけになる。
+///
+/// `cuStreamWaitEvent` は**積まれた後**の記録を見るので、呼ぶ前に `ready` を
+/// 待っていないと 1 つ前の記録で満たされてしまう (データがまだ来ていないのに
+/// カーネルが走る)。
+fn pf_stream_wait_up_in(st: &mut PfStream, g: u64, pinned: bool) -> Result<()> {
+    if !pinned {
+        return Ok(());
+    }
+    let s = (g as usize) % PF_STAGE_SLOTS;
+    let Some(ev) = st.slot[s].ev_up.as_ref() else {
+        return Ok(());
+    };
+    let Some(sw) = lib()?.stream_wait_event else {
+        return Ok(());
+    };
+    unsafe {
+        check(
+            sw(std::ptr::null_mut(), ev.0, 0),
+            "cuStreamWaitEvent (stage up/計算)",
+        )?;
+    }
+    Ok(())
+}
+
 /// グループ `g` の計算を積んだ後に呼ぶ (スロットの再利用判定用)。
 fn pf_mark_used_in(st: &mut PfStream, g: u64, pinned: bool) {
     if !pinned {
@@ -12442,16 +12471,24 @@ fn pf_submit_group(
     })
 }
 
-/// グループ `g` の上げを待つ (ut 経路)。
+/// グループ `g` の依頼がワーカーに**積まれた**ことを待つ (task 324)。
 ///
-/// 戻り値は (写し ns, 積み込み ns, 順番待ち ns, H2D 待ち ns, スロット待ち ns)。
-fn pf_wait_group(g: u64) -> Result<(u64, u64, u64, u64, u64)> {
-    let ready_ns = PF_UP.with(|cell| -> Result<u64> {
+/// ワーカーが `ev_up` を記録するまでを待つ。写しと DMA の積み込みは済んでいて、
+/// DMA の完了はまだ待たない。戻り値は順番待ちの時間 (ns)。
+fn pf_wait_ready(g: u64) -> Result<u64> {
+    PF_UP.with(|cell| -> Result<u64> {
         match cell.borrow().as_ref() {
             Some(u) => u.wait_ready(g),
             None => bail!("上げスレッドが居ない"),
         }
-    })?;
+    })
+}
+
+/// グループ `g` の上げを待つ (ut 経路)。
+///
+/// 戻り値は (写し ns, 積み込み ns, 順番待ち ns, H2D 待ち ns, スロット待ち ns)。
+fn pf_wait_group(g: u64) -> Result<(u64, u64, u64, u64, u64)> {
+    let ready_ns = pf_wait_ready(g)?;
     let wait_ns = PF_STREAM.with(|cell| -> Result<u64> {
         let mut st = cell.borrow_mut();
         pf_wait_up_in(&mut st, g, true)
@@ -13595,6 +13632,9 @@ fn moe_experts_iq_pf_layer_stream_io(
             // task 227: 転送元を mmap 直接 (page / reg) にするときは、上げ
             // スレッドの経路が pinned のバウンス前提なので使わない。
             let ut = pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
+            // task 324: グループの H2D 完了をホストで待たず、計算ストリームに
+            // `cuStreamWaitEvent` として入れる (カーネルを転送の裏へ回す)。
+            let gpuwait = ut && exp_pf::up_gpuwait_on();
             // グループごとのミス (plan 順) と必要バイト。依頼を先に出せるよう先に作る。
             let items_of: Vec<Vec<(u16, [&[u8]; 3])>> = bounds
                 .iter()
@@ -13731,12 +13771,31 @@ fn moe_experts_iq_pf_layer_stream_io(
                 let t_wait2 = std::time::Instant::now();
                 if ut {
                     if !items.is_empty() {
-                        let (c, e, r, w, sl) = pf_wait_group(g)?;
-                        copy_ns = c;
-                        enq_ns = e;
-                        ready_ns = r;
-                        wait_ns = w;
-                        slot_ns = sl;
+                        if gpuwait {
+                            // task 324: ホストは「依頼が積まれた」ところまでで止め、
+                            // H2D の完了は計算ストリームに待たせる。カーネルは
+                            // 転送が終わったグループから GPU で走り出す。
+                            ready_ns = pf_wait_ready(g)?;
+                            PF_STREAM.with(|cell| -> Result<()> {
+                                let mut st = cell.borrow_mut();
+                                pf_stream_wait_up_in(&mut st, g, true)
+                            })?;
+                            exp_pf::note_stream_gpuwait();
+                            let (c, e, sl) = PF_UP.with(|cell| match cell.borrow().as_ref() {
+                                Some(u) => u.times(g),
+                                None => (0, 0, 0),
+                            });
+                            copy_ns = c;
+                            enq_ns = e;
+                            slot_ns = sl;
+                        } else {
+                            let (c, e, r, w, sl) = pf_wait_group(g)?;
+                            copy_ns = c;
+                            enq_ns = e;
+                            ready_ns = r;
+                            wait_ns = w;
+                            slot_ns = sl;
+                        }
                         if let Some((pb, pn)) =
                             PF_UP.with(|cell| cell.borrow().as_ref().and_then(|u| u.probe()))
                         {

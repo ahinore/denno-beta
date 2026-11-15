@@ -10869,3 +10869,61 @@ fn task320_up_decouple_orders_copy_before_stream_wait() {
         "DMA が待ちの後ろに無い"
     );
 }
+
+/// task 324: グループの H2D 完了を**計算ストリーム**に待たせる配線。
+///
+/// 既定は計算スレッドが `cuEventSynchronize(ev_up)` で転送の完了を待ってから
+/// カーネルを積むので、待っているあいだ GPU が遊び、カーネルは転送の**後ろ**に
+/// 直列に付く (lab t320c、3,826 cold: wall 2,604 = gpu_busy 1,375 +
+/// exposed 1,228、うち `up_wait` 1,111、MoE カーネルは 598)。
+///
+/// ゲート on では (1) `ready` (ワーカーが ev_up を記録した) までホストで待ち、
+/// (2) `cuStreamWaitEvent` を計算ストリームへ入れ、(3) そのままカーネルを積む。
+/// (2) が (1) より前だと 1 つ前の記録で満たされて**未転送のデータ**で走る。
+#[test]
+fn task324_gpuwait_orders_stream_wait_before_kernel() {
+    assert!(
+        EXP_PF_SRC.contains("pub const UP_GPUWAIT_ENV: &str = \"DENNO_PF_UP_GPUWAIT\";"),
+        "env 名が無い"
+    );
+    assert!(EXP_PF_SRC.contains("pub fn up_gpuwait_on()"), "ゲートの実体が無い");
+    // 発火の証拠が台帳に載る (gpuw=<本数>)。
+    assert!(
+        EXP_PF_SRC.contains("dec={} gpuw={} group={}"),
+        "台帳に gpuw= が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn note_stream_gpuwait()"),
+        "発火の計数が無い"
+    );
+    // ゲートは ut 経路の内側だけ (従来経路 / page / reg の挙動は変えない)。
+    assert!(
+        CUDA_RS.contains("let gpuwait = ut && exp_pf::up_gpuwait_on();"),
+        "ゲートが ut の内側に無い"
+    );
+    // 順序: ready → ストリーム待ち → カーネル。
+    let block = CUDA_RS
+        .split("// (c) **自分のグループの H2D 完了だけ**を待つ (ホスト)。")
+        .nth(1)
+        .expect("(c) の待ちが無い");
+    let ready_at = block.find("ready_ns = pf_wait_ready(g)?;").expect("ready 待ちが無い");
+    let sw_at = block
+        .find("pf_stream_wait_up_in(&mut st, g, true)")
+        .expect("ストリーム待ちが無い");
+    let kernel_at = block.find("// (d) カーネルを積む。").expect("カーネルが無い");
+    assert!(ready_at < sw_at, "ストリーム待ちが ready より前にある");
+    assert!(sw_at < kernel_at, "カーネルがストリーム待ちより前にある");
+    // 既定 (ホストで待つ) の経路が残っている。
+    assert!(
+        block.contains("let (c, e, r, w, sl) = pf_wait_group(g)?;"),
+        "既定の待ちが消えている"
+    );
+    // ストリーム待ちの実体はホストを止めない (event_sync を呼ばない)。
+    let def = CUDA_RS
+        .split("fn pf_stream_wait_up_in(")
+        .nth(1)
+        .expect("ストリーム待ちの実体が無い");
+    let body = &def[..def.find("\n}").expect("本体の終わりが無い")];
+    assert!(body.contains("stream_wait_event"), "cuStreamWaitEvent を呼んでいない");
+    assert!(!body.contains("event_sync"), "ホストで待っている");
+}
