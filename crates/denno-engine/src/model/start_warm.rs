@@ -418,6 +418,150 @@ fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize
     f.read_at(buf, off)
 }
 
+// ---------------------------------------------------------------------------
+// task 349: 起動後の**非同期**温め
+// ---------------------------------------------------------------------------
+//
+// 既存の [`warm`] は `listening` の前に同期で走る (task 243) ので、起動が
+// そのぶん遅れる。共通ルールで「warming at start」は不採用になっている。
+// ここでは**リクエストを 1 バイトも待たせない**形にする: `listening` のあとに
+// 1 本のスレッドを起こし、page cache を読むだけ (戻り値は捨てる)。
+//
+// 冷えた page cache の最初の 14k prefill (lab t343a の x0) の内訳:
+// `other` 4,308 ms (base 830 ms) と `experts` +1.2 s。`other` の H2D は
+// 4,128.72 MB / 4,110 回で、cold のときだけ 3.5 s かかる = mmap 由来の
+// ホスト重み (vram budget の `host_weights=1587 MiB`) と PLE の表を
+// 毎リクエスト読み直している。だから **extra_ranges を先に**、そのあと
+// expert を `DENNO_PF_BG_WARM_MB` まで読む (後から読むものほど LRU で残る)。
+
+/// 非同期温めの env 名 (既定 off)。
+pub const ENV_BG: &str = "DENNO_PF_BG_WARM";
+/// 非同期温めで読む expert の上限 (MiB)。
+pub const ENV_BG_MB: &str = "DENNO_PF_BG_WARM_MB";
+/// 非同期温めの打ち切り時間 (秒)。
+pub const ENV_BG_SECS: &str = "DENNO_PF_BG_WARM_SECS";
+/// 非同期温めのスレッド数。
+pub const ENV_BG_THREADS: &str = "DENNO_PF_BG_WARM_THREADS";
+
+/// 既定 off (lab で測ってから決める)。
+pub const DEFAULT_BG: bool = false;
+/// expert の上限の既定 (24 GiB)。ホストは 59 GiB で RSS が 15-20 GB あるため、
+/// expert 28.38 GB + extra 4 GB が page cache に載る上限に近い。
+pub const DEFAULT_BG_MB: usize = 24 * 1024;
+/// 打ち切り時間の既定 (秒)。最初の prefill が終わるまでに読み終わる長さ。
+pub const DEFAULT_BG_SECS: f64 = 40.0;
+/// スレッド数の既定。task 325 の pread は 14 本で 5.8 GB/s、32 本で 6.2 GB/s。
+pub const DEFAULT_BG_THREADS: usize = 8;
+
+/// [`ENV_BG`] の解釈 (純関数)。
+pub fn bg_from(v: Option<&str>) -> bool {
+    enabled_from(v)
+}
+
+/// [`ENV_BG_MB`] の解釈 (純関数)。0 = expert を読まない。0..=131072 に丸める。
+pub fn bg_mb_from(v: Option<&str>) -> usize {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => n.min(131072),
+            Err(_) => DEFAULT_BG_MB,
+        },
+        None => DEFAULT_BG_MB,
+    }
+}
+
+/// [`ENV_BG_SECS`] の解釈 (純関数)。[`secs_from`] と同じ (1..=3600 秒)。
+pub fn bg_secs_from(v: Option<&str>) -> f64 {
+    secs_from(v)
+}
+
+/// [`ENV_BG_THREADS`] の解釈 (純関数)。1..=32 本。
+pub fn bg_threads_from(v: Option<&str>) -> usize {
+    threads_from(v)
+}
+
+/// 非同期温めが有効か (プロセスで 1 回だけ env を読む)。
+pub fn bg_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| bg_from(std::env::var(ENV_BG).ok().as_deref()))
+}
+
+/// expert の上限バイト (env を 1 回だけ読む)。
+pub fn bg_mb() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| bg_mb_from(std::env::var(ENV_BG_MB).ok().as_deref()))
+}
+
+/// 打ち切り時間 (env を 1 回だけ読む)。
+pub fn bg_secs() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| bg_secs_from(std::env::var(ENV_BG_SECS).ok().as_deref()))
+}
+
+/// スレッド数 (env を 1 回だけ読む)。
+pub fn bg_threads() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| bg_threads_from(std::env::var(ENV_BG_THREADS).ok().as_deref()))
+}
+
+/// 範囲の列を**先頭から** `max` バイトまでに切る (純関数)。
+///
+/// 1 つのテンソルは丸ごと残す (途中で切ると中途半端なページを温める)。
+/// 入らないテンソルに当たったらそこで止める (ファイル順に読むので、飛ばすと
+/// シークになるだけ)。
+pub fn cap_ranges(ranges: &mut Vec<Range>, max: u64) {
+    let mut used = 0u64;
+    let mut keep = Vec::with_capacity(ranges.len());
+    for &r in ranges.iter() {
+        if used + r.2 > max {
+            break;
+        }
+        used += r.2;
+        keep.push(r);
+    }
+    *ranges = keep;
+}
+
+/// 背景の温めが読んだ合計バイト (診断とテスト用)。
+static BG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`BG_BYTES`] を読む (背景スレッドが 1 本終わるたびに足される)。
+pub fn bg_bytes() -> u64 {
+    BG_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 背景で page cache を温める (戻りを待たない)。
+///
+/// 失敗しても何も壊さない: 読むだけ、`warm` の中は fail open、スレッドが
+/// 作れなければ `false` を返して終わり。数値経路には触らない。
+pub fn spawn_background(
+    parts: Vec<PathBuf>,
+    ranges: Vec<Range>,
+    secs: f64,
+    threads: usize,
+) -> bool {
+    if ranges.is_empty() || secs <= 0.0 {
+        return false;
+    }
+    let planned: u64 = ranges.iter().map(|r| r.2).sum();
+    std::thread::Builder::new()
+        .name("pf-bg-warm".into())
+        .spawn(move || {
+            let rep = warm(&parts, &ranges, secs, threads);
+            BG_BYTES.fetch_add(rep.bytes, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[pf-bg-warm] {}", rep.line());
+        })
+        .map(|_| {
+            eprintln!(
+                "[pf-bg-warm] start {:.1} MB ({} secs, {} threads)",
+                planned as f64 / 1e6,
+                secs,
+                threads
+            );
+            true
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(not(unix))]
 fn read_at(_f: &std::fs::File, _buf: &mut [u8], _off: u64) -> std::io::Result<usize> {
     Err(std::io::Error::new(
@@ -514,6 +658,78 @@ mod tests {
         let rep = warm(&[], &[], 30.0, 2);
         assert_eq!(rep.bytes, 0);
         assert_eq!(rep.pieces, 0);
+    }
+
+    /// task 349: 非同期温めの env の解釈 (既定 off、`0` 系だけ偽)。
+    #[test]
+    fn bg_gate_strings_and_bounds() {
+        assert_eq!(bg_from(None), DEFAULT_BG);
+        assert!(!bg_from(None), "既定は off");
+        assert!(bg_from(Some("1")));
+        assert!(bg_from(Some(" on ")));
+        assert!(!bg_from(Some("0")));
+        assert!(!bg_from(Some("off")));
+        assert_eq!(bg_mb_from(None), DEFAULT_BG_MB);
+        assert_eq!(bg_mb_from(Some("")), DEFAULT_BG_MB);
+        assert_eq!(bg_mb_from(Some("0")), 0, "0 = expert を読まない");
+        assert_eq!(bg_mb_from(Some("512")), 512);
+        assert_eq!(bg_mb_from(Some("999999")), 131072);
+        assert_eq!(bg_mb_from(Some("x")), DEFAULT_BG_MB);
+        assert_eq!(bg_secs_from(None), DEFAULT_SECS);
+        assert_eq!(bg_threads_from(Some("4")), 4);
+    }
+
+    /// task 349: `cap_ranges` は先頭から丸ごと残し、入らない所で止める。
+    #[test]
+    fn cap_ranges_keeps_whole_tensors_from_the_front() {
+        let mut r = vec![(0usize, 0u64, 10u64), (0, 10, 20), (0, 30, 5)];
+        cap_ranges(&mut r, 30);
+        assert_eq!(r, vec![(0, 0, 10), (0, 10, 20)], "30 バイトちょうどまで");
+        let mut r2 = vec![(0usize, 0u64, 10u64), (0, 10, 20)];
+        cap_ranges(&mut r2, 29);
+        assert_eq!(r2, vec![(0, 0, 10)], "途中では切らない");
+        let mut r3 = vec![(0usize, 0u64, 10u64)];
+        cap_ranges(&mut r3, 0);
+        assert!(r3.is_empty());
+    }
+
+    /// task 349: 背景の温めは範囲が空ならスレッドを作らず false を返す。
+    #[test]
+    fn spawn_background_is_inert_without_ranges() {
+        assert!(!spawn_background(Vec::new(), Vec::new(), 5.0, 2));
+        assert!(!spawn_background(vec![PathBuf::from("/dev/null")], Vec::new(), 5.0, 2));
+    }
+
+    /// task 349: 背景の温めが**実際に読む** (発火の証拠)。戻りは待たず、
+    /// 台帳 (`bg_bytes`) が計画したバイト数に達する。
+    #[test]
+    fn spawn_background_reads_the_planned_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "denno_bg_warm_{}_{}.bin",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let n = PIECE + 123;
+        let data: Vec<u8> = (0..n).map(|i| (i % 241) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let before = bg_bytes();
+        assert!(spawn_background(
+            vec![path.clone()],
+            vec![(0usize, 0u64, data.len() as u64)],
+            30.0,
+            2
+        ));
+        // 背景なので、戻った時点ではまだ読んでいないことがある。
+        let t0 = Instant::now();
+        while bg_bytes() == before && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            bg_bytes() >= before + data.len() as u64,
+            "背景の温めが 1 バイトも読んでいない"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), data, "中身が変わった");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// expert 以外はホスト型 (F32/BF16) と名前付きの表だけを、小さい順に予算まで。
