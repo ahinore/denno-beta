@@ -2358,6 +2358,12 @@ fn expert_ram_prepare(f: &GgufFile, layers: &[LayerW]) -> Result<()> {
     if layers.is_empty() {
         return Ok(());
     }
+    // task 325: `DENNO_PF_PREAD` の読み口。常に開いておく (4 本の open だけ)。
+    // 有効化は prefill の写しの側 (`DENNO_PF_PREAD=1` + 開けたパート) が決める。
+    let parts: Vec<std::path::PathBuf> = (0..f.part_count())
+        .filter_map(|i| f.path_at(i).map(|p| p.to_path_buf()))
+        .collect();
+    crate::model::exp_pf::install_parts(parts);
     // 診断用の範囲 (probe の mincore / page cache の drop)。tier の有無に依らず覚える。
     if expert_ram::probe_enabled() || expert_ram::drop_enabled() {
         let mut ranges: Vec<(usize, u64, u64)> = Vec::new();
@@ -17165,6 +17171,7 @@ fn iq_pf_stream_layer(
                         d.ptr(ExpertMatrix::Down),
                     ]),
                     host: None,
+                    src: None,
                 });
             }
             None => match &ram[ei] {
@@ -17172,6 +17179,7 @@ fn iq_pf_stream_layer(
                     expert: ei as u16,
                     dev: None,
                     host: Some([r[0].as_slice(), r[1].as_slice(), r[2].as_slice()]),
+                    src: None,
                 }),
                 None => {
                     let host = [
@@ -17179,10 +17187,25 @@ fn iq_pf_stream_layer(
                         lw.up_exps.slice(ei)?,
                         lw.down_exps.slice(ei)?,
                     ];
+                    // task 325: `DENNO_PF_PREAD` 用の (パート, 絶対オフセット)。
+                    // `slice` と同じ `ExpertSlice` から出るので範囲は必ず一致する。
+                    let src = match (
+                        lw.gate_exps.slice_abs(ei),
+                        lw.up_exps.slice_abs(ei),
+                        lw.down_exps.slice_abs(ei),
+                    ) {
+                        (Ok((ga, _)), Ok((ua, _)), Ok((da, _))) => Some([
+                            (lw.gate_exps.file as u32, ga),
+                            (lw.up_exps.file as u32, ua),
+                            (lw.down_exps.file as u32, da),
+                        ]),
+                        _ => None,
+                    };
                     entries.push(crate::cuda::PfStreamEntry {
                         expert: ei as u16,
                         dev: None,
                         host: Some(host),
+                        src,
                     });
                 }
             },

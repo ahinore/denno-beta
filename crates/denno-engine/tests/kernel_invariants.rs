@@ -10852,7 +10852,9 @@ fn task320_up_decouple_orders_copy_before_stream_wait() {
         .split("fn pf_up_run(")
         .nth(1)
         .expect("pf_up_run が無い");
-    let copy_at = run.find("pf_copy_into_pin(job.pin, &job.parts)").expect("写しが無い");
+    let copy_at = run
+        .find("pf_copy_into_pin(job.pin, &job.parts, job.pread)")
+        .expect("写しが無い");
     let wait_at = run
         .find("cuStreamWaitEvent (stage reuse/上げスレッド)")
         .expect("ストリーム待ちが無い");
