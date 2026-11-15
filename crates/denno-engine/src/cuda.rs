@@ -17131,10 +17131,18 @@ fn gdn_devstate() -> bool {
 fn gdn_host_writeback(conv_st: &mut [f32], ssm_st: &mut [f32]) -> Result<()> {
     GDN_SCRATCH.with(|cell| -> Result<()> {
         let s = cell.borrow();
-        let cv = s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_st.len())?;
-        let sm = s.buf(GdnBuf::SsmOut).to_vec::<f32>(ssm_st.len())?;
-        conv_st.copy_from_slice(&cv);
-        ssm_st.copy_from_slice(&sm);
+        if crate::model::exp_pf::gdn_wb_direct_on() {
+            // task 334: `to_vec` は 1.6 MB の Vec を確保して D2H したあと
+            // `copy_from_slice` でもう 1 回写す (毎チャンク 2 本 x 48 層 x 7)。
+            // `to_slice` は呼び出し側の配列へ直接 D2H する (値は同じバイト列)。
+            s.buf(GdnBuf::ConvOut).to_slice(conv_st)?;
+            s.buf(GdnBuf::SsmOut).to_slice(ssm_st)?;
+        } else {
+            let cv = s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_st.len())?;
+            let sm = s.buf(GdnBuf::SsmOut).to_vec::<f32>(ssm_st.len())?;
+            conv_st.copy_from_slice(&cv);
+            ssm_st.copy_from_slice(&sm);
+        }
         Ok(())
     })
 }

@@ -854,6 +854,26 @@ pub fn mix_gamma_cache_on() -> bool {
     })
 }
 
+/// `DENNO_PF_GDN_WB_DIRECT=1`: GDN の状態のホスト書き戻しを、呼び出し側の配列へ
+/// 直接 D2H する (task 334、既定 off)。
+///
+/// 従来は `to_vec` で 1.6 MB の Vec を確保して D2H し、`copy_from_slice` で
+/// もう 1 回写していた (1 チャンク層 2 本 × 36 層 × 7 チャンク = 504 回、
+/// 台帳の `ssm` の d2h 823.7 MB)。`to_slice` は同じ同期 D2H を 1 回だけ行う。
+/// デバイスへ渡るバイト列もホストの配列も同じ。
+pub const GDN_WB_DIRECT_ENV: &str = "DENNO_PF_GDN_WB_DIRECT";
+
+/// [`GDN_WB_DIRECT_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn gdn_wb_direct_from_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+}
+
+/// 状態の書き戻しを直接 D2H にするか (プロセスで 1 回だけ env を読む)。
+pub fn gdn_wb_direct_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gdn_wb_direct_from_value(std::env::var(GDN_WB_DIRECT_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_STREAM_FIRST_G=<n>`: 層の**先頭グループ**の expert 数を n 本に絞る
 /// (task 324、既定 0 = 絞らない。`DENNO_PF_UP_GPUWAIT=1` のときだけ効く)。
 ///
@@ -3142,6 +3162,11 @@ mod tests {
         assert!(mix_gamma_cache_from_value(Some("1")));
         assert!(mix_gamma_cache_from_value(Some("on")));
         assert_eq!(MIX_GAMMA_CACHE_ENV, "DENNO_PF_MIX_GAMMA_CACHE");
+        // GDN の状態の書き戻し (直接 D2H)。
+        assert!(!gdn_wb_direct_from_value(None), "未設定は既定 off");
+        assert!(!gdn_wb_direct_from_value(Some("0")));
+        assert!(gdn_wb_direct_from_value(Some("1")));
+        assert_eq!(GDN_WB_DIRECT_ENV, "DENNO_PF_GDN_WB_DIRECT");
     }
 
     /// ゲートは `DENNO_EXPERT_IQ_GPU=1` の内側だけ。既定は [`DEFAULT_ON`]。
