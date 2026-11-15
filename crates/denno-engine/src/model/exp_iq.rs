@@ -182,33 +182,6 @@ pub fn iq_v3_enabled() -> bool {
 /// v3 が差し替えるスロット (`kernels_exp_iq_v3.cu` にあるカーネルの型)。
 pub const IQ_V3_SLOTS: [usize; 2] = [0, 2];
 
-/// task 342: v4 (`kernels_exp_iq_v4.cu`) のゲート。**既定 off**。
-///
-/// v4 は v3 と同じ 2 スロット (IQ2_S / IQ3_S) を、**nb ブロックぶんのメタデータを
-/// 先にまとめて読む**形で持つ。1 レーンが 1 ブロックあたり 6 バイトしか読まない
-/// ため、v3 の 1 ブロック先読みではレイテンシを 1 回ぶんしか隠せず、k=2560
-/// (nb=10) では 10 回の直列レイテンシになる (lab t342a: IQ3_S の gate+up が
-/// 441 GB/s、同 run の Q5_K v5 は 940 GB/s)。値は **v3 とビット一致**
-/// (積の順・アキュムレータ・warp の木は同じで、ロードの発行順だけが変わる)。
-pub const EXPERT_IQ_V4_ENV: &str = "DENNO_EXP_IQ_V4";
-
-/// [`EXPERT_IQ_V4_ENV`] の解釈 (純関数)。`"1"` / `"true"` / `"on"` / `"yes"` だけが真。
-pub fn iq_v4_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("on") | Some("yes")
-    )
-}
-
-/// v4 カーネルを使うか (プロセスで 1 回だけ env を読む)。
-pub fn iq_v4_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| iq_v4_from_value(std::env::var(EXPERT_IQ_V4_ENV).ok().as_deref()))
-}
-
-/// v4 が差し替えるスロット ([`IQ_V3_SLOTS`] と同じ 2 本)。
-pub const IQ_V4_SLOTS: [usize; 2] = IQ_V3_SLOTS;
-
 /// [`EXPERT_IQ_UPLOAD_ENV`] の解釈 (純関数)。未設定・数値でない値は既定値。
 pub fn upload_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim) {
@@ -981,57 +954,6 @@ mod tests {
             assert_eq!(count(name), Some(8), "v2: {name} の引数の数が .cu と違う");
         }
         assert_eq!(count(SILU_KERNEL), Some(4), "v2: {SILU_KERNEL} の引数の数");
-    }
-
-    /// task 342: v4 ゲートは**既定 off** (`DENNO_EXP_IQ_V4`)。名前は .cu に在り、
-    /// v3 と同じ 8 引数であること (PTX があれば引数の数も見る)。
-    /// 値は v3 とビット一致 (先読みを深くしただけ) なので、既定 off のまま
-    /// lab で採否を決める。
-    #[test]
-    fn v4_gate_and_kernel_names() {
-        assert!(!iq_v4_from_value(None));
-        assert!(!iq_v4_from_value(Some("")));
-        assert!(!iq_v4_from_value(Some("0")));
-        assert!(!iq_v4_from_value(Some("off")));
-        for v in ["1", "on", "true", " on ", "YES"] {
-            assert!(iq_v4_from_value(Some(v)), "v4: {v} が on にならない");
-        }
-        let dir = std::path::Path::new(env!(
-            "CARGO_MANIFEST_DIR"
-        ))
-        .join("kernels");
-        let cu = std::fs::read_to_string(dir.join("kernels_exp_iq_v4.cu")).expect(".cu が読めない");
-        for i in IQ_V4_SLOTS {
-            let name = kernel_name(i).expect("slot");
-            let full = format!("{name}_v4");
-            assert!(
-                cu.contains(&format!("__global__ void {full}(")),
-                "{full} が .cu に無い"
-            );
-        }
-        // v4 が差し替えないスロットの名前を持ち込まない。
-        for i in 0..SLOTS {
-            if IQ_V4_SLOTS.contains(&i) {
-                continue;
-            }
-            let name = kernel_name(i).expect("slot");
-            assert!(
-                !cu.contains(&format!("__global__ void {name}_v4(")),
-                "{name} は v4 の担当外"
-            );
-        }
-        // PTX があれば引数 8 本 (v1/v2/v3 と同じ segment 表)。
-        let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq_v4.ptx")) else {
-            return;
-        };
-        for i in IQ_V4_SLOTS {
-            let name = format!("{}_v4", kernel_name(i).expect("slot"));
-            let head = format!(".visible .entry {name}(");
-            let j = ptx.find(&head).expect("v4 PTX に kernel が無い");
-            let rest = &ptx[j + head.len()..];
-            let end = rest.find(')').unwrap_or(rest.len());
-            assert_eq!(rest[..end].matches(".param").count(), 8, "{name} の引数の数");
-        }
     }
 
     /// task 275: v3 ゲートは**既定 off** (`DENNO_EXP_IQ_V3`)。名前は .cu に在り、

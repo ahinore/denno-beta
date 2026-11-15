@@ -8373,8 +8373,6 @@ static EXP_IQ_KERNELS: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 static EXP_IQ_KERNELS_V2: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 /// task 275: v3 (`kernels_exp_iq_v3.ptx`)。IQ2_S / IQ3_S のスロットだけを持つ。
 static EXP_IQ_KERNELS_V3: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
-/// task 342: v4 (`kernels_exp_iq_v4.ptx`)。v3 と同じ 2 スロット (先読みを深くした版)。
-static EXP_IQ_KERNELS_V4: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 /// task 275: decode 用の合成 (v2 か v1 に v3 のスロットを重ねたもの)。
 static EXP_IQ_KERNELS_DECODE: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 
@@ -8483,7 +8481,6 @@ fn load_exp_iq_slots(
     path: &std::path::Path,
     tag: &str,
     slots: &[usize],
-    suffix: &str,
 ) -> Option<ExpIqKernels> {
     let mut image = match std::fs::read(path) {
         Ok(b) => b,
@@ -8510,13 +8507,13 @@ fn load_exp_iq_slots(
         let Some(name) = crate::model::exp_iq::kernel_name(i) else {
             return None;
         };
-        let mut cname = format!("{name}{suffix}").into_bytes();
+        let mut cname = format!("{name}_v3").into_bytes();
         cname.push(0);
         unsafe {
             if (lib.module_get_function)(&mut fns[i], module, cname.as_ptr() as *const c_char)
                 != CUDA_SUCCESS
             {
-                eprintln!("[exp-iq] {tag}: PTX に {name}{suffix} が無い → v2 のまま");
+                eprintln!("[exp-iq] {tag}: PTX に {name}_v3 が無い → v2 のまま");
                 return None;
             }
         }
@@ -8536,32 +8533,6 @@ fn exp_iq_kernels_v3() -> Option<&'static ExpIqKernels> {
                 &exp_iq_v3_ptx_path(),
                 "v3",
                 &crate::model::exp_iq::IQ_V3_SLOTS,
-                "_v3",
-            )
-        })
-        .as_ref()
-}
-
-/// task 342: v4 の PTX の置き場所 (`DENNO_EXP_IQ_V4_PTX` で差し替え可)。
-fn exp_iq_v4_ptx_path() -> std::path::PathBuf {
-    match std::env::var("DENNO_EXP_IQ_V4_PTX") {
-        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("kernels")
-            .join("kernels_exp_iq_v4.ptx"),
-    }
-}
-
-/// task 342: v4 カーネル (無ければ `None` = v3/v2 のまま)。
-/// メタデータの先読みを深くしただけで、値は v3 とビット一致。
-fn exp_iq_kernels_v4() -> Option<&'static ExpIqKernels> {
-    EXP_IQ_KERNELS_V4
-        .get_or_init(|| {
-            load_exp_iq_slots(
-                &exp_iq_v4_ptx_path(),
-                "v4",
-                &crate::model::exp_iq::IQ_V4_SLOTS,
-                "_v4",
             )
         })
         .as_ref()
@@ -8574,8 +8545,6 @@ fn exp_iq_kernels_v4() -> Option<&'static ExpIqKernels> {
 /// task 275: `DENNO_EXP_IQ_V3=1` かつ v3 の PTX が読めたときは、v3 が持つスロット
 /// (`IQ_V3_SLOTS`) だけ v3 の関数で置き換える。PTX のモジュールはそれぞれの
 /// `OnceLock` がプロセス終了まで保持するので、ハンドルは有効なまま。
-/// task 342: `DENNO_EXP_IQ_V4=1` かつ v4 の PTX が読めたときは v4 を優先する
-/// (同じスロット。v4 は v3 と同じ値で、メタデータの先読みだけ深い)。
 fn exp_iq_kernels_decode() -> Option<&'static ExpIqKernels> {
     EXP_IQ_KERNELS_DECODE
         .get_or_init(|| {
@@ -8594,15 +8563,6 @@ fn exp_iq_kernels_decode() -> Option<&'static ExpIqKernels> {
                     for &i in crate::model::exp_iq::IQ_V3_SLOTS.iter() {
                         if !v3.fns[i].is_null() {
                             k.fns[i] = v3.fns[i];
-                        }
-                    }
-                }
-            }
-            if crate::model::exp_iq::iq_v4_enabled() {
-                if let Some(v4) = exp_iq_kernels_v4() {
-                    for &i in crate::model::exp_iq::IQ_V4_SLOTS.iter() {
-                        if !v4.fns[i].is_null() {
-                            k.fns[i] = v4.fns[i];
                         }
                     }
                 }
@@ -9113,9 +9073,7 @@ where
             // 2. act = silu(g) * u
             {
                 let n = ng as c_int;
-                // task 342: 32 スレッドにすると 20 ブロック -> 160 ブロック
-                // (`DENNO_DEC_TINY32`。値はビット一致)。
-                let threads = dec_tiny_block();
+                let threads = 256usize;
                 let blocks = ng.div_ceil(threads) as u32;
                 let mut pgg = g_ptr;
                 let mut puu = u_ptr;
@@ -9188,8 +9146,7 @@ where
                     &mut pn as *mut _ as *mut c_void,
                     &mut phs as *mut _ as *mut c_void,
                 ];
-                // task 342: silu と同じ扱い (`DENNO_DEC_TINY32`。値はビット一致)。
-                let threads = dec_tiny_block();
+                let threads = 256usize;
                 let blocks = sum_e.div_ceil(threads) as u32;
                 ctx.launch_async(sk.sum, (blocks.max(1), 1, 1), (threads as u32, 1, 1), 0, &mut args)?;
                 dec_exp_kprof::mark(dec_exp_kprof::SUM);
@@ -32256,27 +32213,29 @@ fn dec_mix_upmix_on() -> bool {
 }
 
 /// task 342: decode の mix 本線 (chain3) の `hc_mixed` のブロック幅
-/// (`DENNO_DEC_MIX_HCBLK`、既定 256 = 従来)。
+/// (`DENNO_DEC_MIX_HCBLK`、既定 32)。切り戻しは `DENNO_DEC_MIX_HCBLK=256`。
 ///
 /// なぜ効くか: `dno_hc_mixed_f32` は **1 出力 1 スレッド**で、出力ごとに
 /// `dno_expf` を hc 回 (= 4 回) 呼ぶ。`dno_expf` は glibc expf のビット一致
 /// 実装で **double** (fp64) の FMA/乗算を使う。RTX 5090 の fp64 は fp32 の
 /// 1/64 (SM あたり 2 レーン) なので、fp64 の warp 命令 1 本は約 16 サイクル。
-/// 既定の grid = ceil(e/256) = 10 ブロック (e = 2560) では **10 SM にしか
-/// 載らず**、1 SM あたり 8 warp × 4 expf × 9 fp64 命令 = 288 命令 = 約
-/// 4,600 サイクル (3 us 超) が fp64 の床になる。
+/// 既定だった grid = ceil(e/256) = 10 ブロック (e = 2560) では **10 SM にしか
+/// 載らず**、1 SM あたり 8 warp × 36 fp64 命令 = 288 命令 = 約 4,600 サイクル
+/// (3 us 超) が fp64 の床になっていた。
 /// ブロック幅を 32 にすると 80 ブロック = 80 SM に散り、床は 1/8 になる。
 ///
 /// **値はビット一致**: 1 出力を計算するスレッドの式も s 昇順の加算順も
 /// カーネル側のままで、どのブロックがそのスレッドを持つかだけが変わる。
+/// 実測 (lab t342a/b/c、各 2 ラウンド): `dno_hc_mixed_f32` 5.8 -> 3.9 us/窓、
+/// mix 段の gpu 2.71-2.75 -> 2.61-2.64 ms/token (-3〜-4%)、decode 中央値 -0.5%。
 pub const DEC_MIX_HCBLK_ENV: &str = "DENNO_DEC_MIX_HCBLK";
 
 /// [`DEC_MIX_HCBLK_ENV`] の解釈 (純関数)。32..=1024 の 32 の倍数だけ受け付け、
-/// それ以外 (未設定・数でない・範囲外) は従来の 256。
+/// それ以外 (未設定・数でない・範囲外) は 32 (task 342 の採否後の既定)。
 pub fn parse_dec_mix_hcblk(raw: Option<&str>) -> usize {
     match raw.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
         Some(v) if v >= 32 && v <= 1024 && v % 32 == 0 => v,
-        _ => 256,
+        _ => 32,
     }
 }
 
@@ -32284,37 +32243,6 @@ pub fn parse_dec_mix_hcblk(raw: Option<&str>) -> usize {
 fn dec_mix_hcblk() -> usize {
     static ON: OnceLock<usize> = OnceLock::new();
     *ON.get_or_init(|| parse_dec_mix_hcblk(std::env::var(DEC_MIX_HCBLK_ENV).ok().as_deref()))
-}
-
-/// task 342: expert 段の**小さい要素ごとカーネル** (`silu_mul` / `exp_sum`) を
-/// 32 スレッドのブロックで撃つか (`DENNO_DEC_TINY32`、既定 off)。
-///
-/// どちらも 1 出力 1 スレッドで、出力数は ng = nseg*ff = 5,120 と e = 2,560。
-/// 既定は 256 スレッドなので grid は 20 / 10 ブロック = **20 SM と 10 SM しか
-/// 使わない**。仕事は 1 出力 1 ロード (exp_sum は nseg 本) なので、カーネルの
-/// 時間はほぼ「起動 + 1 往復のレイテンシ」で、SM を増やすほど短くなる。
-/// 32 スレッドにすると 160 / 80 ブロックになる。
-///
-/// **値はビット一致** (要素ごとに独立・式はカーネル側のまま)。
-pub const DEC_TINY32_ENV: &str = "DENNO_DEC_TINY32";
-
-/// [`DEC_TINY32_ENV`] の解釈 (純関数)。
-fn parse_dec_tiny32(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
-}
-
-/// task 342: 小さい要素ごとカーネルのブロック幅 (32 = on / 256 = 従来)。
-fn dec_tiny_block() -> usize {
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| parse_dec_tiny32(std::env::var(DEC_TINY32_ENV).ok().as_deref()));
-    if on {
-        32
-    } else {
-        256
-    }
 }
 
 /// hc 方向を畳んだ norm+inject を使うか (`DENNO_MIX_DEC_FOLD`)。
@@ -57156,18 +57084,18 @@ mod task184_tests {
     }
 
     /// task 342: `DENNO_DEC_MIX_HCBLK` は 32..=1024 の 32 の倍数だけ受け付け、
-    /// それ以外は従来の 256 (hc_mixed のブロック幅)。
+    /// それ以外は既定の 32 (hc_mixed のブロック幅。採否後の既定 = 32)。
     #[test]
     fn dec_mix_hcblk_truth_table() {
         for (raw, want) in [
-            (None, 256),
-            (Some(""), 256),
-            (Some("0"), 256),
-            (Some("16"), 256),
-            (Some("33"), 256),
-            (Some("1000"), 256),
-            (Some("-32"), 256),
-            (Some("abc"), 256),
+            (None, 32),
+            (Some(""), 32),
+            (Some("0"), 32),
+            (Some("16"), 32),
+            (Some("33"), 32),
+            (Some("1000"), 32),
+            (Some("-32"), 32),
+            (Some("abc"), 32),
             (Some("32"), 32),
             (Some(" 64 "), 64),
             (Some("128"), 128),
@@ -57175,17 +57103,6 @@ mod task184_tests {
             (Some("1024"), 1024),
         ] {
             assert_eq!(parse_dec_mix_hcblk(raw), want, "raw={raw:?}");
-        }
-    }
-
-    /// task 342: `DENNO_DEC_TINY32` は明示的な真値だけ on。
-    #[test]
-    fn dec_tiny32_truth_table() {
-        for raw in [None, Some(""), Some("0"), Some("off"), Some("x")] {
-            assert!(!parse_dec_tiny32(raw), "raw={raw:?} が on になっている");
-        }
-        for raw in [Some("1"), Some("on"), Some(" true "), Some("YES")] {
-            assert!(parse_dec_tiny32(raw), "raw={raw:?} が off になっている");
         }
     }
 
