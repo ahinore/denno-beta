@@ -2715,6 +2715,10 @@ mod tests {
     fn retry_pays_only_for_the_transfer_guards() {
         assert!(stream_retry_pays("no_upload"), "上げスレッドが居ない");
         assert!(stream_retry_pays("ptr_table"), "ポインタ表の不整合");
+        // 1 グループでも計算した後は `out` を触っているので再試行しない
+        // (呼び出し側の従来経路と二重加算になる)。
+        assert!(!stream_retry_pays("no_upload_late"));
+        assert!(!stream_retry_pays("ptr_table_late"));
         for why in [
             "stage",
             "no_miss",

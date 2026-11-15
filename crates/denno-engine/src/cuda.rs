@@ -13966,6 +13966,11 @@ fn moe_experts_iq_pf_layer_stream_io(
             let look = if ut { exp_pf::stream_lookahead() } else { 0 };
             // task 325: 写しの外から何グループ先を先読みするか。
             let ra = exp_pf::ra_groups();
+            // task 333: ここまでに 1 グループでも計算したか。
+            // `Ok(None)` の契約は「`out` を触っていない」なので、書いた後の
+            // 門は再試行しない (`*_late`)。呼び出し側が従来経路へ落ちると
+            // 二重加算になるため、再試行の可否もここで分ける。
+            let mut wrote = false;
             for (gi, &(a, b)) in bounds.iter().enumerate() {
                 let g = base_g + gi as u64;
                 let items = &items_of[gi];
@@ -13994,6 +13999,9 @@ fn moe_experts_iq_pf_layer_stream_io(
                     }
                     if !items.is_empty() && ready_ptrs[gi].is_none() {
                         // 上げスレッドが居ない → この層は従来経路へ。
+                        if wrote {
+                            return Ok(pf_stream_skip("no_upload_late"));
+                        }
                         return Ok(pf_stream_skip("no_upload"));
                     }
                 }
@@ -14044,6 +14052,9 @@ fn moe_experts_iq_pf_layer_stream_io(
                             ip += 1;
                         } else {
                             // 表が足りない = 内部の不整合。この層は従来経路へ。
+                            if wrote {
+                                return Ok(pf_stream_skip("ptr_table_late"));
+                            }
                             return Ok(pf_stream_skip("ptr_table"));
                         }
                     }
@@ -14186,6 +14197,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                         )?;
                     }
                 }
+                wrote = true;
                 PF_STREAM.with(|cell| {
                     let mut st = cell.borrow_mut();
                     pf_mark_used_in(&mut st, g, pinned);

@@ -11041,6 +11041,23 @@ fn t333_stream_retry_swaps_only_the_transfer_owner() {
         EXP_PF_SRC.contains("matches!(why, \"no_upload\" | \"ptr_table\")"),
         "再試行する門が転送系に限られていない"
     );
+    // 1 グループでも計算した後 (`out` を触った後) は再試行しない。
+    assert!(
+        CUDA_RS.contains("\"no_upload_late\""),
+        "書いた後の門に別名が無い (二重加算になる)"
+    );
+    assert!(
+        CUDA_RS.contains("\"ptr_table_late\""),
+        "書いた後の門に別名が無い (二重加算になる)"
+    );
+    assert!(
+        CUDA_RS.contains("let mut wrote = false;"),
+        "書いたかどうかの追跡が無い"
+    );
+    assert!(
+        CUDA_RS.contains("wrote = true;"),
+        "カーネルを積んだ後に印を付けていない"
+    );
     // 直列の再試行は「上げスレッドを使わない」だけを変える。
     assert!(
         CUDA_RS.contains("let ut = !serial && pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;"),
