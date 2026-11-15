@@ -11218,3 +11218,36 @@ fn t349_ple_pipe_is_wired_and_does_not_double_read() {
         "パイプが gather 本体を通っていない"
     );
 }
+
+/// task 349: `DENNO_PF_PLE_PIPE` が層優先 (LM) の先頭 gather でも効き、
+/// 専用プールの本数まで並列度を上げること (読む行は同じ)。
+#[test]
+fn t349_ple_pipe_widens_the_lm_gather_pool() {
+    let ple = include_str!("../src/ple.rs");
+    assert!(
+        ple.contains("if crate::model::exp_pf::ple_pipe() {"),
+        "ple_par_parts がゲートを見ていない"
+    );
+    assert!(
+        ple.contains("rayon::current_num_threads().clamp(1, 32)"),
+        "並列度の上限が 32 でない"
+    );
+    // 層優先の先頭 gather が専用プールで回る (埋め込みは直列のまま)。
+    assert!(
+        QWEN_SRC.contains("let ple_wide = ple_batch && crate::model::exp_pf::ple_pipe();"),
+        "LM 経路がゲートを見ていない"
+    );
+    assert!(
+        QWEN_SRC.contains("const PLE_PIPE_THREADS: usize = 32;"),
+        "専用プールの本数が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("Ok(p) => ples_all = p.install(run)?,"),
+        "専用プールで gather を回していない"
+    );
+    // 値は変えない: 同じ gather 本体を通る。
+    assert!(
+        QWEN_SRC.contains("out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);"),
+        "LM の wide 経路が gather 本体を通っていない"
+    );
+}

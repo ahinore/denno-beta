@@ -5178,6 +5178,11 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let ple_batch = ple_batch_enabled();
         // 埋め込みと PLE は層ループの外で 1 回だけ (全トークン)。
         let mut res_all: Vec<f32> = Vec::with_capacity(nt_all * hc_dim);
+        // task 349: `DENNO_PF_PLE_PIPE` では埋め込み (直列) と gather を分け、
+        // gather を広い専用プールで引く。冷えた page cache では 1 行 90 B の
+        // ランダム pread が IOPS 律速 (14k で 1,848 ms、wall の 20%) なので、
+        // queue を深くする。読む行・綴じ方は同じ。
+        let ple_wide = ple_batch && crate::model::exp_pf::ple_pipe();
         let mut ples_all: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(ranges.len());
         for &(start, end) in &ranges {
             let t_emb = prekprof::stamp();
@@ -5186,18 +5191,43 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 res_all.extend_from_slice(&r.data);
             }
             prekprof::mark(t_emb, prekprof::EMBED);
+            if !ple_wide {
+                let t_ple = prekprof::stamp();
+                let ples: Vec<Option<Vec<f32>>> = if ple_batch {
+                    self.gather_ple_many(&ctx[..end], start)?
+                } else {
+                    let mut v: Vec<Option<Vec<f32>>> = Vec::with_capacity(end - start);
+                    for i in start..end {
+                        v.push(self.gather_ple(&ctx[..=i])?);
+                    }
+                    v
+                };
+                prekprof::mark(t_ple, prekprof::PLE);
+                ples_all.push(ples);
+            }
+        }
+        if ple_wide {
+            // 専用プールの本数がそのまま同時に飛ぶ pread の数になる
+            // (`ple_par_parts` が `current_num_threads()` を上限 32 で見る)。
+            const PLE_PIPE_THREADS: usize = 32;
             let t_ple = prekprof::stamp();
-            let ples: Vec<Option<Vec<f32>>> = if ple_batch {
-                self.gather_ple_many(&ctx[..end], start)?
-            } else {
-                let mut v: Vec<Option<Vec<f32>>> = Vec::with_capacity(end - start);
-                for i in start..end {
-                    v.push(self.gather_ple(&ctx[..=i])?);
+            let rt = self.ple.as_ref().map(std::sync::Arc::clone);
+            let chunk_list: Vec<(usize, usize)> = ranges.to_vec();
+            let run = || -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+                let mut out: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(chunk_list.len());
+                for &(start, end) in &chunk_list {
+                    out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);
                 }
-                v
+                Ok(out)
             };
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(PLE_PIPE_THREADS)
+                .build()
+            {
+                Ok(p) => ples_all = p.install(run)?,
+                Err(_) => ples_all = run()?,
+            }
             prekprof::mark(t_ple, prekprof::PLE);
-            ples_all.push(ples);
         }
         // task 233: デバイス経路を諦めたときだけ要るホストの控え (普段は確保しない)。
         let mut mixed_buf: Option<PfHostBuf> = None;
