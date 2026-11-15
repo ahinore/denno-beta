@@ -598,11 +598,15 @@ pub const DEFAULT_STREAM_MIN_TOK: usize = 512;
 
 /// [`STREAM_GROUP_ENV`] の既定値 (1 回に上げる expert 数)。
 ///
-/// task 165: 32 → **64**。1 グループあたりの固定費 (3 本のポインタ表コピーと
-/// カーネル起動) が半分になる。ステージング 1 枚 (512 MiB / 3 = 170 MiB) に
-/// 64 本 (平均 2.05 MB/本で 131 MB) が載る。lab t165c: 14k cold は g32wc 96.81 s
-/// に対し g64wc 95.31 s。
-pub const DEFAULT_STREAM_GROUP: usize = 64;
+/// task 165: 32 → 64 (固定費の削減。lab t165c: 14k cold は g32 96.81 s に対し
+/// g64 95.31 s)。
+///
+/// task 324: **64 → 32**。カーネルの転送の裏への重なり (`DENNO_PF_UP_GPUWAIT`)
+/// が既定になると、残る露出は**層の入口の段差** (最初のグループの転送) になる。
+/// 段差はグループのバイト数に比例するので、g64 → g32 で半減する。lab t324b
+/// (3,826 cold、2 ラウンド): g64 2,605 / 2,607 → g32 2,532 / 2,532 ms (-2.8%)、
+/// 14k cold 6,641 → 6,517 (-1.9%)。`DENNO_PF_STREAM_GROUP=64` で切り戻せる。
+pub const DEFAULT_STREAM_GROUP: usize = 32;
 
 /// [`STREAM_PIN_ENV`] の既定値 (1 = pinned バウンス + 非同期)。
 pub const DEFAULT_STREAM_PIN: usize = 1;
@@ -688,6 +692,102 @@ pub fn up_decouple_from_value(v: Option<&str>) -> bool {
 pub fn up_decouple_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| up_decouple_from_value(std::env::var(UP_DECOUPLE_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_UP_GPUWAIT=1`: 計算スレッドがグループの H2D 完了を**ホストで待たず**、
+/// 計算ストリームに `cuStreamWaitEvent` として入れる (task 324、既定 off)。
+///
+/// # なぜ要るか (lab t320c の台帳、3,826 cold、既定 ut=1)
+///
+/// 転送は写しが床 (22.65 GB / 1.08 s = 21 GB/s、DDR 律速) で、MoE のカーネルは
+/// 同じ区間に 598 ms ある。ところが計算スレッドはグループごとに
+/// `cuEventSynchronize(ev_up)` で H2D の完了を待ってからカーネルを積むので、
+/// 待っているあいだ GPU は遊び、カーネルは転送の**後ろ**に直列に付く
+/// (wall 2,604 = gpu_busy 1,375 + exposed 1,228、うち `up_wait` 1,111)。
+///
+/// 待ちを GPU の後ろへ送ると、GPU は前のグループの転送完了で自分から走り出し、
+/// 計算スレッドは次の依頼を積み続けられる。壁時計は「転送」と「カーネル」の
+/// 大きいほう (推定 1.1 s) に近づく。
+///
+/// 依頼 (`PfUpJob`) の H2D は**積まれた後**でないと `cuStreamWaitEvent` が
+/// 古い記録を見るので、`ready` (ワーカーが ev_up を記録した) まではホストで待つ。
+pub const UP_GPUWAIT_ENV: &str = "DENNO_PF_UP_GPUWAIT";
+
+/// [`UP_GPUWAIT_ENV`] の既定値 (lab t324b で採ったので on)。
+///
+/// lab t324b (3,826 cold、2 ラウンド、t324b の `[q4ledger-pf]`): gpuwait + nosync +
+/// group 32 で 2,532 / 2,532 ms、旧既定 (off) は 2,607 / 2,609 ms = **-2.9%**。
+/// 14k cold は 6,517 対 6,655 = -2.1% (round 1 の 1 サンプル)。
+pub const DEFAULT_UP_GPUWAIT: bool = true;
+
+/// [`UP_GPUWAIT_ENV`] の解釈。未設定は [`DEFAULT_UP_GPUWAIT`]、
+/// `0` / `off` などは偽。
+pub fn up_gpuwait_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_UP_GPUWAIT,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// グループの H2D 完了を計算ストリームの待ちにするか (プロセスで 1 回だけ env を読む)。
+pub fn up_gpuwait_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| up_gpuwait_from_value(std::env::var(UP_GPUWAIT_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_STREAM_NOSYNC=1`: 層優先 MoE の出力がデバイスのままのとき、
+/// 層の終端で `cuCtxSynchronize` しない (task 324、既定 off)。
+///
+/// # なぜ要るか
+///
+/// 層の終端の同期は「最後のグループのカーネル + 累積」が終わるまでホストを
+/// 止める。その間 GPU は遊び、次の層の attention はその後でしか積まれない。
+/// 待たなくても、次の層のホスト側の書き込みは同期コピー (`cuMemcpyHtoD` /
+/// `cuMemcpyDtoH`) なので、既定ストリームの前の仕事を待つ = 順序は保たれる。
+/// 出力をホストへ戻す経路 (`PfStreamIo::Host`) は従来どおり待つ。
+pub const STREAM_NOSYNC_ENV: &str = "DENNO_PF_STREAM_NOSYNC";
+
+/// [`STREAM_NOSYNC_ENV`] の既定値 (gpuwait と一緒に lab t324b で採ったので on)。
+///
+/// 単独では効果なし (lab t324b の gwn 2,606 対 gw 2,611 ms) だが、採った形
+/// (gpuwait + nosync + group 32) の一部なので同じ既定にする。
+pub const DEFAULT_STREAM_NOSYNC: bool = true;
+
+/// [`STREAM_NOSYNC_ENV`] の解釈。未設定は [`DEFAULT_STREAM_NOSYNC`]。
+pub fn stream_nosync_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_STREAM_NOSYNC,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// 層の終端で同期しないか (プロセスで 1 回だけ env を読む)。
+pub fn stream_nosync_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| stream_nosync_from_value(std::env::var(STREAM_NOSYNC_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_STREAM_FIRST_G=<n>`: 層の**先頭グループ**の expert 数を n 本に絞る
+/// (task 324、既定 0 = 絞らない。`DENNO_PF_UP_GPUWAIT=1` のときだけ効く)。
+///
+/// 先頭グループの転送は、層の入口で GPU が遊ぶ時間そのもの (lab t324b:
+/// `experts` の exposed 849 ms のうち約 290 ms が 48 層ぶんの段差)。
+pub const STREAM_FIRST_G_ENV: &str = "DENNO_PF_STREAM_FIRST_G";
+
+/// [`STREAM_FIRST_G_ENV`] の解釈 (純関数)。読めない値・0 は「絞らない」。
+pub fn stream_first_group_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) if !s.is_empty() => s.parse::<usize>().map(|n| n.min(256)).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// 先頭グループの expert 数 (0 = 絞らない)。
+pub fn stream_first_group() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        stream_first_group_from_value(std::env::var(STREAM_FIRST_G_ENV).ok().as_deref())
+    })
 }
 
 /// [`STREAM_WC_ENV`] の既定値 (true = write-combined のバウンス)。
@@ -1622,6 +1722,51 @@ pub fn group_bounds(needs: &[usize], cap: usize, max_group: usize) -> Option<Vec
     Some(out)
 }
 
+/// task 324: 層の**先頭グループだけ** `first` 本に絞って切る。
+///
+/// 層の入口では、前の層の MoE が終わってからでないと次の層の計画 (router) が
+/// 立たないので、**最初のグループの転送がまるごと露出する** (lab t324b の
+/// `[q4ledger-pf] experts` の exposed 849 ms のうち、g64 で 1 層 6 ms 級 x 48 層
+/// = 約 290 ms が段差)。先頭だけ小さく切ると段差がその比で縮む。
+///
+/// `first == 0` か 1 グループしか作れないときは [`group_bounds`] と同じ結果になる
+/// (既定 off で従来と 1 バイトも変わらない)。担当は重複なし・取りこぼしなし。
+pub fn group_bounds_first(
+    needs: &[usize],
+    cap: usize,
+    max_group: usize,
+    first: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let max_group = max_group.max(1);
+    let first = first.clamp(0, max_group);
+    if first == 0 || needs.len() <= 1 {
+        return group_bounds(needs, cap, max_group);
+    }
+    if needs.is_empty() || cap == 0 || needs.iter().any(|&n| n > cap) {
+        // 既存の判定 (None / 空) に任せる。
+        return group_bounds(needs, cap, max_group);
+    }
+    let n = needs.len().min(first);
+    let mut sum = 0usize;
+    let mut end = 0usize;
+    for (i, &need) in needs.iter().enumerate().take(n) {
+        if i > 0 && sum + need > cap {
+            break;
+        }
+        sum += need;
+        end = i + 1;
+    }
+    if end == 0 {
+        return group_bounds(needs, cap, max_group);
+    }
+    let mut out: Vec<(usize, usize)> = vec![(0usize, end)];
+    if end < needs.len() {
+        let rest = group_bounds(&needs[end..], cap, max_group)?;
+        out.extend(rest.into_iter().map(|(a, b)| (a + end, b + end)));
+    }
+    Some(out)
+}
+
 /// task 242: グループ局所の g/u/act に要る行数 (グループの最大行数)。
 ///
 /// `seg` は 4 語 × segment (`[行数, 行の先頭, 0, 0]`)、`bounds` は
@@ -1758,6 +1903,10 @@ static STREAM_READY_NS: AtomicU64 = AtomicU64::new(0);
 static STREAM_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 /// task 233: スロット再利用前の「計算完了イベント」待ち (診断。今まで台帳に出ていなかった)。
 static STREAM_USE_NS: AtomicU64 = AtomicU64::new(0);
+/// task 324: H2D の完了を**計算ストリーム**に待たせたグループ数 (ゲートの発火の証拠)。
+static STREAM_GPUWAIT: AtomicU64 = AtomicU64::new(0);
+/// task 324: 層の終端で同期を省いた回数 (ゲートの発火の証拠)。
+static STREAM_NOSYNC: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
 static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 上げの回数 (グループ数)。
@@ -1861,6 +2010,16 @@ pub fn note_stream_group(
 /// task 233: スロット再利用前の計算完了待ちの時間を積む (診断)。
 pub fn note_stream_use_ns(ns: u64) {
     STREAM_USE_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// task 324: H2D の完了を計算ストリーム (`cuStreamWaitEvent`) に待たせた。
+pub fn note_stream_gpuwait() {
+    STREAM_GPUWAIT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// task 324: 層の終端で同期を省いた (デバイス出力のまま次へ渡した)。
+pub fn note_stream_nosync() {
+    STREAM_NOSYNC.fetch_add(1, Ordering::Relaxed);
 }
 
 /// task 162: ストリーミングで 1 層を GPU に載せた。
@@ -2017,7 +2176,7 @@ pub fn stats_line() -> Option<String> {
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} group={} min_tok={} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} gpuw={} nsync={} group={} min_tok={} \
              chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
@@ -2032,6 +2191,8 @@ pub fn stats_line() -> Option<String> {
             u8::from(stream_wc()),
             u8::from(stream_ut()),
             u8::from(up_decouple_on()),
+            STREAM_GPUWAIT.load(Ordering::Relaxed),
+            STREAM_NOSYNC.load(Ordering::Relaxed),
             stream_group(),
             stream_min_tok(),
             stream_chunk_bytes() >> 10,
@@ -2077,6 +2238,8 @@ pub fn stats_reset() {
         &STREAM_ENQ_NS,
         &STREAM_READY_NS,
         &STREAM_SLOT_NS,
+        &STREAM_GPUWAIT,
+        &STREAM_NOSYNC,
         &STREAM_ROWS,
         &STREAM_GROUPS,
         &STREAM_SPILL,
@@ -2770,6 +2933,46 @@ mod tests {
         assert!(group_bounds(&[10], 0, 8).is_none());
     }
 
+    /// task 324: 先頭だけ小さいグループに切る。担当は重複なし・取りこぼしなしで、
+    /// `first == 0` なら従来とまったく同じ。
+    #[test]
+    fn first_group_is_short_and_covers_everything() {
+        let needs = [100usize; 10];
+        // 絞らないときは従来と一致する。
+        assert_eq!(
+            group_bounds_first(&needs, 1000, 4, 0),
+            group_bounds(&needs, 1000, 4)
+        );
+        // 先頭は 1 本、残りは従来の切り方。
+        let g = group_bounds_first(&needs, 1000, 4, 1).expect("分けられる");
+        assert_eq!(g, vec![(0, 1), (1, 5), (5, 9), (9, 10)]);
+        // 先頭 2 本。
+        let g = group_bounds_first(&needs, 1000, 4, 2).expect("分けられる");
+        assert_eq!(g[0], (0, 2));
+        // 容量でも先頭は切られる。
+        let needs = [90usize, 90, 90, 90];
+        let g = group_bounds_first(&needs, 100, 4, 4).expect("1 本ずつ");
+        assert_eq!(g, vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
+        // 先頭の指定が上限 (max_group) を超えても本数上限は守る。
+        let g = group_bounds_first(&needs, 1000, 2, 9).expect("分けられる");
+        assert_eq!(Some(g), group_bounds(&needs, 1000, 2));
+        // 全範囲が被覆され、重複が無い。
+        let needs = [3usize, 1, 4, 1, 5, 9, 2, 6];
+        let g = group_bounds_first(&needs, 1000, 3, 2).expect("分けられる");
+        let mut seen = vec![0usize; needs.len()];
+        for &(a, b) in &g {
+            assert!(a < b && b <= needs.len());
+            for s in seen.iter_mut().take(b).skip(a) {
+                *s += 1;
+            }
+        }
+        assert!(seen.iter().all(|&c| c == 1), "重複か穴がある: {g:?}");
+        // 1 本で容量を超えるものは従来どおり `None`。
+        assert!(group_bounds_first(&[500, 10], 400, 8, 1).is_none());
+        assert!(group_bounds_first(&[], 400, 8, 1).is_none());
+        assert!(group_bounds_first(&[10], 0, 8, 1).is_none());
+    }
+
     /// task 162: ストリーミングのゲートは prefill ゲートの内側だけ。
     /// 床 (min_tok) は 19 トークンの next turn prefill を巻き込まない。
     #[test]
@@ -2809,6 +3012,33 @@ mod tests {
         assert!(!up_decouple_from_value(Some("")));
         assert!(up_decouple_from_value(Some("1")));
         assert!(up_decouple_from_value(Some("yes")));
+        // task 324: H2D の完了を計算ストリームに待たせるゲート (lab t324b で採った)。
+        assert_eq!(up_gpuwait_from_value(None), DEFAULT_UP_GPUWAIT);
+        assert_eq!(up_gpuwait_from_value(Some("")), DEFAULT_UP_GPUWAIT);
+        assert!(DEFAULT_UP_GPUWAIT, "採ったので既定 on");
+        assert!(!up_gpuwait_from_value(Some("0")), "明示的な 0 で切り戻せる");
+        assert!(!up_gpuwait_from_value(Some("off")));
+        assert!(up_gpuwait_from_value(Some("1")));
+        assert!(up_gpuwait_from_value(Some(" on ")), "前後の空白は無視する");
+        assert!(up_gpuwait_from_value(Some("yes")));
+        // task 324: 層の終端の同期を省くゲート (同じく既定 on、0 で切り戻す)。
+        assert_eq!(stream_nosync_from_value(None), DEFAULT_STREAM_NOSYNC);
+        assert_eq!(stream_nosync_from_value(Some("")), DEFAULT_STREAM_NOSYNC);
+        assert!(DEFAULT_STREAM_NOSYNC);
+        assert!(!stream_nosync_from_value(Some("0")));
+        assert!(!stream_nosync_from_value(Some("false")));
+        assert!(stream_nosync_from_value(Some("1")));
+        assert!(stream_nosync_from_value(Some(" true ")));
+        // グループ 1 個の本数は 32 (task 324 で 64 から)。切り戻しは env で。
+        assert_eq!(DEFAULT_STREAM_GROUP, 32);
+        // task 324: 先頭グループの本数 (0 = 絞らない。読めない値は 0)。
+        assert_eq!(stream_first_group_from_value(None), 0);
+        assert_eq!(stream_first_group_from_value(Some("")), 0);
+        assert_eq!(stream_first_group_from_value(Some("0")), 0);
+        assert_eq!(stream_first_group_from_value(Some("16")), 16);
+        assert_eq!(stream_first_group_from_value(Some(" 8 ")), 8);
+        assert_eq!(stream_first_group_from_value(Some("x")), 0);
+        assert_eq!(stream_first_group_from_value(Some("999")), 256, "上限 256");
         // task 165: write-combined のバウンスは明示的な真値だけ on。
         assert!(!stream_wc_from_value(false, Some("1")), "stream off なら動かない");
         assert_eq!(stream_wc_from_value(true, None), DEFAULT_STREAM_WC);
@@ -2868,7 +3098,9 @@ mod tests {
         // task 165 で決めた既定 (lab t165b/t165c の最良)。
         assert!(DEFAULT_STREAM_ON, "lab t165c で採用して既定 on");
         assert!(DEFAULT_STREAM_WC, "write-combined のバウンスが効いた");
-        assert_eq!(stream_group(), 64, "グループ 64 が最良");
+        // task 324: 32 (gpuwait の既定化で、残る露出は層の入口の段差 = グループの
+        // バイト数に比例するようになった。lab t324b で g64 2,605 → g32 2,532)。
+        assert_eq!(stream_group(), 32, "グループ 32 が最良");
         // task 239: 分割は既定 1 (従来の 1 回写し + 1 回 DMA)。
         assert_eq!(
             stream_split_from_value(None),

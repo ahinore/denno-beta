@@ -12194,6 +12194,35 @@ fn pf_wait_up_in(st: &mut PfStream, g: u64, pinned: bool) -> Result<u64> {
     Ok(t.elapsed().as_nanos() as u64)
 }
 
+/// グループ `g` の H2D 完了を**計算ストリームの待ち**として入れる (task 324)。
+///
+/// ホストはここで止まらない。カーネルは同じ (既定) ストリームに積むので、
+/// DMA が終わったグループから順に GPU が走る。ホストが待つのは
+/// [`pf_wait_ready`] (ワーカーが ev_up を記録したこと) だけになる。
+///
+/// `cuStreamWaitEvent` は**積まれた後**の記録を見るので、呼ぶ前に `ready` を
+/// 待っていないと 1 つ前の記録で満たされてしまう (データがまだ来ていないのに
+/// カーネルが走る)。
+fn pf_stream_wait_up_in(st: &mut PfStream, g: u64, pinned: bool) -> Result<()> {
+    if !pinned {
+        return Ok(());
+    }
+    let s = (g as usize) % PF_STAGE_SLOTS;
+    let Some(ev) = st.slot[s].ev_up.as_ref() else {
+        return Ok(());
+    };
+    let Some(sw) = lib()?.stream_wait_event else {
+        return Ok(());
+    };
+    unsafe {
+        check(
+            sw(std::ptr::null_mut(), ev.0, 0),
+            "cuStreamWaitEvent (stage up/計算)",
+        )?;
+    }
+    Ok(())
+}
+
 /// グループ `g` の計算を積んだ後に呼ぶ (スロットの再利用判定用)。
 fn pf_mark_used_in(st: &mut PfStream, g: u64, pinned: bool) {
     if !pinned {
@@ -12486,16 +12515,24 @@ fn pf_submit_group(
     })
 }
 
-/// グループ `g` の上げを待つ (ut 経路)。
+/// グループ `g` の依頼がワーカーに**積まれた**ことを待つ (task 324)。
 ///
-/// 戻り値は (写し ns, 積み込み ns, 順番待ち ns, H2D 待ち ns, スロット待ち ns)。
-fn pf_wait_group(g: u64) -> Result<(u64, u64, u64, u64, u64)> {
-    let ready_ns = PF_UP.with(|cell| -> Result<u64> {
+/// ワーカーが `ev_up` を記録するまでを待つ。写しと DMA の積み込みは済んでいて、
+/// DMA の完了はまだ待たない。戻り値は順番待ちの時間 (ns)。
+fn pf_wait_ready(g: u64) -> Result<u64> {
+    PF_UP.with(|cell| -> Result<u64> {
         match cell.borrow().as_ref() {
             Some(u) => u.wait_ready(g),
             None => bail!("上げスレッドが居ない"),
         }
-    })?;
+    })
+}
+
+/// グループ `g` の上げを待つ (ut 経路)。
+///
+/// 戻り値は (写し ns, 積み込み ns, 順番待ち ns, H2D 待ち ns, スロット待ち ns)。
+fn pf_wait_group(g: u64) -> Result<(u64, u64, u64, u64, u64)> {
+    let ready_ns = pf_wait_ready(g)?;
     let wait_ns = PF_STREAM.with(|cell| -> Result<u64> {
         let mut st = cell.borrow_mut();
         pf_wait_up_in(&mut st, g, true)
@@ -13378,6 +13415,15 @@ fn moe_experts_iq_pf_layer_stream_io(
         _ => return Ok(None),
     };
     let pinned = exp_pf::stream_pin() == 1;
+    // task 165: 上げ (写し + 積み込み) を専用スレッドへ出すか。
+    // 出さないときは task 162 と同じく、このスレッドで直列に写して積む。
+    // task 227: 転送元を mmap 直接 (page / reg) にするときは、上げ
+    // スレッドの経路が pinned のバウンス前提なので使わない。
+    // task 324: `gpuwait` は上の ut 経路の中で、グループの H2D 完了を
+    // ホストではなく計算ストリームに待たせる (`cuStreamWaitEvent`)。
+    // グループ分け (先頭を小さく切るか) にも効くので、ここで 1 回だけ決める。
+    let ut = pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
+    let gpuwait = ut && exp_pf::up_gpuwait_on();
     // task 233: 共有 expert の行 (末尾 `sh_rows` 行) も h に含める。
     let nh = (total_rows + sh_rows) * e;
     let host_x = host_in;
@@ -13564,7 +13610,14 @@ fn moe_experts_iq_pf_layer_stream_io(
             if slot_cap == 0 {
                 return Ok(None);
             }
-            let Some(bounds) = exp_pf::group_bounds(&needs, slot_cap, group) else {
+            // task 324: 先頭グループだけ小さく切る (層の入口の段差を縮める)。
+            // GPU 側で待つ経路のときだけ (既定 off では 0 = 従来と同じ切り方)。
+            let first_g = if gpuwait {
+                exp_pf::stream_first_group()
+            } else {
+                0
+            };
+            let Some(bounds) = exp_pf::group_bounds_first(&needs, slot_cap, group, first_g) else {
                 return Ok(None);
             };
             pf_host::mark(t_plan, pf_host::PLAN);
@@ -13634,11 +13687,6 @@ fn moe_experts_iq_pf_layer_stream_io(
             let pg_tab = sc.pg.as_ref().expect("確保済み");
             let pu_tab = sc.pu.as_ref().expect("確保済み");
             let pd_tab = sc.pd.as_ref().expect("確保済み");
-            // task 165: 上げ (写し + 積み込み) を専用スレッドへ出すか。
-            // 出さないときは task 162 と同じく、このスレッドで直列に写して積む。
-            // task 227: 転送元を mmap 直接 (page / reg) にするときは、上げ
-            // スレッドの経路が pinned のバウンス前提なので使わない。
-            let ut = pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
             // グループごとのミス (plan 順) と必要バイト。依頼を先に出せるよう先に作る。
             let items_of: Vec<Vec<(u16, [&[u8]; 3])>> = bounds
                 .iter()
@@ -13775,12 +13823,31 @@ fn moe_experts_iq_pf_layer_stream_io(
                 let t_wait2 = std::time::Instant::now();
                 if ut {
                     if !items.is_empty() {
-                        let (c, e, r, w, sl) = pf_wait_group(g)?;
-                        copy_ns = c;
-                        enq_ns = e;
-                        ready_ns = r;
-                        wait_ns = w;
-                        slot_ns = sl;
+                        if gpuwait {
+                            // task 324: ホストは「依頼が積まれた」ところまでで止め、
+                            // H2D の完了は計算ストリームに待たせる。カーネルは
+                            // 転送が終わったグループから GPU で走り出す。
+                            ready_ns = pf_wait_ready(g)?;
+                            PF_STREAM.with(|cell| -> Result<()> {
+                                let mut st = cell.borrow_mut();
+                                pf_stream_wait_up_in(&mut st, g, true)
+                            })?;
+                            exp_pf::note_stream_gpuwait();
+                            let (c, e, sl) = PF_UP.with(|cell| match cell.borrow().as_ref() {
+                                Some(u) => u.times(g),
+                                None => (0, 0, 0),
+                            });
+                            copy_ns = c;
+                            enq_ns = e;
+                            slot_ns = sl;
+                        } else {
+                            let (c, e, r, w, sl) = pf_wait_group(g)?;
+                            copy_ns = c;
+                            enq_ns = e;
+                            ready_ns = r;
+                            wait_ns = w;
+                            slot_ns = sl;
+                        }
                         if let Some((pb, pn)) =
                             PF_UP.with(|cell| cell.borrow().as_ref().and_then(|u| u.probe()))
                         {
@@ -13930,9 +13997,17 @@ fn moe_experts_iq_pf_layer_stream_io(
                 exp_pf::note_kernel_ns(t_k.elapsed().as_nanos() as u64);
                 // task 254: 累積カーネルの完了待ちと D2H を項目別に積む。
                 let t_sync = std::time::Instant::now();
-                ctx.sync()?;
-                exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
-                pf_host::add_ns(pf_host::SYNC, t_sync.elapsed().as_nanos() as u64);
+                // task 324: 出力が置き場 (デバイス) のままなら待たない。次の層の
+                // カーネルは同じストリームの後ろに積まれ、ホストが書く表は同期
+                // コピーが前のカーネルを待つので順序は保たれる。
+                let nosync = host_out.is_none() && exp_pf::stream_nosync_on();
+                if nosync {
+                    exp_pf::note_stream_nosync();
+                } else {
+                    ctx.sync()?;
+                    exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
+                    pf_host::add_ns(pf_host::SYNC, t_sync.elapsed().as_nanos() as u64);
+                }
                 if let (Some(b), Some(o)) = (oacc, host_out.as_mut()) {
                     let t_d2h = std::time::Instant::now();
                     b.to_slice(&mut o[..ntok * e])?;
