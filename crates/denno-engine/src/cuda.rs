@@ -13371,6 +13371,15 @@ fn moe_experts_iq_pf_layer_stream_io(
         _ => return Ok(None),
     };
     let pinned = exp_pf::stream_pin() == 1;
+    // task 165: 上げ (写し + 積み込み) を専用スレッドへ出すか。
+    // 出さないときは task 162 と同じく、このスレッドで直列に写して積む。
+    // task 227: 転送元を mmap 直接 (page / reg) にするときは、上げ
+    // スレッドの経路が pinned のバウンス前提なので使わない。
+    // task 324: `gpuwait` は上の ut 経路の中で、グループの H2D 完了を
+    // ホストではなく計算ストリームに待たせる (`cuStreamWaitEvent`)。
+    // グループ分け (先頭を小さく切るか) にも効くので、ここで 1 回だけ決める。
+    let ut = pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
+    let gpuwait = ut && exp_pf::up_gpuwait_on();
     // task 233: 共有 expert の行 (末尾 `sh_rows` 行) も h に含める。
     let nh = (total_rows + sh_rows) * e;
     let host_x = host_in;
@@ -13557,7 +13566,14 @@ fn moe_experts_iq_pf_layer_stream_io(
             if slot_cap == 0 {
                 return Ok(None);
             }
-            let Some(bounds) = exp_pf::group_bounds(&needs, slot_cap, group) else {
+            // task 324: 先頭グループだけ小さく切る (層の入口の段差を縮める)。
+            // GPU 側で待つ経路のときだけ (既定 off では 0 = 従来と同じ切り方)。
+            let first_g = if gpuwait {
+                exp_pf::stream_first_group()
+            } else {
+                0
+            };
+            let Some(bounds) = exp_pf::group_bounds_first(&needs, slot_cap, group, first_g) else {
                 return Ok(None);
             };
             pf_host::mark(t_plan, pf_host::PLAN);
@@ -13627,14 +13643,6 @@ fn moe_experts_iq_pf_layer_stream_io(
             let pg_tab = sc.pg.as_ref().expect("確保済み");
             let pu_tab = sc.pu.as_ref().expect("確保済み");
             let pd_tab = sc.pd.as_ref().expect("確保済み");
-            // task 165: 上げ (写し + 積み込み) を専用スレッドへ出すか。
-            // 出さないときは task 162 と同じく、このスレッドで直列に写して積む。
-            // task 227: 転送元を mmap 直接 (page / reg) にするときは、上げ
-            // スレッドの経路が pinned のバウンス前提なので使わない。
-            let ut = pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
-            // task 324: グループの H2D 完了をホストで待たず、計算ストリームに
-            // `cuStreamWaitEvent` として入れる (カーネルを転送の裏へ回す)。
-            let gpuwait = ut && exp_pf::up_gpuwait_on();
             // グループごとのミス (plan 順) と必要バイト。依頼を先に出せるよう先に作る。
             let items_of: Vec<Vec<(u16, [&[u8]; 3])>> = bounds
                 .iter()

@@ -10945,4 +10945,25 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
         !CUDA_RS.contains("let nosync = exp_pf::stream_nosync_on();"),
         "ホスト出力の経路まで同期を省いている"
     );
+    // task 324 (3): 先頭グループは GPU 側で待つ経路のときだけ小さく切る。
+    assert!(
+        EXP_PF_SRC.contains("pub const STREAM_FIRST_G_ENV: &str = \"DENNO_PF_STREAM_FIRST_G\";"),
+        "先頭グループの env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn group_bounds_first("),
+        "先頭だけ小さく切る関数が無い"
+    );
+    assert!(
+        CUDA_RS.contains("let first_g = if gpuwait {"),
+        "先頭グループの絞りが gpuwait の内側に無い"
+    );
+    assert!(
+        CUDA_RS.contains("exp_pf::group_bounds_first(&needs, slot_cap, group, first_g)"),
+        "グループ分けが新しい関数を通っていない"
+    );
+    assert!(
+        !CUDA_RS.contains("exp_pf::group_bounds(&needs, slot_cap, group)"),
+        "旧い呼び出しが残っている"
+    );
 }
