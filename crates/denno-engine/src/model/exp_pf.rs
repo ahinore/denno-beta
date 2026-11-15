@@ -1114,6 +1114,44 @@ pub fn stream_ut() -> bool {
     })
 }
 
+/// task 333: ストリーミングが門で落ちたとき、写しを計算スレッドへ落として
+/// **1 回だけ**やり直すか。
+///
+/// task 328 は 3 ラウンドとも層優先 dev MoE が `理由: stream` で落ちたが、
+/// どの門かは分からなかった。上げスレッド / 表の不整合で落ちたときに限り、
+/// 同じカーネル・同じ順序のまま転送の担い手だけを替えて再試行する。
+/// 既定 on (落ちた経路でしか走らないので、正常時の数値は変わらない)。
+pub const STREAM_RETRY_ENV: &str = "DENNO_PF_STREAM_RETRY";
+
+/// [`STREAM_RETRY_ENV`] の既定値。
+pub const DEFAULT_STREAM_RETRY: bool = true;
+
+/// [`STREAM_RETRY_ENV`] の解釈 (純関数)。`0` / `off` / `false` / `no` だけが偽。
+pub fn stream_retry_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_STREAM_RETRY,
+        Some(s) => !matches!(s, "0" | "off" | "false" | "no"),
+    }
+}
+
+/// 落ちた門の理由が、写しを計算スレッドへ落とす再試行で直りうるか (純関数)。
+///
+/// `no_upload` = 上げスレッドが居ない、`ptr_table` = 依頼したグループの
+/// デバイスポインタ表が合わない (直列経路はポインタ表を自分で組む)。
+/// `stage` (ステージングの確保) や `no_miss` (全 expert が常駐) は
+/// 転送の担い手を替えても直らないので再試行しない。
+pub fn stream_retry_pays(why: &str) -> bool {
+    matches!(why, "no_upload" | "ptr_table")
+}
+
+/// 再試行するか (プロセスで 1 回だけ env を読む)。
+pub fn stream_retry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        stream_retry_from_value(std::env::var(STREAM_RETRY_ENV).ok().as_deref())
+    })
+}
+
 /// `DENNO_PF_STREAM_WC` の解釈 (純関数)。**明示的な真値だけ on**。
 ///
 /// ストリーミング自体が無効なら常に偽。
@@ -2163,6 +2201,8 @@ static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 static SKIP_LAYERS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ストリーミングで GPU に載せた層の数。
 static STREAM_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// task 333: 上げスレッドを使わない写しでやり直した回数 (`DENNO_PF_STREAM_RETRY`)。
+static STREAM_RETRY: AtomicU64 = AtomicU64::new(0);
 /// task 261: 旧 4 型 (Q8_0 / Q5_1 / Q4_K / Q5_K) の prefill GPU 経路。
 /// `QUANT_PF_LAYERS` = GPU で回し切った層、`QUANT_PF_SKIPS` = 途中で諦めた層。
 static QUANT_PF_LAYERS: AtomicU64 = AtomicU64::new(0);
@@ -2308,6 +2348,11 @@ pub fn note_stream_nosync() {
 /// task 162: ストリーミングで 1 層を GPU に載せた。
 pub fn note_stream_layer() {
     STREAM_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// task 333: 上げスレッドを使わない写しで 1 回やり直した。
+pub fn note_stream_retry() {
+    STREAM_RETRY.fetch_add(1, Ordering::Relaxed);
 }
 
 /// task 162: CPU に残したミスの計算時間。
@@ -2460,7 +2505,7 @@ pub fn stats_line() -> Option<String> {
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
              probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} gpuw={} nsync={} group={} min_tok={} \
-             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x}",
+             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x} retry={}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -2485,6 +2530,7 @@ pub fn stats_line() -> Option<String> {
             REG_CALLS.load(Ordering::Relaxed),
             REG_NS.load(Ordering::Relaxed) as f64 / 1e9,
             REG_FLAGS.load(Ordering::Relaxed) as u32,
+            STREAM_RETRY.load(Ordering::Relaxed),
         ));
         // task 254: 表の非同期 H2D が発火したか (gate on の証拠)。
         #[cfg(feature = "cuda")]
@@ -2517,6 +2563,7 @@ pub fn stats_reset() {
         &UPLOAD_NS,
         &SKIP_LAYERS,
         &STREAM_LAYERS,
+        &STREAM_RETRY,
         &STREAM_EXPERTS,
         &STREAM_BYTES,
         &STREAM_WAIT_NS,
@@ -2647,6 +2694,53 @@ mod tests {
         assert_eq!(ra_groups_from_value(Some(" 3 ")), 3);
         assert_eq!(ra_groups_from_value(Some("999")), 64, "上限 64");
         assert_eq!(ra_groups_from_value(Some("x")), 0, "解析不能は既定");
+    }
+
+    /// task 333: `DENNO_PF_STREAM_RETRY` は既定 on、`0` 系だけが偽。
+    #[test]
+    fn stream_retry_gate_truth_table() {
+        assert!(stream_retry_from_value(None), "未設定は既定 (on)");
+        assert!(stream_retry_from_value(Some("")), "空も既定 (on)");
+        assert!(!stream_retry_from_value(Some("0")));
+        assert!(!stream_retry_from_value(Some("off")));
+        assert!(!stream_retry_from_value(Some("false")));
+        assert!(!stream_retry_from_value(Some("no")));
+        assert!(stream_retry_from_value(Some("1")));
+        assert!(stream_retry_from_value(Some(" on ")));
+        assert!(stream_retry_from_value(Some("x")), "解析不能は既定 (on)");
+    }
+
+    /// task 333: 再試行して意味がある門だけ true (転送の担い手を替えて直るもの)。
+    #[test]
+    fn retry_pays_only_for_the_transfer_guards() {
+        assert!(stream_retry_pays("no_upload"), "上げスレッドが居ない");
+        assert!(stream_retry_pays("ptr_table"), "ポインタ表の不整合");
+        for why in [
+            "stage",
+            "no_miss",
+            "dead",
+            "type",
+            "slot",
+            "ctx",
+            "kernels",
+            "accum",
+            "current",
+            "row_bytes",
+            "shape",
+            "bounds",
+            "group_rows",
+            "seg_local",
+            "args",
+            "entries",
+            "plan",
+            "row_table",
+            "shared_table",
+            "host_missing",
+            "no_bytes",
+            "",
+        ] {
+            assert!(!stream_retry_pays(why), "{why} は再試行しない");
+        }
     }
 
     /// task 325: `DENNO_PF_PREAD` は既定 on、`0` 系だけが偽。

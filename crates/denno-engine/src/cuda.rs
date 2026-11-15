@@ -13412,6 +13412,39 @@ pub enum PfStreamIo<'a> {
     },
 }
 
+// ---------------------------------------------------------------------------
+// task 333: ストリーミング経路が `Ok(None)` を返した理由 (診断)
+// ---------------------------------------------------------------------------
+//
+// 層優先 dev MoE が `理由: stream` で落ちたとき、どの門で落ちたのかがログに
+// 出ていなかった (task 328 は 3 ラウンドとも `理由: stream` だけで、
+// ステージングの確保なのか上げスレッドなのかを切り分けられなかった)。
+// 数値経路は変えず、層の処理と同じスレッドで理由だけを控える。
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static PF_STREAM_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// task 333: 直前のストリーミング試行が諦めた理由 (空 = 諦めていない)。
+#[cfg(feature = "cuda")]
+pub fn pf_stream_why() -> &'static str {
+    PF_STREAM_WHY.with(|c| c.get())
+}
+
+/// task 333: 理由を控える (空文字で消す)。診断専用。
+#[cfg(feature = "cuda")]
+pub fn pf_stream_why_set(why: &'static str) {
+    PF_STREAM_WHY.with(|c| c.set(why));
+}
+
+/// task 333: 理由を控えて `None` を返す。
+#[cfg(feature = "cuda")]
+fn pf_stream_skip(why: &'static str) -> Option<u32> {
+    pf_stream_why_set(why);
+    None
+}
+
 /// task 162: 1 層ぶんの expert FFN を、ミスをステージングへ上げながら回す。
 ///
 /// - ミスは `DENNO_PF_STREAM_GROUP` 本ずつのグループに切り、2 枚のステージングを
@@ -13440,6 +13473,7 @@ pub fn moe_experts_iq_pf_layer_stream(
     wrow: &[f32],
     group: usize,
     out: &mut [f32],
+    serial: bool,
 ) -> Result<Option<u32>> {
     moe_experts_iq_pf_layer_stream_io(
         ty_g,
@@ -13457,6 +13491,7 @@ pub fn moe_experts_iq_pf_layer_stream(
         wrow,
         group,
         PfStreamIo::Host { xs, out },
+        serial,
     )
 }
 
@@ -13484,6 +13519,7 @@ pub fn moe_experts_iq_pf_layer_stream_dev(
     sh: CUdeviceptr,
     sh_w: &[f32],
     out: CUdeviceptr,
+    serial: bool,
 ) -> Result<Option<u32>> {
     moe_experts_iq_pf_layer_stream_io(
         ty_g,
@@ -13506,6 +13542,7 @@ pub fn moe_experts_iq_pf_layer_stream_dev(
             sh,
             sh_w,
         },
+        serial,
     )
 }
 
@@ -13526,9 +13563,12 @@ fn moe_experts_iq_pf_layer_stream_io(
     wrow: &[f32],
     group: usize,
     mut io: PfStreamIo<'_>,
+    serial: bool,
 ) -> Result<Option<u32>> {
+    // task 333: この試行の理由を 0 から積む (前の層 / 前の試行の理由を残さない)。
+    pf_stream_why_set("");
     if PF_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(None);
+        return Ok(pf_stream_skip("dead"));
     }
     let nseg = entries.len();
     let total_rows = rows_gu.len();
@@ -13567,36 +13607,36 @@ fn moe_experts_iq_pf_layer_stream_io(
         || wrow.len() < ntok * k
         || (sh_rows > 0 && (sh_w.len() < ntok || dev_sh == 0))
     {
-        return Ok(None);
+        return Ok(pf_stream_skip("shape"));
     }
     let mut host_out = host_out;
     if !moe_gemv_iq_pf_ready(ty_g, n_in)
         || !moe_gemv_iq_pf_ready(ty_u, n_in)
         || !moe_gemv_iq_pf_ready(ty_d, ff)
     {
-        return Ok(None);
+        return Ok(pf_stream_skip("type"));
     }
     let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
         exp_pf::slot(ty_g),
         exp_pf::slot(ty_u),
         exp_pf::slot(ty_d),
     ) else {
-        return Ok(None);
+        return Ok(pf_stream_skip("slot"));
     };
     // task 309: K 系の層か。pinned バウンスの作り方 (`DENNO_PF_STREAM_WC` の
     // 既定) を型で変える (lab t309b: K 系は write-combined でないほうが速い)。
     PF_STREAM.with(|c| c.borrow_mut().k_mode = exp_pf::is_k_slot(slot_g));
     let Some(ctx) = shared_ctx() else {
-        return Ok(None);
+        return Ok(pf_stream_skip("ctx"));
     };
     let Some(kernels) = exp_pf_kernels() else {
-        return Ok(None);
+        return Ok(pf_stream_skip("kernels"));
     };
     let Some(accum) = kernels.accum else {
-        return Ok(None);
+        return Ok(pf_stream_skip("accum"));
     };
     if ctx.make_current().is_err() {
-        return Ok(None);
+        return Ok(pf_stream_skip("current"));
     }
     let (rb_g, rb_u, rb_d) = match (
         exp_pf::row_bytes(ty_g, n_in),
@@ -13604,7 +13644,7 @@ fn moe_experts_iq_pf_layer_stream_io(
         exp_pf::row_bytes(ty_d, ff),
     ) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
-        _ => return Ok(None),
+        _ => return Ok(pf_stream_skip("row_bytes")),
     };
     let pinned = exp_pf::stream_pin() == 1;
     // task 165: 上げ (写し + 積み込み) を専用スレッドへ出すか。
@@ -13614,7 +13654,9 @@ fn moe_experts_iq_pf_layer_stream_io(
     // task 324: `gpuwait` は上の ut 経路の中で、グループの H2D 完了を
     // ホストではなく計算ストリームに待たせる (`cuStreamWaitEvent`)。
     // グループ分け (先頭を小さく切るか) にも効くので、ここで 1 回だけ決める。
-    let ut = pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
+    // task 333: `serial` は「上げスレッドを使わず、このスレッドで写す」へ落とす
+    // 再試行用 (上げスレッドが居ない門で落ちたときの 1 回だけのやり直し)。
+    let ut = !serial && pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;
     let gpuwait = ut && exp_pf::up_gpuwait_on();
     // task 233: 共有 expert の行 (末尾 `sh_rows` 行) も h に含める。
     let nh = (total_rows + sh_rows) * e;
@@ -13697,7 +13739,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                     let Some((pr0, wr0)) = crate::model::exp_pf::row_table_with_shared(
                         prow, wrow, ntok, k, total_rows, sh_w,
                     ) else {
-                        return Ok(None);
+                        return Ok(pf_stream_skip("shared_table"));
                     };
                     pr = pr0;
                     wr = wr0;
@@ -13758,20 +13800,20 @@ fn moe_experts_iq_pf_layer_stream_io(
                     continue;
                 }
                 let Some(h) = en.host else {
-                    return Ok(None);
+                    return Ok(pf_stream_skip("host_missing"));
                 };
                 let need = h
                     .iter()
                     .map(|b| pf_stage_align_up(b.len()))
                     .sum::<usize>();
                 if need == 0 {
-                    return Ok(None);
+                    return Ok(pf_stream_skip("no_bytes"));
                 }
                 needs[i] = need;
                 miss_total += need;
             }
             if miss_total == 0 {
-                return Ok(None);
+                return Ok(pf_stream_skip("no_miss"));
             }
             let want_slot = miss_total.min((exp_pf::stream_bytes() / PF_STAGE_SLOTS).max(1 << 20));
             // 全枚を同じ容量で確保し、その実サイズでグループを切る
@@ -13800,7 +13842,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                 Ok(())
             })?;
             if slot_cap == 0 {
-                return Ok(None);
+                return Ok(pf_stream_skip("stage"));
             }
             // task 324: 先頭グループだけ小さく切る (層の入口の段差を縮める)。
             // GPU 側で待つ経路のときだけ (既定 off では 0 = 従来と同じ切り方)。
@@ -13810,7 +13852,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                 0
             };
             let Some(bounds) = exp_pf::group_bounds_first(&needs, slot_cap, group, first_g) else {
-                return Ok(None);
+                return Ok(pf_stream_skip("bounds"));
             };
             pf_host::mark(t_plan, pf_host::PLAN);
             // task 242: デバイス出力のときは g/u/act を**グループ局所**にする。
@@ -13840,7 +13882,7 @@ fn moe_experts_iq_pf_layer_stream_io(
             let rows_cap = if gl {
                 match exp_pf::max_group_rows(seg, &bounds) {
                     Some(r) => r,
-                    None => return Ok(None),
+                    None => return Ok(pf_stream_skip("group_rows")),
                 }
             } else {
                 total_rows
@@ -13864,7 +13906,7 @@ fn moe_experts_iq_pf_layer_stream_io(
             let seg_gl: Option<Vec<u32>> = if gl {
                 match exp_pf::seg_group_local(seg, &bounds) {
                     Some(v) => Some(v),
-                    None => return Ok(None),
+                    None => return Ok(pf_stream_skip("seg_local")),
                 }
             } else {
                 None
@@ -13952,7 +13994,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                     }
                     if !items.is_empty() && ready_ptrs[gi].is_none() {
                         // 上げスレッドが居ない → この層は従来経路へ。
-                        return Ok(None);
+                        return Ok(pf_stream_skip("no_upload"));
                     }
                 }
                 // (a) 上げ。ut 経路は依頼済み (待つのは (c))。
@@ -14002,7 +14044,7 @@ fn moe_experts_iq_pf_layer_stream_io(
                             ip += 1;
                         } else {
                             // 表が足りない = 内部の不整合。この層は従来経路へ。
-                            return Ok(None);
+                            return Ok(pf_stream_skip("ptr_table"));
                         }
                     }
                     // task 233: 同期 H2D は前のグループのカーネル / DMA を待つ。
@@ -14935,6 +14977,7 @@ mod pf_stream_tests {
             &wrow,
             32,
             &mut out,
+            false,
         )
         .expect("GPU 無しでもエラーにしない");
         assert!(r.is_none(), "GPU が無いのに起動した");
@@ -14957,6 +15000,7 @@ mod pf_stream_tests {
             &wrow,
             32,
             &mut out,
+            false,
         );
         assert!(r2.is_err() || r2.expect("shape").is_none());
     }
