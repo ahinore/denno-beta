@@ -11177,3 +11177,44 @@ fn t349_bg_warm_is_background_and_ordered() {
     // 6. 発火の台帳。
     assert!(sw.contains("[pf-bg-warm]"), "台帳の行が無い");
 }
+
+/// task 349: `DENNO_PF_PLE_PIPE` が「プロンプト全体の先読み」を 1 本の生産
+/// スレッドで流し、次の 1 チャンク先読みと**二重に走らない**こと。
+#[test]
+fn t349_ple_pipe_is_wired_and_does_not_double_read() {
+    assert!(
+        EXP_PF_SRC.contains("pub const PLE_PIPE_ENV: &str = \"DENNO_PF_PLE_PIPE\";"),
+        "ゲート名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const DEFAULT_PLE_PIPE: bool = false;"),
+        "既定が off でない"
+    );
+    // 生産スレッドはチャンク順に全部を流し、sync_channel で 1 個ずつ渡す。
+    assert!(
+        QWEN_SRC.contains("crate::model::exp_pf::ple_pipe()"),
+        "qwen4exp からゲートを読んでいない"
+    );
+    assert!(
+        QWEN_SRC.contains("std::sync::mpsc::sync_channel::<Result<Vec<Option<Vec<f32>>>>>(2)"),
+        "生産と消費の口が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("let mut s = 0usize;"),
+        "生産スレッドが先頭から流していない"
+    );
+    assert!(
+        QWEN_SRC.contains("rx.recv()"),
+        "消費者が受け取っていない"
+    );
+    // 二重読みしない: パイプが居るときは 1 チャンク先読みを起こさない。
+    assert!(
+        QWEN_SRC.contains("if ple_pre && ple_pipe_rx.is_none() && end < ctx.len() {"),
+        "1 チャンク先読みとパイプが同時に走る"
+    );
+    // 値は変えない: 同じ gather 関数を通る。
+    assert!(
+        QWEN_SRC.contains("gather_ple_many_rt(rt.as_deref(), &c[..e], s)"),
+        "パイプが gather 本体を通っていない"
+    );
+}

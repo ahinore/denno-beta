@@ -1785,6 +1785,34 @@ pub fn stream_pread() -> bool {
     *ON.get_or_init(|| stream_pread_from_value(std::env::var(STREAM_PREAD_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_PLE_PIPE`: task 349。プロンプト全体の PLE 行 gather を 1 本の
+/// 生産スレッドで先に流す (パイプライン)。
+///
+/// 既存の `DENNO_PF_PLE_PRE` は **次の 1 チャンク**しか先読みしない。冷えた
+/// page cache では 14k の gather が 2.7 s かかる (`ple.rs` の実測) のに、1 チャンクの
+/// 層ループは 0.46 s しかないので、隠れずに `other` へ出る (lab t349a の
+/// 14k cold: `other` 2,608 ms / 露出 2,334 ms、base は 830 ms)。
+///
+/// ここでは gather を 1 本のスレッドで **チャンク順に全部**作り、`sync_channel` で
+/// 1 チャンクずつ渡す。層ループ (GPU) の裏でディスクのランダム読みが進むので、
+/// 2.7 s のうち層ループに隠れる分が増える。並列度 (`DENNO_PLE_PAR`) も
+/// 表の置き場所 (RAM 常駐) も変えない。
+pub const PLE_PIPE_ENV: &str = "DENNO_PF_PLE_PIPE";
+
+/// [`PLE_PIPE_ENV`] の既定値 (off)。
+pub const DEFAULT_PLE_PIPE: bool = false;
+
+/// [`PLE_PIPE_ENV`] の解釈 (純関数)。`1` 系だけが真。
+pub fn ple_pipe_from_value(v: Option<&str>) -> bool {
+    stream_pread_from_value(v)
+}
+
+/// PLE のパイプライン先読みを使うか (プロセスで 1 回だけ env を読む)。
+pub fn ple_pipe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ple_pipe_from_value(std::env::var(PLE_PIPE_ENV).ok().as_deref()))
+}
+
 /// パート番号ごとの読み口 (pread 経路だけが使う)。
 ///
 /// モデルの構築時に 1 回だけ開く。開けなかったパートは `None` で、その
@@ -2964,6 +2992,18 @@ mod tests {
         assert!(stream_pread_from_value(Some("on")));
         assert!(stream_pread_from_value(Some("TRUE")));
         assert!(stream_pread_from_value(Some(" yes ")));
+    }
+
+    /// task 349: `DENNO_PF_PLE_PIPE` は既定 off、`1` 系だけが真。
+    #[test]
+    fn ple_pipe_gate_truth_table() {
+        assert!(!ple_pipe_from_value(None));
+        assert!(!ple_pipe_from_value(Some("0")));
+        assert!(!ple_pipe_from_value(Some("off")));
+        assert!(ple_pipe_from_value(Some("1")));
+        assert!(ple_pipe_from_value(Some("on")));
+        assert_eq!(PLE_PIPE_ENV, "DENNO_PF_PLE_PIPE");
+        assert!(!DEFAULT_PLE_PIPE);
     }
 
     /// task 325: `DENNO_PF_PREAD_THREADS` の丸めと既定 (0 = 共有プール)。
