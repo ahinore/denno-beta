@@ -288,17 +288,29 @@ pub fn d2h_stream_reset() {
 // ホストへ直接書くので、D2H も、その完了待ちも要らない。値は同じ (同じカーネル・
 // 同じ式・同じ並び)。ストリームの同期は従来どおり 1 回で、その後ホストが
 // バッファを読む (カーネル完了 = 書き込みが見える)。
+//
+// lab t356b (2 ラウンド、交互、4 COND) の実測:
+// - `[dec-exp-kprof]` の 1 層あたり: base = gate 23.2 / up 4.2 / silu 4.9 /
+//   down 15.4 / d2h 10.0 / sum 5.2 (計 62.9) -> 本ゲート = d2h 1.3 / sum 7.2
+//   (計 56.8)。**d2h -8.7 us の代わりに sum +2.0 us** (ホストへの 10 KB 書き) で
+//   正味 -5.4〜-6.0 us/層。
+// - `[q4ledger] experts` (ms/tok、同じ request 同士の比較):
+//   28 tok 窓 base 3.41/3.48・base2 3.46/3.44 -> **3.23/3.20 (-6.7%)**、
+//   3929 tok 窓 4.36/4.19・4.21/4.19 -> 4.03/3.99 (-5.4%)、
+//   3826 tok 窓 5.39/4.85・4.86/4.87 -> 4.63/4.69 (-4.2%)。
+//   2 ラウンドとも同じ向き。md5 は全 COND SAME、errors 0。
+// - decode 中央値は 16.8 (base/base2) -> 16.7 (本ゲート) で、段の -6.7% が
+//   トークンでは -1.4% 相当 (きれいな窓の step 13.80 -> 13.61)。
 pub const SUM_ZC_ENV: &str = "DENNO_DEC_EXP_SUM_ZC";
 
-/// [`SUM_ZC_ENV`] の解釈 (純関数)。**既定 off**。
+/// [`SUM_ZC_ENV`] の解釈 (純関数)。**既定 on** (lab t356b で採否 yes)。
+///
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
 pub fn sum_zc_from_value(v: Option<&str>) -> bool {
-    match v.map(str::trim) {
-        Some(s) => matches!(
-            s.to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
-        ),
-        None => false,
-    }
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
 }
 
 /// ゲートが有効か (プロセスで 1 回だけ env を読む)。
@@ -989,15 +1001,16 @@ mod tests {
         assert!(d2h_stream_line_with(true).is_none(), "0 に戻したら行を出さない");
     }
 
-    /// task 356: `DENNO_DEC_EXP_SUM_ZC` は**既定 off**で、明示的な真値だけ on。
+    /// task 356: `DENNO_DEC_EXP_SUM_ZC` は**既定 on** (lab t356b で採否 yes)。
+    /// 明示的な偽値だけ切る (lab の COND は `VAR=value` をそのまま env にする)。
     #[test]
-    fn sum_zc_gate_defaults_off() {
-        assert!(!sum_zc_from_value(None), "未設定は off");
-        for v in ["", "0", "off", "false", "no", "2", "abc"] {
+    fn sum_zc_gate_defaults_on() {
+        assert!(sum_zc_from_value(None), "未設定は on");
+        for v in ["0", "off", "false", "no", " OFF ", "False"] {
             assert!(!sum_zc_from_value(Some(v)), "{v:?} は off");
         }
-        for v in ["1", "on", "true", "yes", " ON ", "True"] {
-            assert!(sum_zc_from_value(Some(v)), "{v:?} は on");
+        for v in ["", "1", "on", "true", "yes", "2", "abc"] {
+            assert!(sum_zc_from_value(Some(v)), "{v:?} は on (偽値だけ切る)");
         }
     }
 
