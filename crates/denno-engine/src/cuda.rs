@@ -25283,6 +25283,7 @@ pub fn router_in_mix_token_start() {
 ///
 /// [`router_in_mix_enqueue`] と同じ条件を読むだけの判定。qchain の入口で
 /// 「載せにいく」回数を数えるのと、診断に使う。
+#[cfg(test)]
 fn router_in_mix_armed_for(k: usize) -> bool {
     ROUTER_ARM.with(|c| {
         c.borrow().as_ref().is_some_and(|job| {
@@ -42493,6 +42494,71 @@ mod tests {
         let bytes = vec![0u8; k * n * 4];
         assert!(!router_in_mix_arm(77, &bytes, k, n), "ゲート off で控えを積んだ");
         assert!(!router_in_mix_armed_for(k), "ゲート off なのに拾える状態");
+        router_in_mix_set_for_test(None);
+        router_in_mix_token_start();
+    }
+
+    /// task 364: qchain の入口が「ルータを載せにいく」分岐に実際に入ること
+    /// (GPU 無しでも数えられる。`cuda_enabled()` の判定より前に数えている)。
+    #[test]
+    fn qchain_counts_router_arm_attempts_without_gpu() {
+        router_in_mix_set_for_test(Some(true));
+        router_in_mix_token_start();
+        router_in_qchain_arms_reset();
+        let (k1, n1, e, hc) = (8usize, 2usize, 4usize, 2usize);
+        let bytes = vec![0u8; k1 * n1 * 4];
+        assert!(router_in_mix_arm(91, &bytes, k1, n1));
+        let xn = [0f32; 8];
+        let mut out = [0f32; 4];
+        let ran = maybe_gpu_mix_q_chain_into(
+            91,
+            crate::kquant::GgmlType::Q8_0,
+            &bytes,
+            k1,
+            n1,
+            92,
+            crate::kquant::GgmlType::Q8_0,
+            &bytes,
+            n1,
+            k1,
+            1.0 / hc as f32,
+            e,
+            hc,
+            &xn,
+            &mut out,
+            None,
+        );
+        assert!(!ran, "CUDA 無しで mix の鎖が走った");
+        assert_eq!(
+            router_in_qchain_arms(),
+            1,
+            "qchain がルータの控えを見にいっていない"
+        );
+        // ゲート off では 1 回も見にいかない。控えは on のうちに落としておく
+        // (`router_in_mix_token_start` はゲート off だと早期に返るため)。
+        router_in_qchain_arms_reset();
+        router_in_mix_token_start();
+        router_in_mix_set_for_test(Some(false));
+        assert!(!router_in_mix_arm(91, &bytes, k1, n1));
+        let _ = maybe_gpu_mix_q_chain_into(
+            91,
+            crate::kquant::GgmlType::Q8_0,
+            &bytes,
+            k1,
+            n1,
+            92,
+            crate::kquant::GgmlType::Q8_0,
+            &bytes,
+            n1,
+            k1,
+            1.0 / hc as f32,
+            e,
+            hc,
+            &xn,
+            &mut out,
+            None,
+        );
+        assert_eq!(router_in_qchain_arms(), 0, "ゲート off なのに数えた");
         router_in_mix_set_for_test(None);
         router_in_mix_token_start();
     }

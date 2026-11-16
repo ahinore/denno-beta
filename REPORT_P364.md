@@ -95,10 +95,12 @@ qchain を通り、ルータは鎖の外 (H2D 10 KB + 起動 + D2H + 同期 48 �
   `router_in_mix_arm` の入口で効くので、**`=0` が int-auto の挙動そのもの**になる
   (控えが積まれない → qchain 側も何も積まない)。既定の変更は無い。
 - 診断: `[mix-qchain]` の行に `rtr=<積んだ回数>` を足した (0 なら載っていない)。
-- テスト: `router_in_mix_on` にテスト用の強制 (`router_in_mix_set_for_test`) と、
-  「qchain が控えを拾う条件 (形・層・token の入口で落ちる)」を固定する 2 本
-  (`qchain_picks_up_router_arm_by_shape_and_layer` /
-  `qchain_router_arm_respects_gate_off`)。GPU 無しでも分岐の意図は数えられる。
+- テスト: `router_in_mix_on` にテスト用の強制 (`router_in_mix_set_for_test`) を足し、
+  3 本を固定した (すべて GPU 不要):
+  `qchain_picks_up_router_arm_by_shape_and_layer` (形・層・token の入口での失効)、
+  `qchain_router_arm_respects_gate_off`、`qchain_counts_router_arm_attempts_without_gpu`
+  (`cuda_enabled()` の判定より前に置いた入口カウンタで、**分岐に実際に入った回数**を
+  on で 1 / off で 0 と数える = 緑が「配線が生きている証拠」になる)。
 
 ## 4. lab の結果
 
@@ -173,13 +175,17 @@ VERDICT off2 vs off OK decode -2.0% prefill +0.0% md5 SAME errors 0
 
 ```text
 cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1
-  -> 1251 passed; 0 failed; 103 ignored
+  -> 1252 passed; 0 failed; 103 ignored
 cargo test --release -p denno-engine --features cuda --test kernel_invariants
   -> 108 passed; 0 failed
 ```
 
-`CARGO_TARGET_DIR=/tmp/t364`。merge 前 (`f3f9aa7f7`) と merge 後 (`c28266028`) の
-両方で実行し、どちらも緑。足したテストは §3 の 2 本 (GPU 不要)。
+`CARGO_TARGET_DIR=/tmp/t364`。merge 前 (`f3f9aa7f7`、テスト 2 本のとき) は
+1246 / 107、merge 後 (`5be76040d`、テスト 3 本) は 1252 / 108 で、どちらも緑
+(増えたぶんは br369 のテストとこのタスクのテスト)。足したテストは §3 の 3 本
+(GPU 不要)。最終 HEAD と計測した `5be76040d` の差は **`#[cfg(test)]` と
+テスト 1 本とこの REPORT だけ** (実バイナリの挙動は同一)。
+
 既知の赤 (`qwen4exp_decode spec_batch_stops_at_eos` / `qwen4exp_params` の
 validate 2 件) はこのタスクの対象外で、`--lib` の緑には影響していない。
 
