@@ -538,8 +538,9 @@ fn bump_par_calls() {
 /// 従来の逐次和のまま = ビット不変。
 pub const HC_NORM_QUAD_ENV: &str = "DENNO_HC_NORM_QUAD";
 
-/// 既定 (採否は lab t368x で決める。採用したら true にして既定 on にする)。
-pub const HC_NORM_QUAD_DEFAULT: bool = false;
+/// 既定。**lab t368a/t368b (2 ラウンド) で採否 yes**: `mix` 段 4.67 -> 4.39 ms/tok
+/// (-6.0%)、短い decode 16.6 -> 16.4 (2 ラウンドとも同じ)。md5 は全 COND SAME。
+pub const HC_NORM_QUAD_DEFAULT: bool = true;
 
 /// [`HC_NORM_QUAD_ENV`] の解釈 (純関数)。
 pub fn hc_norm_quad_from_value(v: Option<&str>) -> bool {
@@ -1240,12 +1241,20 @@ mod tests {
     /// task 368: `DENNO_HC_NORM_QUAD` の解釈 (既定 off、明示的な真偽だけ)。
     #[test]
     fn hc_norm_quad_gate_reads_only_explicit_values() {
-        assert!(!hc_norm_quad_from_value(None), "既定は off");
+        assert_eq!(hc_norm_quad_from_value(None), HC_NORM_QUAD_DEFAULT, "未設定は既定");
         for v in ["1", "on", "ON", " true ", "yes"] {
             assert!(hc_norm_quad_from_value(Some(v)), "{v} を on と読んでいない");
         }
-        for v in ["0", "off", "False", "no", "", "2", "maybe"] {
+        for v in ["0", "off", "False", "no"] {
             assert!(!hc_norm_quad_from_value(Some(v)), "{v} を off と読んでいない");
+        }
+        // 壊れた値・空文字は既定へ倒す (明示的な真偽だけを受け付ける)。
+        for v in ["", "2", "maybe"] {
+            assert_eq!(
+                hc_norm_quad_from_value(Some(v)),
+                HC_NORM_QUAD_DEFAULT,
+                "{v} が既定へ倒れていない"
+            );
         }
     }
 

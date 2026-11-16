@@ -26781,6 +26781,11 @@ mod tests {
             };
 
             let par_before = par_calls();
+            // task 368: decode (`nt == 1`) の mix norm は `DENNO_HC_NORM_QUAD` (既定 on)
+            // で **4 本アキュムレータの二乗和**になる。意図した丸め変更なので、
+            // 「逐次版とバッチ版がビット一致する」この契約は**ゲート off の経路**で
+            // 検査する (on のときの差は数 ulp。decode の出力は lab で md5 SAME)。
+            hyper::hc_norm_quad_set_for_test(Some(false));
             for &nt in &[1usize, 3, 64] {
                 let ress = make(nt);
 
@@ -26870,6 +26875,8 @@ mod tests {
             );
             #[cfg(not(feature = "par"))]
             assert_eq!(par_calls(), par_before, "par off なのに並列カウンタが増えた");
+            // task 368: 強制を戻す (--test-threads=1 ではスレッドを跨ぐ)。
+            hyper::hc_norm_quad_set_for_test(None);
         }
 
         /// バッチ版が rayon 経路に入った回数 (テスト用カウンタ)。

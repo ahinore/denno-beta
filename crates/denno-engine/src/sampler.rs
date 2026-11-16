@@ -248,8 +248,9 @@ pub struct Sampler {
 /// NaN は無視 (どちらも `>` が偽になるため) という規則がそのまま残る。
 pub const ARGMAX_FAST_ENV: &str = "DENNO_ARGMAX_FAST";
 
-/// 既定 (採否は lab で決める)。
-pub const ARGMAX_FAST_DEFAULT: bool = false;
+/// 既定。**lab t368b で採否 yes**: 短い decode 16.6 -> 16.5 (単独) / qd と重ねて
+/// 16.2 (-2.4%)。手元実測 110.5 -> 11.9 us/token。md5 は全 COND SAME。
+pub const ARGMAX_FAST_DEFAULT: bool = true;
 
 /// [`ARGMAX_FAST_ENV`] の解釈 (純関数)。
 pub fn argmax_fast_from_value(v: Option<&str>) -> bool {
@@ -1227,12 +1228,19 @@ mod tests {
     /// 入ること (off では 0 回)。
     #[test]
     fn argmax_fast_gate_switches_the_greedy_path() {
-        assert!(!argmax_fast_from_value(None), "既定は off");
+        assert_eq!(argmax_fast_from_value(None), ARGMAX_FAST_DEFAULT, "未設定は既定");
         for v in ["1", "on", "ON", " true ", "yes"] {
             assert!(argmax_fast_from_value(Some(v)), "{v} を on と読んでいない");
         }
-        for v in ["0", "off", "False", "no", "", "2"] {
+        for v in ["0", "off", "False", "no"] {
             assert!(!argmax_fast_from_value(Some(v)), "{v} を off と読んでいない");
+        }
+        for v in ["", "2"] {
+            assert_eq!(
+                argmax_fast_from_value(Some(v)),
+                ARGMAX_FAST_DEFAULT,
+                "{v} が既定へ倒れていない"
+            );
         }
         let logits: Vec<f32> = (0..64).map(|i| ((i * 11) % 17) as f32 * 0.25 - 2.0).collect();
         let want = {
