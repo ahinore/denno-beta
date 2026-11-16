@@ -524,6 +524,87 @@ fn bump_par_calls() {
     HC_BATCH_PAR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ---- task 368: decode の mix norm を 4 本アキュムレータで足す --------------------
+
+/// task 368: `DENNO_HC_NORM_QUAD` — decode (`nt == 1`) の RMS の二乗和を
+/// **4 本のアキュムレータ**で足す (既定 on。lab t368a/t368b で採否 yes、`=0` で戻せる)。
+///
+/// 逐次和 (`src.iter().map(|v| v * v).sum::<f32>()`) は `n_embd` 要素の依存の鎖で、
+/// 実測 (このコンテナの Ryzen 8700G、hc=4 / n_embd=2560) では 1 群 0.95 us・
+/// `grouped_rms_norm_batch_into` 1 回 **4.24 us**。4 本に分けると 1 回 1.38 us に
+/// なる (差 2.86 us x 97 回/token = 0.28 ms/token の見積り)。
+///
+/// **丸め順が変わる** (二乗和が数 ulp 動く)。採否は lab で yes なので既定 on
+/// (`=0` で逐次和に戻る)。prefill (`nt > 1`) は
+/// 従来の逐次和のまま = ビット不変。
+pub const HC_NORM_QUAD_ENV: &str = "DENNO_HC_NORM_QUAD";
+
+/// 既定。**lab t368a/t368b (2 ラウンド) で採否 yes**: `mix` 段 4.67 -> 4.39 ms/tok
+/// (-6.0%)、短い decode 16.6 -> 16.4 (2 ラウンドとも同じ)。md5 は全 COND SAME。
+pub const HC_NORM_QUAD_DEFAULT: bool = true;
+
+/// [`HC_NORM_QUAD_ENV`] の解釈 (純関数)。
+pub fn hc_norm_quad_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "on" | "true" | "yes") => true,
+        Some("0" | "off" | "false" | "no") => false,
+        _ => HC_NORM_QUAD_DEFAULT,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// テストが env を立てずに on/off を強制する。
+    static NORM_QUAD_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// テストが env を立てずに on/off を強制する (`None` で env の解釈へ戻る)。
+#[cfg(test)]
+pub(crate) fn hc_norm_quad_set_for_test(v: Option<bool>) {
+    NORM_QUAD_FORCE.with(|c| c.set(v));
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn hc_norm_quad_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = NORM_QUAD_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| hc_norm_quad_from_value(std::env::var(HC_NORM_QUAD_ENV).ok().as_deref()))
+}
+
+/// 4 本アキュムレータの二乗和 (**逐次和と丸め順が違う**)。
+///
+/// 4 要素ずつ読み、最後に `(a0 + a1) + (a2 + a3)` で閉じる。要素数が 4 で
+/// 割り切れないときの端数は `a0` に足す (逐次和と同じ順)。
+#[inline]
+fn sq_sum_quad(src: &[f32]) -> f32 {
+    let mut a = [0.0f32; 4];
+    let mut it = src.chunks_exact(4);
+    for c in &mut it {
+        a[0] += c[0] * c[0];
+        a[1] += c[1] * c[1];
+        a[2] += c[2] * c[2];
+        a[3] += c[3] * c[3];
+    }
+    for v in it.remainder() {
+        a[0] += v * v;
+    }
+    (a[0] + a[1]) + (a[2] + a[3])
+}
+
+/// テスト用: 4 本アキュムレータの経路に入った回数 (「緑 = 発動」ではないので数える)。
+#[cfg(test)]
+pub(crate) static HC_NORM_QUAD_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn bump_quad_calls() {
+    #[cfg(test)]
+    HC_NORM_QUAD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// [`grouped_rms_norm_batch`] の in-place 版。`out` は `[nt][hc][n_embd]` の連結。
 ///
 /// 作業域を呼び出し側が持てるようにしてある。実形 (nt=512 / hc_dim=10240) では
@@ -554,12 +635,25 @@ pub fn grouped_rms_norm_batch_into(
         );
     }
 
+    // task 368: 4 本アキュムレータの二乗和は **decode (nt == 1) だけ**。
+    // prefill (nt > 1) は従来の逐次和のまま = ビット不変。
+    let quad = xs.len() == 1 && hc_norm_quad_enabled();
+    if quad {
+        bump_quad_calls();
+    }
+
     let fill = |row: &mut [f32], x: &HyperStreams| {
         for s in 0..hc {
             let src = &x.data[s * e..(s + 1) * e];
             let gamma = &w_norm[s * e..(s + 1) * e];
-            // `crate::tensor::rmsnorm` と同じ丸め順 (逐次二乗和 → rsqrt → x*inv*w)
-            let ss = src.iter().map(|v| v * v).sum::<f32>() / e as f32;
+            // `crate::tensor::rmsnorm` と同じ丸め順 (逐次二乗和 → rsqrt → x*inv*w)。
+            // task 368: decode (`nt == 1`) だけ 4 本アキュムレータの和に替えられる
+            // (`DENNO_HC_NORM_QUAD`、既定 on。`=0` で逐次和のまま)。丸め順が変わる。
+            let ss = if quad {
+                sq_sum_quad(src)
+            } else {
+                src.iter().map(|v| v * v).sum::<f32>()
+            } / e as f32;
             let inv = 1.0 / (ss + p.eps).sqrt();
             let dst = &mut row[s * e..(s + 1) * e];
             // 添字アクセス (`dst[i]`/`src[i]`/`gamma[i]`) だと 3 本の境界チェックが
@@ -1142,6 +1236,119 @@ mod tests {
     /// GEMV (down/up) は [`crate::model::qwen4exp::gemv_batch`] ではなく
     /// `tests/hc_mix_bench.rs` (`hc_mix_gemv_bf16_shape_scaling`) の実形計測を
     /// 使う (本ベンチは要素演算の配分だけを見る)。
+    ///
+    /// ---
+    ///
+    /// task 368: `DENNO_HC_NORM_QUAD` の解釈 (既定 on、明示的な真偽だけ)。
+    #[test]
+    fn hc_norm_quad_gate_reads_only_explicit_values() {
+        assert_eq!(hc_norm_quad_from_value(None), HC_NORM_QUAD_DEFAULT, "未設定は既定");
+        for v in ["1", "on", "ON", " true ", "yes"] {
+            assert!(hc_norm_quad_from_value(Some(v)), "{v} を on と読んでいない");
+        }
+        for v in ["0", "off", "False", "no"] {
+            assert!(!hc_norm_quad_from_value(Some(v)), "{v} を off と読んでいない");
+        }
+        // 壊れた値・空文字は既定へ倒す (明示的な真偽だけを受け付ける)。
+        for v in ["", "2", "maybe"] {
+            assert_eq!(
+                hc_norm_quad_from_value(Some(v)),
+                HC_NORM_QUAD_DEFAULT,
+                "{v} が既定へ倒れていない"
+            );
+        }
+    }
+
+    /// task 368: 4 本アキュムレータの和は逐次和と数 ulp しか違わない
+    /// (丸め順は変わるが、値の意味は同じ)。
+    #[test]
+    fn sq_sum_quad_is_close_to_serial_sum() {
+        let src: Vec<f32> = (0..2560)
+            .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.013)
+            .collect();
+        let serial = src.iter().map(|v| v * v).sum::<f32>();
+        let quad = sq_sum_quad(&src);
+        let truth: f64 = src.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let rel = |v: f32| ((v as f64) - truth).abs() / truth;
+        // 基準は「絶対 1e-4 + 相対 1e-5」(丸め順が違うだけなので同じ帯に入る)。
+        assert!(rel(quad) < 1e-5, "quad の相対誤差 {} が大きい", rel(quad));
+        assert!(rel(serial) < 1e-5, "serial の相対誤差 {} が大きい", rel(serial));
+        // 4 本版は逐次版より真値に近い (要素数が同じなら丸め誤差は増えない)。
+        assert!(
+            rel(quad) <= rel(serial) * 2.0,
+            "quad {} が serial {} より大きく外れた",
+            rel(quad),
+            rel(serial)
+        );
+        // 端数 (4 で割り切れない長さ) でも壊れない。
+        let odd = &src[..2559];
+        let q = sq_sum_quad(odd);
+        let t: f64 = odd.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        assert!((((q as f64) - t) / t).abs() < 1e-6, "端数で誤差が大きい");
+        // 決定的 (同じ入力で同じ値)。
+        assert_eq!(quad.to_bits(), sq_sum_quad(&src).to_bits());
+    }
+
+    /// task 368: 4 本アキュムレータの分岐は **decode (nt == 1) でだけ**発火する。
+    /// (prefill は逐次和のまま = ビット不変であることも同時に固定する。)
+    #[test]
+    fn hc_norm_quad_branch_fires_only_for_single_token() {
+        let hp = HyperParams {
+            hc: 2,
+            n_embd: 8,
+            low_rank: 2,
+            eps: 1e-6,
+        };
+        let hc_dim = hp.hc * hp.n_embd;
+        let mk = |t: usize| HyperStreams {
+            data: (0..hc_dim)
+                .map(|i| (((i * 7 + t) % 13) as f32 - 6.0) * 0.1)
+                .collect(),
+            hc: hp.hc,
+            n_embd: hp.n_embd,
+        };
+        let norm: Vec<f32> = (0..hc_dim).map(|i| 0.9 + (i % 5) as f32 * 0.02).collect();
+        let one = [mk(0)];
+        let two = [mk(0), mk(1)];
+        let mut out1 = vec![0.0f32; hc_dim];
+        let mut out2 = vec![0.0f32; 2 * hc_dim];
+
+        // off: 1 回も数えない。
+        hc_norm_quad_set_for_test(Some(false));
+        HC_NORM_QUAD_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        grouped_rms_norm_batch_into(&one, &norm, &mut out1, &hp);
+        assert_eq!(
+            HC_NORM_QUAD_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "ゲート off で 4 本経路に入った"
+        );
+        let serial_out = out1.clone();
+
+        // on: nt == 1 で 1 回。prefill (nt == 2) では数えない。
+        hc_norm_quad_set_for_test(Some(true));
+        HC_NORM_QUAD_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        grouped_rms_norm_batch_into(&two, &norm, &mut out2, &hp);
+        assert_eq!(
+            HC_NORM_QUAD_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "prefill (nt=2) で 4 本経路に入った"
+        );
+        grouped_rms_norm_batch_into(&one, &norm, &mut out1, &hp);
+        assert_eq!(
+            HC_NORM_QUAD_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "decode (nt=1) で 4 本経路に入っていない"
+        );
+        // 値は「ほぼ同じ」(丸め順が違うのでビット一致は要求しない)。
+        let num = out1
+            .iter()
+            .zip(serial_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(num < 1e-4, "逐次和との差 {num} が大きい");
+        hc_norm_quad_set_for_test(None);
+    }
+
     #[test]
     #[ignore = "実形状の CPU マイクロベンチ (手動)"]
     fn bench_decode_mix_elements() {
