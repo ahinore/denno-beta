@@ -30477,9 +30477,18 @@ pub fn pf_full_out(
             true => match q4_attn_mirror_ready(cache_id, kv_dim, layer, gen, t_total) {
                 Some(p) => p,
                 // 台帳は合うがバッファが無い (LRU で落ちた等) → 従来経路で作り直す。
-                None => q4_attn_mirror_prepare(
-                    cache_id, n_layer, kv_dim, layer, gen, t_total, k_cpu, v_cpu, true,
-                )?,
+                None => {
+                    // task 369: `DENNO_PF_KV_ASYNC` で push を後ろへ回している
+                    // ときはホスト KV がまだ短い。短いままで作り直すと足りない
+                    // 行を積むので、ここで諦めて呼び出し側を従来経路へ戻す
+                    // (`ok_shape` の長さ検査はミラー直書きのとき外している)。
+                    if k_cpu.len() < t_total * kv_dim || v_cpu.len() < t_total * kv_dim {
+                        bail!("full out: ミラーが落ちた (ホスト KV も未確定)");
+                    }
+                    q4_attn_mirror_prepare(
+                        cache_id, n_layer, kv_dim, layer, gen, t_total, k_cpu, v_cpu, true,
+                    )?
+                }
             },
             false => q4_attn_mirror_prepare(
                 cache_id, n_layer, kv_dim, layer, gen, t_total, k_cpu, v_cpu, true,
