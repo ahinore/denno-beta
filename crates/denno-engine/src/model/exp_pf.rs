@@ -1751,6 +1751,91 @@ pub fn pread_threads() -> usize {
     })
 }
 
+/// `DENNO_PF_STREAM_PREAD`: task 349。IQ 系のストリームでも `read_at` を使う。
+///
+/// task 325 の pread は「pinned バウンスが write-combined でない」スロットだけ
+/// で発火する (`pf_stage_plan` の `!pin_wc`)。IQ 系は
+/// [`stream_wc_for`] の既定が WC なので、**IQ3_S では pread が一度も
+/// 発火していなかった** (lab t343c の `[exp-pf-stream]` に `pread_` の欄が無い)。
+///
+/// このゲートを on にすると、ストリームのスロットだけ pin を**非 WC** に
+/// 落として pread を発火させる (`DENNO_PF_STREAM_WC` より優先する)。
+/// WC へ `read(2)` すると極端に遅いため (task 325)、WC のままでは使えない。
+/// 既定 off: 非 WC のバウンスはホスト側の memcpy が遅いので、cold で勝つかを
+/// lab で測ってから決める。
+pub const STREAM_PREAD_ENV: &str = "DENNO_PF_STREAM_PREAD";
+
+/// [`STREAM_PREAD_ENV`] の既定値 (off)。
+pub const DEFAULT_STREAM_PREAD: bool = false;
+
+/// [`STREAM_PREAD_ENV`] の解釈 (純関数)。未設定は既定、`1` 系だけが真。
+pub fn stream_pread_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_STREAM_PREAD,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// ストリームの pread を使うか (プロセスで 1 回だけ env を読む)。
+pub fn stream_pread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| stream_pread_from_value(std::env::var(STREAM_PREAD_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_PLE_PIPE`: task 349。プロンプト全体の PLE 行 gather を 1 本の
+/// 生産スレッドで先に流す (パイプライン)。
+///
+/// 既存の `DENNO_PF_PLE_PRE` は **次の 1 チャンク**しか先読みしない。冷えた
+/// page cache では 14k の gather が 2.7 s かかる (`ple.rs` の実測) のに、1 チャンクの
+/// 層ループは 0.46 s しかないので、隠れずに `other` へ出る (lab t349a の
+/// 14k cold: `other` 2,608 ms / 露出 2,334 ms、base は 830 ms)。
+///
+/// ここでは gather を 1 本のスレッドで **チャンク順に全部**作り、`sync_channel` で
+/// 1 チャンクずつ渡す。層ループ (GPU) の裏でディスクのランダム読みが進むので、
+/// 2.7 s のうち層ループに隠れる分が増える。並列度 (`DENNO_PLE_PAR`) も
+/// 表の置き場所 (RAM 常駐) も変えない。
+///
+/// task 353: 層優先 (`forward_prefill_batch_resident_lm`) では gather が
+/// **層ループの前に全チャンク直列**なので、パイプの生産スレッドは使わない。
+/// 代わりに gather を 32 本の専用プール (`ple_par_parts` の上限 32) で引く。
+/// 冷えた page cache の実測は [`DEFAULT_PLE_PIPE`] の doc を見ること。
+pub const PLE_PIPE_ENV: &str = "DENNO_PF_PLE_PIPE";
+
+/// [`PLE_PIPE_ENV`] の既定値。**task 353 の lab t353a で採ったので on**。
+///
+/// lab t353a (depth8k、`DENNO_START_DROP_CACHE=1` で全 COND を冷えた状態に揃え、
+/// 同じ run の baseline b1/b2 = 8.85/8.82 s と 9.29/9.21 s):
+///
+/// | COND | 3,826 cold | 14k cold | `[pre-kprof]` ple (3.8k / 14k) | decode |
+/// | --- | --- | --- | --- | --- |
+/// | b1 (baseline) | 8.85 s | 9.29 s | 771 / 1,851 ms | 16.6 |
+/// | pl (`DENNO_PF_PLE_PIPE=1`) | **8.41 s (-5.0%)** | **8.06 s (-13.2%)** | 328 / 681 ms | 16.7 |
+/// | b2 (baseline) | 8.82 s | 9.24 s | — | 16.6 |
+///
+/// md5 は pl の 8 本すべて SAME (`a91e17da` / `5a8f5488` / `e2292eb6` / `561c6da8`)、
+/// errors 0、text sane。効いているのは**層優先の先頭 gather の並列度**
+/// (32 本、`ple_par_parts`) で、パイプ側 (`forward_prefill_batch_resident`) は
+/// このモデルでは層優先経路が使われるため主因ではない (lab の ple 時間は
+/// 1,851 → 681 ms に落ちた)。decode は 0.1 ms/tok の刻み内。
+pub const DEFAULT_PLE_PIPE: bool = true;
+
+/// [`PLE_PIPE_ENV`] の解釈 (純関数)。未設定は既定 (on)、`0` 系だけが偽。
+pub fn ple_pipe_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PLE_PIPE,
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// PLE のパイプライン先読みを使うか (プロセスで 1 回だけ env を読む)。
+pub fn ple_pipe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ple_pipe_from_value(std::env::var(PLE_PIPE_ENV).ok().as_deref()))
+}
+
 /// パート番号ごとの読み口 (pread 経路だけが使う)。
 ///
 /// モデルの構築時に 1 回だけ開く。開けなかったパートは `None` で、その
@@ -2647,7 +2732,7 @@ pub fn stats_line() -> Option<String> {
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} dec={} gpuw={} nsync={} group={} min_tok={} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} spread={} ut={} dec={} gpuw={} nsync={} group={} min_tok={} \
              chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x} retry={}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
@@ -2660,6 +2745,7 @@ pub fn stats_line() -> Option<String> {
             STREAM_CPU_MISS_NS.load(Ordering::Relaxed) as f64 / 1e6,
             stream_pin(),
             u8::from(stream_wc()),
+            u8::from(stream_pread()),
             u8::from(stream_ut()),
             u8::from(up_decouple_on()),
             STREAM_GPUWAIT.load(Ordering::Relaxed),
@@ -2915,6 +3001,36 @@ mod tests {
         assert_eq!(pread_kb_from_value(Some("1024")), 1024);
         assert_eq!(pread_kb_from_value(Some("999999")), 65536, "上限 64 MiB");
         assert_eq!(pread_kb_from_value(Some("x")), DEFAULT_PREAD_KB);
+    }
+
+    /// task 349: `DENNO_PF_STREAM_PREAD` は既定 off、`1` 系だけが真。
+    #[test]
+    fn stream_pread_gate_truth_table() {
+        assert!(!stream_pread_from_value(None), "未設定は既定 (off)");
+        assert!(!stream_pread_from_value(Some("")), "空も既定 (off)");
+        assert!(!stream_pread_from_value(Some("0")));
+        assert!(!stream_pread_from_value(Some("off")));
+        assert!(!stream_pread_from_value(Some("x")), "解析不能は既定 (off)");
+        assert!(stream_pread_from_value(Some("1")));
+        assert!(stream_pread_from_value(Some("on")));
+        assert!(stream_pread_from_value(Some("TRUE")));
+        assert!(stream_pread_from_value(Some(" yes ")));
+    }
+
+    /// task 349 / 353: `DENNO_PF_PLE_PIPE` は既定 on (t353a で採用)、`0` 系だけが偽。
+    #[test]
+    fn ple_pipe_gate_truth_table() {
+        assert!(ple_pipe_from_value(None), "未設定は既定 (on)");
+        assert!(ple_pipe_from_value(Some("")), "空も既定 (on)");
+        assert!(!ple_pipe_from_value(Some("0")));
+        assert!(!ple_pipe_from_value(Some("off")));
+        assert!(!ple_pipe_from_value(Some("x")), "解析不能は偽 (明示の真値だけ on)");
+        assert!(ple_pipe_from_value(Some("1")));
+        assert!(ple_pipe_from_value(Some("on")));
+        assert!(ple_pipe_from_value(Some("TRUE")));
+        assert!(ple_pipe_from_value(Some(" yes ")));
+        assert_eq!(PLE_PIPE_ENV, "DENNO_PF_PLE_PIPE");
+        assert!(DEFAULT_PLE_PIPE);
     }
 
     /// task 325: `DENNO_PF_PREAD_THREADS` の丸めと既定 (0 = 共有プール)。
