@@ -122,6 +122,17 @@ b0t の `Q4_TLINE=1` は**使えなかった**: `gpu_busy=0.00 gpu_idle=31.20ms`
 | zcsum (`DEC_EXP_SUM_ZC=1`) | **16.7** | 0.59 | 0 | looks ok | 全 SAME |
 | base2 | 16.8 | 0.59 | 0 | looks ok | 全 SAME |
 
+```text
+VERDICT base vs b0t OK decode -2.0% prefill -2.5% md5 SAME errors 0
+VERDICT zcsum vs b0t OK decode -2.7% prefill -2.5% md5 SAME errors 0
+VERDICT base2 vs b0t OK decode -2.0% prefill -3.3% md5 SAME errors 0
+```
+
+この run も **b0t が最初の COND で冷えており** (c2000_cold prefill 5.50 s / decode
+20.6 対 base 2.65 s / 16.2)、b0t を基準にした VERDICT は順序バイアスを含む
+(`base` と `base2` が同じ env なのに -2.0% と出るのがその証拠)。だから採否は
+b0t ではなく **base / base2 と zcsum の比較** (§3.2 の表) で読んだ。
+
 段の比較 (同じ request 同士。`base` と `base2` は同じ env なので、この 2 本の
 ばらつきがノイズの目安):
 
