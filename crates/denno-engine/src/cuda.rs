@@ -32599,12 +32599,12 @@ pub fn maybe_gpu_mix_q_chain_into(
             )?;
         }
         // task 364: ルータ GEMV を鎖の末尾に 1 発積む。
-        // task 307 の `DENNO_ROUTER_IN_MIX` は BF16 の chain3 にしか入っておらず、
-        // 新しい既定モデル (unsloth 11-13、mix は Q8_0) はこちらを通るため、
-        // ルータだけが鎖の外に残って層ごとに 1 往復 (起動 + D2H + 同期) していた。
-        // 入力は `dm` (= `mixed` のデバイスコピー) をそのまま読み、D2H は下の
-        // 鎖の同期 (イベント 1 本) でまとめて待つ。載らなければ従来経路が別途
-        // 走る (同じカーネル・同じ入力なので値は変わらない)。
+        // task 307 の `DENNO_ROUTER_IN_MIX` は BF16 の chain2 / chain3 にしか
+        // 入っておらず、新しい既定モデル (unsloth 11-13、mix は Q8_0) はこちらを
+        // 通るため、ルータだけが鎖の外に残って層ごとに 1 往復 (起動 + D2H + 同期)
+        // していた。入力は `dm` (= `mixed` のデバイスコピー) をそのまま読み、
+        // D2H は下の鎖の同期 (イベント 1 本) でまとめて待つ。載らなければ従来経路が
+        // 別途走る (同じカーネル・同じ入力なので値は変わらない)。
         let enq = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
         if enq != 0 {
             ROUTER_IN_QCHAIN_HITS.fetch_add(1, AO::Relaxed);
