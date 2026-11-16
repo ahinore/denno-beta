@@ -8606,6 +8606,9 @@ struct IqScratch {
     /// task 187: 和モードの重み (nseg 本) と和の出力 (e 要素)。
     wt: Option<DevBuffer>,
     psum: Option<DevBuffer>,
+    /// task 356: 和モードの ZC (`DENNO_DEC_EXP_SUM_ZC`) のときの和の出力先。
+    /// pinned のホスト (UVA でデバイスからも書ける) = D2H を消すため。
+    psum_zc: Option<PinMem>,
     /// task 204: gate+up 融合 (`DENNO_DEC_EXPGU`) の連結出力 `[g[ng] | u[ng]]`。
     gu: Option<DevBuffer>,
 }
@@ -8626,6 +8629,7 @@ impl IqScratch {
             hpin: None,
             wt: None,
             psum: None,
+            psum_zc: None,
             gu: None,
         }
     }
@@ -8850,6 +8854,18 @@ where
             MoeScratch::ensure_tagged(&mut sc.wt, nseg * 4, crate::mem_audit::TAG_GDN_SC)?;
             MoeScratch::ensure_tagged(&mut sc.psum, nout * 4, crate::mem_audit::TAG_GDN_SC)?;
         }
+        // task 356: 和の出力を pinned のホストへ直接書く (`DENNO_DEC_EXP_SUM_ZC`)。
+        // 確保できなければ従来の D2H 経路へ (fail closed)。
+        let zc = sum_mode
+            && sumk.is_some()
+            && crate::model::exp_iq::sum_zc_enabled()
+            && match Scratch::ensure_pin(&mut sc.psum_zc, nout * 4) {
+                Ok(()) => true,
+                Err(_) => {
+                    crate::model::exp_iq::note_sum_zc_fallback();
+                    false
+                }
+            };
         // task 150: overlap 経路だけ pinned staging を用意する (grow-only)。
         if overlap {
             Scratch::ensure_pin(&mut sc.hpin, nout * 4)?;
@@ -9129,12 +9145,21 @@ where
             //     (`out[j] = sum_t w[t] * h[t*e+j]`)。t 昇順の 1 アキュムレータ
             //     なので、ミスの無い層ではホストの足し込みとビット一致する。
             let src_ptr = if let Some(sk) = sumk {
+                // task 356 (`DENNO_DEC_EXP_SUM_ZC`): 和の出力を pinned のホストへ
+                // 直接書かせる (UVA なのでホストのアドレスがそのままデバイスの
+                // アドレス)。これで 10 KB の D2H とその完了待ちが丸ごと消える。
+                let zc_ptr = if zc {
+                    let pin = sc.psum_zc.as_ref().expect("確保済み");
+                    Some(pin.ptr as u64)
+                } else {
+                    None
+                };
                 let psum = sc.psum.as_ref().expect("確保済み");
                 let mut ph = h.ptr;
                 let mut pwv = w_addr as *mut c_void;
                 let mut psh = std::ptr::null_mut::<c_void>();
                 let mut pw = 0.0f32;
-                let mut po = psum.ptr;
+                let mut po = zc_ptr.unwrap_or(psum.ptr);
                 let (mut pe, mut pn, mut phs) = (e as c_int, nseg as c_int, 0 as c_int);
                 let mut args = [
                     &mut ph as *mut _ as *mut c_void,
@@ -9150,7 +9175,10 @@ where
                 let blocks = sum_e.div_ceil(threads) as u32;
                 ctx.launch_async(sk.sum, (blocks.max(1), 1, 1), (threads as u32, 1, 1), 0, &mut args)?;
                 dec_exp_kprof::mark(dec_exp_kprof::SUM);
-                psum.ptr
+                if zc_ptr.is_some() {
+                    crate::model::exp_iq::note_sum_zc_layer();
+                }
+                zc_ptr.unwrap_or(psum.ptr)
             } else {
                 h.ptr
             };
@@ -9158,13 +9186,31 @@ where
             //    非同期で先に出し、`middle` (CPU ミス) を挟んでから同期する。
             //    カーネル・引数・発行順は逐次版と同一 (変わるのは待つ位置だけ)。
             if overlap {
-                // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
-                // 借り直さないよう、アドレスを先に写す)。
-                let pin = sc.hpin.as_mut().expect("確保済み");
-                check(
-                    (lib()?.memcpy_dtoh_async)(pin.ptr, src_ptr, nout * 4, std::ptr::null_mut()),
-                    "cuMemcpyDtoHAsync (iq layer overlap)",
-                )?;
+                if zc {
+                    // task 356: カーネルが pinned のホストへ直接書いた = D2H 無し。
+                    // 待ちは下の同期 1 回だけで足りる。
+                } else {
+                    // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
+                    // 借り直さないよう、アドレスを先に写す)。
+                    let pin = sc.hpin.as_mut().expect("確保済み");
+                    if !exp_d2h_issue(pin.ptr, src_ptr, nout * 4) {
+                        // task 356 (`DENNO_DEC_EXP_D2H_STREAM`): コピーを専用の
+                        // 非ブロッキングストリームへ出す。null ストリームのままだと、
+                        // 小さいコピーで driver が呼び出しの中で待つことがあり、その
+                        // 待ちが CPU ミスの前に直列に挟まる。待ちは下の
+                        // `exp_d2h_wait` へ回す。失敗したら従来の null ストリーム
+                        // 経路へ (fail closed)。
+                        check(
+                            (lib()?.memcpy_dtoh_async)(
+                                pin.ptr,
+                                src_ptr,
+                                nout * 4,
+                                std::ptr::null_mut(),
+                            ),
+                            "cuMemcpyDtoHAsync (iq layer overlap)",
+                        )?;
+                    }
+                }
                 crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
                 dec_exp_kprof::mark(dec_exp_kprof::D2H);
             } else {
@@ -9175,19 +9221,44 @@ where
         if overlap {
             // ここから下はデバイスの完了を待たずに走る (GPU と CPU の重ね打ち)。
             middle()?;
-            // task 155: 待つのは null ストリーム (この層の expert GEMV と D2H)
-            // だけ。shared expert のサイドストリームは join まで待たない。
-            sync_default_or_ctx(ctx, dec_overlap_enabled())?;
-            let pin = sc.hpin.as_ref().expect("確保済み");
-            out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
-        } else {
-            let src = if sum_mode {
-                sc.psum.as_ref().expect("確保済み")
+            // task 356: 専用ストリームへ出したときは、`done` の完了が
+            // 「`ready` (この層のカーネル全部の後)」を待っているので、null ストリームの
+            // 同期は要らない (= 待ちを 1 回減らせる)。`DENNO_DEC_OVERLAP=0` のときは
+            // 従来どおりコンテキスト全体を待ってから `done` を待つ。
+            if exp_d2h_inflight() && dec_overlap_enabled() {
+                if !exp_d2h_wait() {
+                    bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+                }
             } else {
-                sc.h.as_ref().expect("確保済み")
-            };
-            let got: Vec<f32> = src.to_vec(nout)?;
-            out_h[..nout].copy_from_slice(&got);
+                // task 155: 待つのは null ストリーム (この層の expert GEMV と D2H)
+                // だけ。shared expert のサイドストリームは join まで待たない。
+                sync_default_or_ctx(ctx, dec_overlap_enabled())?;
+                // task 356: 専用ストリームへ出したコピーの完了 (通常はもう終わっている)。
+                if !exp_d2h_wait() {
+                    bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+                }
+            }
+            if zc {
+                // task 356: 和は pinned のホストに直接書かれている (コピー無し)。
+                let pin = sc.psum_zc.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            } else {
+                let pin = sc.hpin.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            }
+        } else {
+            if zc {
+                let pin = sc.psum_zc.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            } else {
+                let src = if sum_mode {
+                    sc.psum.as_ref().expect("確保済み")
+                } else {
+                    sc.h.as_ref().expect("確保済み")
+                };
+                let got: Vec<f32> = src.to_vec(nout)?;
+                out_h[..nout].copy_from_slice(&got);
+            }
             dec_exp_kprof::mark(dec_exp_kprof::D2H);
             middle()?;
         }
@@ -9556,6 +9627,162 @@ pub fn dec_stage_issue(total: usize) -> Result<()> {
         }
         st.used[i] = true;
         Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// task 356: expert 段の寄与 D2H を専用ストリームへ (`DENNO_DEC_EXP_D2H_STREAM`)
+// ---------------------------------------------------------------------------
+//
+// IQ expert の層一括経路は「カーネルを積む -> 非同期 D2H -> CPU ミス -> 同期」で
+// GPU と CPU を重ねる。ところが D2H を **null ストリーム** に出しているので、
+// 小さいコピー (和モードは e = 2,560 要素 = 10 KB) では、driver がコピーの完了を
+// 呼び出しの中で待つ経路に入ることがある。その待ちは CPU ミスの**前**に直列に
+// 挟まるので、重ね打ちが丸ごと効かなくなる (lab t352a の台帳: experts 段
+// 5.39 ms/tok に対し GPU 3.07 + ミス 2.78 で、重なりは 8% しか無い)。
+//
+// 専用の非ブロッキングストリームへ出すと、コピーは「この層のカーネルの完了」を
+// イベントで待つだけになり、呼び出しはホストを止めない。待ちは CPU ミスの後へ
+// 回す。**デバイスへ渡るバイト列・カーネル・発行順は 1 つも変わらない**。
+//
+// ゲートの解釈と積算は `model::exp_iq` 側にある ([`crate::model::exp_iq::DEC_D2H_STREAM_ENV`])。
+// ここはストリームとイベントだけを持つ。
+
+/// 専用ストリームとイベント 2 本 (スレッドローカル。作るのは 1 回だけ)。
+struct ExpD2h {
+    stream: CUstream,
+    /// この層のカーネルの完了 (null ストリームに打つ)。
+    ready: CUevent,
+    /// コピーの完了 (専用ストリームに打つ)。
+    done: CUevent,
+}
+
+thread_local! {
+    static EXP_D2H: std::cell::RefCell<Option<ExpD2h>> =
+        const { std::cell::RefCell::new(None) };
+    /// 直前に [`exp_d2h_issue`] がコピーを出したか (±[`exp_d2h_wait`] で落とす)。
+    static EXP_D2H_INFLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+const CU_STREAM_NON_BLOCKING_D2H: u32 = 0x01;
+const CU_EVENT_DISABLE_TIMING_D2H: u32 = 0x02;
+
+/// 専用ストリームを用意する (無ければ作る)。作れなければ `false`。
+fn exp_d2h_ensure() -> bool {
+    EXP_D2H.with(|c| {
+        if c.borrow().is_some() {
+            return true;
+        }
+        let Ok(l) = lib() else {
+            return false;
+        };
+        let (Some(create_stream), Some(create_event)) = (l.stream_create, l.event_create) else {
+            return false;
+        };
+        if l.stream_wait_event.is_none() || l.event_record.is_none() || l.event_sync.is_none() {
+            return false;
+        }
+        let mut st: CUstream = std::ptr::null_mut();
+        if unsafe { create_stream(&mut st, CU_STREAM_NON_BLOCKING_D2H) } != CUDA_SUCCESS {
+            return false;
+        }
+        let mut ready: CUevent = std::ptr::null_mut();
+        let mut done: CUevent = std::ptr::null_mut();
+        let ok = unsafe { create_event(&mut ready, CU_EVENT_DISABLE_TIMING_D2H) } == CUDA_SUCCESS
+            && unsafe { create_event(&mut done, CU_EVENT_DISABLE_TIMING_D2H) } == CUDA_SUCCESS;
+        if !ok {
+            return false;
+        }
+        *c.borrow_mut() = Some(ExpD2h {
+            stream: st,
+            ready,
+            done,
+        });
+        true
+    })
+}
+
+/// 専用ストリーム経由の非同期 D2H を 1 回出す。
+///
+/// 順序は「null ストリームに ready を打つ -> 専用ストリームで ready を待つ ->
+/// コピー -> done を打つ」。戻り値 `true` のとき、呼び出し側は
+/// [`exp_d2h_wait`] で完了を待ってからホストのバッファを読むこと。
+///
+/// `false` は「この経路を使えない」= 呼び出し側は従来の null ストリーム経路へ。
+pub(crate) fn exp_d2h_issue(dst: *mut c_void, src: u64, bytes: usize) -> bool {
+    if !crate::model::exp_iq::dec_d2h_stream_enabled() {
+        return false;
+    }
+    if !exp_d2h_ensure() {
+        crate::model::exp_iq::note_d2h_stream_fallback();
+        return false;
+    }
+    let Ok(l) = lib() else {
+        return false;
+    };
+    let (Some(record), Some(wait_ev), Some(copy)) =
+        (l.event_record, l.stream_wait_event, Some(l.memcpy_dtoh_async))
+    else {
+        return false;
+    };
+    EXP_D2H.with(|c| {
+        let b = c.borrow();
+        let Some(d) = b.as_ref() else {
+            return false;
+        };
+        // 1. この層のカーネル (null ストリーム) の完了点。
+        if unsafe { record(d.ready, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            return false;
+        }
+        // 2. 専用ストリームはその点を待つ。
+        if unsafe { wait_ev(d.stream, d.ready, 0) } != CUDA_SUCCESS {
+            return false;
+        }
+        // 3. コピーと完了イベント。
+        if unsafe { copy(dst, src, bytes, d.stream) } != CUDA_SUCCESS {
+            return false;
+        }
+        if unsafe { record(d.done, d.stream) } != CUDA_SUCCESS {
+            return false;
+        }
+        EXP_D2H_INFLIGHT.with(|f| f.set(true));
+        crate::model::exp_iq::note_d2h_stream_copy();
+        true
+    })
+}
+
+/// [`exp_d2h_issue`] で出したコピーがまだ待たれていないか。
+pub(crate) fn exp_d2h_inflight() -> bool {
+    EXP_D2H_INFLIGHT.with(|f| f.get())
+}
+
+/// [`exp_d2h_issue`] で出したコピーの完了を待つ (出していなければ何もしない)。
+///
+/// 通常は CPU ミスの後に呼ぶので待ちはゼロ。待った時間は台帳の `sync` に積む。
+pub(crate) fn exp_d2h_wait() -> bool {
+    if !EXP_D2H_INFLIGHT.with(|f| f.replace(false)) {
+        return true;
+    }
+    let Ok(l) = lib() else {
+        return false;
+    };
+    let Some(esync) = l.event_sync else {
+        return false;
+    };
+    let t = crate::model::q4ledger::stamp();
+    EXP_D2H.with(|c| {
+        let b = c.borrow();
+        let Some(d) = b.as_ref() else {
+            return false;
+        };
+        let ok = unsafe { esync(d.done) } == CUDA_SUCCESS;
+        if ok {
+            if let Some(t) = t {
+                crate::model::exp_iq::note_d2h_stream_wait(t.elapsed().as_nanos() as u64);
+            }
+            crate::model::q4ledger::note_sync(t);
+        }
+        ok
     })
 }
 
