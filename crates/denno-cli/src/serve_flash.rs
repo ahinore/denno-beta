@@ -743,6 +743,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::qwen4exp::mix_qchain_reset();
+    // task 358: pinned バウンス (`DENNO_PF_PIN_STAGE`) が流した量 (発火しなければ出ない)。
+    if let Some(line) = denno_engine::cuda::pf_pin_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::cuda::pf_pin_reset();
     if !q4prof::enabled() {
         return;
     }

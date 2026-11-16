@@ -3660,17 +3660,14 @@ impl DevBuffer {
         if bytes == 0 {
             return Ok(true);
         }
-        let Some(pin) = pf_pin_stage(bytes)? else {
-            return Ok(false);
-        };
-        unsafe {
+        let done = with_pf_pin(bytes, |pin| unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, pin as *mut u8, bytes);
             check(
                 (lib()?.memcpy_htod)(self.ptr, pin as *const c_void, bytes),
                 "cuMemcpyHtoD (pin stage)",
-            )?;
-        }
-        Ok(true)
+            )
+        })?;
+        Ok(done.is_some())
     }
 
     /// task 318: pinned バウンス経由の同期 D2H (`DENNO_PF_PIN_STAGE=1`)。
@@ -3680,17 +3677,16 @@ impl DevBuffer {
         if bytes == 0 {
             return Ok(true);
         }
-        let Some(pin) = pf_pin_stage(bytes)? else {
-            return Ok(false);
-        };
-        unsafe {
+        let dst = out.as_mut_ptr() as *mut u8;
+        let done = with_pf_pin(bytes, |pin| unsafe {
             check(
                 (lib()?.memcpy_dtoh)(pin, self.ptr, bytes),
                 "cuMemcpyDtoH (pin stage)",
             )?;
-            std::ptr::copy_nonoverlapping(pin as *const u8, out.as_mut_ptr() as *mut u8, bytes);
-        }
-        Ok(true)
+            std::ptr::copy_nonoverlapping(pin as *const u8, dst, bytes);
+            Ok(())
+        })?;
+        Ok(done.is_some())
     }
 
     /// s141b (Task B7c): 既存バッファへ**デバイスから**上書きコピー (D2D・同期)。
@@ -8303,11 +8299,15 @@ where
         sync_r?;
 
         // 8. 結果 (e 要素) だけ戻す。
+        //
+        // task 358: `to_vec` は毎層 `Vec` を確保して pageable の同期 D2H をするので、
+        // e=2,560 (10 KB) で 11 us/層かかっていた (lab の `[seg-prof] d2h=`)。
+        // `to_slice` は 1 本の作業域へ直接戻し、`DENNO_PF_PIN_STAGE` の窓に入って
+        // いれば pinned バウンス経由 (同じバイト列) になる。
         let _t_d2h = crate::model::seg_prof::stamp();
-        let got: Vec<f32> = outb.to_vec(e)?;
+        outb.to_slice(&mut out[..e])?;
         dbg_d2h(e * 4);
         crate::model::seg_prof::add(crate::model::seg_prof::PH_D2H, _t_d2h);
-        out[..e].copy_from_slice(&got);
 
         // 9. 計上 (GPU 時間はイベント、バイト数は segment x 行数 x 行長)。
         if prof {
@@ -15769,9 +15769,61 @@ pub fn pf_pin_stage_from_value(v: Option<&str>) -> bool {
     }
 }
 
-/// pinned バウンスを使う転送サイズの下限 / 上限 (1 MiB ..= 256 MiB)。
+/// pinned バウンスを使う転送サイズの下限 (既定) / 上限 (1 MiB ..= 256 MiB)。
 const PF_PIN_MIN_BYTES: usize = 1 << 20;
 const PF_PIN_MAX_BYTES: usize = 256 << 20;
+
+/// task 358: 下限を env で動かす (`DENNO_PF_PIN_MIN_KB`、既定 1024 KiB)。
+///
+/// 1 MiB の床は task 318 が「小さい転送は写しの固定費が勝つ」として置いたもの。
+/// 共有バウンスにした今は、decode の 10 KB D2H (pageable で 11 us) も
+/// 同じ 1 本で速くなる可能性があるので、床を下げた条件を 1 つの COND で測れる
+/// ようにしておく。
+pub const PF_PIN_MIN_KB_ENV: &str = "DENNO_PF_PIN_MIN_KB";
+
+/// [`PF_PIN_MIN_KB_ENV`] の解釈 (純関数)。1..=262144 KiB に丸める。未設定は既定。
+fn pf_pin_min_kb_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return PF_PIN_MIN_BYTES >> 10;
+    };
+    match s.parse::<usize>() {
+        Ok(kb) if kb > 0 => kb.min(262_144),
+        _ => PF_PIN_MIN_BYTES >> 10,
+    }
+}
+
+/// 下限 (バイト)。プロセスで 1 回だけ env を読む。
+fn pf_pin_min_bytes() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        pf_pin_min_kb_from_value(std::env::var(PF_PIN_MIN_KB_ENV).ok().as_deref()) << 10
+    })
+}
+
+/// task 358: `bytes` が pinned バウンスの窓に入るか (純関数)。
+///
+/// 小さい転送は写しの固定費が勝ち、大きすぎる転送は pinned を食い潰す。
+fn pf_pin_window_from(min: usize, bytes: usize) -> bool {
+    (min..=PF_PIN_MAX_BYTES).contains(&bytes)
+}
+
+/// 実際の下限で窓を判定する。
+fn pf_pin_window_ok(bytes: usize) -> bool {
+    pf_pin_window_from(pf_pin_min_bytes(), bytes)
+}
+
+/// task 358: 共有バウンスを `want` へ育てる必要があるか (純関数)。
+///
+/// 育つときは **2 の冪へ切り上げる**。1.4 MB → 39 MB → 143 MB と昇順に来るので、
+/// 毎回ちょうどの大きさで取り直すと `cuMemHostAlloc` (device を同期させる) が
+/// 何度も走る。切り上げれば 1 プロセスで数回で済む。
+fn pf_pin_need_grow(cur: usize, want: usize) -> Option<usize> {
+    if cur >= want {
+        return None;
+    }
+    let pow = want.next_power_of_two().min(PF_PIN_MAX_BYTES);
+    Some(pow.max(want))
+}
 
 /// 層ループの同期 H2D / D2H を pinned バウンス経由にするか。
 fn pf_pin_stage_on() -> bool {
@@ -15781,44 +15833,131 @@ fn pf_pin_stage_on() -> bool {
     })
 }
 
-thread_local! {
-    /// task 318: 層ループの同期コピー用の pinned バウンス (grow-only)。
-    static PF_PIN_STAGE: std::cell::RefCell<Option<PinMem>> = const {
-        std::cell::RefCell::new(None)
-    };
+/// task 358: pinned バウンスの実体 (**プロセスで 1 本**、grow-only)。
+///
+/// task 318 は `thread_local!` に持たせたため、rayon のワーカー 14 本が
+/// それぞれ 143 MiB の pinned を `cuMemHostAlloc` で取りに行った
+/// (lab t318a: 14k cold 34.8 -> 55.3 s = +59%、3,826 も +10%)。pinned の
+/// 確保は device 全体を同期させるので、**回数を 1 回に固定する**のが要点。
+/// ここでは共有 1 本 + ロックにし、サイズは「必要になったときだけ」育てる
+/// (3,826 の 39 MiB -> 14k の 143 MiB で 2 回)。
+struct PfPinShared {
+    /// 転送先/転送元の pinned バッファ。
+    buf: Option<PinMem>,
+    /// 育ち直した回数 (診断: 1 プロセスで数回であること)。
+    grows: u64,
+    /// 他のスレッドがバウンスを使っていて待った回数と合計 ns (診断)。
+    waits: u64,
+    wait_ns: u64,
+    /// バウンス経由で流したバイト数と回数 (診断: 発火の証拠)。
+    bytes: u64,
+    calls: u64,
 }
 
-/// pinned バウンスを `bytes` 以上に育てて先頭ポインタを返す。
-///
-/// ゲートが off、または確保に失敗したら `Ok(None)` (呼び出し側は pageable 経路へ)。
-fn pf_pin_stage(bytes: usize) -> Result<Option<*mut c_void>> {
-    if !pf_pin_stage_on() {
-        return Ok(None);
-    }
-    // 小さい転送は写しの固定費が勝つ。大きすぎる転送はスレッドごとの pinned が
-    // 効きすぎる (14 本の rayon で 2 GB 級) ので、その窓の外は従来経路。
-    if !(PF_PIN_MIN_BYTES..=PF_PIN_MAX_BYTES).contains(&bytes) {
-        return Ok(None);
-    }
-    PF_PIN_STAGE.with(|c| {
-        let mut s = c.borrow_mut();
-        if s.as_ref().map(|p| p.bytes >= bytes).unwrap_or(false) {
-            return Ok(s.as_ref().map(|p| p.ptr));
+/// 共有バウンス (プロセスで 1 本)。
+fn pf_pin_shared() -> &'static std::sync::Mutex<PfPinShared> {
+    static S: OnceLock<std::sync::Mutex<PfPinShared>> = OnceLock::new();
+    S.get_or_init(|| {
+        std::sync::Mutex::new(PfPinShared {
+            buf: None,
+            grows: 0,
+            waits: 0,
+            wait_ns: 0,
+            bytes: 0,
+            calls: 0,
+        })
+    })
+}
+
+/// task 358: 共有バウンスの台帳 (grows, waits, wait_ns, bytes, calls)。
+pub fn pf_pin_stats() -> (u64, u64, u64, u64, u64) {
+    match pf_pin_shared().lock() {
+        Ok(g) => (g.grows, g.waits, g.wait_ns, g.bytes, g.calls),
+        Err(p) => {
+            let g = p.into_inner();
+            (g.grows, g.waits, g.wait_ns, g.bytes, g.calls)
         }
-        match PinMem::alloc(bytes) {
+    }
+}
+
+/// task 358: 台帳を 0 に戻す (リクエスト終端)。
+pub fn pf_pin_reset() {
+    let m = pf_pin_shared();
+    let mut g = match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.grows = 0;
+    g.waits = 0;
+    g.wait_ns = 0;
+    g.bytes = 0;
+    g.calls = 0;
+}
+
+/// task 358: 1 行のレポート (発火が 0 なら `None` = 出力しない)。
+pub fn pf_pin_line() -> Option<String> {
+    let (grows, waits, wait_ns, bytes, calls) = pf_pin_stats();
+    if calls == 0 {
+        return None;
+    }
+    Some(format!(
+        "[pf-pin] calls={calls} MB={:.1} grows={grows} waits={waits} wait_ms={:.1}",
+        bytes as f64 / 1e6,
+        wait_ns as f64 / 1e6
+    ))
+}
+
+/// 共有バウンスを `bytes` 以上に育てて、ロックを持ったまま `f` を実行する。
+///
+/// - ゲート off / 窓の外: `Ok(None)` (呼び出し側は pageable 経路へ)。
+/// - 確保できない (pinned 不足など): 1 回だけ記録して `Ok(None)` (数値は同じ)。
+///
+/// ロックは転送が終わるまで持つ。転送は葉 (この中で別の転送を呼ばない) なので
+/// 再入は起きない。並行に来た転送は直列になるが、pinned の 1 本は pageable より
+/// 桁で速いので損にならない (lab の数字で確認する)。
+fn with_pf_pin<T>(
+    bytes: usize,
+    f: impl FnOnce(*mut c_void) -> Result<T>,
+) -> Result<Option<T>> {
+    if bytes == 0 || !pf_pin_stage_on() || !pf_pin_window_ok(bytes) {
+        return Ok(None);
+    }
+    let m = pf_pin_shared();
+    let t0 = std::time::Instant::now();
+    let mut g = match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // ロック待ち (他のスレッドがバウンスを使っていた時間) を数える。
+    // 200 us を超えたものだけ「待ち」として数える (通常は 0)。
+    let lock_ns = t0.elapsed().as_nanos() as u64;
+    if lock_ns > 200_000 {
+        g.waits += 1;
+        g.wait_ns += lock_ns;
+    }
+    let cur = g.buf.as_ref().map(|b| b.bytes).unwrap_or(0);
+    if let Some(want) = pf_pin_need_grow(cur, bytes) {
+        // 新しい 1 本を取る前に古い 1 本を落とす (pinned を二重に持たない)。
+        g.buf = None;
+        match PinMem::alloc(want) {
             Ok(p) => {
-                let ptr = p.ptr;
-                *s = Some(p);
-                Ok(Some(ptr))
+                g.buf = Some(p);
+                g.grows += 1;
             }
             Err(e) => {
-                // メモリが足りない等。以後は pageable で回す (数値は同じ)。
-                tracing::info!("[pf] pinned バウンスを確保できない ({bytes} B): {e:#}");
-                *s = None;
-                Ok(None)
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("[pf-pin] pinned バウンスを確保できない ({want} B): {e:#}");
+                }
+                return Ok(None);
             }
         }
-    })
+    }
+    let pin = g.buf.as_ref().expect("確保済み").ptr;
+    g.calls += 1;
+    g.bytes += bytes as u64;
+    f(pin).map(Some)
 }
 
 impl Drop for PinMem {
@@ -57735,5 +57874,47 @@ mod task318_tests {
         assert_eq!(q::SUB_NAMES.len(), q::SUB_N);
         assert!(q::SUB_RES_UP < q::SUB_N);
         assert!(q::SUB_LM_PARK < q::SUB_N);
+    }
+
+    /// task 358: バウンスの窓 (既定 1 MiB..=256 MiB) と下限の env 解釈。
+    #[test]
+    fn pin_window_and_min_kb_truth_table() {
+        let mib = 1usize << 20;
+        let min = PF_PIN_MIN_BYTES;
+        assert_eq!(min, mib);
+        // 窓: 1 MiB は入る、その 1 B 下は入らない、256 MiB は入る、その上は入らない。
+        assert!(pf_pin_window_from(min, mib));
+        assert!(!pf_pin_window_from(min, mib - 1));
+        assert!(pf_pin_window_from(min, PF_PIN_MAX_BYTES));
+        assert!(!pf_pin_window_from(min, PF_PIN_MAX_BYTES + 1));
+        // 床を 4 KiB に下げると decode の 10 KB も入る。
+        assert!(pf_pin_window_from(4 << 10, 10 << 10));
+        assert!(!pf_pin_window_from(4 << 10, 4 << 10 - 1));
+        // env の解釈: 未設定・空・0・壊れた値は既定 (1024 KiB)、1..=262144 に丸める。
+        assert_eq!(pf_pin_min_kb_from_value(None), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("")), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("0")), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("x")), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("4")), 4);
+        assert_eq!(pf_pin_min_kb_from_value(Some(" 64 ")), 64);
+        assert_eq!(pf_pin_min_kb_from_value(Some("99999999")), 262_144);
+    }
+
+    /// task 358: 育つ判断は grow-only + 2 の冪切り上げ (確保の回数を数回に抑える)。
+    #[test]
+    fn pin_grow_is_grow_only_and_rounded() {
+        // 既に足りている: 触らない。
+        assert_eq!(pf_pin_need_grow(1 << 20, 1 << 20), None);
+        assert_eq!(pf_pin_need_grow(1 << 21, 1 << 20), None);
+        // 足りない: 2 の冪へ切り上げる (要求より小さくはしない)。
+        assert_eq!(pf_pin_need_grow(0, 1_400_000), Some(2 << 20));
+        assert_eq!(pf_pin_need_grow(1 << 20, 39 << 20), Some(64 << 20));
+        assert_eq!(pf_pin_need_grow(64 << 20, 143 << 20), Some(256 << 20));
+        // 上限で頭打ち (窓の外は呼ばれないが、関数としては上限を超えない)。
+        assert_eq!(
+            pf_pin_need_grow(0, PF_PIN_MAX_BYTES),
+            Some(PF_PIN_MAX_BYTES)
+        );
+        assert_eq!(pf_pin_need_grow(0, PF_PIN_MAX_BYTES - 1), Some(PF_PIN_MAX_BYTES));
     }
 }
