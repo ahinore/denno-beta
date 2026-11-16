@@ -15858,6 +15858,70 @@ impl PinMem {
     fn as_mut_slice<T>(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.bytes / std::mem::size_of::<T>()) }
     }
+
+    /// task 382: **device から直接見える** pinned (`CU_MEMHOSTALLOC_DEVICEMAP`)。
+    ///
+    /// 返り値の `CUdeviceptr` は同じホストメモリを指すので、カーネルは
+    /// H2D 無しでこれを読み、D2H 無しでこれへ書ける (PCIe 越しの読み書きは
+    /// ユニファイドアドレスで透過)。mix の鎖は 1 回 5.7 us の H2D と 2.6 us の
+    /// D2H を払っていたので、そこを消すための器。
+    ///
+    /// DEVICEMAP が付かない環境 (古い driver / WSL など) では `Err` を返し、
+    /// 呼び出し側は従来の H2D / D2H 経路へ落ちる (fail closed)。
+    fn alloc_mapped(bytes: usize) -> Result<(Self, CUdeviceptr)> {
+        const CU_MEMHOSTALLOC_PORTABLE: u32 = 0x01;
+        const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
+        let bytes = bytes.max(1);
+        let lib = lib()?;
+        let Some(get_dev) = lib.mem_host_get_device_ptr else {
+            bail!("cuMemHostGetDevicePointer が無い");
+        };
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            check(
+                (lib.mem_host_alloc)(
+                    &mut ptr,
+                    bytes,
+                    CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP,
+                ),
+                "cuMemHostAlloc (devicemap)",
+            )?;
+        }
+        let mut dev: CUdeviceptr = 0;
+        unsafe {
+            let rc = get_dev(&mut dev, ptr, 0);
+            if rc != CUDA_SUCCESS {
+                let _ = (lib.mem_host_free)(ptr);
+                bail!("cuMemHostGetDevicePointer が失敗: {rc:?}");
+            }
+        }
+        Ok((Self { ptr, bytes }, dev))
+    }
+}
+
+/// task 382: device から直接読み書きできる pinned の組 (ホスト側の見え方と
+/// device 側の見え方は同じ 1 本のメモリ)。
+struct MapMem {
+    pin: PinMem,
+    dev: CUdeviceptr,
+}
+
+impl MapMem {
+    /// 必要バイト数を満たすまで確保し直す (足りていれば何もしない)。
+    fn ensure(slot: &mut Option<MapMem>, bytes: usize) -> Result<()> {
+        if let Some(m) = slot.as_ref() {
+            if m.pin.bytes >= bytes.max(1) {
+                return Ok(());
+            }
+        }
+        *slot = Some(MapMem::alloc(bytes)?);
+        Ok(())
+    }
+
+    fn alloc(bytes: usize) -> Result<Self> {
+        let (pin, dev) = PinMem::alloc_mapped(bytes)?;
+        Ok(Self { pin, dev })
+    }
 }
 
 /// task 318: `DENNO_PF_PIN_STAGE` の値の解釈 (純関数)。
@@ -25908,6 +25972,14 @@ struct MixGpuScratch {
     /// (`[wptr_d][wptr_u][seg_d][seg_u][xn]` を 1 本の H2D で送る)。
     stage: Option<DevBuffer>,
     hstage: Option<PinMem>,
+    /// task 382: `DENNO_MIX_ZC` 用。device から直接見える pinned。
+    /// `xmap` = down の入力 (`xn`、H2D を消す)、`omap` = `mixed` の行き先
+    /// (hc_mixed に直接書かせて D2H を消す)。`None` の間は従来経路。
+    xmap: Option<MapMem>,
+    omap: Option<MapMem>,
+    /// task 382: `DENNO_MIX_UPQ8=check` の比較用 (融合版の出力 / その受け皿)。
+    chk: Option<DevBuffer>,
+    hchk: Option<PinMem>,
 }
 
 thread_local! {
@@ -25921,6 +25993,10 @@ thread_local! {
             ho: None,
             stage: None,
             hstage: None,
+            xmap: None,
+            omap: None,
+            chk: None,
+            hchk: None,
         });
 }
 
@@ -32326,6 +32402,267 @@ fn launch_mix_v5(
     }
 }
 
+// ===========================================================================
+// task 382: mix の silu + up + hc_mixed を 1 本に畳む (`DENNO_MIX_UPQ8`)
+// ===========================================================================
+//
+// 実形 (n_in = 320 = 5 対、n_out = 10240、e = 2560、hc = 4) で、従来の 3 本は
+//   lo_silu 3.3 us (2 ブロック、320 要素) + up 13.1 us (3.48 MB を 266 GB/s)
+//   + hc_mixed 5.8 us (gate 40 KB の往復 + 起動)
+// を払っていた (t372a の `[dec-kprof-avg]`)。up が遅いのは v5 の `lanes=1`
+// (1 スレッド 1 行) ではスレッド数が n_out で頭打ちになり 4 warp/SM しか
+// 出ないため。融合版はレーン 5 (1 レーン = 1 対) にして 5 倍のスレッドを出し、
+// silu と hc_mixed も同じカーネルの中で済ませる (`kernels_mix_upmix_q8.cu`)。
+//
+// 丸め順は v5 + `dno_hc_mixed_f32` と揃えていない (レーン 0..4 の逐次加算)。
+// ゲート `DENNO_MIX_UPQ8` は既定 on (lab t382b の 2 ラウンドで採否 yes)、
+// `=0` で従来の 3 本経路、`=check` で従来経路の出力と max|diff| を比べる。
+
+/// 融合版のカーネル名。
+const MIX_UPQ8_KERNEL_NAME: &str = "dno_mix_upmix_q8_0";
+
+/// 融合版の引数の数 (lo, w, xn, out, n_in, e, inv_hc, row_bytes)。
+const MIX_UPQ8_NARGS: usize = 8;
+
+/// `.cu` の UPQ8_JC (1 ブロックが受け持つ e の数)。
+const MIX_UPQ8_JC: usize = 6;
+
+/// `.cu` の UPQ8_LANES (1 レーン = 1 対 = 64 要素)。
+const MIX_UPQ8_LANES: usize = 5;
+
+/// `.cu` の UPQ8_THREADS。
+const MIX_UPQ8_THREADS: u32 = 128;
+
+struct MixUpq8Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixUpq8Kernels {}
+unsafe impl Sync for MixUpq8Kernels {}
+
+static MIX_UPQ8_KERNELS: OnceLock<Option<MixUpq8Kernels>> = OnceLock::new();
+
+fn mix_upq8_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_UPQ8_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_upmix_q8.ptx"),
+    }
+}
+
+/// 融合版のカーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_upq8_kernels() -> Option<&'static MixUpq8Kernels> {
+    MIX_UPQ8_KERNELS
+        .get_or_init(|| {
+            let path = mix_upq8_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_UPQ8_KERNEL_NAME) != Some(MIX_UPQ8_NARGS) {
+                eprintln!(
+                    "[mix-upq8] PTX の引数が {MIX_UPQ8_NARGS} 本でない → 従来の 3 本経路へ。\
+                     `bash build_ptx.sh mix_upmix_q8` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_UPQ8_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-upq8] PTX に {MIX_UPQ8_KERNEL_NAME} が無い → 従来の 3 本経路へ");
+                    return None;
+                }
+                Some(MixUpq8Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 融合版が載っているか (テスト / 診断用)。
+pub fn mix_upq8_loaded() -> bool {
+    mix_upq8_kernels().is_some()
+}
+
+/// 形の門番 (純関数)。`.cu` の前提 (n_in = 64 * 5、hc = 4) と同じ。
+pub fn mix_upq8_shape_ok(n_in: usize, e: usize, hc: usize) -> bool {
+    n_in == 64 * MIX_UPQ8_LANES && e > 0 && hc == 4
+}
+
+/// `DENNO_MIX_UPQ8` の解釈 (純関数)。0 = 従来経路 / 1 = 融合 / 2 = 比較。
+///
+/// lab t382b (2 ラウンド、base 16.2 / fused 15.8 = -2.5%、mix 段 4.38 -> 3.93 ms/tok
+/// = -10.3%、prefill 0.68 s で不変、errors 0、md5 は 6 コンテキスト全部 SAME、
+/// `=check` の max|diff| は 1.5e-5 / |ref| 132 = 相対 1e-7、閾値超え 0 本) で
+/// 採ったので **既定 on**。切り戻しは `DENNO_MIX_UPQ8=0`。
+const MIX_UPQ8_DEFAULT: u8 = 1;
+
+pub fn mix_upq8_from_value(v: Option<&str>) -> u8 {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1") | Some("on") | Some("true") | Some("yes") => 1,
+        Some("check") | Some("2") => 2,
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("") => 0,
+        _ => MIX_UPQ8_DEFAULT,
+    }
+}
+
+pub const MIX_UPQ8_ENV: &str = "DENNO_MIX_UPQ8";
+
+/// ゲートの実値 (プロセスで 1 回だけ env を読む)。
+pub fn mix_upq8_on() -> u8 {
+    #[cfg(test)]
+    if let Some(v) = MIX_UPQ8_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| mix_upq8_from_value(std::env::var(MIX_UPQ8_ENV).ok().as_deref()))
+}
+
+/// 台帳 (`gate_audit::DEFAULT_ON_GATES`) 用の bool。
+pub fn mix_upq8_gate_on() -> bool {
+    mix_upq8_on() != 0
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIX_UPQ8_FORCE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト用: ゲートの強制 (`None` = env の解釈)。
+#[cfg(test)]
+pub(crate) fn mix_upq8_set_for_test(v: Option<u8>) {
+    MIX_UPQ8_FORCE.with(|c| c.set(v));
+}
+
+static MIX_UPQ8_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 融合カーネルを撃った回数 (診断。`PROFILE` の `[mix-upq8]` 行)。
+pub fn mix_upq8_hits() -> u64 {
+    MIX_UPQ8_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn mix_upq8_reset() {
+    MIX_UPQ8_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    /// (max|diff|, そのときの |ref|, 閾値超えの個数, 比較した要素数)
+    static UPQ8_CHECK: std::cell::RefCell<(f64, f64, u64, u64)> =
+        const { std::cell::RefCell::new((0.0, 0.0, 0, 0)) };
+}
+
+/// `=check` の比較結果を積む (鎖を回したスレッドがそのまま呼ぶ)。
+fn mix_upq8_note_check(worst: f64, worst_ref: f64, bad: u64, n: u64) {
+    UPQ8_CHECK.with(|c| {
+        let mut s = c.borrow_mut();
+        if worst > s.0 {
+            s.0 = worst;
+            s.1 = worst_ref;
+        }
+        s.2 += bad;
+        s.3 += n;
+    });
+}
+
+/// `=check` の集計を 1 行で取り出す (積んでいなければ None)。取り出すと 0 に戻る。
+pub fn mix_upq8_check_line() -> Option<String> {
+    let v = UPQ8_CHECK.with(|c| {
+        let mut s = c.borrow_mut();
+        let v = *s;
+        *s = (0.0, 0.0, 0, 0);
+        v
+    });
+    if v.3 == 0 {
+        return None;
+    }
+    Some(format!(
+        "[mix-upq8] check max|diff|={:.3e} (|ref|={:.3e}) bad={}/{} (閾値 1e-4+1e-5*|ref|)",
+        v.0, v.1, v.2, v.3
+    ))
+}
+
+// ===========================================================================
+// task 382: mix の鎖から H2D / D2H を消す (`DENNO_MIX_ZC`)
+// ===========================================================================
+//
+// 鎖 1 回の実測 (t372a、`[dec-kprof-avg]` の op 表) は
+//   H2D@a 5.7 us / down 6.4 / lo_silu 3.3 / up 13.1 / hc_mixed 5.8 / D2H@a 2.6
+// で、**両端の往復 8.3 us は「xn 40 KB を送る」「mixed 10 KB を戻す」だけ**。
+// xn は device から直接読める pinned (`CU_MEMHOSTALLOC_DEVICEMAP`) に置けば
+// H2D が丸ごと消え、mixed は hc_mixed にその pinned へ書かせれば D2H が消える。
+// カーネルは 1 本も変えない (ポインタが変わるだけ) ので値はビット一致。
+
+/// `DENNO_MIX_ZC` の解釈 (純関数)。返り値は `(H2D を消す, D2H を消す)`。
+///
+/// - 未設定 / `0` / `off` (既定): 従来 (H2D + D2H)。
+/// - `x` / `in`: H2D だけ消す (`down` がホストの `xn` を PCIe 越しに読む)。
+/// - `out`: D2H だけ消す (`hc_mixed` がホストメモリへ直接書く)。
+/// - `1` / `on` / `both`: 両方。
+pub fn mix_zc_from_value(v: Option<&str>) -> (bool, bool) {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("x") | Some("in") => (true, false),
+        Some("out") => (false, true),
+        Some("1") | Some("on") | Some("true") | Some("yes") | Some("both") => (true, true),
+        _ => (false, false),
+    }
+}
+
+pub const MIX_ZC_ENV: &str = "DENNO_MIX_ZC";
+
+/// ゲートの実値 (プロセスで 1 回だけ env を読む)。
+pub fn mix_zc_enabled() -> (bool, bool) {
+    #[cfg(test)]
+    if let Some(v) = MIX_ZC_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: OnceLock<(bool, bool)> = OnceLock::new();
+    *ON.get_or_init(|| mix_zc_from_value(std::env::var(MIX_ZC_ENV).ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIX_ZC_FORCE: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト用: ゲートの強制 (`None` = env の解釈)。
+#[cfg(test)]
+pub(crate) fn mix_zc_set_for_test(v: Option<(bool, bool)>) {
+    MIX_ZC_FORCE.with(|c| c.set(v));
+}
+
+static MIX_ZC_X_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MIX_ZC_OUT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 実際に H2D を省いた回数 / D2H を省いた回数 (診断)。
+pub fn mix_zc_hits() -> (u64, u64) {
+    use std::sync::atomic::Ordering as AO;
+    (
+        MIX_ZC_X_HITS.load(AO::Relaxed),
+        MIX_ZC_OUT_HITS.load(AO::Relaxed),
+    )
+}
+
+pub fn mix_zc_reset() {
+    use std::sync::atomic::Ordering as AO;
+    MIX_ZC_X_HITS.store(0, AO::Relaxed);
+    MIX_ZC_OUT_HITS.store(0, AO::Relaxed);
+}
+
 /// task 282: `[mix-qchain]` 行に出す高速 GEMV の発火回数。
 pub fn mix_qk_hits() -> u64 {
     MIX_QK_HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -32464,8 +32801,16 @@ pub fn maybe_gpu_mix_q_chain_into(
             ho,
             stage,
             hstage,
+            xmap,
+            omap,
+            chk: dchk,
+            hchk,
             ..
         } = &mut *s;
+        // task 382: 鎖の両端の往復 (H2D xn / D2H mixed) を消すかの実値。
+        // H2D を消せるのは down/up が両方 v5 のときだけ (stage の前置きを
+        // 読むのは Blk / Seg のカーネルで、v5 は重みポインタを引数で受ける)。
+        let zc = mix_zc_enabled();
         // task 282: mix の GEMV を向きごとに選ぶ (`DENNO_MIX_QK`)。
         // seg_k 系は Q8_0 のときだけ (mix の実型)。形が合わなければ旧 GEMV。
         let (want_down, want_up) = mix_qk_enabled();
@@ -32510,6 +32855,32 @@ pub fn maybe_gpu_mix_q_chain_into(
             Scratch::ensure(stage, MIX_QK_PROLOGUE + k1 * 4)?;
             Scratch::ensure_pin(hstage, MIX_QK_PROLOGUE + k1 * 4)?;
         }
+        // task 382: device から見える pinned を用意する。確保に失敗したら
+        // その方向だけ従来経路へ落ちる (鎖そのものは止めない)。
+        let mut zc_x = zc.0 && down_kind == MixGemv::V5 && up_kind == MixGemv::V5;
+        let mut zc_out = zc.1;
+        if zc_x && MapMem::ensure(xmap, k1 * 4).is_err() {
+            zc_x = false;
+        }
+        if zc_out && MapMem::ensure(omap, e * 4).is_err() {
+            zc_out = false;
+        }
+        // task 382: silu + up + hc_mixed の融合版を撃つか (`DENNO_MIX_UPQ8`)。
+        // 形 (up が v5 / Q8_0 / n1 = 320 / hc = 4) が揃わなければ従来の 3 本。
+        let fu_pre: Option<u8> = {
+            let g = mix_upq8_on();
+            if g != 0
+                && fast_up
+                && up_kind == MixGemv::V5
+                && up_ty == crate::kquant::GgmlType::Q8_0
+                && mix_upq8_shape_ok(n1, e, hc)
+                && !zc_x
+            {
+                Some(g)
+            } else {
+                None
+            }
+        };
         let (dx, dlo, dout, dm) = (
             dx.as_ref().unwrap(),
             dlo.as_ref().unwrap(),
@@ -32517,7 +32888,13 @@ pub fn maybe_gpu_mix_q_chain_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
-        if need_stage {
+        if need_stage && zc_x {
+            // task 382: xn を device から見える pinned へ置くだけ (転送命令なし)。
+            dec_kprof::step("mix_h2d_pack", || {
+                let m = xmap.as_mut().expect("確保済み");
+                m.pin.as_mut_slice::<f32>()[..k1].copy_from_slice(xn);
+            });
+        } else if need_stage {
             // 前置き (重みポインタ 2 本 + segment 表 2 枚 + xn) を 1 本で送る。
             let st = stage.as_ref().expect("確保済み");
             let hs = hstage.as_mut().expect("確保済み");
@@ -32602,7 +32979,9 @@ pub fn maybe_gpu_mix_q_chain_into(
             dec_kprof::op_end(kp_cp);
         }
         // デバイス側の xn の置き場所 (down が高速なら前置きバッファの末尾)。
-        let xdev = if fast_down {
+        let xdev = if zc_x {
+            xmap.as_ref().expect("確保済み").dev
+        } else if fast_down {
             stage.as_ref().expect("確保済み").ptr() + off_x as u64
         } else {
             dx.ptr()
@@ -32669,7 +33048,55 @@ pub fn maybe_gpu_mix_q_chain_into(
                 return Err(anyhow::anyhow!("down の GEMV 計画が無い"));
             }
         }
-        // 2. lo_apply (silu(v * inv_hc)) — in-place
+        // task 382: silu + up + hc_mixed を 1 本に畳む (`DENNO_MIX_UPQ8`)。
+        // 形 (n1 = 320 / hc = 4 / Q8_0 / v5) と PTX が揃ったときだけ。
+        let upq8 = fu_pre.unwrap_or(0);
+        let loaded = fu_pre.is_some() && mix_upq8_kernels().is_some();
+        // fu_use: 融合版を出力に使う / fu_chk: 従来経路の出力と比べるだけ。
+        let fu_use = loaded && upq8 == 1;
+        let fu_chk = loaded && upq8 == 2;
+        let fu = fu_use || fu_chk;
+        if fu_chk {
+            Scratch::ensure(dchk, e * 4)?;
+            Scratch::ensure_pin(hchk, e * 4)?;
+        }
+        if fu {
+            let f = mix_upq8_kernels().expect("直前に確認").f;
+            let pout = if fu_use {
+                dm.ptr()
+            } else {
+                dchk.as_ref().expect("確保済み").ptr()
+            };
+            let (mut plo, mut pw2, mut pxn, mut pm2) = (dlo.ptr(), wu, xdev, pout);
+            let (mut ni2, mut ec2) = (n1 as c_int, e as c_int);
+            let mut inv2 = inv_hc;
+            let mut rb2 = ru.expect("形は検査済み") as c_int;
+            let mut args = [
+                &mut plo as *mut _ as *mut c_void,
+                &mut pw2 as *mut _ as *mut c_void,
+                &mut pxn as *mut _ as *mut c_void,
+                &mut pm2 as *mut _ as *mut c_void,
+                &mut ni2 as *mut _ as *mut c_void,
+                &mut ec2 as *mut _ as *mut c_void,
+                &mut inv2 as *mut _ as *mut c_void,
+                &mut rb2 as *mut _ as *mut c_void,
+            ];
+            let grid = (e.div_ceil(MIX_UPQ8_JC)).max(1) as u32;
+            unsafe {
+                ctx.launch_async(
+                    f,
+                    (grid, 1, 1),
+                    (MIX_UPQ8_THREADS, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+            if fu_use {
+                MIX_UPQ8_HITS.fetch_add(1, AO::Relaxed);
+            }
+        }
+        // 2. lo_apply (silu(v * inv_hc)) — in-place (融合版では fused が中で行う)
+        if !fu_use {
         unsafe {
             let (mut pv, mut nc) = (dlo.ptr(), n1 as c_int);
             let mut invc = inv_hc;
@@ -32681,8 +33108,9 @@ pub fn maybe_gpu_mix_q_chain_into(
             let grid = n1.div_ceil(THREADS_Q).max(1) as u32;
             ctx.launch_async(f_silu, (grid, 1, 1), (THREADS_Q as u32, 1, 1), 0, &mut args)?;
         }
+        }
         // 3. up (量子 GEMV)
-        if fast_up {
+        if !fu_use && fast_up {
             let st = stage.as_ref().expect("確保済み");
             let rb_u = ru.expect("形は検査済み");
             let fk = kern.expect("検査済み");
@@ -32744,33 +33172,41 @@ pub fn maybe_gpu_mix_q_chain_into(
                     )?;
                 }
             }
-        } else {
+        } else if !fu_use {
             let ok = ctx.moe_gemv_dev_ptrs(up_ty, wu, dlo.ptr(), dout.ptr(), n1, n2)?;
             if !ok {
                 return Err(anyhow::anyhow!("up の GEMV 計画が無い"));
             }
         }
         // 4. hc_mixed (xn と gate から mixed)
-        unsafe {
-            let (mut px, mut pg, mut pm) = (xdev, dout.ptr(), dm.ptr());
-            let (mut ec, mut hcc) = (e as c_int, hc as c_int);
-            let mut invc2 = inv_hc;
-            let mut args = [
-                &mut px as *mut _ as *mut c_void,
-                &mut pg as *mut _ as *mut c_void,
-                &mut pm as *mut _ as *mut c_void,
-                &mut ec as *mut _ as *mut c_void,
-                &mut hcc as *mut _ as *mut c_void,
-                &mut invc2 as *mut _ as *mut c_void,
-            ];
-            let grid = (e.div_ceil(MIXED_THREADS).max(1)) as u32;
-            ctx.launch_async(
-                f_mixed,
-                (grid, 1, 1),
-                (MIXED_THREADS as u32, 1, 1),
-                0,
-                &mut args,
-            )?;
+        // task 382: zc_out のときはホストの pinned へ直接書く (D2H を消す)。
+        let mdev = if zc_out {
+            omap.as_ref().expect("確保済み").dev
+        } else {
+            dm.ptr()
+        };
+        if !fu_use {
+            unsafe {
+                let (mut px, mut pg, mut pm) = (xdev, dout.ptr(), mdev);
+                let (mut ec, mut hcc) = (e as c_int, hc as c_int);
+                let mut invc2 = inv_hc;
+                let mut args = [
+                    &mut px as *mut _ as *mut c_void,
+                    &mut pg as *mut _ as *mut c_void,
+                    &mut pm as *mut _ as *mut c_void,
+                    &mut ec as *mut _ as *mut c_void,
+                    &mut hcc as *mut _ as *mut c_void,
+                    &mut invc2 as *mut _ as *mut c_void,
+                ];
+                let grid = (e.div_ceil(MIXED_THREADS).max(1)) as u32;
+                ctx.launch_async(
+                    f_mixed,
+                    (grid, 1, 1),
+                    (MIXED_THREADS as u32, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
         }
         // task 364: ルータ GEMV を鎖の末尾に 1 発積む。
         // task 307 の `DENNO_ROUTER_IN_MIX` は BF16 の chain2 / chain3 にしか
@@ -32779,25 +33215,50 @@ pub fn maybe_gpu_mix_q_chain_into(
         // していた。入力は `dm` (= `mixed` のデバイスコピー) をそのまま読み、
         // D2H は下の鎖の同期 (イベント 1 本) でまとめて待つ。載らなければ従来経路が
         // 別途走る (同じカーネル・同じ入力なので値は変わらない)。
-        let enq = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
+        let enq = router_in_mix_enqueue(ctx, mdev, e, &mut router_w);
         if enq != 0 {
             ROUTER_IN_QCHAIN_HITS.fetch_add(1, AO::Relaxed);
         }
-        let kp_cp = dec_kprof::op_begin(
-            || "D2H@a".to_string(),
-            (0, 0, 0),
-            (0, 0, 0),
-            0,
-            e * 4,
-        );
-        unsafe {
-            check(
-                (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
-                "cuMemcpyDtoHAsync (mix q chain)",
-            )?;
+        if !zc_out {
+            let kp_cp = dec_kprof::op_begin(
+                || "D2H@a".to_string(),
+                (0, 0, 0),
+                (0, 0, 0),
+                0,
+                e * 4,
+            );
+            unsafe {
+                check(
+                    (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (mix q chain)",
+                )?;
+            }
+            dec_kprof::op_end(kp_cp);
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
-        dec_kprof::op_end(kp_cp);
-        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        // task 382: 比較モードでは融合版の出力も戻す (同じ待ちで 1 本増やすだけ)。
+        if fu_chk {
+            let kp_cp = dec_kprof::op_begin(
+                || "D2H@a".to_string(),
+                (0, 0, 0),
+                (0, 0, 0),
+                0,
+                e * 4,
+            );
+            unsafe {
+                check(
+                    (lib.memcpy_dtoh_async)(
+                        hchk.as_ref().expect("確保済み").ptr,
+                        dchk.as_ref().expect("確保済み").ptr(),
+                        e * 4,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyDtoHAsync (mix upq8 check)",
+                )?;
+            }
+            dec_kprof::op_end(kp_cp);
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
         if fast_down || fast_up {
             MIX_QK_HITS.fetch_add(1, AO::Relaxed);
         }
@@ -32818,8 +33279,43 @@ pub fn maybe_gpu_mix_q_chain_into(
         // task 364: 鎖に積んだルータ GEMV の重み参照を手放す (同期の後)。
         drop(router_w);
         dec_kprof::step("mix_pack", || {
-            out.copy_from_slice(&ho.as_slice::<f32>()[..e])
+            if zc_out {
+                // task 382: hc_mixed がホストの pinned へ直接書いている。
+                let m = omap.as_ref().expect("確保済み");
+                out.copy_from_slice(&m.pin.as_slice::<f32>()[..e]);
+            } else {
+                out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+            }
         });
+        // task 382: 比較モード (`DENNO_MIX_UPQ8=check`) — 従来の 3 本の出力
+        // (`ho`) と融合版の出力 (`hchk`) を突き合わせる。値を変えないので
+        // テキストと md5 は従来経路のまま。
+        if fu_chk {
+            let a = ho.as_slice::<f32>();
+            let b = hchk.as_ref().expect("確保済み").as_slice::<f32>();
+            let mut worst = 0.0f64;
+            let mut worst_ref = 0.0f64;
+            let mut bad = 0u64;
+            for i in 0..e {
+                let (x, y) = (a[i] as f64, b[i] as f64);
+                let d = (x - y).abs();
+                if d > worst {
+                    worst = d;
+                    worst_ref = x.abs();
+                }
+                if d > 1e-4 + 1e-5 * x.abs() {
+                    bad += 1;
+                }
+            }
+            mix_upq8_note_check(worst, worst_ref, bad, e as u64);
+        }
+        // task 382: 発火の証拠 (PROFILE の `[mix-zc]` 行のもと)。
+        if zc_x {
+            MIX_ZC_X_HITS.fetch_add(1, AO::Relaxed);
+        }
+        if zc_out {
+            MIX_ZC_OUT_HITS.fetch_add(1, AO::Relaxed);
+        }
         Ok(())
     });
     match r {
@@ -42835,6 +43331,63 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
         // 未知の値は既定へ (切り戻しは 0)。
         assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::V5, MixGemv::V5));
+    }
+
+    /// task 382: `DENNO_MIX_UPQ8` の真理値表と形の門番。
+    /// t382b で採ったので既定 on、明示的な偽値だけが従来経路。
+    #[test]
+    fn mix_upq8_gate_and_shape() {
+        assert_eq!(mix_upq8_from_value(None), 1, "未設定は融合 (既定 on)");
+        assert_eq!(mix_upq8_from_value(Some("nope")), 1, "未知も既定 on");
+        assert_eq!(mix_upq8_from_value(Some("")), 0, "空文字は切り戻し");
+        assert_eq!(mix_upq8_from_value(Some("0")), 0);
+        assert_eq!(mix_upq8_from_value(Some("off")), 0);
+        assert_eq!(mix_upq8_from_value(Some("NO")), 0);
+        assert_eq!(mix_upq8_from_value(Some("1")), 1);
+        assert_eq!(mix_upq8_from_value(Some("on")), 1);
+        assert_eq!(mix_upq8_from_value(Some("CHECK")), 2);
+        assert_eq!(mix_upq8_from_value(Some("2")), 2);
+        // 形の門番: 実形 (n_in = 320 / hc = 4) だけ通す。
+        assert!(mix_upq8_shape_ok(320, 2560, 4));
+        assert!(!mix_upq8_shape_ok(320, 0, 4));
+        assert!(!mix_upq8_shape_ok(320, 2560, 8), "hc は 4 だけ");
+        assert!(!mix_upq8_shape_ok(256, 2560, 4), "n_in は 64*5 だけ");
+        assert!(!mix_upq8_shape_ok(384, 2560, 4));
+        // check の集計は積んでいなければ None。
+        assert!(mix_upq8_check_line().is_none());
+    }
+
+    /// task 382: `DENNO_MIX_ZC` の真理値表。既定は off (従来の H2D + D2H)。
+    /// `x` / `out` で片側ずつ、`1` / `both` で両側を消す。
+    #[test]
+    fn mix_zc_gate_defaults_off_and_parses_explicitly() {
+        assert_eq!(mix_zc_from_value(None), (false, false), "未設定は従来経路");
+        assert_eq!(mix_zc_from_value(Some("")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("0")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("off")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("NO")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("x")), (true, false));
+        assert_eq!(mix_zc_from_value(Some(" IN ")), (true, false));
+        assert_eq!(mix_zc_from_value(Some("out")), (false, true));
+        assert_eq!(mix_zc_from_value(Some("1")), (true, true));
+        assert_eq!(mix_zc_from_value(Some("both")), (true, true));
+        assert_eq!(mix_zc_from_value(Some("ON")), (true, true));
+        // 未知の値は既定 (従来経路) へ倒す。
+        assert_eq!(mix_zc_from_value(Some("nope")), (false, false));
+    }
+
+    /// task 382: ZC のゲートを立てても、CUDA が無い環境では鎖そのものが
+    /// 走らないので H2D/D2H を省いた回数は 0 のまま (fail soft)。
+    #[test]
+    fn mix_zc_hits_stay_zero_without_cuda_chain() {
+        mix_zc_reset();
+        let (x, o) = mix_zc_hits();
+        assert_eq!((x, o), (0, 0));
+        // ゲートの強制はスレッド局所なので、他のテストの env 解釈を汚さない。
+        mix_zc_set_for_test(Some((true, true)));
+        assert_eq!(mix_zc_enabled(), (true, true));
+        mix_zc_set_for_test(None);
+        assert_eq!(mix_zc_hits(), (0, 0), "鎖が走らないので数えない");
     }
 
     /// task 286: v5 形の起動計画。UD の mix の実形 (down 10240->320 / up 320->10240)

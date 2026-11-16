@@ -651,6 +651,27 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
             eprintln!("{line}");
         }
     }
+    // task 382: silu + up + hc_mixed の融合版 (`DENNO_MIX_UPQ8`) の発火回数と、
+    // `=check` の比較結果 (積んでいるときだけ)。
+    {
+        let n = denno_engine::cuda::mix_upq8_hits();
+        if n != 0 {
+            eprintln!("[mix-upq8] fused={n} ({tag})");
+            denno_engine::cuda::mix_upq8_reset();
+        }
+        if let Some(line) = denno_engine::cuda::mix_upq8_check_line() {
+            eprintln!("{line}");
+        }
+    }
+    // task 382: mix の鎖から H2D / D2H を消した回数 (`DENNO_MIX_ZC` のときだけ)。
+    // ここが 0 のままなら鎖は従来経路で、測った数字は ZC の効果ではない。
+    {
+        let (zx, zo) = denno_engine::cuda::mix_zc_hits();
+        if zx != 0 || zo != 0 {
+            eprintln!("[mix-zc] no_h2d={zx} no_d2h={zo} ({tag})");
+            denno_engine::cuda::mix_zc_reset();
+        }
+    }
     // task 187: decode の IQ expert 段の層内 GPU 時間 (PROFILE のときだけ)。
     if tag == "decode" {
         for line in denno_engine::model::q4ledger::dec_exp_kprof_lines() {
