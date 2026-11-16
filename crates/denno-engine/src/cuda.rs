@@ -29659,22 +29659,7 @@ pub fn pf_full_qkv(
                 )?;
             }
         }
-        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (直後の `to_slice` が
-        // 同じストリームの完了を待つ同期 D2H)。
-        pf_chain_sync(&ctx)?;
-        // 4. k / v だけ戻す (ホストの KV が正)
-        //    task 181: `DENNO_PF_D2H_DIRECT` なら中間 Vec を作らず caller の
-        //    バッファへ直接 D2H する (値は同じ。毎チャンク 2 x 1 MB の確保を消す)。
-        if pf_d2h_direct_on() {
-            kdb.to_slice(&mut k_out[..nt * kv])?;
-            vdb.to_slice(&mut v_out[..nt * kv])?;
-        } else {
-            let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
-            k_out.copy_from_slice(&kgot);
-            let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
-            v_out.copy_from_slice(&vgot);
-        }
-        // 5. task 181: ミラーへは**チャンクの行だけ**を直接書く (D2D)。
+        // 4. task 181: ミラーへは**チャンクの行だけ**を直接書く (D2D)。
         //    ミラーが行 [0, pos0) を持っていない (最初のチャンク・世代が変わった)
         //    ときは `Err` が返るので、`pf_full_out` が従来の H2D 経路へ戻る。
         //    ここで失敗しても値は壊れない (ホストの KV は既に積んである)。
@@ -29685,6 +29670,35 @@ pub fn pf_full_qkv(
             ) {
                 Ok(_) => staged = Some((cache_id, layer, gen, t_total)),
                 Err(e) => pf2_warn(&format!("full qkv: ミラーへの直接書き: {e:#}")),
+            }
+        }
+        // 5. k / v だけ戻す (ホストの KV が正)
+        //    task 369: ミラーへ直書きできたときは non-blocking の `DtoHAsync` で
+        //    pinned に積む (`DENNO_PF_KV_ASYNC`)。待つのは `AttnCache::push` の
+        //    直前 (`pf_kv_wb_copy_into`) まで。同期 `cuMemcpyDtoH` は呼び出しで
+        //    コンテキスト全体を待つので、168 回の待ちが full 段の露出になっていた。
+        let mut async_started = false;
+        if staged.is_some() && pf_kv_async_on() {
+            match pf_kv_wb_begin(kdb.ptr(), vdb.ptr(), nt * kv * 4, nt * kv * 4) {
+                Ok(true) => async_started = true,
+                Ok(false) => {}
+                Err(e) => pf2_warn(&format!("full qkv: KV の非同期 D2H: {e:#}")),
+            }
+        }
+        if !async_started {
+            // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (直後の `to_slice` が
+            // 同じストリームの完了を待つ同期 D2H)。
+            pf_chain_sync(&ctx)?;
+            //    task 181: `DENNO_PF_D2H_DIRECT` なら中間 Vec を作らず caller の
+            //    バッファへ直接 D2H する (値は同じ。毎チャンク 2 x 1 MB の確保を消す)。
+            if pf_d2h_direct_on() {
+                kdb.to_slice(&mut k_out[..nt * kv])?;
+                vdb.to_slice(&mut v_out[..nt * kv])?;
+            } else {
+                let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
+                k_out.copy_from_slice(&kgot);
+                let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
+                v_out.copy_from_slice(&vgot);
             }
         }
         d.mir = staged;
@@ -29996,20 +30010,7 @@ pub fn pf_full_qkv_fused(
                 ctx.launch_async(kr3.gather, (nt as u32, 1, 1), (kv as u32, 1, 1), 0, &mut args)?;
             }
         }
-        // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (直後の `to_slice` が
-        // 同じストリームの完了を待つ同期 D2H)。
-        pf_chain_sync(&ctx)?;
-        // 5. k / v だけ戻す (ホストの KV が正。値は従来経路と同じ)
-        if pf_d2h_direct_on() {
-            kdb.to_slice(&mut k_out[..nt * kv])?;
-            vdb.to_slice(&mut v_out[..nt * kv])?;
-        } else {
-            let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
-            k_out.copy_from_slice(&kgot);
-            let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
-            v_out.copy_from_slice(&vgot);
-        }
-        // 6. ミラーへはチャンクの行だけを直接書く (D2D。`DENNO_PF_MIRROR_DELTA`)
+        // 5. ミラーへはチャンクの行だけを直接書く (D2D。`DENNO_PF_MIRROR_DELTA`)
         let mut staged = None;
         if pf_mirror_delta_on() {
             match q4_attn_mirror_stage_dev(
@@ -30017,6 +30018,31 @@ pub fn pf_full_qkv_fused(
             ) {
                 Ok(_) => staged = Some((cache_id, layer, gen, t_total)),
                 Err(e) => pf2_warn(&format!("full qkv (融合): ミラーへの直接書き: {e:#}")),
+            }
+        }
+        // 6. k / v だけ戻す (ホストの KV が正。値は従来経路と同じ)
+        //    task 369: ミラーへ直書きできたときは non-blocking で積む
+        //    (`DENNO_PF_KV_ASYNC`。待つのは `pf_kv_wb_copy_into` まで)。
+        let mut async_started = false;
+        if staged.is_some() && pf_kv_async_on() {
+            match pf_kv_wb_begin(kdb.ptr(), vdb.ptr(), nt * kv * 4, nt * kv * 4) {
+                Ok(true) => async_started = true,
+                Ok(false) => {}
+                Err(e) => pf2_warn(&format!("full qkv (融合): KV の非同期 D2H: {e:#}")),
+            }
+        }
+        if !async_started {
+            // task 334: `DENNO_PF_ATTN_NOSYNC` なら待たない (直後の `to_slice` が
+            // 同じストリームの完了を待つ同期 D2H)。
+            pf_chain_sync(&ctx)?;
+            if pf_d2h_direct_on() {
+                kdb.to_slice(&mut k_out[..nt * kv])?;
+                vdb.to_slice(&mut v_out[..nt * kv])?;
+            } else {
+                let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
+                k_out.copy_from_slice(&kgot);
+                let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
+                v_out.copy_from_slice(&vgot);
             }
         }
         d.mir = staged;
@@ -30157,6 +30183,212 @@ pub(crate) const ATTN_PF3_DH: usize = 256;
 /// v3 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid y の分母)。
 pub(crate) const ATTN_PF3_BQ: usize = 64;
 
+// ---------------------------------------------------------------------------
+// task 369: full 層の K/V 書き戻しを非同期にする (`DENNO_PF_KV_ASYNC`)
+// ---------------------------------------------------------------------------
+//
+// `pf_full_qkv` / `pf_full_qkv_fused` は k/v を `cuMemcpyDtoH` (同期) で
+// ホストへ戻していた。この API は**呼び出しの時点でコンテキスト全体の完了を
+// 待つ**ので、14k の prefill では「層 x チャンク」= 168 回の待ちが `full` 段の
+// 露出になる (t365a b2_1 の台帳: full wall 1,157.3 / busy 793.1 /
+// exposed 364.2 ms、d2h 689.01 MB / 168 呼び出し)。
+//
+// ホストの KV は `pf_full_out` の後、`AttnCache::push` まで読まれない
+// (ミラーへ直書きできたときは `pf_full_out` も読まない)。そこで k/v を pinned へ
+// `cuMemcpyDtoHAsync` (同じ null ストリーム = カーネルの後ろ) で積み、実際に
+// 読む直前にイベントで待つ。**デバイスから出るバイト列は同じ**で、ホストへ
+// 載る順序だけが変わる (値は不変)。
+//
+// ゲート: `DENNO_PF_KV_ASYNC` (明示的な真値だけ on)。
+pub(crate) fn pf_kv_async_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+#[cfg(test)]
+static PF_KV_ASYNC_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_kv_async_for_test(v: Option<bool>) {
+    PF_KV_ASYNC_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// k/v の書き戻しを非同期にするか。
+pub(crate) fn pf_kv_async_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_KV_ASYNC_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_kv_async_from_value(std::env::var("DENNO_PF_KV_ASYNC").ok().as_deref()))
+}
+
+/// 非同期の k/v 書き戻しの置き場 (スレッド局所・grow-only)。
+struct KvWbSc {
+    pin: Option<PinMem>,
+    ev: Option<CUevent>,
+    /// 保留中のバイト数 (k, v)。(0, 0) で保留なし。
+    bytes: (usize, usize),
+}
+
+thread_local! {
+    static KV_WB_SC: std::cell::RefCell<KvWbSc> = const {
+        std::cell::RefCell::new(KvWbSc { pin: None, ev: None, bytes: (0, 0) })
+    };
+}
+
+/// 保留中の k/v 書き戻しがあるか。
+pub fn pf_kv_wb_pending() -> bool {
+    KV_WB_SC.with(|c| c.borrow().bytes.0 > 0)
+}
+
+/// k/v を pinned へ非同期で積む (ストリーム順序。待たない)。
+///
+/// `Ok(false)` = 積まなかった (ゲート off / イベントが取れない / 既に保留あり)。
+fn pf_kv_wb_begin(
+    kptr: CUdeviceptr,
+    vptr: CUdeviceptr,
+    k_bytes: usize,
+    v_bytes: usize,
+) -> Result<bool> {
+    if !pf_kv_async_on() || k_bytes == 0 || v_bytes == 0 {
+        return Ok(false);
+    }
+    let lib = lib()?;
+    let (Some(create), Some(record)) = (lib.event_create, lib.event_record) else {
+        return Ok(false);
+    };
+    KV_WB_SC.with(|cell| -> Result<bool> {
+        let mut s = cell.borrow_mut();
+        if s.bytes.0 > 0 {
+            return Ok(false);
+        }
+        let total = k_bytes + v_bytes;
+        let need = !matches!(&s.pin, Some(p) if p.bytes >= total);
+        if need {
+            s.pin = Some(PinMem::alloc(total)?);
+        }
+        let base = s.pin.as_ref().expect("確保済み").ptr as usize;
+        unsafe {
+            check(
+                (lib.memcpy_dtoh_async)(base as *mut c_void, kptr, k_bytes, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (full k)",
+            )?;
+            check(
+                (lib.memcpy_dtoh_async)(
+                    (base + k_bytes) as *mut c_void,
+                    vptr,
+                    v_bytes,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (full v)",
+            )?;
+        }
+        if s.ev.is_none() {
+            let mut ev: CUevent = std::ptr::null_mut();
+            if unsafe { create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                return Ok(false);
+            }
+            s.ev = Some(ev);
+        }
+        let ev = s.ev.expect("作成済み");
+        if unsafe { record(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            return Ok(false);
+        }
+        s.bytes = (k_bytes, v_bytes);
+        Ok(true)
+    })
+}
+
+/// 保留中の転送を待って `k_out` / `v_out` へ写す。`false` = 保留なし。
+pub fn pf_kv_wb_copy_into(k_out: &mut [f32], v_out: &mut [f32]) -> bool {
+    KV_WB_SC.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let (kb, vb) = s.bytes;
+        if kb == 0 {
+            return false;
+        }
+        let (kf, vf) = (kb / 4, vb / 4);
+        let Some(pin) = s.pin.as_ref() else {
+            s.bytes = (0, 0);
+            return false;
+        };
+        let base = pin.ptr as usize;
+        if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
+            unsafe {
+                let _ = (esync)(ev);
+            }
+        }
+        s.bytes = (0, 0);
+        if k_out.len() < kf || v_out.len() < vf {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(base as *const u8, k_out.as_mut_ptr() as *mut u8, kb);
+            std::ptr::copy_nonoverlapping(
+                (base + kb) as *const u8,
+                v_out.as_mut_ptr() as *mut u8,
+                vb,
+            );
+        }
+        true
+    })
+}
+
+/// 保留を捨てる (デバイスのコピー完了は待つ)。`false` = 保留なし。
+pub fn pf_kv_wb_discard() -> bool {
+    KV_WB_SC.with(|cell| {
+        let mut s = cell.borrow_mut();
+        if s.bytes.0 == 0 {
+            return false;
+        }
+        if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
+            unsafe {
+                let _ = (esync)(ev);
+            }
+        }
+        s.bytes = (0, 0);
+        true
+    })
+}
+
+/// `pf_full_out` がミラーから読める状態か (= ホスト KV を読まない)。
+///
+/// `pf_full_qkv` が記録した `mir` が一致し、かつミラーが生きているときだけ
+/// `true`。呼び出し側はこのときだけ `AttnCache::push` を後ろへ回してよい。
+/// 偽を返したときは従来どおり「ホスト KV を先に積む」経路へ戻る (安全側)。
+pub fn pf_full_mirror_direct(
+    cache_id: u64,
+    layer: usize,
+    gen: u64,
+    t_total: usize,
+    kv_dim: usize,
+) -> bool {
+    if !pf_kv_async_on() {
+        return false;
+    }
+    let staged = PF2_DEV.with(|c| c.borrow().mir);
+    let direct = matches!(
+        staged,
+        Some((cid, li, g, tt)) if cid == cache_id && li == layer && g == gen && tt == t_total
+    );
+    direct && q4_attn_mirror_ready(cache_id, kv_dim, layer, gen, t_total).is_some()
+}
+
 /// task 172: full 層 1 チャンクの後半 (attention → 出力ゲート → 出力投影)。
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
@@ -30192,6 +30424,14 @@ pub fn pf_full_out(
 ) -> bool {
     pf2_set_nt(nt);
     let qd = heads * dh;
+    // task 369: ミラーへ直書きできていればここでホスト KV を読まない。
+    // `DENNO_PF_KV_ASYNC` は k/v の D2H を `AttnCache::push` の直前まで遅らせる
+    // ので、そのときはホスト KV の長さを要求しない (`k_cpu` はまだ短い)。
+    let staged_mir = PF2_DEV.with(|c| c.borrow().mir);
+    let mirror_direct = matches!(
+        staged_mir,
+        Some((cid, li, g, tt)) if cid == cache_id && li == layer && g == gen && tt == t_total
+    );
     let ok_shape = nt >= PF2_MIN_ROWS
         && dh >= ATTN_PF_BQ
         && dh <= 1024
@@ -30200,8 +30440,8 @@ pub fn pf_full_out(
         && heads % group == 0
         && kv_dim == (heads / group) * dh
         && pos0 + nt == t_total
-        && k_cpu.len() >= t_total * kv_dim
-        && v_cpu.len() >= t_total * kv_dim
+        && (mirror_direct || k_cpu.len() >= t_total * kv_dim)
+        && (mirror_direct || v_cpu.len() >= t_total * kv_dim)
         && wo.k == qd
         && wo.n == e
         && (keep_dev || out.len() == nt * e);
@@ -30232,11 +30472,7 @@ pub fn pf_full_out(
     let r = (|| -> Result<()> {
         // task 181: `pf_full_qkv` がミラーへ直接書いていれば H2D をしない
         // (`DENNO_PF_MIRROR_DELTA`)。台帳が一致しないときは従来の差分 H2D。
-        let staged = PF2_DEV.with(|c| c.borrow().mir);
-        let mirror_direct = matches!(
-            staged,
-            Some((cid, li, g, tt)) if cid == cache_id && li == layer && g == gen && tt == t_total
-        );
+        // task 369: 判定は `ok_shape` の前へ出した (上の `mirror_direct`)。
         let (kptr, vptr) = match mirror_direct {
             true => match q4_attn_mirror_ready(cache_id, kv_dim, layer, gen, t_total) {
                 Some(p) => p,
@@ -57508,5 +57744,53 @@ mod task318_tests {
         assert_eq!(q::SUB_NAMES.len(), q::SUB_N);
         assert!(q::SUB_RES_UP < q::SUB_N);
         assert!(q::SUB_LM_PARK < q::SUB_N);
+    }
+
+    /// task 369: `DENNO_PF_KV_ASYNC` の解釈 (明示的な真値だけ on)。
+    #[test]
+    fn t369_kv_async_gate_truth_table() {
+        for raw in [
+            None,
+            Some(""),
+            Some(" 0 "),
+            Some("off"),
+            Some("FALSE"),
+            Some("no"),
+            Some("x"),
+        ] {
+            assert!(!pf_kv_async_from_value(raw), "raw={raw:?} が on になっている");
+        }
+        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
+            assert!(pf_kv_async_from_value(raw), "raw={raw:?} が off になっている");
+        }
+        assert!(!pf_kv_async_from_value(None), "既定が on になっている");
+    }
+
+    /// task 369: 保留が無いときの `pf_kv_wb_copy_into` / `pf_kv_wb_discard` は
+    /// 何もせず false を返す (値を 1 バイトも触らない)。
+    #[test]
+    fn t369_kv_wb_copy_without_pending_touches_nothing() {
+        let mut k = [1.5f32, -2.0, 3.25];
+        let mut v = [7.0f32, 8.0, 9.0];
+        let before_k = k;
+        let before_v = v;
+        assert!(!pf_kv_wb_pending(), "最初から保留がある");
+        assert!(!pf_kv_wb_copy_into(&mut k, &mut v), "保留なしで true を返した");
+        assert_eq!(k, before_k, "保留なしで k を書き換えた");
+        assert_eq!(v, before_v, "保留なしで v を書き換えた");
+        assert!(!pf_kv_wb_discard(), "保留なしで true を返した");
+    }
+
+    /// task 369: ゲートが off なら積まない (pinned の確保もしない)。
+    #[test]
+    fn t369_kv_wb_begin_is_gated() {
+        set_pf_kv_async_for_test(Some(false));
+        assert!(!pf_kv_async_on());
+        assert!(
+            matches!(pf_kv_wb_begin(1, 2, 64, 64), Ok(false)),
+            "ゲート off で積もうとした"
+        );
+        assert!(!pf_kv_wb_pending(), "ゲート off なのに保留が立った");
+        set_pf_kv_async_for_test(None);
     }
 }

@@ -11285,3 +11285,69 @@ fn t357_ple_threads_gate_is_wired_to_the_pool() {
         "32 本固定が残っている"
     );
 }
+
+/// task 369: full 層の K/V 書き戻しの非同期化 (`DENNO_PF_KV_ASYNC`) の配線。
+///
+/// 緑は発火の証拠ではないので、ここでは字面で
+/// 1. 同期 `to_slice` が「非同期を積まなかった枝」の内側にだけある、
+/// 2. 非同期の開始が「ミラーへ直書きできたとき」に限られている、
+/// 3. `pf_full_out` がミラー直書きのときホスト KV の長さを要求しない、
+/// 4. 呼び出し側が `AttnCache::push` を `pf_full_out` の後ろへ回す分岐を持つ、
+/// 5. 積んだ転送を必ず回収する (copy か discard) ことを確かめる。
+/// 発火そのものは lab の台帳 (`full` の d2h 呼び出し数) で数える。
+#[test]
+fn t369_kv_async_is_wired_and_off_by_default() {
+    use denno_engine::cuda::pf_kv_wb_pending;
+    const ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
+    assert!(!pf_kv_wb_pending(), "起動直後に保留がある");
+    // 同期 D2H は 2 箇所 (pf_full_qkv / _fused)。どちらも `!async_started` の内側。
+    assert_eq!(
+        CUDA_RS
+            .matches("kdb.to_slice(&mut k_out[..nt * kv])?")
+            .count(),
+        2,
+        "同期 D2H の箇所が 2 つでない"
+    );
+    assert_eq!(
+        CUDA_RS.matches("if !async_started {").count(),
+        2,
+        "非同期の分岐が 2 箇所に無い"
+    );
+    assert_eq!(
+        CUDA_RS.matches("if staged.is_some() && pf_kv_async_on() {").count(),
+        2,
+        "非同期の開始条件が 2 箇所に無い"
+    );
+    assert!(
+        CUDA_RS.contains("(mirror_direct || k_cpu.len() >= t_total * kv_dim)"),
+        "pf_full_out がミラー直書きのときもホスト KV を要求している"
+    );
+    assert!(
+        CUDA_RS.contains("if !pf_kv_async_on() {"),
+        "pf_full_mirror_direct にゲートが無い"
+    );
+    // 呼び出し側: 遅延の判定と、pf_full_out の後ろの push。
+    assert!(
+        ATTN_SRC.contains("let wb_deferred = crate::cuda::pf_full_mirror_direct("),
+        "呼び出し側に遅延の判定が無い"
+    );
+    let out_pos = ATTN_SRC
+        .find("let done = crate::cuda::pf_full_out(")
+        .expect("pf_full_out の呼び出しが無い");
+    let defer_pos = ATTN_SRC
+        .find("if wb_deferred {")
+        .expect("遅延 push の分岐が無い");
+    assert!(defer_pos > out_pos, "遅延 push が pf_full_out より前にある");
+    // 回収: 先に積む枝と後ろへ回す枝の両方で copy し、落ちた枝では捨てる。
+    assert_eq!(
+        ATTN_SRC
+            .matches("crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);")
+            .count(),
+        2,
+        "copy_into の呼び出しが 2 箇所でない"
+    );
+    assert!(
+        ATTN_SRC.contains("crate::cuda::pf_kv_wb_discard();"),
+        "落ちた枝で保留を捨てていない"
+    );
+}
