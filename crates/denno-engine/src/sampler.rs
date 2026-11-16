@@ -240,7 +240,7 @@ pub struct Sampler {
 }
 
 /// task 368: `DENNO_ARGMAX_FAST` — greedy の argmax を 8 本の部分最大に分ける
-/// (既定 off)。
+/// (既定 on。lab t368b で採否 yes、`=0` で素直な比較鎖に戻る)。
 ///
 /// 素直な 1 本の比較鎖 (`v > best_v`) は語彙 248320 で実測 **0.11 ms/token**
 /// (`[q4prof] sample` 14.6 ms / 128 tok)。8 本に分けると 3-4x 速くなる。
@@ -348,7 +348,7 @@ impl Sampler {
     pub fn sample(&mut self, logits: &[f32]) -> usize {
         // greedy (P8 でも不変)
         if self.temperature <= 0.0 {
-            // task 368: `DENNO_ARGMAX_FAST` (既定 off)。8 本の部分最大に分ける。
+            // task 368: `DENNO_ARGMAX_FAST` (既定 on)。8 本の部分最大に分ける。
             // 語彙 248320 で素直な比較鎖は実測 0.11 ms/token (`[q4prof] sample`)。
             // **返す添字は従来と同一** (同じ最大値の最初の添字)。
             if argmax_fast_enabled() {

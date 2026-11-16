@@ -527,14 +527,15 @@ fn bump_par_calls() {
 // ---- task 368: decode の mix norm を 4 本アキュムレータで足す --------------------
 
 /// task 368: `DENNO_HC_NORM_QUAD` — decode (`nt == 1`) の RMS の二乗和を
-/// **4 本のアキュムレータ**で足す (既定 off)。
+/// **4 本のアキュムレータ**で足す (既定 on。lab t368a/t368b で採否 yes、`=0` で戻せる)。
 ///
 /// 逐次和 (`src.iter().map(|v| v * v).sum::<f32>()`) は `n_embd` 要素の依存の鎖で、
 /// 実測 (このコンテナの Ryzen 8700G、hc=4 / n_embd=2560) では 1 群 0.95 us・
 /// `grouped_rms_norm_batch_into` 1 回 **4.24 us**。4 本に分けると 1 回 1.38 us に
 /// なる (差 2.86 us x 97 回/token = 0.28 ms/token の見積り)。
 ///
-/// **丸め順が変わる** (二乗和が数 ulp 動く) ので既定 off。prefill (`nt > 1`) は
+/// **丸め順が変わる** (二乗和が数 ulp 動く)。採否は lab で yes なので既定 on
+/// (`=0` で逐次和に戻る)。prefill (`nt > 1`) は
 /// 従来の逐次和のまま = ビット不変。
 pub const HC_NORM_QUAD_ENV: &str = "DENNO_HC_NORM_QUAD";
 
@@ -647,7 +648,7 @@ pub fn grouped_rms_norm_batch_into(
             let gamma = &w_norm[s * e..(s + 1) * e];
             // `crate::tensor::rmsnorm` と同じ丸め順 (逐次二乗和 → rsqrt → x*inv*w)。
             // task 368: decode (`nt == 1`) だけ 4 本アキュムレータの和に替えられる
-            // (`DENNO_HC_NORM_QUAD`、既定 off = 逐次和のまま)。丸め順が変わる。
+            // (`DENNO_HC_NORM_QUAD`、既定 on。`=0` で逐次和のまま)。丸め順が変わる。
             let ss = if quad {
                 sq_sum_quad(src)
             } else {
@@ -1238,7 +1239,7 @@ mod tests {
     ///
     /// ---
     ///
-    /// task 368: `DENNO_HC_NORM_QUAD` の解釈 (既定 off、明示的な真偽だけ)。
+    /// task 368: `DENNO_HC_NORM_QUAD` の解釈 (既定 on、明示的な真偽だけ)。
     #[test]
     fn hc_norm_quad_gate_reads_only_explicit_values() {
         assert_eq!(hc_norm_quad_from_value(None), HC_NORM_QUAD_DEFAULT, "未設定は既定");
