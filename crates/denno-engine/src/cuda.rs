@@ -15858,6 +15858,70 @@ impl PinMem {
     fn as_mut_slice<T>(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.bytes / std::mem::size_of::<T>()) }
     }
+
+    /// task 382: **device から直接見える** pinned (`CU_MEMHOSTALLOC_DEVICEMAP`)。
+    ///
+    /// 返り値の `CUdeviceptr` は同じホストメモリを指すので、カーネルは
+    /// H2D 無しでこれを読み、D2H 無しでこれへ書ける (PCIe 越しの読み書きは
+    /// ユニファイドアドレスで透過)。mix の鎖は 1 回 5.7 us の H2D と 2.6 us の
+    /// D2H を払っていたので、そこを消すための器。
+    ///
+    /// DEVICEMAP が付かない環境 (古い driver / WSL など) では `Err` を返し、
+    /// 呼び出し側は従来の H2D / D2H 経路へ落ちる (fail closed)。
+    fn alloc_mapped(bytes: usize) -> Result<(Self, CUdeviceptr)> {
+        const CU_MEMHOSTALLOC_PORTABLE: u32 = 0x01;
+        const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
+        let bytes = bytes.max(1);
+        let lib = lib()?;
+        let Some(get_dev) = lib.mem_host_get_device_ptr else {
+            bail!("cuMemHostGetDevicePointer が無い");
+        };
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            check(
+                (lib.mem_host_alloc)(
+                    &mut ptr,
+                    bytes,
+                    CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP,
+                ),
+                "cuMemHostAlloc (devicemap)",
+            )?;
+        }
+        let mut dev: CUdeviceptr = 0;
+        unsafe {
+            let rc = get_dev(&mut dev, ptr, 0);
+            if rc != CUDA_SUCCESS {
+                let _ = (lib.mem_host_free)(ptr);
+                bail!("cuMemHostGetDevicePointer が失敗: {rc:?}");
+            }
+        }
+        Ok((Self { ptr, bytes }, dev))
+    }
+}
+
+/// task 382: device から直接読み書きできる pinned の組 (ホスト側の見え方と
+/// device 側の見え方は同じ 1 本のメモリ)。
+struct MapMem {
+    pin: PinMem,
+    dev: CUdeviceptr,
+}
+
+impl MapMem {
+    /// 必要バイト数を満たすまで確保し直す (足りていれば何もしない)。
+    fn ensure(slot: &mut Option<MapMem>, bytes: usize) -> Result<()> {
+        if let Some(m) = slot.as_ref() {
+            if m.pin.bytes >= bytes.max(1) {
+                return Ok(());
+            }
+        }
+        *slot = Some(MapMem::alloc(bytes)?);
+        Ok(())
+    }
+
+    fn alloc(bytes: usize) -> Result<Self> {
+        let (pin, dev) = PinMem::alloc_mapped(bytes)?;
+        Ok(Self { pin, dev })
+    }
 }
 
 /// task 318: `DENNO_PF_PIN_STAGE` の値の解釈 (純関数)。
@@ -25908,6 +25972,11 @@ struct MixGpuScratch {
     /// (`[wptr_d][wptr_u][seg_d][seg_u][xn]` を 1 本の H2D で送る)。
     stage: Option<DevBuffer>,
     hstage: Option<PinMem>,
+    /// task 382: `DENNO_MIX_ZC` 用。device から直接見える pinned。
+    /// `xmap` = down の入力 (`xn`、H2D を消す)、`omap` = `mixed` の行き先
+    /// (hc_mixed に直接書かせて D2H を消す)。`None` の間は従来経路。
+    xmap: Option<MapMem>,
+    omap: Option<MapMem>,
 }
 
 thread_local! {
@@ -25921,6 +25990,8 @@ thread_local! {
             ho: None,
             stage: None,
             hstage: None,
+            xmap: None,
+            omap: None,
         });
 }
 
@@ -32326,6 +32397,73 @@ fn launch_mix_v5(
     }
 }
 
+// ===========================================================================
+// task 382: mix の鎖から H2D / D2H を消す (`DENNO_MIX_ZC`)
+// ===========================================================================
+//
+// 鎖 1 回の実測 (t372a、`[dec-kprof-avg]` の op 表) は
+//   H2D@a 5.7 us / down 6.4 / lo_silu 3.3 / up 13.1 / hc_mixed 5.8 / D2H@a 2.6
+// で、**両端の往復 8.3 us は「xn 40 KB を送る」「mixed 10 KB を戻す」だけ**。
+// xn は device から直接読める pinned (`CU_MEMHOSTALLOC_DEVICEMAP`) に置けば
+// H2D が丸ごと消え、mixed は hc_mixed にその pinned へ書かせれば D2H が消える。
+// カーネルは 1 本も変えない (ポインタが変わるだけ) ので値はビット一致。
+
+/// `DENNO_MIX_ZC` の解釈 (純関数)。返り値は `(H2D を消す, D2H を消す)`。
+///
+/// - 未設定 / `0` / `off` (既定): 従来 (H2D + D2H)。
+/// - `x` / `in`: H2D だけ消す (`down` がホストの `xn` を PCIe 越しに読む)。
+/// - `out`: D2H だけ消す (`hc_mixed` がホストメモリへ直接書く)。
+/// - `1` / `on` / `both`: 両方。
+pub fn mix_zc_from_value(v: Option<&str>) -> (bool, bool) {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("x") | Some("in") => (true, false),
+        Some("out") => (false, true),
+        Some("1") | Some("on") | Some("true") | Some("yes") | Some("both") => (true, true),
+        _ => (false, false),
+    }
+}
+
+pub const MIX_ZC_ENV: &str = "DENNO_MIX_ZC";
+
+/// ゲートの実値 (プロセスで 1 回だけ env を読む)。
+pub fn mix_zc_enabled() -> (bool, bool) {
+    #[cfg(test)]
+    if let Some(v) = MIX_ZC_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: OnceLock<(bool, bool)> = OnceLock::new();
+    *ON.get_or_init(|| mix_zc_from_value(std::env::var(MIX_ZC_ENV).ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIX_ZC_FORCE: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト用: ゲートの強制 (`None` = env の解釈)。
+#[cfg(test)]
+pub(crate) fn mix_zc_set_for_test(v: Option<(bool, bool)>) {
+    MIX_ZC_FORCE.with(|c| c.set(v));
+}
+
+static MIX_ZC_X_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MIX_ZC_OUT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 実際に H2D を省いた回数 / D2H を省いた回数 (診断)。
+pub fn mix_zc_hits() -> (u64, u64) {
+    use std::sync::atomic::Ordering as AO;
+    (
+        MIX_ZC_X_HITS.load(AO::Relaxed),
+        MIX_ZC_OUT_HITS.load(AO::Relaxed),
+    )
+}
+
+pub fn mix_zc_reset() {
+    use std::sync::atomic::Ordering as AO;
+    MIX_ZC_X_HITS.store(0, AO::Relaxed);
+    MIX_ZC_OUT_HITS.store(0, AO::Relaxed);
+}
+
 /// task 282: `[mix-qchain]` 行に出す高速 GEMV の発火回数。
 pub fn mix_qk_hits() -> u64 {
     MIX_QK_HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -32464,8 +32602,14 @@ pub fn maybe_gpu_mix_q_chain_into(
             ho,
             stage,
             hstage,
+            xmap,
+            omap,
             ..
         } = &mut *s;
+        // task 382: 鎖の両端の往復 (H2D xn / D2H mixed) を消すかの実値。
+        // H2D を消せるのは down/up が両方 v5 のときだけ (stage の前置きを
+        // 読むのは Blk / Seg のカーネルで、v5 は重みポインタを引数で受ける)。
+        let zc = mix_zc_enabled();
         // task 282: mix の GEMV を向きごとに選ぶ (`DENNO_MIX_QK`)。
         // seg_k 系は Q8_0 のときだけ (mix の実型)。形が合わなければ旧 GEMV。
         let (want_down, want_up) = mix_qk_enabled();
@@ -32510,6 +32654,16 @@ pub fn maybe_gpu_mix_q_chain_into(
             Scratch::ensure(stage, MIX_QK_PROLOGUE + k1 * 4)?;
             Scratch::ensure_pin(hstage, MIX_QK_PROLOGUE + k1 * 4)?;
         }
+        // task 382: device から見える pinned を用意する。確保に失敗したら
+        // その方向だけ従来経路へ落ちる (鎖そのものは止めない)。
+        let mut zc_x = zc.0 && down_kind == MixGemv::V5 && up_kind == MixGemv::V5;
+        let mut zc_out = zc.1;
+        if zc_x && MapMem::ensure(xmap, k1 * 4).is_err() {
+            zc_x = false;
+        }
+        if zc_out && MapMem::ensure(omap, e * 4).is_err() {
+            zc_out = false;
+        }
         let (dx, dlo, dout, dm) = (
             dx.as_ref().unwrap(),
             dlo.as_ref().unwrap(),
@@ -32517,7 +32671,13 @@ pub fn maybe_gpu_mix_q_chain_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
-        if need_stage {
+        if need_stage && zc_x {
+            // task 382: xn を device から見える pinned へ置くだけ (転送命令なし)。
+            dec_kprof::step("mix_h2d_pack", || {
+                let m = xmap.as_mut().expect("確保済み");
+                m.pin.as_mut_slice::<f32>()[..k1].copy_from_slice(xn);
+            });
+        } else if need_stage {
             // 前置き (重みポインタ 2 本 + segment 表 2 枚 + xn) を 1 本で送る。
             let st = stage.as_ref().expect("確保済み");
             let hs = hstage.as_mut().expect("確保済み");
@@ -32602,7 +32762,9 @@ pub fn maybe_gpu_mix_q_chain_into(
             dec_kprof::op_end(kp_cp);
         }
         // デバイス側の xn の置き場所 (down が高速なら前置きバッファの末尾)。
-        let xdev = if fast_down {
+        let xdev = if zc_x {
+            xmap.as_ref().expect("確保済み").dev
+        } else if fast_down {
             stage.as_ref().expect("確保済み").ptr() + off_x as u64
         } else {
             dx.ptr()
@@ -32751,8 +32913,14 @@ pub fn maybe_gpu_mix_q_chain_into(
             }
         }
         // 4. hc_mixed (xn と gate から mixed)
+        // task 382: zc_out のときはホストの pinned へ直接書く (D2H を消す)。
+        let mdev = if zc_out {
+            omap.as_ref().expect("確保済み").dev
+        } else {
+            dm.ptr()
+        };
         unsafe {
-            let (mut px, mut pg, mut pm) = (xdev, dout.ptr(), dm.ptr());
+            let (mut px, mut pg, mut pm) = (xdev, dout.ptr(), mdev);
             let (mut ec, mut hcc) = (e as c_int, hc as c_int);
             let mut invc2 = inv_hc;
             let mut args = [
@@ -32779,25 +32947,27 @@ pub fn maybe_gpu_mix_q_chain_into(
         // していた。入力は `dm` (= `mixed` のデバイスコピー) をそのまま読み、
         // D2H は下の鎖の同期 (イベント 1 本) でまとめて待つ。載らなければ従来経路が
         // 別途走る (同じカーネル・同じ入力なので値は変わらない)。
-        let enq = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
+        let enq = router_in_mix_enqueue(ctx, mdev, e, &mut router_w);
         if enq != 0 {
             ROUTER_IN_QCHAIN_HITS.fetch_add(1, AO::Relaxed);
         }
-        let kp_cp = dec_kprof::op_begin(
-            || "D2H@a".to_string(),
-            (0, 0, 0),
-            (0, 0, 0),
-            0,
-            e * 4,
-        );
-        unsafe {
-            check(
-                (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
-                "cuMemcpyDtoHAsync (mix q chain)",
-            )?;
+        if !zc_out {
+            let kp_cp = dec_kprof::op_begin(
+                || "D2H@a".to_string(),
+                (0, 0, 0),
+                (0, 0, 0),
+                0,
+                e * 4,
+            );
+            unsafe {
+                check(
+                    (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (mix q chain)",
+                )?;
+            }
+            dec_kprof::op_end(kp_cp);
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
-        dec_kprof::op_end(kp_cp);
-        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         if fast_down || fast_up {
             MIX_QK_HITS.fetch_add(1, AO::Relaxed);
         }
@@ -32818,8 +32988,21 @@ pub fn maybe_gpu_mix_q_chain_into(
         // task 364: 鎖に積んだルータ GEMV の重み参照を手放す (同期の後)。
         drop(router_w);
         dec_kprof::step("mix_pack", || {
-            out.copy_from_slice(&ho.as_slice::<f32>()[..e])
+            if zc_out {
+                // task 382: hc_mixed がホストの pinned へ直接書いている。
+                let m = omap.as_ref().expect("確保済み");
+                out.copy_from_slice(&m.pin.as_slice::<f32>()[..e]);
+            } else {
+                out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+            }
         });
+        // task 382: 発火の証拠 (PROFILE の `[mix-zc]` 行のもと)。
+        if zc_x {
+            MIX_ZC_X_HITS.fetch_add(1, AO::Relaxed);
+        }
+        if zc_out {
+            MIX_ZC_OUT_HITS.fetch_add(1, AO::Relaxed);
+        }
         Ok(())
     });
     match r {
@@ -42835,6 +43018,39 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
         // 未知の値は既定へ (切り戻しは 0)。
         assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::V5, MixGemv::V5));
+    }
+
+    /// task 382: `DENNO_MIX_ZC` の真理値表。既定は off (従来の H2D + D2H)。
+    /// `x` / `out` で片側ずつ、`1` / `both` で両側を消す。
+    #[test]
+    fn mix_zc_gate_defaults_off_and_parses_explicitly() {
+        assert_eq!(mix_zc_from_value(None), (false, false), "未設定は従来経路");
+        assert_eq!(mix_zc_from_value(Some("")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("0")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("off")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("NO")), (false, false));
+        assert_eq!(mix_zc_from_value(Some("x")), (true, false));
+        assert_eq!(mix_zc_from_value(Some(" IN ")), (true, false));
+        assert_eq!(mix_zc_from_value(Some("out")), (false, true));
+        assert_eq!(mix_zc_from_value(Some("1")), (true, true));
+        assert_eq!(mix_zc_from_value(Some("both")), (true, true));
+        assert_eq!(mix_zc_from_value(Some("ON")), (true, true));
+        // 未知の値は既定 (従来経路) へ倒す。
+        assert_eq!(mix_zc_from_value(Some("nope")), (false, false));
+    }
+
+    /// task 382: ZC のゲートを立てても、CUDA が無い環境では鎖そのものが
+    /// 走らないので H2D/D2H を省いた回数は 0 のまま (fail soft)。
+    #[test]
+    fn mix_zc_hits_stay_zero_without_cuda_chain() {
+        mix_zc_reset();
+        let (x, o) = mix_zc_hits();
+        assert_eq!((x, o), (0, 0));
+        // ゲートの強制はスレッド局所なので、他のテストの env 解釈を汚さない。
+        mix_zc_set_for_test(Some((true, true)));
+        assert_eq!(mix_zc_enabled(), (true, true));
+        mix_zc_set_for_test(None);
+        assert_eq!(mix_zc_hits(), (0, 0), "鎖が走らないので数えない");
     }
 
     /// task 286: v5 形の起動計画。UD の mix の実形 (down 10240->320 / up 320->10240)
