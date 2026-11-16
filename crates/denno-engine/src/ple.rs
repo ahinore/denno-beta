@@ -617,10 +617,11 @@ fn ple_par_parts(rows: usize) -> usize {
         return 1;
     }
     // task 349: `DENNO_PF_PLE_PIPE` のときは専用プールの本数まで使う。task 357:
-    // その本数は `DENNO_PF_PLE_THREADS` (既定 32) が決める。冷えた page cache では
+    // その本数は `DENNO_PF_PLE_THREADS` (既定 96) が決める。冷えた page cache では
     // 1 行 90 B のランダム pread がレイテンシ律速で、14k の gather が 1.85 s
-    // (lab t349b の `[pre-kprof] ple=1848.2`)、32 本でも 681 ms (t353a の pl)。
-    // 並列度を上げると同じ行数を深い queue で投げられる。読む行と綴じ方は同じ。
+    // (lab t349b の `[pre-kprof] ple=1848.2`)、32 本でも 681 ms (t353a の pl)、
+    // 96 本で 425 ms (t357a/t357b)。並列度を上げると同じ行数を深い queue で
+    // 投げられる。読む行と綴じ方は同じ。
     if crate::model::exp_pf::ple_pipe() {
         let n = rayon::current_num_threads()
             .min(crate::model::exp_pf::ple_threads().max(1))
