@@ -8299,11 +8299,15 @@ where
         sync_r?;
 
         // 8. 結果 (e 要素) だけ戻す。
+        //
+        // task 358: `to_vec` は毎層 `Vec` を確保して pageable の同期 D2H をするので、
+        // e=2,560 (10 KB) で 11 us/層かかっていた (lab の `[seg-prof] d2h=`)。
+        // `to_slice` は 1 本の作業域へ直接戻し、`DENNO_PF_PIN_STAGE` の窓に入って
+        // いれば pinned バウンス経由 (同じバイト列) になる。
         let _t_d2h = crate::model::seg_prof::stamp();
-        let got: Vec<f32> = outb.to_vec(e)?;
+        outb.to_slice(&mut out[..e])?;
         dbg_d2h(e * 4);
         crate::model::seg_prof::add(crate::model::seg_prof::PH_D2H, _t_d2h);
-        out[..e].copy_from_slice(&got);
 
         // 9. 計上 (GPU 時間はイベント、バイト数は segment x 行数 x 行長)。
         if prof {
