@@ -5208,8 +5208,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         }
         if ple_wide {
             // 専用プールの本数がそのまま同時に飛ぶ pread の数になる
-            // (`ple_par_parts` が `current_num_threads()` を上限 32 で見る)。
-            const PLE_PIPE_THREADS: usize = 32;
+            // (`ple_par_parts` が `DENNO_PF_PLE_THREADS` (既定 32) と
+            // `current_num_threads()` の小さいほうを見る。task 357)。
+            let ple_threads = crate::model::exp_pf::ple_threads().max(1);
             let t_ple = prekprof::stamp();
             let rt = self.ple.as_ref().map(std::sync::Arc::clone);
             let chunk_list: Vec<(usize, usize)> = ranges.to_vec();
@@ -5221,7 +5222,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 Ok(out)
             };
             match rayon::ThreadPoolBuilder::new()
-                .num_threads(PLE_PIPE_THREADS)
+                .num_threads(ple_threads)
                 .build()
             {
                 Ok(p) => ples_all = p.install(run)?,

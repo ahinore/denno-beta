@@ -1836,6 +1836,37 @@ pub fn ple_pipe() -> bool {
     *ON.get_or_init(|| ple_pipe_from_value(std::env::var(PLE_PIPE_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_PLE_THREADS`: task 357。層優先 prefill の PLE gather を引く専用
+/// プールの本数 (= 同時に飛ぶ 90 B のランダム pread の数)。
+///
+/// task 353 は 32 本で固定していた (`qwen4exp.rs` の `PLE_PIPE_THREADS`)。1 行
+/// 90 B の pread は **レイテンシ律速**で、14k cold の gather は 32 本でも
+/// 681 ms かかる (lab t353a の pl、`[pre-kprof]` ple=681.3、166,728 reads =
+/// 245k IOPS、1 本あたり 79 us)。ホストは 8C/16T だが pread はカーネル内で
+/// 待つので、本数を増やすとデバイスのキューに同時に乗る読みが増える
+/// (CPU は遊んだまま)。64/96 を lab で測って既定を決める。
+pub const PLE_THREADS_ENV: &str = "DENNO_PF_PLE_THREADS";
+
+/// [`PLE_THREADS_ENV`] の既定値 (task 353 と同じ 32 本)。
+pub const DEFAULT_PLE_THREADS: usize = 32;
+
+/// [`PLE_THREADS_ENV`] の解釈 (純関数)。1..=128 に丸める。未設定・解析不能は既定。
+pub fn ple_threads_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_PLE_THREADS;
+    };
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => n.min(128),
+        _ => DEFAULT_PLE_THREADS,
+    }
+}
+
+/// PLE gather の専用プールの本数 (プロセスで 1 回だけ env を読む)。
+pub fn ple_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| ple_threads_from_value(std::env::var(PLE_THREADS_ENV).ok().as_deref()))
+}
+
 /// パート番号ごとの読み口 (pread 経路だけが使う)。
 ///
 /// モデルの構築時に 1 回だけ開く。開けなかったパートは `None` で、その
@@ -3031,6 +3062,20 @@ mod tests {
         assert!(ple_pipe_from_value(Some(" yes ")));
         assert_eq!(PLE_PIPE_ENV, "DENNO_PF_PLE_PIPE");
         assert!(DEFAULT_PLE_PIPE);
+    }
+
+    /// task 357: `DENNO_PF_PLE_THREADS` の丸めと既定 (32 本)。
+    #[test]
+    fn ple_threads_rounds_and_defaults() {
+        assert_eq!(ple_threads_from_value(None), 32, "未設定は既定 32");
+        assert_eq!(ple_threads_from_value(Some("")), 32);
+        assert_eq!(ple_threads_from_value(Some("x")), 32, "解析不能は既定");
+        assert_eq!(ple_threads_from_value(Some("0")), 32, "0 は既定へ");
+        assert_eq!(ple_threads_from_value(Some("64")), 64);
+        assert_eq!(ple_threads_from_value(Some(" 96 ")), 96);
+        assert_eq!(ple_threads_from_value(Some("999")), 128, "上限 128");
+        assert_eq!(PLE_THREADS_ENV, "DENNO_PF_PLE_THREADS");
+        assert_eq!(DEFAULT_PLE_THREADS, 32);
     }
 
     /// task 325: `DENNO_PF_PREAD_THREADS` の丸めと既定 (0 = 共有プール)。
