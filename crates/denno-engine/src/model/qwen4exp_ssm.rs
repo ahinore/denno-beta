@@ -705,6 +705,12 @@ impl SsmLayer {
             if let Some(rows) = self.forward_batch_chain(flat, nt)? {
                 return Ok(rows);
             }
+            // task 379: `DENNO_PF_GDN_WB_LAST` は途中チャンクの書き戻しを飛ばすので、
+            // 連鎖に乗れなかったこのチャンクのホスト控えは古い。ホスト経路へ落ちる
+            // 前にデバイス正本から読み直す (値が変わらないための保険)。
+            if crate::model::exp_pf::gdn_wb_last_on() {
+                crate::cuda::gdn_state_restore_host(0, self.il, &mut self.state.conv, &mut self.state.ssm);
+            }
         }
         // task 317: 直前の mix を D2H していない (`DENNO_PF_MIXKEEP_SSM`) のに
         // 連鎖に乗らなかったときは、ホスト経路の前にデバイスから埋め直す
