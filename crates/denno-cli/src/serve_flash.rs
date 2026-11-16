@@ -721,6 +721,12 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_up_worker::stats_reset();
+    // task 356: expert 段の D2H を専用ストリームへ出した本数
+    // (`DENNO_DEC_EXP_D2H_STREAM=1` のときだけ 1 行 = 分岐が発火した証拠)。
+    if let Some(line) = denno_engine::model::exp_iq::d2h_stream_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_iq::d2h_stream_reset();
     // task 266: decode の先読み (`DENNO_DEC_PREF` のときだけ 1 行)。
     if let Some(line) = denno_engine::model::exp_prefetch::stats_line() {
         eprintln!("{line}");
@@ -3050,6 +3056,16 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     eprintln!(
         "[flash] exp miss rows: {} (DENNO_EXP_MISS_ROWS)",
         denno_engine::model::qwen4exp::exp_miss_rows_report()
+    );
+    // task 356: expert 段の寄与 D2H を専用ストリームへ出すゲート
+    // (`DENNO_DEC_EXP_D2H_STREAM`、既定 off)。COND の env が届いたかをログで確かめる。
+    eprintln!(
+        "[flash] exp d2h stream: {} (DENNO_DEC_EXP_D2H_STREAM)",
+        if denno_engine::model::exp_iq::dec_d2h_stream_enabled() {
+            "on"
+        } else {
+            "off"
+        }
     );
     // task 213: 既定 on のゲートが必要とする PTX を起動時に監査する。
     // PTX が無いとその機能は**静かに**従来経路へ落ちる (REPORT_P204 の fold/upw)。
