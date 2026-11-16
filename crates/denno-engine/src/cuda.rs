@@ -2501,7 +2501,9 @@ pub(crate) mod dec_full_dev {
             }
         }
         kp_mark!("fd_d2h");
-        ctx.sync()?;
+        // task 368: 読むのは null ストリームの非同期コピーが書いた pinned だけなので、
+        // 待つ範囲を null ストリームに狭めてよい (`DENNO_DEC_SYNC_STREAM`、既定 off)。
+        ctx.sync_decode()?;
         kp_mark!("fd_sync");
         let out: Vec<f32> = st
             .pin_out
@@ -4611,6 +4613,37 @@ impl CudaCtx {
         crate::model::q4ledger::note_sync(t);
         r
     }
+
+    /// task 368: **null ストリームだけ**を待つ (このスレッドが積んだ仕事の完了)。
+    ///
+    /// [`Self::sync`] との違いは待つ**範囲**だけで、待つ相手の仕事は同じ:
+    /// `cuEventSynchronize` は null ストリームに積まれた仕事 (このスレッドの
+    /// カーネルと非同期コピー) の完了を待つ。文脈同期と違って、背景の上げ直し
+    /// (expert の非ブロッキングストリーム) と shared expert の side stream は
+    /// 待たない。イベントが張れない環境だけ [`Self::sync`] へ落ちる。
+    pub fn sync_stream(&self) -> Result<()> {
+        let t = crate::model::q4ledger::stamp();
+        if seg_ev::record_raw(DEC_SYNC_SLOT) {
+            let r = seg_ev::wait(DEC_SYNC_SLOT);
+            crate::model::q4ledger::note_sync(t);
+            DEC_SYNC_EVENTS.fetch_add(1, Ordering::Relaxed);
+            r
+        } else {
+            DEC_SYNC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            self.sync()
+        }
+    }
+
+    /// task 368: `DENNO_DEC_SYNC_STREAM` で待ちの種類を選ぶ入口。
+    ///
+    /// 既定 off では [`Self::sync`] そのもの (int-auto の挙動と 1 命令も変わらない)。
+    pub fn sync_decode(&self) -> Result<()> {
+        if dec_sync_stream_enabled() {
+            self.sync_stream()
+        } else {
+            self.sync()
+        }
+    }
     /// 呼び出しスレッドに primary context を current として設定する。
     /// CUDA の current context は**スレッドローカル** (P17c の教訓: libtest は
     /// テスト毎に新スレッドを立てるため、初期化スレッドで 1 回だけ設定したのでは
@@ -5305,7 +5338,10 @@ impl CudaCtx {
                     }
                     dec_kprof::op_end(kp_cp);
                 }
-                self.sync()?;
+                // task 368: 読むのは null ストリームの非同期 D2H が書いた pinned
+                // だけなので、待つ範囲を null ストリームに狭めてよい
+                // (`DENNO_DEC_SYNC_STREAM`、既定 off)。
+                self.sync_decode()?;
                 let t3 = t0.map(|_| std::time::Instant::now());
                 if let Some(t) = t_sync {
                     crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
@@ -5358,7 +5394,9 @@ impl CudaCtx {
                     shmem,
                     &mut args[..nargs],
                 )?;
-                self.sync()?;
+                // task 368: 直後の `to_vec` は null ストリームの同期コピーなので、
+                // 待つ範囲を null ストリームに狭めてよい (`DENNO_DEC_SYNC_STREAM`)。
+                self.sync_decode()?;
             }
             let got: Vec<f32> = ob.to_vec(n_out)?;
             let t3 = t0.map(|_| std::time::Instant::now());
@@ -7940,6 +7978,73 @@ mod seg_ev {
         }
         Some((ms.max(0.0) as f64 * 1e6) as u64)
     }
+}
+
+// ---- task 368: decode の待ちを null ストリームへ狭める -------------------------
+
+/// task 368: `DENNO_DEC_SYNC_STREAM` — decode の待ちを `cuCtxSynchronize` から
+/// **null ストリームのイベント 1 本**へ狭めるゲート (既定 off)。
+///
+/// `Context::sync()` は文脈の**全ストリーム**を待つので、「このスレッドが null
+/// ストリームへ積んだ仕事の結果だけ」欲しい場所でも
+/// - expert の**上げ直し** (非ブロッキングストリーム。1 本 178 us・実測 0.57 ms/token)
+/// - shared expert の side stream
+/// の完了まで待ってしまう。狭めても、ホストが読むのは null ストリームの非同期
+/// コピーで書いた pinned バッファだけなので**値は変わらない** (同じカーネル・
+/// 同じ入力・同じ順序で、待つ相手だけが違う)。
+pub const DEC_SYNC_STREAM_ENV: &str = "DENNO_DEC_SYNC_STREAM";
+
+/// 既定 (採否は lab t368x で決める。採用したら true にして既定 on にする)。
+pub const DEC_SYNC_STREAM_DEFAULT: bool = false;
+
+/// イベントのスロット。`seg_ev` の 0..=6 / 8 とは分ける (記録と待ちは必ず
+/// 隣り合うので、同じスロットを 2 か所で同時に使うことはない)。
+const DEC_SYNC_SLOT: usize = 7;
+
+/// [`DEC_SYNC_STREAM_ENV`] の解釈 (純関数)。
+pub fn dec_sync_stream_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "on" | "true" | "yes") => true,
+        Some("0" | "off" | "false" | "no") => false,
+        _ => DEC_SYNC_STREAM_DEFAULT,
+    }
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn dec_sync_stream_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        dec_sync_stream_from_value(std::env::var(DEC_SYNC_STREAM_ENV).ok().as_deref())
+    })
+}
+
+/// イベントで待てた回数 (**分岐が発火した証拠**)。
+static DEC_SYNC_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// イベントが張れず文脈同期へ落ちた回数。
+static DEC_SYNC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 1 リクエストぶんの 1 行 (ゲート on で 1 回も通らなければ `None`)。
+pub fn dec_sync_stream_line() -> Option<String> {
+    dec_sync_stream_line_with(dec_sync_stream_enabled())
+}
+
+/// [`dec_sync_stream_line`] の本体 (ゲートの真偽を引数で受ける = テストで両側を踏める)。
+fn dec_sync_stream_line_with(on: bool) -> Option<String> {
+    if !on {
+        return None;
+    }
+    let ev = DEC_SYNC_EVENTS.load(Ordering::Relaxed);
+    let fb = DEC_SYNC_FALLBACKS.load(Ordering::Relaxed);
+    if ev == 0 && fb == 0 {
+        return None;
+    }
+    Some(format!("[dec-sync-stream] events={ev} fallback={fb}"))
+}
+
+/// 積算を 0 に戻す (リクエスト単位で読む)。
+pub fn dec_sync_stream_reset() {
+    DEC_SYNC_EVENTS.store(0, Ordering::Relaxed);
+    DEC_SYNC_FALLBACKS.store(0, Ordering::Relaxed);
 }
 
 /// ホストの `Vec<u8>` の一部へ `u64` の列を書く (prologue の詰め込み)。
@@ -37809,7 +37914,9 @@ fn q4_attn_decode_single(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         })?;
         q4attn_kprof::note_launch(tl);
         let tw = q4attn_kprof::stamp();
-        q4ok(ctx.sync())?;
+        // task 368: 直後に読むのは null ストリームのカーネルが書いた `out` だけなので、
+        // 待つ範囲を null ストリームに狭めてよい (`DENNO_DEC_SYNC_STREAM`、既定 off)。
+        q4ok(ctx.sync_decode())?;
         q4attn_kprof::note_wait(tw);
         let td = q4attn_kprof::stamp();
         let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(qd))?;
@@ -37938,7 +38045,9 @@ fn q4_attn_decode_split(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         })?;
         q4attn_kprof::note_launch(tl);
         let tw = q4attn_kprof::stamp();
-        q4ok(ctx.sync())?;
+        // task 368: 直後に読むのは null ストリームのカーネルが書いた `out` だけなので、
+        // 待つ範囲を null ストリームに狭めてよい (`DENNO_DEC_SYNC_STREAM`、既定 off)。
+        q4ok(ctx.sync_decode())?;
         q4attn_kprof::note_wait(tw);
         let td = q4attn_kprof::stamp();
         let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(qd))?;
@@ -38069,7 +38178,9 @@ fn q4_attn_decode_flashdec(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         })?;
         q4attn_kprof::note_launch(tl);
         let tw = q4attn_kprof::stamp();
-        q4ok(ctx.sync())?;
+        // task 368: 直後に読むのは null ストリームのカーネルが書いた `out` だけなので、
+        // 待つ範囲を null ストリームに狭めてよい (`DENNO_DEC_SYNC_STREAM`、既定 off)。
+        q4ok(ctx.sync_decode())?;
         q4attn_kprof::note_wait(tw);
         let td = q4attn_kprof::stamp();
         let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(qd))?;
@@ -42657,6 +42768,35 @@ mod tests {
         assert_ne!(filled, (7, 2560, 640), "n が違えば使わない");
         ROUTER_FILLED.with(|c| c.set((0, 0, 0)));
         ROUTER_SYNCED.with(|c| c.set(false));
+    }
+
+    /// task 368: `DENNO_DEC_SYNC_STREAM` の解釈。既定は off (採否前)。
+    /// 明示的な真偽だけを受け付け、壊れた値は既定へ倒す。
+    #[test]
+    fn dec_sync_stream_gate_reads_only_explicit_values() {
+        assert!(!dec_sync_stream_from_value(None), "既定は off");
+        for v in ["1", "on", "ON", " true ", "yes"] {
+            assert!(dec_sync_stream_from_value(Some(v)), "{v} を on と読んでいない");
+        }
+        for v in ["0", "off", "False", "no", "", "2", "maybe"] {
+            assert!(!dec_sync_stream_from_value(Some(v)), "{v} を off と読んでいない");
+        }
+    }
+
+    /// task 368: 1 行はゲート on で 1 回でも通ったときだけ出る
+    /// (off では `None` = int-auto と同じ出力)。
+    #[test]
+    fn dec_sync_stream_line_only_when_on_and_used() {
+        dec_sync_stream_reset();
+        assert!(dec_sync_stream_line_with(false).is_none(), "ゲート off で行が出た");
+        assert!(dec_sync_stream_line_with(true).is_none(), "0 回なのに行が出た");
+        DEC_SYNC_EVENTS.fetch_add(3, Ordering::Relaxed);
+        DEC_SYNC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        let line = dec_sync_stream_line_with(true).expect("行が出ていない");
+        assert!(line.contains("events=3"), "{line}");
+        assert!(line.contains("fallback=1"), "{line}");
+        assert!(dec_sync_stream_line_with(false).is_none(), "off で行が出た");
+        dec_sync_stream_reset();
     }
 
     /// task 278: 高速版 GEMV のゲートは既定 on、明示的な偽値だけ切る。

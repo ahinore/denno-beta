@@ -733,6 +733,12 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_iq::sum_zc_reset();
+    // task 368: decode の待ちを null ストリームのイベントへ狭めた回数
+    // (`DENNO_DEC_SYNC_STREAM=1` のときだけ 1 行 = 分岐が発火した証拠)。
+    if let Some(line) = denno_engine::cuda::dec_sync_stream_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::cuda::dec_sync_stream_reset();
     // task 266: decode の先読み (`DENNO_DEC_PREF` のときだけ 1 行)。
     if let Some(line) = denno_engine::model::exp_prefetch::stats_line() {
         eprintln!("{line}");
