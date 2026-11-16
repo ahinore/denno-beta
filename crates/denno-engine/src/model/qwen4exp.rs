@@ -6907,7 +6907,12 @@ fn hc_mix_quant_ref(
     let t_all = mix_kprof::stamp();
 
     let t = mix_kprof::stamp();
-    let xn = hyper::grouped_rms_norm(res, norm, hp);
+    // task 368: norm は**高速経路と同じ関数**を通す。`DENNO_HC_NORM_QUAD` (既定 on)
+    // は二乗和の丸め順を変えるので、ここだけ `grouped_rms_norm` (逐次和) のままだと
+    // 「fast と ref がビット一致する」という既存の契約が崩れる。値の意味は同じで、
+    // 変わるのは丸め順だけ (ゲート `=0` で両方とも逐次和に戻る)。
+    let mut xn = vec![0.0f32; hp.hc * hp.n_embd];
+    hyper::grouped_rms_norm_batch_into(std::slice::from_ref(res), norm, &mut xn, hp);
     mix_kprof::mark(t, mix_kprof::GN);
 
     let t = mix_kprof::stamp();
