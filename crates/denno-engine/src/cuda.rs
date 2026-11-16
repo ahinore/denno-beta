@@ -25159,8 +25159,61 @@ fn parse_router_in_mix(raw: Option<&str>) -> bool {
 /// 同期 1 回 (層あたり 5〜6 us) が消える。入力は鎖の中間バッファ `dm`
 /// (= `mixed` のデバイスコピー) をそのまま読むので H2D も消える。
 pub fn router_in_mix_on() -> bool {
+    #[cfg(test)]
+    if let Some(v) = ROUTER_IN_MIX_FORCE.with(|c| c.get()) {
+        return v;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| parse_router_in_mix(std::env::var("DENNO_ROUTER_IN_MIX").ok().as_deref()))
+}
+
+/// task 364: テスト用のゲート強制 (None = env の解釈)。
+#[cfg(test)]
+thread_local! {
+    static ROUTER_IN_MIX_FORCE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// task 364: `DENNO_ROUTER_IN_MIX` をテストから固定する。
+#[cfg(test)]
+pub(crate) fn router_in_mix_set_for_test(v: Option<bool>) {
+    ROUTER_IN_MIX_FORCE.with(|c| c.set(v));
+}
+
+/// task 364: qchain がルータの控え (**積む前**の判定) を見つけた回数。
+///
+/// task 307 の `DENNO_ROUTER_IN_MIX` は BF16 の chain3 にしか入っていなかった。
+/// 新しい既定モデルは mix が Q8_0 なので qchain を通る = ルータ GEMV が
+/// 鎖の外に残っていた。ここは「載せにいった回数」を GPU 無しでも数える。
+#[cfg(test)]
+static ROUTER_IN_QCHAIN_ARMS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 364: [`ROUTER_IN_QCHAIN_ARMS`] を読む (テスト専用)。
+#[cfg(test)]
+pub(crate) fn router_in_qchain_arms() -> usize {
+    ROUTER_IN_QCHAIN_ARMS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 364: カウンタを 0 に戻す (テスト専用)。
+#[cfg(test)]
+pub(crate) fn router_in_qchain_arms_reset() {
+    ROUTER_IN_QCHAIN_ARMS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 364: ルータ GEMV を qchain の末尾に実際に積んだ回数 (1 プロセス通算)。
+/// 診断行 `[mix-qchain]` の `rtr=` に出る (0 なら載っていない)。
+static ROUTER_IN_QCHAIN_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// task 364: [`ROUTER_IN_QCHAIN_HITS`] を読む。
+pub(crate) fn router_in_mix_qchain_hits() -> u64 {
+    ROUTER_IN_QCHAIN_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 364: 計数を 0 に戻す (リクエスト終端)。
+pub(crate) fn router_in_mix_qchain_reset() {
+    ROUTER_IN_QCHAIN_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// task 307: 次の mix の鎖にルータ GEMV を載せるための控え。
@@ -25224,6 +25277,18 @@ pub fn router_in_mix_token_start() {
     ROUTER_ARM.with(|c| {
         let _ = c.borrow_mut().take();
     });
+}
+
+/// task 364: 控え (`ROUTER_ARM`) がこの形・この層で消費できる状態か (**取らない**)。
+///
+/// [`router_in_mix_enqueue`] と同じ条件を読むだけの判定。qchain の入口で
+/// 「載せにいく」回数を数えるのと、診断に使う。
+fn router_in_mix_armed_for(k: usize) -> bool {
+    ROUTER_ARM.with(|c| {
+        c.borrow().as_ref().is_some_and(|job| {
+            job.k == k && job.layer == dec_kprof::cur_layer() && job.pos == dec_kprof::cur_pos()
+        })
+    })
 }
 
 /// task 307: mix の鎖の末尾にルータ GEMV を 1 発積む (鎖の中から呼ぶ)。
@@ -31802,6 +31867,12 @@ pub fn maybe_gpu_mix_q_chain_into(
     pre_wait: Option<&mut dyn FnMut() -> Result<()>>,
 ) -> bool {
     use std::sync::atomic::Ordering as AO;
+    // task 364: ルータ GEMV をこの鎖に載せにいく回数 (テスト専用。GPU 無しでも
+    // 数える)。`DENNO_ROUTER_IN_MIX=0` のときは控えが無いので 0 のまま。
+    #[cfg(test)]
+    if router_in_mix_armed_for(k1) {
+        ROUTER_IN_QCHAIN_ARMS.fetch_add(1, AO::Relaxed);
+    }
     if !cuda_enabled() || MIX_GPU_BROKEN.load(AO::Relaxed) {
         return false;
     }
@@ -31873,6 +31944,8 @@ pub fn maybe_gpu_mix_q_chain_into(
     // task 282: 高速 GEMV の前置きレイアウト (重みポインタ 2 + segment 2 + xn)。
     let (off_wd, off_wu, off_sd, off_su, off_x) = mix_qk_layout();
     let mut pre_wait = pre_wait;
+    // task 364: 鎖の末尾に積むルータ GEMV の重み (同期の後まで生かす)。
+    let mut router_w: Option<GgufWRef> = None;
     let r = MIX_GPU_SC.with(|cell| -> Result<()> {
         let _kp_win = dec_kprof::window(
             dec_kprof::MIX,
@@ -32198,6 +32271,17 @@ pub fn maybe_gpu_mix_q_chain_into(
                 &mut args,
             )?;
         }
+        // task 364: ルータ GEMV を鎖の末尾に 1 発積む。
+        // task 307 の `DENNO_ROUTER_IN_MIX` は BF16 の chain3 にしか入っておらず、
+        // 新しい既定モデル (unsloth 11-13、mix は Q8_0) はこちらを通るため、
+        // ルータだけが鎖の外に残って層ごとに 1 往復 (起動 + D2H + 同期) していた。
+        // 入力は `dm` (= `mixed` のデバイスコピー) をそのまま読み、D2H は下の
+        // 鎖の同期 (イベント 1 本) でまとめて待つ。載らなければ従来経路が別途
+        // 走る (同じカーネル・同じ入力なので値は変わらない)。
+        let enq = router_in_mix_enqueue(ctx, dm.ptr(), e, &mut router_w);
+        if enq != 0 {
+            ROUTER_IN_QCHAIN_HITS.fetch_add(1, AO::Relaxed);
+        }
         let kp_cp = dec_kprof::op_begin(
             || "D2H@a".to_string(),
             (0, 0, 0),
@@ -32230,6 +32314,8 @@ pub fn maybe_gpu_mix_q_chain_into(
         } else {
             ctx.sync()?;
         }
+        // task 364: 鎖に積んだルータ GEMV の重み参照を手放す (同期の後)。
+        drop(router_w);
         dec_kprof::step("mix_pack", || {
             out.copy_from_slice(&ho.as_slice::<f32>()[..e])
         });
@@ -42040,6 +42126,48 @@ mod tests {
         for v in ["", "1", "on", "true", " ON ", " TRUE ", "yes"] {
             assert!(parse_router_in_mix(Some(v)), "raw={v:?}");
         }
+    }
+
+    /// task 364: qchain がルータの控えを拾う条件 (層・位置・k が一致) を固定する。
+    ///
+    /// task 307 の控えは BF16 の chain3 だけが消費していた。新しい既定モデルは
+    /// mix が Q8_0 で qchain を通るので、ここが拾えないとルータ GEMV が鎖の外に
+    /// 残る。GPU 無しでも「拾う / 拾わない」は数えられる。
+    #[test]
+    fn qchain_picks_up_router_arm_by_shape_and_layer() {
+        router_in_mix_set_for_test(Some(true));
+        router_in_mix_token_start();
+        let (k, n) = (8usize, 2usize);
+        let bytes = vec![0u8; k * n * 4];
+        assert!(router_in_mix_arm(77, &bytes, k, n), "既定 on で控えが積まれない");
+        assert!(router_in_mix_armed_for(k), "同じ形・同じ層の控えを拾えない");
+        assert!(!router_in_mix_armed_for(k + 1), "形が違うのに拾った");
+        // 層が変われば拾わない。層番号は `dec_kprof` が on のときだけ更新される
+        // thread_local なので、ここでは計測を強制して動かす。
+        dec_kprof::set_force_for_test(Some(true));
+        let saved = dec_kprof::cur_layer();
+        dec_kprof::set_layer(saved + 3);
+        assert!(!router_in_mix_armed_for(k), "層が違うのに拾った");
+        dec_kprof::set_layer(saved);
+        assert!(router_in_mix_armed_for(k));
+        dec_kprof::set_force_for_test(None);
+        // トークンの入口で控えは落ちる (前のトークンの値を使わない)。
+        router_in_mix_token_start();
+        assert!(!router_in_mix_armed_for(k), "token_start が控えを落としていない");
+        router_in_mix_set_for_test(None);
+    }
+
+    /// task 364: ゲート off では控えを積まない (qchain 側も何も積まない)。
+    #[test]
+    fn qchain_router_arm_respects_gate_off() {
+        router_in_mix_set_for_test(Some(false));
+        router_in_mix_token_start();
+        let (k, n) = (8usize, 2usize);
+        let bytes = vec![0u8; k * n * 4];
+        assert!(!router_in_mix_arm(77, &bytes, k, n), "ゲート off で控えを積んだ");
+        assert!(!router_in_mix_armed_for(k), "ゲート off なのに拾える状態");
+        router_in_mix_set_for_test(None);
+        router_in_mix_token_start();
     }
 
     /// task 307: 共有 expert のキャッシュは、空のときは必ず外れる

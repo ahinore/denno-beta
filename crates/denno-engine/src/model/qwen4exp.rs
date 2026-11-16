@@ -6274,8 +6274,14 @@ pub fn mix_qchain_line() -> Option<String> {
     let qk = crate::cuda::mix_qk_hits();
     #[cfg(not(feature = "cuda"))]
     let qk = 0u64;
+    // task 364: ルータ GEMV を鎖の末尾に積んだ回数 (task 307 の
+    // `DENNO_ROUTER_IN_MIX` を Q8_0 の qchain にも広げた)。0 なら載っていない。
+    #[cfg(feature = "cuda")]
+    let rtr = crate::cuda::router_in_mix_qchain_hits();
+    #[cfg(not(feature = "cuda"))]
+    let rtr = 0u64;
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6287,6 +6293,9 @@ pub fn mix_qchain_reset() {
     // task 282: 高速 GEMV の計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::mix_qk_reset();
+    // task 364: ルータを鎖に積んだ回数も同じ区切りで 0 に戻す。
+    #[cfg(feature = "cuda")]
+    crate::cuda::router_in_mix_qchain_reset();
 }
 
 #[cfg(test)]
