@@ -12877,7 +12877,7 @@ fn expert_miss_contribs_into(
             if sel.is_empty() {
                 return Ok(());
             }
-            return expert_contribs_flat_decode_into(lw, sel, x, e, ff, dst, DECODE_FLAT_ROWS);
+            return expert_contribs_flat_decode_into(lw, sel, x, e, ff, dst, miss_flat_rows());
         }
         expert_contribs_par_into(lw, sel, x, e, ff, None, dst)
     }
@@ -19221,6 +19221,57 @@ fn expert_contribs_flat_decode_into(
 /// 実形 (e = 2560 / ff = 640) の実測は `bench_decode_flat` を参照。
 const DECODE_FLAT_ROWS: usize = 64;
 
+/// task 361: ミス経路の 1 タスクあたりの行数 (`DENNO_EXP_MISS_ROWS`、既定 16)。
+///
+/// `DENNO_EXP_MISS_FLAT` (task 153) の平坦化経路は 1 層のミス (0〜3 本) を
+/// 行チャンクに割って全スレッドへ配る。固定 64 行だとミス 1 本の層で
+/// gate/up が 20 タスク / 14 スレッド = 2 巡 (6 スレッド遊び)、down が 40 タスク
+/// = 3 巡になり、末尾の巡が遊ぶ。16 行にすると gate/up 80 / down 160 タスクに
+/// なって末尾の偏りが消える (行は独立なので値はビット一致)。
+///
+/// lab t361b (IQ3_S、depth8k、ミス CPU 時間 `[exp-iq-hit]` の ms/tok、2 ラウンド):
+/// 定常窓 (レイヤ 6117 / ミス 5338) で 2.820 -> 2.810 (r1) / 2.864 -> 2.784 (r2)。
+/// 窓ごとの比の中央値は r1 **-5.8%** / r2 **-2.4%** (ミスが 1 本以下の窓で
+/// -2〜-12%、ミス 3 本の窓では 0%)。decode 中央値は 16.6 -> 16.7 (+0.2% = 分解能)、
+/// prefill +0.9%、md5 は全 COND SAME、errors 0。
+/// `=auto` (位相の全行数 / スレッド数) も測ったが、定常窓で **+4.0% (r1) /
+/// +3.9% (r2)**、ミス 3 本/層の窓で +7.3 / +7.8% と悪化した (大きい塊ほど
+/// 1 タスクの末尾待ちが効く) ので、その経路は撤去した。
+/// `=64` で元に戻る (切り戻し)。
+#[cfg_attr(not(feature = "par"), allow(dead_code))]
+const MISS_FLAT_ROWS: usize = 16;
+
+/// task 361: `DENNO_EXP_MISS_ROWS` の解釈 (純関数)。数字だけを受け付け、
+/// 未設定は [`MISS_FLAT_ROWS`]、壊れた値も既定へ倒す。
+#[cfg_attr(not(feature = "par"), allow(dead_code))]
+fn miss_flat_rows_from_value(v: Option<&str>) -> usize {
+    match v.map(|s| s.trim()) {
+        None => MISS_FLAT_ROWS,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => MISS_FLAT_ROWS,
+        },
+    }
+}
+
+/// task 361: [`miss_flat_rows_from_value`] をプロセスで 1 回だけ env から読む。
+#[cfg_attr(not(feature = "par"), allow(dead_code))]
+fn miss_flat_rows() -> usize {
+    static ON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| miss_flat_rows_from_value(std::env::var("DENNO_EXP_MISS_ROWS").ok().as_deref()))
+}
+
+/// task 361: 起動行用。ミス経路の行幅を 1 行にする (ラボの COND の env が
+/// サーバに届いたかを起動ログで確かめるため。env は `OnceLock` で 1 回だけ読む)。
+pub fn exp_miss_rows_report() -> String {
+    let v = miss_flat_rows();
+    if v == MISS_FLAT_ROWS {
+        format!("{v} (既定)")
+    } else {
+        format!("{v} (DENNO_EXP_MISS_ROWS)")
+    }
+}
+
 /// P64: expert 1 本の寄与 `h = down(silu(gate(x)) * up(x))` を `h` に書く。
 ///
 /// 従来の並列経路 ([`expert_contribs_par`]) の 1 expert ぶんと**同じ呼び出し列**:
@@ -22211,6 +22262,23 @@ mod tests {
         assert!(expert_contribs_flat_decode_into(&lw, &sel, &x, e, ff, &mut got, 0).is_err());
     }
 
+    /// task 361: `DENNO_EXP_MISS_ROWS` の解釈 (純関数) と既定値。
+    ///
+    /// - 未設定は 16 (ミス 1 本の層で gate/up が 80 タスク = 14 スレッドで
+    ///   端数が出ない幅。lab t361b でミス CPU 時間の中央値 -2.4〜-5.8%)。
+    /// - 数字だけを受け付ける。0 と壊れた値は既定へ倒す (0 行はタスクを作れない)。
+    #[test]
+    fn exp_miss_rows_value() {
+        assert_eq!(miss_flat_rows_from_value(None), MISS_FLAT_ROWS);
+        assert_eq!(MISS_FLAT_ROWS, 16);
+        assert_eq!(miss_flat_rows_from_value(Some(" 32 ")), 32);
+        assert_eq!(miss_flat_rows_from_value(Some("64")), 64);
+        assert_eq!(miss_flat_rows_from_value(Some("0")), MISS_FLAT_ROWS);
+        assert_eq!(miss_flat_rows_from_value(Some("junk")), MISS_FLAT_ROWS);
+        // 起動行 (テストプロセスでは env 未設定 = 既定と出る)。
+        assert_eq!(exp_miss_rows_report(), "16 (既定)");
+    }
+
     /// P70 マイクロベンチ: decode の expert 寄与 (10 expert) と層 1 回ぶんを
     /// 従来 (1 expert = 1 タスク) / 平坦化 (expert 横断の行タスク) で A/B する。
     ///
@@ -22366,6 +22434,83 @@ mod tests {
                 layer_best[0] * 48.0,
                 layer_best[1] * 48.0,
             );
+        }
+    }
+
+    /// task 348/361 マイクロベンチ: ミス経路 (1 層のミス 1〜3 本) の行幅。
+    ///
+    /// 実形 (e=2560 / ff=640 / 512 expert) の疎 GGUF で
+    /// [`expert_contribs_flat_decode_into`] をミス本数 × 行幅で交互に測る。
+    /// 行幅は値に影響しない (測る前に全組み合わせのビット一致を確かめる)。
+    ///
+    /// この環境 (dev コンテナ) の値。実機の decode は lab が測る。
+    ///
+    /// `cargo test --release -p denno-engine --lib --features cuda -- \
+    ///   --ignored --nocapture --test-threads=1 bench_miss_flat_rows`
+    #[test]
+    #[cfg(feature = "par")]
+    #[ignore]
+    fn bench_miss_flat_rows() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let (n_embd, n_ff, ne) = (2560usize, 640usize, 512usize);
+        let x = cache_test_x_seed(n_embd, 0);
+        let real: Vec<usize> = (0..10).collect();
+        let dir = TempDir::new("t361bench");
+        let path = dir.path("bench.gguf");
+        write_expert_gguf_sparse(&path, n_embd, n_ff, ne, &real);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(n_embd, n_ff, ne, 10);
+        let lw = layer_at(&f, &p, 0);
+        let rows_opts = [8usize, 16, 32, 46, 64, 92, 128, 256];
+        let reps = 20usize;
+        for threads in [14usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            for k in [1usize, 2, 3, 10] {
+                let sel: Vec<usize> = (0..k).collect();
+                let mut want = vec![0.0f32; k * n_embd];
+                let mut got = vec![0.0f32; k * n_embd];
+                pool.install(|| {
+                    expert_contribs_flat_decode_into(
+                        &lw, &sel, &x, n_embd, n_ff, &mut want, DECODE_FLAT_ROWS,
+                    )
+                    .expect("従来幅");
+                    assert!(want.iter().any(|v| *v != 0.0), "寄与が全 0");
+                    for &rows in rows_opts.iter() {
+                        expert_contribs_flat_decode_into(
+                            &lw, &sel, &x, n_embd, n_ff, &mut got, rows,
+                        )
+                        .expect("平坦化");
+                        assert_bitwise_eq(&want, &got, &format!("k={k} rows={rows}"));
+                    }
+                });
+                let mut best = vec![f64::INFINITY; rows_opts.len()];
+                for _ in 0..reps {
+                    for (i, &rows) in rows_opts.iter().enumerate() {
+                        let t0 = std::time::Instant::now();
+                        pool.install(|| {
+                            expert_contribs_flat_decode_into(
+                                &lw, &sel, &x, n_embd, n_ff, &mut got, rows,
+                            )
+                            .expect("平坦化");
+                        });
+                        best[i] = best[i].min(t0.elapsed().as_secs_f64());
+                    }
+                }
+                let mut line = format!("[bench361miss] threads={threads} k={k}:");
+                for (i, &rows) in rows_opts.iter().enumerate() {
+                    let name = if rows == 0 {
+                        "auto".to_string()
+                    } else {
+                        rows.to_string()
+                    };
+                    line.push_str(&format!(" {name}={:.1}us", best[i] * 1e6));
+                }
+                eprintln!("{line}");
+            }
         }
     }
 

@@ -3046,6 +3046,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     spawn_sigterm_saver();
     // task 119b: プールの初回使用 (モデル読み込み) の前に既定スレッド数を決める。
     ensure_rayon_pool();
+    // task 361: ミス経路の行幅 (`DENNO_EXP_MISS_ROWS`、既定 16) を起動時に 1 行で出す。
+    eprintln!(
+        "[flash] exp miss rows: {} (DENNO_EXP_MISS_ROWS)",
+        denno_engine::model::qwen4exp::exp_miss_rows_report()
+    );
     // task 213: 既定 on のゲートが必要とする PTX を起動時に監査する。
     // PTX が無いとその機能は**静かに**従来経路へ落ちる (REPORT_P204 の fold/upw)。
     // 起動は止めず、summary 1 行 + 欠落ごとに 1 行を出す。
