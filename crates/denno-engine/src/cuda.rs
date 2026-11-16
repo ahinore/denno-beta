@@ -30199,12 +30199,18 @@ pub(crate) const ATTN_PF3_BQ: usize = 64;
 // 読む直前にイベントで待つ。**デバイスから出るバイト列は同じ**で、ホストへ
 // 載る順序だけが変わる (値は不変)。
 //
-// ゲート: `DENNO_PF_KV_ASYNC` (明示的な真値だけ on)。
+// ゲート: `DENNO_PF_KV_ASYNC`。**既定 on** (lab t369a で採った)。
+//
+// lab t369a (depth8k、同じ run の base と対で読む): 14k cold は base 7.04 /
+// 6.45 s に対し 6.30 s (台帳の exposed_host は 2,867 -> 2,125 ms、gpu_busy は
+// 4,907 -> 4,909 ms で不変)、3,826 cold は 2,512 / 2,524 に対し
+// 2,475 / 2,469 ms、decode は 15.7-16.2 ms/tok で不変、md5 は全 COND・
+// 全リクエスト SAME、errors 0、text sane。切り戻しは `DENNO_PF_KV_ASYNC=0`。
 pub(crate) fn pf_kv_async_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
 }
 
 #[cfg(test)]
@@ -57755,24 +57761,32 @@ mod task318_tests {
         assert!(q::SUB_LM_PARK < q::SUB_N);
     }
 
-    /// task 369: `DENNO_PF_KV_ASYNC` の解釈 (明示的な真値だけ on)。
+    /// task 369: `DENNO_PF_KV_ASYNC` の解釈 (lab t369a で採ったので既定 on)。
     #[test]
     fn t369_kv_async_gate_truth_table() {
         for raw in [
-            None,
-            Some(""),
-            Some(" 0 "),
+            Some("0"),
             Some("off"),
             Some("FALSE"),
-            Some("no"),
-            Some("x"),
+            Some(" No "),
+            Some(""),
         ] {
             assert!(!pf_kv_async_from_value(raw), "raw={raw:?} が on になっている");
         }
-        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
+        for raw in [
+            None,
+            Some("1"),
+            Some("on"),
+            Some("TRUE"),
+            Some(" yes "),
+            Some("x"),
+        ] {
             assert!(pf_kv_async_from_value(raw), "raw={raw:?} が off になっている");
         }
-        assert!(!pf_kv_async_from_value(None), "既定が on になっている");
+        assert!(
+            pf_kv_async_from_value(None),
+            "既定が off になっている (t369a で採ったので on)"
+        );
     }
 
     /// task 369: 保留が無いときの `pf_kv_wb_copy_into` / `pf_kv_wb_discard` は
