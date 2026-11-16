@@ -11221,6 +11221,8 @@ fn t349_ple_pipe_is_wired_and_does_not_double_read() {
 
 /// task 349: `DENNO_PF_PLE_PIPE` が層優先 (LM) の先頭 gather でも効き、
 /// 専用プールの本数まで並列度を上げること (読む行は同じ)。
+///
+/// task 357: 本数は `DENNO_PF_PLE_THREADS` (既定 32) から取る。
 #[test]
 fn t349_ple_pipe_widens_the_lm_gather_pool() {
     let ple = include_str!("../src/ple.rs");
@@ -11229,8 +11231,12 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
         "ple_par_parts がゲートを見ていない"
     );
     assert!(
-        ple.contains("rayon::current_num_threads().clamp(1, 32)"),
-        "並列度の上限が 32 でない"
+        ple.contains("crate::model::exp_pf::ple_threads().max(1)"),
+        "並列度の上限が env (DENNO_PF_PLE_THREADS) から来ていない"
+    );
+    assert!(
+        ple.contains(".clamp(1, 128);"),
+        "並列度の上限 128 が無い"
     );
     // 層優先の先頭 gather が専用プールで回る (埋め込みは直列のまま)。
     assert!(
@@ -11238,8 +11244,8 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
         "LM 経路がゲートを見ていない"
     );
     assert!(
-        QWEN_SRC.contains("const PLE_PIPE_THREADS: usize = 32;"),
-        "専用プールの本数が無い"
+        QWEN_SRC.contains("let ple_threads = crate::model::exp_pf::ple_threads().max(1);"),
+        "専用プールの本数が env から来ていない"
     );
     assert!(
         QWEN_SRC.contains("Ok(p) => ples_all = p.install(run)?,"),
@@ -11249,5 +11255,33 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
     assert!(
         QWEN_SRC.contains("out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);"),
         "LM の wide 経路が gather 本体を通っていない"
+    );
+}
+
+/// task 357: PLE gather の本数は env ゲートで決まり、プールへそのまま渡る。
+#[test]
+fn t357_ple_threads_gate_is_wired_to_the_pool() {
+    use denno_engine::model::exp_pf::{
+        ple_threads_from_value, DEFAULT_PLE_THREADS, PLE_THREADS_ENV,
+    };
+    assert_eq!(PLE_THREADS_ENV, "DENNO_PF_PLE_THREADS");
+    assert_eq!(DEFAULT_PLE_THREADS, 96, "既定は lab t357a/t357b の 96 本");
+    assert_eq!(ple_threads_from_value(None), 96);
+    assert_eq!(ple_threads_from_value(Some("64")), 64);
+    assert_eq!(
+        ple_threads_from_value(Some("32")),
+        32,
+        "切り戻しは 32 (task 353 の値)"
+    );
+    assert_eq!(ple_threads_from_value(Some("0")), 96, "0 は既定へ (逐次にはしない)");
+    assert_eq!(ple_threads_from_value(Some("4096")), 128, "上限 128");
+    // プールの生成に env の本数が渡る (定数で固定されていない)。
+    assert!(
+        QWEN_SRC.contains(".num_threads(ple_threads)"),
+        "プールの本数が env を見ていない"
+    );
+    assert!(
+        !QWEN_SRC.contains("const PLE_PIPE_THREADS: usize = 32;"),
+        "32 本固定が残っている"
     );
 }
