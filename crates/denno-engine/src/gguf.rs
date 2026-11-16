@@ -861,7 +861,9 @@ fn parse_fields(b: &[u8]) -> Result<ParsedFields, GgufError> {
     }
     // データ部は alignment に整列
     let data_start = (p + (alignment as usize - 1)) & !(alignment as usize - 1);
-    if data_start > b.len() {
+    // 2026-11-16: unsloth 11-13 版の分割 GGUF は先頭がメタデータだけ (tensor 0 個) で、
+    // 末尾の alignment 詰めが無い。tensor が無ければデータ部は読まないので許す。
+    if data_start > b.len() && !tensors.is_empty() {
         return err("データ部がファイル終端を超えている");
     }
 
