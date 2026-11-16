@@ -2218,12 +2218,20 @@ impl FullAttn {
             )
         };
         if !ok {
+            crate::cuda::pf_kv_wb_discard();
             return Ok(None);
         }
+        // task 369: k/v の D2H を非同期で積んだとき (`DENNO_PF_KV_ASYNC`) は、
+        // `pf_full_out` がホスト KV を読まないと分かる間だけ push を後ろへ回す。
+        // それ以外は従来どおり「先に積んでから後半へ」。
+        let wb_deferred = crate::cuda::pf_full_mirror_direct(cache_id, layer, gen, base + nt, kv);
         // KV は従来経路と同じ順序・同じ値でホストのキャッシュへ積む。
-        for t in 0..nt {
-            self.cache
-                .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+        if !wb_deferred {
+            crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);
+            for t in 0..nt {
+                self.cache
+                    .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+            }
         }
         let kb = self.cache.k(layer)?;
         let vb = self.cache.v(layer)?;
@@ -2268,9 +2276,38 @@ impl FullAttn {
             &mut flat_out,
         );
         if !done {
+            crate::cuda::pf_kv_wb_discard();
             // 後半で落ちたら積んだ KV を巻き戻す (従来経路が二重に積まない)。
             self.cache.truncate_layer(layer, base)?;
             return Ok(None);
+        }
+        if wb_deferred {
+            // ここで初めて転送を待つ (attention と out のカーネルの裏に隠れる)。
+            // `DENNO_PF_KV_PUSH` では pinned から直接積む (ks/vs への写しを省く)。
+            let mut err = None;
+            let used = crate::cuda::pf_kv_push_on()
+                && crate::cuda::pf_kv_wb_with(|k: &[f32], v: &[f32]| {
+                    for t in 0..nt {
+                        if let Err(e) = self.cache.push(
+                            layer,
+                            &k[t * kv..(t + 1) * kv],
+                            &v[t * kv..(t + 1) * kv],
+                        ) {
+                            err = Some(e);
+                            return;
+                        }
+                    }
+                });
+            if !used {
+                crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);
+                for t in 0..nt {
+                    self.cache
+                        .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+                }
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
         }
         if self.pos < base + nt {
             self.pos = base + nt;
