@@ -11914,7 +11914,7 @@ fn moe_ffn_quant_impl(
                 // 行分割の有無・タスクの割り当てに依らず出力はビット一致する。
                 if flat_new {
                     let mut hs = vec![0.0f32; sel.len() * e];
-                    expert_contribs_flat_decode_into(lw, &sel, x, e, ff, &mut hs, DECODE_FLAT_ROWS)?;
+                    expert_contribs_flat_decode_into(lw, &sel, x, e, ff, &mut hs, miss_flat_rows())?;
                     let t_scat = crate::model::exp_kprof::stamp();
                     for (t, _) in sel.iter().enumerate() {
                         let pe = weights[t];
@@ -12877,7 +12877,7 @@ fn expert_miss_contribs_into(
             if sel.is_empty() {
                 return Ok(());
             }
-            return expert_contribs_flat_decode_into(lw, sel, x, e, ff, dst, DECODE_FLAT_ROWS);
+            return expert_contribs_flat_decode_into(lw, sel, x, e, ff, dst, miss_flat_rows());
         }
         expert_contribs_par_into(lw, sel, x, e, ff, None, dst)
     }
@@ -19084,7 +19084,21 @@ fn expert_contribs_flat_decode_into(
     rows: usize,
 ) -> Result<()> {
     use rayon::prelude::*;
-    if rows == 0 {
+    // task 348: `rows == 0` は自動 (位相ごとに「全スレッドへ 1 本ずつ」を選ぶ)。
+    // 1 層のミスが 1〜2 本のとき固定 64 行だと 20 タスク / 14 スレッド = 2 巡に
+    // なって 29% 遊ぶ。行の切り方は値に影響しない (各行は独立)。
+    let threads = rayon::current_num_threads().max(1);
+    let rows_gu = if rows == 0 {
+        flat_auto_rows(sel.len() * 2 * ff, threads)
+    } else {
+        rows
+    };
+    let rows_d = if rows == 0 {
+        flat_auto_rows(sel.len() * e, threads)
+    } else {
+        rows
+    };
+    if rows_gu == 0 || rows_d == 0 {
         return Err(one("expert 平坦化: 行チャンク幅が 0".to_string()));
     }
     if hs.len() != sel.len() * e {
@@ -19124,7 +19138,7 @@ fn expert_contribs_flat_decode_into(
         for &ei in sel {
             let mut r = 0;
             while r < ff {
-                let n = rows.min(ff - r);
+                let n = rows_gu.min(ff - r);
                 let (a, arest) = ar.split_at_mut(n);
                 ar = arest;
                 let (u, urest) = ur.split_at_mut(n);
@@ -19190,7 +19204,7 @@ fn expert_contribs_flat_decode_into(
             let inp = &act[t * ff..(t + 1) * ff];
             let mut r = 0;
             while r < e {
-                let n = rows.min(e - r);
+                let n = rows_d.min(e - r);
                 let (h, hrest) = hr.split_at_mut(n);
                 hr = hrest;
                 djobs.push(DownJob {
@@ -19220,6 +19234,47 @@ fn expert_contribs_flat_decode_into(
 /// 勝ち、128 行を超えると端数 (10 expert × 行数) でスレッドが遊ぶ。
 /// 実形 (e = 2560 / ff = 640) の実測は `bench_decode_flat` を参照。
 const DECODE_FLAT_ROWS: usize = 64;
+
+/// task 348: 平坦化経路の**自動**行幅 (純関数)。`total` はその位相の全行数
+/// (gate/up なら `sel.len() * 2 * ff`、down なら `sel.len() * e`)。
+///
+/// 「全スレッドへ 1 本ずつ」になる行幅 = `ceil(total / threads)` を選ぶ。
+/// ミスが 1 本の層 (実測で最多) では `rows = 64` の 20 タスク / 14 スレッド
+/// = 2 巡 (6 スレッド遊び) が、14 タスク / 1 巡になる。
+/// 開発コンテナの実測 (`bench_miss_flat_rows`、Q4_K/Q5_1 の実形、min of 20):
+/// ミス 1 本 14T で 71.2 -> 57.7 us (-19%)、16T で 52.9 -> 41.7 us (-21%)。
+/// ミス 2 本は 110.8 -> 118.3 us (+7%、4 タスクが端数になるため)、
+/// ミス 3 本は 127.8 -> 129.2 us、10 本は 382.8 -> 390.5 us と横ばい。
+///
+/// 行幅は値に影響しない (行は独立) ので、ここで何を選んでも寄与はビット一致する。
+#[cfg_attr(not(feature = "par"), allow(dead_code))]
+fn flat_auto_rows(total: usize, threads: usize) -> usize {
+    total.div_ceil(threads.max(1)).clamp(16, 256).max(1)
+}
+
+/// task 348: 平坦化経路の行チャンク幅を env で選ぶ (`DENNO_EXP_MISS_ROWS`)。
+///
+/// - 未設定: 従来の固定 [`DECODE_FLAT_ROWS`] (= 64)。
+/// - `auto`: 0 を返し、[`expert_contribs_flat_decode_into`] が位相ごとに
+///   [`flat_auto_rows`] で「全スレッドへ 1 本ずつ」になる幅を選ぶ。
+/// - 整数: その行数に固定 (掃引用)。
+///
+/// 値は行の切り方だけを変えるので、どの値でも寄与は**ビット一致**する。
+#[cfg_attr(not(feature = "par"), allow(dead_code))]
+fn miss_flat_rows_from_value(v: Option<&str>) -> usize {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => DECODE_FLAT_ROWS,
+        Some(s) if s == "auto" => 0,
+        Some(s) => s.parse::<usize>().unwrap_or(DECODE_FLAT_ROWS),
+    }
+}
+
+/// task 348: [`miss_flat_rows_from_value`] をプロセスで 1 回だけ env から読む。
+#[cfg_attr(not(feature = "par"), allow(dead_code))]
+fn miss_flat_rows() -> usize {
+    static ON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| miss_flat_rows_from_value(std::env::var("DENNO_EXP_MISS_ROWS").ok().as_deref()))
+}
 
 /// P64: expert 1 本の寄与 `h = down(silu(gate(x)) * up(x))` を `h` に書く。
 ///
@@ -22206,9 +22261,46 @@ mod tests {
             );
             assert_bitwise_eq(&want, &got, &format!("rows={rows}"));
         }
-        // 0 行は落ちる (空タスクを回さない)。
+        // task 348: 0 は「自動」(位相の全行数をスレッド数で割った幅)。
+        // タスク本数は自動幅から数え、値はビット一致する。
+        let threads = rayon::current_num_threads().max(1);
+        let (rg, rd) = (
+            flat_auto_rows(sel.len() * 2 * ff, threads),
+            flat_auto_rows(sel.len() * e, threads),
+        );
+        assert!(rg > 0 && rd > 0, "自動幅が 0: {rg} / {rd}");
         let mut got = vec![0.0f32; want.len()];
-        assert!(expert_contribs_flat_decode_into(&lw, &sel, &x, e, ff, &mut got, 0).is_err());
+        let t0 = FLAT_DECODE_TASKS.load(std::sync::atomic::Ordering::Relaxed);
+        expert_contribs_flat_decode_into(&lw, &sel, &x, e, ff, &mut got, 0).expect("自動幅");
+        let want_tasks = sel.len() * (2 * ff.div_ceil(rg) + e.div_ceil(rd));
+        assert_eq!(
+            FLAT_DECODE_TASKS.load(std::sync::atomic::Ordering::Relaxed) - t0,
+            want_tasks,
+            "rows=auto ({rg}/{rd}): 行タスクの本数が違う"
+        );
+        assert_bitwise_eq(&want, &got, "rows=auto");
+    }
+
+    /// task 348: `DENNO_EXP_MISS_ROWS` の解釈 (純関数) と自動幅。
+    ///
+    /// - 未設定は従来の 64 (既定を変えない = 切り戻し不要)。
+    /// - `auto` は 0 を返し、[`flat_auto_rows`] が位相ごとの幅を出す。
+    /// - 数字はそのまま、壊れた値は 64。
+    #[test]
+    fn exp_miss_rows_value_and_auto() {
+        assert_eq!(miss_flat_rows_from_value(None), DECODE_FLAT_ROWS);
+        assert_eq!(miss_flat_rows_from_value(Some("auto")), 0);
+        assert_eq!(miss_flat_rows_from_value(Some(" AUTO ")), 0);
+        assert_eq!(miss_flat_rows_from_value(Some("96")), 96);
+        assert_eq!(miss_flat_rows_from_value(Some("junk")), DECODE_FLAT_ROWS);
+        // 実形 (ff = 640 / e = 2560) の自動幅。14 スレッドならミス 1 本で
+        // gate/up = 92 行 (14 タスク = 1 巡)、down = 183 行 (14 タスク = 1 巡)。
+        assert_eq!(flat_auto_rows(1 * 2 * 640, 14), 92);
+        assert_eq!(flat_auto_rows(1 * 2560, 14), 183);
+        assert_eq!(flat_auto_rows(2 * 2 * 640, 16), 160);
+        // 16 行を下回らない (タスクの固定費) / 256 行を超えない (端数が出る)。
+        assert_eq!(flat_auto_rows(1, 14), 16);
+        assert_eq!(flat_auto_rows(10 * 2 * 640, 8), 256);
     }
 
     /// P70 マイクロベンチ: decode の expert 寄与 (10 expert) と層 1 回ぶんを
@@ -22366,6 +22458,84 @@ mod tests {
                 layer_best[0] * 48.0,
                 layer_best[1] * 48.0,
             );
+        }
+    }
+
+    /// task 348/361 マイクロベンチ: ミス経路 (1 層のミス 1〜3 本) の行幅。
+    ///
+    /// 実形 (e=2560 / ff=640 / 512 expert) の疎 GGUF で
+    /// [`expert_contribs_flat_decode_into`] をミス本数 × 行幅で交互に測る。
+    /// 行幅は値に影響しない (測る前に全組み合わせのビット一致を確かめる)。
+    /// 0 = `auto` (行幅を自動で選ぶ)。
+    ///
+    /// この環境 (dev コンテナ) の値。実機の decode は lab が測る。
+    ///
+    /// `cargo test --release -p denno-engine --lib --features cuda -- \
+    ///   --ignored --nocapture --test-threads=1 bench_miss_flat_rows`
+    #[test]
+    #[cfg(feature = "par")]
+    #[ignore]
+    fn bench_miss_flat_rows() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let (n_embd, n_ff, ne) = (2560usize, 640usize, 512usize);
+        let x = cache_test_x_seed(n_embd, 0);
+        let real: Vec<usize> = (0..10).collect();
+        let dir = TempDir::new("t361bench");
+        let path = dir.path("bench.gguf");
+        write_expert_gguf_sparse(&path, n_embd, n_ff, ne, &real);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(n_embd, n_ff, ne, 10);
+        let lw = layer_at(&f, &p, 0);
+        let rows_opts = [0usize, 32, 46, 64, 92, 128, 256];
+        let reps = 20usize;
+        for threads in [14usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            for k in [1usize, 2, 3, 10] {
+                let sel: Vec<usize> = (0..k).collect();
+                let mut want = vec![0.0f32; k * n_embd];
+                let mut got = vec![0.0f32; k * n_embd];
+                pool.install(|| {
+                    expert_contribs_flat_decode_into(
+                        &lw, &sel, &x, n_embd, n_ff, &mut want, DECODE_FLAT_ROWS,
+                    )
+                    .expect("従来幅");
+                    assert!(want.iter().any(|v| *v != 0.0), "寄与が全 0");
+                    for &rows in rows_opts.iter() {
+                        expert_contribs_flat_decode_into(
+                            &lw, &sel, &x, n_embd, n_ff, &mut got, rows,
+                        )
+                        .expect("平坦化");
+                        assert_bitwise_eq(&want, &got, &format!("k={k} rows={rows}"));
+                    }
+                });
+                let mut best = vec![f64::INFINITY; rows_opts.len()];
+                for _ in 0..reps {
+                    for (i, &rows) in rows_opts.iter().enumerate() {
+                        let t0 = std::time::Instant::now();
+                        pool.install(|| {
+                            expert_contribs_flat_decode_into(
+                                &lw, &sel, &x, n_embd, n_ff, &mut got, rows,
+                            )
+                            .expect("平坦化");
+                        });
+                        best[i] = best[i].min(t0.elapsed().as_secs_f64());
+                    }
+                }
+                let mut line = format!("[bench361miss] threads={threads} k={k}:");
+                for (i, &rows) in rows_opts.iter().enumerate() {
+                    let name = if rows == 0 {
+                        "auto".to_string()
+                    } else {
+                        rows.to_string()
+                    };
+                    line.push_str(&format!(" {name}={:.1}us", best[i] * 1e6));
+                }
+                eprintln!("{line}");
+            }
         }
     }
 

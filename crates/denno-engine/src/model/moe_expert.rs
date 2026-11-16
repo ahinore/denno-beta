@@ -1074,6 +1074,13 @@ fn expert_gemv_inner(
     // アキュムレータ)。classic とは累積順が違うのでビット一致しない
     // (gemv_iq / IQ4_NL m1 と同じ立場)。`DENNO_IQ3S_FAST=0` で下の classic
     // スカラー経路に戻る (退避路)。
+    // task 348: AVX-512F 版 (16 要素/zmm) も書いて測ったが、実形 2560x640 で
+    // **AVX2 版の 0.56x (1T 4.59 -> 2.56 GB/s、8T 31.2 -> 18.4 GB/s、min of 30)**。
+    // IQ3_S の dequant は 32 要素あたり 8 本の格子 (IQ3S_GRID) の**スカラー
+    // ロード**が本体で、FMA を半分にしても縮まない (IQ4_NL が 1.17x になったのは
+    // 格子が 16 エントリで zmm の VPERMD に載ったため)。同じ理由で 14 スレッド
+    // では DRAM 帯域 (~48 GB/s) が上に来るので、カーネルを速くしても効かない。
+    // よってカーネルは AVX2 版だけを残す (task 361 で zmm 版は削除)。
     if ty == GgmlType::IQ3S && q4k_fused_supported() && iq3s_fast_enabled() {
         #[cfg(target_arch = "x86_64")]
         {
@@ -3010,7 +3017,6 @@ pub fn iq3s_fast_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| iq3s_fast_from_value(std::env::var("DENNO_IQ3S_FAST").ok().as_deref()))
 }
-
 
 // ---- IQ2_S / IQ3_XXS のバッチ融合 GEMM (task 99) -----------------------------
 //
