@@ -1724,15 +1724,34 @@ pub fn pread_blocks(len: usize, blk: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// `DENNO_PF_PREAD_THREADS`: pread の写し専用のスレッド数 (既定 0 = rayon の
-/// 共有プール = 14 本)。`read_at` は同期なので、デバイスがレイテンシ律速なら
-/// 本数を増やすと同時に飛ぶ I/O が増える (仮説)。
+/// `DENNO_PF_PREAD_THREADS`: pread の写し専用のスレッド数 (既定 **32**、
+/// `0` で従来の共有プール = 14 本)。`read_at` は同期なので、デバイスが
+/// レイテンシ律速なら本数を増やすと同時に飛ぶ I/O が増える。
 pub const PREAD_THREADS_ENV: &str = "DENNO_PF_PREAD_THREADS";
 
-/// [`PREAD_THREADS_ENV`] の既定値 (0 = 共有プール)。
-pub const DEFAULT_PREAD_THREADS: usize = 0;
+/// [`PREAD_THREADS_ENV`] の既定値 (32)。task 358 の lab t358b で採った。
+///
+/// task 325 は 14 (共有プール) と 32 を比べて「壁時計は動かない」として
+/// 0 のまま残した (当時の 3,826 は 10.3-11.4 s、copy 7.2-7.7 s)。その後の
+/// task 353/357 で PLE と層優先の前処理が速くなり、**prefill の壁時計に
+/// 占める expert の pread (44.4 GB / 98.2 GB) の比率が上がった**ので、
+/// 同じ 32 本をもう一度測った:
+///
+/// lab t358b (UD-Q4_K_XL、depth8k、`[exp-pf-stream]` の copy_s と壁時計):
+///
+/// | cond | 3,826 copy | 3,826 wall | 14k copy | 14k wall |
+/// | --- | --- | --- | --- | --- |
+/// | x0 (14 本) | 10.37 / 9.26 s | 12.81 / 11.54 s | 14.30 s | 30.25 s |
+/// | **32 本** | **8.61 / 7.74 s** | **10.83 / 9.87 s** | **11.84 s** | **25.71 s** |
+/// | 48 本 | 7.41 / 8.58 s | 9.84 / 11.04 s | 14.11 s | 34.65 s |
+/// | b1 (14 本) | 9.96 / 14.12 s | 12.12 / 18.28 s | 14.02 s | 31.18 s |
+///
+/// 3,826 は中央値 12.12 -> 10.35 s (-14.6%)、14k は 30.25 -> 25.71 s (-15.0%)。
+/// 48 本は 3,826 で最速だが 14k で負け (ホストの外乱) なので 32 を採る。
+/// decode は変わらない (a1/a2 の生秒 2.3-2.6 s)。
+pub const DEFAULT_PREAD_THREADS: usize = 32;
 
-/// [`PREAD_THREADS_ENV`] の解釈 (純関数)。0..=64 に丸める。
+/// [`PREAD_THREADS_ENV`] の解釈 (純関数)。0..=64 に丸める。`0` = 共有プール。
 pub fn pread_threads_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_PREAD_THREADS;
@@ -3084,15 +3103,22 @@ mod tests {
         assert_eq!(DEFAULT_PLE_THREADS, 96);
     }
 
-    /// task 325: `DENNO_PF_PREAD_THREADS` の丸めと既定 (0 = 共有プール)。
+    /// task 325 / 358: `DENNO_PF_PREAD_THREADS` の丸めと既定 (32 本)。
+    ///
+    /// task 358 で既定を 0 (共有プール 14 本) から 32 本へ変えた (lab t358b:
+    /// 3,826 -14.6%、14k -15.0%)。**`0` は明示的な切り戻し**として 0 を返す
+    /// (未設定・空・解析不能だけが新しい既定へ行く)。
     #[test]
     fn pread_threads_rounds_and_defaults() {
-        assert_eq!(pread_threads_from_value(None), 0);
-        assert_eq!(pread_threads_from_value(Some("")), 0);
-        assert_eq!(pread_threads_from_value(Some("0")), 0);
+        assert_eq!(pread_threads_from_value(None), 32, "未設定は新しい既定 32");
+        assert_eq!(pread_threads_from_value(Some("")), 32);
+        assert_eq!(pread_threads_from_value(Some("0")), 0, "0 = 共有プールへ戻す");
         assert_eq!(pread_threads_from_value(Some("32")), 32);
+        assert_eq!(pread_threads_from_value(Some(" 16 ")), 16);
         assert_eq!(pread_threads_from_value(Some("999")), 64, "上限 64");
-        assert_eq!(pread_threads_from_value(Some("x")), 0);
+        assert_eq!(pread_threads_from_value(Some("x")), 32);
+        assert_eq!(PREAD_THREADS_ENV, "DENNO_PF_PREAD_THREADS");
+        assert_eq!(DEFAULT_PREAD_THREADS, 32);
     }
 
     /// task 325: 塊に切っても合計は元の長さで、隙間も重なりも無い。

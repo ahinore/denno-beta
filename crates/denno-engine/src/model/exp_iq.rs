@@ -182,6 +182,183 @@ pub fn iq_v3_enabled() -> bool {
 /// v3 が差し替えるスロット (`kernels_exp_iq_v3.cu` にあるカーネルの型)。
 pub const IQ_V3_SLOTS: [usize; 2] = [0, 2];
 
+// ---------------------------------------------------------------------------
+// task 356: expert 段の寄与 D2H を専用ストリームへ (`DENNO_DEC_EXP_D2H_STREAM`)
+// ---------------------------------------------------------------------------
+//
+// IQ expert の層一括経路は「カーネルを積む -> 非同期 D2H -> CPU ミス -> 同期」で
+// GPU と CPU を重ねる。ところが D2H を **null ストリーム** に出しているので、
+// 小さいコピー (和モードは e = 2,560 要素 = 10 KB) では driver がコピーの完了を
+// 呼び出しの中で待つ経路に入ることがある。その待ちは CPU ミスの**前**に直列に
+// 挟まるので、重ね打ちが丸ごと効かなくなる (lab t352a の台帳: experts 段
+// 5.39 ms/tok に対し GPU 3.07 + ミス 2.78 で、重なりは 8% しか無い)。
+//
+// 専用の非ブロッキングストリームへ出すと、コピーは「この層のカーネルの完了」を
+// イベントで待つだけになり、呼び出しはホストを止めない。待ちは CPU ミスの後へ
+// 回す。**デバイスへ渡るバイト列・カーネル・発行順は 1 つも変わらない**。
+pub const DEC_D2H_STREAM_ENV: &str = "DENNO_DEC_EXP_D2H_STREAM";
+
+/// [`DEC_D2H_STREAM_ENV`] の解釈 (純関数)。**既定 off**。
+///
+/// 明示的な真値 (`1` / `on` / `true` / `yes`) だけ on にする (A/B 用のゲート)。
+pub fn dec_d2h_stream_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn dec_d2h_stream_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dec_d2h_stream_from_value(std::env::var(DEC_D2H_STREAM_ENV).ok().as_deref()))
+}
+
+/// 専用ストリームへ出したコピーの本数 (**分岐が発火した証拠**)。
+static D2H_STREAM_COPIES: AtomicU64 = AtomicU64::new(0);
+/// 専用ストリームのコピーを待った合計時間 (ns)。
+static D2H_STREAM_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// 専用ストリームを作れず従来経路へ落ちた回数。
+static D2H_STREAM_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// コピーを 1 本、専用ストリームへ出した。
+pub fn note_d2h_stream_copy() {
+    D2H_STREAM_COPIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 専用ストリームのコピーを待った (`ns` = 待ち時間)。
+pub fn note_d2h_stream_wait(ns: u64) {
+    D2H_STREAM_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// 専用ストリームを作れず従来経路へ落ちた。
+pub fn note_d2h_stream_fallback() {
+    D2H_STREAM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 リクエストぶんの 1 行 (ゲート on でもコピーが 0 なら `None`)。
+pub fn d2h_stream_line() -> Option<String> {
+    d2h_stream_line_with(dec_d2h_stream_enabled())
+}
+
+/// [`d2h_stream_line`] の本体 (ゲートの真偽を引数で受ける = テストで両側を踏める)。
+fn d2h_stream_line_with(on: bool) -> Option<String> {
+    if !on {
+        return None;
+    }
+    let copies = D2H_STREAM_COPIES.load(Ordering::Relaxed);
+    if copies == 0 && D2H_STREAM_FALLBACKS.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let wait_ms = D2H_STREAM_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6;
+    let us = if copies > 0 {
+        wait_ms * 1e3 / copies as f64
+    } else {
+        0.0
+    };
+    Some(format!(
+        "[dec-exp-d2h] stream=1 copies={copies} fallback={} wait={wait_ms:.2}ms us/copy={us:.1}",
+        D2H_STREAM_FALLBACKS.load(Ordering::Relaxed)
+    ))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn d2h_stream_reset() {
+    for c in [&D2H_STREAM_COPIES, &D2H_STREAM_WAIT_NS, &D2H_STREAM_FALLBACKS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 356: 和の出力を **pinned のホストバッファへ直接書く** (`DENNO_DEC_EXP_SUM_ZC`)
+// ---------------------------------------------------------------------------
+//
+// lab t356a の実測 (IQ3_S、depth8k、hit_rate 0.99、decode 14.8 ms/tok) では
+// experts 段が 1 層 71.7 us で、そのうち GPU の鎖が 54 us:
+// gate+up 25.9 / silu 3.9 / down 16.8 / sum 5.0 / **d2h 5.5** (us/層)。
+// d2h は `dno_dec_exp_sum` の e = 2,560 要素 (10 KB) を VRAM から pinned へ
+// 写すだけで、DMA の起動待ちがそのまま層の鎖に乗る。t356a で専用ストリームへ
+// 出しても decode は変わらなかった (ホストが結局その完了を待つため)。
+//
+// ならば**コピーそのものを消す**: 和のカーネルの出力ポインタに pinned のホスト
+// バッファのアドレスを渡す (UVA なのでデバイスから同じアドレスで書ける)。カーネルが
+// ホストへ直接書くので、D2H も、その完了待ちも要らない。値は同じ (同じカーネル・
+// 同じ式・同じ並び)。ストリームの同期は従来どおり 1 回で、その後ホストが
+// バッファを読む (カーネル完了 = 書き込みが見える)。
+//
+// lab t356b (2 ラウンド、交互、4 COND) の実測:
+// - `[dec-exp-kprof]` の 1 層あたり: base = gate 23.2 / up 4.2 / silu 4.9 /
+//   down 15.4 / d2h 10.0 / sum 5.2 (計 62.9) -> 本ゲート = d2h 1.3 / sum 7.2
+//   (計 56.8)。**d2h -8.7 us の代わりに sum +2.0 us** (ホストへの 10 KB 書き) で
+//   正味 -5.4〜-6.0 us/層。
+// - `[q4ledger] experts` (ms/tok、同じ request 同士の比較):
+//   28 tok 窓 base 3.41/3.48・base2 3.46/3.44 -> **3.23/3.20 (-6.7%)**、
+//   3929 tok 窓 4.36/4.19・4.21/4.19 -> 4.03/3.99 (-5.4%)、
+//   3826 tok 窓 5.39/4.85・4.86/4.87 -> 4.63/4.69 (-4.2%)。
+//   2 ラウンドとも同じ向き。md5 は全 COND SAME、errors 0。
+// - decode 中央値は 16.8 (base/base2) -> 16.7 (本ゲート) で、段の -6.7% が
+//   トークンでは -1.4% 相当 (きれいな窓の step 13.80 -> 13.61)。
+pub const SUM_ZC_ENV: &str = "DENNO_DEC_EXP_SUM_ZC";
+
+/// [`SUM_ZC_ENV`] の解釈 (純関数)。**既定 on** (lab t356b で採否 yes)。
+///
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+pub fn sum_zc_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn sum_zc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| sum_zc_from_value(std::env::var(SUM_ZC_ENV).ok().as_deref()))
+}
+
+/// 和を pinned のホストへ直接書いた層の数 (**分岐が発火した証拠**)。
+static SUM_ZC_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// pinned を確保できず従来の D2H 経路へ落ちた層の数。
+static SUM_ZC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 和をホストへ直接書いた層を 1 つ数える。
+pub fn note_sum_zc_layer() {
+    SUM_ZC_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// pinned を確保できず従来経路へ落ちた層を 1 つ数える。
+pub fn note_sum_zc_fallback() {
+    SUM_ZC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 リクエストぶんの 1 行 (ゲート on でも 0 層なら `None`)。
+pub fn sum_zc_line() -> Option<String> {
+    sum_zc_line_with(sum_zc_enabled())
+}
+
+/// [`sum_zc_line`] の本体 (ゲートの真偽を引数で受ける = テストで両側を踏める)。
+fn sum_zc_line_with(on: bool) -> Option<String> {
+    if !on {
+        return None;
+    }
+    let layers = SUM_ZC_LAYERS.load(Ordering::Relaxed);
+    let fb = SUM_ZC_FALLBACKS.load(Ordering::Relaxed);
+    if layers == 0 && fb == 0 {
+        return None;
+    }
+    Some(format!("[dec-exp-zc] sum_zc_layers={layers} fallback={fb}"))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn sum_zc_reset() {
+    for c in [&SUM_ZC_LAYERS, &SUM_ZC_FALLBACKS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// [`EXPERT_IQ_UPLOAD_ENV`] の解釈 (純関数)。未設定・数値でない値は既定値。
 pub fn upload_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim) {
@@ -785,6 +962,78 @@ mod tests {
             GgmlType::Q2_0,
         ]
     }
+
+    /// task 356: `DENNO_DEC_EXP_D2H_STREAM` は**既定 off** で、明示的な真値だけ on。
+    ///
+    /// lab の COND は `VAR=value` をそのまま env にするので、`0` / 空 / 未知の値で
+    /// 黙って on になると A/B が壊れる。ここで解釈を固定する。
+    #[test]
+    fn dec_d2h_stream_gate_defaults_off() {
+        assert!(!dec_d2h_stream_from_value(None), "未設定は off");
+        for v in ["", "0", "off", "false", "no", "2", "abc", " ON?"] {
+            assert!(!dec_d2h_stream_from_value(Some(v)), "{v:?} は off");
+        }
+        for v in ["1", "on", "true", "yes", " ON ", "True"] {
+            assert!(dec_d2h_stream_from_value(Some(v)), "{v:?} は on");
+        }
+    }
+
+    /// task 356: 積算が 0 のときは行を出さず、コピーを数えると 1 行になる
+    /// (ゲート on でも「分岐が発火したか」を数字で読めるようにする)。
+    #[test]
+    fn dec_d2h_stream_line_counts_copies() {
+        d2h_stream_reset();
+        assert!(d2h_stream_line_with(true).is_none(), "0 本なら行を出さない");
+        note_d2h_stream_copy();
+        assert!(
+            d2h_stream_line_with(false).is_none(),
+            "ゲート off は数えていても行を出さない"
+        );
+        let line = d2h_stream_line_with(true).expect("ゲート on なら行が出る");
+        assert!(line.contains("copies=1"), "{line}");
+        note_d2h_stream_wait(2_000_000);
+        note_d2h_stream_fallback();
+        let line = d2h_stream_line_with(true).expect("行が出る");
+        assert!(line.contains("wait=2.00ms"), "{line}");
+        assert!(line.contains("fallback=1"), "{line}");
+        assert!(line.contains("us/copy=2000.0"), "{line}");
+        d2h_stream_reset();
+        assert!(d2h_stream_line_with(true).is_none(), "0 に戻したら行を出さない");
+    }
+
+    /// task 356: `DENNO_DEC_EXP_SUM_ZC` は**既定 on** (lab t356b で採否 yes)。
+    /// 明示的な偽値だけ切る (lab の COND は `VAR=value` をそのまま env にする)。
+    #[test]
+    fn sum_zc_gate_defaults_on() {
+        assert!(sum_zc_from_value(None), "未設定は on");
+        for v in ["0", "off", "false", "no", " OFF ", "False"] {
+            assert!(!sum_zc_from_value(Some(v)), "{v:?} は off");
+        }
+        for v in ["", "1", "on", "true", "yes", "2", "abc"] {
+            assert!(sum_zc_from_value(Some(v)), "{v:?} は on (偽値だけ切る)");
+        }
+    }
+
+    /// task 356: 和の ZC の積算 (0 層なら行を出さない / 数えると出る)。
+    #[test]
+    fn sum_zc_line_counts_layers() {
+        sum_zc_reset();
+        assert!(sum_zc_line_with(true).is_none(), "0 層なら行を出さない");
+        note_sum_zc_layer();
+        note_sum_zc_layer();
+        assert!(
+            sum_zc_line_with(false).is_none(),
+            "ゲート off は数えていても行を出さない"
+        );
+        let line = sum_zc_line_with(true).expect("ゲート on なら行が出る");
+        assert!(line.contains("sum_zc_layers=2"), "{line}");
+        note_sum_zc_fallback();
+        let line = sum_zc_line_with(true).expect("行が出る");
+        assert!(line.contains("fallback=1"), "{line}");
+        sum_zc_reset();
+        assert!(sum_zc_line_with(true).is_none(), "0 に戻したら行を出さない");
+    }
+
 
     /// ミラーの索引が `kquant::dequant_row` とビット一致する (全 6 型 x 実形の k)。
     #[test]

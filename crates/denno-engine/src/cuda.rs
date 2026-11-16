@@ -3660,17 +3660,14 @@ impl DevBuffer {
         if bytes == 0 {
             return Ok(true);
         }
-        let Some(pin) = pf_pin_stage(bytes)? else {
-            return Ok(false);
-        };
-        unsafe {
+        let done = with_pf_pin(bytes, |pin| unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, pin as *mut u8, bytes);
             check(
                 (lib()?.memcpy_htod)(self.ptr, pin as *const c_void, bytes),
                 "cuMemcpyHtoD (pin stage)",
-            )?;
-        }
-        Ok(true)
+            )
+        })?;
+        Ok(done.is_some())
     }
 
     /// task 318: pinned バウンス経由の同期 D2H (`DENNO_PF_PIN_STAGE=1`)。
@@ -3680,17 +3677,16 @@ impl DevBuffer {
         if bytes == 0 {
             return Ok(true);
         }
-        let Some(pin) = pf_pin_stage(bytes)? else {
-            return Ok(false);
-        };
-        unsafe {
+        let dst = out.as_mut_ptr() as *mut u8;
+        let done = with_pf_pin(bytes, |pin| unsafe {
             check(
                 (lib()?.memcpy_dtoh)(pin, self.ptr, bytes),
                 "cuMemcpyDtoH (pin stage)",
             )?;
-            std::ptr::copy_nonoverlapping(pin as *const u8, out.as_mut_ptr() as *mut u8, bytes);
-        }
-        Ok(true)
+            std::ptr::copy_nonoverlapping(pin as *const u8, dst, bytes);
+            Ok(())
+        })?;
+        Ok(done.is_some())
     }
 
     /// s141b (Task B7c): 既存バッファへ**デバイスから**上書きコピー (D2D・同期)。
@@ -8303,11 +8299,15 @@ where
         sync_r?;
 
         // 8. 結果 (e 要素) だけ戻す。
+        //
+        // task 358: `to_vec` は毎層 `Vec` を確保して pageable の同期 D2H をするので、
+        // e=2,560 (10 KB) で 11 us/層かかっていた (lab の `[seg-prof] d2h=`)。
+        // `to_slice` は 1 本の作業域へ直接戻し、`DENNO_PF_PIN_STAGE` の窓に入って
+        // いれば pinned バウンス経由 (同じバイト列) になる。
         let _t_d2h = crate::model::seg_prof::stamp();
-        let got: Vec<f32> = outb.to_vec(e)?;
+        outb.to_slice(&mut out[..e])?;
         dbg_d2h(e * 4);
         crate::model::seg_prof::add(crate::model::seg_prof::PH_D2H, _t_d2h);
-        out[..e].copy_from_slice(&got);
 
         // 9. 計上 (GPU 時間はイベント、バイト数は segment x 行数 x 行長)。
         if prof {
@@ -8606,6 +8606,9 @@ struct IqScratch {
     /// task 187: 和モードの重み (nseg 本) と和の出力 (e 要素)。
     wt: Option<DevBuffer>,
     psum: Option<DevBuffer>,
+    /// task 356: 和モードの ZC (`DENNO_DEC_EXP_SUM_ZC`) のときの和の出力先。
+    /// pinned のホスト (UVA でデバイスからも書ける) = D2H を消すため。
+    psum_zc: Option<PinMem>,
     /// task 204: gate+up 融合 (`DENNO_DEC_EXPGU`) の連結出力 `[g[ng] | u[ng]]`。
     gu: Option<DevBuffer>,
 }
@@ -8626,6 +8629,7 @@ impl IqScratch {
             hpin: None,
             wt: None,
             psum: None,
+            psum_zc: None,
             gu: None,
         }
     }
@@ -8850,6 +8854,18 @@ where
             MoeScratch::ensure_tagged(&mut sc.wt, nseg * 4, crate::mem_audit::TAG_GDN_SC)?;
             MoeScratch::ensure_tagged(&mut sc.psum, nout * 4, crate::mem_audit::TAG_GDN_SC)?;
         }
+        // task 356: 和の出力を pinned のホストへ直接書く (`DENNO_DEC_EXP_SUM_ZC`)。
+        // 確保できなければ従来の D2H 経路へ (fail closed)。
+        let zc = sum_mode
+            && sumk.is_some()
+            && crate::model::exp_iq::sum_zc_enabled()
+            && match Scratch::ensure_pin(&mut sc.psum_zc, nout * 4) {
+                Ok(()) => true,
+                Err(_) => {
+                    crate::model::exp_iq::note_sum_zc_fallback();
+                    false
+                }
+            };
         // task 150: overlap 経路だけ pinned staging を用意する (grow-only)。
         if overlap {
             Scratch::ensure_pin(&mut sc.hpin, nout * 4)?;
@@ -9129,12 +9145,21 @@ where
             //     (`out[j] = sum_t w[t] * h[t*e+j]`)。t 昇順の 1 アキュムレータ
             //     なので、ミスの無い層ではホストの足し込みとビット一致する。
             let src_ptr = if let Some(sk) = sumk {
+                // task 356 (`DENNO_DEC_EXP_SUM_ZC`): 和の出力を pinned のホストへ
+                // 直接書かせる (UVA なのでホストのアドレスがそのままデバイスの
+                // アドレス)。これで 10 KB の D2H とその完了待ちが丸ごと消える。
+                let zc_ptr = if zc {
+                    let pin = sc.psum_zc.as_ref().expect("確保済み");
+                    Some(pin.ptr as u64)
+                } else {
+                    None
+                };
                 let psum = sc.psum.as_ref().expect("確保済み");
                 let mut ph = h.ptr;
                 let mut pwv = w_addr as *mut c_void;
                 let mut psh = std::ptr::null_mut::<c_void>();
                 let mut pw = 0.0f32;
-                let mut po = psum.ptr;
+                let mut po = zc_ptr.unwrap_or(psum.ptr);
                 let (mut pe, mut pn, mut phs) = (e as c_int, nseg as c_int, 0 as c_int);
                 let mut args = [
                     &mut ph as *mut _ as *mut c_void,
@@ -9150,7 +9175,10 @@ where
                 let blocks = sum_e.div_ceil(threads) as u32;
                 ctx.launch_async(sk.sum, (blocks.max(1), 1, 1), (threads as u32, 1, 1), 0, &mut args)?;
                 dec_exp_kprof::mark(dec_exp_kprof::SUM);
-                psum.ptr
+                if zc_ptr.is_some() {
+                    crate::model::exp_iq::note_sum_zc_layer();
+                }
+                zc_ptr.unwrap_or(psum.ptr)
             } else {
                 h.ptr
             };
@@ -9158,13 +9186,31 @@ where
             //    非同期で先に出し、`middle` (CPU ミス) を挟んでから同期する。
             //    カーネル・引数・発行順は逐次版と同一 (変わるのは待つ位置だけ)。
             if overlap {
-                // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
-                // 借り直さないよう、アドレスを先に写す)。
-                let pin = sc.hpin.as_mut().expect("確保済み");
-                check(
-                    (lib()?.memcpy_dtoh_async)(pin.ptr, src_ptr, nout * 4, std::ptr::null_mut()),
-                    "cuMemcpyDtoHAsync (iq layer overlap)",
-                )?;
+                if zc {
+                    // task 356: カーネルが pinned のホストへ直接書いた = D2H 無し。
+                    // 待ちは下の同期 1 回だけで足りる。
+                } else {
+                    // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
+                    // 借り直さないよう、アドレスを先に写す)。
+                    let pin = sc.hpin.as_mut().expect("確保済み");
+                    if !exp_d2h_issue(pin.ptr, src_ptr, nout * 4) {
+                        // task 356 (`DENNO_DEC_EXP_D2H_STREAM`): コピーを専用の
+                        // 非ブロッキングストリームへ出す。null ストリームのままだと、
+                        // 小さいコピーで driver が呼び出しの中で待つことがあり、その
+                        // 待ちが CPU ミスの前に直列に挟まる。待ちは下の
+                        // `exp_d2h_wait` へ回す。失敗したら従来の null ストリーム
+                        // 経路へ (fail closed)。
+                        check(
+                            (lib()?.memcpy_dtoh_async)(
+                                pin.ptr,
+                                src_ptr,
+                                nout * 4,
+                                std::ptr::null_mut(),
+                            ),
+                            "cuMemcpyDtoHAsync (iq layer overlap)",
+                        )?;
+                    }
+                }
                 crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
                 dec_exp_kprof::mark(dec_exp_kprof::D2H);
             } else {
@@ -9175,19 +9221,44 @@ where
         if overlap {
             // ここから下はデバイスの完了を待たずに走る (GPU と CPU の重ね打ち)。
             middle()?;
-            // task 155: 待つのは null ストリーム (この層の expert GEMV と D2H)
-            // だけ。shared expert のサイドストリームは join まで待たない。
-            sync_default_or_ctx(ctx, dec_overlap_enabled())?;
-            let pin = sc.hpin.as_ref().expect("確保済み");
-            out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
-        } else {
-            let src = if sum_mode {
-                sc.psum.as_ref().expect("確保済み")
+            // task 356: 専用ストリームへ出したときは、`done` の完了が
+            // 「`ready` (この層のカーネル全部の後)」を待っているので、null ストリームの
+            // 同期は要らない (= 待ちを 1 回減らせる)。`DENNO_DEC_OVERLAP=0` のときは
+            // 従来どおりコンテキスト全体を待ってから `done` を待つ。
+            if exp_d2h_inflight() && dec_overlap_enabled() {
+                if !exp_d2h_wait() {
+                    bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+                }
             } else {
-                sc.h.as_ref().expect("確保済み")
-            };
-            let got: Vec<f32> = src.to_vec(nout)?;
-            out_h[..nout].copy_from_slice(&got);
+                // task 155: 待つのは null ストリーム (この層の expert GEMV と D2H)
+                // だけ。shared expert のサイドストリームは join まで待たない。
+                sync_default_or_ctx(ctx, dec_overlap_enabled())?;
+                // task 356: 専用ストリームへ出したコピーの完了 (通常はもう終わっている)。
+                if !exp_d2h_wait() {
+                    bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+                }
+            }
+            if zc {
+                // task 356: 和は pinned のホストに直接書かれている (コピー無し)。
+                let pin = sc.psum_zc.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            } else {
+                let pin = sc.hpin.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            }
+        } else {
+            if zc {
+                let pin = sc.psum_zc.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            } else {
+                let src = if sum_mode {
+                    sc.psum.as_ref().expect("確保済み")
+                } else {
+                    sc.h.as_ref().expect("確保済み")
+                };
+                let got: Vec<f32> = src.to_vec(nout)?;
+                out_h[..nout].copy_from_slice(&got);
+            }
             dec_exp_kprof::mark(dec_exp_kprof::D2H);
             middle()?;
         }
@@ -9556,6 +9627,162 @@ pub fn dec_stage_issue(total: usize) -> Result<()> {
         }
         st.used[i] = true;
         Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// task 356: expert 段の寄与 D2H を専用ストリームへ (`DENNO_DEC_EXP_D2H_STREAM`)
+// ---------------------------------------------------------------------------
+//
+// IQ expert の層一括経路は「カーネルを積む -> 非同期 D2H -> CPU ミス -> 同期」で
+// GPU と CPU を重ねる。ところが D2H を **null ストリーム** に出しているので、
+// 小さいコピー (和モードは e = 2,560 要素 = 10 KB) では、driver がコピーの完了を
+// 呼び出しの中で待つ経路に入ることがある。その待ちは CPU ミスの**前**に直列に
+// 挟まるので、重ね打ちが丸ごと効かなくなる (lab t352a の台帳: experts 段
+// 5.39 ms/tok に対し GPU 3.07 + ミス 2.78 で、重なりは 8% しか無い)。
+//
+// 専用の非ブロッキングストリームへ出すと、コピーは「この層のカーネルの完了」を
+// イベントで待つだけになり、呼び出しはホストを止めない。待ちは CPU ミスの後へ
+// 回す。**デバイスへ渡るバイト列・カーネル・発行順は 1 つも変わらない**。
+//
+// ゲートの解釈と積算は `model::exp_iq` 側にある ([`crate::model::exp_iq::DEC_D2H_STREAM_ENV`])。
+// ここはストリームとイベントだけを持つ。
+
+/// 専用ストリームとイベント 2 本 (スレッドローカル。作るのは 1 回だけ)。
+struct ExpD2h {
+    stream: CUstream,
+    /// この層のカーネルの完了 (null ストリームに打つ)。
+    ready: CUevent,
+    /// コピーの完了 (専用ストリームに打つ)。
+    done: CUevent,
+}
+
+thread_local! {
+    static EXP_D2H: std::cell::RefCell<Option<ExpD2h>> =
+        const { std::cell::RefCell::new(None) };
+    /// 直前に [`exp_d2h_issue`] がコピーを出したか (±[`exp_d2h_wait`] で落とす)。
+    static EXP_D2H_INFLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+const CU_STREAM_NON_BLOCKING_D2H: u32 = 0x01;
+const CU_EVENT_DISABLE_TIMING_D2H: u32 = 0x02;
+
+/// 専用ストリームを用意する (無ければ作る)。作れなければ `false`。
+fn exp_d2h_ensure() -> bool {
+    EXP_D2H.with(|c| {
+        if c.borrow().is_some() {
+            return true;
+        }
+        let Ok(l) = lib() else {
+            return false;
+        };
+        let (Some(create_stream), Some(create_event)) = (l.stream_create, l.event_create) else {
+            return false;
+        };
+        if l.stream_wait_event.is_none() || l.event_record.is_none() || l.event_sync.is_none() {
+            return false;
+        }
+        let mut st: CUstream = std::ptr::null_mut();
+        if unsafe { create_stream(&mut st, CU_STREAM_NON_BLOCKING_D2H) } != CUDA_SUCCESS {
+            return false;
+        }
+        let mut ready: CUevent = std::ptr::null_mut();
+        let mut done: CUevent = std::ptr::null_mut();
+        let ok = unsafe { create_event(&mut ready, CU_EVENT_DISABLE_TIMING_D2H) } == CUDA_SUCCESS
+            && unsafe { create_event(&mut done, CU_EVENT_DISABLE_TIMING_D2H) } == CUDA_SUCCESS;
+        if !ok {
+            return false;
+        }
+        *c.borrow_mut() = Some(ExpD2h {
+            stream: st,
+            ready,
+            done,
+        });
+        true
+    })
+}
+
+/// 専用ストリーム経由の非同期 D2H を 1 回出す。
+///
+/// 順序は「null ストリームに ready を打つ -> 専用ストリームで ready を待つ ->
+/// コピー -> done を打つ」。戻り値 `true` のとき、呼び出し側は
+/// [`exp_d2h_wait`] で完了を待ってからホストのバッファを読むこと。
+///
+/// `false` は「この経路を使えない」= 呼び出し側は従来の null ストリーム経路へ。
+pub(crate) fn exp_d2h_issue(dst: *mut c_void, src: u64, bytes: usize) -> bool {
+    if !crate::model::exp_iq::dec_d2h_stream_enabled() {
+        return false;
+    }
+    if !exp_d2h_ensure() {
+        crate::model::exp_iq::note_d2h_stream_fallback();
+        return false;
+    }
+    let Ok(l) = lib() else {
+        return false;
+    };
+    let (Some(record), Some(wait_ev), Some(copy)) =
+        (l.event_record, l.stream_wait_event, Some(l.memcpy_dtoh_async))
+    else {
+        return false;
+    };
+    EXP_D2H.with(|c| {
+        let b = c.borrow();
+        let Some(d) = b.as_ref() else {
+            return false;
+        };
+        // 1. この層のカーネル (null ストリーム) の完了点。
+        if unsafe { record(d.ready, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            return false;
+        }
+        // 2. 専用ストリームはその点を待つ。
+        if unsafe { wait_ev(d.stream, d.ready, 0) } != CUDA_SUCCESS {
+            return false;
+        }
+        // 3. コピーと完了イベント。
+        if unsafe { copy(dst, src, bytes, d.stream) } != CUDA_SUCCESS {
+            return false;
+        }
+        if unsafe { record(d.done, d.stream) } != CUDA_SUCCESS {
+            return false;
+        }
+        EXP_D2H_INFLIGHT.with(|f| f.set(true));
+        crate::model::exp_iq::note_d2h_stream_copy();
+        true
+    })
+}
+
+/// [`exp_d2h_issue`] で出したコピーがまだ待たれていないか。
+pub(crate) fn exp_d2h_inflight() -> bool {
+    EXP_D2H_INFLIGHT.with(|f| f.get())
+}
+
+/// [`exp_d2h_issue`] で出したコピーの完了を待つ (出していなければ何もしない)。
+///
+/// 通常は CPU ミスの後に呼ぶので待ちはゼロ。待った時間は台帳の `sync` に積む。
+pub(crate) fn exp_d2h_wait() -> bool {
+    if !EXP_D2H_INFLIGHT.with(|f| f.replace(false)) {
+        return true;
+    }
+    let Ok(l) = lib() else {
+        return false;
+    };
+    let Some(esync) = l.event_sync else {
+        return false;
+    };
+    let t = crate::model::q4ledger::stamp();
+    EXP_D2H.with(|c| {
+        let b = c.borrow();
+        let Some(d) = b.as_ref() else {
+            return false;
+        };
+        let ok = unsafe { esync(d.done) } == CUDA_SUCCESS;
+        if ok {
+            if let Some(t) = t {
+                crate::model::exp_iq::note_d2h_stream_wait(t.elapsed().as_nanos() as u64);
+            }
+            crate::model::q4ledger::note_sync(t);
+        }
+        ok
     })
 }
 
@@ -15542,9 +15769,61 @@ pub fn pf_pin_stage_from_value(v: Option<&str>) -> bool {
     }
 }
 
-/// pinned バウンスを使う転送サイズの下限 / 上限 (1 MiB ..= 256 MiB)。
+/// pinned バウンスを使う転送サイズの下限 (既定) / 上限 (1 MiB ..= 256 MiB)。
 const PF_PIN_MIN_BYTES: usize = 1 << 20;
 const PF_PIN_MAX_BYTES: usize = 256 << 20;
+
+/// task 358: 下限を env で動かす (`DENNO_PF_PIN_MIN_KB`、既定 1024 KiB)。
+///
+/// 1 MiB の床は task 318 が「小さい転送は写しの固定費が勝つ」として置いたもの。
+/// 共有バウンスにした今は、decode の 10 KB D2H (pageable で 11 us) も
+/// 同じ 1 本で速くなる可能性があるので、床を下げた条件を 1 つの COND で測れる
+/// ようにしておく。
+pub const PF_PIN_MIN_KB_ENV: &str = "DENNO_PF_PIN_MIN_KB";
+
+/// [`PF_PIN_MIN_KB_ENV`] の解釈 (純関数)。1..=262144 KiB に丸める。未設定は既定。
+fn pf_pin_min_kb_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return PF_PIN_MIN_BYTES >> 10;
+    };
+    match s.parse::<usize>() {
+        Ok(kb) if kb > 0 => kb.min(262_144),
+        _ => PF_PIN_MIN_BYTES >> 10,
+    }
+}
+
+/// 下限 (バイト)。プロセスで 1 回だけ env を読む。
+fn pf_pin_min_bytes() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        pf_pin_min_kb_from_value(std::env::var(PF_PIN_MIN_KB_ENV).ok().as_deref()) << 10
+    })
+}
+
+/// task 358: `bytes` が pinned バウンスの窓に入るか (純関数)。
+///
+/// 小さい転送は写しの固定費が勝ち、大きすぎる転送は pinned を食い潰す。
+fn pf_pin_window_from(min: usize, bytes: usize) -> bool {
+    (min..=PF_PIN_MAX_BYTES).contains(&bytes)
+}
+
+/// 実際の下限で窓を判定する。
+fn pf_pin_window_ok(bytes: usize) -> bool {
+    pf_pin_window_from(pf_pin_min_bytes(), bytes)
+}
+
+/// task 358: 共有バウンスを `want` へ育てる必要があるか (純関数)。
+///
+/// 育つときは **2 の冪へ切り上げる**。1.4 MB → 39 MB → 143 MB と昇順に来るので、
+/// 毎回ちょうどの大きさで取り直すと `cuMemHostAlloc` (device を同期させる) が
+/// 何度も走る。切り上げれば 1 プロセスで数回で済む。
+fn pf_pin_need_grow(cur: usize, want: usize) -> Option<usize> {
+    if cur >= want {
+        return None;
+    }
+    let pow = want.next_power_of_two().min(PF_PIN_MAX_BYTES);
+    Some(pow.max(want))
+}
 
 /// 層ループの同期 H2D / D2H を pinned バウンス経由にするか。
 fn pf_pin_stage_on() -> bool {
@@ -15554,44 +15833,131 @@ fn pf_pin_stage_on() -> bool {
     })
 }
 
-thread_local! {
-    /// task 318: 層ループの同期コピー用の pinned バウンス (grow-only)。
-    static PF_PIN_STAGE: std::cell::RefCell<Option<PinMem>> = const {
-        std::cell::RefCell::new(None)
-    };
+/// task 358: pinned バウンスの実体 (**プロセスで 1 本**、grow-only)。
+///
+/// task 318 は `thread_local!` に持たせたため、rayon のワーカー 14 本が
+/// それぞれ 143 MiB の pinned を `cuMemHostAlloc` で取りに行った
+/// (lab t318a: 14k cold 34.8 -> 55.3 s = +59%、3,826 も +10%)。pinned の
+/// 確保は device 全体を同期させるので、**回数を 1 回に固定する**のが要点。
+/// ここでは共有 1 本 + ロックにし、サイズは「必要になったときだけ」育てる
+/// (3,826 の 39 MiB -> 14k の 143 MiB で 2 回)。
+struct PfPinShared {
+    /// 転送先/転送元の pinned バッファ。
+    buf: Option<PinMem>,
+    /// 育ち直した回数 (診断: 1 プロセスで数回であること)。
+    grows: u64,
+    /// 他のスレッドがバウンスを使っていて待った回数と合計 ns (診断)。
+    waits: u64,
+    wait_ns: u64,
+    /// バウンス経由で流したバイト数と回数 (診断: 発火の証拠)。
+    bytes: u64,
+    calls: u64,
 }
 
-/// pinned バウンスを `bytes` 以上に育てて先頭ポインタを返す。
-///
-/// ゲートが off、または確保に失敗したら `Ok(None)` (呼び出し側は pageable 経路へ)。
-fn pf_pin_stage(bytes: usize) -> Result<Option<*mut c_void>> {
-    if !pf_pin_stage_on() {
-        return Ok(None);
-    }
-    // 小さい転送は写しの固定費が勝つ。大きすぎる転送はスレッドごとの pinned が
-    // 効きすぎる (14 本の rayon で 2 GB 級) ので、その窓の外は従来経路。
-    if !(PF_PIN_MIN_BYTES..=PF_PIN_MAX_BYTES).contains(&bytes) {
-        return Ok(None);
-    }
-    PF_PIN_STAGE.with(|c| {
-        let mut s = c.borrow_mut();
-        if s.as_ref().map(|p| p.bytes >= bytes).unwrap_or(false) {
-            return Ok(s.as_ref().map(|p| p.ptr));
+/// 共有バウンス (プロセスで 1 本)。
+fn pf_pin_shared() -> &'static std::sync::Mutex<PfPinShared> {
+    static S: OnceLock<std::sync::Mutex<PfPinShared>> = OnceLock::new();
+    S.get_or_init(|| {
+        std::sync::Mutex::new(PfPinShared {
+            buf: None,
+            grows: 0,
+            waits: 0,
+            wait_ns: 0,
+            bytes: 0,
+            calls: 0,
+        })
+    })
+}
+
+/// task 358: 共有バウンスの台帳 (grows, waits, wait_ns, bytes, calls)。
+pub fn pf_pin_stats() -> (u64, u64, u64, u64, u64) {
+    match pf_pin_shared().lock() {
+        Ok(g) => (g.grows, g.waits, g.wait_ns, g.bytes, g.calls),
+        Err(p) => {
+            let g = p.into_inner();
+            (g.grows, g.waits, g.wait_ns, g.bytes, g.calls)
         }
-        match PinMem::alloc(bytes) {
+    }
+}
+
+/// task 358: 台帳を 0 に戻す (リクエスト終端)。
+pub fn pf_pin_reset() {
+    let m = pf_pin_shared();
+    let mut g = match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.grows = 0;
+    g.waits = 0;
+    g.wait_ns = 0;
+    g.bytes = 0;
+    g.calls = 0;
+}
+
+/// task 358: 1 行のレポート (発火が 0 なら `None` = 出力しない)。
+pub fn pf_pin_line() -> Option<String> {
+    let (grows, waits, wait_ns, bytes, calls) = pf_pin_stats();
+    if calls == 0 {
+        return None;
+    }
+    Some(format!(
+        "[pf-pin] calls={calls} MB={:.1} grows={grows} waits={waits} wait_ms={:.1}",
+        bytes as f64 / 1e6,
+        wait_ns as f64 / 1e6
+    ))
+}
+
+/// 共有バウンスを `bytes` 以上に育てて、ロックを持ったまま `f` を実行する。
+///
+/// - ゲート off / 窓の外: `Ok(None)` (呼び出し側は pageable 経路へ)。
+/// - 確保できない (pinned 不足など): 1 回だけ記録して `Ok(None)` (数値は同じ)。
+///
+/// ロックは転送が終わるまで持つ。転送は葉 (この中で別の転送を呼ばない) なので
+/// 再入は起きない。並行に来た転送は直列になるが、pinned の 1 本は pageable より
+/// 桁で速いので損にならない (lab の数字で確認する)。
+fn with_pf_pin<T>(
+    bytes: usize,
+    f: impl FnOnce(*mut c_void) -> Result<T>,
+) -> Result<Option<T>> {
+    if bytes == 0 || !pf_pin_stage_on() || !pf_pin_window_ok(bytes) {
+        return Ok(None);
+    }
+    let m = pf_pin_shared();
+    let t0 = std::time::Instant::now();
+    let mut g = match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // ロック待ち (他のスレッドがバウンスを使っていた時間) を数える。
+    // 200 us を超えたものだけ「待ち」として数える (通常は 0)。
+    let lock_ns = t0.elapsed().as_nanos() as u64;
+    if lock_ns > 200_000 {
+        g.waits += 1;
+        g.wait_ns += lock_ns;
+    }
+    let cur = g.buf.as_ref().map(|b| b.bytes).unwrap_or(0);
+    if let Some(want) = pf_pin_need_grow(cur, bytes) {
+        // 新しい 1 本を取る前に古い 1 本を落とす (pinned を二重に持たない)。
+        g.buf = None;
+        match PinMem::alloc(want) {
             Ok(p) => {
-                let ptr = p.ptr;
-                *s = Some(p);
-                Ok(Some(ptr))
+                g.buf = Some(p);
+                g.grows += 1;
             }
             Err(e) => {
-                // メモリが足りない等。以後は pageable で回す (数値は同じ)。
-                tracing::info!("[pf] pinned バウンスを確保できない ({bytes} B): {e:#}");
-                *s = None;
-                Ok(None)
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("[pf-pin] pinned バウンスを確保できない ({want} B): {e:#}");
+                }
+                return Ok(None);
             }
         }
-    })
+    }
+    let pin = g.buf.as_ref().expect("確保済み").ptr;
+    g.calls += 1;
+    g.bytes += bytes as u64;
+    f(pin).map(Some)
 }
 
 impl Drop for PinMem {
@@ -57921,5 +58287,47 @@ mod task318_tests {
         );
         assert!(!pf_kv_wb_pending(), "ゲート off なのに保留が立った");
         set_pf_kv_async_for_test(None);
+    }
+
+    /// task 358: バウンスの窓 (既定 1 MiB..=256 MiB) と下限の env 解釈。
+    #[test]
+    fn pin_window_and_min_kb_truth_table() {
+        let mib = 1usize << 20;
+        let min = PF_PIN_MIN_BYTES;
+        assert_eq!(min, mib);
+        // 窓: 1 MiB は入る、その 1 B 下は入らない、256 MiB は入る、その上は入らない。
+        assert!(pf_pin_window_from(min, mib));
+        assert!(!pf_pin_window_from(min, mib - 1));
+        assert!(pf_pin_window_from(min, PF_PIN_MAX_BYTES));
+        assert!(!pf_pin_window_from(min, PF_PIN_MAX_BYTES + 1));
+        // 床を 4 KiB に下げると decode の 10 KB も入る。
+        assert!(pf_pin_window_from(4 << 10, 10 << 10));
+        assert!(!pf_pin_window_from(4 << 10, 4 << 10 - 1));
+        // env の解釈: 未設定・空・0・壊れた値は既定 (1024 KiB)、1..=262144 に丸める。
+        assert_eq!(pf_pin_min_kb_from_value(None), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("")), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("0")), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("x")), 1024);
+        assert_eq!(pf_pin_min_kb_from_value(Some("4")), 4);
+        assert_eq!(pf_pin_min_kb_from_value(Some(" 64 ")), 64);
+        assert_eq!(pf_pin_min_kb_from_value(Some("99999999")), 262_144);
+    }
+
+    /// task 358: 育つ判断は grow-only + 2 の冪切り上げ (確保の回数を数回に抑える)。
+    #[test]
+    fn pin_grow_is_grow_only_and_rounded() {
+        // 既に足りている: 触らない。
+        assert_eq!(pf_pin_need_grow(1 << 20, 1 << 20), None);
+        assert_eq!(pf_pin_need_grow(1 << 21, 1 << 20), None);
+        // 足りない: 2 の冪へ切り上げる (要求より小さくはしない)。
+        assert_eq!(pf_pin_need_grow(0, 1_400_000), Some(2 << 20));
+        assert_eq!(pf_pin_need_grow(1 << 20, 39 << 20), Some(64 << 20));
+        assert_eq!(pf_pin_need_grow(64 << 20, 143 << 20), Some(256 << 20));
+        // 上限で頭打ち (窓の外は呼ばれないが、関数としては上限を超えない)。
+        assert_eq!(
+            pf_pin_need_grow(0, PF_PIN_MAX_BYTES),
+            Some(PF_PIN_MAX_BYTES)
+        );
+        assert_eq!(pf_pin_need_grow(0, PF_PIN_MAX_BYTES - 1), Some(PF_PIN_MAX_BYTES));
     }
 }
