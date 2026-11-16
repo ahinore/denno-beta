@@ -5391,6 +5391,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         q4ledger::OTHER
                     };
                     let _l = q4ledger::enter(item);
+                    // task 379: 層の最終チャンクかを GDN 連鎖へ伝える
+                    // (`DENNO_PF_GDN_WB_LAST` は最終チャンクだけ状態を書き戻す)。
+                    // 直後に必ず真へ戻す (途中で失敗しても次の層が拾わない)。
+                    crate::cuda::pf_gdn_last_chunk_set(end == nt_all);
                     let r = Self::prefill_attn_chunk(
                         self.attn.as_mut(),
                         il,
@@ -5401,6 +5405,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         flat_attn,
                         attn_dev,
                     );
+                    crate::cuda::pf_gdn_last_chunk_reset();
                     crate::cuda::pf_attn_dev_request(false);
                     r?
                 };

@@ -17551,6 +17551,74 @@ fn gdn_devstate() -> bool {
     )
 }
 
+thread_local! {
+    /// task 379: 「いま回しているチャンク層は層の最終チャンクか」。
+    ///
+    /// 層優先 prefill のループが attn の直前で立て、直後に真へ戻す。既定は真
+    /// (どこから呼ばれても従来どおり書き戻す)。[`GDN_WB_LAST_ENV`] が on の
+    /// ときだけ読む。
+    ///
+    /// [`GDN_WB_LAST_ENV`]: crate::model::exp_pf::GDN_WB_LAST_ENV
+    static PF_GDN_LAST_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// task 379: このチャンク層が層の最終チャンクか (既定 = 真)。
+pub fn pf_gdn_last_chunk() -> bool {
+    PF_GDN_LAST_CHUNK.with(|c| c.get())
+}
+
+/// task 379: 「このチャンク層は層の最終チャンクか」を立てる。
+///
+/// 呼び出し側 (層優先 prefill) は attn の直後に必ず [`pf_gdn_last_chunk_reset`]
+/// で真へ戻すこと (次の層の最初のチャンクが古い偽を拾わないため)。
+pub fn pf_gdn_last_chunk_set(v: bool) {
+    PF_GDN_LAST_CHUNK.with(|c| c.set(v));
+}
+
+/// task 379: [`pf_gdn_last_chunk_set`] を既定 (真) に戻す。
+pub fn pf_gdn_last_chunk_reset() {
+    PF_GDN_LAST_CHUNK.with(|c| c.set(true));
+}
+
+/// task 379: このチャンク層の書き戻しを飛ばしてよいか。
+///
+/// `DENNO_PF_GDN_WB_LAST=1` かつ最終チャンク以外、かつデバイスが正本
+/// (`DENNO_GDN_DEVSTATE=0` の切り分け時は毎チャンクの書き戻しが要る)、かつ
+/// 診断のトークン逐次 (`DENNO_DEBUG_GDN_DUMP_LAYER` がこの層を指す) でないとき
+/// だけ真。診断時は連鎖に乗らずホスト経路がホスト控えを読むので、古い控えを
+/// 渡さない。
+pub fn pf_gdn_last_chunk_skippable(li: usize) -> bool {
+    crate::model::exp_pf::gdn_wb_last_on()
+        && gdn_devstate()
+        && !pf_gdn_last_chunk()
+        && !crate::gdn::gdn_dbg_enabled_for(li as i64)
+}
+
+thread_local! {
+    /// task 379: [`gdn_state_restore_host`] の受け皿 (層ごとに使い回す)。
+    static GDN_RESTORE_STAGE: std::cell::RefCell<GdnHostStage> =
+        std::cell::RefCell::new(GdnHostStage::new());
+}
+
+/// task 379: デバイス正本の層状態をホストの配列へ戻す (`valid[li]` は落とす)。
+///
+/// `DENNO_PF_GDN_WB_LAST` で途中チャンクの書き戻しを飛ばしている木で、そのチャンク
+/// が連鎖に乗れずホスト経路へ落ちたときにだけ使う (古い控えで計算しないため)。
+/// 戻せたら真。デバイス正本が無い (未確定 / 別 kv) ときは何もせず偽。
+pub fn gdn_state_restore_host(kv: u64, li: usize, conv: &mut [f32], ssm: &mut [f32]) -> bool {
+    GDN_RESTORE_STAGE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        match gdn_state_take(kv, li, &mut st) {
+            Some((c, s)) if c.len() == conv.len() && s.len() == ssm.len() => {
+                conv.copy_from_slice(c);
+                ssm.copy_from_slice(s);
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 // 従来動作のホスト書き戻し (デバイス正本を使わないときだけ)。
 fn gdn_host_writeback(conv_st: &mut [f32], ssm_st: &mut [f32]) -> Result<()> {
     GDN_SCRATCH.with(|cell| -> Result<()> {
@@ -51245,9 +51313,15 @@ pub fn gdn_pf_chain(
     gdn_state_commit(li, ptrs[4], ptrs[5], conv_dim * cs, nv, dk * dv)?;
     // prefill のあとに decode (別ストア) や CPU 経路がホスト state を seed に
     // するので、状態は毎回ホストへも戻す (従来の sig 経路と同じ)。
-    gdn_pf_kprof::begin(gdn_pf_kprof::ST_D2H);
-    gdn_host_writeback(conv_st, ssm_st)?;
-    gdn_pf_kprof::end(gdn_pf_kprof::ST_D2H);
+    // task 379: `DENNO_PF_GDN_WB_LAST` では層の最終チャンクだけ戻す (途中チャンクの
+    // ホスト控えは次チャンクが読まない。値は同じ)。飛ばした回数を数える。
+    if pf_gdn_last_chunk_skippable(li) {
+        crate::model::exp_pf::note_gdn_wb_skip();
+    } else {
+        gdn_pf_kprof::begin(gdn_pf_kprof::ST_D2H);
+        gdn_host_writeback(conv_st, ssm_st)?;
+        gdn_pf_kprof::end(gdn_pf_kprof::ST_D2H);
+    }
     // task 173: 段ごとの GPU 時間を回収する (この時点で全イベントが完了している)。
     gdn_pf_kprof::collect();
     Ok(true)
@@ -58523,5 +58597,31 @@ mod task318_tests {
             Some(PF_PIN_MAX_BYTES)
         );
         assert_eq!(pf_pin_need_grow(0, PF_PIN_MAX_BYTES - 1), Some(PF_PIN_MAX_BYTES));
+    }
+}
+
+#[cfg(test)]
+mod task379_tests {
+    use super::*;
+
+    /// task 379: 「層の最終チャンクか」の旗は既定で真 (どこから呼ばれても従来どおり書き戻す)。
+    /// ゲート off の既定の木では、旗が偽でも飛ばさない。
+    #[test]
+    fn gdn_last_chunk_flag_defaults_true_and_gate_is_off() {
+        pf_gdn_last_chunk_reset();
+        assert!(pf_gdn_last_chunk(), "既定は真");
+        pf_gdn_last_chunk_set(false);
+        assert!(!pf_gdn_last_chunk(), "立てた値が読める");
+        pf_gdn_last_chunk_reset();
+        assert!(pf_gdn_last_chunk(), "戻すと真");
+        // 既定 (env 未設定) では旗・診断によらず必ず書き戻す。
+        if !crate::model::exp_pf::gdn_wb_last_on() {
+            pf_gdn_last_chunk_set(false);
+            assert!(
+                !pf_gdn_last_chunk_skippable(0),
+                "ゲート off では飛ばさない"
+            );
+            pf_gdn_last_chunk_reset();
+        }
     }
 }

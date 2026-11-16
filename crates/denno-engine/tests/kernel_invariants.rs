@@ -11369,3 +11369,145 @@ fn t369_kv_async_is_wired() {
         "pinned 直送の分岐が無い"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 379: GDN 状態の書き戻しを層の最終チャンクだけにする
+// (`DENNO_PF_GDN_WB_LAST`、既定 off)
+//
+// 14k cold の `[q4ledger-pf]` は `ssm` の d2h 823.69 MB / 504 回と exposed
+// 1,052.5 ms で、これは 36 ssm 層 x 7 チャンクの各終端に置かれた
+// `gdn_host_writeback` (conv + ssm の同期 D2H 2 本) だった。層の中のチャンクは
+// 昇順に回り、prefill のスキャン状態はデバイスが正本なので、途中チャンクの
+// ホスト控えは誰も読まない。ゲートはその書き戻しを最終チャンクだけにする。
+// ---------------------------------------------------------------------------
+
+/// env 名は 1 箇所、明示的な真値だけ on、既定 off。
+#[test]
+fn task379_gdn_wb_last_gate_is_single_and_off_by_default() {
+    assert_eq!(
+        EXP_PF_SRC
+            .matches("pub const GDN_WB_LAST_ENV: &str = \"DENNO_PF_GDN_WB_LAST\";")
+            .count(),
+        1,
+        "env 名の宣言が 1 箇所でない"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const DEFAULT_GDN_WB_LAST: bool = false;"),
+        "既定が off でない"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn gdn_wb_last_on()"),
+        "ゲートの実体が無い"
+    );
+    // 解釈は明示的な真値だけ on (未設定は偽)。
+    let f = EXP_PF_SRC
+        .split("pub fn gdn_wb_last_from_value(")
+        .nth(1)
+        .expect("解釈が無い");
+    let head = &f[..f.find('}').expect("本体が無い")];
+    assert!(
+        head.contains("Some(\"1\" | \"on\" | \"true\" | \"yes\")"),
+        "真値の集合が変わった"
+    );
+}
+
+/// 飛ばす判断は 1 箇所だけで、書き戻しはその分岐の **else** 側にある
+/// (飛ばす判断と書き戻しが別々の条件になると、両方真のときに書き戻しが消える)。
+#[test]
+fn task379_gdn_wb_last_skip_wraps_the_writeback() {
+    let chain = CUDA_RS
+        .split("fn gdn_pf_chain(")
+        .nth(1)
+        .expect("gdn_pf_chain が無い");
+    assert_eq!(
+        chain.matches("gdn_host_writeback(conv_st, ssm_st)?").count(),
+        1,
+        "書き戻しの呼び出しが 1 箇所でない"
+    );
+    let skip_at = chain
+        .find("if pf_gdn_last_chunk_skippable(li) {")
+        .expect("飛ばす判断が無い");
+    let wb_at = chain
+        .find("gdn_host_writeback(conv_st, ssm_st)?")
+        .expect("書き戻しが無い");
+    assert!(skip_at < wb_at, "書き戻しが判断より前にある");
+    let between = &chain[skip_at..wb_at];
+    assert!(
+        between.contains("} else {"),
+        "書き戻しが else 側に無い (飛ばす分岐と直列になっている)"
+    );
+    assert!(
+        between.contains("note_gdn_wb_skip()"),
+        "飛ばした回数を数えていない (発火の証拠が読めない)"
+    );
+    // 飛ばせる条件: ゲート on / デバイスが正本 / 最終チャンクでない / 診断でない。
+    let sk = CUDA_RS
+        .split("pub fn pf_gdn_last_chunk_skippable(")
+        .nth(1)
+        .expect("判断の実体が無い");
+    let body = &sk[..sk.find("\n}").expect("本体が無い")];
+    assert!(body.contains("gdn_wb_last_on()"), "ゲートを見ていない");
+    assert!(body.contains("gdn_devstate()"), "デバイス正本の条件が無い");
+    assert!(body.contains("!pf_gdn_last_chunk()"), "最終チャンクの条件が無い");
+    assert!(body.contains("!crate::gdn::gdn_dbg_enabled_for(li as i64)"), "診断の除外が無い");
+    // 旗の既定は真 (どこから呼ばれても従来どおり書き戻す)。
+    assert!(
+        CUDA_RS.contains(
+            "static PF_GDN_LAST_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };"
+        ),
+        "旗の既定が真でない"
+    );
+}
+
+/// 層優先 prefill が attn の直前に「最終チャンクか」を立て、直後に戻す。
+#[test]
+fn task379_gdn_last_chunk_flag_is_set_in_the_layer_major_loop() {
+    let lm = QWEN_SRC
+        .split("fn forward_prefill_batch_resident_lm(")
+        .nth(1)
+        .expect("層優先 prefill が無い");
+    let set_at = lm
+        .find("crate::cuda::pf_gdn_last_chunk_set(end == nt_all);")
+        .expect("旗を立てていない (最終チャンクの判定が end == nt_all でない)");
+    let attn_at = lm
+        .find("let r = Self::prefill_attn_chunk(")
+        .expect("attn の呼び出しが無い");
+    let reset_at = lm
+        .find("crate::cuda::pf_gdn_last_chunk_reset();")
+        .expect("旗を戻していない");
+    assert!(set_at < attn_at, "旗が attn の後で立っている");
+    assert!(attn_at < reset_at, "旗が attn より前で戻っている");
+    // 連鎖に乗れずホスト経路へ落ちたときはデバイス正本から読み直す (値の保険)。
+    assert!(
+        SSM_SRC.contains("if crate::model::exp_pf::gdn_wb_last_on() {"),
+        "ホスト経路へ落ちる前の読み直しが無い"
+    );
+    assert!(
+        SSM_SRC.contains(
+            "crate::cuda::gdn_state_restore_host(0, self.il, &mut self.state.conv, &mut self.state.ssm);"
+        ),
+        "読み直しの呼び出しが無い"
+    );
+}
+
+/// 台帳 (`[exp-pf-stream]`) にゲートと飛ばした回数が出る = lab で発火を読める。
+#[test]
+fn task379_gdn_wb_last_is_visible_in_the_stream_ledger() {
+    assert!(
+        EXP_PF_SRC.contains("wbl={} wbskip={}"),
+        "台帳に wbl / wbskip が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("u8::from(gdn_wb_last_on()),"),
+        "台帳がゲートの値を出していない"
+    );
+    assert!(
+        EXP_PF_SRC.contains("GDN_WB_SKIPS.load(Ordering::Relaxed),"),
+        "台帳が飛ばした回数を出していない"
+    );
+    // 積算はリクエスト単位 (前のリクエストの回数を持ち越さない)。
+    assert!(
+        EXP_PF_SRC.contains("&GDN_WB_SKIPS,"),
+        "stats_reset が飛ばした回数を戻していない"
+    );
+}
