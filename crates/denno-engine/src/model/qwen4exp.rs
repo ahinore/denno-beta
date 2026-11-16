@@ -19276,6 +19276,25 @@ fn miss_flat_rows() -> usize {
     *ON.get_or_init(|| miss_flat_rows_from_value(std::env::var("DENNO_EXP_MISS_ROWS").ok().as_deref()))
 }
 
+/// task 361: 起動行用。`DENNO_EXP_MISS_ROWS` の解釈と、ミス 1〜3 本のときに
+/// 選ばれる行幅 (実形 ff = 640 / e = 2560、rayon `threads` 本) を 1 行にする。
+///
+/// ラボの COND の env がサーバに届いたかを起動ログで確かめるためのもの
+/// (env は `OnceLock` なのでプロセスで 1 回しか読まない)。
+pub fn exp_miss_rows_report(threads: usize) -> String {
+    let threads = threads.max(1);
+    match miss_flat_rows() {
+        0 => {
+            let gu: Vec<usize> = (1..=3)
+                .map(|k| flat_auto_rows(k * 2 * 640, threads))
+                .collect();
+            let dn: Vec<usize> = (1..=3).map(|k| flat_auto_rows(k * 2560, threads)).collect();
+            format!("auto (実形 ff=640 e=2560, {threads}T: gate/up {gu:?} down {dn:?})")
+        }
+        v => format!("{v} (固定)"),
+    }
+}
+
 /// P64: expert 1 本の寄与 `h = down(silu(gate(x)) * up(x))` を `h` に書く。
 ///
 /// 従来の並列経路 ([`expert_contribs_par`]) の 1 expert ぶんと**同じ呼び出し列**:
@@ -22301,6 +22320,8 @@ mod tests {
         // 16 行を下回らない (タスクの固定費) / 256 行を超えない (端数が出る)。
         assert_eq!(flat_auto_rows(1, 14), 16);
         assert_eq!(flat_auto_rows(10 * 2 * 640, 8), 256);
+        // 起動行 (テストプロセスでは env 未設定 = 従来の 64 と出る)。
+        assert_eq!(exp_miss_rows_report(14), "64 (固定)");
     }
 
     /// P70 マイクロベンチ: decode の expert 寄与 (10 expert) と層 1 回ぶんを
