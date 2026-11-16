@@ -32415,7 +32415,8 @@ fn launch_mix_v5(
 // silu と hc_mixed も同じカーネルの中で済ませる (`kernels_mix_upmix_q8.cu`)。
 //
 // 丸め順は v5 + `dno_hc_mixed_f32` と揃えていない (レーン 0..4 の逐次加算)。
-// ゲート `DENNO_MIX_UPQ8` は既定 off、`=check` で従来経路の出力と比較する。
+// ゲート `DENNO_MIX_UPQ8` は既定 on (lab t382b の 2 ラウンドで採否 yes)、
+// `=0` で従来の 3 本経路、`=check` で従来経路の出力と max|diff| を比べる。
 
 /// 融合版のカーネル名。
 const MIX_UPQ8_KERNEL_NAME: &str = "dno_mix_upmix_q8_0";
@@ -32503,12 +32504,20 @@ pub fn mix_upq8_shape_ok(n_in: usize, e: usize, hc: usize) -> bool {
     n_in == 64 * MIX_UPQ8_LANES && e > 0 && hc == 4
 }
 
-/// `DENNO_MIX_UPQ8` の解釈 (純関数)。0 = 従来 (既定) / 1 = 融合 / 2 = 比較。
+/// `DENNO_MIX_UPQ8` の解釈 (純関数)。0 = 従来経路 / 1 = 融合 / 2 = 比較。
+///
+/// lab t382b (2 ラウンド、base 16.2 / fused 15.8 = -2.5%、mix 段 4.38 -> 3.93 ms/tok
+/// = -10.3%、prefill 0.68 s で不変、errors 0、md5 は 6 コンテキスト全部 SAME、
+/// `=check` の max|diff| は 1.5e-5 / |ref| 132 = 相対 1e-7、閾値超え 0 本) で
+/// 採ったので **既定 on**。切り戻しは `DENNO_MIX_UPQ8=0`。
+const MIX_UPQ8_DEFAULT: u8 = 1;
+
 pub fn mix_upq8_from_value(v: Option<&str>) -> u8 {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("1") | Some("on") | Some("true") | Some("yes") => 1,
         Some("check") | Some("2") => 2,
-        _ => 0,
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("") => 0,
+        _ => MIX_UPQ8_DEFAULT,
     }
 }
 
@@ -32522,6 +32531,11 @@ pub fn mix_upq8_on() -> u8 {
     }
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| mix_upq8_from_value(std::env::var(MIX_UPQ8_ENV).ok().as_deref()))
+}
+
+/// 台帳 (`gate_audit::DEFAULT_ON_GATES`) 用の bool。
+pub fn mix_upq8_gate_on() -> bool {
+    mix_upq8_on() != 0
 }
 
 #[cfg(test)]
@@ -43320,13 +43334,15 @@ mod tests {
     }
 
     /// task 382: `DENNO_MIX_UPQ8` の真理値表と形の門番。
+    /// t382b で採ったので既定 on、明示的な偽値だけが従来経路。
     #[test]
     fn mix_upq8_gate_and_shape() {
-        assert_eq!(mix_upq8_from_value(None), 0, "未設定は従来の 3 本経路");
-        assert_eq!(mix_upq8_from_value(Some("")), 0);
+        assert_eq!(mix_upq8_from_value(None), 1, "未設定は融合 (既定 on)");
+        assert_eq!(mix_upq8_from_value(Some("nope")), 1, "未知も既定 on");
+        assert_eq!(mix_upq8_from_value(Some("")), 0, "空文字は切り戻し");
         assert_eq!(mix_upq8_from_value(Some("0")), 0);
         assert_eq!(mix_upq8_from_value(Some("off")), 0);
-        assert_eq!(mix_upq8_from_value(Some("nope")), 0);
+        assert_eq!(mix_upq8_from_value(Some("NO")), 0);
         assert_eq!(mix_upq8_from_value(Some("1")), 1);
         assert_eq!(mix_upq8_from_value(Some("on")), 1);
         assert_eq!(mix_upq8_from_value(Some("CHECK")), 2);
