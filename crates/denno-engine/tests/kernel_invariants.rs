@@ -11089,3 +11089,165 @@ fn t333_stream_retry_swaps_only_the_transfer_owner() {
         "[exp-pf-stream] に retry= が出ない"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 349: 冷えた page cache の 1 回目の読み (2 本のゲート)
+// ---------------------------------------------------------------------------
+
+/// task 349: `DENNO_PF_STREAM_PREAD` が **WC を落として** pread を発火させ、
+/// 既定は off のままであること (配線の 6 点)。
+#[test]
+fn t349_stream_pread_is_wired_through_the_wc_decision() {
+    // 1. ゲート名と既定 off。
+    assert!(
+        EXP_PF_SRC.contains("pub const STREAM_PREAD_ENV: &str = \"DENNO_PF_STREAM_PREAD\";"),
+        "ゲート名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const DEFAULT_STREAM_PREAD: bool = false;"),
+        "既定が off でない"
+    );
+    // 2. 純関数は「1 系だけ真」。
+    assert!(
+        EXP_PF_SRC.contains("pub fn stream_pread_from_value(v: Option<&str>) -> bool"),
+        "純関数が無い"
+    );
+    // 3. WC の判断に繋がっている (WC のままだと pread は発火しない)。
+    assert!(
+        CUDA_RS.contains(
+            "let wc = exp_pf::stream_wc_for(st.k_mode) && !exp_pf::stream_pread();"
+        ),
+        "WC の判断にゲートが入っていない (pread が発火しない)"
+    );
+    // 4. pread の可否は従来どおり `!pin_wc` で決まる (この 1 本を消すと
+    //    WC へ read(2) して極端に遅くなる)。
+    assert!(
+        CUDA_RS.contains("&& !st.pin_wc[s]"),
+        "pread の可否から pin_wc の条件が消えている"
+    );
+    // 5. 台帳 (`[exp-pf-stream]`) に spread= が出る。
+    assert!(EXP_PF_SRC.contains("spread={}"), "[exp-pf-stream] に spread= が無い");
+    // 6. ゲートは pread (task 325) と独立に読める。
+    assert!(
+        EXP_PF_SRC.contains("std::env::var(STREAM_PREAD_ENV)"),
+        "env を読んでいない"
+    );
+}
+
+/// task 349: `DENNO_PF_BG_WARM` が `listening` を待たせない背景スレッドで、
+/// extra (PLE + ホスト重み) を先に、expert を後に読むこと。
+#[test]
+fn t349_bg_warm_is_background_and_ordered() {
+    assert!(
+        EXP_PF_SRC.contains("\"DENNO_PF_STREAM_PREAD\""),
+        "stream pread のゲート名が exp_pf に無い"
+    );
+    // 1. ゲートと既定 off (start_warm.rs は EXP_PF_SRC ではないので文字列で見る)。
+    let sw = include_str!("../src/model/start_warm.rs");
+    assert!(sw.contains("pub const ENV_BG: &str = \"DENNO_PF_BG_WARM\";"), "ゲート名が無い");
+    assert!(sw.contains("pub const DEFAULT_BG: bool = false;"), "既定が off でない");
+    // 2. 起動を待たせない: 戻りを待たずにスレッドを立てる。
+    assert!(sw.contains(".spawn(move ||"), "スレッドを立てていない");
+    assert!(
+        !sw.contains("join()"),
+        "join すると起動 (またはリクエスト) を待たせる"
+    );
+    // 3. serve_flash は同期の warm とは別の if で呼ぶ (listening 前でも戻らない)。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::start_warm::bg_on()"),
+        "serve_flash から呼んでいない"
+    );
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::start_warm::spawn_background("),
+        "spawn を呼んでいない"
+    );
+    // 4. 順序: extra を先に積み、expert を後で extend する (LRU で残す側を後)。
+    let i_extra = SERVE_FLASH_SRC
+        .find("let mut ranges = denno_engine::model::start_warm::extra_ranges(")
+        .expect("extra_ranges が無い");
+    let i_ext = SERVE_FLASH_SRC
+        .find("ranges.extend(experts);")
+        .expect("expert の extend が無い");
+    assert!(i_extra < i_ext, "extra が expert より後になっている");
+    // 5. expert は上限で切る (59 GiB のホストで page cache を溢れさせない)。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::start_warm::cap_ranges(&mut experts, cap)"),
+        "expert の上限が無い"
+    );
+    // 6. 発火の台帳。
+    assert!(sw.contains("[pf-bg-warm]"), "台帳の行が無い");
+}
+
+/// task 349: `DENNO_PF_PLE_PIPE` が「プロンプト全体の先読み」を 1 本の生産
+/// スレッドで流し、次の 1 チャンク先読みと**二重に走らない**こと。
+#[test]
+fn t349_ple_pipe_is_wired_and_does_not_double_read() {
+    assert!(
+        EXP_PF_SRC.contains("pub const PLE_PIPE_ENV: &str = \"DENNO_PF_PLE_PIPE\";"),
+        "ゲート名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const DEFAULT_PLE_PIPE: bool = false;"),
+        "既定が off でない"
+    );
+    // 生産スレッドはチャンク順に全部を流し、sync_channel で 1 個ずつ渡す。
+    assert!(
+        QWEN_SRC.contains("crate::model::exp_pf::ple_pipe()"),
+        "qwen4exp からゲートを読んでいない"
+    );
+    assert!(
+        QWEN_SRC.contains("std::sync::mpsc::sync_channel::<Result<Vec<Option<Vec<f32>>>>>(2)"),
+        "生産と消費の口が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("let mut s = 0usize;"),
+        "生産スレッドが先頭から流していない"
+    );
+    assert!(
+        QWEN_SRC.contains("rx.recv()"),
+        "消費者が受け取っていない"
+    );
+    // 二重読みしない: パイプが居るときは 1 チャンク先読みを起こさない。
+    assert!(
+        QWEN_SRC.contains("if ple_pre && ple_pipe_rx.is_none() && end < ctx.len() {"),
+        "1 チャンク先読みとパイプが同時に走る"
+    );
+    // 値は変えない: 同じ gather 関数を通る。
+    assert!(
+        QWEN_SRC.contains("gather_ple_many_rt(rt.as_deref(), &c[..e], s)"),
+        "パイプが gather 本体を通っていない"
+    );
+}
+
+/// task 349: `DENNO_PF_PLE_PIPE` が層優先 (LM) の先頭 gather でも効き、
+/// 専用プールの本数まで並列度を上げること (読む行は同じ)。
+#[test]
+fn t349_ple_pipe_widens_the_lm_gather_pool() {
+    let ple = include_str!("../src/ple.rs");
+    assert!(
+        ple.contains("if crate::model::exp_pf::ple_pipe() {"),
+        "ple_par_parts がゲートを見ていない"
+    );
+    assert!(
+        ple.contains("rayon::current_num_threads().clamp(1, 32)"),
+        "並列度の上限が 32 でない"
+    );
+    // 層優先の先頭 gather が専用プールで回る (埋め込みは直列のまま)。
+    assert!(
+        QWEN_SRC.contains("let ple_wide = ple_batch && crate::model::exp_pf::ple_pipe();"),
+        "LM 経路がゲートを見ていない"
+    );
+    assert!(
+        QWEN_SRC.contains("const PLE_PIPE_THREADS: usize = 32;"),
+        "専用プールの本数が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("Ok(p) => ples_all = p.install(run)?,"),
+        "専用プールで gather を回していない"
+    );
+    // 値は変えない: 同じ gather 本体を通る。
+    assert!(
+        QWEN_SRC.contains("out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);"),
+        "LM の wide 経路が gather 本体を通っていない"
+    );
+}

@@ -11418,7 +11418,9 @@ fn pf_slot_prepare(
             // task 296: 確保し直しの回数と時間を診断で読めるようにする
             // (`DENNO_PF_LM_DBG=1` の `[pf-lm-dbg] stream` 行)。
             let t_pin = std::time::Instant::now();
-            let wc = exp_pf::stream_wc_for(st.k_mode);
+            // task 349: `DENNO_PF_STREAM_PREAD` のときだけ非 WC にする
+            // (WC のメモリへ `read(2)` すると極端に遅いので pread が使えない)。
+            let wc = exp_pf::stream_wc_for(st.k_mode) && !exp_pf::stream_pread();
             st.pin[s] = Some(PinMem::alloc_flags(want, wc)?);
             st.pin_wc[s] = wc;
             pf_stream_t_add(6, t_pin.elapsed().as_nanos() as u64);

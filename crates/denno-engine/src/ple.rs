@@ -616,6 +616,14 @@ fn ple_par_parts(rows: usize) -> usize {
     if rows < PLE_PAR_MIN_ROWS {
         return 1;
     }
+    // task 349: `DENNO_PF_PLE_PIPE` のときは専用プールの本数まで使う (上限 32)。
+    // 冷えた page cache では 1 行 90 B のランダム pread が IOPS 律速で、
+    // 14k の gather が 1.85 s (lab t349b の `[pre-kprof] ple=1848.2`)。並列度を
+    // 上げると同じ行数を深い queue で投げられる。読む行と綴じ方は同じ。
+    if crate::model::exp_pf::ple_pipe() {
+        let n = rayon::current_num_threads().clamp(1, 32);
+        return n.min(rows / 16).max(1);
+    }
     if pf_ple_par_on() {
         let n = rayon::current_num_threads().clamp(1, 16);
         // 1 パートあたり最低 16 行は残す (細かく割りすぎると pread が増える)。
