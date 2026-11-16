@@ -11383,7 +11383,7 @@ fn t369_kv_async_is_wired() {
 
 /// env 名は 1 箇所、明示的な真値だけ on、既定 off。
 #[test]
-fn task379_gdn_wb_last_gate_is_single_and_off_by_default() {
+fn task379_gdn_wb_last_gate_is_single_and_on_by_default() {
     assert_eq!(
         EXP_PF_SRC
             .matches("pub const GDN_WB_LAST_ENV: &str = \"DENNO_PF_GDN_WB_LAST\";")
@@ -11392,22 +11392,26 @@ fn task379_gdn_wb_last_gate_is_single_and_off_by_default() {
         "env 名の宣言が 1 箇所でない"
     );
     assert!(
-        EXP_PF_SRC.contains("pub const DEFAULT_GDN_WB_LAST: bool = false;"),
-        "既定が off でない"
+        EXP_PF_SRC.contains("pub const DEFAULT_GDN_WB_LAST: bool = true;"),
+        "既定が on でない (lab で採った)"
     );
     assert!(
         EXP_PF_SRC.contains("pub fn gdn_wb_last_on()"),
         "ゲートの実体が無い"
     );
-    // 解釈は明示的な真値だけ on (未設定は偽)。
+    // 解釈は「未設定は既定 (on)、明示的な偽値で切り戻す」。
     let f = EXP_PF_SRC
         .split("pub fn gdn_wb_last_from_value(")
         .nth(1)
         .expect("解釈が無い");
     let head = &f[..f.find('}').expect("本体が無い")];
     assert!(
-        head.contains("Some(\"1\" | \"on\" | \"true\" | \"yes\")"),
+        head.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
         "真値の集合が変わった"
+    );
+    assert!(
+        head.contains("None | Some(\"\") => DEFAULT_GDN_WB_LAST"),
+        "未設定・空が既定へ落ちていない (切り戻しの形が壊れる)"
     );
 }
 

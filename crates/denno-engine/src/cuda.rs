@@ -58605,23 +58605,27 @@ mod task379_tests {
     use super::*;
 
     /// task 379: 「層の最終チャンクか」の旗は既定で真 (どこから呼ばれても従来どおり書き戻す)。
-    /// ゲート off の既定の木では、旗が偽でも飛ばさない。
+    /// ゲートは lab で採ったので既定 on、途中チャンクだけ飛ばす。
     #[test]
-    fn gdn_last_chunk_flag_defaults_true_and_gate_is_off() {
+    fn gdn_last_chunk_flag_defaults_true_and_skips_only_mid_chunks() {
         pf_gdn_last_chunk_reset();
         assert!(pf_gdn_last_chunk(), "既定は真");
         pf_gdn_last_chunk_set(false);
         assert!(!pf_gdn_last_chunk(), "立てた値が読める");
         pf_gdn_last_chunk_reset();
         assert!(pf_gdn_last_chunk(), "戻すと真");
-        // 既定 (env 未設定) では旗・診断によらず必ず書き戻す。
-        if !crate::model::exp_pf::gdn_wb_last_on() {
+        if crate::model::exp_pf::gdn_wb_last_on() {
+            // 途中チャンクは飛ばす、最終チャンクは必ず書き戻す。
             pf_gdn_last_chunk_set(false);
             assert!(
-                !pf_gdn_last_chunk_skippable(0),
-                "ゲート off では飛ばさない"
+                pf_gdn_last_chunk_skippable(0),
+                "既定 on の途中チャンクは飛ばす"
             );
             pf_gdn_last_chunk_reset();
+            assert!(
+                !pf_gdn_last_chunk_skippable(0),
+                "最終チャンクで飛ばしてはいけない"
+            );
         }
     }
 }

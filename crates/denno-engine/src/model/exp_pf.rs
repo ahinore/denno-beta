@@ -911,7 +911,7 @@ pub fn gdn_wb_direct_on() -> bool {
 }
 
 /// `DENNO_PF_GDN_WB_LAST`: GDN 状態のホスト書き戻しを**層の最終チャンクだけ**にする
-/// (task 379、既定 off)。
+/// (task 379、lab t379a / t379b で採ったので既定 on。`=0` で切り戻す)。
 ///
 /// # なぜ要るか (lab t377c の台帳、既定モデル、14k cold)
 ///
@@ -936,12 +936,31 @@ pub fn gdn_wb_direct_on() -> bool {
 /// `pf_gdn_last_chunk_skippable`)。
 pub const GDN_WB_LAST_ENV: &str = "DENNO_PF_GDN_WB_LAST";
 
-/// [`GDN_WB_LAST_ENV`] の既定 (lab で採るまで off)。
-pub const DEFAULT_GDN_WB_LAST: bool = false;
+/// [`GDN_WB_LAST_ENV`] の既定 (lab t379a / t379b で採ったので **on**)。
+///
+/// lab 実測 (既定モデル、depth8k、PROFILE=1、`[q4ledger-pf]` の ssm 段):
+///
+/// | 段 | 3,826 cold | 14k cold |
+/// | --- | --- | --- |
+/// | ssm の壁 (ゲート off -> on) | 616.9/622.6/620.0/622.7 -> 456.1/449.2/454.6 | 2,609.2/2,610.5 -> 2,458.2/2,451.7 |
+/// | ssm の d2h | 235.34 MB/144 -> 117.67 MB/72 | 823.69 MB/504 -> 117.67 MB/72 |
+/// | ssm の exposed | 183.6/189.7 -> 23.1 | 1,052.9/1,053.0 -> 901.1/894.2 |
+/// | wall | 2,451.5/2,462.6 -> 2,446.5/2,439.0 | 6,165.4 -> 6,001.4 |
+///
+/// 3,826 は ssm 段 **-26.7%** (2 ラウンド x 2 run の 6 サンプル中央値) だが、その分の
+/// 待ちは `mix` 段の壁 (137.3 -> 285.0 ms) へ移り、wall は -0.6% (同じ)。3,826 は
+/// expert stream の写しが壁なので、ホストの待ちを消しても壁は動かない。
+/// 14k は ssm 段 -5.8%、wall は 6,165.4 -> 6,001.4 = **-2.66%** (同じ run の対)。
+/// md5 は 3 run の全 COND・全リクエストで SAME、decode 16.6 (0.1 ms 刻みで不変)。
+pub const DEFAULT_GDN_WB_LAST: bool = true;
 
-/// [`GDN_WB_LAST_ENV`] の解釈 (明示的な真値だけ on)。
+/// [`GDN_WB_LAST_ENV`] の解釈。未設定 / 空は [`DEFAULT_GDN_WB_LAST`]、
+/// `0` / `off` などの明示的な偽値で切り戻せる。
 pub fn gdn_wb_last_from_value(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_GDN_WB_LAST,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
 }
 
 /// 最終チャンクだけ書き戻すか (プロセスで 1 回だけ env を読む)。
@@ -3907,10 +3926,11 @@ mod tests {
         assert!(!up_decouple_from_value(Some("")));
         assert!(up_decouple_from_value(Some("1")));
         assert!(up_decouple_from_value(Some("yes")));
-        // task 379: GDN 状態の書き戻しを最終チャンクだけにするゲート (明示的な真値だけ on)。
-        assert!(!gdn_wb_last_from_value(None), "既定 off");
-        assert!(!gdn_wb_last_from_value(Some("")));
-        assert!(!gdn_wb_last_from_value(Some("0")));
+        // task 379: GDN 状態の書き戻しを最終チャンクだけにするゲート
+        // (lab t379a / t379b で採ったので既定 on)。
+        assert!(gdn_wb_last_from_value(None), "既定 on");
+        assert!(gdn_wb_last_from_value(Some("")), "未設定と同じ");
+        assert!(!gdn_wb_last_from_value(Some("0")), "明示的な 0 で切り戻せる");
         assert!(!gdn_wb_last_from_value(Some("off")));
         assert!(!gdn_wb_last_from_value(Some("no")));
         assert!(gdn_wb_last_from_value(Some("1")));
@@ -3918,7 +3938,7 @@ mod tests {
         assert!(gdn_wb_last_from_value(Some("true")));
         assert!(gdn_wb_last_from_value(Some("yes")));
         assert!(gdn_wb_last_from_value(Some(" 1 ")), "前後の空白は無視する");
-        assert!(!DEFAULT_GDN_WB_LAST, "lab で採るまで既定 off");
+        assert!(DEFAULT_GDN_WB_LAST, "lab で採ったので既定 on");
         // task 324: H2D の完了を計算ストリームに待たせるゲート (lab t324b で採った)。
         assert_eq!(up_gpuwait_from_value(None), DEFAULT_UP_GPUWAIT);
         assert_eq!(up_gpuwait_from_value(Some("")), DEFAULT_UP_GPUWAIT);
