@@ -30355,6 +30355,82 @@ pub fn pf_kv_wb_copy_into(k_out: &mut [f32], v_out: &mut [f32]) -> bool {
     })
 }
 
+/// `DENNO_PF_KV_PUSH`: 保留中の k/v を **pinned のまま** `AttnCache::push` に
+/// 渡す (`ks`/`vs` への写しをしない)。既定 off。
+///
+/// pinned から `ks`/`vs` へ写す経路は 14k で 304 ms (689 MB、約 2.3 GB/s)、
+/// 3,826 で 89 ms (188 MB) のホスト時間を使っていた (lab t369a の `full` の
+/// cpu 列: 239 -> 543 ms / 55 -> 144 ms。うち大半は初回タッチのページフォルト)。
+/// 直接 push すれば写しは 1 回 (pinned -> キャッシュ) で済む。
+/// デバイスから出るバイト列は同じなので値は不変。
+pub const PF_KV_PUSH_ENV: &str = "DENNO_PF_KV_PUSH";
+
+/// [`PF_KV_PUSH_ENV`] の解釈 (明示的な真値だけ on)。
+pub(crate) fn pf_kv_push_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+#[cfg(test)]
+static PF_KV_PUSH_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_kv_push_for_test(v: Option<bool>) {
+    PF_KV_PUSH_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// pinned から直接 push するか (既定 off)。
+pub fn pf_kv_push_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_KV_PUSH_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_kv_push_from_value(std::env::var(PF_KV_PUSH_ENV).ok().as_deref()))
+}
+
+/// 保留中の k/v を **pinned のまま** `f` に渡す (コピーしない)。
+///
+/// `false` = 保留なし (呼び出し側は従来の `ks`/`vs` 経路へ)。
+pub fn pf_kv_wb_with<F: FnOnce(&[f32], &[f32])>(f: F) -> bool {
+    KV_WB_SC.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let (kb, vb) = s.bytes;
+        if kb == 0 {
+            return false;
+        }
+        let Some(pin) = s.pin.as_ref() else {
+            s.bytes = (0, 0);
+            return false;
+        };
+        let base = pin.ptr as usize;
+        if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
+            unsafe {
+                let _ = (esync)(ev);
+            }
+        }
+        s.bytes = (0, 0);
+        // SAFETY: pinned は `kb + vb` バイト以上あり、転送はイベントで完了済み。
+        let k = unsafe { std::slice::from_raw_parts(base as *const f32, kb / 4) };
+        let v = unsafe { std::slice::from_raw_parts((base + kb) as *const f32, vb / 4) };
+        f(k, v);
+        true
+    })
+}
+
 /// 保留を捨てる (デバイスのコピー完了は待つ)。`false` = 保留なし。
 pub fn pf_kv_wb_discard() -> bool {
     KV_WB_SC.with(|cell| {
@@ -57802,6 +57878,36 @@ mod task318_tests {
         assert_eq!(k, before_k, "保留なしで k を書き換えた");
         assert_eq!(v, before_v, "保留なしで v を書き換えた");
         assert!(!pf_kv_wb_discard(), "保留なしで true を返した");
+    }
+
+    /// task 369: `DENNO_PF_KV_PUSH` の解釈 (既定 off、明示的な真値だけ on)。
+    #[test]
+    fn t369_kv_push_gate_truth_table() {
+        for raw in [
+            None,
+            Some(""),
+            Some(" 0 "),
+            Some("off"),
+            Some("FALSE"),
+            Some("no"),
+            Some("x"),
+        ] {
+            assert!(!pf_kv_push_from_value(raw), "raw={raw:?} が on になっている");
+        }
+        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" yes ")] {
+            assert!(pf_kv_push_from_value(raw), "raw={raw:?} が off になっている");
+        }
+        assert!(!pf_kv_push_from_value(None), "既定が on になっている");
+    }
+
+    /// task 369: 保留が無いとき `pf_kv_wb_with` は closure を呼ばず false を返す。
+    #[test]
+    fn t369_kv_wb_with_without_pending_does_not_call() {
+        let mut called = false;
+        assert!(!pf_kv_wb_with(|_k, _v| {
+            called = true;
+        }));
+        assert!(!called, "保留なしで closure が呼ばれた");
     }
 
     /// task 369: ゲートが off なら積まない (pinned の確保もしない)。

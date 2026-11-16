@@ -11296,7 +11296,7 @@ fn t357_ple_threads_gate_is_wired_to_the_pool() {
 /// 5. 積んだ転送を必ず回収する (copy か discard) ことを確かめる。
 /// 発火そのものは lab の台帳 (`full` の d2h 呼び出し数) で数える。
 #[test]
-fn t369_kv_async_is_wired_and_off_by_default() {
+fn t369_kv_async_is_wired() {
     use denno_engine::cuda::pf_kv_wb_pending;
     const ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
     assert!(!pf_kv_wb_pending(), "起動直後に保留がある");
@@ -11349,5 +11349,23 @@ fn t369_kv_async_is_wired_and_off_by_default() {
     assert!(
         ATTN_SRC.contains("crate::cuda::pf_kv_wb_discard();"),
         "落ちた枝で保留を捨てていない"
+    );
+    // pinned から直接 push する枝 (`DENNO_PF_KV_PUSH`、既定 off) も配線されている。
+    assert_eq!(
+        CUDA_RS.matches("pub const PF_KV_PUSH_ENV: &str = \"DENNO_PF_KV_PUSH\";").count(),
+        1,
+        "env 名が 1 箇所でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub fn pf_kv_wb_with<F: FnOnce(&[f32], &[f32])>(f: F) -> bool {"),
+        "pinned 直送の入口が無い"
+    );
+    assert!(
+        ATTN_SRC.contains("crate::cuda::pf_kv_push_on()"),
+        "呼び出し側が pinned 直送のゲートを見ていない"
+    );
+    assert!(
+        ATTN_SRC.contains("&& crate::cuda::pf_kv_wb_with(|k: &[f32], v: &[f32]| {"),
+        "pinned 直送の分岐が無い"
     );
 }

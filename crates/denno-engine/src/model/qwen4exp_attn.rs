@@ -2283,10 +2283,30 @@ impl FullAttn {
         }
         if wb_deferred {
             // ここで初めて転送を待つ (attention と out のカーネルの裏に隠れる)。
-            crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);
-            for t in 0..nt {
-                self.cache
-                    .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+            // `DENNO_PF_KV_PUSH` では pinned から直接積む (ks/vs への写しを省く)。
+            let mut err = None;
+            let used = crate::cuda::pf_kv_push_on()
+                && crate::cuda::pf_kv_wb_with(|k: &[f32], v: &[f32]| {
+                    for t in 0..nt {
+                        if let Err(e) = self.cache.push(
+                            layer,
+                            &k[t * kv..(t + 1) * kv],
+                            &v[t * kv..(t + 1) * kv],
+                        ) {
+                            err = Some(e);
+                            return;
+                        }
+                    }
+                });
+            if !used {
+                crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);
+                for t in 0..nt {
+                    self.cache
+                        .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+                }
+            }
+            if let Some(e) = err {
+                return Err(e);
             }
         }
         if self.pos < base + nt {
