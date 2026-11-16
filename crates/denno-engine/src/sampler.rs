@@ -239,6 +239,96 @@ pub struct Sampler {
     exps: Vec<f32>,
 }
 
+/// task 368: `DENNO_ARGMAX_FAST` — greedy の argmax を 8 本の部分最大に分ける
+/// (既定 off)。
+///
+/// 素直な 1 本の比較鎖 (`v > best_v`) は語彙 248320 で実測 **0.11 ms/token**
+/// (`[q4prof] sample` 14.6 ms / 128 tok)。8 本に分けると 3-4x 速くなる。
+/// **返す添字は従来と同一**: 最大値に一致する最初の添字を返すので、同点は先頭・
+/// NaN は無視 (どちらも `>` が偽になるため) という規則がそのまま残る。
+pub const ARGMAX_FAST_ENV: &str = "DENNO_ARGMAX_FAST";
+
+/// 既定 (採否は lab で決める)。
+pub const ARGMAX_FAST_DEFAULT: bool = false;
+
+/// [`ARGMAX_FAST_ENV`] の解釈 (純関数)。
+pub fn argmax_fast_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "on" | "true" | "yes") => true,
+        Some("0" | "off" | "false" | "no") => false,
+        _ => ARGMAX_FAST_DEFAULT,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// テストが env を立てずに on/off を強制する。
+    static ARGMAX_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// テストが env を立てずに on/off を強制する (`None` で env の解釈へ戻る)。
+#[cfg(test)]
+pub(crate) fn argmax_fast_set_for_test(v: Option<bool>) {
+    ARGMAX_FORCE.with(|c| c.set(v));
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn argmax_fast_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = ARGMAX_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| argmax_fast_from_value(std::env::var(ARGMAX_FAST_ENV).ok().as_deref()))
+}
+
+/// テスト用: 8 本経路に入った回数 (「緑 = 発動」ではないので数える)。
+#[cfg(test)]
+pub(crate) static ARGMAX_FAST_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn bump_argmax_fast_calls() {
+    #[cfg(test)]
+    ARGMAX_FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 最初の最大値の添字 (greedy の argmax)。
+///
+/// 8 本の部分最大 → 最大値 → 「その値に一致する最初の添字」の 2 パス。
+/// 素直な `if v > best { .. }` と**同じ添字**を返す (NaN は無視・同点は先頭)。
+pub fn argmax_first(v: &[f32]) -> usize {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut m = [f32::NEG_INFINITY; 8];
+    let mut it = v.chunks_exact(8);
+    for c in &mut it {
+        for k in 0..8 {
+            if c[k] > m[k] {
+                m[k] = c[k];
+            }
+        }
+    }
+    for &x in it.remainder() {
+        if x > m[0] {
+            m[0] = x;
+        }
+    }
+    let mut best = m[0];
+    for k in 1..8 {
+        if m[k] > best {
+            best = m[k];
+        }
+    }
+    for (i, &x) in v.iter().enumerate() {
+        if x == best {
+            return i;
+        }
+    }
+    0
+}
+
 impl Sampler {
     pub fn new(temperature: Option<f32>, top_k: Option<usize>, top_p: Option<f32>, seed: Option<u64>) -> Self {
         Self {
@@ -257,6 +347,13 @@ impl Sampler {
     pub fn sample(&mut self, logits: &[f32]) -> usize {
         // greedy (P8 でも不変)
         if self.temperature <= 0.0 {
+            // task 368: `DENNO_ARGMAX_FAST` (既定 off)。8 本の部分最大に分ける。
+            // 語彙 248320 で素直な比較鎖は実測 0.11 ms/token (`[q4prof] sample`)。
+            // **返す添字は従来と同一** (同じ最大値の最初の添字)。
+            if argmax_fast_enabled() {
+                bump_argmax_fast_calls();
+                return argmax_first(logits);
+            }
             let mut best = 0usize;
             let mut best_v = f32::NEG_INFINITY;
             for (i, &v) in logits.iter().enumerate() {
@@ -1088,7 +1185,87 @@ mod tests {
         assert_eq!(seq1, seq2, "penalty 適用が RNG 消費を変えた");
     }
 
-    /// normalized(): n<=1 を無効に落とす (内部防御)。
+    /// task 368: 8 本 argmax は素直な比較鎖と**同じ添字**を返す
+    /// (同点は先頭・NaN は無視・-0.0/+0.0 の同値も同じ扱い)。
+    #[test]
+    fn argmax_first_matches_naive_scan() {
+        let naive = |v: &[f32]| -> usize {
+            let mut best = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &x) in v.iter().enumerate() {
+                if x > best_v {
+                    best_v = x;
+                    best = i;
+                }
+            }
+            best
+        };
+        let mut lcg: u64 = 0x0bad_f00d_1234_5678;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (lcg >> 40) as f32 / 1024.0 - 8.0
+        };
+        for n in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 1023, 248320] {
+            let v: Vec<f32> = (0..n).map(|_| next()).collect();
+            assert_eq!(argmax_first(&v), naive(&v), "n={n} で添字が違う");
+        }
+        // 同点は先頭 (末尾側に同じ最大値を置いても先頭が勝つ)。
+        let mut v = vec![0.5f32; 100];
+        v[3] = 9.0;
+        v[97] = 9.0;
+        assert_eq!(argmax_first(&v), 3);
+        assert_eq!(naive(&v), 3);
+        // -0.0 と +0.0 の同値 (最初の 0 が勝つ)。
+        let v2 = vec![-0.0f32, 0.0, -1.0];
+        assert_eq!(argmax_first(&v2), naive(&v2));
+        // NaN は無視。
+        let v3 = vec![f32::NAN, 1.0, f32::NAN];
+        assert_eq!(argmax_first(&v3), 1);
+    }
+
+    /// task 368: `DENNO_ARGMAX_FAST` の解釈と、greedy の分岐が実際に 8 本経路へ
+    /// 入ること (off では 0 回)。
+    #[test]
+    fn argmax_fast_gate_switches_the_greedy_path() {
+        assert!(!argmax_fast_from_value(None), "既定は off");
+        for v in ["1", "on", "ON", " true ", "yes"] {
+            assert!(argmax_fast_from_value(Some(v)), "{v} を on と読んでいない");
+        }
+        for v in ["0", "off", "False", "no", "", "2"] {
+            assert!(!argmax_fast_from_value(Some(v)), "{v} を off と読んでいない");
+        }
+        let logits: Vec<f32> = (0..64).map(|i| ((i * 11) % 17) as f32 * 0.25 - 2.0).collect();
+        let want = {
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &x) in logits.iter().enumerate() {
+                if x > bv {
+                    bv = x;
+                    best = i;
+                }
+            }
+            best
+        };
+        ARGMAX_FAST_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        argmax_fast_set_for_test(Some(false));
+        let mut s_off = sampler(Some(0.0), None, None, Some(7));
+        assert_eq!(s_off.sample(&logits), want);
+        assert_eq!(
+            ARGMAX_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "ゲート off で 8 本経路に入った"
+        );
+        argmax_fast_set_for_test(Some(true));
+        let mut s_on = sampler(Some(0.0), None, None, Some(7));
+        assert_eq!(s_on.sample(&logits), want, "8 本経路で選ぶトークンが違う");
+        assert_eq!(
+            ARGMAX_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "ゲート on で 8 本経路に入っていない"
+        );
+        argmax_fast_set_for_test(None);
+    }
+
     #[test]
     fn anti_repetition_normalized_drops_small_n() {
         for n in [0usize, 1] {
