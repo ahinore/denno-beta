@@ -11187,8 +11187,8 @@ fn t349_ple_pipe_is_wired_and_does_not_double_read() {
         "ゲート名が無い"
     );
     assert!(
-        EXP_PF_SRC.contains("pub const DEFAULT_PLE_PIPE: bool = false;"),
-        "既定が off でない"
+        EXP_PF_SRC.contains("pub const DEFAULT_PLE_PIPE: bool = true;"),
+        "既定が on でない (task 353 の t353a で採用)"
     );
     // 生産スレッドはチャンク順に全部を流し、sync_channel で 1 個ずつ渡す。
     assert!(

@@ -1797,14 +1797,37 @@ pub fn stream_pread() -> bool {
 /// 1 チャンクずつ渡す。層ループ (GPU) の裏でディスクのランダム読みが進むので、
 /// 2.7 s のうち層ループに隠れる分が増える。並列度 (`DENNO_PLE_PAR`) も
 /// 表の置き場所 (RAM 常駐) も変えない。
+///
+/// task 353: 層優先 (`forward_prefill_batch_resident_lm`) では gather が
+/// **層ループの前に全チャンク直列**なので、パイプの生産スレッドは使わない。
+/// 代わりに gather を 32 本の専用プール (`ple_par_parts` の上限 32) で引く。
+/// 冷えた page cache の実測は [`DEFAULT_PLE_PIPE`] の doc を見ること。
 pub const PLE_PIPE_ENV: &str = "DENNO_PF_PLE_PIPE";
 
-/// [`PLE_PIPE_ENV`] の既定値 (off)。
-pub const DEFAULT_PLE_PIPE: bool = false;
+/// [`PLE_PIPE_ENV`] の既定値。**task 353 の lab t353a で採ったので on**。
+///
+/// lab t353a (depth8k、`DENNO_START_DROP_CACHE=1` で全 COND を冷えた状態に揃え、
+/// 同じ run の baseline b1/b2 = 8.85/8.82 s と 9.29/9.21 s):
+///
+/// | COND | 3,826 cold | 14k cold | `[pre-kprof]` ple (3.8k / 14k) | decode |
+/// | --- | --- | --- | --- | --- |
+/// | b1 (baseline) | 8.85 s | 9.29 s | 771 / 1,851 ms | 16.6 |
+/// | pl (`DENNO_PF_PLE_PIPE=1`) | **8.41 s (-5.0%)** | **8.06 s (-13.2%)** | 328 / 681 ms | 16.7 |
+/// | b2 (baseline) | 8.82 s | 9.24 s | — | 16.6 |
+///
+/// md5 は pl の 8 本すべて SAME (`a91e17da` / `5a8f5488` / `e2292eb6` / `561c6da8`)、
+/// errors 0、text sane。効いているのは**層優先の先頭 gather の並列度**
+/// (32 本、`ple_par_parts`) で、パイプ側 (`forward_prefill_batch_resident`) は
+/// このモデルでは層優先経路が使われるため主因ではない (lab の ple 時間は
+/// 1,851 → 681 ms に落ちた)。decode は 0.1 ms/tok の刻み内。
+pub const DEFAULT_PLE_PIPE: bool = true;
 
-/// [`PLE_PIPE_ENV`] の解釈 (純関数)。`1` 系だけが真。
+/// [`PLE_PIPE_ENV`] の解釈 (純関数)。未設定は既定 (on)、`0` 系だけが偽。
 pub fn ple_pipe_from_value(v: Option<&str>) -> bool {
-    stream_pread_from_value(v)
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PLE_PIPE,
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+    }
 }
 
 /// PLE のパイプライン先読みを使うか (プロセスで 1 回だけ env を読む)。
@@ -2994,16 +3017,20 @@ mod tests {
         assert!(stream_pread_from_value(Some(" yes ")));
     }
 
-    /// task 349: `DENNO_PF_PLE_PIPE` は既定 off、`1` 系だけが真。
+    /// task 349 / 353: `DENNO_PF_PLE_PIPE` は既定 on (t353a で採用)、`0` 系だけが偽。
     #[test]
     fn ple_pipe_gate_truth_table() {
-        assert!(!ple_pipe_from_value(None));
+        assert!(ple_pipe_from_value(None), "未設定は既定 (on)");
+        assert!(ple_pipe_from_value(Some("")), "空も既定 (on)");
         assert!(!ple_pipe_from_value(Some("0")));
         assert!(!ple_pipe_from_value(Some("off")));
+        assert!(!ple_pipe_from_value(Some("x")), "解析不能は偽 (明示の真値だけ on)");
         assert!(ple_pipe_from_value(Some("1")));
         assert!(ple_pipe_from_value(Some("on")));
+        assert!(ple_pipe_from_value(Some("TRUE")));
+        assert!(ple_pipe_from_value(Some(" yes ")));
         assert_eq!(PLE_PIPE_ENV, "DENNO_PF_PLE_PIPE");
-        assert!(!DEFAULT_PLE_PIPE);
+        assert!(DEFAULT_PLE_PIPE);
     }
 
     /// task 325: `DENNO_PF_PREAD_THREADS` の丸めと既定 (0 = 共有プール)。
