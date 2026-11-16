@@ -8606,6 +8606,9 @@ struct IqScratch {
     /// task 187: 和モードの重み (nseg 本) と和の出力 (e 要素)。
     wt: Option<DevBuffer>,
     psum: Option<DevBuffer>,
+    /// task 356: 和モードの ZC (`DENNO_DEC_EXP_SUM_ZC`) のときの和の出力先。
+    /// pinned のホスト (UVA でデバイスからも書ける) = D2H を消すため。
+    psum_zc: Option<PinMem>,
     /// task 204: gate+up 融合 (`DENNO_DEC_EXPGU`) の連結出力 `[g[ng] | u[ng]]`。
     gu: Option<DevBuffer>,
 }
@@ -8626,6 +8629,7 @@ impl IqScratch {
             hpin: None,
             wt: None,
             psum: None,
+            psum_zc: None,
             gu: None,
         }
     }
@@ -8850,6 +8854,18 @@ where
             MoeScratch::ensure_tagged(&mut sc.wt, nseg * 4, crate::mem_audit::TAG_GDN_SC)?;
             MoeScratch::ensure_tagged(&mut sc.psum, nout * 4, crate::mem_audit::TAG_GDN_SC)?;
         }
+        // task 356: 和の出力を pinned のホストへ直接書く (`DENNO_DEC_EXP_SUM_ZC`)。
+        // 確保できなければ従来の D2H 経路へ (fail closed)。
+        let zc = sum_mode
+            && sumk.is_some()
+            && crate::model::exp_iq::sum_zc_enabled()
+            && match Scratch::ensure_pin(&mut sc.psum_zc, nout * 4) {
+                Ok(()) => true,
+                Err(_) => {
+                    crate::model::exp_iq::note_sum_zc_fallback();
+                    false
+                }
+            };
         // task 150: overlap 経路だけ pinned staging を用意する (grow-only)。
         if overlap {
             Scratch::ensure_pin(&mut sc.hpin, nout * 4)?;
@@ -9129,12 +9145,21 @@ where
             //     (`out[j] = sum_t w[t] * h[t*e+j]`)。t 昇順の 1 アキュムレータ
             //     なので、ミスの無い層ではホストの足し込みとビット一致する。
             let src_ptr = if let Some(sk) = sumk {
+                // task 356 (`DENNO_DEC_EXP_SUM_ZC`): 和の出力を pinned のホストへ
+                // 直接書かせる (UVA なのでホストのアドレスがそのままデバイスの
+                // アドレス)。これで 10 KB の D2H とその完了待ちが丸ごと消える。
+                let zc_ptr = if zc {
+                    let pin = sc.psum_zc.as_ref().expect("確保済み");
+                    Some(pin.ptr as u64)
+                } else {
+                    None
+                };
                 let psum = sc.psum.as_ref().expect("確保済み");
                 let mut ph = h.ptr;
                 let mut pwv = w_addr as *mut c_void;
                 let mut psh = std::ptr::null_mut::<c_void>();
                 let mut pw = 0.0f32;
-                let mut po = psum.ptr;
+                let mut po = zc_ptr.unwrap_or(psum.ptr);
                 let (mut pe, mut pn, mut phs) = (e as c_int, nseg as c_int, 0 as c_int);
                 let mut args = [
                     &mut ph as *mut _ as *mut c_void,
@@ -9150,7 +9175,10 @@ where
                 let blocks = sum_e.div_ceil(threads) as u32;
                 ctx.launch_async(sk.sum, (blocks.max(1), 1, 1), (threads as u32, 1, 1), 0, &mut args)?;
                 dec_exp_kprof::mark(dec_exp_kprof::SUM);
-                psum.ptr
+                if zc_ptr.is_some() {
+                    crate::model::exp_iq::note_sum_zc_layer();
+                }
+                zc_ptr.unwrap_or(psum.ptr)
             } else {
                 h.ptr
             };
@@ -9158,19 +9186,30 @@ where
             //    非同期で先に出し、`middle` (CPU ミス) を挟んでから同期する。
             //    カーネル・引数・発行順は逐次版と同一 (変わるのは待つ位置だけ)。
             if overlap {
-                // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
-                // 借り直さないよう、アドレスを先に写す)。
-                let pin = sc.hpin.as_mut().expect("確保済み");
-                // task 356 (`DENNO_DEC_EXP_D2H_STREAM`): コピーを専用の非ブロッキング
-                // ストリームへ出す。null ストリームのままだと、小さいコピー (和モード
-                // 10 KB) で driver が呼び出しの中で待つことがあり、その待ちが CPU
-                // ミスの前に直列に挟まる。待ちは下の `exp_d2h_wait` へ回す。
-                // 失敗したら従来の null ストリーム経路へ (fail closed)。
-                if !exp_d2h_issue(pin.ptr, src_ptr, nout * 4) {
-                    check(
-                        (lib()?.memcpy_dtoh_async)(pin.ptr, src_ptr, nout * 4, std::ptr::null_mut()),
-                        "cuMemcpyDtoHAsync (iq layer overlap)",
-                    )?;
+                if zc {
+                    // task 356: カーネルが pinned のホストへ直接書いた = D2H 無し。
+                    // 待ちは下の同期 1 回だけで足りる。
+                } else {
+                    // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
+                    // 借り直さないよう、アドレスを先に写す)。
+                    let pin = sc.hpin.as_mut().expect("確保済み");
+                    if !exp_d2h_issue(pin.ptr, src_ptr, nout * 4) {
+                        // task 356 (`DENNO_DEC_EXP_D2H_STREAM`): コピーを専用の
+                        // 非ブロッキングストリームへ出す。null ストリームのままだと、
+                        // 小さいコピーで driver が呼び出しの中で待つことがあり、その
+                        // 待ちが CPU ミスの前に直列に挟まる。待ちは下の
+                        // `exp_d2h_wait` へ回す。失敗したら従来の null ストリーム
+                        // 経路へ (fail closed)。
+                        check(
+                            (lib()?.memcpy_dtoh_async)(
+                                pin.ptr,
+                                src_ptr,
+                                nout * 4,
+                                std::ptr::null_mut(),
+                            ),
+                            "cuMemcpyDtoHAsync (iq layer overlap)",
+                        )?;
+                    }
                 }
                 crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
                 dec_exp_kprof::mark(dec_exp_kprof::D2H);
@@ -9199,16 +9238,27 @@ where
                     bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
                 }
             }
-            let pin = sc.hpin.as_ref().expect("確保済み");
-            out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
-        } else {
-            let src = if sum_mode {
-                sc.psum.as_ref().expect("確保済み")
+            if zc {
+                // task 356: 和は pinned のホストに直接書かれている (コピー無し)。
+                let pin = sc.psum_zc.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
             } else {
-                sc.h.as_ref().expect("確保済み")
-            };
-            let got: Vec<f32> = src.to_vec(nout)?;
-            out_h[..nout].copy_from_slice(&got);
+                let pin = sc.hpin.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            }
+        } else {
+            if zc {
+                let pin = sc.psum_zc.as_ref().expect("確保済み");
+                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+            } else {
+                let src = if sum_mode {
+                    sc.psum.as_ref().expect("確保済み")
+                } else {
+                    sc.h.as_ref().expect("確保済み")
+                };
+                let got: Vec<f32> = src.to_vec(nout)?;
+                out_h[..nout].copy_from_slice(&got);
+            }
             dec_exp_kprof::mark(dec_exp_kprof::D2H);
             middle()?;
         }

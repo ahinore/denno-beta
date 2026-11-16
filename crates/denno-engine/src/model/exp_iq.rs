@@ -272,6 +272,81 @@ pub fn d2h_stream_reset() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 356: 和の出力を **pinned のホストバッファへ直接書く** (`DENNO_DEC_EXP_SUM_ZC`)
+// ---------------------------------------------------------------------------
+//
+// lab t356a の実測 (IQ3_S、depth8k、hit_rate 0.99、decode 14.8 ms/tok) では
+// experts 段が 1 層 71.7 us で、そのうち GPU の鎖が 54 us:
+// gate+up 25.9 / silu 3.9 / down 16.8 / sum 5.0 / **d2h 5.5** (us/層)。
+// d2h は `dno_dec_exp_sum` の e = 2,560 要素 (10 KB) を VRAM から pinned へ
+// 写すだけで、DMA の起動待ちがそのまま層の鎖に乗る。t356a で専用ストリームへ
+// 出しても decode は変わらなかった (ホストが結局その完了を待つため)。
+//
+// ならば**コピーそのものを消す**: 和のカーネルの出力ポインタに pinned のホスト
+// バッファのアドレスを渡す (UVA なのでデバイスから同じアドレスで書ける)。カーネルが
+// ホストへ直接書くので、D2H も、その完了待ちも要らない。値は同じ (同じカーネル・
+// 同じ式・同じ並び)。ストリームの同期は従来どおり 1 回で、その後ホストが
+// バッファを読む (カーネル完了 = 書き込みが見える)。
+pub const SUM_ZC_ENV: &str = "DENNO_DEC_EXP_SUM_ZC";
+
+/// [`SUM_ZC_ENV`] の解釈 (純関数)。**既定 off**。
+pub fn sum_zc_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn sum_zc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| sum_zc_from_value(std::env::var(SUM_ZC_ENV).ok().as_deref()))
+}
+
+/// 和を pinned のホストへ直接書いた層の数 (**分岐が発火した証拠**)。
+static SUM_ZC_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// pinned を確保できず従来の D2H 経路へ落ちた層の数。
+static SUM_ZC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 和をホストへ直接書いた層を 1 つ数える。
+pub fn note_sum_zc_layer() {
+    SUM_ZC_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// pinned を確保できず従来経路へ落ちた層を 1 つ数える。
+pub fn note_sum_zc_fallback() {
+    SUM_ZC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 リクエストぶんの 1 行 (ゲート on でも 0 層なら `None`)。
+pub fn sum_zc_line() -> Option<String> {
+    sum_zc_line_with(sum_zc_enabled())
+}
+
+/// [`sum_zc_line`] の本体 (ゲートの真偽を引数で受ける = テストで両側を踏める)。
+fn sum_zc_line_with(on: bool) -> Option<String> {
+    if !on {
+        return None;
+    }
+    let layers = SUM_ZC_LAYERS.load(Ordering::Relaxed);
+    let fb = SUM_ZC_FALLBACKS.load(Ordering::Relaxed);
+    if layers == 0 && fb == 0 {
+        return None;
+    }
+    Some(format!("[dec-exp-zc] sum_zc_layers={layers} fallback={fb}"))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn sum_zc_reset() {
+    for c in [&SUM_ZC_LAYERS, &SUM_ZC_FALLBACKS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// [`EXPERT_IQ_UPLOAD_ENV`] の解釈 (純関数)。未設定・数値でない値は既定値。
 pub fn upload_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim) {
@@ -913,6 +988,39 @@ mod tests {
         d2h_stream_reset();
         assert!(d2h_stream_line_with(true).is_none(), "0 に戻したら行を出さない");
     }
+
+    /// task 356: `DENNO_DEC_EXP_SUM_ZC` は**既定 off**で、明示的な真値だけ on。
+    #[test]
+    fn sum_zc_gate_defaults_off() {
+        assert!(!sum_zc_from_value(None), "未設定は off");
+        for v in ["", "0", "off", "false", "no", "2", "abc"] {
+            assert!(!sum_zc_from_value(Some(v)), "{v:?} は off");
+        }
+        for v in ["1", "on", "true", "yes", " ON ", "True"] {
+            assert!(sum_zc_from_value(Some(v)), "{v:?} は on");
+        }
+    }
+
+    /// task 356: 和の ZC の積算 (0 層なら行を出さない / 数えると出る)。
+    #[test]
+    fn sum_zc_line_counts_layers() {
+        sum_zc_reset();
+        assert!(sum_zc_line_with(true).is_none(), "0 層なら行を出さない");
+        note_sum_zc_layer();
+        note_sum_zc_layer();
+        assert!(
+            sum_zc_line_with(false).is_none(),
+            "ゲート off は数えていても行を出さない"
+        );
+        let line = sum_zc_line_with(true).expect("ゲート on なら行が出る");
+        assert!(line.contains("sum_zc_layers=2"), "{line}");
+        note_sum_zc_fallback();
+        let line = sum_zc_line_with(true).expect("行が出る");
+        assert!(line.contains("fallback=1"), "{line}");
+        sum_zc_reset();
+        assert!(sum_zc_line_with(true).is_none(), "0 に戻したら行を出さない");
+    }
+
 
     /// ミラーの索引が `kquant::dequant_row` とビット一致する (全 6 型 x 実形の k)。
     #[test]
