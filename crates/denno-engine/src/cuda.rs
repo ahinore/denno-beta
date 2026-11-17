@@ -43275,6 +43275,33 @@ mod tests {
         }
     }
 
+    /// task 392: `DENNO_GDN_BA_PAR` は既定 off・明示的な真値だけ on。
+    #[test]
+    fn gdn_ba_par_gate_truth_table() {
+        assert!(!gdn_ba_par_from_value(None), "未設定は既定 off");
+        for v in ["", "0", "off", "false", "no", "2", " on?"] {
+            assert!(!gdn_ba_par_from_value(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", " TRUE ", "yes", " YES "] {
+            assert!(gdn_ba_par_from_value(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 392: 発火の行は「ゲート on で 1 層でも通ったとき」だけ出る
+    /// (**緑 = 経路が通った証拠ではない** ので層数を数えて出す)。
+    #[test]
+    fn gdn_ba_par_line_counts_fired_layers() {
+        assert_eq!(gdn_ba_par_line_with(false, 6144, 0), None, "ゲート off");
+        assert_eq!(gdn_ba_par_line_with(true, 0, 0), None, "0 層なら出さない");
+        let l = gdn_ba_par_line_with(true, 2304, 0).expect("on で層があれば出す");
+        assert!(l.starts_with("[gdn-ba-par] "), "{l}");
+        assert!(l.contains("par_layers=2304"), "{l}");
+        assert!(l.contains("fallback=0"), "{l}");
+        let f = gdn_ba_par_line_with(true, 0, 3).expect("用意に失敗した回数も出す");
+        assert!(f.contains("par_layers=0"), "{f}");
+        assert!(f.contains("fallback=3"), "{f}");
+    }
+
     /// task 310 / 319: `DENNO_DEC_SH_V5` は `1` (3 本) / `2` (gate+up) の 2 段だけ。
     /// task 319 で既定を 2 にした (明示的な偽値だけが off)。
     #[test]
@@ -57181,8 +57208,12 @@ pub fn gdn_ba_ty_ok(ty: crate::kquant::GgmlType) -> bool {
 }
 
 /// task 269: beta/alpha を 1 発の matvec で `x_dev` → `out_dev` へ。
-fn gdn_launch_ba(
+///
+/// task 392: `stream` を渡すとそのストリームへ出す (重ね打ち経路)。
+/// `stream == None` は従来と同じ (null ストリーム)。
+fn gdn_launch_ba_on(
     ctx: &CudaCtx,
+    stream: Option<CUstream>,
     unit: &GdnGgufUnit<'_>,
     x_dev: CUdeviceptr,
     out_dev: CUdeviceptr,
@@ -57217,7 +57248,217 @@ fn gdn_launch_ba(
         &mut kc as *mut _ as *mut c_void,
         &mut nc as *mut _ as *mut c_void,
     ];
-    unsafe { ctx.launch_async(f, (unit.n as u32, 1, 1), (thr, 1, 1), 0, &mut args)? };
+    unsafe {
+        ctx.launch_async_on(
+            stream.unwrap_or(std::ptr::null_mut()),
+            f,
+            (unit.n as u32, 1, 1),
+            (thr, 1, 1),
+            0,
+            &mut args,
+        )?
+    };
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// task 392: beta/alpha の matvec を qkv GEMV と同じ時間帯に走らせる
+// (`DENNO_GDN_BA_PAR`)
+// ---------------------------------------------------------------------------
+//
+// GDN の submission は「xba H2D -> ba matvec (beta/alpha) -> qkv GEMV -> scan
+// -> out GEMV -> D2H」の 1 本の鎖で、ba は **x だけで決まる** (qkv とは独立)。
+// lab t392a の `[dec-kprof-avg]` (gdn、1 層 1 回) は ba 6.0 us / qkv 35.2 us /
+// scan 13.2 us / out 35.2 us で、ba は qkv の前に直列に並んでいるだけ = 1 層
+// 6 us が丸ごと遊び。ba を専用ストリームへ出し、scan の前にイベントで join
+// すると、カーネルも引数も入力も変えずに鎖が 6 us/層 短くなる (36 層 =
+// 0.22 ms/token)。値はビット一致 (同じカーネル・同じ入力・同じ順序)。
+//
+// 失敗したら (ドライバのシンボルが無い / 生成に失敗) 従来の直列経路へ落ちる。
+
+/// `DENNO_GDN_BA_PAR`: ba matvec を専用ストリームで qkv と重ねる。
+pub const GDN_BA_PAR_ENV: &str = "DENNO_GDN_BA_PAR";
+
+/// [`GDN_BA_PAR_ENV`] の解釈 (純関数)。**既定 off**。
+///
+/// 明示的な真値 (`1` / `on` / `true` / `yes`) のときだけ重ねる。
+/// 採否が出たら既定を here で切り替える。
+fn gdn_ba_par_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// `DENNO_GDN_BA_PAR` が有効か (プロセスで 1 回だけ env を読む)。
+fn gdn_ba_par_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_ba_par_from_value(std::env::var(GDN_BA_PAR_ENV).ok().as_deref()))
+}
+
+/// 重ね打ちが効いた層数 / 用意に失敗した回数。
+static GDN_BA_PAR_LAYERS: AtomicU64 = AtomicU64::new(0);
+static GDN_BA_PAR_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// 重ね打ちが成立した層を 1 つ数える。
+fn note_gdn_ba_par_layer() {
+    GDN_BA_PAR_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 専用ストリームを用意できなかった回数を 1 つ数える。
+fn note_gdn_ba_par_fallback() {
+    GDN_BA_PAR_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 リクエストぶんの 1 行 (ゲート on で 1 層も通らなければ `None`)。
+///
+/// **緑 = 経路が通った証拠ではない**ので、層数を数えて 1 行で出す。
+pub fn gdn_ba_par_line() -> Option<String> {
+    gdn_ba_par_line_with(
+        gdn_ba_par_on(),
+        GDN_BA_PAR_LAYERS.load(Ordering::Relaxed),
+        GDN_BA_PAR_FALLBACK.load(Ordering::Relaxed),
+    )
+}
+
+/// [`gdn_ba_par_line`] の本体 (テストで両側を踏めるように引数で受ける)。
+fn gdn_ba_par_line_with(on: bool, layers: u64, fallback: u64) -> Option<String> {
+    if !on || (layers == 0 && fallback == 0) {
+        return None;
+    }
+    Some(format!(
+        "[gdn-ba-par] par_layers={layers} fallback={fallback}"
+    ))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn gdn_ba_par_reset() {
+    GDN_BA_PAR_LAYERS.store(0, Ordering::Relaxed);
+    GDN_BA_PAR_FALLBACK.store(0, Ordering::Relaxed);
+}
+
+const CU_STREAM_NON_BLOCKING_BAPAR: u32 = 0x01;
+const CU_EVENT_DISABLE_TIMING_BAPAR: u32 = 0x02;
+
+/// 専用ストリームとイベント 2 本 (スレッドローカル。作るのは 1 回だけ)。
+struct GdnBaParStream {
+    stream: CUstream,
+    /// null ストリーム (xba H2D の後) に打つ。
+    ready: CUevent,
+    /// 専用ストリームの終点に打つ。
+    done: CUevent,
+}
+
+thread_local! {
+    static GDN_BA_PAR_STREAM: std::cell::RefCell<Option<GdnBaParStream>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 専用ストリームを用意する (無ければ作る)。作れなければ `false`。
+fn gdn_ba_par_ensure() -> bool {
+    GDN_BA_PAR_STREAM.with(|c| {
+        if c.borrow().is_some() {
+            return true;
+        }
+        let Ok(l) = lib() else {
+            return false;
+        };
+        let (Some(create_stream), Some(create_event)) = (l.stream_create, l.event_create) else {
+            return false;
+        };
+        if l.stream_wait_event.is_none() || l.event_record.is_none() {
+            return false;
+        }
+        let mut st: CUstream = std::ptr::null_mut();
+        if unsafe { create_stream(&mut st, CU_STREAM_NON_BLOCKING_BAPAR) } != CUDA_SUCCESS {
+            return false;
+        }
+        let mut ready: CUevent = std::ptr::null_mut();
+        let mut done: CUevent = std::ptr::null_mut();
+        let ok = unsafe { create_event(&mut ready, CU_EVENT_DISABLE_TIMING_BAPAR) } == CUDA_SUCCESS
+            && unsafe { create_event(&mut done, CU_EVENT_DISABLE_TIMING_BAPAR) } == CUDA_SUCCESS;
+        if !ok {
+            return false;
+        }
+        *c.borrow_mut() = Some(GdnBaParStream {
+            stream: st,
+            ready,
+            done,
+        });
+        true
+    })
+}
+
+/// この層ぶんの重ね打ちを用意する。戻り値は専用ストリーム (join は
+/// [`gdn_ba_par_mark_done`] / [`gdn_ba_par_join`] で行う)。
+///
+/// xba の H2D は**同期コピー**なので、この時点で null ストリームは空。
+/// そこへ `ready` を打ち、専用ストリームに待たせる = ba は H2D の後に走る。
+fn gdn_ba_par_arm() -> Option<CUstream> {
+    if !gdn_ba_par_ensure() {
+        note_gdn_ba_par_fallback();
+        return None;
+    }
+    let Ok(l) = lib() else {
+        note_gdn_ba_par_fallback();
+        return None;
+    };
+    let (Some(rec), Some(wait_ev)) = (l.event_record, l.stream_wait_event) else {
+        note_gdn_ba_par_fallback();
+        return None;
+    };
+    GDN_BA_PAR_STREAM.with(|c| {
+        let b = c.borrow();
+        let Some(p) = b.as_ref() else {
+            return None;
+        };
+        if unsafe { rec(p.ready, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            note_gdn_ba_par_fallback();
+            return None;
+        }
+        if unsafe { wait_ev(p.stream, p.ready, 0) } != CUDA_SUCCESS {
+            note_gdn_ba_par_fallback();
+            return None;
+        }
+        Some(p.stream)
+    })
+}
+
+/// 専用ストリームの終点に `done` を打つ (ba を積み終わった直後に呼ぶ)。
+fn gdn_ba_par_mark_done() -> Result<()> {
+    let l = lib()?;
+    let Some(rec) = l.event_record else {
+        bail!("gdn ba par: event_record が無い");
+    };
+    GDN_BA_PAR_STREAM.with(|c| {
+        let b = c.borrow();
+        let Some(p) = b.as_ref() else {
+            bail!("gdn ba par: 専用ストリームが無い");
+        };
+        if unsafe { rec(p.done, p.stream) } != CUDA_SUCCESS {
+            bail!("gdn ba par: done を打てない");
+        }
+        Ok(())
+    })
+}
+
+/// null ストリームに `done` を待たせる (scan を積む前)。成立した層を数える。
+fn gdn_ba_par_join() -> Result<()> {
+    let l = lib()?;
+    let Some(wait_ev) = l.stream_wait_event else {
+        bail!("gdn ba par: stream_wait_event が無い");
+    };
+    GDN_BA_PAR_STREAM.with(|c| {
+        let b = c.borrow();
+        let Some(p) = b.as_ref() else {
+            bail!("gdn ba par: 専用ストリームが無い");
+        };
+        if unsafe { wait_ev(std::ptr::null_mut(), p.done, 0) } != CUDA_SUCCESS {
+            bail!("gdn ba par: join できない");
+        }
+        Ok(())
+    })?;
+    note_gdn_ba_par_layer();
     Ok(())
 }
 
@@ -57979,9 +58220,24 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         let pa = pb + (req.nv * 4) as CUdeviceptr;
         // task 269: beta/alpha の f32 matvec を qkv GEMV より前に積む
         // (scan は最後なので順序は同一ストリームで保証される)。
+        //
+        // task 392: `DENNO_GDN_BA_PAR` のときは ba を専用ストリームへ出し、
+        // qkv GEMV と同じ時間帯に走らせる (ba は x だけで決まる = 独立)。
+        // 診断の段同期 (`DENNO_GDN_SUBMIT_SYNC`) が on のときは従来の直列
+        // (段ごとの同期の意味を保つ)。
+        let ba_stream = if !sync_dbg && !req.ba_units.is_empty() && gdn_ba_par_on() {
+            gdn_ba_par_arm()
+        } else {
+            None
+        };
+        let ba_overlapped = ba_stream.is_some();
         for (u, off) in req.ba_units {
-            gdn_launch_ba(ctx, u, px, pb + (*off * 4) as CUdeviceptr)?;
+            gdn_launch_ba_on(ctx, ba_stream, u, px, pb + (*off * 4) as CUdeviceptr)?;
             stage_sync!("ba_gemv");
+        }
+        if ba_overlapped {
+            // ba を積み終わった地点を専用ストリームに印す (join は scan の前)。
+            gdn_ba_par_mark_done()?;
         }
         for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
             gdn_launch_gemv_dev(
@@ -58043,6 +58299,10 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             &mut epsi as *mut _ as *mut c_void,
             &mut qsi as *mut _ as *mut c_void,
         ];
+        if ba_overlapped {
+            // task 392: 専用ストリームの ba を待ってから scan を積む。
+            gdn_ba_par_join()?;
+        }
         let shmem = ((3 * dk + dv + 5) * 4) as u32;
         unsafe {
             ctx.launch_async(
