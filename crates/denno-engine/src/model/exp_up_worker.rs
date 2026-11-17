@@ -147,10 +147,21 @@ pub fn max_per_token() -> Option<usize> {
 // いまは背景スレッドが送るので `queue_max=1` (ほぼ空) で、メインスレッドの
 // 代価は積むだけの約 1 us。よって空きがある間だけ 2 倍にする。
 
-/// `DENNO_EXP_UP_FILL`: LRU に空きがある間、1 トークンあたりの上げ予算を 2 倍にする。
-/// **既定 on** (lab t406b で採った: 短い decode -11.4%、c8000_turn2 -10.3%、
-/// 同じ run の `[q4ledger] experts` は 4.43 -> 3.15 ms/token。切り戻しは `=0`)。
+/// `DENNO_EXP_UP_FILL`: LRU に空きがある間、1 トークンあたりの上げ予算を
+/// `DENNO_EXP_UP_FILL_MULT` 倍にする。**既定 on**。
+///
+/// lab の実測 (depth8k、同じ run の対、短い decode の中央値):
+/// t406b `f1` (2 倍) 13.7 / `f4` (4 倍) 13.2 vs base 15.4、
+/// t406c `def` (2 倍) 14.1 / `f4b` (4 倍) 13.2 vs off 15.6・off2 15.4。
+/// 同じ run の `[q4ledger] experts` は 4.43 -> 3.15 (2 倍) / 2.94 (4 倍) ms/token。
+/// 切り戻しは `=0`。
 pub const FILL_ENV: &str = "DENNO_EXP_UP_FILL";
+
+/// `DENNO_EXP_UP_FILL_MULT`: 上げ予算の倍率 (既定 4、1..=8 に丸める)。
+///
+/// 2 にすると lab t406b の `f1` / t406c の `def` と同じ (2 本/層)、
+/// 4 が lab t406b の `f4` / t406c の `f4b` と同じ (4 本/層)。
+pub const FILL_MULT_ENV: &str = "DENNO_EXP_UP_FILL_MULT";
 
 /// [`FILL_ENV`] の解釈 (純関数)。**既定 on**、明示的な偽値だけ off。
 ///
@@ -162,22 +173,35 @@ pub fn fill_from_value(v: Option<&str>) -> bool {
     }
 }
 
-/// 空きがある間の上げ予算を 2 倍にするか (プロセスで 1 回だけ env を読む)。
+/// [`FILL_MULT_ENV`] の解釈 (純関数)。未設定・不正値は既定 4、1..=8 に丸める。
+pub fn fill_mult_from_value(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, 8),
+        None => DEFAULT_FILL_MULT,
+    }
+}
+
+/// [`FILL_MULT_ENV`] の既定値 (lab t406b / t406c の `f4` と同じ 4 本/層)。
+pub const DEFAULT_FILL_MULT: usize = 4;
+
+/// 空きがある間の上げ予算を倍率倍にするか (プロセスで 1 回だけ env を読む)。
 pub fn fill_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| fill_from_value(std::env::var(FILL_ENV).ok().as_deref()))
 }
 
-/// 上げ予算 (本/token) に倍率を当てる。**純関数** (`fill` が偽なら恒等)。
+/// 上げ予算の倍率 (プロセスで 1 回だけ env を読む)。
+pub fn fill_mult() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| fill_mult_from_value(std::env::var(FILL_MULT_ENV).ok().as_deref()))
+}
+
+/// 上げ予算 (本/token) に倍率を当てる。**純関数** (`mult <= 1` は恒等)。
 ///
-/// `base` は従来の規則が返す値 (空きあり 48 / 埋まり 16)。倍率は 2 倍だけで、
-/// 層あたりの割り当ては `予算 / 層数` で決まる (48 層なら 48 -> 2 本/層)。
-pub fn upload_budget(base: usize, fill: bool) -> usize {
-    if fill {
-        base.saturating_mul(2)
-    } else {
-        base
-    }
+/// `base` は従来の規則が返す値 (空きあり 48 / 埋まり 16)。層あたりの割り当ては
+/// `予算 / 層数` で決まる (48 層・48 本なら 1 本/層、192 本なら 4 本/層)。
+pub fn upload_budget(base: usize, mult: usize) -> usize {
+    base.saturating_mul(mult.max(1))
 }
 
 /// 積めなかった理由。呼び出し側は「同期 H2D へ落とす」か「このトークンは諦める」を
@@ -506,19 +530,33 @@ mod tests {
         assert!(!fill_from_value(Some("no")));
     }
 
-    /// task 406: 予算の倍率は 2 倍だけ。off は恒等 (1 バイトも変わらない)。
+    /// task 406: 予算の倍率は `mult` 倍 (1 以下は恒等)。off は 1 を渡す。
     #[test]
-    fn upload_budget_doubles_only_when_fill_is_on() {
-        // 48 層のモデル: 48 本 = 1 本/層 -> 96 本 = 2 本/層。
-        assert_eq!(upload_budget(48, false), 48);
-        assert_eq!(upload_budget(48, true), 96);
-        // 埋まっているときの値 (16) はこの関数を通さない契約だが、通しても 2 倍。
-        assert_eq!(upload_budget(16, false), 16);
-        assert_eq!(upload_budget(16, true), 32);
+    fn upload_budget_multiplies_and_keeps_one_as_identity() {
+        // 48 層のモデル: 48 本 = 1 本/層 -> 96 = 2 本/層 -> 192 = 4 本/層。
+        assert_eq!(upload_budget(48, 1), 48);
+        assert_eq!(upload_budget(48, 2), 96);
+        assert_eq!(upload_budget(48, 4), 192);
         // 0 は 0 のまま (ゲート off と同じ「上げない」)。
-        assert_eq!(upload_budget(0, true), 0);
+        assert_eq!(upload_budget(0, 4), 0);
+        // 0 倍は恒等に丸める (予算を 0 にして上げ直しを止めない)。
+        assert_eq!(upload_budget(48, 0), 48);
         // 飽和しても溢れない。
-        assert_eq!(upload_budget(usize::MAX, true), usize::MAX);
+        assert_eq!(upload_budget(usize::MAX, 4), usize::MAX);
+    }
+
+    /// task 406: 倍率の解釈は 1..=8 に丸め、未設定・不正値は既定 4。
+    #[test]
+    fn fill_mult_parses_and_clamps() {
+        assert_eq!(fill_mult_from_value(None), DEFAULT_FILL_MULT);
+        assert_eq!(DEFAULT_FILL_MULT, 4);
+        assert_eq!(fill_mult_from_value(Some("")), 4);
+        assert_eq!(fill_mult_from_value(Some("abc")), 4);
+        assert_eq!(fill_mult_from_value(Some("1")), 1);
+        assert_eq!(fill_mult_from_value(Some(" 2 ")), 2);
+        assert_eq!(fill_mult_from_value(Some("4")), 4);
+        assert_eq!(fill_mult_from_value(Some("99")), 8, "上限 8");
+        assert_eq!(fill_mult_from_value(Some("0")), 1, "0 は 1 に丸める");
     }
 
     /// task 406: 諦めるのはゲート on かつ「積めなかった」ときだけ。
