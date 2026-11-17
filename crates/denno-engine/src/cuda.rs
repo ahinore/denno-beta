@@ -50716,6 +50716,155 @@ pub(crate) fn gdn_pf_wy5_ok(
     gdn_pf_wy4_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
 }
 
+// ---------------------------------------------------------------------------
+// task 407: WY スキャンの占有率を上げた版 (`DENNO_PF_SCAN_WY6` / `DENNO_PF_SCAN_WY6P`)
+// ---------------------------------------------------------------------------
+//
+// 形 (v 列 4 分割 = (nv, 4) ブロック) も共有メモリ (7,393 float = 29,572 B) も
+// wy5 と同じで、**1 ブロックのスレッド数だけ** 256 -> 512 にした。170 SM に対して
+// 192 ブロック = 1 ブロック/SM だと 8 ワープ/SM (64 の 12.5%) しか立たず、
+// 共有メモリ経由の従属連鎖を隠せないため (P397 §6-2 の「まだ余白がある」)。
+//
+// - wy6: 演算列も wy5 と同一 (値も同一)。状態の更新が 1 スレッド 16 -> 8 本、
+//   A/G が 8 -> 16 ワープになる。
+// - wy6p: wy6 に加えて (5) P/QP の r 方向 (dk=128) を隣り合う 2 レーンで
+//   半分ずつ持ち、`__shfl_xor_sync(...,1)` で足す。和の木が変わるので
+//   **丸めだけ** wy6 と違う (決定論的)。
+pub(crate) const GDN_PF_WY6_SMEM_FLOATS: usize = GDN_PF_WY4_SMEM_FLOATS;
+pub(crate) const GDN_PF_WY6_SMEM_BYTES: usize = GDN_PF_WY6_SMEM_FLOATS * 4;
+pub(crate) const GDN_PF_WY6_THREADS: usize = 512;
+pub(crate) const GDN_PF_WY6_BLOCKS: usize = GDN_PF_WY4_BLOCKS;
+
+fn gdn_pf_wy6_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SCAN_WY6_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf_wy6.ptx"),
+    }
+}
+
+fn gdn_pf_wy6_kernels() -> Option<&'static GdnPfWyKernels> {
+    static K: OnceLock<Option<GdnPfWyKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        gdn_wy_load(
+            gdn_pf_wy6_ptx_path(),
+            b"dno_gdn_pf_wy6\0",
+            GDN_PF_WY6_SMEM_BYTES,
+            "[gdn-pf-wy6]",
+            GDN_PF_WY_SMEM_LIMIT,
+            false,
+        )
+    })
+    .as_ref()
+}
+
+fn gdn_pf_wy6p_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SCAN_WY6P_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf_wy6p.ptx"),
+    }
+}
+
+fn gdn_pf_wy6p_kernels() -> Option<&'static GdnPfWyKernels> {
+    static K: OnceLock<Option<GdnPfWyKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        gdn_wy_load(
+            gdn_pf_wy6p_ptx_path(),
+            b"dno_gdn_pf_wy6p\0",
+            GDN_PF_WY6_SMEM_BYTES,
+            "[gdn-pf-wy6p]",
+            GDN_PF_WY_SMEM_LIMIT,
+            false,
+        )
+    })
+    .as_ref()
+}
+
+#[cfg(test)]
+static WY6_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static WY6P_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_gdn_pf_wy6_for_test(v: Option<bool>) {
+    WY6_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn set_gdn_pf_wy6p_for_test(v: Option<bool>) {
+    WY6P_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_PF_SCAN_WY6` の解釈 (純関数)。**既定 off** (lab で採否を決める)。
+pub(crate) fn gdn_pf_wy6_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// `DENNO_PF_SCAN_WY6P` の解釈 (純関数)。**既定 off**。
+pub(crate) fn gdn_pf_wy6p_from_value(v: Option<&str>) -> bool {
+    gdn_pf_wy6_from_value(v)
+}
+
+pub(crate) fn gdn_pf_wy6_on() -> bool {
+    #[cfg(test)]
+    {
+        match WY6_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf_wy6_from_value(std::env::var("DENNO_PF_SCAN_WY6").ok().as_deref()))
+}
+
+pub(crate) fn gdn_pf_wy6p_on() -> bool {
+    #[cfg(test)]
+    {
+        match WY6P_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf_wy6p_from_value(std::env::var("DENNO_PF_SCAN_WY6P").ok().as_deref()))
+}
+
+/// wy6 / wy6p が受ける形か (wy4 / wy5 と同じ前提)。
+pub(crate) fn gdn_pf_wy6_ok(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) -> bool {
+    gdn_pf_wy5_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+}
+
+
 
 #[cfg(test)]
 static WY4_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -51153,6 +51302,103 @@ mod pf228_wy_tests {
             "P/QP の 4 アキュムレータが無い"
         );
     }
+
+    /// task 407: wy6 / wy6p のゲート (どちらも既定 off)・形の前提・共有メモリ。
+    ///
+    /// wy6 = wy5 の 1 ブロック 512 スレッド版 (値は wy5 と同一)、
+    /// wy6p = wy6 + P/QP の r 方向 2 分割 (丸めだけ wy6 と違う)。
+    #[test]
+    fn task407_scan_wy6_gate_and_shape() {
+        // ゲート: 未設定は既定 off (lab で採否を決める)。
+        assert!(!gdn_pf_wy6_from_value(None), "wy6 の既定は off");
+        assert!(!gdn_pf_wy6p_from_value(None), "wy6p の既定は off");
+        for v in ["", "0", "off", "false", "no", " off "] {
+            assert!(!gdn_pf_wy6_from_value(Some(v)), "wy6: {v:?} が on になった");
+            assert!(!gdn_pf_wy6p_from_value(Some(v)), "wy6p: {v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(gdn_pf_wy6_from_value(Some(v)), "wy6: {v:?} が off のまま");
+            assert!(gdn_pf_wy6p_from_value(Some(v)), "wy6p: {v:?} が off のまま");
+        }
+        set_gdn_pf_wy6_for_test(Some(true));
+        assert!(gdn_pf_wy6_on());
+        set_gdn_pf_wy6_for_test(Some(false));
+        assert!(!gdn_pf_wy6_on());
+        set_gdn_pf_wy6_for_test(None);
+        assert!(!gdn_pf_wy6_on(), "FORCE を戻したら既定 off");
+        set_gdn_pf_wy6p_for_test(Some(true));
+        assert!(gdn_pf_wy6p_on());
+        set_gdn_pf_wy6p_for_test(Some(false));
+        assert!(!gdn_pf_wy6p_on());
+        set_gdn_pf_wy6p_for_test(None);
+        assert!(!gdn_pf_wy6p_on(), "FORCE を戻したら既定 off");
+        // 形の前提は wy5 (wy4) と同じ: dv = 128 = 4 分割 x 32。
+        let conv_dim = 2 * 16 * 128 + 48 * 128;
+        assert!(gdn_pf_wy6_ok(2003, 16, 48, 128, 128, 4, conv_dim));
+        assert!(gdn_pf_wy6_ok(3826, 16, 48, 128, 128, 4, conv_dim));
+        assert!(
+            !gdn_pf_wy6_ok(2048, 16, 48, 128, 64, 4, 2 * 16 * 128 + 48 * 64),
+            "dv=64 は受けない"
+        );
+        assert!(!gdn_pf_wy6_ok(0, 16, 48, 128, 128, 4, conv_dim), "n=0 は受けない");
+        // 起動形: 1 ブロック 512 スレッド / v 列 4 分割 / 共有メモリは wy4 と同一。
+        assert_eq!(GDN_PF_WY6_THREADS, 512);
+        assert_eq!(GDN_PF_WY6_BLOCKS, 4);
+        assert_eq!(GDN_PF_WY6_SMEM_FLOATS, GDN_PF_WY4_SMEM_FLOATS);
+        assert_eq!(GDN_PF_WY6_SMEM_BYTES, 29_572);
+        let get_of = |src: &'static str, name: &str| -> usize {
+            let key = format!("#define {name} ");
+            for line in src.lines() {
+                if let Some(rest) = line.strip_prefix(&key) {
+                    return rest
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{name} が数値でない"));
+                }
+            }
+            panic!("{name} が .cu に無い");
+        };
+        let src6 = include_str!("../kernels/kernels_gdn_pf_wy6.cu");
+        assert_eq!(get_of(src6, "WY6_TOTAL"), GDN_PF_WY6_SMEM_FLOATS);
+        assert_eq!(get_of(src6, "WY6_THREADS"), GDN_PF_WY6_THREADS);
+        assert_eq!(get_of(src6, "WY6_WARPS") * 32, GDN_PF_WY6_THREADS);
+        assert_eq!(get_of(src6, "WY6_DV") * GDN_PF_WY6_BLOCKS, 128);
+        assert_eq!(get_of(src6, "WY6_C"), 8, "チャンク長は wy5 と同じ 8");
+        assert!(src6.contains("dno_gdn_pf_wy6("), "カーネル名が無い");
+        // 共有メモリの区画は wy5 と 1 つずつ同じ (オフセットを動かしていない)。
+        let src5 = include_str!("../kernels/kernels_gdn_pf_wy5.cu");
+        for name in [
+            "S", "KC", "QC", "VC", "DC", "PC", "QPC", "RDEC", "AC", "GC", "LAM", "RL", "EG", "BC",
+            "LL",
+        ] {
+            assert_eq!(
+                get_of(src6, &format!("WY6_{name}")),
+                get_of(src5, &format!("WY5_{name}")),
+                "WY6_{name} のオフセットが wy5 と違う"
+            );
+        }
+        // 状態の更新は 1 スレッド 8 本 (per = dk*dv/512)、A/G は 16 ワープで回す。
+        assert!(src6.contains("const int per = WY6_DK * WY6_DV / WY6_THREADS;"));
+        assert!(src6.contains("for (int p = warp; p < npair; p += WY6_WARPS)"));
+        // wy6 は wy5 と同じく 4 アキュムレータの P/QP のまま (値が変わらない)。
+        assert_eq!(src6.matches("float sk0 = 0.0f;").count(), 1);
+        assert!(!src6.contains("__shfl_xor_sync(0xffffffffu, sk, 1)"));
+        // wy6p は r 方向 2 分割 (ループが 2*len*dv、隣接レーンで足す)。
+        let src6p = include_str!("../kernels/kernels_gdn_pf_wy6p.cu");
+        assert!(src6p.contains("dno_gdn_pf_wy6p("), "カーネル名が無い");
+        assert_eq!(get_of(src6p, "WY6P_THREADS"), GDN_PF_WY6_THREADS);
+        assert_eq!(get_of(src6p, "WY6P_TOTAL"), GDN_PF_WY6_SMEM_FLOATS);
+        assert!(
+            src6p.contains("for (int j = tid; j < 2 * len * WY6P_DV; j += WY6P_THREADS)"),
+            "P/QP の r 分割ループが無い"
+        );
+        assert!(src6p.contains("__shfl_xor_sync(0xffffffffu, sk, 1)"), "和の合流が無い");
+        assert!(src6p.contains("const int rh = WY6P_DK / 2;"));
+        // 2*len*dv は常にワープ境界 (64) の倍数 = ペアが片側だけ inactive にならない。
+        assert_eq!((2 * 8 * 32) % 64, 0);
+        assert_eq!((2 * 7 * 32) % 64, 0);
+    }
+
 
     /// task 397: 状態の書き戻しの非同期化ゲート (既定 off)。
     #[test]
@@ -51638,6 +51884,11 @@ pub mod gdn_pf_kprof {
     }
 
     /// 積算する (**同期の後**に呼ぶ。イベントが完了している必要がある)。
+    ///
+    /// task 407: まだ GPU が通っていない段 (イベントが未完了 = `CUDA_ERROR_NOT_READY`)
+    /// は**捨てずに次回へ回す**。捨てると、同期を省いた経路
+    /// (`DENNO_PF_GDN_STATE_LAST` で書き戻しを飛ばしたチャンクなど) の段だけが
+    /// 数から抜けて合計が小さく出る (P397 §6-1 の「scan が 36 回しか出ない」)。
     pub fn collect() {
         if !on() {
             return;
@@ -51649,6 +51900,7 @@ pub mod gdn_pf_kprof {
         if pend.is_empty() {
             return;
         }
+        let mut keep: Vec<(u8, u32, u32)> = Vec::new();
         P.with(|c| {
             let p = c.borrow();
             for (item, a, b) in pend {
@@ -51659,11 +51911,17 @@ pub mod gdn_pf_kprof {
                 let mut ms = 0.0f32;
                 if unsafe { f(&mut ms, ea, eb) } == CUDA_SUCCESS && ms.is_finite() && ms >= 0.0 {
                     add_ns(item as usize, (ms as f64 * 1e6) as u64);
+                } else {
+                    keep.push((item, a, b));
                 }
             }
         });
-        // イベントは先頭から使い直す (プールは数十本で足りる)。
-        P.with(|c| c.borrow_mut().used = 0);
+        if keep.is_empty() {
+            // イベントは先頭から使い直す (プールは数十本で足りる)。
+            P.with(|c| c.borrow_mut().used = 0);
+        } else {
+            PEND.with(|c| c.borrow_mut().extend(keep));
+        }
     }
 }
 
@@ -52124,7 +52382,25 @@ pub fn gdn_pf_chain(
     // まだ何も書いていないここで降りる (呼び出し側は従来経路で計算し直す)。
     // 既定の順は task 173/186/225/228/311 のまま: WY8 (opt-in) → WY4 (opt-in)
     // → WY (opt-in) → v3 → v2 → v1。
-    let pf_scan_wy5 = if gdn_pf_wy5_on() && gdn_pf_wy5_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+    // task 407: 占有率を上げた wy6p / wy6 が先 (既定 off)。次に wy5 / wy4 (既定 on)。
+    let pf_scan_wy6p = if gdn_pf_wy6p_on() && gdn_pf_wy6_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+        gdn_pf_wy6p_kernels()
+    } else {
+        None
+    };
+    let pf_scan_wy6 = if pf_scan_wy6p.is_none()
+        && gdn_pf_wy6_on()
+        && gdn_pf_wy6_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
+        gdn_pf_wy6_kernels()
+    } else {
+        None
+    };
+    let pf_scan_wy5 = if pf_scan_wy6p.is_none()
+        && pf_scan_wy6.is_none()
+        && gdn_pf_wy5_on()
+        && gdn_pf_wy5_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
         gdn_pf_wy5_kernels()
     } else {
         None
@@ -52170,6 +52446,8 @@ pub fn gdn_pf_chain(
         None
     };
     if nt >= GDN_CHUNK_MIN_TOKENS
+        && pf_scan_wy6p.is_none()
+        && pf_scan_wy6.is_none()
         && pf_scan_wy5.is_none()
         && pf_scan_wy4.is_none()
         && pf_scan_wy.is_none()
@@ -52402,7 +52680,23 @@ pub fn gdn_pf_chain(
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();
-        if let Some(fns) = pf_scan_wy5 {
+        if let Some(fns) = pf_scan_wy6p {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf_wy_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+                GDN_PF_WY6_BLOCKS, GDN_PF_WY6_THREADS, GDN_PF_WY6_SMEM_BYTES as u32,
+            )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else if let Some(fns) = pf_scan_wy6 {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf_wy_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+                GDN_PF_WY6_BLOCKS, GDN_PF_WY6_THREADS, GDN_PF_WY6_SMEM_BYTES as u32,
+            )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else if let Some(fns) = pf_scan_wy5 {
             gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
             gdn_pf_wy_launch(
                 &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
