@@ -359,6 +359,92 @@ pub fn sum_zc_reset() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 388: ミスの CPU 計算を GPU の起動と重ねる (`DENNO_DEC_MISS_SPAWN`)
+// ---------------------------------------------------------------------------
+//
+// いまの `iq_layer_run` は「カーネルを全部積む -> `cpu_miss` (ミスの CPU GEMV)
+// -> 同期」の順で、CPU の仕事は**起動が終わってから**始まる。起動 (1 層 4 本 =
+// 実測 5-6 us) の裏へ回せば、そのぶん層が縮む。
+//
+// `DENNO_DEC_MISS_SPAWN=1` では `cpu_miss` を rayon のプールへ先に流し、
+// 呼び出しスレッドは起動と同期だけを行う (scoped なので借用はそのまま)。
+// 値は変えない (同じカーネル・同じ順序・同じ足し込み)。
+//
+// `DENNO_DEC_MISS_SERIAL=1` は**診断用**: 同期と控えの写しを先に済ませてから
+// CPU ミスを回す (= 重ね打ちを完全に切る)。既定との差が「いま重ね打ちが
+// 効いている量」になる。
+pub const DEC_MISS_SPAWN_ENV: &str = "DENNO_DEC_MISS_SPAWN";
+pub const DEC_MISS_SERIAL_ENV: &str = "DENNO_DEC_MISS_SERIAL";
+
+/// 真理値の解釈 (純関数)。明示的な真値だけ on (既定 off)。
+fn on_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// `DENNO_DEC_MISS_SPAWN` が有効か (プロセスで 1 回だけ env を読む)。
+pub fn miss_spawn_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on_from_value(std::env::var(DEC_MISS_SPAWN_ENV).ok().as_deref()))
+}
+
+/// `DENNO_DEC_MISS_SERIAL` が有効か (プロセスで 1 回だけ env を読む)。
+pub fn miss_serial_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on_from_value(std::env::var(DEC_MISS_SERIAL_ENV).ok().as_deref()))
+}
+
+/// 分岐が発火した層数 (spawn / serial)。**緑 = 経路が通った証拠ではない**ので、
+/// 発火を数えて 1 行で出す。
+static MISS_SPAWN_LAYERS: AtomicU64 = AtomicU64::new(0);
+static MISS_SERIAL_LAYERS: AtomicU64 = AtomicU64::new(0);
+
+/// spawn 経路を 1 層ぶん数える。
+pub fn note_miss_spawn_layer() {
+    MISS_SPAWN_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// serial 経路を 1 層ぶん数える。
+pub fn note_miss_serial_layer() {
+    MISS_SERIAL_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 リクエストぶんの 1 行 (どちらのゲートも off、または 0 層なら `None`)。
+pub fn miss_spawn_line() -> Option<String> {
+    miss_spawn_line_with(
+        miss_spawn_enabled(),
+        miss_serial_enabled(),
+        MISS_SPAWN_LAYERS.load(Ordering::Relaxed),
+        MISS_SERIAL_LAYERS.load(Ordering::Relaxed),
+    )
+}
+
+/// [`miss_spawn_line`] の本体 (テストで両側を踏めるように引数で受ける)。
+fn miss_spawn_line_with(on: bool, serial: bool, spawn: u64, ser: u64) -> Option<String> {
+    if !on && !serial {
+        return None;
+    }
+    if spawn == 0 && ser == 0 {
+        return None;
+    }
+    Some(format!(
+        "[dec-miss-spawn] spawn_layers={spawn} serial_layers={ser}"
+    ))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn miss_spawn_reset() {
+    for c in [&MISS_SPAWN_LAYERS, &MISS_SERIAL_LAYERS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// [`EXPERT_IQ_UPLOAD_ENV`] の解釈 (純関数)。未設定・数値でない値は既定値。
 pub fn upload_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim) {
@@ -1032,6 +1118,42 @@ mod tests {
         assert!(line.contains("fallback=1"), "{line}");
         sum_zc_reset();
         assert!(sum_zc_line_with(true).is_none(), "0 に戻したら行を出さない");
+    }
+
+    /// task 388: `DENNO_DEC_MISS_SPAWN` / `DENNO_DEC_MISS_SERIAL` は既定 off、
+    /// 明示的な真値だけ on。
+    #[test]
+    fn miss_spawn_gates_default_off_and_parse_explicitly() {
+        assert!(!on_from_value(None));
+        assert!(!on_from_value(Some("")));
+        assert!(!on_from_value(Some("0")));
+        assert!(!on_from_value(Some("off")));
+        assert!(on_from_value(Some("1")));
+        assert!(on_from_value(Some(" on ")));
+        assert!(on_from_value(Some("TRUE")));
+    }
+
+    /// task 388: 発火した層数を数えて 1 行で出す (ゲート off / 0 層なら出さない)。
+    #[test]
+    fn miss_spawn_line_counts_fired_layers() {
+        miss_spawn_reset();
+        assert!(miss_spawn_line_with(true, true, 0, 0).is_none(), "0 層なら出さない");
+        note_miss_spawn_layer();
+        note_miss_spawn_layer();
+        note_miss_serial_layer();
+        let spawn = MISS_SPAWN_LAYERS.load(Ordering::Relaxed);
+        let ser = MISS_SERIAL_LAYERS.load(Ordering::Relaxed);
+        assert_eq!((spawn, ser), (2, 1), "数える");
+        let line = miss_spawn_line_with(true, false, spawn, ser).expect("ゲート on なら出る");
+        assert!(line.contains("spawn_layers=2"), "{line}");
+        assert!(line.contains("serial_layers=1"), "{line}");
+        assert!(
+            miss_spawn_line_with(false, false, spawn, ser).is_none(),
+            "ゲート off は数えていても出さない"
+        );
+        miss_spawn_reset();
+        assert_eq!(MISS_SPAWN_LAYERS.load(Ordering::Relaxed), 0);
+        assert_eq!(MISS_SERIAL_LAYERS.load(Ordering::Relaxed), 0);
     }
 
 

@@ -8103,7 +8103,7 @@ pub fn moe_seg_layer_sum<F>(
     cpu_miss: F,
 ) -> Result<bool>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnOnce() -> Result<()> + Send,
 {
     use crate::model::expert_batch as eb;
     let nseg = pg.len();
@@ -8804,7 +8804,9 @@ pub fn moe_experts_iq_layer_overlap<F>(
     cpu_miss: F,
 ) -> Result<bool>
 where
-    F: FnOnce() -> Result<()>,
+    // task 388: `DENNO_DEC_MISS_SPAWN` で `cpu_miss` を rayon のプールへ渡すので
+    // `Send` を要求する (借用は scoped のまま)。
+    F: FnOnce() -> Result<()> + Send,
 {
     iq_layer_run(
         ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, &[], 0, true,
@@ -8840,7 +8842,7 @@ pub fn moe_experts_iq_layer_sum_overlap<F>(
     cpu_miss: F,
 ) -> Result<bool>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnOnce() -> Result<()> + Send,
 {
     iq_layer_run(
         ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out, w, e, true, cpu_miss,
@@ -8870,7 +8872,7 @@ fn iq_layer_run<F>(
     middle: F,
 ) -> Result<bool>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnOnce() -> Result<()> + Send,
 {
     let nseg = pg.len();
     // task 187: `sum_e != 0` は「ヒットの寄与をデバイスで重み付き和にして
@@ -8942,6 +8944,26 @@ where
     // 同じときだけ畳める (違えば従来の 2 起動へ fail closed)。
     let rb_g_pre = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
     let rb_u_pre = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
+    // task 388: CPU ミス (`middle`) を 3 つの順序で呼べるようにする。
+    // - 既定: 起動のあと、同期の前 (従来)。
+    // - `DENNO_DEC_MISS_SERIAL=1`: 同期と写しの**後ろ** (診断 = 重ね打ち無し)。
+    // - `DENNO_DEC_MISS_SPAWN=1`: rayon のプールで**起動と同時**に走らせる。
+    // どの順序でもカーネル・引数・足し込みの順は同じ (値は変わらない)。
+    let spawn_cpu = overlap && crate::model::exp_iq::miss_spawn_enabled();
+    let serial_cpu = overlap && !spawn_cpu && crate::model::exp_iq::miss_serial_enabled();
+    // `FnOnce` を 2 つの経路 (プール / このスレッド) から 1 回だけ呼ぶための持ち場。
+    let holder: std::sync::Mutex<Option<F>> = std::sync::Mutex::new(Some(middle));
+    let call_mid = || -> Result<()> {
+        let got = holder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("iq layer: cpu_miss のロックが poisoned"))?
+            .take();
+        match got {
+            Some(f) => f(),
+            None => Ok(()),
+        }
+    };
+    let mut run_body = |call_mid: &dyn Fn() -> Result<()>| -> Result<()> {
     IQ_SCRATCH.with(|cell| -> Result<()> {
         let mut sc = cell.borrow_mut();
         MoeScratch::ensure_tagged(&mut sc.x, n_in * 4, crate::mem_audit::TAG_GDN_SC)?;
@@ -9324,32 +9346,48 @@ where
             }
         }
         if overlap {
-            // ここから下はデバイスの完了を待たずに走る (GPU と CPU の重ね打ち)。
-            middle()?;
-            // task 356: 専用ストリームへ出したときは、`done` の完了が
-            // 「`ready` (この層のカーネル全部の後)」を待っているので、null ストリームの
-            // 同期は要らない (= 待ちを 1 回減らせる)。`DENNO_DEC_OVERLAP=0` のときは
-            // 従来どおりコンテキスト全体を待ってから `done` を待つ。
-            if exp_d2h_inflight() && dec_overlap_enabled() {
-                if !exp_d2h_wait() {
-                    bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+            // task 388: 同期と控えの写しを 1 本にまとめ、CPU ミスをその
+            // 前 (既定) / 後ろ (serial) / 別スレッド (spawn) に置く。
+            let mut finish_gpu = || -> Result<()> {
+                // task 356: 専用ストリームへ出したときは、`done` の完了が
+                // 「`ready` (この層のカーネル全部の後)」を待っているので、null ストリームの
+                // 同期は要らない (= 待ちを 1 回減らせる)。`DENNO_DEC_OVERLAP=0` のときは
+                // 従来どおりコンテキスト全体を待ってから `done` を待つ。
+                if exp_d2h_inflight() && dec_overlap_enabled() {
+                    if !exp_d2h_wait() {
+                        bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+                    }
+                } else {
+                    // task 155: 待つのは null ストリーム (この層の expert GEMV と D2H)
+                    // だけ。shared expert のサイドストリームは join まで待たない。
+                    sync_default_or_ctx(ctx, dec_overlap_enabled())?;
+                    // task 356: 専用ストリームへ出したコピーの完了 (通常はもう終わっている)。
+                    if !exp_d2h_wait() {
+                        bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+                    }
                 }
-            } else {
-                // task 155: 待つのは null ストリーム (この層の expert GEMV と D2H)
-                // だけ。shared expert のサイドストリームは join まで待たない。
-                sync_default_or_ctx(ctx, dec_overlap_enabled())?;
-                // task 356: 専用ストリームへ出したコピーの完了 (通常はもう終わっている)。
-                if !exp_d2h_wait() {
-                    bail!("cuEventSynchronize (iq layer d2h stream) が失敗");
+                if zc {
+                    // task 356: 和は pinned のホストに直接書かれている (コピー無し)。
+                    let pin = sc.psum_zc.as_ref().expect("確保済み");
+                    out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+                } else {
+                    let pin = sc.hpin.as_ref().expect("確保済み");
+                    out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
                 }
-            }
-            if zc {
-                // task 356: 和は pinned のホストに直接書かれている (コピー無し)。
-                let pin = sc.psum_zc.as_ref().expect("確保済み");
-                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+                Ok(())
+            };
+            if serial_cpu {
+                // 診断 (`DENNO_DEC_MISS_SERIAL`): 重ね打ちを完全に切る。
+                finish_gpu()?;
+                call_mid()?;
+                crate::model::exp_iq::note_miss_serial_layer();
+            } else if spawn_cpu {
+                // CPU ミスは呼び出し側がプールで走らせている (`run_body` の後で join)。
+                finish_gpu()?;
             } else {
-                let pin = sc.hpin.as_ref().expect("確保済み");
-                out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
+                // 従来: デバイスの完了を待たずに CPU ミスを回す (GPU と重ね打ち)。
+                call_mid()?;
+                finish_gpu()?;
             }
         } else {
             if zc {
@@ -9365,13 +9403,38 @@ where
                 out_h[..nout].copy_from_slice(&got);
             }
             dec_exp_kprof::mark(dec_exp_kprof::D2H);
-            middle()?;
+            call_mid()?;
         }
         dbg_d2h(nout * 4);
         // ここまでで GPU は同期済み (両経路とも) = イベントが完了している。
         dec_exp_kprof::end_layer();
         Ok(())
-    })?;
+    })
+    };
+    // task 388: spawn 経路だけ「CPU ミスをプールで走らせながら起動と同期を進める」。
+    // scoped なので借用はそのまま (値も順序も変わらない)。
+    let mut body_res: Result<()> = Ok(());
+    if spawn_cpu {
+        // `Scope::spawn` は join ハンドルを返さないので、結果は channel で受ける
+        // (scope の終端でタスクの完了は待たれる = `recv` で詰まらない)。
+        let (tx, rx) = std::sync::mpsc::channel::<Result<()>>();
+        rayon::in_place_scope(|s| {
+            s.spawn(move |_| {
+                let r = call_mid();
+                let _ = tx.send(r);
+            });
+            body_res = run_body(&call_mid);
+        });
+        crate::model::exp_iq::note_miss_spawn_layer();
+        body_res?;
+        match rx.recv() {
+            Ok(r) => r?,
+            Err(_) => return Err(anyhow::anyhow!("iq layer: cpu_miss の結果が返らない")),
+        }
+    } else {
+        body_res = run_body(&call_mid);
+        body_res?;
+    }
     Ok(true)
 }
 
@@ -15667,7 +15730,9 @@ mod iq_overlap_tests {
     /// 二重計算になるうえ、`out_h` が途中まで書かれた状態で CPU 経路へ戻すことになる。
     #[test]
     fn overlap_skips_cpu_miss_when_it_does_not_launch() {
-        let called = std::cell::Cell::new(0u32);
+        // task 388: `cpu_miss` は `Send` を要求される (`DENNO_DEC_MISS_SPAWN` で
+        // プールへ渡せるようにするため) ので、数え役は atomic にする。
+        let called = std::sync::atomic::AtomicU32::new(0);
         let mut out = vec![0.0f32; 4];
         // seg_gu の長さが 4 の倍数でない → 起動計画より前に落ちる。
         let r = moe_experts_iq_layer_overlap(
@@ -15685,13 +15750,17 @@ mod iq_overlap_tests {
             4,
             &mut out,
             || {
-                called.set(called.get() + 1);
+                called.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             },
         )
         .expect("形状検査は Err ではなく Ok(false)");
         assert!(!r, "不正な形状で GPU 経路を選んではいけない");
-        assert_eq!(called.get(), 0, "起動しないのに CPU ミスを走らせた");
+        assert_eq!(
+            called.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "起動しないのに CPU ミスを走らせた"
+        );
         assert!(out.iter().all(|&v| v == 0.0), "out を書いてはいけない");
     }
 

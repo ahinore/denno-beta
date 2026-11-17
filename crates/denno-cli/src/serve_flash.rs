@@ -754,6 +754,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_iq::sum_zc_reset();
+    // task 388: ミスの CPU 計算を GPU の起動と重ねた層数 (ゲート on のときだけ 1 行)。
+    if let Some(line) = denno_engine::model::exp_iq::miss_spawn_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_iq::miss_spawn_reset();
     // task 368: decode の待ちを null ストリームのイベントへ狭めた回数
     // (`DENNO_DEC_SYNC_STREAM=1` のときだけ 1 行 = 分岐が発火した証拠)。
     if let Some(line) = denno_engine::gpu_report::dec_sync_stream_line() {
