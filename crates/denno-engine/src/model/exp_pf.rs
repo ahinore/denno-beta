@@ -2527,34 +2527,46 @@ pub fn lm_reload_evicted() -> bool {
 }
 
 /// task 394: 層優先 prefill の終端で戻す expert の転送を**複数スレッド**で行う
-/// (`DENNO_PF_RESTORE_MT`)。**既定 off** (測ってから決める)。
+/// (`DENNO_PF_RESTORE_MT`)。**既定 on** (lab t394a / t394c で採った)。
 ///
 /// # なぜ要るか (lab t390b / REPORT_P390 §1 の実測)
 ///
 /// UD-Q4_K_XL の 14k cold では、prefill の終端で 1,057 本 (3,310 MiB) を LRU へ
-/// 戻すのに `other` 段の未分類ぶん **約 1.27 s** を使っていた (1 本 1.2 ms)。
-/// 戻しの 1 本は「gate/up/down を 3 回の同期 H2D」で、待ちが直列に並ぶ。
-/// ページは page cache に載っているので (P390 §1 の先読みは 3.3 GB を 2 ms で
-/// 触った)、律速は I/O ではなく **同期転送 3 回 + 確保** の側にある。
+/// 戻すのに `other` 段の未分類ぶんを使っていた。戻しの 1 本は「gate/up/down を
+/// 3 回の同期 H2D」で、待ちが直列に並ぶ。ページは page cache に載っているので
+/// (P390 §1 の先読みは 3.3 GB を 2 ms で触った)、律速は I/O ではなく
+/// **同期転送 3 回 + 確保** の側にある。
 ///
 /// ここでは [`crate::model::expert_vram::acquire_deferred`] (転送を LRU のロックの
 /// 外で行う版。task 214 が背景の上げ直しで使っている) を N 本のスレッドで回し、
 /// 同期の待ちを重ねる。VRAM へ渡るバイト列・LRU の内容は 1 本ずつの経路と同一で、
 /// 変わるのは**順序と重なり**だけ。
 ///
-/// 失敗しても致命的ではない (戻せなかった expert は次の decode が `acquire` で
-/// 上げ直す)。`acquire_deferred` はラッチしないので、確保に失敗した 1 本を
-/// 捨てても以後の経路は変わらない。
+/// # 実測 (lab t394a / t394c、`[pf-restore]` の ms)
+///
+/// | 条件 | 戻す本数 | mt=0 | mt=1 (8 本) | mt=1 (16 本) |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | UD 3,826 (2 ラウンド) | 289 | 70 / 72 | **55 / 53** | 59 / 57 |
+/// | UD 14k | 1,057 | 549 | **213** | 177 |
+/// | 既定モデル 14k | 827 | 121 | **71** | — |
+///
+/// 壁時計への寄与は小さい (戻しは 14k の壁の 2%) が、段は 2 ラウンドとも
+/// 2 割以上速く、decode・md5・既定モデルの数字はどれも変わらなかった
+/// (t394c の既定モデルは 4 COND 全リクエストで md5 SAME)。
 pub const PF_RESTORE_MT_ENV: &str = "DENNO_PF_RESTORE_MT";
 
-/// [`PF_RESTORE_MT_ENV`] の既定 (off)。
-pub const DEFAULT_PF_RESTORE_MT: bool = false;
+/// [`PF_RESTORE_MT_ENV`] の既定 (on)。
+pub const DEFAULT_PF_RESTORE_MT: bool = true;
 
-/// [`PF_RESTORE_MT_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+/// [`PF_RESTORE_MT_ENV`] の解釈 (純関数)。未設定は既定 (on)、
+/// **明示的な偽値だけ off** (`pf_pool_big_from_value` と同じ規約)。
 pub fn pf_restore_mt_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim) {
         None | Some("") => DEFAULT_PF_RESTORE_MT,
-        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+        Some(s) => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
     }
 }
 
@@ -2606,13 +2618,20 @@ pub fn pf_restore_threads() -> usize {
 /// ディスクは遊んでいる (3,826 で 1.2 s / 14k で 4.5 s、14k の `copy_s` は
 /// 12.2-12.6 s で壁 25.3 s の 49%)。
 ///
-/// ここでは routing ではなく「**その層の expert は全部要る**」という事実だけで
-/// 1 層先を読む (3,826 の `[exp-pf-stream] experts=14192 / 48 層 = 296 本 = 層の
-/// 全数)。予測ではないので外れない。読むのはページキャッシュへで、
-/// Linux の `readahead(2)` を使う (ユーザー側の写しを伴わない)。
+/// ここでは routing ではなく「**その層の expert は全部要る**」という前提で
+/// 1 層先を読む。読むのはページキャッシュへで、Linux の `readahead(2)` を使う
+/// (ユーザー側の写しを伴わない)。
 ///
-/// VRAM もステージングも増やさない。中身は 1 バイトも変えない
-/// (ページを先に載せるだけ)。
+/// # 結果: **効かなかったので既定 off** (lab t394b、`ADOPT: no`)
+///
+/// 前提が外れていた。3,826 の `[exp-pf-stream] experts=14192 / 48 層 = 296 本`
+/// に対し、層の全数は **512 本** (`lpre_MB` 77,018 MB / 48 層 / 3.13 MB = 512)。
+/// つまり routing は 58% しか使わない。全数を読むと 44.4 GB の 1.73 倍 =
+/// 77 GB を投げることになり、ディスクの空き (3,826 の `copy_s` は壁の 75-78%)
+/// を無駄読みが食う。t394b の round 2 は b1 copy_s 7.36 / lp 7.25 / b2 7.20 で
+/// **区別できない** (round 1 の -8% は b2 の位置効果)。
+///
+/// 予測で絞る道は task 337 が否定済み。この枝は閉じる。
 pub const LAYER_PRE_ENV: &str = "DENNO_PF_LAYER_PRE";
 
 /// [`LAYER_PRE_ENV`] の既定 (off)。
@@ -3225,17 +3244,18 @@ pub fn upload_budget_experts() -> usize {
 mod tests {
     use super::*;
 
-    /// task 394: 戻しの並列化のゲートは既定 off、明示の真値だけ on。
-    /// スレッド数は 1..=32 に丸める。
+    /// task 394: 戻しの並列化のゲートは既定 on (lab t394a / t394c で採った)。
+    /// 明示的な偽値だけ off。スレッド数は 1..=32 に丸める。
     #[test]
     fn restore_mt_gate_truth_table() {
-        assert!(!DEFAULT_PF_RESTORE_MT, "既定が on になっている");
-        assert!(!pf_restore_mt_from_value(None), "未設定は既定 (off)");
-        assert!(!pf_restore_mt_from_value(Some("")), "空も既定 (off)");
+        assert!(DEFAULT_PF_RESTORE_MT, "lab で採ったのに既定 off に戻っている");
+        assert!(pf_restore_mt_from_value(None), "未設定は既定 (on)");
+        assert!(pf_restore_mt_from_value(Some("")), "空も既定 (on)");
         assert!(!pf_restore_mt_from_value(Some("0")));
         assert!(!pf_restore_mt_from_value(Some("off")));
         assert!(!pf_restore_mt_from_value(Some("false")));
         assert!(!pf_restore_mt_from_value(Some("no")));
+        assert!(!pf_restore_mt_from_value(Some(" OFF ")));
         assert!(pf_restore_mt_from_value(Some("1")));
         assert!(pf_restore_mt_from_value(Some("on")));
         assert!(pf_restore_mt_from_value(Some(" true ")));
