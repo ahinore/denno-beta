@@ -1600,6 +1600,54 @@ pub fn tc_exp_k_on() -> bool {
     *ON.get_or_init(|| tc_exp_k_from_value(std::env::var(TC_EXP_K_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_POOL_K_PLAN=1`: prefill のプール計画 (タイル / 余白) を **K 系の
+/// dev MoE + tensor core 経路**に合わせる (task 420)。
+///
+/// # 機序
+///
+/// task 318 (`DENNO_PF_LM_K_DEV`、既定 on) で層優先のデバイス MoE は K 系
+/// (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0) でも回るようになり、task 416 で K 系の
+/// TC grouped GEMM (`DENNO_PF_TC_EXP_K`、既定 on) が入った。ところがプール計画の
+/// 2 か所は IQ 版の述語のままだった:
+///
+/// 1. `pf_pool_need_for` の `tc` が IQ の `tc_shapes_ok` だけを見るので、
+///    UD-Q4_K_XL では **使わない g / u の作業域**を予約する (14k で 686 MiB)。
+/// 2. `pf_pool_reserve_for` の `dev_ok` が `iq_expert_mode` のままで、UD は
+///    「dev MoE が使えない」= CPU 経路と判定され、余白が 3,072 MiB になる
+///    (dev 経路なら 1,024 MiB)。
+///
+/// その結果 14k の 1 パス (タイル = 14,018) が上限に収まらず、7,009 の 2 パスに
+/// なっていた。2 パスは expert 重みの pread が 98.5 GB (1 パスの 2 倍) で、
+/// 14k cold prefill の 74% を占める。
+///
+/// # 実測 (lab t420a、sha ff1a1ec、MODEL=flash-next-UD-Q4_K_XL、depth8k)
+///
+/// ゲート無しで `DENNO_PF_POOL_BIG_MB=8192` を渡すと 1 パスに届く
+/// (`形を上げた (タイル 5120 → 14018 = 3 → 1 パス / 作業域 4779 MiB)`)。
+/// 14k cold 17.47 / 17.50 s -> **15.03 s (-14.1%)**、`up_MB` 98,460 -> 53,323、
+/// copy_s 12.69 -> 9.75。ただし作業域 4,779 MiB + 余白 3,072 MiB のぶん
+/// expert を 1,500 本追い出して戻すため、14k 後の decode が 23-24 -> 26 ms/tok に
+/// 落ちた。本ゲートは同じ 1 パスを **もっと小さい作業域と余白**で取る
+/// (g/u を取らない / 余白 1,024) ので、追い出しは base の 1,007 本より少ない。
+pub const POOL_K_PLAN_ENV: &str = "DENNO_PF_POOL_K_PLAN";
+
+/// [`POOL_K_PLAN_ENV`] の既定 (lab の結果で決める。いまは off)。
+pub const DEFAULT_POOL_K_PLAN: bool = false;
+
+/// [`POOL_K_PLAN_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn pool_k_plan_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None => DEFAULT_POOL_K_PLAN,
+    }
+}
+
+/// K 系の dev MoE + TC 経路に合わせたプール計画を使うか (プロセスで 1 回だけ env を読む)。
+pub fn pool_k_plan_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pool_k_plan_from_value(std::env::var(POOL_K_PLAN_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_LM_LAYER=1`: prefill の層ループを層優先にする (task 227、既定 off)。
 ///
 /// いまはチャンク優先 (チャンク → 全 48 層) なので、1 つの expert が
@@ -3431,6 +3479,24 @@ mod tests {
         ] {
             assert!(!stream_retry_pays(why), "{why} は再試行しない");
         }
+    }
+
+    /// task 420: `DENNO_PF_POOL_K_PLAN` は**明示的な真値だけ** on (未設定は既定 off)。
+    #[test]
+    fn pool_k_plan_gate_truth_table() {
+        assert!(!pool_k_plan_from_value(None), "未設定は既定 (off)");
+        assert!(!pool_k_plan_from_value(Some("")), "空も既定 (off)");
+        assert!(!pool_k_plan_from_value(Some("0")));
+        assert!(!pool_k_plan_from_value(Some("off")));
+        assert!(!pool_k_plan_from_value(Some("false")));
+        assert!(!pool_k_plan_from_value(Some("no")));
+        assert!(!pool_k_plan_from_value(Some("x")), "解析不能は既定 (off)");
+        assert!(pool_k_plan_from_value(Some("1")));
+        assert!(pool_k_plan_from_value(Some("on")));
+        assert!(pool_k_plan_from_value(Some("true")));
+        assert!(pool_k_plan_from_value(Some("yes")));
+        assert!(pool_k_plan_from_value(Some(" 1 ")), "前後の空白は無視する");
+        assert!(!DEFAULT_POOL_K_PLAN, "既定は off (lab の結果で決める)");
     }
 
     /// task 325: `DENNO_PF_PREAD` は既定 on、`0` 系だけが偽。

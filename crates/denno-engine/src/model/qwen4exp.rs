@@ -4859,6 +4859,41 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         crate::cuda::pf_pool_acquire(&need)
     }
 
+    /// task 420: 層ごとの TC 適格性 `(IQ の形が合う, K の形が合う)` を集める。
+    ///
+    /// 実行時の選択 (`cuda` のストリーミング MoE の `tc_kernels`) と**同じ 2 段**で
+    /// 見る: IQ の形が合えば IQ 版、合わなければ K 版 (IQ の形が合って PTX が無い
+    /// 層は K へ落ちない)。判定は層の型だけで、PTX の有無は [`pf_pool_tc_all`] が受ける。
+    #[cfg(feature = "cuda")]
+    fn pf_pool_tc_layers(&self, e: usize, ff: usize) -> Vec<(bool, bool)> {
+        self.layers
+            .iter()
+            .map(|lw| {
+                let (g, u, d) = (lw.gate_exps.ty, lw.up_exps.ty, lw.down_exps.ty);
+                (
+                    crate::cuda::tc_shapes_ok(
+                        crate::model::exp_pf::slot(g),
+                        crate::model::exp_pf::slot(d),
+                        g == u,
+                        e,
+                        ff,
+                        ff,
+                        e,
+                    ),
+                    crate::cuda::ktc_shapes_ok(
+                        crate::model::exp_pf::slot(g),
+                        crate::model::exp_pf::slot(d),
+                        g == u,
+                        e,
+                        ff,
+                        ff,
+                        e,
+                    ),
+                )
+            })
+            .collect()
+    }
+
     /// task 279: このリクエストの形 (チャンク / タイル) からレイアウトの材料を組む。
     #[cfg(feature = "cuda")]
     fn pf_pool_need_for(
@@ -4871,22 +4906,42 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     ) -> crate::model::pf_pool::Need {
         let e = self.p.n_embd;
         let ff = self.p.n_ff_exp;
-        // tensor core の grouped GEMM がこのモデルで実際に使えるか (層 0 の型で判定)。
+        // tensor core の grouped GEMM がこのモデルで実際に使えるか。
         // 使えないときは GEMV 経路になり g / u の作業域が要るので、その分も取る。
         let lw0 = &self.layers[0];
         let (ty_g, ty_u, ty_d) = (lw0.gate_exps.ty, lw0.up_exps.ty, lw0.down_exps.ty);
-        let tc = crate::model::exp_pf::tc_exp_on()
-            && !crate::model::exp_pf::lm_group_local()
-            && crate::cuda::exp_tc_ready()
-            && crate::cuda::tc_shapes_ok(
-                crate::model::exp_pf::slot(ty_g),
-                crate::model::exp_pf::slot(ty_d),
-                ty_g == ty_u,
-                e,
-                ff,
-                ff,
-                e,
-            );
+        // task 420: 実行時の TC の選択は層ごとに IQ → K の 2 段。K 系
+        // (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0) は task 416 から既定 on なので、
+        // 計画側も K を見ないと **使わない g / u を予約してしまう**
+        // (UD-Q4_K_XL の 14k で 686 MiB。1 パスのタイルが上限に収まらず 2 パスに
+        // なり、expert の pread が 98.5 GB = 1 パスの 2 倍になっていた)。
+        let tc = if crate::model::exp_pf::pool_k_plan_on() {
+            !crate::model::exp_pf::lm_group_local()
+                && pf_pool_tc_all(
+                    &self.pf_pool_tc_layers(e, ff),
+                    (
+                        crate::model::exp_pf::tc_exp_on(),
+                        crate::cuda::exp_tc_ready(),
+                    ),
+                    (
+                        crate::model::exp_pf::tc_exp_k_on(),
+                        crate::cuda::exp_ktc_ready(),
+                    ),
+                )
+        } else {
+            crate::model::exp_pf::tc_exp_on()
+                && !crate::model::exp_pf::lm_group_local()
+                && crate::cuda::exp_tc_ready()
+                && crate::cuda::tc_shapes_ok(
+                    crate::model::exp_pf::slot(ty_g),
+                    crate::model::exp_pf::slot(ty_d),
+                    ty_g == ty_u,
+                    e,
+                    ff,
+                    ff,
+                    e,
+                )
+        };
         crate::model::pf_pool::Need {
             nt_all,
             tile,
@@ -4994,10 +5049,19 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     #[cfg(feature = "cuda")]
     fn pf_pool_reserve_for(&self, nt_all: usize) -> usize {
         let lw0 = &self.layers[0];
+        // task 420: task 318 で層優先の dev MoE の前提は `pf_expert_mode` (IQ or K)
+        // になったが、ここは `iq_expert_mode` のままだった。UD-Q4_K_XL は dev MoE を
+        // 使うのに「使えない」と判定され、余白が CPU 経路の 3,072 MiB になっていた
+        // (dev 経路は 1,024 MiB)。余白 2,048 MiB の差が、14k の 1 パスを潰していた。
+        let expert_mode = if crate::model::exp_pf::pool_k_plan_on() {
+            pf_expert_mode(lw0)
+        } else {
+            iq_expert_mode(lw0)
+        };
         let dev_ok = lm_dev_moe_ok(
             nt_all,
             crate::model::exp_pf::pf_enabled(),
-            iq_expert_mode(lw0),
+            expert_mode,
             crate::model::exp_pf::stream_enabled(),
             crate::model::exp_pf::stream_min_tok(),
             pf_router_gpu_on(),
@@ -19203,9 +19267,66 @@ pub(crate) fn lm_dev_moe_ok(
         && gate_in_k_is_e
 }
 
+/// task 420: **全 MoE 層**が tensor core の grouped GEMM に乗るか (純関数)。
+///
+/// 実行時の層ごとの選択は 2 段で、IQ の形が合えば IQ 版、合わなければ K 版。
+/// IQ の形が合うのに PTX が無い層は **K へ落ちない** (`tc_kernels = None`) ので、
+/// 「全層 IQ」と「全層 K (IQ の形はどこも合わない)」を別々に評価する。
+///
+/// `per_layer` は層ごとの `(IQ の形が合う, K の形が合う)`、`iq` / `k` は
+/// `(ゲートが on, PTX が読めた)`。1 層でも乗らない層があれば `false` =
+/// 呼び出し側は g / u の作業域を取る (安全側。取り過ぎても遅いだけで壊れない)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn pf_pool_tc_all(
+    per_layer: &[(bool, bool)],
+    iq: (bool, bool),
+    k: (bool, bool),
+) -> bool {
+    if per_layer.is_empty() {
+        return false;
+    }
+    let iq_all = iq.0 && iq.1 && per_layer.iter().all(|&(i, _)| i);
+    let k_all = k.0 && k.1 && per_layer.iter().all(|&(i, kk)| !i && kk);
+    iq_all || k_all
+}
+
 #[cfg(test)]
 mod lm_dev_tests {
     use super::*;
+
+    /// task 420: 全層 TC の真理値表。
+    ///
+    /// K だけのモデル (UD-Q4_K_XL) は K で乗る。IQ と K が混在したら、実行時に
+    /// 層ごとに別のカーネルになるので g / u を取る (安全側)。
+    #[test]
+    fn pf_pool_tc_all_truth_table() {
+        let k_model = [(false, true), (false, true)];
+        let iq_model = [(true, true), (true, true)];
+        let mixed = [(false, true), (true, true)];
+        let iq = (true, true);
+        let k = (true, true);
+        assert!(pf_pool_tc_all(&k_model, iq, k), "K だけのモデルは K で乗る");
+        assert!(pf_pool_tc_all(&iq_model, iq, k), "IQ のモデルは IQ で乗る");
+        assert!(
+            !pf_pool_tc_all(&mixed, iq, k),
+            "IQ と K が混在したら g / u を取る"
+        );
+        assert!(!pf_pool_tc_all(&k_model, iq, (true, false)), "K の PTX が無い");
+        assert!(!pf_pool_tc_all(&k_model, iq, (false, true)), "K のゲートが off");
+        assert!(
+            !pf_pool_tc_all(&iq_model, (true, false), k),
+            "IQ の形で PTX が無い層は K へ落ちない (実行時と同じ)"
+        );
+        assert!(
+            !pf_pool_tc_all(&iq_model, (false, true), k),
+            "IQ のゲートが off なら IQ の形の層は乗らない"
+        );
+        assert!(!pf_pool_tc_all(&[], iq, k), "層が無い");
+        assert!(
+            pf_pool_tc_all(&[(true, false)], iq, k),
+            "IQ の形だけ合っていても、IQ が使えれば TC に乗る"
+        );
+    }
 
     /// task 233: 層優先のデバイス MoE の前提 (真理値表)。
     ///

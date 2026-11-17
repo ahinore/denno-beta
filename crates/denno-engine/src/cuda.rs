@@ -15094,6 +15094,20 @@ mod pf_exp_ktc_tests {
         assert!(!ktc_shapes_ok(Some(k0), Some(k0 + 3), true, 0, 1536, 1536, 2560));
     }
 
+    /// task 420: UD-Q4_K_XL の層 0 の形 (e = 2560 / ff = 640、gate/up = Q4_K、
+    /// down = Q5_1) は **K 版にだけ**乗る = プール計画の `tc` は K を見ないと
+    /// 「乗らない」と誤判定する (14k で g / u 686 MiB を無駄に予約していた)。
+    #[test]
+    fn ud_q4_k_xl_shape_takes_the_k_path_only() {
+        let k0 = crate::model::exp_pf::K_SLOT0;
+        let (gu, dn) = (Some(k0), Some(k0 + 3));
+        assert!(ktc_shapes_ok(gu, dn, true, 2560, 640, 640, 2560), "K 版は受ける");
+        assert!(
+            !tc_shapes_ok(gu, dn, true, 2560, 640, 640, 2560),
+            "IQ 版は受けない (スロットが IQ の範囲外)"
+        );
+    }
+
     /// ゲートの真理値表 (task 416: lab t416b で採って既定 on。明示的な偽値だけ off)。
     #[test]
     fn tc_exp_k_gate_defaults_on() {
