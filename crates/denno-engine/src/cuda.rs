@@ -50601,15 +50601,21 @@ pub(crate) fn set_gdn_pf_wy5_for_test(v: Option<bool>) {
     );
 }
 
-/// `DENNO_PF_SCAN_WY5` の解釈 (純関数)。**既定 off** (lab で採否を決める)。
+/// `DENNO_PF_SCAN_WY5` の解釈 (純関数)。**lab t397b で採ったので既定 on**。
+///
+/// lab 実測 (既定モデル、depth8k、PROFILE=1、`[q4ledger-pf]` の `ssm` 段の
+/// `busy`): 3,826 cold 433.3/433.1 (b1/b2) -> **370.9** (wy5) = -14.4%、
+/// 14k cold 1,554.5/1,557.9 -> **1,330.9** = -14.5%。decode は 15.5-15.9 ms/tok で
+/// 不変、errors 0、text sane。md5 は turn2 の 2 本だけ DIFF (A/G と P/QP の
+/// 和の木を変えた丸め差。cold の text は同じ)。切り戻しは `DENNO_PF_SCAN_WY5=0`。
 pub(crate) fn gdn_pf_wy5_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
-/// 従属連鎖を短くした WY スキャンを使うか (既定 off)。
+/// 従属連鎖を短くした WY スキャンを使うか (既定 on)。
 pub(crate) fn gdn_pf_wy5_on() -> bool {
     #[cfg(test)]
     {
@@ -50983,10 +50989,10 @@ mod pf228_wy_tests {
         assert_eq!(offs.last().unwrap().1 + 1, GDN_PF_WY4_SMEM_FLOATS);
     }
 
-    /// task 397: wy5 のゲート (既定 off)・形の前提 (wy4 と同じ)・共有メモリ。
+    /// task 397: wy5 のゲート (lab t397b で採ったので既定 on)・形の前提・共有メモリ。
     #[test]
     fn task397_scan_wy5_gate_and_shape() {
-        assert!(!gdn_pf_wy5_from_value(None), "既定 off");
+        assert!(gdn_pf_wy5_from_value(None), "既定 on (lab t397b)");
         for v in ["0", "off", "false", "no", "", " off "] {
             assert!(!gdn_pf_wy5_from_value(Some(v)), "{v:?} が on になった");
         }
@@ -50998,7 +51004,7 @@ mod pf228_wy_tests {
         set_gdn_pf_wy5_for_test(Some(false));
         assert!(!gdn_pf_wy5_on());
         set_gdn_pf_wy5_for_test(None);
-        assert!(!gdn_pf_wy5_on(), "FORCE を戻したら既定 off");
+        assert!(gdn_pf_wy5_on(), "FORCE を戻したら既定 on");
         // 形の前提は wy4 と同じ (dv = 128 = 4 x 32)。
         let conv_dim = 2 * 16 * 128 + 48 * 128;
         assert!(gdn_pf_wy5_ok(2048, 16, 48, 128, 128, 4, conv_dim));
