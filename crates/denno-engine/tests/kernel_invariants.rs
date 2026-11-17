@@ -11643,8 +11643,12 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
     let pbody = &pin[..pin.find("\n}\n").expect("本体が無い")];
     assert!(pbody.contains("if pinned {"), "pinned の枝が無い");
     assert!(
-        pbody.contains("crate::cuda::PfHostBuf::new(len)"),
+        pbody.contains("PlePinBuf::new(len)"),
         "pinned の確保が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("type PlePinBuf = crate::cuda::PfHostBuf;"),
+        "pinned の実体が PfHostBuf でない"
     );
     assert!(
         pbody.contains("Some(b) if b.len() >= len => b"),

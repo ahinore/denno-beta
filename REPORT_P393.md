@@ -243,6 +243,12 @@ VERDICT baseline x0 errors 0 text ok
   全部を見ること (`cuda::task393_tests`)
 - 分岐の発火: `DENNO_PF_GDN_WSTAT` は lab の ssm h2d (1,080 -> 216 回) で確認。
   `KV_BULK` / `PLE_PIN` は CPU では発火を数えられないので、lab の段の ms で見た (§3.2)。
+- cuda feature 無しの CI: `cargo build --workspace --release` と
+  `CUDA_VISIBLE_DEVICES=-1 cargo test --workspace --no-fail-fast` が緑
+  (engine 945 passed / 0 failed)。`PlePinBuf` は feature 無しでは `Vec` の器に
+  なるので、`crate::cuda` を参照しない。t393c の測定後に足したのはこの
+  コンパイル用の器だけで、cuda feature では `type PlePinBuf = PfHostBuf` に
+  解決されるので測定したコードと同一。
 - 既知の赤 (`qwen4exp_decode spec_batch_stops_at_eos`、`qwen4exp_params` の validate 2 件)
   は触っていない。
 

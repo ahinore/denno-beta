@@ -7888,12 +7888,43 @@ pub(crate) fn pf_ple_pin_on() -> bool {
     *ON.get_or_init(|| pf_ple_pin_from_value(std::env::var(PLE_PIN_ENV).ok().as_deref()))
 }
 
+/// task 393: pinned 版のバッファ型 (cuda feature が無いときは `Vec` で代替する)。
+///
+/// prefill の GPU 経路自体が cuda feature の内側なので、feature 無しでは
+/// このバッファは使われない。それでも `cargo build --workspace` が通るように
+/// 同じ口 (`new` / `len` / `as_slice` / `as_mut_slice`) だけを持つ器を置く。
+#[cfg(feature = "cuda")]
+type PlePinBuf = crate::cuda::PfHostBuf;
+
+#[cfg(not(feature = "cuda"))]
+struct PlePinBuf {
+    v: Vec<f32>,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl PlePinBuf {
+    fn new(len: usize) -> Self {
+        Self {
+            v: vec![0.0f32; len],
+        }
+    }
+    fn len(&self) -> usize {
+        self.v.len()
+    }
+    fn as_slice(&self) -> &[f32] {
+        &self.v
+    }
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.v
+    }
+}
+
 thread_local! {
     /// task 300: PLE の res 往復バッファ (`nt × hc_dim`)。grow-only。
     static PLE_BACK_BUF: std::cell::RefCell<Vec<f32>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// task 393: 同じバッファの pinned 版 (`DENNO_PF_PLE_PIN`)。grow-only。
-    static PLE_BACK_PIN: std::cell::RefCell<Option<crate::cuda::PfHostBuf>> =
+    static PLE_BACK_PIN: std::cell::RefCell<Option<PlePinBuf>> =
         const { std::cell::RefCell::new(None) };
     /// task 300: PLE の射影バッファ (`key` / `value`)。grow-only。
     static PLE_KV_BUF: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
@@ -7906,7 +7937,7 @@ thread_local! {
 /// どちらも `Deref` で `[f32]` になるので、呼び出し側は今までどおり
 /// `&mut back` / `&back` / `back[a..b]` と書ける。
 struct PleBack {
-    pin: Option<crate::cuda::PfHostBuf>,
+    pin: Option<PlePinBuf>,
     v: Vec<f32>,
     len: usize,
 }
@@ -7971,7 +8002,7 @@ fn pf_ple_back_take_pin(len: usize, reuse: bool, pinned: bool) -> (PleBack, bool
         let cur = PLE_BACK_PIN.with(|c| c.borrow_mut().take());
         let buf = match cur {
             Some(b) if b.len() >= len => b,
-            _ => crate::cuda::PfHostBuf::new(len),
+            _ => PlePinBuf::new(len),
         };
         return (
             PleBack {
