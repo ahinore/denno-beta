@@ -647,16 +647,28 @@ fn ple_par_parts(rows: usize) -> usize {
 /// task 410: `DENNO_DEC_PLE_PAR` の上限 (1 トークンの行数は実ファイルで 16)。
 const DEC_PLE_PAR_MAX: usize = 64;
 
+/// task 410: `DENNO_DEC_PLE_PAR` の既定。lab t410b/t410c で採用したので **16**。
+///
+/// 冷えた page cache での長文脈 decode (`[q4prof] ple`) が base 210-368 ms /
+/// 1 リクエスト -> 34-67 ms、decode の中央値が 14k で -15% (t410b)。温かい側は
+/// 不変 (t410a の全 COND が 14.8 ms/tok)。切り戻しは `DENNO_DEC_PLE_PAR=0`。
+pub(crate) const DEFAULT_DEC_PLE_PAR: usize = 16;
+
 /// task 410: decode の PLE gather の並列度 (`DENNO_DEC_PLE_PAR`) の解釈 (純関数)。
 ///
-/// 未設定・`0`・`off`・不正値・範囲外は 0 (= 従来の逐次) に落ちる。
+/// 未設定は [`DEFAULT_DEC_PLE_PAR`] (既定 on)、明示的な偽値 (`0` / `off` /
+/// `false` / `no` / 空) は 0 (= 従来の逐次)、数値は 0..=[`DEC_PLE_PAR_MAX`]
+/// に丸め、解釈できない値は既定へ。
 fn dec_ple_par_from_value(v: Option<&str>) -> usize {
-    match v {
-        None => 0,
-        Some(s) => match s.trim().parse::<usize>() {
-            Ok(n) => n.min(DEC_PLE_PAR_MAX),
-            Err(_) => 0,
-        },
+    let Some(s) = v else {
+        return DEFAULT_DEC_PLE_PAR;
+    };
+    match s.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" | "no" => 0,
+        other => other
+            .parse::<usize>()
+            .map(|n| n.min(DEC_PLE_PAR_MAX))
+            .unwrap_or(DEFAULT_DEC_PLE_PAR),
     }
 }
 
@@ -691,14 +703,16 @@ pub fn set_dec_ple_par_for_test(n: Option<usize>) -> Option<usize> {
     }
 }
 
-/// task 410: decode の PLE gather の並列度 (`DENNO_DEC_PLE_PAR`、既定 0 = 逐次)。
+/// task 410: decode の PLE gather の並列度 (`DENNO_DEC_PLE_PAR`、既定 16)。
 ///
 /// 背景 (task 410): [`ple_par_parts`] は 64 行未満を逐次にする
 /// (`PLE_PAR_MIN_ROWS`) ので、decode の 1 トークン (実ファイルは `n_heads` = 16 行)
 /// は 90 B のランダム pread を **1 本ずつ直列に**出していた。page cache が
-/// 冷えているとき (長い prefill の後) は 1 本 50-130 us かかり、lab t406c の
-/// `[q4prof] ple` は 14k で 0.80 ms/token、2k で 2.08 ms/token だった
-/// (温かいと 0.02 ms/token)。行は独立なので並列度を上げても値はビット一致。
+/// 冷えているときは 1 本 50-130 us かかり、lab t410b (`DENNO_START_DROP_CACHE=1`
+/// で全 COND を冷えた状態に揃えた run) の `[q4prof] ple` は base 210-368 ms /
+/// リクエスト -> 16 本並列で 34-67 ms、decode の中央値は長文脈で -9.5..-15%。
+/// 温かい page cache では base も 2 ms/リクエストで、並列度を上げても不変
+/// (t410a)。行は独立なので並列度を上げても値はビット一致。
 fn dec_ple_par() -> usize {
     use std::sync::atomic::Ordering;
     let forced = DEC_PLE_PAR_FORCE.load(Ordering::Relaxed);
@@ -1120,17 +1134,24 @@ mod tests {
     }
 
     /// task 410: `DENNO_DEC_PLE_PAR` (decode の PLE gather の並列度) の真理値表と、
-    /// parts の選び方。未設定・`0`・偽値・不正値は従来 (逐次) に落ちる。
+    /// parts の選び方。未設定は既定 on (16)、明示的な偽値だけ従来 (逐次)。
     #[test]
     fn dec_ple_par_gate_truth_table() {
-        assert_eq!(dec_ple_par_from_value(None), 0, "未設定は従来 (逐次)");
-        for v in ["0", "off", "false", "no", "", " off ", "-1", "x"] {
+        assert_eq!(
+            dec_ple_par_from_value(None),
+            DEFAULT_DEC_PLE_PAR,
+            "未設定は既定 on"
+        );
+        assert_eq!(DEFAULT_DEC_PLE_PAR, 16, "lab t410b/t410c の採否 (16)");
+        for v in ["0", "off", "false", "no", "", " off ", "NO"] {
             assert_eq!(dec_ple_par_from_value(Some(v)), 0, "{v:?} が逐次でない");
         }
         assert_eq!(dec_ple_par_from_value(Some("8")), 8);
         assert_eq!(dec_ple_par_from_value(Some(" 16 ")), 16);
         // 上限 (64) を超える値は丸める (行数は実ファイルで 16)。
         assert_eq!(dec_ple_par_from_value(Some("1000")), DEC_PLE_PAR_MAX);
+        // 解釈できない値は既定 (on) へ。
+        assert_eq!(dec_ple_par_from_value(Some("x")), DEFAULT_DEC_PLE_PAR);
 
         // parts の選び方: 0 (ゲート off) と 1 行以下は 1、それ以外は min(want, rows)。
         assert_eq!(dec_gather_parts(16, 0), 1, "ゲート off は逐次");
