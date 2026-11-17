@@ -1627,18 +1627,30 @@ pub fn tc_exp_k_on() -> bool {
 /// 14k cold 17.47 / 17.50 s -> **15.03 s (-14.1%)**、`up_MB` 98,460 -> 53,323、
 /// copy_s 12.69 -> 9.75。ただし作業域 4,779 MiB + 余白 3,072 MiB のぶん
 /// expert を 1,500 本追い出して戻すため、14k 後の decode が 23-24 -> 26 ms/tok に
-/// 落ちた。本ゲートは同じ 1 パスを **もっと小さい作業域と余白**で取る
-/// (g/u を取らない / 余白 1,024) ので、追い出しは base の 1,007 本より少ない。
+/// 落ちた。
+///
+/// # 実測 (lab t420b、sha b187ed1、同じモデル / シナリオ、本ゲート on)
+///
+/// 余白 1,024 MiB / 作業域 **4,094 MiB** (g / u を取らない) / 追い出し **543 本**
+/// (base は 957 本) で 1 パス。14k cold **13.56 s** 対 base 17.53 / 17.76 s =
+/// **-23%**、`up_MB` 98,173 -> 52,516、copy_s 21.64 (外れ回) / 8.64。
+/// 3,826 cold 9.56 対 10.13 / 10.70 / 9.36 (差はノイズ)、14k 後 decode
+/// **22.0 対 21.8 ms/tok** (悪化なし)、短い decode 16.4 対 16.2、md5 は全文脈 SAME。
+/// 14k 後の decode が落ちた t420a の形 (作業域 4,779 + 余白 3,072) と違い、
+/// 追い出しが base より少ないので悪化しない。
 pub const POOL_K_PLAN_ENV: &str = "DENNO_PF_POOL_K_PLAN";
 
-/// [`POOL_K_PLAN_ENV`] の既定 (lab の結果で決める。いまは off)。
-pub const DEFAULT_POOL_K_PLAN: bool = false;
+/// [`POOL_K_PLAN_ENV`] の既定 (**on**。lab t420b で採用)。
+pub const DEFAULT_POOL_K_PLAN: bool = true;
 
-/// [`POOL_K_PLAN_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+/// [`POOL_K_PLAN_ENV`] の解釈 (純関数)。既定 on、**明示的な偽値だけ off**。
 pub fn pool_k_plan_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim) {
-        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
-        None => DEFAULT_POOL_K_PLAN,
+        None | Some("") => DEFAULT_POOL_K_PLAN,
+        Some(s) => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
     }
 }
 
@@ -3481,22 +3493,22 @@ mod tests {
         }
     }
 
-    /// task 420: `DENNO_PF_POOL_K_PLAN` は**明示的な真値だけ** on (未設定は既定 off)。
+    /// task 420: `DENNO_PF_POOL_K_PLAN` は既定 on、**明示的な偽値だけ** off
+    /// (lab t420b で採用。task 265 の 3 本と同じ規約)。
     #[test]
     fn pool_k_plan_gate_truth_table() {
-        assert!(!pool_k_plan_from_value(None), "未設定は既定 (off)");
-        assert!(!pool_k_plan_from_value(Some("")), "空も既定 (off)");
+        assert!(pool_k_plan_from_value(None), "未設定は既定 (on)");
+        assert!(pool_k_plan_from_value(Some("")), "空も既定 (on)");
         assert!(!pool_k_plan_from_value(Some("0")));
         assert!(!pool_k_plan_from_value(Some("off")));
-        assert!(!pool_k_plan_from_value(Some("false")));
+        assert!(!pool_k_plan_from_value(Some("FALSE")));
         assert!(!pool_k_plan_from_value(Some("no")));
-        assert!(!pool_k_plan_from_value(Some("x")), "解析不能は既定 (off)");
+        assert!(pool_k_plan_from_value(Some("x")), "解析不能は既定 (on)");
         assert!(pool_k_plan_from_value(Some("1")));
         assert!(pool_k_plan_from_value(Some("on")));
-        assert!(pool_k_plan_from_value(Some("true")));
-        assert!(pool_k_plan_from_value(Some("yes")));
+        assert!(pool_k_plan_from_value(Some("YES")));
         assert!(pool_k_plan_from_value(Some(" 1 ")), "前後の空白は無視する");
-        assert!(!DEFAULT_POOL_K_PLAN, "既定は off (lab の結果で決める)");
+        assert!(DEFAULT_POOL_K_PLAN, "既定は on (lab t420b)");
     }
 
     /// task 325: `DENNO_PF_PREAD` は既定 on、`0` 系だけが偽。
