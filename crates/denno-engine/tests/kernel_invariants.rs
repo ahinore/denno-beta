@@ -10121,7 +10121,8 @@ fn t242_lm_work_area_is_group_local_and_experts_come_back() {
         "グループ局所でないときの全体サイズへの落とし方が変わっている"
     );
     // 5. 戻す経路はラッチしない acquire_soft を使う (失敗しても decode を殺さない)。
-    let restore = fn_body(QWEN_SRC, "fn pf_restore_experts(");
+    //    task 394: 1 本ぶんの処理は `pf_restore_one` へ切り出した (直列と並列で共有)。
+    let restore = fn_body(QWEN_SRC, "fn pf_restore_one(");
     assert!(
         restore.contains("expert_vram::acquire_soft("),
         "戻す経路が acquire_soft でない (確保失敗で CPU に張り付く)"
@@ -10129,6 +10130,11 @@ fn t242_lm_work_area_is_group_local_and_experts_come_back() {
     assert!(
         !restore.contains("expert_vram::acquire("),
         "戻す経路がラッチする acquire を使っている"
+    );
+    // 5b. task 394: 並列の戻しもラッチしない acquire_deferred を通る。
+    assert!(
+        restore.contains("expert_vram::acquire_deferred("),
+        "並列の戻しが acquire_deferred を通っていない"
     );
     // 6. 純関数と env ゲートが exp_pf にある。
     for k in [
@@ -10139,6 +10145,75 @@ fn t242_lm_work_area_is_group_local_and_experts_come_back() {
     ] {
         assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
     }
+}
+
+/// task 394: 戻しの並列化 (`DENNO_PF_RESTORE_MT`) が配線されていること。
+///
+/// - `pf_restore_experts` がゲートを読み、off なら直列経路へ落ちる (既定 off)。
+/// - 並列経路はプールの各スレッドで CUDA context と H2D 専用ストリームを張る。
+///   context を張らないと最初の確保が error 201 で落ち、1 本も載らないまま
+///   静かに終わる (task 146 / task 214 で踏んだ穴)。
+/// - 台帳 `[pf-restore]` が `DENNO_Q4_PROFILE` で出る (ゲートが効いた証拠を lab で読む)。
+#[test]
+fn t394_restore_mt_is_wired() {
+    let f = fn_body(QWEN_SRC, "fn pf_restore_experts(");
+    for k in [
+        "crate::model::exp_pf::pf_restore_mt()",
+        "pf_restore_experts_mt(",
+        "pf_restore_experts_seq(",
+        "[pf-restore]",
+    ] {
+        assert!(f.contains(k), "戻しの入口に {k} が無い");
+    }
+    let mt = fn_body(QWEN_SRC, "fn pf_restore_experts_mt(");
+    for k in [
+        "crate::cuda::make_current_on_this_thread()",
+        "crate::cuda::enable_thread_upload_stream()",
+        ".broadcast(",
+        "pool.install(",
+        "keys.par_iter()",
+    ] {
+        assert!(mt.contains(k), "並列の戻しに {k} が無い");
+    }
+    // プールはプロセスで 1 個 (スレッド局所の pinned とストリームを使い回す)。
+    let pool = fn_body(QWEN_SRC, "fn pf_restore_pool(");
+    assert!(
+        pool.contains("OnceLock<Option<rayon::ThreadPool>>"),
+        "戻しのプールが 1 個に固定されていない"
+    );
+    // ゲートと純関数が exp_pf にある。
+    for k in [
+        "pub fn pf_restore_mt(",
+        "pub fn pf_restore_mt_from_value(",
+        "pub fn pf_restore_threads(",
+        "pub fn pf_restore_threads_from_value(",
+        "pub fn layer_pre(",
+        "pub fn readahead_part(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 層優先のループが「次の層」を先読みしている (attention の裏でディスクを回す)。
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    for k in [
+        "crate::model::exp_pf::layer_pre()",
+        "pf_layer_prefetch(&self.layers[0])",
+        "pf_layer_prefetch(&self.layers[il + 1])",
+    ] {
+        assert!(lm.contains(k), "層優先のループに {k} が無い");
+    }
+    let pf = fn_body(QWEN_SRC, "fn pf_layer_prefetch(");
+    for k in [
+        "w.slice_abs(0)",
+        "crate::model::exp_pf::readahead_part(",
+        "w.n_expert",
+    ] {
+        assert!(pf.contains(k), "先読みの本体に {k} が無い");
+    }
+    // 台帳が `[exp-pf-stream]` に出る (ゲートが効いた証拠を lab で読む)。
+    assert!(
+        EXP_PF_SRC.contains("out.push_str(&layer_pre_stats())"),
+        "[exp-pf-stream] に先読みの台帳が無い"
+    );
 }
 
 // ---------------------------------------------------------------------------

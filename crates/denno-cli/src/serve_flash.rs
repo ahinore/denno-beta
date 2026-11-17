@@ -759,6 +759,18 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_iq::miss_spawn_reset();
+    // task 392: GDN の ba matvec を qkv GEMV と重ねた層数
+    // (`DENNO_GDN_BA_PAR=1` のときだけ 1 行 = 分岐が発火した証拠)。
+    if let Some(line) = denno_engine::gpu_report::gdn_ba_par_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::gpu_report::gdn_ba_par_reset();
+    // task 392: GDN の入力 cur の H2D を mix のデバイス出力で置き換えた層数
+    // (`DENNO_GDN_X_MIX=1` のときだけ 1 行 = 分岐が発火した証拠)。
+    if let Some(line) = denno_engine::gpu_report::gdn_x_mix_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::gpu_report::gdn_x_mix_reset();
     // task 368: decode の待ちを null ストリームのイベントへ狭めた回数
     // (`DENNO_DEC_SYNC_STREAM=1` のときだけ 1 行 = 分岐が発火した証拠)。
     if let Some(line) = denno_engine::gpu_report::dec_sync_stream_line() {
