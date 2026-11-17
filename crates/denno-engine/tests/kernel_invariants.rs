@@ -11543,8 +11543,8 @@ fn task393_kv_bulk_is_wired_through_push_many() {
         "env 名の宣言が 1 箇所でない"
     );
     assert!(
-        ATTN_SRC.contains("pub const DEFAULT_PF_KV_BULK: bool = false;"),
-        "既定が off でない (lab で採るまで off)"
+        ATTN_SRC.contains("pub const DEFAULT_PF_KV_BULK: bool = true;"),
+        "既定が on でない (lab t393a/t393b で採った)"
     );
     // 解釈は「未設定・空は既定 (off)、明示的な真値だけ on」。
     let f = ATTN_SRC
@@ -11610,8 +11610,8 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
         "env 名の宣言が 1 箇所でない"
     );
     assert!(
-        QWEN_SRC.contains("pub const DEFAULT_PLE_PIN: bool = false;"),
-        "既定が off でない (lab で採るまで off)"
+        QWEN_SRC.contains("pub const DEFAULT_PLE_PIN: bool = true;"),
+        "既定が on でない (lab t393a/t393b で採った)"
     );
     let f = QWEN_SRC
         .split("pub(crate) fn pf_ple_pin_from_value(")

@@ -7865,8 +7865,14 @@ pub(crate) fn pf_ple_reuse_on() -> bool {
 /// 「pinned へ写してから同期コピー」で写しを 1 回増やしていた)。
 pub const PLE_PIN_ENV: &str = "DENNO_PF_PLE_PIN";
 
-/// [`PLE_PIN_ENV`] の既定 (lab で採れば true にする)。
-pub const DEFAULT_PLE_PIN: bool = false;
+/// [`PLE_PIN_ENV`] の既定 (**lab で採ったので on**)。`=0` で切り戻す。
+///
+/// 実測 (lab t393a / t393b、depth8k、2 ラウンドずつ): 3,826 の `other` 段が
+/// wall 409.3 / 238.9 (base) -> 226.2 / 226.1 ms (`other` の内側は
+/// res_up 44.9-46.2 -> 32.1-33.0、ple 111.3 -> 101.3-101.9)。
+/// 14k は `other` 764.6 -> 743.2 ms、`res_up` 206.0 -> 163.1 ms。
+/// 壁は 3,826 で -0.6%、14k で -0.1%。decode と md5 は全 COND 不変。
+pub const DEFAULT_PLE_PIN: bool = true;
 
 /// [`PLE_PIN_ENV`] の解釈 (未設定・空は [`DEFAULT_PLE_PIN`])。
 pub(crate) fn pf_ple_pin_from_value(v: Option<&str>) -> bool {
@@ -25488,9 +25494,10 @@ mod tests {
             assert!(pf_ple_reuse_from_value(Some(" on ")));
             assert!(pf_ple_reuse_from_value(Some("TRUE")));
 
-            // task 393: `DENNO_PF_PLE_PIN` は既定 off (明示的な真値だけ on)。
-            assert!(!pf_ple_pin_from_value(None), "未設定が on になった");
-            assert!(!pf_ple_pin_from_value(Some("")));
+            // task 393: `DENNO_PF_PLE_PIN` は lab で採ったので既定 on
+            // (明示的な偽値だけ off)。
+            assert!(pf_ple_pin_from_value(None), "未設定が off になった");
+            assert!(pf_ple_pin_from_value(Some("")));
             for v in ["0", "off", "false", "no"] {
                 assert!(!pf_ple_pin_from_value(Some(v)), "{v:?} が on になった");
             }

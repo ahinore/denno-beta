@@ -17453,7 +17453,13 @@ enum GdnBuf {
 /// task 393: `DENNO_PF_GDN_WSTAT` の env 名。
 pub const GDN_WSTAT_ENV: &str = "DENNO_PF_GDN_WSTAT";
 
-/// 未設定のときの既定 (lab で採れば true にする)。
+/// 未設定のときの既定 (**off のまま**)。
+///
+/// 実測 (lab t393b、depth8k): ゲートは発火した (ssm の H2D 159.18 MB / 1,080 回
+/// -> 123.60 MB / 216 回 = 36 層 x 6 チャンク x 4 本を飛ばした) が、ssm 段の壁は
+/// 14k 2,459.8 -> 2,433.8 ms (-1.1%)、3,826 454.9 -> 452.3 ms (-0.6%) だけで、
+/// 壁は -0.1% / -0.0%。**同期 H2D の待ちは ssm の露出の正体ではなかった**
+/// (露出 900 ms は GPU の待ち)。採否規則 (段で 2% 以上) に届かないので off。
 pub const DEFAULT_GDN_WSTAT: bool = false;
 
 /// [`GDN_WSTAT_ENV`] の解釈 (未設定・空は [`DEFAULT_GDN_WSTAT`])。

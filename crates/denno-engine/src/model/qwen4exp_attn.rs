@@ -492,10 +492,13 @@ impl Drop for AttnCache {
 /// task 393: `DENNO_PF_KV_BULK` の env 名。
 pub const PF_KV_BULK_ENV: &str = "DENNO_PF_KV_BULK";
 
-/// 未設定のときの既定 (lab で採れば true にする)。
+/// 未設定のときの既定 (**lab で採ったので on**)。`=0` で切り戻す。
 ///
-/// `false` = 従来 (チャンクごとに `vec!` 2 本 + 1 位置ずつの `push`)。
-pub const DEFAULT_PF_KV_BULK: bool = false;
+/// 実測 (lab t393a / t393b、model=flash-next-UD-IQ3_XXS、depth8k、2 ラウンドずつ):
+/// 3,826 の `full` 段が wall 134.2-138.5 -> 126.8-129.6 ms (-3.4% / -7.9% /
+/// -7.0% / -7.2% の 4 サンプル)。14k は 881.7 -> 880.5 ms (差なし)。
+/// 壁は 3,826 で -0.1% / -0.5%、14k で ±0.1%。decode と md5 は全 COND 不変。
+pub const DEFAULT_PF_KV_BULK: bool = true;
 
 /// [`PF_KV_BULK_ENV`] の解釈 (未設定・空は [`DEFAULT_PF_KV_BULK`])。
 pub(crate) fn pf_kv_bulk_from_value(v: Option<&str>) -> bool {
@@ -625,14 +628,14 @@ mod attn_cache_tests {
         );
     }
 
-    /// task 393: ゲートの真理値表 (既定 off。明示的な真値だけ on)。
+    /// task 393: ゲートの真理値表 (未設定・空は既定、明示的な偽値だけ off)。
     #[test]
     fn kv_bulk_gate_truth_table() {
         assert!(
-            !super::pf_kv_bulk_from_value(None),
-            "未設定が on になった (既定 off のはず)"
+            super::pf_kv_bulk_from_value(None),
+            "未設定が off になった (lab で採ったので既定 on)"
         );
-        assert!(!super::pf_kv_bulk_from_value(Some("")));
+        assert!(super::pf_kv_bulk_from_value(Some("")));
         for v in ["0", "off", "false", "no", " off "] {
             assert!(!super::pf_kv_bulk_from_value(Some(v)), "{v:?} が on になった");
         }
@@ -640,7 +643,7 @@ mod attn_cache_tests {
             assert!(super::pf_kv_bulk_from_value(Some(v)), "{v:?} が off のまま");
         }
         if std::env::var_os(super::PF_KV_BULK_ENV).is_none() {
-            assert!(!super::pf_kv_bulk_on(), "未設定で既定 off になっていない");
+            assert!(super::pf_kv_bulk_on(), "未設定で既定 on になっていない");
         }
     }
 
