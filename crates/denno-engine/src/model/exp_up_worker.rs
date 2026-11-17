@@ -148,15 +148,18 @@ pub fn max_per_token() -> Option<usize> {
 // 代価は積むだけの約 1 us。よって空きがある間だけ 2 倍にする。
 
 /// `DENNO_EXP_UP_FILL`: LRU に空きがある間、1 トークンあたりの上げ予算を 2 倍にする。
-/// **既定 off** (明示的な真値だけ on)。
+/// **既定 on** (lab t406b で採った: 短い decode -11.4%、c8000_turn2 -10.3%、
+/// 同じ run の `[q4ledger] experts` は 4.43 -> 3.15 ms/token。切り戻しは `=0`)。
 pub const FILL_ENV: &str = "DENNO_EXP_UP_FILL";
 
-/// [`FILL_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+/// [`FILL_ENV`] の解釈 (純関数)。**既定 on**、明示的な偽値だけ off。
+///
+/// 明示的な真値 (`1` / `on` / `true` / `yes`) も on (既定と同じ)。
 pub fn fill_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no"),
+        None => true,
+    }
 }
 
 /// 空きがある間の上げ予算を 2 倍にするか (プロセスで 1 回だけ env を読む)。
@@ -488,19 +491,19 @@ mod tests {
         assert_eq!(max_from_value(Some("1")), Some(1));
     }
 
-    /// task 406: `DENNO_EXP_UP_FILL` は既定 off、明示的な真値だけ on。
+    /// task 406: `DENNO_EXP_UP_FILL` は既定 on、明示的な偽値だけ off。
     #[test]
-    fn fill_gate_defaults_off_and_accepts_explicit_true_only() {
-        assert!(!fill_from_value(None), "未設定は既定 off");
-        assert!(!fill_from_value(Some("")));
-        assert!(!fill_from_value(Some("0")));
-        assert!(!fill_from_value(Some("off")));
-        assert!(!fill_from_value(Some("false")));
-        assert!(!fill_from_value(Some("2")), "数値の 2 は倍率ではなく偽");
+    fn fill_gate_defaults_on_and_only_false_values_turn_it_off() {
+        assert!(fill_from_value(None), "未設定は既定 on");
+        assert!(fill_from_value(Some("")));
         assert!(fill_from_value(Some("1")));
         assert!(fill_from_value(Some(" on ")));
         assert!(fill_from_value(Some("TRUE")));
         assert!(fill_from_value(Some("yes")));
+        assert!(!fill_from_value(Some("0")));
+        assert!(!fill_from_value(Some("off")));
+        assert!(!fill_from_value(Some("false")));
+        assert!(!fill_from_value(Some("no")));
     }
 
     /// task 406: 予算の倍率は 2 倍だけ。off は恒等 (1 バイトも変わらない)。
