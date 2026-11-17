@@ -26059,6 +26059,8 @@ mod tests {
         /// env の解釈に従うことを保つ)。
         #[test]
         fn attn_kprof_line_counts_calls_and_gpu_hits() {
+            // ssm_decode_fills_attn_kprof_slots と同じカウンタを使うので順番に走らせる。
+            let _g = crate::model::moe_expert::moe_test_lock();
             crate::model::qwen4exp::attn_kprof::set_for_test(true);
             crate::model::qwen4exp::attn_kprof::reset();
             let t = std::time::Instant::now();

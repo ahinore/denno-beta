@@ -291,6 +291,7 @@ mod tests {
         let _g = lock();
         set_for_test(true);
         reset();
+        let t0 = std::time::Instant::now();
         {
             let _a = stage();
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -299,11 +300,13 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+        let outer = t0.elapsed().as_nanos() as u64;
         let wall = stage_wall_ns();
-        // 外側の 2 ms ぶんだけ。内側を足すと 3 ms を超える。
+        // 外側の区間ぶんだけ (外の Instant で測った時間以下)。内側も足すと内側の
+        // 1 ms 以上ぶん外の時間を超える。sleep の寝過ごしで固定の上限は使わない。
         assert!(
-            wall >= 2_000_000 && wall < 3_000_000,
-            "入れ子の壁時計が 1 回でない: {wall}"
+            wall >= 2_000_000 && wall <= outer,
+            "入れ子の壁時計が 1 回でない: {wall} (外側 {outer})"
         );
         set_for_test(false);
         reset();

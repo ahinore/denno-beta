@@ -33,8 +33,10 @@ jobs:
         run: cargo build --workspace --release
 
       # モデルDLを要する exactness テストは #[ignore] 付きなので除外される
+      # engine のテストはプロセス共有のゲート (env の OnceLock や強制フラグ) を切り替えるので、
+      # 開発の関門と同じく 1 スレッドで走らせる。並列だと別テストの切り替えを拾って偶発的に落ちる。
       - name: Test (workspace)
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
       # P17: cuda feature のコンパイルチェック (GPU 不要 — libcuda は実行時 dlopen)。
       # PTX はコミット済みのため include_bytes もランナー上で解決できる。

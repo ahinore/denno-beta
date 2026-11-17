@@ -2147,6 +2147,10 @@ mod tests {
     /// assert しない。終わりに必ず FORCE を戻す。
     #[test]
     fn ssm_decode_fills_attn_kprof_slots() {
+        // attn_kprof のカウンタはプロセス共有。もう 1 本の attn_kprof テストとは
+        // 同じロックで順番に走らせ、FORCE on の間に並行テストの forward が足す分は
+        // 許して「3 回以上」で確かめる。
+        let _g = crate::model::moe_expert::moe_test_lock();
         crate::model::qwen4exp::attn_kprof::set_for_test(true);
         crate::model::qwen4exp::attn_kprof::reset();
         let (mut layer, _p) = small_layer();
@@ -2157,9 +2161,16 @@ mod tests {
             let _ = layer.forward_token(&cur).expect("forward_token");
         }
         let line = crate::model::qwen4exp::attn_kprof::line().expect("強制 on なのに line() が None");
-        assert!(line.contains("qkv calls=3"), "qkv が積まれていない: {line}");
-        assert!(line.contains("gate calls=3"), "gate が積まれていない: {line}");
-        assert!(line.contains("out calls=3"), "out が積まれていない: {line}");
+        let calls = |name: &str| -> u64 {
+            line.split(&format!("{name} calls="))
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+        assert!(calls("qkv") >= 3, "qkv が積まれていない: {line}");
+        assert!(calls("gate") >= 3, "gate が積まれていない: {line}");
+        assert!(calls("out") >= 3, "out が積まれていない: {line}");
         crate::model::qwen4exp::attn_kprof::reset();
         crate::model::qwen4exp::attn_kprof::set_for_test(false);
     }
