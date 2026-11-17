@@ -8945,9 +8945,10 @@ where
     let rb_g_pre = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
     let rb_u_pre = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
     // task 388: CPU ミス (`middle`) を 3 つの順序で呼べるようにする。
-    // - 既定: 起動のあと、同期の前 (従来)。
+    // - 既定 (`DENNO_DEC_MISS_SPAWN` on): rayon のプールで**起動と同時**に走らせる。
+    //   呼び出しスレッドは起動と同期だけを行う (lab t388b で experts 段 -4.5/-6.9%)。
+    // - `DENNO_DEC_MISS_SPAWN=0`: 起動のあと、同期の前 (t388b 以前の従来)。
     // - `DENNO_DEC_MISS_SERIAL=1`: 同期と写しの**後ろ** (診断 = 重ね打ち無し)。
-    // - `DENNO_DEC_MISS_SPAWN=1`: rayon のプールで**起動と同時**に走らせる。
     // どの順序でもカーネル・引数・足し込みの順は同じ (値は変わらない)。
     let spawn_cpu = overlap && crate::model::exp_iq::miss_spawn_enabled();
     let serial_cpu = overlap && !spawn_cpu && crate::model::exp_iq::miss_serial_enabled();

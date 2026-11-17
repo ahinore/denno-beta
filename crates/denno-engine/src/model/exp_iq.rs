@@ -374,6 +374,9 @@ pub fn sum_zc_reset() {
 // `DENNO_DEC_MISS_SERIAL=1` は**診断用**: 同期と控えの写しを先に済ませてから
 // CPU ミスを回す (= 重ね打ちを完全に切る)。既定との差が「いま重ね打ちが
 // 効いている量」になる。
+//
+// 既定は spawn **on** (lab t388b: experts 段 -4.5% / -6.9% の 2 ラウンド、
+// decode 15.8 -> 15.6、14k 後 17.2 -> 15.3、md5 全 SAME、errors 0)。
 pub const DEC_MISS_SPAWN_ENV: &str = "DENNO_DEC_MISS_SPAWN";
 pub const DEC_MISS_SERIAL_ENV: &str = "DENNO_DEC_MISS_SERIAL";
 
@@ -388,10 +391,20 @@ fn on_from_value(v: Option<&str>) -> bool {
     }
 }
 
+/// [`DEC_MISS_SPAWN_ENV`] の解釈 (純関数)。**既定 on** (lab t388b で採否 yes)。
+///
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+pub fn miss_spawn_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
 /// `DENNO_DEC_MISS_SPAWN` が有効か (プロセスで 1 回だけ env を読む)。
 pub fn miss_spawn_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on_from_value(std::env::var(DEC_MISS_SPAWN_ENV).ok().as_deref()))
+    *ON.get_or_init(|| miss_spawn_from_value(std::env::var(DEC_MISS_SPAWN_ENV).ok().as_deref()))
 }
 
 /// `DENNO_DEC_MISS_SERIAL` が有効か (プロセスで 1 回だけ env を読む)。
@@ -1120,16 +1133,22 @@ mod tests {
         assert!(sum_zc_line_with(true).is_none(), "0 に戻したら行を出さない");
     }
 
-    /// task 388: `DENNO_DEC_MISS_SPAWN` / `DENNO_DEC_MISS_SERIAL` は既定 off、
-    /// 明示的な真値だけ on。
+    /// task 388: `DENNO_DEC_MISS_SPAWN` は**既定 on** (lab t388b で採否 yes)、
+    /// 明示的な偽値だけ切る。`DENNO_DEC_MISS_SERIAL` は既定 off (診断用)。
     #[test]
-    fn miss_spawn_gates_default_off_and_parse_explicitly() {
+    fn miss_spawn_gates_parse_explicitly() {
+        assert!(miss_spawn_from_value(None), "既定 on");
+        assert!(miss_spawn_from_value(Some("")), "空は on");
+        for v in ["0", "off", "false", "no", " OFF ", "False"] {
+            assert!(!miss_spawn_from_value(Some(v)), "{v:?} は off");
+        }
+        for v in ["1", "on", "true", "yes", "2", "abc"] {
+            assert!(miss_spawn_from_value(Some(v)), "{v:?} は on (偽値だけ切る)");
+        }
+        // serial は診断用なので既定 off (明示的な真値だけ on)。
         assert!(!on_from_value(None));
-        assert!(!on_from_value(Some("")));
         assert!(!on_from_value(Some("0")));
-        assert!(!on_from_value(Some("off")));
         assert!(on_from_value(Some("1")));
-        assert!(on_from_value(Some(" on ")));
         assert!(on_from_value(Some("TRUE")));
     }
 
