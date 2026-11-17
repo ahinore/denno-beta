@@ -131,6 +131,105 @@ pub fn max_per_token() -> Option<usize> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// task 406: 空きがある間は 1 層あたりの上げ本数を 2 本にする (`DENNO_EXP_UP_FILL`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t406a の `[q4ledger]` / `[exp-iq]` / `[dec-up-w]`、int-auto 8aaf48807):
+// 短い decode の定常窓で **ミス 38.6 本/token・VRAM は 15,311 MiB / 22,000 MiB**、
+// 上げ直しは **19.5 本/token** しか積めていない。1 層あたりの割り当ては
+// `quota = 予算 / 層数 = 48 / 48 = 1` 本なので、1 層で 2 本以上ミスした分は
+// **永久にミスのまま** (同じ expert が毎トークン CPU で回る)。ミス 1 本の CPU は
+// 実測 59 us、ヒット 1 本の GPU は 5.5 us (`[exp-iq-kprof]`) なので、空きが
+// あるのに埋めないのは損。
+//
+// 1 本/token という上限は **同期 H2D だった頃** (task 144/214 より前) のもの。
+// いまは背景スレッドが送るので `queue_max=1` (ほぼ空) で、メインスレッドの
+// 代価は積むだけの約 1 us。よって空きがある間だけ 2 倍にする。
+
+/// `DENNO_EXP_UP_FILL`: LRU に空きがある間、1 トークンあたりの上げ予算を
+/// `DENNO_EXP_UP_FILL_MULT` 倍にする。**既定 on**。
+///
+/// lab の実測 (depth8k、同じ run の対、短い decode の中央値):
+/// t406b `f1` (2 倍) 13.7 / `f4` (4 倍) 13.2 vs base 15.4、
+/// t406c `def` (2 倍) 14.1 / `f4b` (4 倍) 13.2 vs off 15.6・off2 15.4。
+/// 同じ run の `[q4ledger] experts` は 4.43 -> 3.15 (2 倍) / 2.94 (4 倍) ms/token。
+/// 切り戻しは `=0`。
+pub const FILL_ENV: &str = "DENNO_EXP_UP_FILL";
+
+/// `DENNO_EXP_UP_FILL_MULT`: 上げ予算の倍率 (既定 4、1..=8 に丸める)。
+///
+/// 2 にすると lab t406b の `f1` / t406c の `def` と同じ (2 本/層)、
+/// 4 が lab t406b の `f4` / t406c の `f4b` と同じ (4 本/層)。
+pub const FILL_MULT_ENV: &str = "DENNO_EXP_UP_FILL_MULT";
+
+/// [`FILL_ENV`] の解釈 (純関数)。**既定 on**、明示的な偽値だけ off。
+///
+/// 明示的な真値 (`1` / `on` / `true` / `yes`) も on (既定と同じ)。
+pub fn fill_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no"),
+        None => true,
+    }
+}
+
+/// [`FILL_MULT_ENV`] の解釈 (純関数)。未設定・不正値は既定 4、1..=8 に丸める。
+pub fn fill_mult_from_value(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, 8),
+        None => DEFAULT_FILL_MULT,
+    }
+}
+
+/// [`FILL_MULT_ENV`] の既定値 (lab t406b / t406c の `f4` と同じ 4 本/層)。
+pub const DEFAULT_FILL_MULT: usize = 4;
+
+/// 空きがある間の上げ予算を倍率倍にするか (プロセスで 1 回だけ env を読む)。
+pub fn fill_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| fill_from_value(std::env::var(FILL_ENV).ok().as_deref()))
+}
+
+/// 上げ予算の倍率 (プロセスで 1 回だけ env を読む)。
+pub fn fill_mult() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| fill_mult_from_value(std::env::var(FILL_MULT_ENV).ok().as_deref()))
+}
+
+/// 上げ予算 (本/token) に倍率を当てる。**純関数** (`mult <= 1` は恒等)。
+///
+/// `base` は従来の規則が返す値 (空きあり 48 / 埋まり 16)。層あたりの割り当ては
+/// `予算 / 層数` で決まる (48 層・48 本なら 1 本/層、192 本なら 4 本/層)。
+pub fn upload_budget(base: usize, mult: usize) -> usize {
+    base.saturating_mul(mult.max(1))
+}
+
+/// 積めなかった理由。呼び出し側は「同期 H2D へ落とす」か「このトークンは諦める」を
+/// 選ぶ。task 406 の `DENNO_EXP_UP_FILL` は後者 (メインスレッドを止めない)。
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// 待ち行列へ積めた。
+    Queued,
+    /// 同じ鍵が飛行中 (二重 DMA を避けた)。
+    Already,
+    /// 待ち行列が満杯 / ワーカーが死んだ。
+    Refused,
+    /// バイト列が mmap の外 (ヒープ実体) で積めない。同期経路でしか上げられない。
+    NoMap,
+}
+
+/// 積めなかったときに同期 H2D へ落とさず**諦める**か。**純関数**。
+///
+/// `fill` が立っているときだけ諦める (既定の経路は 1 バイトも変わらない)。
+/// 理由が `Already` (同じ expert が既に飛行中) や `Refused` (行列が満杯) の
+/// ときにメインスレッドで 0.16 ms の同期 H2D を撃つのは、上げ予算を増やした
+/// 目的 (メインスレッドを止めない) と逆行するため。
+#[cfg(feature = "cuda")]
+pub fn skip_on_refusal(fill: bool, outcome: SubmitOutcome) -> bool {
+    fill && matches!(outcome, SubmitOutcome::Already | SubmitOutcome::Refused)
+}
+
 /// expert 1 本の 1 行列ぶんのバイト範囲 (mmap のハンドル + 絶対オフセット + 長さ)。
 #[derive(Clone)]
 pub struct Part {
@@ -158,6 +257,8 @@ static ERRORS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static JOB_NS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_MAX: AtomicU64 = AtomicU64::new(0);
+/// 積めなかった回数 (ゲート `DENNO_EXP_UP_FILL` の判断材料。task 406)。
+static SKIPPED_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// 専用ストリームが張れたか (診断用)。
 static STREAM_ON: AtomicBool = AtomicBool::new(false);
 
@@ -183,13 +284,14 @@ pub fn stats_line() -> Option<String> {
         .unwrap_or(0);
     Some(format!(
         "[dec-up-w] submitted={sub} done={done} fail={} err={} dropped={} inflight={inflight} \
-         queue_max={} stream={} dma={:.2}ms us_per_job={us:.1}",
+         queue_max={} stream={} dma={:.2}ms us_per_job={us:.1} skip={}",
         FAILED.load(Ordering::Relaxed),
         ERRORS.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
         QUEUE_MAX.load(Ordering::Relaxed),
         u8::from(STREAM_ON.load(Ordering::Relaxed)),
-        ns as f64 / 1e6
+        ns as f64 / 1e6,
+        SKIPPED_REFUSED.load(Ordering::Relaxed)
     ))
 }
 
@@ -206,6 +308,7 @@ pub fn stats_reset() {
         &DROPPED,
         &JOB_NS,
         &QUEUE_MAX,
+        &SKIPPED_REFUSED,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -320,23 +423,32 @@ mod gpu {
     /// 積めない (ゲート off / スレッドが死んだ / 同じ鍵が飛行中 / 溢れた) ときは
     /// false を返す。呼び出し側は従来の同期経路へ落ちる。
     pub fn submit(job: Job) -> bool {
+        submit_detailed(job) == SubmitOutcome::Queued
+    }
+
+    /// [`submit`] の理由つき版 (task 406)。積めなかった理由で呼び出し側の落とし先が
+    /// 変わる (`DENNO_EXP_UP_FILL` は `Already` / `Refused` で諦める)。
+    pub fn submit_detailed(job: Job) -> SubmitOutcome {
         if DEAD.load(Ordering::Relaxed) {
-            return false;
+            SKIPPED_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return SubmitOutcome::Refused;
         }
         let Some(tx) = sender() else {
-            return false;
+            SKIPPED_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return SubmitOutcome::Refused;
         };
         let key = (job.layer, job.expert);
         {
             let Ok(mut s) = INFLIGHT.lock() else {
-                return false;
+                SKIPPED_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return SubmitOutcome::Refused;
             };
             if s.contains(&key) {
-                return false;
+                return SubmitOutcome::Already;
             }
             if s.len() >= MAX_QUEUE {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
-                return false;
+                return SubmitOutcome::Refused;
             }
             s.insert(key);
             let n = s.len() as u64;
@@ -346,10 +458,11 @@ mod gpu {
             if let Ok(mut s) = INFLIGHT.lock() {
                 s.remove(&key);
             }
-            return false;
+            SKIPPED_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return SubmitOutcome::Refused;
         }
         SUBMITTED.fetch_add(1, Ordering::Relaxed);
-        true
+        SubmitOutcome::Queued
     }
 
     /// 積んだがまだ完了していない本数 (診断用)。
@@ -359,7 +472,7 @@ mod gpu {
 }
 
 #[cfg(feature = "cuda")]
-pub use gpu::{inflight, submit, Job};
+pub use gpu::{inflight, submit, submit_detailed, Job};
 
 #[cfg(test)]
 mod tests {
@@ -400,6 +513,64 @@ mod tests {
         assert_eq!(max_from_value(Some("abc")), None);
         assert_eq!(max_from_value(Some(" 128 ")), Some(128));
         assert_eq!(max_from_value(Some("1")), Some(1));
+    }
+
+    /// task 406: `DENNO_EXP_UP_FILL` は既定 on、明示的な偽値だけ off。
+    #[test]
+    fn fill_gate_defaults_on_and_only_false_values_turn_it_off() {
+        assert!(fill_from_value(None), "未設定は既定 on");
+        assert!(fill_from_value(Some("")));
+        assert!(fill_from_value(Some("1")));
+        assert!(fill_from_value(Some(" on ")));
+        assert!(fill_from_value(Some("TRUE")));
+        assert!(fill_from_value(Some("yes")));
+        assert!(!fill_from_value(Some("0")));
+        assert!(!fill_from_value(Some("off")));
+        assert!(!fill_from_value(Some("false")));
+        assert!(!fill_from_value(Some("no")));
+    }
+
+    /// task 406: 予算の倍率は `mult` 倍 (1 以下は恒等)。off は 1 を渡す。
+    #[test]
+    fn upload_budget_multiplies_and_keeps_one_as_identity() {
+        // 48 層のモデル: 48 本 = 1 本/層 -> 96 = 2 本/層 -> 192 = 4 本/層。
+        assert_eq!(upload_budget(48, 1), 48);
+        assert_eq!(upload_budget(48, 2), 96);
+        assert_eq!(upload_budget(48, 4), 192);
+        // 0 は 0 のまま (ゲート off と同じ「上げない」)。
+        assert_eq!(upload_budget(0, 4), 0);
+        // 0 倍は恒等に丸める (予算を 0 にして上げ直しを止めない)。
+        assert_eq!(upload_budget(48, 0), 48);
+        // 飽和しても溢れない。
+        assert_eq!(upload_budget(usize::MAX, 4), usize::MAX);
+    }
+
+    /// task 406: 倍率の解釈は 1..=8 に丸め、未設定・不正値は既定 4。
+    #[test]
+    fn fill_mult_parses_and_clamps() {
+        assert_eq!(fill_mult_from_value(None), DEFAULT_FILL_MULT);
+        assert_eq!(DEFAULT_FILL_MULT, 4);
+        assert_eq!(fill_mult_from_value(Some("")), 4);
+        assert_eq!(fill_mult_from_value(Some("abc")), 4);
+        assert_eq!(fill_mult_from_value(Some("1")), 1);
+        assert_eq!(fill_mult_from_value(Some(" 2 ")), 2);
+        assert_eq!(fill_mult_from_value(Some("4")), 4);
+        assert_eq!(fill_mult_from_value(Some("99")), 8, "上限 8");
+        assert_eq!(fill_mult_from_value(Some("0")), 1, "0 は 1 に丸める");
+    }
+
+    /// task 406: 諦めるのはゲート on かつ「積めなかった」ときだけ。
+    /// 積めた (`Queued`) / 写像できない (`NoMap`) は従来どおり扱う。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn skip_on_refusal_is_gated_and_keeps_queued_and_nomap() {
+        use SubmitOutcome::*;
+        assert!(!skip_on_refusal(false, Already));
+        assert!(!skip_on_refusal(false, Refused));
+        assert!(skip_on_refusal(true, Already));
+        assert!(skip_on_refusal(true, Refused));
+        assert!(!skip_on_refusal(true, Queued));
+        assert!(!skip_on_refusal(true, NoMap));
     }
 
     #[test]

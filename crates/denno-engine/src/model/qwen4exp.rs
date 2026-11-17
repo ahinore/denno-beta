@@ -13756,10 +13756,25 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     // (背景スレッド経路では上げ直しがメインスレッドの外なので、本数の上限だけ
     // 別に測れるようにしてある)。未設定は従来の規則そのもの。
     let worker = crate::model::exp_up_worker::enabled();
+    // task 406: 空きがある間に詰め込むか (`DENNO_EXP_UP_FILL`) と、その倍率。
+    // 倍率を当てるのは**背景スレッド経路だけ**: 同期 H2D の経路 (ワーカー無し /
+    // 起動失敗) はメインスレッドが 1 本 0.16 ms を払うので従来のままにする。
+    let fill_on = worker && crate::model::exp_up_worker::fill_enabled();
+    let fill_mult = if fill_on {
+        crate::model::exp_up_worker::fill_mult()
+    } else {
+        1
+    };
     // `DENNO_DEC_UP_WORKER_MAX` が無いときのワーカー経路は、予算を**トークン先頭で
     // 1 回**だけ決める。`cache_usage()` は LRU のロックを取るので、層ごとに呼ぶと
     // ワーカーの転送中 (ロック保持 0.16 ms) に当たる (48 回/token)。
     static TOKEN_BUDGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+    // task 406: 空きがある間の予算 (`DENNO_EXP_UP_FILL`)。埋まっているとき
+    // (追い出しが起きる) は従来の控えめな値のまま = 充填の速さだけを変える。
+    let free_budget = || {
+        let base = crate::model::exp_iq::upload_per_token();
+        crate::model::exp_up_worker::upload_budget(base, fill_mult)
+    };
     let budget = match crate::model::exp_up_worker::max_per_token() {
         Some(n) => n,
         None => match (worker, lw.il) {
@@ -13768,7 +13783,7 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
                     Some((used, cap)) if cap > 0 && used.saturating_add(32 << 20) >= cap => {
                         crate::model::exp_iq::upload_when_full()
                     }
-                    _ => crate::model::exp_iq::upload_per_token(),
+                    _ => free_budget(),
                 };
                 TOKEN_BUDGET.store(b, Ordering::Relaxed);
                 b
@@ -13776,7 +13791,7 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
             (true, _) => {
                 let b = TOKEN_BUDGET.load(Ordering::Relaxed);
                 if b == usize::MAX {
-                    crate::model::exp_iq::upload_per_token()
+                    free_budget()
                 } else {
                     b
                 }
@@ -13785,7 +13800,7 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
                 Some((used, cap)) if cap > 0 && used.saturating_add(32 << 20) >= cap => {
                     crate::model::exp_iq::upload_when_full()
                 }
-                _ => crate::model::exp_iq::upload_per_token(),
+                _ => free_budget(),
             },
         },
     };
@@ -13876,7 +13891,15 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
         if worker {
             // task 214: 背景スレッドへ渡す (メインスレッドは待たない)。
             // 1 本でも積めなければ従来の同期経路へ落ちる。
-            if submit_deferred_upload(lw, ei, shapes) {
+            // task 406: `DENNO_EXP_UP_FILL` のときは `Already` / `Refused` で
+            // **この層の残りを諦める** (予算を 2 倍にした目的はメインスレッドを
+            // 止めないことなので、行列が詰まったときに 0.16 ms の同期 H2D を
+            // 撃つと逆行する)。写像できない重み (`NoMap`) は従来どおり同期経路へ。
+            let outcome = submit_deferred_upload(lw, ei, shapes);
+            if crate::model::exp_up_worker::skip_on_refusal(fill_on, outcome) {
+                break;
+            }
+            if outcome == crate::model::exp_up_worker::SubmitOutcome::Queued {
                 left -= 1;
                 can -= 1;
                 LEFT.store(left, Ordering::Relaxed);
@@ -13912,23 +13935,25 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
 
 /// task 214: 1 本を背景スレッドの待ち行列へ積む。
 ///
-/// 積めたら true。積めない (ゲート off / 待ち行列が満杯 / ヒープ実体の重み) なら
-/// false を返し、呼び出し側は従来の同期 H2D 経路へ落ちる。
+/// 積めたら [`SubmitOutcome::Queued`]。積めない理由は呼び出し側が使う
+/// (task 406 の `DENNO_EXP_UP_FILL` は `Already` / `Refused` でこのトークンを諦め、
+/// メインスレッドの同期 H2D へ落とさない)。
 #[cfg(feature = "cuda")]
 fn submit_deferred_upload(
     lw: &LayerW,
     ei: usize,
     shapes: [crate::model::expert_vram::ExpertShape; 3],
-) -> bool {
+) -> crate::model::exp_up_worker::SubmitOutcome {
+    use crate::model::exp_up_worker::SubmitOutcome;
     let part = |w: &ExpertW| w.slice_mapped(ei).ok().flatten();
     let (Some(g), Some(u), Some(d)) = (
         part(&lw.gate_exps),
         part(&lw.up_exps),
         part(&lw.down_exps),
     ) else {
-        return false;
+        return SubmitOutcome::NoMap;
     };
-    crate::model::exp_up_worker::submit(crate::model::exp_up_worker::Job {
+    crate::model::exp_up_worker::submit_detailed(crate::model::exp_up_worker::Job {
         layer: lw.il as u16,
         expert: ei as u16,
         shapes,
