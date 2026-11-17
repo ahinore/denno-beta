@@ -350,27 +350,44 @@ dno_gdn_pf_wy5(
         __syncthreads();
 
         // ---- (7) o = QP + (G の下三角) D ----------------------------------
-        if (tid < WY5_DV) {
-            const int c = tid;
-            for (int i = 0; i < len; ++i) {
-                float acc = QPc[i * WY5_DV + c];
-                for (int j = 0; j <= i; ++j) acc += Gc[i * WY5_C + j] * Dc[j * WY5_DV + c];
-                o_out[(long long)(t0 + i) * vd + h * WY5_DK + voff + c] = acc;
-            }
+        // task 397: D は確定済みなので行は独立。wy4 は 32 スレッドで行を直列に
+        // 回していたが、(i, c) の全要素を 1 スレッドずつに割る (和の順は同じ)。
+        for (int idx = tid; idx < len * WY5_DV; idx += WY5_THREADS) {
+            const int i = idx / WY5_DV;
+            const int c = idx - i * WY5_DV;
+            float acc = QPc[idx];
+            for (int j = 0; j <= i; ++j) acc += Gc[i * WY5_C + j] * Dc[j * WY5_DV + c];
+            o_out[(long long)(t0 + i) * vd + h * WY5_DK + voff + c] = acc;
         }
         __syncthreads();
 
         // ---- (8) 状態の更新 (チャンクに 1 回) -------------------------------
         {
             const float lam_last = sh[WY5_LL];
-            for (int idx = tid; idx < WY5_DK * WY5_DV; idx += WY5_THREADS) {
-                const int r = idx / WY5_DV;
-                const int c = idx - r * WY5_DV;
-                float acc = S[idx] * lam_last;
-                for (int t = 0; t < len; ++t) {
-                    acc += rl[t] * Kc[t * WY5_DK + r] * Dc[t * WY5_DV + c];
+            // task 397: 1 スレッドは列 c を固定して r 方向に 16 本を持つ
+            // (wy4 の idx += THREADS は r が 8 ずつ進むので、同じ 16 本)。
+            // t を外に回して rl[t] と Dc[t][c] を 1 回ずつ読み、積の順は wy4 と
+            // 同じ (rl * Kc * Dc、左から) に保つ。
+            const int per = WY5_DK * WY5_DV / WY5_THREADS;
+            const int step = WY5_THREADS / WY5_DV;
+            const int c = tid % WY5_DV;
+            const int r0 = tid / WY5_DV;
+            float acc[16];
+#pragma unroll
+            for (int k = 0; k < per; ++k) {
+                acc[k] = S[(r0 + k * step) * WY5_DV + c] * lam_last;
+            }
+            for (int t = 0; t < len; ++t) {
+                const float rlt = rl[t];
+                const float dt = Dc[t * WY5_DV + c];
+#pragma unroll
+                for (int k = 0; k < per; ++k) {
+                    acc[k] += rlt * Kc[t * WY5_DK + r0 + k * step] * dt;
                 }
-                S[idx] = acc;
+            }
+#pragma unroll
+            for (int k = 0; k < per; ++k) {
+                S[(r0 + k * step) * WY5_DV + c] = acc[k];
             }
         }
         __syncthreads();
