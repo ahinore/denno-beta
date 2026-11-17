@@ -832,6 +832,12 @@ export function heat(v, scale = 1) {
 ///   st.accum[l]  — decay 付きの選択回数 (mode に依らない。accum モードでは
 ///                  st.experts[l] がこの配列そのものを指す)
 ///   st.topk[l]   — 最後のトークンでルータが選んだ expert のビット
+const ROLE_KEYS = Object.freeze(['attn', 'gdn', 'router', 'shex', 'ple']);
+
+function zeroRoleCount() {
+  return { attn: 0, gdn: 0, router: 0, shex: 0, ple: 0, any: 0 };
+}
+
 export function createMapState(shape, opts = {}) {
   const s = normaliseShape(shape);
   const decay = Number.isFinite(opts.decay) ? opts.decay : 0.9;
@@ -848,6 +854,11 @@ export function createMapState(shape, opts = {}) {
     skip: [],
     role: [],
     act: [],
+    // 構成図 / ノード選択 DSL 用: リセットからの「活性化した回数」(decay なし)。
+    //   count[l][e]   — expert e がルータの top-k に入ったトークン数
+    //   roleCount[l]  — RoleAct の各役割が 0 より大きかったトークン数 (any はどれか 1 つ)
+    count: [],
+    roleCount: [],
     lastToken: null,
     frames: 0,
   };
@@ -861,6 +872,8 @@ export function createMapState(shape, opts = {}) {
     st.skip.push(new Uint8Array(s.n_expert));
     st.role.push({ attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 });
     st.act.push(new Float32Array(ACT_BUCKETS));
+    st.count.push(new Uint32Array(s.n_expert));
+    st.roleCount.push(zeroRoleCount());
   }
 
   st.setMode = (mode) => {
@@ -886,6 +899,8 @@ export function createMapState(shape, opts = {}) {
       st.skip[l].fill(0);
       st.role[l] = { attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 };
       st.act[l].fill(0);
+      st.count[l].fill(0);
+      st.roleCount[l] = zeroRoleCount();
     }
   };
 
@@ -918,6 +933,7 @@ export function createMapState(shape, opts = {}) {
           if (w[i] > 0) {
             top[i] = 1;
             acc[i] += w[i];
+            st.count[l][i]++;
           }
         }
         if (st.mode === 'token') st.experts[l].set(w);
@@ -926,6 +942,12 @@ export function createMapState(shape, opts = {}) {
       }
       case 'RoleAct': {
         st.role[l] = Object.assign({ attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 }, f.roles || {});
+        const rc = st.roleCount[l];
+        let any = false;
+        for (const k of ROLE_KEYS) {
+          if (Number(st.role[l][k]) > 0) { rc[k]++; any = true; }
+        }
+        if (any) rc.any++;
         st.frames++;
         return true;
       }

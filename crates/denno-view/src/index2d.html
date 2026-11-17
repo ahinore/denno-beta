@@ -43,12 +43,14 @@
   .banner.st { border-color:#7a5a12; background:rgba(255,196,77,.10); color:#ffcf7a; }
   .banner.both { border-color:#8a2a4a; background:rgba(255,59,48,.16); color:#ff9db0; }
 
-  main { display:grid; grid-template-columns:340px minmax(500px,1fr) 338px;
+  main { --cw:340px; --tw:330px; --kw:338px; display:grid;
+         grid-template-columns:var(--cw) minmax(420px,1fr) var(--tw) var(--kw);
          grid-template-rows:minmax(0,1fr); height:calc(100% - 42px); }
   section { min-width:0; min-height:0; display:flex; flex-direction:column; padding:8px 10px; }
   #chatpane { border-right:1px solid var(--line); grid-column:1; grid-row:1; }
   #mappane { grid-column:2; grid-row:1; }
-  #ctrl { border-left:1px solid var(--line); overflow-y:auto; gap:8px; grid-column:3; grid-row:1; }
+  #treepane { border-left:1px solid var(--line); grid-column:3; grid-row:1; gap:5px; }
+  #ctrl { border-left:1px solid var(--line); overflow-y:auto; gap:8px; grid-column:4; grid-row:1; }
   h2 { font-size:11px; font-weight:400; letter-spacing:.10em; color:var(--dim);
        margin:0 0 6px; padding-bottom:3px; border-bottom:1px solid var(--line); }
   h2 .dim { color:#38505f; letter-spacing:0; }
@@ -103,11 +105,52 @@
   #mapstat b { color:#7fa4b8; font-weight:400; }
 
   /* task 235: チャット / 操作列を 1 クリックで畳む (地図に場所を渡す) */
-  main.hide-chat { grid-template-columns:0 minmax(500px,1fr) 338px; }
+  main.hide-chat { --cw:0px; }
   main.hide-chat #chatpane { display:none; }
-  main.hide-ctrl { grid-template-columns:340px minmax(500px,1fr) 0; }
+  main.hide-ctrl { --kw:0px; }
   main.hide-ctrl #ctrl { display:none; }
-  main.hide-chat.hide-ctrl { grid-template-columns:0 minmax(500px,1fr) 0; }
+  main.hide-tree { --tw:0px; }
+  main.hide-tree #treepane { display:none; }
+
+  /* ---- 構成図の操作 (拡大縮小 / 表示の切り替え) ---- */
+  .zoombar { display:flex; gap:2px; align-items:center; flex:none; }
+  .zoombar button { background:#0a1620; color:#8fb4c8; border:1px solid var(--line); border-radius:3px;
+                    font:inherit; font-size:10px; padding:1px 7px; cursor:pointer; }
+  .zoombar button.on { background:#0f3a4d; color:#9fefff; border-color:#2f8aa8; }
+  .zoombar #zoomstat { color:var(--dim); font-size:10px; min-width:44px; text-align:right; }
+  #map.arch { cursor:grab; }
+  #map.arch.panning { cursor:grabbing; }
+
+  /* ---- ノードのツリーと選択式 ---- */
+  #dsl { width:100%; height:46px; resize:vertical; background:#08131c; color:var(--fg);
+         border:1px solid #1b4b60; border-radius:3px; font:inherit; font-size:11px; padding:4px 6px; outline:none; }
+  #dsl:focus { border-color:#2f8aa8; }
+  #dsl.bad { border-color:#a8323c; }
+  #dslstat { font-size:10px; color:#7fa4b8; min-height:14px; white-space:pre-wrap; word-break:break-word; }
+  #dslstat.err { color:#ff6b86; }
+  #dslhelp { font-size:10px; color:#8fb4c8; }
+  #dslhelp summary { cursor:pointer; color:var(--dim); }
+  #dslhelp pre { margin:4px 0 0; padding:5px 6px; background:#060e15; border:1px solid var(--line);
+                 border-radius:3px; white-space:pre-wrap; font-size:9.5px; line-height:1.45; max-height:220px; overflow:auto; }
+  #dslhelp .ex { display:block; cursor:pointer; color:#9fdcff; }
+  #dslhelp .ex:hover { text-decoration:underline; }
+  #tree { flex:1; min-height:120px; overflow-y:auto; position:relative; border:1px solid var(--line);
+          border-radius:4px; background:#050b11; }
+  #treein { position:relative; }
+  .tr { position:absolute; left:0; right:0; height:20px; display:flex; align-items:center; gap:3px;
+        padding-right:6px; font-size:11px; white-space:nowrap; cursor:default; }
+  .tr:hover { background:#0b1b26; }
+  .tr.hit { background:#10283a; }
+  .tr .tw { width:14px; flex:none; text-align:center; color:var(--dim); cursor:pointer; user-select:none; }
+  .tr input { margin:0; accent-color:#2f8aa8; flex:none; }
+  .tr .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+  .tr .nm.info { color:var(--dim); }
+  .tr .mt { color:#5f8296; font-size:9.5px; flex:none; }
+  .tr .of { color:#ff8a94; font-size:9px; border:1px solid #6b2a33; border-radius:2px; padding:0 3px; flex:none; }
+  .tr .k-qsa { color:#c79bff; }
+  .tr .k-gdn { color:#4fe3b8; }
+  #treefoot { display:flex; gap:4px; flex-wrap:wrap; }
+  #treefoot button { flex:1; }
 
   /* ---- controls ---- */
   .box { border:1px solid var(--line); border-radius:5px; padding:7px 8px; background:var(--panel); }
@@ -156,6 +199,7 @@
   <div class="sp"></div>
   <div class="modes">panes:
     <button id="t-chat" class="on">chat</button>
+    <button id="t-tree" class="on">tree</button>
     <button id="t-ctrl" class="on">ctrl</button>
   </div>
   <div class="modes">colour:
@@ -185,7 +229,16 @@
 
   <section id="mappane">
     <div id="maphead">
-      <h2>layer wall <span class="dim" id="shapeline"></span></h2>
+      <h2><span id="viewname">architecture</span> <span class="dim" id="shapeline"></span></h2>
+      <div class="zoombar">
+        <button id="v-arch" class="on" title="公式の構成図と同じ並びの図 (拡大縮小できる)">arch</button>
+        <button id="v-wall" title="48 層をタイルで並べた従来の表示">wall</button>
+        <span style="width:6px"></span>
+        <button id="z-out" title="縮小 (ホイールでも可)">−</button>
+        <span id="zoomstat">-</span>
+        <button id="z-in" title="拡大 (ホイールでも可)">+</button>
+        <button id="z-fit" title="全体を表示 (キー 0)">fit</button>
+      </div>
       <div id="legend">
         <span><i class="sw" style="background:#b46bff"></i>full</span>
         <span><i class="sw" style="background:#00d9a0"></i>gdn</span>
@@ -209,6 +262,47 @@
     </div>
     <div id="cachenote"></div>
     <div id="tip"></div>
+  </section>
+
+  <section id="treepane">
+    <h2>nodes <span class="dim" id="treecount"></span></h2>
+    <textarea id="dsl" spellcheck="false" placeholder='選択式 (Ctrl+Enter で選択)  例: expert: count == 0 and layer >= 40'></textarea>
+    <div class="row2" style="margin-top:0">
+      <button id="dsl-sel" class="b go" title="式に合うノードで選択を置き換える (Ctrl+Enter)">select</button>
+      <button id="dsl-add" class="b" title="式に合うノードを選択に足す (Shift+Enter)">+ add</button>
+      <button id="dsl-sub" class="b" title="式に合うノードを選択から外す">− remove</button>
+      <button id="dsl-show" class="b" title="合ったノードをツリーで開いて見せる">reveal</button>
+    </div>
+    <div id="dslstat"></div>
+    <details id="dslhelp"><summary>選択式の書き方</summary>
+<pre>[種類:] 条件 [| top N by 式 [per layer|hybrid]] [| limit N] ; …
+種類 expert mixer moe shared ple stream block layer hybrid
+     residual ffn experts *   (省略時は介入できる全種類)
+値   layer hybrid pos index kind("gdn"|"qsa") type
+     count=活性化した回数 rate=count/tokens rank=層内順位
+     act/w=最後のトークン acc=累積 topk off sel vram skip
+     tokens layers n_expert n_used n_hc
+演算 + - * / % ^  == != < <= > >= (0 <= layer < 8 も可)
+     and or not  x in a..b  x in [1, 2]
+関数 abs min max sqrt log log2 exp floor ceil round clamp
+     lmax lmin lmean lsum(式) = 同じ層の同じ種類で集計
+     gmax gmin gmean gsum(式) = 全層で集計
+例 (押すと入る):</pre>
+      <span class="ex">expert: count == 0 and layer >= 40</span>
+      <span class="ex">expert: count >= 0.5 * lmax(count)</span>
+      <span class="ex">expert: rate > 0.05 | top 5 by count per layer</span>
+      <span class="ex">mixer: kind == "qsa" and layer % 8 == 3</span>
+      <span class="ex">stream: index == 0 and layer in 0..11; moe: layer in [5, 9, 17]</span>
+      <span class="ex">shared: act > 2 * gmean(act)</span>
+      <span class="ex">expert: off</span>
+    </details>
+    <div id="tree"><div id="treein"></div></div>
+    <div id="treefoot">
+      <button id="tr-off" class="b warn" title="チェックしたノードを off にする (POST /v1/intervene)">switch off checked</button>
+      <button id="tr-on" class="b" title="チェックしたノードを on に戻す">switch on checked</button>
+      <button id="tr-clear" class="b" title="チェックを全部外す">clear</button>
+      <button id="tr-fold" class="b" title="ツリーを畳む">fold</button>
+    </div>
   </section>
 
   <section id="ctrl">
@@ -286,8 +380,16 @@ import {
   mockTokenFrames, normaliseShape, rampRGB, roleForBlock, selectionCount,
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
   toggleItem, addItem, removeItem, selectionItems, wallHitTest,
-  wallItemsInRect, wallLayout,
+  wallItemsInRect, wallLayout, hasItem,
 } from '/view2d.mjs';
+import {
+  archLayout, archHitTest, archItemsInRect, archNodeRect, drawArch, fitView, gridPixels,
+  toWorld, zoomAt,
+} from '/arch2d.mjs';
+import {
+  buildTree, visibleRows, ancestorIds, nodeCheckState, nodeItems, createEnv, runDsl,
+  dslSummary, DslError,
+} from '/nodes2d.mjs';
 
 const $ = (id) => document.getElementById(id);
 const Q = new URLSearchParams(location.search);
@@ -309,6 +411,17 @@ let offStr = new Map();                // layer -> Set(stream)
 let dirty = true;
 let requests = [];
 let ivSig = '';                        // 介入の内容の署名 (skip 表示の取り消し用)
+// 構成図 (arch) / 従来の壁 (wall)
+let viewMode = Q.get('view') === 'wall' ? 'wall' : 'arch';
+let arch = null;                       // archLayout(shape)
+let view = { s: 0.1, tx: 0, ty: 0 };   // 世界 → 画面
+let viewFitted = false;
+let gridImgs = [];                     // 層ごとの expert 格子の縮小画像
+let gridDirty = true;
+let tree = null;                       // buildTree(shape)
+const expanded = new Set(['H0', 'L0']);
+let treeDirty = true;
+let treeHit = new Set();               // 最後の選択式に合ったノード id
 
 // ---- API (live or mock) -------------------------------------------------
 async function api(method, path, body) {
@@ -443,6 +556,7 @@ async function probeLive(first) {
 
 async function boot() {
   rebuild(shape);                 // 既定の形で枠を描く (live が返ったら差し替え)
+  setViewMode(viewMode);
   $('lfrom').max = String(shape.layers);
   $('lto').max = String(shape.layers);
   $('lto').value = String(shape.layers);   // 実 API の layers は [from, to)
@@ -474,11 +588,70 @@ function paneSize() {
 
 function relayout(force) {
   const p = paneSize();
-  const key = p.w + 'x' + p.h;
+  const key = viewMode + ':' + p.w + 'x' + p.h;
   if (!force && wall && key === lastPaneKey) return;
+  const prev = lastPaneKey;
   lastPaneKey = key;
   wall = wallLayout(shape, p);
-  fitCanvas();
+  if (viewMode === 'arch') {
+    fitArchCanvas(p);
+    // 画面の大きさが変わったら中心を保つ (初回は全体を収める)
+    if (!viewFitted) { view = fitView(arch.bounds, p); viewFitted = true; }
+    else if (prev) {
+      const m = /:(\d+)x(\d+)$/.exec(prev);
+      if (m) { view.tx += (p.w - +m[1]) / 2; view.ty += (p.h - +m[2]) / 2; }
+    }
+    renderZoom();
+  } else {
+    fitCanvas();
+  }
+  dirty = true;
+}
+
+/// 構成図: canvas は地図の実面積そのもの (拡大縮小は view で行う)。
+function fitArchCanvas(p) {
+  const c = $('map');
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  c.width = Math.max(1, Math.round(p.w * dpr));
+  c.height = Math.max(1, Math.round(p.h * dpr));
+  c.style.width = p.w + 'px';
+  c.style.height = p.h + 'px';
+  c.className = 'arch';
+  $('mapwrap').style.overflow = 'hidden';
+  $('gridstat').textContent = arch.blocks.length + ' blocks · ' + arch.panels.length + ' layers';
+  $('cellstat').textContent = 'world ' + arch.width + 'x' + arch.height;
+  document.body.dataset.map = 'arch pane=' + p.w + 'x' + p.h;
+}
+
+function renderZoom() {
+  $('zoomstat').textContent = (view.s * 100 < 10 ? (view.s * 100).toFixed(1) : Math.round(view.s * 100)) + '%';
+}
+
+function setViewMode(m) {
+  viewMode = m === 'wall' ? 'wall' : 'arch';
+  $('v-arch').classList.toggle('on', viewMode === 'arch');
+  $('v-wall').classList.toggle('on', viewMode === 'wall');
+  $('viewname').textContent = viewMode === 'arch' ? 'architecture' : 'layer wall';
+  for (const id of ['z-out', 'z-in', 'z-fit']) $(id).disabled = viewMode !== 'arch';
+  $('map').className = viewMode === 'arch' ? 'arch' : '';
+  hover = null;
+  relayout(true);
+}
+
+/// 画面の中心を保って factor 倍 (ボタン / キー)。
+function zoomBy(factor, sx, sy) {
+  const p = paneSize();
+  const fit = fitView(arch.bounds, p).s;
+  view = zoomAt(view, factor, sx == null ? p.w / 2 : sx, sy == null ? p.h / 2 : sy, fit * 0.4, 12);
+  renderZoom();
+  dirty = true;
+}
+
+/// 世界座標の矩形へ寄る (ツリー / ダブルクリック)。
+function focusRect(r, margin) {
+  if (!r) return;
+  view = fitView(r, paneSize(), margin == null ? 30 : margin);
+  renderZoom();
   dirty = true;
 }
 
@@ -508,6 +681,13 @@ function rebuild(next) {
   $('shapeline').textContent = shape.layers + 'L · ' + shape.n_expert + 'e top-' +
     shape.n_expert_used + ' · ' + shape.n_hc + 'hc';
   buildScale();
+  arch = archLayout(shape);
+  gridImgs = [];
+  gridDirty = true;
+  viewFitted = false;
+  tree = buildTree(shape);
+  treeHit = new Set();
+  treeDirty = true;
   relayout(true);
   dirty = true;
 }
@@ -671,6 +851,8 @@ function renderState() {
       : n.steer ? 'st' : 'iv');
   }
   $('applyinfo').textContent = steer.apply ? 'applied: ' + steerSummary(steer.apply) : '';
+  treeDirty = true;
+  gridDirty = true;
 }
 
 // ---- 介入の操作 ---------------------------------------------------------
@@ -1048,11 +1230,69 @@ $('btn-resclear').addEventListener('click', () => {
 });
 
 // ---- 地図の描画 (task 235: 層の壁) ---------------------------------------
-function tick() {
+let lastTreeRender = 0;
+function tick(now) {
   requestAnimationFrame(tick);
+  // ツリーの値 (count など) はテレメトリで動くので 4 Hz で描き直す
+  // (押している間は描き直さない。行が差し替わるとクリックが落ちる)
+  if (!treePress && ((treeDirty && now - lastTreeRender > 30) || (dirty && now - lastTreeRender > 250))) {
+    renderTree();
+    lastTreeRender = now;
+  }
   if (!dirty || !wall) return;
   dirty = false;
-  draw();
+  if (viewMode === 'arch') drawArchView();
+  else draw();
+}
+
+// ---- 構成図の描画 -------------------------------------------------------
+function gridImage(l) {
+  if (typeof document === 'undefined') return null;
+  let c = gridImgs[l];
+  const gd = arch.panels[l].grid;
+  if (!c) {
+    c = document.createElement('canvas');
+    c.width = gd.cols; c.height = gd.rows;
+    c._img = c.getContext('2d').createImageData(gd.cols, gd.rows);
+    c._dirty = true;
+    gridImgs[l] = c;
+  }
+  if (gridDirty || c._dirty) {
+    gridPixels(arch, st, l, c._img.data, offExp.get(l), offBlk.has(l + ':moe'));
+    c.getContext('2d').putImageData(c._img, 0, 0);
+    c._dirty = false;
+  }
+  return c;
+}
+
+function focusHybridOf(h) {
+  if (!h) return null;
+  if (h.type === 'hybrid') return h.hybrid;
+  if (h.layer != null) return Math.floor(h.layer / 4);
+  return null;
+}
+
+function drawArchView() {
+  const c = $('map');
+  const g = c.getContext('2d');
+  const p = paneSize();
+  const dpr = c.width / Math.max(1, p.w);
+  // 縮小画像は描画のたびに 1 回だけ作り直す (層ごとに必要になったら)
+  for (const img of gridImgs) if (img) img._dirty = true;
+  gridDirty = false;
+  const dragKeys = drag && drag.items ? new Set(drag.items.map(itemKey)) : null;
+  drawArch(g, arch, { s: view.s, tx: view.tx, ty: view.ty, w: p.w, h: p.h }, {
+    st, offExp, offBlk, offStr, isSel, dragKeys, hover, vramOn, gridImage, dpr,
+    focusHybrid: focusHybridOf(hover),
+  });
+  if (drag && drag.active && drag.select) {
+    const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
+    const w = Math.abs(drag.x1 - drag.x0), h = Math.abs(drag.y1 - drag.y0);
+    g.fillStyle = 'rgba(120,220,255,.12)';
+    g.fillRect(x, y, w, h);
+    g.strokeStyle = 'rgba(140,230,255,.7)';
+    g.strokeRect(x + .5, y + .5, w, h);
+  }
 }
 
 function itemKey(it) {
@@ -1276,7 +1516,117 @@ function describe(hit) {
     (offStr.get(hit.layer) && offStr.get(hit.layer).has(hit.stream) ? ' · OFF' : '');
 }
 
+// ---- 構成図の操作 ------------------------------------------------------
+// ドラッグ = 移動、Shift+ドラッグ = 範囲で選択に足す、クリック = 選択の切り替え、
+// ホイール = 拡大縮小、ダブルクリック = その部品へ寄る、0 = 全体。
+function archHit(p) {
+  const w = toWorld(view, p.x, p.y);
+  return archHitTest(arch, w.x, w.y);
+}
+
+function describeArch(hit) {
+  if (!hit) return '';
+  if (hit.type === 'column') return 'layer ' + hit.layer + ' · ' + (shape.layer_kinds[hit.layer] === 'attn' ? 'QSA' : 'GDN') +
+    ' · act ' + (Math.round(streamValue(st.role[hit.layer] || {}) * 100) / 100) + ' · クリックで詳細へ';
+  if (hit.type === 'panel') return 'layer ' + hit.layer + ' · ダブルクリックで寄る';
+  if (hit.type === 'hybrid') return 'hybrid block ' + hit.hybrid + ' · クリックで寄る';
+  if (hit.type === 'info') return 'layer ' + hit.layer + ' · ' + hit.label + ' (介入の対象外)';
+  if (hit.type === 'top') return { mtp: 'MTP modules', grFinal: 'final GR Read', hidFinal: 'final hidden state',
+    head: 'Prediction head', vocab: 'Vocabulary embedding', ngram: 'N-gram embedding (PLE)' }[hit.part] || hit.part;
+  let s = describe(hit);
+  if (hit.type === 'expert' && st.count[hit.layer]) s += ' · activated ' + st.count[hit.layer][hit.expert] + 'x';
+  return s;
+}
+
+function showTip(ev, text) {
+  if (!text) { tip.style.display = 'none'; return; }
+  tip.style.display = 'block';
+  tip.textContent = text;
+  tip.style.left = (ev.clientX + 14) + 'px';
+  tip.style.top = (ev.clientY + 12) + 'px';
+}
+
+function archDown(ev) {
+  const p = mapPoint(ev);
+  drag = {
+    x0: p.x, y0: p.y, x1: p.x, y1: p.y, active: false, select: ev.shiftKey,
+    hit: archHit(p), items: null, tx: view.tx, ty: view.ty,
+  };
+  canvas.setPointerCapture(ev.pointerId);
+}
+
+function archMove(ev) {
+  const p = mapPoint(ev);
+  if (drag) {
+    drag.x1 = p.x; drag.y1 = p.y;
+    if (!drag.active && (Math.abs(p.x - drag.x0) > 3 || Math.abs(p.y - drag.y0) > 3)) {
+      drag.active = true;
+      if (!drag.select) canvas.classList.add('panning');
+      tip.style.display = 'none';
+    }
+    if (drag.active) {
+      if (drag.select) {
+        const a = toWorld(view, drag.x0, drag.y0), b = toWorld(view, p.x, p.y);
+        drag.items = archItemsInRect(arch, a.x, a.y, b.x, b.y);
+        $('n-sel').textContent = String(selectionCount(sel) + drag.items.length);
+      } else {
+        view.tx = drag.tx + (p.x - drag.x0);
+        view.ty = drag.ty + (p.y - drag.y0);
+      }
+      dirty = true;
+    }
+    return;
+  }
+  const hit = archHit(p);
+  const changed = JSON.stringify(hit) !== JSON.stringify(hover);
+  hover = hit;
+  if (changed) dirty = true;
+  showTip(ev, describeArch(hit));
+}
+
+function archUp() {
+  const d = drag;
+  drag = null;
+  canvas.classList.remove('panning');
+  if (!d) return;
+  if (d.active) {
+    if (d.select) for (const it of d.items || []) addItem(sel, it);
+  } else if (d.hit) {
+    const h = d.hit;
+    if (h.type === 'expert' || h.type === 'block' || h.type === 'stream') toggleItem(sel, h);
+    else if (h.type === 'column') { focusRect(arch.panels[h.layer]); revealNode('L' + h.layer); }
+    else if (h.type === 'hybrid') { focusRect(arch.blocks[h.hybrid]); revealNode('H' + h.hybrid); }
+  }
+  renderState();
+  dirty = true;
+}
+
+canvas.addEventListener('wheel', (ev) => {
+  if (viewMode !== 'arch') return;
+  ev.preventDefault();
+  const p = mapPoint(ev);
+  const k = ev.deltaMode === 1 ? 40 : ev.deltaMode === 2 ? 400 : 1;
+  zoomBy(Math.exp(-ev.deltaY * k * 0.0015), p.x, p.y);
+}, { passive: false });
+
+canvas.addEventListener('dblclick', (ev) => {
+  if (viewMode !== 'arch') return;
+  const p = mapPoint(ev);
+  const h = archHit(p);
+  if (h && h.type === 'expert') focusRect(archNodeRect(arch, 'L' + h.layer + '/e' + h.expert));
+  else if (h && h.type === 'block' && h.block === 'moe') focusRect(arch.panels[h.layer].moe);
+  else if (h && h.layer != null && h.type !== 'column') focusRect(arch.panels[h.layer]);
+  else zoomBy(2, p.x, p.y);
+});
+
+$('z-in').addEventListener('click', () => zoomBy(1.5));
+$('z-out').addEventListener('click', () => zoomBy(1 / 1.5));
+$('z-fit').addEventListener('click', () => focusRect(arch.bounds, 16));
+$('v-arch').addEventListener('click', () => setViewMode('arch'));
+$('v-wall').addEventListener('click', () => setViewMode('wall'));
+
 canvas.addEventListener('pointerdown', (ev) => {
+  if (viewMode === 'arch') { archDown(ev); return; }
   const p = mapPoint(ev);
   const hit = wallHitTest(wall, p.x, p.y);
   drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, add: !ev.shiftKey, active: false, hit, items: null };
@@ -1284,6 +1634,7 @@ canvas.addEventListener('pointerdown', (ev) => {
 });
 
 canvas.addEventListener('pointermove', (ev) => {
+  if (viewMode === 'arch') { archMove(ev); return; }
   const p = mapPoint(ev);
   if (drag) {
     drag.x1 = p.x; drag.y1 = p.y;
@@ -1310,6 +1661,7 @@ canvas.addEventListener('pointermove', (ev) => {
 });
 
 canvas.addEventListener('pointerup', () => {
+  if (viewMode === 'arch') { archUp(); return; }
   const d = drag;
   drag = null;
   if (!d) return;
@@ -1330,7 +1682,9 @@ canvas.addEventListener('pointerup', () => {
 });
 
 canvas.addEventListener('pointerleave', () => {
-  hover = null; drag = null; $('tip').style.display = 'none'; dirty = true;
+  hover = null; $('tip').style.display = 'none'; dirty = true;
+  // 構成図の移動はポインタを捕まえているので、外に出ても続ける
+  if (viewMode !== 'arch') drag = null;
 });
 
 canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
@@ -1358,15 +1712,191 @@ $('cb-vram').addEventListener('change', () => {
 // チャット / 操作列の畳み (1 クリック)。地図に場所を渡す。
 function togglePane(which) {
   const main = document.querySelector('main');
-  const cls = which === 'chat' ? 'hide-chat' : 'hide-ctrl';
+  const cls = 'hide-' + which;
   const on = !main.classList.contains(cls);
   main.classList.toggle(cls, on);
-  $(which === 'chat' ? 't-chat' : 't-ctrl').classList.toggle('on', !on);
-  lastPaneKey = '';
+  $('t-' + which).classList.toggle('on', !on);
   requestAnimationFrame(() => relayout(true));
+  treeDirty = true;
 }
 $('t-chat').addEventListener('click', () => togglePane('chat'));
+$('t-tree').addEventListener('click', () => togglePane('tree'));
 $('t-ctrl').addEventListener('click', () => togglePane('ctrl'));
+
+// ---- ノードのツリー (仮想スクロール) ------------------------------------
+// チェック = 選択 (sel)。グループのチェックは下の全 item。下の「switch off / on
+// checked」は操作列の「switch off / on selected」と同じ処理 (層あたり n_expert_used
+// 個は残す規則つき)。名前を押すと構成図がそのノードへ寄る。
+const ROW_H = 20;
+const treeEl = $('tree');
+const treeIn = $('treein');
+let treeRows = [];
+
+function selHas(item) { return hasItem(sel, item); }
+
+function nodeMetric(env, n) {
+  if (n.type === 'info' || n.type === 'group' || n.type === 'model') return '';
+  const c = env.count(n);
+  const a = env.act(n);
+  return 'c' + c + (a > 0 ? ' · ' + a.toFixed(2) : '');
+}
+
+function nodeOffCount(n) {
+  let k = 0;
+  for (let i = n.lo; i < n.hi; i++) {
+    const it = tree.items[i].item;
+    if (it.type === 'expert') { if (offExp.get(it.layer) && offExp.get(it.layer).has(it.expert)) k++; }
+    else if (it.type === 'stream') { if (offStr.get(it.layer) && offStr.get(it.layer).has(it.stream)) k++; }
+    else if (offBlk.has(it.layer + ':' + it.block)) k++;
+  }
+  return k;
+}
+
+function renderTree() {
+  treeDirty = false;
+  if (!tree || document.querySelector('main').classList.contains('hide-tree')) return;
+  treeRows = visibleRows(tree, expanded);
+  treeIn.style.height = (treeRows.length * ROW_H) + 'px';
+  const top = treeEl.scrollTop;
+  const h = treeEl.clientHeight || 400;
+  const a = Math.max(0, Math.floor(top / ROW_H) - 5);
+  const b = Math.min(treeRows.length, Math.ceil((top + h) / ROW_H) + 5);
+  const env = createEnv(tree, { st, off: applied, has: selHas });
+  const html = [];
+  for (let i = a; i < b; i++) {
+    const n = treeRows[i];
+    const kids = n.children && n.children.length;
+    const open = expanded.has(n.id);
+    const cs = nodeCheckState(tree, n, selHas);
+    const off = n.hi > n.lo ? nodeOffCount(n) : 0;
+    const kcls = n.type === 'layer' ? (n.kind === 'attn' ? ' k-qsa' : ' k-gdn') : '';
+    html.push('<div class="tr' + (treeHit.has(n.id) ? ' hit' : '') + '" data-i="' + i + '" style="top:' +
+      (i * ROW_H) + 'px;padding-left:' + (4 + n.depth * 11) + 'px">' +
+      '<span class="tw">' + (kids ? (open ? '▾' : '▸') : '') + '</span>' +
+      (cs === 'na' ? '<input type="checkbox" disabled>'
+        : '<input type="checkbox"' + (cs === 'all' ? ' checked' : '') + (cs === 'some' ? ' data-some="1"' : '') + '>') +
+      '<span class="nm' + (cs === 'na' ? ' info' : '') + kcls + '" title="' + esc(n.id) + '">' + esc(n.label) + '</span>' +
+      (off ? '<span class="of">' + (n.item ? 'OFF' : off + ' off') + '</span>' : '') +
+      '<span class="mt">' + nodeMetric(env, n) + '</span></div>');
+  }
+  treeIn.innerHTML = html.join('');
+  for (const cb of treeIn.querySelectorAll('input[data-some]')) cb.indeterminate = true;
+  $('treecount').textContent = tree.nodes.length + ' nodes · ' + selectionCount(sel) + ' checked';
+}
+
+treeEl.addEventListener('scroll', () => renderTree());
+var treePress = false;
+treeEl.addEventListener('pointerdown', () => { treePress = true; });
+addEventListener('pointerup', () => { if (treePress) { treePress = false; treeDirty = true; } });
+
+treeIn.addEventListener('click', (ev) => {
+  const row = ev.target.closest('.tr');
+  if (!row) return;
+  const n = treeRows[+row.dataset.i];
+  if (!n) return;
+  if (ev.target.classList.contains('tw')) {
+    if (expanded.has(n.id)) expanded.delete(n.id); else expanded.add(n.id);
+    treeDirty = true;
+    return;
+  }
+  if (ev.target.tagName === 'INPUT') {
+    const cs = nodeCheckState(tree, n, selHas);
+    const items = nodeItems(tree, n);
+    if (cs === 'all') for (const it of items) removeItem(sel, it);
+    else for (const it of items) addItem(sel, it);
+    renderState();
+    dirty = true;
+    return;
+  }
+  if (ev.target.classList.contains('nm')) {
+    if (viewMode === 'arch') focusRect(archNodeRect(arch, n.id));
+    if (n.children && !expanded.has(n.id)) { expanded.add(n.id); treeDirty = true; }
+  }
+});
+
+treeIn.addEventListener('mousemove', (ev) => {
+  const row = ev.target.closest('.tr');
+  const n = row ? treeRows[+row.dataset.i] : null;
+  let h = null;
+  if (n && n.item) h = n.item;
+  else if (n && n.type === 'hybrid') h = { type: 'hybrid', hybrid: n.hybrid };
+  else if (n && n.layer >= 0) h = { type: 'panel', layer: n.layer };
+  if (JSON.stringify(h) !== JSON.stringify(hover)) { hover = h; dirty = true; }
+});
+treeIn.addEventListener('mouseleave', () => { hover = null; dirty = true; });
+
+/// ノードの祖先を開いて、見える位置までスクロールする。
+function revealNode(id) {
+  const n = tree && tree.byId.get(id);
+  if (!n) return;
+  for (const a of ancestorIds(n)) expanded.add(a);
+  renderTree();
+  const i = treeRows.indexOf(n);
+  if (i >= 0) treeEl.scrollTop = Math.max(0, i * ROW_H - treeEl.clientHeight / 3);
+  treeDirty = true;
+}
+
+$('tr-off').addEventListener('click', () => $('btn-off').click());
+$('tr-on').addEventListener('click', () => $('btn-on').click());
+$('tr-clear').addEventListener('click', () => { clearSel(sel); renderState(); dirty = true; });
+$('tr-fold').addEventListener('click', () => { expanded.clear(); treeEl.scrollTop = 0; treeDirty = true; });
+
+// ---- 選択式 (DSL) -------------------------------------------------------
+let lastDsl = null;
+
+function evalDsl() {
+  const src = $('dsl').value;
+  const stat = $('dslstat');
+  try {
+    const res = runDsl(src, tree, { st, off: applied, has: selHas });
+    $('dsl').classList.remove('bad');
+    stat.className = '';
+    stat.textContent = dslSummary(res);
+    treeHit = new Set(res.nodes.map((n) => n.id));
+    lastDsl = res;
+    treeDirty = true;
+    return res;
+  } catch (e) {
+    if (!(e instanceof DslError)) throw e;
+    $('dsl').classList.add('bad');
+    stat.className = 'err';
+    // 位置を ^ で示す (式の該当行)
+    const before = src.slice(0, e.pos);
+    const line = before.split('\n').length;
+    const col = before.length - before.lastIndexOf('\n') - 1;
+    const text = src.split('\n')[line - 1] || '';
+    stat.textContent = e.message + '\n' + text + '\n' + ' '.repeat(col) + '^';
+    lastDsl = null;
+    return null;
+  }
+}
+
+function dslApply(how) {
+  const res = evalDsl();
+  if (!res) return;
+  if (how === 'set') clearSel(sel);
+  for (const it of res.items) (how === 'sub' ? removeItem : addItem)(sel, it);
+  renderState();
+  dirty = true;
+}
+
+$('dsl-sel').addEventListener('click', () => dslApply('set'));
+$('dsl-add').addEventListener('click', () => dslApply('add'));
+$('dsl-sub').addEventListener('click', () => dslApply('sub'));
+$('dsl-show').addEventListener('click', () => {
+  const res = evalDsl();
+  if (!res || !res.nodes.length) return;
+  for (const n of res.nodes.slice(0, 200)) for (const a of ancestorIds(n)) expanded.add(a);
+  revealNode(res.nodes[0].id);
+  if (viewMode === 'arch') focusRect(archNodeRect(arch, res.nodes[0].id));
+});
+$('dsl').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); dslApply('set'); }
+  else if (ev.key === 'Enter' && ev.shiftKey) { ev.preventDefault(); dslApply('add'); }
+});
+for (const ex of document.querySelectorAll('#dslhelp .ex')) {
+  ex.addEventListener('click', () => { $('dsl').value = ex.textContent; evalDsl(); });
+}
 
 // ---- テレメトリ ---------------------------------------------------------
 let wsRetry = 2000;
@@ -1675,6 +2205,11 @@ function setBusy(on) {
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
   if (e.key === 'Escape') { clearSel(sel); renderState(); dirty = true; }
+  if (viewMode === 'arch' && arch) {
+    if (e.key === '0') focusRect(arch.bounds, 16);
+    else if (e.key === '+' || e.key === '=') zoomBy(1.5);
+    else if (e.key === '-') zoomBy(1 / 1.5);
+  }
 });
 
 // ---- 検証用フック (?shot / CDP から叩く) --------------------------------
@@ -1713,6 +2248,17 @@ window.__view2d = {
   refreshCtx: () => refreshCtx(),
   api,
   pushFrame: (f) => handleFrame(f),
+  // 構成図 / ツリー / 選択式
+  arch: () => arch,
+  view: () => Object.assign({}, view),
+  setView: (v) => { view = Object.assign({}, view, v); renderZoom(); dirty = true; },
+  setViewMode,
+  focus: (id) => focusRect(archNodeRect(arch, id)),
+  tree: () => tree,
+  treeRows: () => treeRows.map((n) => n.id),
+  expand: (id) => { expanded.add(id); treeDirty = true; },
+  reveal: (id) => revealNode(id),
+  dsl: (src, how) => { $('dsl').value = src; if (how) dslApply(how); else evalDsl(); return lastDsl ? dslSummary(lastDsl) : $('dslstat').textContent; },
   ready: false,
 };
 
