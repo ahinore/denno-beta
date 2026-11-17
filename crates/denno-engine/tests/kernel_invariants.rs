@@ -11676,3 +11676,74 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
         "PLE 層の res D2H が 2 箇所 (層優先 / チャンク優先) に無い"
     );
 }
+
+/// `DENNO_PF_GDN_WSTAT`: GDN の重み 4 本のアップロードが **鍵を通る 1 本**に
+/// まとまっていて、3 つの呼び出し口 (層優先 prefill / チャンク優先 / decode) が
+/// 同じ関数を使っていること。
+///
+/// 飛ばす条件は「同じ層・同じバイト列・同じ置き場」だけ (テストは
+/// `cuda::task393_tests::gdn_wstat_key_covers_layer_src_and_dst` が固定する)。
+/// 緑は発火の証拠ではないので、効いたかは lab の `[q4ledger-pf]` ssm exposed で見る。
+#[cfg(feature = "cuda")]
+#[test]
+fn task393_gdn_wstat_is_wired_through_one_helper() {
+    assert_eq!(
+        CUDA_RS
+            .matches("pub const GDN_WSTAT_ENV: &str = \"DENNO_PF_GDN_WSTAT\";")
+            .count(),
+        1,
+        "env 名の宣言が 1 箇所でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub const DEFAULT_GDN_WSTAT: bool = false;"),
+        "既定が off でない (lab で採るまで off)"
+    );
+    let f = CUDA_RS
+        .split("pub(crate) fn gdn_wstat_from_value(")
+        .nth(1)
+        .expect("解釈が無い");
+    let head = &f[..f.find('}').expect("本体が無い")];
+    assert!(
+        head.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+        "真値の集合が変わった"
+    );
+    assert!(
+        head.contains("None | Some(\"\") => DEFAULT_GDN_WSTAT"),
+        "未設定・空が既定へ落ちていない"
+    );
+    // 生の copy_from は 0、鍵を通る呼び出しが 3 箇所。
+    assert_eq!(
+        CUDA_RS
+            .matches("s.wc.as_ref().unwrap().copy_from(wconv)?")
+            .count(),
+        0,
+        "鍵を通らない重みのアップロードが残っている"
+    );
+    assert_eq!(
+        CUDA_RS
+            .matches("gdn_put_weights(&s, li, [wconv, wa, wdt, wnorm])?")
+            .count(),
+        3,
+        "重みのアップロードが 3 箇所 (層優先 / チャンク優先 / decode) でない"
+    );
+    // 鍵は純関数で、層・転送元・置き場の全部を見る。
+    let k = CUDA_RS
+        .split("fn gdn_wstat_key(")
+        .nth(1)
+        .expect("鍵の関数が無い");
+    let kbody = &k[..k.find("\n}\n").expect("本体が無い")];
+    assert!(kbody.contains("key[0] = li;"), "層が鍵に入っていない");
+    assert!(kbody.contains("src[i].0"), "転送元のポインタが鍵に入っていない");
+    assert!(kbody.contains("src[i].1"), "転送元の長さが鍵に入っていない");
+    assert!(kbody.contains("dst[i]"), "置き場が鍵に入っていない");
+    // ゲート off では必ず上げ直す (鍵を読まない)。
+    let put = CUDA_RS
+        .split("fn gdn_put_weights(")
+        .nth(1)
+        .expect("上げ直しの関数が無い");
+    let pbody = &put[..put.find("\n}\n").expect("本体が無い")];
+    assert!(
+        pbody.contains("if gdn_wstat_on() && GDN_WSTAT_KEY.with(|c| c.get()) == Some(key) {"),
+        "ゲートと鍵の両方を見ていない (off でも飛ばす可能性がある)"
+    );
+}
