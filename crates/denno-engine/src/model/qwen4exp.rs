@@ -5237,8 +5237,19 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let mut lm_fallback = 0usize;
         // task 233: attention の入口は CPU が読むので、チャンクぶんだけホストへ戻す。
         let mut attn_buf = PfHostBuf::new(chunk * e);
+        // task 394: 次の層の expert 重みを先にページキャッシュへ載せる
+        // (`DENNO_PF_LAYER_PRE`)。層優先の MoE は routing が決まるまで読めないので、
+        // attention (phase 1) のあいだディスクが遊ぶ。3,826 の実測では 1 層 =
+        // 296 本 (層の全数) が要るので、予測ではなく全数を 1 層先に読む。
+        let layer_pre_on = crate::model::exp_pf::layer_pre();
+        if layer_pre_on {
+            pf_layer_prefetch(&self.layers[0]);
+        }
         for il in 0..n_layer {
             let lw = &self.layers[il];
+            if layer_pre_on && il + 1 < n_layer {
+                pf_layer_prefetch(&self.layers[il + 1]);
+            }
             if q4prof::enabled() {
                 q4prof::N_LAYER.fetch_add(nt_all as u64, std::sync::atomic::Ordering::Relaxed);
             }
@@ -18536,6 +18547,41 @@ fn pf_restore_experts(
         );
     }
     (n, bytes)
+}
+
+/// task 394: その層の expert 重み全体 (gate / up / down) をページキャッシュへ
+/// 先読みする (`DENNO_PF_LAYER_PRE`)。戻り値は投げたバイト数。
+///
+/// 範囲は [`ExpertW::slice_abs`] (mmap 経路の `slice` と同じ `ExpertSlice`) から
+/// 作るので、あとで `pread` が読む範囲と必ず一致する。1 層あたり 3 本
+/// (gate / up / down) の `readahead(2)` を投げるだけで、待たない。
+/// VRAM もステージングも増やさず、中身は 1 バイトも変えない。
+#[cfg(feature = "cuda")]
+fn pf_layer_prefetch(lw: &LayerW) -> usize {
+    let mut total = 0usize;
+    let mut calls = 0usize;
+    for w in [&lw.gate_exps, &lw.up_exps, &lw.down_exps] {
+        let Some(last) = w.n_expert.checked_sub(1) else {
+            continue;
+        };
+        let (Ok((off0, _)), Ok((off1, len1))) = (w.slice_abs(0), w.slice_abs(last)) else {
+            continue;
+        };
+        let end = off1.saturating_add(len1 as u64);
+        if end <= off0 {
+            continue;
+        }
+        let n =
+            crate::model::exp_pf::readahead_part(w.file as u32, off0, (end - off0) as usize);
+        if n > 0 {
+            total += n;
+            calls += 1;
+        }
+    }
+    if total > 0 {
+        crate::model::exp_pf::note_layer_pre(total, calls);
+    }
+    total
 }
 
 /// task 394: 戻しの 1 本ぶん。`deferred` なら転送を LRU のロックの外で行う

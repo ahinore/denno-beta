@@ -10187,9 +10187,33 @@ fn t394_restore_mt_is_wired() {
         "pub fn pf_restore_mt_from_value(",
         "pub fn pf_restore_threads(",
         "pub fn pf_restore_threads_from_value(",
+        "pub fn layer_pre(",
+        "pub fn readahead_part(",
     ] {
         assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
     }
+    // 層優先のループが「次の層」を先読みしている (attention の裏でディスクを回す)。
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    for k in [
+        "crate::model::exp_pf::layer_pre()",
+        "pf_layer_prefetch(&self.layers[0])",
+        "pf_layer_prefetch(&self.layers[il + 1])",
+    ] {
+        assert!(lm.contains(k), "層優先のループに {k} が無い");
+    }
+    let pf = fn_body(QWEN_SRC, "fn pf_layer_prefetch(");
+    for k in [
+        "w.slice_abs(0)",
+        "crate::model::exp_pf::readahead_part(",
+        "w.n_expert",
+    ] {
+        assert!(pf.contains(k), "先読みの本体に {k} が無い");
+    }
+    // 台帳が `[exp-pf-stream]` に出る (ゲートが効いた証拠を lab で読む)。
+    assert!(
+        EXP_PF_SRC.contains("out.push_str(&layer_pre_stats())"),
+        "[exp-pf-stream] に先読みの台帳が無い"
+    );
 }
 
 // ---------------------------------------------------------------------------
