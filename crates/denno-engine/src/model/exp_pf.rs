@@ -1561,6 +1561,45 @@ pub fn tc_exp_on() -> bool {
     *ON.get_or_init(|| tc_exp_from_value(std::env::var(TC_EXP_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_TC_EXP_K=1`: **K 系** (Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0) の prefill
+/// expert グループも tensor core の grouped GEMM (`kernels_exp_k_tc.cu`) で回す
+/// (task 416、**既定 on** = lab t416b で採用)。
+///
+/// `DENNO_PF_TC_EXP` (IQ 系) とは別のゲートにしてある。IQ 系は 2026-11-13 から
+/// 既定 on だが、K 系は新しいカーネルなので lab の A/B で採否を決めた。
+/// 形が合わない (k がブロックで割り切れない / gate と up の型が違う) ときは
+/// 従来の m 行 GEMV (`kernels_exp_k_pf.cu`) へ落ちる。
+///
+/// # 実測 (task 416、lab t416b、MODEL=flash-next-UD-Q4_K_XL、depth8k、PROFILE=1)
+///
+/// 14k cold prefill **17.98 s** 対 baseline 25.18 / 25.22 / 24.96 s = **-28.6%**。
+/// experts 段の gpu_busy は 18.34 -> 0.43 s (3,826 は 4.70 -> 0.43 s)。
+/// 3,826 cold は read (44.4 GB の pread) が律速になり、copy_s が 7.2 s の
+/// ラウンドでは 8.76 s 対 baseline 9.13/9.17 s (-4%)、12.6 s のラウンドでは
+/// 14.68 s (ディスクの振れ)。decode は 16.3 対 16.4 ms/tok で不変。
+/// 既定モデル (IQ 系) は `exp_pf::slot` が IQ のスロットを返すので
+/// `ktc_shapes_ok` が偽 = 構造的に不発 (lab t416c で md5 全一致)。
+pub const TC_EXP_K_ENV: &str = "DENNO_PF_TC_EXP_K";
+
+/// 既定値 (**on**。lab t416b で採用)。
+pub const DEFAULT_TC_EXP_K_ON: bool = true;
+
+/// [`TC_EXP_K_ENV`] の解釈 (純関数)。明示的な偽値 (`0` / `off` / `false` /
+/// `no`) だけが偽で、未設定は [`DEFAULT_TC_EXP_K_ON`]。
+pub fn tc_exp_k_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_TC_EXP_K_ON,
+        Some(s) => crate::model::expert_vram::flag_on(Some(s))
+            || !matches!(s.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+    }
+}
+
+/// K 系のグループ GEMM ゲート (プロセスで 1 回だけ env を読む)。
+pub fn tc_exp_k_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| tc_exp_k_from_value(std::env::var(TC_EXP_K_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_LM_LAYER=1`: prefill の層ループを層優先にする (task 227、既定 off)。
 ///
 /// いまはチャンク優先 (チャンク → 全 48 層) なので、1 つの expert が
