@@ -10459,6 +10459,158 @@ fn task311_gdn_pf_wy4_kernel_is_wired() {
 
 const SEG_K_SRC: &str = include_str!("../kernels/kernels_seg_k.cu");
 
+/// task 397: wy4 の従属連鎖を短くした `kernels_gdn_pf_wy5.cu` の配線。
+///
+/// 値 (丸めが wy4 と違うこと) は lab の段の時間と md5、形の正しさは CPU 参照
+/// (`gdn/wy.rs`) の担当。ここでは**ホストと .cu の契約**だけを固定する。
+#[test]
+fn task397_gdn_pf_wy5_kernel_is_wired() {
+    const EXP_PF_RS: &str = include_str!("../src/model/exp_pf.rs");
+    let src = include_str!("../kernels/kernels_gdn_pf_wy5.cu");
+    assert!(src.contains("dno_gdn_pf_wy5"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_wy5\\0\""),
+        "cuda.rs が dno_gdn_pf_wy5 を読んでいない"
+    );
+    // 引数は wy4 と同じ 17 個 (ホストの起動 `gdn_pf_wy_launch` を共有する)。
+    assert_eq!(
+        cu_kernel_nargs(src, "dno_gdn_pf_wy5"),
+        17,
+        "引数の個数が wy4 と違う"
+    );
+    for line in [
+        "#define WY5_DK 128",
+        "#define WY5_DV 32",
+        "#define WY5_C 8",
+        "#define WY5_THREADS 256",
+        "#define WY5_WARPS 8",
+        "#define WY5_DCONV 4",
+        "#define WY5_CS 3",
+    ] {
+        assert!(src.contains(line), "{line} が無い");
+    }
+    let define = |name: &str| -> usize {
+        src.lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"))
+    };
+    // 共有メモリの区画が重ならず、終端が WY5_TOTAL (wy4 と同じ 7,393 本)。
+    let dk = define("WY5_DK");
+    let dv = define("WY5_DV");
+    let c = define("WY5_C");
+    let regions = [
+        ("WY5_S", dk * dv),
+        ("WY5_KC", c * dk),
+        ("WY5_QC", c * dk),
+        ("WY5_VC", c * dv),
+        ("WY5_DC", c * dv),
+        ("WY5_PC", c * dv),
+        ("WY5_QPC", c * dv),
+        ("WY5_RDEC", c * c),
+        ("WY5_AC", c * c),
+        ("WY5_GC", c * c),
+        ("WY5_LAM", c),
+        ("WY5_RL", c),
+        ("WY5_EG", c),
+        ("WY5_BC", c),
+        ("WY5_LL", 1),
+    ];
+    let mut at = 0usize;
+    for (name, size) in regions {
+        let lo = define(name);
+        assert_eq!(lo, at, "{name} の並びに隙間/重なりがある ({lo} != {at})");
+        at = lo + size;
+    }
+    assert_eq!(at, define("WY5_TOTAL"), "WY5_TOTAL が最後の領域の終端と違う");
+    assert_eq!(at, 7393, "wy4 と同じ 29,572 B でない");
+    assert!(at * 4 < 48 * 1024, "48 KB 既定を超える");
+    // 直した 3 点 (A/G のワープ並列 / conv の先読み / P/QP の 4 アキュムレータ)。
+    assert!(src.contains("__shfl_down_sync"), "A/G がワープ並列でない");
+    assert!(src.contains("float xq[WY5_C];"), "conv の先読みが無い");
+    assert_eq!(
+        src.matches("float sk0 = 0.0f;").count(),
+        1,
+        "P/QP の 4 アキュムレータが無い"
+    );
+    // バリアはチャンク内 8 個 + プロローグ 1 個まで (wy4 と同じ本数)。
+    assert!(src.matches("__syncthreads()").count() <= 10, "バリアが多すぎる");
+    // ホスト側: 定数・起動形・選択順 (wy5 -> wy4)。
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF_WY5_SMEM_FLOATS: usize = GDN_PF_WY4_SMEM_FLOATS;"),
+        "GDN_PF_WY5_SMEM_FLOATS が wy4 と同じでない"
+    );
+    assert!(
+        CUDA_RS.contains("GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY5_SMEM_BYTES as u32,"),
+        "wy5 の呼び出しが (BLOCKS, THREADS, SMEM) を渡していない"
+    );
+    let pick5 = CUDA_RS
+        .find("let pf_scan_wy5 = if gdn_pf_wy5_on()")
+        .expect("wy5 の選択が無い");
+    let pick4 = CUDA_RS
+        .find("let pf_scan_wy4 = if pf_scan_wy5.is_none()")
+        .expect("wy4 の選択が wy5 の後ろに無い");
+    assert!(pick5 < pick4, "wy5 が wy4 より先に選ばれていない");
+    let launch5 = CUDA_RS
+        .find("if let Some(fns) = pf_scan_wy5 {")
+        .expect("wy5 の起動が無い");
+    let launch4 = CUDA_RS
+        .find("} else if let Some(fns) = pf_scan_wy4 {")
+        .expect("wy4 の起動が wy5 の後ろに無い");
+    assert!(launch5 < launch4, "wy5 の起動が wy4 より後ろにある");
+    // v3 へ落ちる前の判定にも wy5 が入っていること。
+    assert!(
+        CUDA_RS.contains("&& pf_scan_wy5.is_none()\n        && pf_scan_wy4.is_none()"),
+        "fail closed の判定に wy5 が入っていない"
+    );
+    // build_ptx.sh の target (targets_all の**末尾**に足す = merge の衝突を避ける)。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy5)  echo \"kernels_gdn_pf_wy5.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf_wy5 が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
+    assert!(
+        targets.trim_end().ends_with("gdn_pf_wy5)"),
+        "targets_all の末尾に無い (merge で衝突する)"
+    );
+    // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
+    let f = CUDA_RS
+        .find("fn gdn_wb_async_copy(")
+        .expect("gdn_wb_async_copy が無い");
+    let tail = &CUDA_RS[f..];
+    let end = tail.find("\n}\n").map(|e| e + 3).unwrap_or(tail.len());
+    let body = &tail[..end];
+    assert!(body.contains("memcpy_dtoh_async"), "非同期コピーでない");
+    assert!(body.contains("pf_sync_own_stream"), "自ストリームだけの待ちが無い");
+    assert!(
+        !body.contains("(lib.memcpy_dtoh)("),
+        "同期コピー (コンテキスト全体の待ち) が混ざっている"
+    );
+    let wb = CUDA_RS
+        .find("fn gdn_host_writeback(")
+        .expect("gdn_host_writeback が無い");
+    let wb_body = &CUDA_RS[wb..];
+    let gate = wb_body.find("gdn_wb_async_on()").expect("ゲートを見ていない");
+    let direct = wb_body
+        .find("gdn_wb_direct_on()")
+        .expect("従来経路が無い");
+    assert!(gate < direct, "非同期経路が従来経路より後ろにある");
+    assert_eq!(
+        EXP_PF_RS.matches("\"DENNO_PF_GDN_WB_ASYNC\"").count(),
+        1,
+        "env 名が 1 箇所でない"
+    );
+    assert_eq!(
+        EXP_PF_RS.matches("pub const DEFAULT_GDN_WB_ASYNC: bool = false;").count(),
+        1,
+        "既定 off でない"
+    );
+}
+
 /// task 278: K 系の高速 GEMV (`kernels_seg_k.cu`) の配線。
 /// GPU 無しでは走らせられないので、**ホストと .cu の契約**だけを固定する:
 /// カーネル名 4 本 / 引数の個数 / 起動形 (4 行 = 4 warp = 128 スレッド) /
