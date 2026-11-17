@@ -93,25 +93,25 @@ denno-beta/
 
 ```mermaid
 flowchart TB
-    REQ["POST /v1/messages"] --> AUTH{api key 検証<br/>model 名検証}
+    REQ["POST /v1/messages"] --> AUTH{"api key 検証<br/>model 名検証"}
     AUTH -->|"queue 満杯"| E503["503 overloaded_error"]
     AUTH --> TOK["tokenizer<br/>apply_chat_template → encode"]
     TOK --> SUB["scheduler.submit_chat<br/>有界キュー(mpsc sync_channel)"]
     SUB -->|"キュー満杯"| E503
     SUB --> W["ワーカー(単一スレッド)"]
-    W --> ADMIT[admit: begin_chat<br/>chat template / max_tokens クランプ]
-    ADMIT --> PC{prefix cache<br/>LCP 最大エントリ?<br/>(recurrent は prompt 全長一致のみ)}
+    W --> ADMIT["admit: begin_chat<br/>chat template / max_tokens クランプ"]
+    ADMIT --> PC{"prefix cache<br/>LCP 最大エントリ?<br/>(recurrent は prompt 全長一致のみ)"}
     PC -->|"ヒット"| TR["KV 再利用 (truncate)・recompute は差分のみ<br/>recurrent は KV+GDN 状態をペア復元 (truncate 不可)"]
     PC -->|"ミス"| PF["全 prompt を prefill<br/>(重み × 入力の GEMM)"]
-    TR --> LIVE[live セッション]
+    TR --> LIVE["live セッション"]
     PF --> LIVE
     LIVE --> LOOP["step_chat × N<br/>(エンジン mutex を 1 forward ずつ)"]
     LOOP --> PULL["ステップ間に新規到着を pull<br/>(スロットに空きがあれば admit)"]
     PULL --> BATCH["decode は全常駐セッションを<br/>1 forward にまとめる(P6)"]
-    BATCH --> STOP{停止条件?<br/>EOS / max_tokens / stop_seq}
+    BATCH --> STOP{"停止条件?<br/>EOS / max_tokens / stop_seq"}
     STOP -->|"継続"| SAMP["sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>seed 固定で決定論"]
     SAMP --> LOOP
-    STOP -->|"停止"| OUT[ChatOutput<br/>text / stop_reason / usage]
+    STOP -->|"停止"| OUT["ChatOutput<br/>text / stop_reason / usage"]
     OUT --> RESP["JSON または SSE<br/>(event: 行 + keep-alive 2秒)"]
 ```
 

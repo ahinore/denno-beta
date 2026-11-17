@@ -93,25 +93,25 @@ denno-beta/
 
 ```mermaid
 flowchart TB
-    REQ["POST /v1/messages"] --> AUTH{api key check<br/>model name check}
+    REQ["POST /v1/messages"] --> AUTH{"api key check<br/>model name check"}
     AUTH -->|"queue full"| E503["503 overloaded_error"]
     AUTH --> TOK["tokenizer<br/>apply_chat_template → encode"]
     TOK --> SUB["scheduler.submit_chat<br/>bounded queue (mpsc sync_channel)"]
     SUB -->|"queue full"| E503
     SUB --> W["worker (single thread)"]
-    W --> ADMIT[admit: begin_chat<br/>chat template / max_tokens clamp]
-    ADMIT --> PC{prefix cache<br/>largest LCP entry?<br/>(recurrent: full prompt match only)}
+    W --> ADMIT["admit: begin_chat<br/>chat template / max_tokens clamp"]
+    ADMIT --> PC{"prefix cache<br/>largest LCP entry?<br/>(recurrent: full prompt match only)"}
     PC -->|"hit"| TR["reuse KV (truncate) · recompute only the difference<br/>recurrent restores KV+GDN state as a pair (no truncate)"]
     PC -->|"miss"| PF["prefill the whole prompt<br/>(weights × input GEMM)"]
-    TR --> LIVE[live session]
+    TR --> LIVE["live session"]
     PF --> LIVE
     LIVE --> LOOP["step_chat × N<br/>(engine mutex one forward at a time)"]
     LOOP --> PULL["pull newly arrived requests between steps<br/>(admit when a slot is free)"]
     PULL --> BATCH["decode: combine all resident sessions<br/>into a single forward (P6)"]
-    BATCH --> STOP{stop condition?<br/>EOS / max_tokens / stop_seq}
+    BATCH --> STOP{"stop condition?<br/>EOS / max_tokens / stop_seq"}
     STOP -->|"continue"| SAMP["sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>fixed seed for determinism"]
     SAMP --> LOOP
-    STOP -->|"stop"| OUT[ChatOutput<br/>text / stop_reason / usage]
+    STOP -->|"stop"| OUT["ChatOutput<br/>text / stop_reason / usage"]
     OUT --> RESP["JSON or SSE<br/>(event: lines + 2-second keep-alive)"]
 ```
 
