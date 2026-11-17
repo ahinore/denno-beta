@@ -10620,7 +10620,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
         "wy5 の呼び出しが (BLOCKS, THREADS, SMEM) を渡していない"
     );
     let pick5 = CUDA_RS
-        .find("let pf_scan_wy5 = if gdn_pf_wy5_on()")
+        .find("let pf_scan_wy5 = if pf_scan_wy6p.is_none()")
         .expect("wy5 の選択が無い");
     let pick4 = CUDA_RS
         .find("let pf_scan_wy4 = if pf_scan_wy5.is_none()")
@@ -10648,8 +10648,9 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
         .find(|l| l.starts_with("targets_all="))
         .unwrap_or("");
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
+    // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy5)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -11977,4 +11978,352 @@ fn task393_gdn_wstat_is_wired_through_one_helper() {
         pbody.contains("if gdn_wstat_on() && GDN_WSTAT_KEY.with(|c| c.get()) == Some(key) {"),
         "ゲートと鍵の両方を見ていない (off でも飛ばす可能性がある)"
     );
+}
+
+/// task 407: GDN prefill スキャンの 512 スレッド版 (wy6) と P/QP 2 分割版 (wy6p)。
+///
+/// 見るもの: カーネル名 / 引数 17 個 (ホストの `gdn_pf_wy_launch` を共有) /
+/// `#define` の値 (スレッド数とワープ数が揃っていること) / 共有メモリの区画が
+/// wy5 と 1 つずつ同じで重ならないこと / ホスト側の選択順 (wy6p -> wy6 -> wy5 ->
+/// wy4) と起動形 / `build_ptx.sh` の target と `targets_all` の**末尾** /
+/// kprof が未完了の段を捨てないこと (P397 §6-1 の数え落としの修正)。
+#[test]
+fn task407_gdn_pf_wy6_kernel_is_wired() {
+    let src6 = include_str!("../kernels/kernels_gdn_pf_wy6.cu");
+    let src6p = include_str!("../kernels/kernels_gdn_pf_wy6p.cu");
+    let src5 = include_str!("../kernels/kernels_gdn_pf_wy5.cu");
+    assert!(src6.contains("dno_gdn_pf_wy6"));
+    assert!(src6p.contains("dno_gdn_pf_wy6p"));
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_wy6\\0\""),
+        "cuda.rs が dno_gdn_pf_wy6 を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_wy6p\\0\""),
+        "cuda.rs が dno_gdn_pf_wy6p を読んでいない"
+    );
+    assert_eq!(cu_kernel_nargs(src6, "dno_gdn_pf_wy6"), 17, "引数の個数が wy5 と違う");
+    assert_eq!(cu_kernel_nargs(src6p, "dno_gdn_pf_wy6p"), 17, "引数の個数が wy5 と違う");
+    for line in [
+        "#define WY6_DK 128",
+        "#define WY6_DV 32",
+        "#define WY6_C 8",
+        "#define WY6_THREADS 512",
+        "#define WY6_WARPS 16",
+        "#define WY6_DCONV 4",
+        "#define WY6_CS 3",
+    ] {
+        assert!(src6.contains(line), "wy6 に {line} が無い");
+    }
+    for line in [
+        "#define WY6P_DK 128",
+        "#define WY6P_DV 32",
+        "#define WY6P_C 8",
+        "#define WY6P_THREADS 512",
+        "#define WY6P_WARPS 16",
+    ] {
+        assert!(src6p.contains(line), "wy6p に {line} が無い");
+    }
+    let define = |src: &str, name: &str| -> usize {
+        src.lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"))
+    };
+    // 区画: 隙間も重なりも無く、終端が TOTAL。wy5 と 1 つずつ同じ値。
+    for (src, p, total) in [(src6, "WY6_", 7393usize), (src6p, "WY6P_", 7393usize)] {
+        let dk = define(src, &format!("{p}DK"));
+        let dv = define(src, &format!("{p}DV"));
+        let c = define(src, &format!("{p}C"));
+        assert_eq!(define(src, &format!("{p}THREADS")), 512);
+        assert_eq!(
+            define(src, &format!("{p}WARPS")) * 32,
+            512,
+            "{p}WARPS と THREADS が違う"
+        );
+        assert_eq!(define(src, &format!("{p}DV")) * 4, dk, "4 分割で dk を覆っていない");
+        let regions = [
+            (format!("{p}S"), dk * dv),
+            (format!("{p}KC"), c * dk),
+            (format!("{p}QC"), c * dk),
+            (format!("{p}VC"), c * dv),
+            (format!("{p}DC"), c * dv),
+            (format!("{p}PC"), c * dv),
+            (format!("{p}QPC"), c * dv),
+            (format!("{p}RDEC"), c * c),
+            (format!("{p}AC"), c * c),
+            (format!("{p}GC"), c * c),
+            (format!("{p}LAM"), c),
+            (format!("{p}RL"), c),
+            (format!("{p}EG"), c),
+            (format!("{p}BC"), c),
+            (format!("{p}LL"), 1),
+        ];
+        let mut at = 0usize;
+        for (name, size) in regions {
+            let lo = define(src, &name);
+            assert_eq!(lo, at, "{name} の並びに隙間/重なりがある ({lo} != {at})");
+            assert_eq!(
+                lo,
+                define(src5, &name.replacen(p, "WY5_", 1)),
+                "{name} のオフセットが wy5 と違う"
+            );
+            at = lo + size;
+        }
+        assert_eq!(at, define(src, &format!("{p}TOTAL")), "{p}TOTAL が終端と違う");
+        assert_eq!(at, total, "wy5 と同じ 29,572 B でない");
+    }
+    // wy6 は wy5 と同じ演算列 (P/QP は 4 アキュムレータのまま)。
+    assert!(!src6.contains("__shfl_xor_sync(0xffffffffu, sk, 1)"));
+    // wy6p だけが P/QP を r 方向に 2 分割する (隣接レーンで足す)。
+    assert!(src6p.contains("for (int j = tid; j < 2 * len * WY6P_DV; j += WY6P_THREADS)"));
+    assert!(src6p.contains("__shfl_xor_sync(0xffffffffu, sk, 1)"));
+    assert!(src6p.contains("if (half == 0) {"), "片側だけが書く形でない");
+    // バリアはチャンク内 8 個 + プロローグ 1 個まで (wy5 と同じ本数)。
+    assert!(src6.matches("__syncthreads()").count() <= 10, "バリアが多すぎる");
+    assert!(src6p.matches("__syncthreads()").count() <= 10, "バリアが多すぎる");
+    // ホスト側: 定数と起動形。
+    assert!(
+        CUDA_RS.contains(
+            "pub(crate) const GDN_PF_WY6_SMEM_FLOATS: usize = GDN_PF_WY4_SMEM_FLOATS;"
+        ),
+        "共有メモリが wy4 と同じでない"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) const GDN_PF_WY6_THREADS: usize = 512;"),
+        "スレッド数が 512 でない"
+    );
+    assert_eq!(
+        CUDA_RS
+            .matches("GDN_PF_WY6_BLOCKS, GDN_PF_WY6_THREADS, GDN_PF_WY6_SMEM_BYTES as u32,")
+            .count(),
+        2,
+        "wy6 / wy6p の起動が (BLOCKS, THREADS, SMEM) を渡していない"
+    );
+    // 選択順: wy7q -> wy7 -> wy6p -> wy6 -> wy5 -> wy4。
+    let picks = [
+        ("wy7q", "let pf_scan_wy7q = if gdn_pf_wy7q_on()"),
+        ("wy7", "let pf_scan_wy7 = if pf_scan_wy7q.is_none()"),
+        ("wy6p", "let pf_scan_wy6p = if pf_scan_wy7q.is_none()"),
+        ("wy6", "let pf_scan_wy6 = if pf_scan_wy6p.is_none()"),
+        ("wy5", "let pf_scan_wy5 = if pf_scan_wy6p.is_none()"),
+        ("wy4", "let pf_scan_wy4 = if pf_scan_wy5.is_none()"),
+    ];
+    let mut prev = 0usize;
+    for (name, pat) in picks {
+        let at = CUDA_RS
+            .find(pat)
+            .unwrap_or_else(|| panic!("{name} の選択が無い"));
+        assert!(at > prev || prev == 0, "{name} の選択順が wy7q -> wy7 -> wy6p -> wy6 -> wy5 -> wy4 でない");
+        prev = at;
+    }
+    let launches = [
+        ("wy7q", "if let Some(fns) = pf_scan_wy7q {"),
+        ("wy7", "} else if let Some(fns) = pf_scan_wy7 {"),
+        ("wy6p", "} else if let Some(fns) = pf_scan_wy6p {"),
+        ("wy6", "} else if let Some(fns) = pf_scan_wy6 {"),
+        ("wy5", "} else if let Some(fns) = pf_scan_wy5 {"),
+    ];
+    let mut prev = 0usize;
+    for (name, pat) in launches {
+        let at = CUDA_RS
+            .find(pat)
+            .unwrap_or_else(|| panic!("{name} の起動が無い"));
+        assert!(at > prev || prev == 0, "{name} の起動順が選択順と違う");
+        prev = at;
+    }
+    // fail closed の判定にも全部入っていること。
+    assert!(
+        CUDA_RS.contains(
+            "&& pf_scan_wy7q.is_none()\n        && pf_scan_wy7.is_none()\n        && pf_scan_wy6p.is_none()\n        && pf_scan_wy6.is_none()\n        && pf_scan_wy5.is_none()"
+        ),
+        "fail closed の判定に wy7q / wy7 / wy6p / wy6 が入っていない"
+    );
+    // build_ptx.sh: target が引けること + targets_all の末尾 (衝突を避ける)。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy6)  echo \"kernels_gdn_pf_wy6.cu|nofmad|compute_90\" ;;"),
+        "build_ptx.sh に wy6 の target が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy6p) echo \"kernels_gdn_pf_wy6p.cu|nofmad|compute_90\" ;;"),
+        "build_ptx.sh に wy6p の target が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q)"),
+        "targets_all の末尾に足していない (他ブランチと衝突する)"
+    );
+    // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
+    let kprof = CUDA_RS
+        .split("pub mod gdn_pf_kprof {")
+        .nth(1)
+        .expect("gdn_pf_kprof が無い");
+    assert!(kprof.contains("keep.push((item, a, b));"), "未完了の段を捨てている");
+    assert!(
+        kprof.contains("PEND.with(|c| c.borrow_mut().extend(keep));"),
+        "未完了の段を次回へ回していない"
+    );
+}
+
+/// task 407 (2 本目): バリア削減版 (wy7) と P/QP の S 読み直し削減版 (wy7q)。
+///
+/// 見るもの: カーネル名 / 引数 17 個 / `#define` (スレッド数・ワープ数) /
+/// 共有メモリの区画 (wy7 は wy5 と同一、wy7q は部分和 2 x 8 x C x DV を足した
+/// 11,489 float) / バリア本数 (wy5 9 -> wy7 7 -> wy7q 8) / 起動形 (スレッド 256 の
+/// まま、smem だけ wy7q が広い) / build_ptx.sh の target と targets_all の末尾。
+#[test]
+fn task407_gdn_pf_wy7_kernel_is_wired() {
+    let src5 = include_str!("../kernels/kernels_gdn_pf_wy5.cu");
+    let src7 = include_str!("../kernels/kernels_gdn_pf_wy7.cu");
+    let src7q = include_str!("../kernels/kernels_gdn_pf_wy7q.cu");
+    assert!(src7.contains("dno_gdn_pf_wy7"));
+    assert!(src7q.contains("dno_gdn_pf_wy7q"));
+    assert!(CUDA_RS.contains("b\"dno_gdn_pf_wy7\\0\""), "cuda.rs が wy7 を読んでいない");
+    assert!(CUDA_RS.contains("b\"dno_gdn_pf_wy7q\\0\""), "cuda.rs が wy7q を読んでいない");
+    assert_eq!(cu_kernel_nargs(src7, "dno_gdn_pf_wy7"), 17, "引数の個数が wy5 と違う");
+    assert_eq!(cu_kernel_nargs(src7q, "dno_gdn_pf_wy7q"), 17, "引数の個数が wy5 と違う");
+    for line in [
+        "#define WY7_DK 128",
+        "#define WY7_DV 32",
+        "#define WY7_C 8",
+        "#define WY7_THREADS 256",
+        "#define WY7_WARPS 8",
+    ] {
+        assert!(src7.contains(line), "wy7 に {line} が無い");
+    }
+    for line in [
+        "#define WY7Q_DK 128",
+        "#define WY7Q_DV 32",
+        "#define WY7Q_C 8",
+        "#define WY7Q_THREADS 256",
+        "#define WY7Q_WARPS 8",
+    ] {
+        assert!(src7q.contains(line), "wy7q に {line} が無い");
+    }
+    let define = |src: &str, name: &str| -> usize {
+        src.lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} が無い"))
+    };
+    // wy7: wy5 と 1 つずつ同じオフセット、終端 7,393。
+    for name in [
+        "S", "KC", "QC", "VC", "DC", "PC", "QPC", "RDEC", "AC", "GC", "LAM", "RL", "EG", "BC", "LL",
+    ] {
+        assert_eq!(
+            define(src7, &format!("WY7_{name}")),
+            define(src5, &format!("WY5_{name}")),
+            "WY7_{name} のオフセットが wy5 と違う"
+        );
+        assert_eq!(
+            define(src7q, &format!("WY7Q_{name}")),
+            define(src5, &format!("WY5_{name}")),
+            "WY7Q_{name} のオフセットが wy5 と違う"
+        );
+    }
+    assert_eq!(define(src7, "WY7_TOTAL"), 7393);
+    // wy7q: 部分和 2 x 8 x 8 x 32 = 4,096 float を LL の後ろに置く。
+    let pp = define(src7q, "WY7Q_PP");
+    let qp = define(src7q, "WY7Q_QP");
+    assert_eq!(pp, 7393, "Pp が LL の直後でない");
+    assert_eq!(qp - pp, 2048, "Pp の大きさが 8 ワープ x C x DV でない");
+    assert_eq!(define(src7q, "WY7Q_TOTAL") - qp, 2048, "Qp の大きさが違う");
+    assert_eq!(define(src7q, "WY7Q_TOTAL"), 11489);
+    assert!(define(src7q, "WY7Q_TOTAL") * 4 < 48 * 1024, "48 KB の既定を超える");
+    // バリア本数: 実物 (`;` 付き) を数える。wy5 9 -> wy7 7 -> wy7q 8。
+    assert_eq!(src5.matches("__syncthreads();").count(), 9);
+    assert_eq!(src7.matches("__syncthreads();").count(), 7, "wy7 で 2 本減っていない");
+    assert_eq!(src7q.matches("__syncthreads();").count(), 8);
+    // wy7 は (5) の形を変えない / wy7q だけが Pp / Qp を使う。
+    assert_eq!(src7.matches("float sk0 = 0.0f;").count(), 1);
+    assert!(src7q.contains("float* Pp = sh + WY7Q_PP;"));
+    assert!(src7q.contains("float* Qp = sh + WY7Q_QP;"));
+    assert!(src7q.contains("Pp[warp * WY7Q_C * WY7Q_DV + i * WY7Q_DV + c] = sk[i];"));
+    assert!(src7q.contains("for (int w = 0; w < WY7Q_WARPS; ++w) {"));
+    // ホスト側: 定数と起動形 (スレッドは 256 のまま、smem だけ wy7q が広い)。
+    assert!(CUDA_RS.contains("pub(crate) const GDN_PF_WY7_SMEM_BYTES: usize = GDN_PF_WY7_SMEM_FLOATS * 4;"));
+    assert!(CUDA_RS.contains("pub(crate) const GDN_PF_WY7Q_PART_FLOATS: usize = 2 * 8 * 8 * 32;"));
+    assert_eq!(
+        CUDA_RS
+            .matches("GDN_PF_WY6_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY7Q_SMEM_BYTES as u32,")
+            .count(),
+        1,
+        "wy7q の起動が 256 スレッド + wy7q の smem を渡していない"
+    );
+    assert_eq!(
+        CUDA_RS
+            .matches("GDN_PF_WY6_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY7_SMEM_BYTES as u32,")
+            .count(),
+        1,
+        "wy7 の起動が 256 スレッド + wy7 の smem を渡していない"
+    );
+    // build_ptx.sh の target と targets_all の末尾。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy7)  echo \"kernels_gdn_pf_wy7.cu|nofmad|compute_90\" ;;"),
+        "build_ptx.sh に wy7 の target が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy7q) echo \"kernels_gdn_pf_wy7q.cu|nofmad|compute_90\" ;;"),
+        "build_ptx.sh に wy7q の target が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q)"),
+        "targets_all の末尾に足していない (他ブランチと衝突する)"
+    );
+}
+
+/// task 407 (3 本目): GDN 連鎖の投影だけ br169 (tc) 側で撃つゲート
+/// (`DENNO_PF_GDN_TC1`、lab t407c で既定 on)。
+///
+/// 見るもの: ゲート名 / `gguf_gemm_dev_launch` に `prefer_tc1` が入っていて
+/// v2 (tc2) の分岐を飛ばせること / GDN 連鎖の 2 か所がゲートを渡すこと /
+/// **モデル全体の既定 (`DENNO_PF_TC_GEMM2`) は動かしていない**こと。
+#[test]
+fn task407_gdn_tc1_gate_is_wired() {
+    assert!(
+        CUDA_RS.contains("std::env::var(\"DENNO_PF_GDN_TC1\")"),
+        "env 名が DENNO_PF_GDN_TC1 でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {"),
+        "純関数が無い"
+    );
+    // 既定 on (未設定で true) であること。
+    let f = CUDA_RS
+        .split("pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {")
+        .nth(1)
+        .expect("純関数の本体が無い");
+    let body = &f[..f.find("\n}\n").expect("本体の終わりが無い")];
+    assert!(body.contains("None => true"), "未設定の既定が on でない");
+    assert!(body.contains("\"0\" | \"off\" | \"false\" | \"no\" | \"\""), "偽値の集合が違う");
+    // tc2 の分岐が prefer_tc1 で飛ばせること。
+    let g = CUDA_RS
+        .split("fn gguf_gemm_dev_launch(")
+        .nth(1)
+        .expect("gguf_gemm_dev_launch が無い");
+    let gbody = &g[..g.find("\n}\n").expect("本体の終わりが無い")];
+    assert!(gbody.contains("prefer_tc1: bool"), "prefer_tc1 引数が無い");
+    assert!(
+        gbody.contains("if !prefer_tc1 && pf_tc2_gemm_on() && pf_tc2_eligible("),
+        "prefer_tc1 で v2 を飛ばしていない"
+    );
+    assert!(
+        gbody.contains("if matches!(ty, T::Q8_0)\n        && pf_tc_gemm_on()"),
+        "br169 (tc) の分岐が無い"
+    );
+    // GDN 連鎖の 2 か所 (qkv/z と out) がゲートを渡すこと。
+    assert_eq!(
+        CUDA_RS
+            .matches("n_out, gdn_pf_tc1_on())")
+            .count()
+            + CUDA_RS.matches("vd, e, gdn_pf_tc1_on())").count(),
+        2,
+        "GDN 連鎖の 2 か所がゲートを渡していない"
+    );
+    // モデル全体の既定は動かさない (tc2 は既定 on のまま)。
+    let t = CUDA_RS
+        .split("pub(crate) fn pf_tc2_gemm_from_value(v: Option<&str>) -> bool {")
+        .nth(1)
+        .expect("tc2 のゲートが無い");
+    let tbody = &t[..t.find("\n}\n").expect("本体の終わりが無い")];
+    assert!(tbody.contains("None => true"), "TC_GEMM2 の既定を動かしている");
 }
