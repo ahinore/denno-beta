@@ -18508,49 +18508,178 @@ fn moe_ffn_quant_batch_full(
 /// `acquire_soft` で入れ直すと、相対的な新しさ (LRU の並び) も元に近づく。
 /// 失敗しても致命的ではない (次の decode が `acquire` で上げ直す) ので、
 /// `acquire_soft` (ラッチしない方) を使う。
+///
+/// task 394: `DENNO_PF_RESTORE_MT=1` のときは [`pf_restore_experts_mt`] へ回す
+/// (1 本ずつの同期 H2D を N 本で重ねる)。`DENNO_Q4_PROFILE=1` のときは
+/// 1 回ぶんの実測を `[pf-restore]` に出す。
 #[cfg(feature = "cuda")]
 fn pf_restore_experts(
     layers: &[LayerW],
     keys: &[crate::model::expert_cache::ExpertKey],
 ) -> (usize, usize) {
+    let t = std::time::Instant::now();
+    let mt = crate::model::exp_pf::pf_restore_mt();
+    let (n, bytes) = if mt && keys.len() >= 2 {
+        pf_restore_experts_mt(layers, keys)
+    } else {
+        pf_restore_experts_seq(layers, keys)
+    };
+    if crate::model::pf_host::on() && !keys.is_empty() {
+        eprintln!(
+            "[pf-restore] {} 本 / {} MiB を戻した ({} 本は戻せず) {} ms mt={} threads={}",
+            n,
+            bytes >> 20,
+            keys.len().saturating_sub(n),
+            t.elapsed().as_millis(),
+            u8::from(mt),
+            crate::model::exp_pf::pf_restore_threads()
+        );
+    }
+    (n, bytes)
+}
+
+/// task 394: 戻しの 1 本ぶん。`deferred` なら転送を LRU のロックの外で行う
+/// ([`crate::model::expert_vram::acquire_deferred`])。
+///
+/// 戻り値は載せたバイト数 (`None` = この 1 本は載せられなかった)。VRAM へ
+/// 渡るバイト列は 1 本ずつの経路と同じ (ここは行列の切り出しと形の判定だけを
+/// 行い、転送は [`crate::model::expert_vram`] の同じ関数に任せる)。
+#[cfg(feature = "cuda")]
+fn pf_restore_one(
+    layers: &[LayerW],
+    key: crate::model::expert_cache::ExpertKey,
+    deferred: bool,
+) -> Option<usize> {
     use crate::model::expert_vram::{self, ExpertShape};
+    let lw = layers.get(key.layer as usize)?;
+    let ei = key.expert as usize;
+    let (g, u, d) = (&lw.gate_exps, &lw.up_exps, &lw.down_exps);
+    let shapes = [
+        ExpertShape {
+            ty: g.ty,
+            k: g.n_in,
+            n: g.n_out,
+        },
+        ExpertShape {
+            ty: u.ty,
+            k: u.n_in,
+            n: u.n_out,
+        },
+        ExpertShape {
+            ty: d.ty,
+            k: d.n_in,
+            n: d.n_out,
+        },
+    ];
+    let want = shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)).ok()?;
+    let load = || Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?]);
+    let got = if deferred {
+        expert_vram::acquire_deferred(key, shapes, load)
+    } else {
+        expert_vram::acquire_soft(key, shapes, load)
+    };
+    match got {
+        Ok(Some(_)) => Some(want),
+        _ => None,
+    }
+}
+
+/// task 394: 戻しを 1 本ずつ直列に行う (従来の経路)。
+#[cfg(feature = "cuda")]
+fn pf_restore_experts_seq(
+    layers: &[LayerW],
+    keys: &[crate::model::expert_cache::ExpertKey],
+) -> (usize, usize) {
     let mut n = 0usize;
     let mut bytes = 0usize;
     for key in keys {
-        let Some(lw) = layers.get(key.layer as usize) else {
-            continue;
-        };
-        let ei = key.expert as usize;
-        let (g, u, d) = (&lw.gate_exps, &lw.up_exps, &lw.down_exps);
-        let shapes = [
-            ExpertShape {
-                ty: g.ty,
-                k: g.n_in,
-                n: g.n_out,
-            },
-            ExpertShape {
-                ty: u.ty,
-                k: u.n_in,
-                n: u.n_out,
-            },
-            ExpertShape {
-                ty: d.ty,
-                k: d.n_in,
-                n: d.n_out,
-            },
-        ];
-        let Ok(want) = shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) else {
-            continue;
-        };
-        let got = expert_vram::acquire_soft(*key, shapes, || {
-            Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
-        });
-        if matches!(got, Ok(Some(_))) {
+        if let Some(want) = pf_restore_one(layers, *key, false) {
             n += 1;
             bytes += want;
         }
     }
     (n, bytes)
+}
+
+/// task 394: 戻しを N 本のスレッドで行う (`DENNO_PF_RESTORE_MT`)。
+///
+/// 1 本の戻しは「gate/up/down の 3 回の同期 H2D + スロット確保」で、待ちが
+/// 直列に並ぶ (lab t390b の 14k: 1,057 本で約 1.27 s = 1 本 1.2 ms)。ここでは
+/// [`crate::model::expert_vram::acquire_deferred`] (転送を LRU のロックの外で
+/// 行う版) を専用プールの N 本で回し、同期の待ちを重ねる。
+///
+/// **CUDA の current context はスレッドローカル**なので、プールの各スレッドで
+/// 1 回 [`crate::cuda::make_current_on_this_thread`] を呼ぶ (呼ばないと最初の
+/// 確保が error 201 で落ち、載せられないまま静かに終わる)。H2D も専用
+/// ストリームへ出す ([`crate::cuda::enable_thread_upload_stream`]) ので、
+/// メインスレッドのカーネルと直列にならない。デバイスへ渡るバイト列は
+/// 1 本ずつの経路と同一で、変わるのは順序と重なりだけ。
+///
+/// プールを作れない / context を張れない / `par` 無しのビルドでは従来経路へ
+/// 落ちる (fail closed)。
+#[cfg(feature = "cuda")]
+fn pf_restore_experts_mt(
+    layers: &[LayerW],
+    keys: &[crate::model::expert_cache::ExpertKey],
+) -> (usize, usize) {
+    #[cfg(feature = "par")]
+    {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static READY: AtomicBool = AtomicBool::new(false);
+        let nt = crate::model::exp_pf::pf_restore_threads()
+            .min(keys.len())
+            .max(1);
+        if let Some(pool) = pf_restore_pool(nt) {
+            if !READY.load(Ordering::Relaxed) {
+                // プールの全スレッドで 1 回ずつ context と H2D ストリームを張る。
+                let ok = pool.broadcast(|_| {
+                    crate::cuda::make_current_on_this_thread()
+                        && crate::cuda::enable_thread_upload_stream()
+                });
+                if !ok.iter().any(|b| *b) {
+                    return pf_restore_experts_seq(layers, keys);
+                }
+                READY.store(true, Ordering::Relaxed);
+            }
+            use rayon::prelude::*;
+            let n = AtomicUsize::new(0);
+            let bytes = AtomicUsize::new(0);
+            pool.install(|| {
+                keys.par_iter().for_each(|k| {
+                    if let Some(want) = pf_restore_one(layers, *k, true) {
+                        n.fetch_add(1, Ordering::Relaxed);
+                        bytes.fetch_add(want, Ordering::Relaxed);
+                    }
+                });
+            });
+            return (n.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed));
+        }
+    }
+    pf_restore_experts_seq(layers, keys)
+}
+
+/// task 394: 戻し専用の rayon プール (スレッド数ごとに 1 個だけ作る)。
+///
+/// スレッド局所の pinned バウンスと H2D ストリームをそのまま使い回せるので、
+/// 2 回目以降の戻しはプールの作成も初期化も要らない。
+#[cfg(all(feature = "cuda", feature = "par"))]
+fn pf_restore_pool(nt: usize) -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    static NT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let first = NT.swap(nt, std::sync::atomic::Ordering::Relaxed) == 0;
+    if !first {
+        // 2 本目以降の違う本数は無視する (プロセスで 1 個)。
+        return POOL.get().and_then(|p| p.as_ref());
+    }
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(nt)
+            .thread_name(|i| format!("pf-restore-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// task 233: 層優先 prefill の MoE (活性はデバイスに置いたまま)。

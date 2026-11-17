@@ -2526,6 +2526,73 @@ pub fn lm_reload_evicted() -> bool {
     })
 }
 
+/// task 394: 層優先 prefill の終端で戻す expert の転送を**複数スレッド**で行う
+/// (`DENNO_PF_RESTORE_MT`)。**既定 off** (測ってから決める)。
+///
+/// # なぜ要るか (lab t390b / REPORT_P390 §1 の実測)
+///
+/// UD-Q4_K_XL の 14k cold では、prefill の終端で 1,057 本 (3,310 MiB) を LRU へ
+/// 戻すのに `other` 段の未分類ぶん **約 1.27 s** を使っていた (1 本 1.2 ms)。
+/// 戻しの 1 本は「gate/up/down を 3 回の同期 H2D」で、待ちが直列に並ぶ。
+/// ページは page cache に載っているので (P390 §1 の先読みは 3.3 GB を 2 ms で
+/// 触った)、律速は I/O ではなく **同期転送 3 回 + 確保** の側にある。
+///
+/// ここでは [`crate::model::expert_vram::acquire_deferred`] (転送を LRU のロックの
+/// 外で行う版。task 214 が背景の上げ直しで使っている) を N 本のスレッドで回し、
+/// 同期の待ちを重ねる。VRAM へ渡るバイト列・LRU の内容は 1 本ずつの経路と同一で、
+/// 変わるのは**順序と重なり**だけ。
+///
+/// 失敗しても致命的ではない (戻せなかった expert は次の decode が `acquire` で
+/// 上げ直す)。`acquire_deferred` はラッチしないので、確保に失敗した 1 本を
+/// 捨てても以後の経路は変わらない。
+pub const PF_RESTORE_MT_ENV: &str = "DENNO_PF_RESTORE_MT";
+
+/// [`PF_RESTORE_MT_ENV`] の既定 (off)。
+pub const DEFAULT_PF_RESTORE_MT: bool = false;
+
+/// [`PF_RESTORE_MT_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn pf_restore_mt_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PF_RESTORE_MT,
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// 戻しを複数スレッドで行うか (プロセスで 1 回だけ env を読む)。
+pub fn pf_restore_mt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_restore_mt_from_value(std::env::var(PF_RESTORE_MT_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_RESTORE_THREADS`: 戻しを回すスレッド数 (既定 8)。
+///
+/// 1 本あたり 3.1 MB のホスト写し (DDR) と DMA (PCIe) なので、本数を増やしても
+/// 帯域で頭打ちになる。8 は DDR の 21 GB/s と PCIe の 52 GB/s に対して
+/// 「1 本 0.2 ms」近くまで詰められる見込みの値 (推定)。
+pub const PF_RESTORE_THREADS_ENV: &str = "DENNO_PF_RESTORE_THREADS";
+
+/// [`PF_RESTORE_THREADS_ENV`] の既定値。
+pub const DEFAULT_PF_RESTORE_THREADS: usize = 8;
+
+/// [`PF_RESTORE_THREADS_ENV`] の解釈 (純関数)。1..=32 に丸める。0 も 1 にする。
+pub fn pf_restore_threads_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_PF_RESTORE_THREADS;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.clamp(1, 32),
+        Err(_) => DEFAULT_PF_RESTORE_THREADS,
+    }
+}
+
+/// 戻しのスレッド数 (プロセスで 1 回だけ env を読む)。
+pub fn pf_restore_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pf_restore_threads_from_value(std::env::var(PF_RESTORE_THREADS_ENV).ok().as_deref())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 1 リクエストぶんの観測 (REPORT 用)
 // ---------------------------------------------------------------------------
@@ -3043,6 +3110,32 @@ pub fn upload_budget_experts() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task 394: 戻しの並列化のゲートは既定 off、明示の真値だけ on。
+    /// スレッド数は 1..=32 に丸める。
+    #[test]
+    fn restore_mt_gate_truth_table() {
+        assert!(!DEFAULT_PF_RESTORE_MT, "既定が on になっている");
+        assert!(!pf_restore_mt_from_value(None), "未設定は既定 (off)");
+        assert!(!pf_restore_mt_from_value(Some("")), "空も既定 (off)");
+        assert!(!pf_restore_mt_from_value(Some("0")));
+        assert!(!pf_restore_mt_from_value(Some("off")));
+        assert!(!pf_restore_mt_from_value(Some("false")));
+        assert!(!pf_restore_mt_from_value(Some("no")));
+        assert!(pf_restore_mt_from_value(Some("1")));
+        assert!(pf_restore_mt_from_value(Some("on")));
+        assert!(pf_restore_mt_from_value(Some(" true ")));
+        assert!(pf_restore_mt_from_value(Some("YES")));
+        // スレッド数: 未設定は既定 8、0 も 1 (0 本のプールは作れない)、上限 32。
+        assert_eq!(DEFAULT_PF_RESTORE_THREADS, 8);
+        assert_eq!(pf_restore_threads_from_value(None), 8);
+        assert_eq!(pf_restore_threads_from_value(Some("")), 8);
+        assert_eq!(pf_restore_threads_from_value(Some("0")), 1);
+        assert_eq!(pf_restore_threads_from_value(Some("1")), 1);
+        assert_eq!(pf_restore_threads_from_value(Some(" 12 ")), 12);
+        assert_eq!(pf_restore_threads_from_value(Some("999")), 32);
+        assert_eq!(pf_restore_threads_from_value(Some("x")), 8);
+    }
 
     /// task 325: `DENNO_PF_RA_GROUPS` の真理値表 (未設定は off)。
     #[test]
