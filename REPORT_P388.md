@@ -3,7 +3,10 @@ ADOPT: yes t388b t388c
 # REPORT P388 — UD-IQ3_XXS decode: ミスの CPU GEMV を GPU の起動と同時に走らせる (DENNO_DEC_MISS_SPAWN)
 
 branch `br388` = 開始時の `int-auto` **056258a92**。作業中に int-auto は
-**66c2a4d2d** まで進んだので merge した (docs / denno-view の 1 本、コードの衝突なし)。
+**66c2a4d2d** (docs / denno-view) と **b7f3e5528** (br393 = prefill のホスト仕事) まで
+進んだので 2 回 merge した。どちらも衝突なし (br393 は cuda.rs / qwen4exp.rs /
+kernel_invariants.rs に触るが、こちらの変更は `iq_layer_run` の 1 か所だけで
+別の関数)。最終 HEAD の関門は §6。
 数値はすべて GPU ラボの実測。lab 名と測った SHA は
 **t388a = 056258a92**(プロファイル用) / **t388b = 3c5318dea**(A/B) /
 **t388c = dfa11b861**(既定 on の確認)。
@@ -212,14 +215,16 @@ c8000_cold:672fec07 c8000_turn2:bc4aaf54` (SAME)。errors は全 COND 0。
 
 ## 6. テスト
 
-関門 (`--features cuda`、merge 後の HEAD で実行):
+関門 (`--features cuda`、**最終 HEAD = br393 の merge 後**で実行):
 
 ```text
 CARGO_TARGET_DIR=/tmp/t388 cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1
-  -> 1265 passed; 0 failed; 103 ignored
+  -> 1271 passed; 0 failed; 103 ignored
 同 --test kernel_invariants
-  -> 112 passed; 0 failed
+  -> 115 passed; 0 failed
 ```
+
+(br393 を merge する前の HEAD では 1265 + 112。br393 が足したぶんが増えている。)
 
 足したテスト (2 本、`exp_iq::tests`):
 - `miss_spawn_gates_parse_explicitly` — spawn は既定 on・明示的な偽値だけ切る、
