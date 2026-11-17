@@ -24,6 +24,7 @@ order runs "features → models → performance → quality → verification".
 | 6 [`50_gdn.md`](50_gdn.md) | Gated DeltaNet: the maths, the kernels, the numbers. Where bit-identity was given up | P19, s61c, s192 and others |
 | 7 [`60_quality.md`](60_quality.md) | Measured isolation of broken output. Fake turns, repetition collapse, thinking modes, stop conditions | s53–s56b, P4-1/P4-4 |
 | 8 [`70_infra.md`](70_infra.md) | How it was measured, and when a number can be trusted. Anchors, cold A/B, measurement windows | everything from P7.5 on |
+| 9 [`85_flash_next_autonomous.md`](85_flash_next_autonomous.md) | 17 days in which a team of agents sped up Flash-Next around the clock. Decode 167 → 15.3 ms/tok, 3,826-token prefill 135 → 2.44 s, the default model switch, the Intel GPU port, measurements on 2026-11-17 | task 98 on to 382, `arc-port` |
 | Appendix A [`90_phase_index.md`](90_phase_index.md) | Every phase in date order (machine-generated index) | 143 phases |
 | Appendix B [`80_licenses.md`](80_licenses.md) | Ledger of the external implementations consulted and their licences | P19 |
 

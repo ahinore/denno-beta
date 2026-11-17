@@ -21,6 +21,7 @@
 | 第6巻 [`50_gdn.md`](50_gdn.md) | Gated DeltaNet の数式・カーネル・数値。どこで bit 一致を諦めたか | P19、s61c、s192 ほか |
 | 第7巻 [`60_quality.md`](60_quality.md) | 出力が壊れたときの切り分け実測。偽ターン、反復崩れ、思考モード、停止条件 | s53〜s56b、P4-1/P4-4 |
 | 第8巻 [`70_infra.md`](70_infra.md) | どう測ったか、数字を信じてよい条件。アンカー、cold A/B、計測窓の運用 | P7.5 以降すべて |
+| 第9巻 [`85_flash_next_autonomous.md`](85_flash_next_autonomous.md) | Flash-Next をエージェントの開発チームで 24 時間速くした 17 日間。decode 167 → 15.3 ms/tok、prefill 3,826 トークン 135 → 2.44 s、既定モデルの切り替え、Intel GPU 移植、2026-11-17 の実測 | task 98 以降〜382、`arc-port` |
 | 付録A [`90_phase_index.md`](90_phase_index.md) | 全 phase の日付順一覧（機械生成の索引） | 143 phase |
 | 付録B [`80_licenses.md`](80_licenses.md) | 参照した外部実装とライセンス帰属の台帳 | P19 |
 

@@ -16,7 +16,8 @@ The goal is to understand how LLMs work (tokenization → forward pass → sampl
 - **Exact decoding**: fixed seed + temperature 0 → bit-identical output for the same input, kept intact across every optimization (continuous batching, SIMD, CUDA), enforced by exactness tests in CI.
 - **CUDA offload**: decode and prefill both run on hand-written kernels with weights / KV / hidden states resident in VRAM. Numerical contract: linear layers, rope, rmsnorm and swiglu are bit-identical to CPU; only attention has an approved relaxation window ([Architecture §8](docs/ARCHITECTURE.en.md), [numeric policy](docs/NUMERIC_POLICY.en.md)).
 - Continuous batching (multiple sessions in one forward, KV slot pool), prefix cache (largest-LCP selection, with GDN state snapshots), int8 quantisation for the 27B path, repetition / frequency / presence penalties, no-repeat n-gram.
-- **Expert tiering** (Flash-Next): each of the 512 experts is cached in VRAM, then RAM, then read from the GGUF on SSD; the router's top-10 per layer pulls the ones it needs back up. Every tier has a budget, so the model runs inside a VRAM limit far smaller than its 104 GB of weights.
+- **Expert tiering** (Flash-Next): each of the 512 experts is cached in VRAM, then RAM, then read from the GGUF on SSD; the router's top-10 per layer pulls the ones it needs back up. Every tier has a budget, so the 84–111 GB model runs on 32 GB of VRAM and 64 GB of RAM.
+- **Intel GPU port (in progress)**: a Level Zero + hand-written OpenCL C backend for the Arc Pro B60 lives on branch `arc-port` (not in `main` yet).
 - **Inference telemetry + viewer**: telemetry that never makes inference wait (`DENNO_TELEMETRY`, on by default on the `serve-flash` path and off on `serve`, read-only) and a separate `denno-view` server with a 2D dashboard (`/`) and a 3D view (`/3d`) of the real layer structure.
 
 ## Qwen3.8-Flash-Next at a glance
@@ -30,21 +31,50 @@ Values read from the GGUF header, not from the model card:
 | Widths | hidden 2560, expert FFN 640, context 262144 |
 | Attention | 24 query heads / 2 KV heads, head dim 256; indexer 4 heads x 128 |
 | PLE | n-gram embedding layer at **layer index 1 only** (one injection per token): 16 heads = (ngram 3 − 1) × 8, 16 tables, about 28.8 GB kept on SSD |
-| Weights | UD-Q4_K_XL split GGUF, about 104 GB — gate/up experts Q4_K, down experts Q5_1, attention / ssm / shared Q8_0 |
+| Weights (default) | unsloth `UD-IQ3_XXS` (2026-11-13 release), split GGUF, 83.6 GB — experts mix IQ3_XXS / IQ2_S / IQ4_NL / IQ4_XS per layer, attention / ssm output / shared expert mostly Q6_K, hyper connection and PLE Q8_0, the 28.8 GB PLE table (Engram) IQ4_NL |
+| Weights (larger) | `UD-Q4_K_XL` from the same repo (2026-11-13 release), 111.3 GB; it does not fit in RAM, so part of the experts is read from the SSD every time |
 
 `serve-flash` keeps the dense weights resident and treats the experts as a cache. The serving path is deliberately minimal: `/v1/messages` only (`/v1/chat/completions` is not implemented), one request at a time, with a prefix cache that reuses the longest shared prefix — continuing an 805-token conversation drops from 204.7 s to 5.7 s.
 
 ## Measured
 
-Wall clock on a single consumer GPU, one request at a time. The first run of any process pays the weight upload and is discarded; figures are medians of alternating A/B runs and are always quoted together with the output-hash anchors.
+### Qwen3.8-Flash-Next (measured 2026-11-17)
+
+One request at a time over HTTP `/v1/messages`. The server is restarted for every measurement; the first condition runs on a cold page cache and is not used as the baseline (2 warm conditions × 2 rounds). "Cold" prefill means no conversation prefix cache. Output is temperature 0 and gives the same md5 on every run.
+
+Machines:
+
+- **rtx5090**: GeForce RTX 5090 32 GB (PCIe Gen5 x16), Ryzen 7 9800X3D, 64 GB RAM, NVMe SSD. Code `8ae66f334` (the parent of this README commit)
+- **arc**: Intel Arc Pro B60 24 GB (PCIe Gen4 x8), Ryzen 7 8700G, 64 GB RAM, NVMe SSD. Branch `arc-port` at `a4f891d28`
+
+| Machine / weights | Decode (short chat) | Decode (after 14k) | Prefill 3,826 tokens | Prefill 14,018 tokens | 2nd turn, time to first token |
+|---|---|---|---|---|---|
+| rtx5090 / UD-IQ3_XXS (default) | **15.3 ms/tok (65 tok/s)** | 16.1–16.5 ms/tok (61 tok/s) | **2.44 s (1,570 tok/s)** | **6.00–6.25 s (2,300 tok/s)** | 0.45–0.51 s |
+| rtx5090 / UD-Q4_K_XL | 18.2–19.3 ms/tok (53 tok/s) | 27–29 ms/tok (35 tok/s) | 9.2–9.8 s (400 tok/s) | 25.2–25.9 s (550 tok/s) | 0.50–0.60 s |
+| arc / UD-IQ3_XXS (reference only, text breaks) | 56 ms/tok (18 tok/s) | 100 ms/tok | 29.4–29.8 s (130 tok/s) | 107.8 s (130 tok/s) | — |
+| arc / swift15 IQ3_S (old default) | 88–90 ms/tok (11 tok/s) | 115 ms/tok | 15.1–15.4 s (250 tok/s) | 62.6 s (220 tok/s) | — |
+
+- On rtx5090, decode is the median over 128 output tokens. A second run of the same chat (experts already in VRAM) drops to 13 ms/tok (77 tok/s).
+- UD-Q4_K_XL is 111 GB and does not fit in RAM; a 3,826-token prefill reads about 44 GB from the SSD every time (capped at 5.95 GB/s).
+- The first request after a server start runs on a cold page cache: 3.8 s for 3,826 tokens and 7.8 s for 14k on UD-IQ3_XXS.
+- The Intel GPU build on arc is still being ported. Each process gets 3,826 tokens → a short question → the same question again; decode is taken from the short question once its experts are in VRAM (all 3 rounds agree).
+  - UD-IQ3_XXS runs fast but the text breaks: the answer to the 28-token question emits the role name `user` at token 44 and stops. The types that changed in the new model are not handled right yet.
+  - swift15 IQ3_S gives correct text, but the third request of a process (the second short question) faults the GPU every time (`ZE_RESULT_ERROR_DEVICE_LOST`), so its decode comes from the first short question (experts still being uploaded).
+
+Where the time goes, rtx5090 / UD-IQ3_XXS (warm, measured on the development branch one step before `8ae66f334`):
+
+| | Total | Breakdown |
+|---|---|---|
+| Decode | 16.3 ms/tok | experts 4.73 (including 2.33 for the 8 % of experts computed on the CPU) / mix (hyper connection) 4.73 / ssm (GDN) 3.52 / full attention 1.47 / head 0.73 / shared + router 0.80 |
+| Prefill 3,826 | 2.45 s | experts 1.32 s (1.09 s waiting for uploads) / ssm 0.62 / other (PLE etc.) 0.24 / mix 0.14 / full attention 0.14 |
+| Prefill 14k | 6.44 s | ssm 2.61 s / experts 1.88 / other 1.05 / full attention 0.88 |
+
+### Other models (older measurements)
 
 | Model | Prefill | Decode |
 |---|---|---|
 | Qwen3.5-27B, Q4_0 | 9.24 s @ 16k ctx / 38.03 s @ 65k ctx | 17.3 ms/token |
-| Qwen3.8-Flash-Next, UD-Q4_K_XL | 29 ms/token @ 706 tok | 191 ms/token @ 706 tok (150 ms/token on a 38-token run) |
 | Qwen3.5-9B, int8 | 13.18 s / 431 tok/s (5,686 tok) | 16.4 ms/token |
-
-Where Flash-Next decode time goes (49 input + 128 output tokens, 193.9 ms/token): selected experts 71.9 ms (37 %) / attention 62.2 ms (32 %) / mix 31.8 / router 17.0 / shared expert 10.9. Per layer, decode costs 4.04 ms against 0.61 ms of prefill — a 6.6× amplification, which is where the fixed cost of a GEMV-shaped batch lives.
 
 Older numbers, rejected experiments and the protocol that defines "official" live in [docs/TASKS.md](docs/TASKS.md) and the [development history](docs/history/en/README.md).
 
@@ -59,25 +89,28 @@ The GGUF is on the Hugging Face Hub, public — no login, no acceptance gate:
 | | |
 |---|---|
 | Repo | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (quantised from [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)) |
-| Quant | `UD-Q4_K_XL`, 4 shards, 111.3 GB / 103.7 GiB |
+| Quant (default) | `UD-IQ3_XXS`, 4 shards, 83.6 GB. The tested release is revision `f5d175de` (2026-11-13) |
 | License | Qwen Community License 1.0 — `LICENSE` ships with the weights; keep it with any copy you pass on |
 
 ```bash
 pip install -U huggingface_hub
 hf download unsloth/Qwen3.8-Flash-Next-GGUF \
-  --include "UD-Q4_K_XL/*" --local-dir ~/models/qwen38-flash-next
+  --revision f5d175de2cf7f720d45d6064019a81fcf056e986 \
+  --include "UD-IQ3_XXS/*" --local-dir ~/models/qwen38-flash-next-1113
 ```
 
-That leaves `~/models/qwen38-flash-next/UD-Q4_K_XL/` holding:
+That leaves `~/models/qwen38-flash-next-1113/UD-IQ3_XXS/` holding:
 
 ```
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   10.9 MB
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf   49.9 GB
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf   49.4 GB
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf   12.1 GB
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf   10.9 MB  (metadata only)
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf   49.9 GB
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf    4.9 GB
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf   28.8 GB  (PLE table)
 ```
 
-`--dir` reads every `*.gguf` in a directory in sorted order, so keep one quant per folder. Sizes above are decimal GB (`du` reports 104 GiB).
+- `--dir` reads every `*.gguf` in a directory in sorted order, so keep one quant per folder. Sizes above are decimal GB.
+- With more RAM you can take the larger `UD-Q4_K_XL` (111.3 GB) the same way: use `--include "UD-Q4_K_XL/*"` and add `DENNO_START_PREFETCH=0` when starting.
+- The first shard of the 11-13 release (metadata only) has no trailing padding to the 32-byte alignment. denno reads it from 2026-11-16 on (commit `42500e5`).
 
 ```bash
 # 1. build the CUDA path (the feature lives on denno-engine, not on the binary crate)
@@ -85,10 +118,16 @@ cargo build --release --features cuda -p denno-cli -p denno-engine
 
 # 2. fetch the weights (command above), then point --dir at the shard directory
 
-# 3. start the server
-DENNO_CUDA=1 ./target/release/denno serve-flash \
-  --dir ~/models/qwen38-flash-next/UD-Q4_K_XL \
-  --port 8098 --max-ctx 65536 --max-tokens 1024
+# 3. start the server (the settings used for the numbers above; for 32 GB of VRAM)
+DENNO_CUDA=1 DENNO_PREFILL_BATCH=1 DENNO_PREFILL_BATCH_CHUNK=512 DENNO_STRIP_TOOLS=1 \
+DENNO_START_PREFETCH=1 DENNO_GPU_WEIGHT_MB=12000 \
+DENNO_EXPERT_GPU=0 DENNO_EXPERT_BATCH=1 DENNO_EXPERT_IQ_GPU=1 \
+DENNO_EXPERT_VRAM_MB=22000 DENNO_EXPERT_GPU_MIN_HIT=0 \
+DENNO_GEMV_V3=1 DENNO_MIX_GPU=1 DENNO_ROUTER_GPU=1 \
+DENNO_MOE_BATCH_PTX=crates/denno-engine/kernels/kernels_moe_batch.ptx \
+./target/release/denno serve-flash \
+  --dir ~/models/qwen38-flash-next-1113/UD-IQ3_XXS \
+  --port 8098 --max-ctx 65536 --max-tokens 4096
 ```
 
 Call it with the Anthropic Messages format — `stream: true` gives you SSE:
@@ -123,7 +162,10 @@ Environment knobs that matter in practice:
 | `DENNO_CUDA=1` | enable the GPU path (without it the same build runs on the CPU, roughly an order of magnitude slower) |
 | `DENNO_PREFILL_BATCH=1`, `DENNO_PREFILL_BATCH_CHUNK=512` | batched GPU GEMM for prefill (chunk default 8; 512 measured best, above 1024 regresses) |
 | `DENNO_GPU_WEIGHT_MB`, `DENNO_EXPERT_VRAM_MB` | VRAM budget for dense weights and for the expert cache; if the dense weights fill the first budget, the experts stay on the CPU and decode roughly halves in speed |
-| `DENNO_EXPERT_GPU=1`, `DENNO_EXPERT_BATCH=1` | place / batch the selected experts on the GPU |
+| `DENNO_EXPERT_IQ_GPU=1`, `DENNO_EXPERT_GPU_MIN_HIT=0` | keep IQ-type experts in VRAM and compute them on the GPU / send all of them to the GPU, with no hit-rate floor |
+| `DENNO_EXPERT_GPU=1`, `DENNO_EXPERT_BATCH=1` | place the selected experts on the GPU (older path) / batch them |
+| `DENNO_START_PREFETCH=1` | read the experts and the PLE table into the page cache before listening (startup grows by a dozen seconds, the first request gets faster) |
+| `DENNO_GEMV_V3=1`, `DENNO_MIX_GPU=1`, `DENNO_ROUTER_GPU=1` | run the decode GEMV, mix and router on the GPU |
 | `DENNO_STRIP_TOOLS=1` | drop the `tools` definitions from the prompt (a 40-tool request costs 6,979 prompt tokens, or 842 without them) |
 | `DENNO_MAX_SYSTEM=N` | keep only the first N characters of the system prompt |
 | `DENNO_TELEMETRY`, `DENNO_TELEMETRY_ACT=1`, `DENNO_TELEMETRY_ARCH=1` | telemetry (on by default here; `0` disables) / per-layer activation / structure frames |
@@ -149,7 +191,7 @@ cargo run --release -p denno-cli -- generate openai-community/gpt2 --prompt "The
 ```bash
 # 1. start the server (serve-flash has telemetry on by default; DENNO_TELEMETRY=0 disables it)
 DENNO_CUDA=1 ./target/release/denno serve-flash \
-  --dir ~/models/flash-next --port 8098 --max-ctx 65536 --max-tokens 1024
+  --dir ~/models/qwen38-flash-next-1113/UD-IQ3_XXS --port 8098 --max-ctx 65536 --max-tokens 1024
 
 # 2. in another terminal, start denno-view against that server
 #    (VIEW_PORT defaults to 8093)

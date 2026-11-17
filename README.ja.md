@@ -16,7 +16,8 @@ LLM の動作原理(トークン化 → forward pass → サンプリング → 
 - **exact decoding**: seed 固定 + 温度 0 で同一入力 → ビット完全同一出力。連続バッチング・SIMD・CUDA 化を経ても壊さない規律で、CI の exactness テストが担保する
 - **CUDA オフロード**: decode / prefill の両チェーンを自前 CUDA カーネルで GPU 化し、重み / KV / 隠れ状態を VRAM に常駐させる。数値契約は「線形層・rope・rmsnorm・swiglu は CPU とビット一致、緩和枠は attention のみ」([アーキテクチャ解説 §8](docs/ARCHITECTURE.ja.md)、[数値方針](docs/NUMERIC_POLICY.ja.md))
 - 連続バッチング(複数セッションの decode を 1 forward に統合・KV スロットプール)、prefix cache(LCP 最大選択・GDN 状態スナップショット対応)、27B 経路の int8 量子化、repetition / frequency / presence penalty、no-repeat n-gram
-- **expert の階層配置**(Flash-Next): 512 個の expert を VRAM → RAM → SSD(GGUF 直読み)の順にキャッシュし、層ごとに router の top-10 が必要なものだけを引き上げる。階層ごとに予算を持つので、重み 104 GB のモデルを遥かに小さい VRAM 枠で回せる
+- **expert の階層配置**(Flash-Next): 512 個の expert を VRAM → RAM → SSD(GGUF 直読み)の順にキャッシュし、層ごとに router の top-10 が必要なものだけを引き上げる。階層ごとに予算を持つので、重み 84〜111 GB のモデルを 32 GB の VRAM と 64 GB の RAM で回せる
+- **Intel GPU 版(移植中)**: Level Zero + OpenCL C の自前カーネルで Arc Pro B60 に載せる移植を、ブランチ `arc-port` で進めている(`main` にはまだ入っていない)
 - **推論テレメトリ + ビューワ**: 推論を一切待たせないテレメトリ(`DENNO_TELEMETRY`、`serve-flash` 経路では既定 ON、`serve` では既定 OFF・read-only)と、別プロセスの `denno-view`。2D ダッシュボード(`/`)と、実構造をそのまま組んだ 3D ビュー(`/3d`)
 
 ## Qwen3.8-Flash-Next の構成
@@ -30,21 +31,50 @@ LLM の動作原理(トークン化 → forward pass → サンプリング → 
 | 幅 | hidden 2560、expert FFN 640、context 262144 |
 | attention | query 24 head / KV 2 head、head dim 256、indexer 4 head x 128 |
 | PLE | n-gram 埋め込み層は **layer index 1 のみ**(1 トークン 1 回注入): 16 head = (ngram 3 − 1) × 8、表 16 本で約 28.8 GB を SSD に常駐 |
-| 重み | UD-Q4_K_XL 分割 GGUF 約 104 GB — gate/up expert は Q4_K、down expert は Q5_1、attention / ssm / shared は Q8_0 |
+| 重み(既定) | unsloth の `UD-IQ3_XXS`(2026-11-13 版)分割 GGUF 83.6 GB — expert は層ごとに IQ3_XXS / IQ2_S / IQ4_NL / IQ4_XS などを混在、attention / ssm 出力 / shared expert は主に Q6_K、hyper connection と PLE は Q8_0、PLE の表(Engram)28.8 GB は IQ4_NL |
+| 重み(大きい版) | 同じリポジトリの `UD-Q4_K_XL`(2026-11-13 版)111.3 GB。RAM に収まらないので expert の一部を毎回 SSD から読む |
 
 `serve-flash` は dense な重みを常駐させ、expert をキャッシュとして扱う。配信経路は意図的に最小で、`/v1/messages` のみ(`/v1/chat/completions` は未実装)、1 リクエストずつ処理し、最長共通接頭辞を再利用する prefix cache を持つ。805 トークンぶん再利用できた続きの会話は 204.7 s → 5.7 s になる。
 
 ## 計測値
 
-単体のコンシューマ GPU、1 リクエストずつの実測。どのプロセスも初回は重みのアップロードを払うので捨て、交互 A/B の中央値を出力ハッシュのアンカーとセットで載せる。
+### Qwen3.8-Flash-Next(2026-11-17 実測)
+
+1 リクエストずつ、HTTP の `/v1/messages` に投げた実測。サーバーは計測ごとに起動し直し、最初の条件はページキャッシュが冷えているので基準から外す(温まった状態の 2 条件 × 2 回)。prefill の「cold」は会話の prefix cache が無い状態から読んだ値。出力は temperature 0 で、どの回も同じ md5 になる。
+
+計測機:
+
+- **rtx5090**: GeForce RTX 5090 32 GB(PCIe Gen5 x16)、Ryzen 7 9800X3D、RAM 64 GB、NVMe SSD。コード `8ae66f334`(この README の commit の親)
+- **arc**: Intel Arc Pro B60 24 GB(PCIe Gen4 x8)、Ryzen 7 8700G、RAM 64 GB、NVMe SSD。ブランチ `arc-port` の `a4f891d28`
+
+| 機材 / 重み | 生成(短い会話) | 生成(14k 読んだあと) | prefill 3,826 トークン | prefill 14,018 トークン | 2 ターン目の応答開始 |
+|---|---|---|---|---|---|
+| rtx5090 / UD-IQ3_XXS(既定) | **15.3 ms/tok(65 tok/s)** | 16.1〜16.5 ms/tok(61 tok/s) | **2.44 s(1,570 tok/s)** | **6.00〜6.25 s(2,300 tok/s)** | 0.45〜0.51 s |
+| rtx5090 / UD-Q4_K_XL | 18.2〜19.3 ms/tok(53 tok/s) | 27〜29 ms/tok(35 tok/s) | 9.2〜9.8 s(400 tok/s) | 25.2〜25.9 s(550 tok/s) | 0.50〜0.60 s |
+| arc / UD-IQ3_XXS(参考値、文章が崩れる) | 56 ms/tok(18 tok/s) | 100 ms/tok | 29.4〜29.8 s(130 tok/s) | 107.8 s(130 tok/s) | — |
+| arc / swift15 IQ3_S(旧既定) | 88〜90 ms/tok(11 tok/s) | 115 ms/tok | 15.1〜15.4 s(250 tok/s) | 62.6 s(220 tok/s) | — |
+
+- 生成の値は rtx5090 では 128 トークン出力したときの中央値。同じ会話の 2 回目(expert が VRAM に揃った状態)は 13 ms/tok(77 tok/s)まで下がる。
+- UD-Q4_K_XL は 111 GB あって RAM に収まらず、3,826 トークンの prefill では毎回約 44 GB を SSD から読む(5.95 GB/s で頭打ち)。
+- サーバーを起動した直後の最初のリクエストはページキャッシュが冷えていて、UD-IQ3_XXS の 3,826 トークンで 3.8 s、14k で 7.8 s かかった。
+- arc の Intel GPU 版はまだ移植中。プロセスごとに 3,826 トークン → 短い質問 → 同じ質問の順で投げ、短い質問の 2 本目(expert が VRAM に揃った状態)を生成の値にした(3 回の値が一致)。
+  - UD-IQ3_XXS は速度は出るが、28 トークンの質問への答えが 44 トークン目で役割名 `user` を出して止まるなど、文章が崩れる。新モデルで変わった型の扱いがまだ合っていない。
+  - swift15 IQ3_S は文章は正しいが、同じプロセスの 3 本目(短い質問の 2 本目)で毎回 GPU がページフォールトを起こして止まる(`ZE_RESULT_ERROR_DEVICE_LOST`)。そのため生成は短い質問の 1 本目(expert を VRAM へ上げている途中)の値。
+
+rtx5090 / UD-IQ3_XXS の段ごとの内訳(温まった状態、`8ae66f334` の 1 つ前の開発ブランチで計測):
+
+| | 合計 | 内訳 |
+|---|---|---|
+| 生成 | 16.3 ms/tok | expert 4.73(GPU に無い 8 % を CPU で計算する分 2.33 を含む)/ mix(hyper connection の混合)4.73 / ssm(GDN)3.52 / full attention 1.47 / head 0.73 / shared + router 0.80 |
+| prefill 3,826 | 2.45 s | expert 1.32 s(転送待ち 1.09 s)/ ssm 0.62 / その他(PLE など)0.24 / mix 0.14 / full attention 0.14 |
+| prefill 14k | 6.44 s | ssm 2.61 s / expert 1.88 / その他 1.05 / full attention 0.88 |
+
+### その他のモデル(旧計測)
 
 | モデル | prefill | decode |
 |---|---|---|
 | Qwen3.5-27B, Q4_0 | 16k ctx 9.24 s / 65k ctx 38.03 s | 17.3 ms/token |
-| Qwen3.8-Flash-Next, UD-Q4_K_XL | 706 tok で 29 ms/token | 706 tok で 191 ms/token(38 tok の実行では 150 ms/token) |
 | Qwen3.5-9B, int8 | 5,686 tok で 13.18 s / 431 tok/s | 16.4 ms/token |
-
-Flash-Next の decode 内訳(入力 49 + 出力 128 トークン、193.9 ms/token): 選択 expert 71.9 ms(37 %)/ attention 62.2 ms(32 %)/ mix 31.8 / router 17.0 / shared expert 10.9。層あたり prefill 0.61 ms に対し decode 4.04 ms で 6.6 倍 — GEMV 形のバッチに固定費が乗る。
 
 古い数値・棄却した試み・「正式値」の定義は [docs/TASKS.md](docs/TASKS.md) と[開発史](docs/history/README.md) にある。
 
@@ -59,25 +89,28 @@ GGUF は Hugging Face Hub にあり、公開リポジトリなのでログイン
 | | |
 |---|---|
 | リポジトリ | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)(量子化元は [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)) |
-| 量子化 | `UD-Q4_K_XL`、4 分割、111.3 GB / 103.7 GiB |
+| 量子化(既定) | `UD-IQ3_XXS`、4 分割、83.6 GB。検証している版はリビジョン `f5d175de`(2026-11-13) |
 | ライセンス | Qwen Community License 1.0。`LICENSE` が重みと同梱されているので、複製を渡すときも一緒に渡す |
 
 ```bash
 pip install -U huggingface_hub
 hf download unsloth/Qwen3.8-Flash-Next-GGUF \
-  --include "UD-Q4_K_XL/*" --local-dir ~/models/qwen38-flash-next
+  --revision f5d175de2cf7f720d45d6064019a81fcf056e986 \
+  --include "UD-IQ3_XXS/*" --local-dir ~/models/qwen38-flash-next-1113
 ```
 
-これで `~/models/qwen38-flash-next/UD-Q4_K_XL/` に次が入る:
+これで `~/models/qwen38-flash-next-1113/UD-IQ3_XXS/` に次が入る:
 
 ```
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   10.9 MB
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf   49.9 GB
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf   49.4 GB
-Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf   12.1 GB
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf   10.9 MB  (メタデータのみ)
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf   49.9 GB
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf    4.9 GB
+Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf   28.8 GB  (PLE の表)
 ```
 
-`--dir` はディレクトリ内の `*.gguf` をソート順に全部読むので、1 フォルダ 1 量子化にする。上の数字は 10 進 GB(`du` は 104 GiB と出る)。
+- `--dir` はディレクトリ内の `*.gguf` をソート順に全部読むので、1 フォルダ 1 量子化にする。上の数字は 10 進 GB。
+- RAM に余裕があるなら、大きい版の `UD-Q4_K_XL`(111.3 GB)も同じ手順で取れる。`--include "UD-Q4_K_XL/*"` に替え、起動時に `DENNO_START_PREFETCH=0` を足す。
+- 11-13 版は先頭ファイル(メタデータのみ)の末尾に 32 バイト境界までの詰め物が無い。これを読めるのは 2026-11-16 以降の denno(commit `42500e5`)。
 
 ```bash
 # 1. CUDA 経路をビルド(フィーチャは denno-engine 側にある)
@@ -85,10 +118,16 @@ cargo build --release --features cuda -p denno-cli -p denno-engine
 
 # 2. 重みを取得(上のコマンド)し、shard のディレクトリを --dir に渡す
 
-# 3. サーバー起動
-DENNO_CUDA=1 ./target/release/denno serve-flash \
-  --dir ~/models/qwen38-flash-next/UD-Q4_K_XL \
-  --port 8098 --max-ctx 65536 --max-tokens 1024
+# 3. サーバー起動(計測値と同じ設定。VRAM 32 GB 向け)
+DENNO_CUDA=1 DENNO_PREFILL_BATCH=1 DENNO_PREFILL_BATCH_CHUNK=512 DENNO_STRIP_TOOLS=1 \
+DENNO_START_PREFETCH=1 DENNO_GPU_WEIGHT_MB=12000 \
+DENNO_EXPERT_GPU=0 DENNO_EXPERT_BATCH=1 DENNO_EXPERT_IQ_GPU=1 \
+DENNO_EXPERT_VRAM_MB=22000 DENNO_EXPERT_GPU_MIN_HIT=0 \
+DENNO_GEMV_V3=1 DENNO_MIX_GPU=1 DENNO_ROUTER_GPU=1 \
+DENNO_MOE_BATCH_PTX=crates/denno-engine/kernels/kernels_moe_batch.ptx \
+./target/release/denno serve-flash \
+  --dir ~/models/qwen38-flash-next-1113/UD-IQ3_XXS \
+  --port 8098 --max-ctx 65536 --max-tokens 4096
 ```
 
 Anthropic Messages 形式で叩く。`stream: true` で SSE になる:
@@ -123,7 +162,10 @@ print(c.messages.create(model="qwen3.8-flash-next", max_tokens=256,
 | `DENNO_CUDA=1` | GPU 経路を有効化(付けなければ同じバイナリが CPU で動く。概ね一桁遅い) |
 | `DENNO_PREFILL_BATCH=1`、`DENNO_PREFILL_BATCH_CHUNK=512` | prefill を GPU バッチ GEMM で回す(chunk の既定は 8、実測で 512 が最良。1024 より上げると退行) |
 | `DENNO_GPU_WEIGHT_MB`、`DENNO_EXPERT_VRAM_MB` | dense 重みと expert キャッシュの VRAM 予算。dense 重みが先の枠を食い切ると expert が CPU に落ち、decode が概ね半分になる |
-| `DENNO_EXPERT_GPU=1`、`DENNO_EXPERT_BATCH=1` | 選択 expert を GPU に載せる / まとめて処理する |
+| `DENNO_EXPERT_IQ_GPU=1`、`DENNO_EXPERT_GPU_MIN_HIT=0` | IQ 系の expert を VRAM に置いて GPU で計算する / 当たり率の下限を付けずに全部 GPU に回す |
+| `DENNO_EXPERT_GPU=1`、`DENNO_EXPERT_BATCH=1` | 選択 expert を GPU に載せる(旧経路)/ まとめて処理する |
+| `DENNO_START_PREFETCH=1` | 起動時に expert と PLE の表をページキャッシュへ読んでから待ち受ける(起動が十数秒延び、最初のリクエストが速くなる) |
+| `DENNO_GEMV_V3=1`、`DENNO_MIX_GPU=1`、`DENNO_ROUTER_GPU=1` | decode の GEMV・mix・router を GPU で回す |
 | `DENNO_STRIP_TOOLS=1` | プロンプトから `tools` 定義を落とす(40 ツールで prompt 6,979 トークンが 842 になる) |
 | `DENNO_MAX_SYSTEM=N` | system プロンプトの先頭 N 文字だけ残す |
 | `DENNO_TELEMETRY`、`DENNO_TELEMETRY_ACT=1`、`DENNO_TELEMETRY_ARCH=1` | テレメトリ(この経路では既定 ON、`0` で無効)/ 層活性 / 構造系フレーム |
@@ -149,7 +191,7 @@ cargo run --release -p denno-cli -- generate openai-community/gpt2 --prompt "The
 ```bash
 # 1. サーバー起動(serve-flash はテレメトリ既定 ON。DENNO_TELEMETRY=0 で無効)
 DENNO_CUDA=1 ./target/release/denno serve-flash \
-  --dir ~/models/flash-next --port 8098 --max-ctx 65536 --max-tokens 1024
+  --dir ~/models/qwen38-flash-next-1113/UD-IQ3_XXS --port 8098 --max-ctx 65536 --max-tokens 1024
 
 # 2. 別ターミナルで、そのサーバーに向けて denno-view を起動
 #    (VIEW_PORT の既定は 8093)
