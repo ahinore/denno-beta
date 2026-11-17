@@ -35,7 +35,9 @@ use denno_engine::model::qwen4exp::{
 };
 use denno_engine::model::qwen4exp_attn::{attend_batch_calls, FullAttn};
 use denno_engine::model::qwen4exp_ssm::{gdn_params, SsmAttn};
-use denno_engine::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
+use denno_engine::ple::{
+    dec_ple_par_gathers, set_dec_ple_par_for_test, PleNgram, PleTable, PLE_TABLE_NAME,
+};
 
 const ALIGN: usize = 32;
 
@@ -942,6 +944,44 @@ fn ssm_attn_differs_from_identity() {
 // ---------------------------------------------------------------------------
 // 6. PLE 層 (il=1) の ple_emb が非ゼロで、層 1 の出口に効いている
 // ---------------------------------------------------------------------------
+
+/// task 410: decode の PLE gather の並列度ゲート (`DENNO_DEC_PLE_PAR`) が
+/// **発火し**、値は逐次版とビット一致すること。
+///
+/// decode は 1 トークンにつき n_heads 行 (実ファイルは 16) を引く。64 行未満は
+/// `ple_par_parts` が逐次にするので、ゲート無しでは 90 B のランダム pread が
+/// 直列に並ぶ (冷えた page cache で 1 トークン 0.8-2.0 ms)。並列度を上げても
+/// 行は独立なので値は変わらない、がここでの契約。
+#[test]
+fn dec_ple_par_gate_fires_and_keeps_bits() {
+    exact_math();
+    let dir = TempDir::new("ple_decpar");
+    let f = open_synth(&dir, "model.gguf", false);
+    let tr = f.tensor_ref(PLE_TABLE_NAME).expect("PLE 表が無い");
+    let table = PleTable::open(&tr, &f).expect("PleTable::open");
+    let ngram = PleNgram::from_meta(&f).expect("PleNgram::from_meta");
+    let ctx = [1u32, 2, 3];
+
+    // ゲート off (既定): 並列経路は 1 回も走らない。
+    set_dec_ple_par_for_test(Some(0));
+    let before = dec_ple_par_gathers();
+    let seq = ngram.gather(&table, &ctx).expect("gather (逐次)");
+    assert_eq!(
+        dec_ple_par_gathers(),
+        before,
+        "ゲート off なのに並列経路が走った"
+    );
+
+    // ゲート on: 発火し、値は逐次と 1 ビットも違わない。
+    set_dec_ple_par_for_test(Some(8));
+    let par = ngram.gather(&table, &ctx).expect("gather (並列)");
+    assert!(
+        dec_ple_par_gathers() > before,
+        "並列経路が発火していない (parts>1 の回数が増えない)"
+    );
+    assert_eq!(bits(&seq), bits(&par), "並列版が逐次版とビット一致しない");
+    set_dec_ple_par_for_test(None);
+}
 
 #[test]
 fn ple_embedding_is_nonzero_and_changes_layer_one() {
