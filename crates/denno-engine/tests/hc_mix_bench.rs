@@ -387,6 +387,10 @@ fn hc_mix_gemv_iq4xs_shape_scaling() {
 #[test]
 #[ignore = "BF16 合成重み (6.55 MB x 2) とスレッドプールを使う (明示実行のみ)"]
 fn hc_mix_gemv_bf16_shape_scaling() {
+    // task 119 から BF16 の融合カーネルは既定で FMA (classic と非ビット一致)。この測定は
+    // 融合版と classic のビット一致を前提にしているので、厳密な版で比べる
+    // (`DENNO_BF16_EXACT` はプロセスで 1 回だけ読むので、最初に設定する)。
+    std::env::set_var("DENNO_BF16_EXACT", "1");
     use denno_engine::model::moe_expert::{bf16_fast_enabled, expert_gemv_scalar};
 
     assert!(

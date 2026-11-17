@@ -926,33 +926,23 @@ fn validate_reports_wrong_shape_with_expected_and_actual() {
 }
 
 #[test]
-fn validate_reports_wrong_quant_type() {
+fn validate_accepts_decodable_quant_type_choices() {
+    // 2026-10-31 から、量子型は「デコードできれば通す」(Swift 1.5 や unsloth 11-13 版は
+    // 層ごとに型が混在し、期待表は UD-Q4_K_XL 時代の固定値)。期待と違う型でも、
+    // デコードできる型なら validate は通る。形状と名前の照合は従来どおり厳密。
     let dir = TempDir::new("type");
     let mut tensors = synth_tensors(DEFAULT_LAYERS);
     for t in tensors.iter_mut() {
         if t.name == "blk.2.ffn_down_exps.weight" {
-            // expert の 3 本は Q4_K / Q5_K / Q5_1 / Q8_0 を許す (UD 量子化)。
-            // Q4_0 は許さない型なので、ここで落ちること。
-            t.ty = TY_Q4_0;
+            t.ty = TY_Q4_0; // 期待表は Q5_1 / Q4_K / Q5_K / Q8_0
         }
         if t.name == "blk.3.indexer.q_proj.weight" {
-            t.ty = TY_Q8_0; // 期待は BF16
+            t.ty = TY_Q8_0; // 期待表は BF16
         }
     }
     let path = write_synth(&dir, "type.gguf", DEFAULT_LAYERS, &tensors);
     let f = GgufFile::open(&path).expect("open");
-
-    let errs = expect_err(validate(&f));
-    let all = joined(&errs);
-    assert_eq!(errs.len(), 2, "{all}");
-    assert!(
-        all.contains("blk.2.ffn_down_exps.weight: 型 Q4_0 が期待 Q5_1 / Q4_K / Q5_K / Q8_0 と違う"),
-        "{all}"
-    );
-    assert!(
-        all.contains("blk.3.indexer.q_proj.weight: 型 Q8_0 が期待 BF16 と違う"),
-        "{all}"
-    );
+    validate(&f).expect("デコードできる型の違いは通る");
 }
 
 #[test]
@@ -992,13 +982,15 @@ fn validate_collects_every_error() {
     let f = GgufFile::open(&path).expect("open");
 
     let errs = expect_err(validate(&f));
-    assert_eq!(errs.len(), 3, "3 件すべて返る: {errs:?}");
+    // 2026-10-31 から、デコードできる量子型は期待と違っても通す (量子化の選択であって
+    // 構造の取り違えではない)。欠落と形状違いの 2 件が返り、Q4_K の shexp は数えない。
+    assert_eq!(errs.len(), 2, "2 件すべて返る: {errs:?}");
     let all = joined(&errs);
     assert!(all.contains("blk.1.ssm_beta.weight"), "{all}");
     assert!(all.contains("blk.3.attn_k.weight"), "{all}");
-    assert!(all.contains("blk.2.ffn_up_shexp.weight"), "{all}");
+    assert!(!all.contains("blk.2.ffn_up_shexp.weight"), "{all}");
     // 1 行 1 件 (行数 = 件数)
-    assert_eq!(Qwen4ExpError(errs.clone()).to_string().lines().count(), 3);
+    assert_eq!(Qwen4ExpError(errs.clone()).to_string().lines().count(), 2);
 }
 
 #[test]

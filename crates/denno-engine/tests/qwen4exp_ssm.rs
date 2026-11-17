@@ -591,7 +591,8 @@ fn from_gguf_rejects_bad_shapes() {
     let e = from_gguf_err(&f, 0, "ssm_norm の長さ違い");
     assert!(e.contains("ssm_norm"), "{e}");
 
-    // (d) gemv が扱えない量子型 (Q4_0) の attn_gate
+    // (d) 期待と違う量子型 (Q4_0) の attn_gate。Q4_0 も GEMV で扱えるようになった
+    // (2026-10-31 からデコードできる型は通す) ので、ここは「通る」ことを確かめる。
     let mut tensors = spec.tensors(0);
     let gate = tensors
         .iter_mut()
@@ -602,8 +603,7 @@ fn from_gguf_rejects_bad_shapes() {
     let p = dir.path("bad_ty.gguf");
     write_gguf(&p, &kvs(), &tensors);
     let f = GgufFile::open(&p).expect("open");
-    let e = from_gguf_err(&f, 0, "未対応の量子型");
-    assert!(e.contains("量子型"), "{e}");
+    SsmLayer::from_gguf(&f, 0).expect("Q4_0 の attn_gate は通る");
 
     // (e) 層番号が違えば別テンソルを探す → 無いので Err
     let p2 = dir.path("ok.gguf");

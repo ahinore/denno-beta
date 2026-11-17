@@ -2066,7 +2066,11 @@ fn sigterm_saves_stats_before_exit() {
 #[ignore = "親テストが子プロセスとして走らせる (自分へ SIGTERM を送る)"]
 fn sigterm_child_saves_and_exits() {
     use denno_engine::model::exp_stats;
-    let dir = std::env::var("DENNO_P271_SIGTERM_DIR").expect("親から渡される");
+    // 親テストを通さずに `--ignored` で直接走ったときは、自分へ SIGTERM を送らずに終わる。
+    let Ok(dir) = std::env::var("DENNO_P271_SIGTERM_DIR") else {
+        eprintln!("DENNO_P271_SIGTERM_DIR が無い (親テスト経由でない) ので skip");
+        return;
+    };
     std::env::remove_var(exp_stats::STATS_FILE_ENV);
     std::env::set_var(exp_stats::STATS_DIR_ENV, &dir);
     exp_stats::set_identity("sigterm", 3_072_000, 2, 4);

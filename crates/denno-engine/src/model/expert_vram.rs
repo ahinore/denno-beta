@@ -897,7 +897,7 @@ pub fn reserve_deficit(need: usize, free: usize, reserved: usize) -> usize {
 /// task 256: prefill の作業域の予約 (drop = release)。
 ///
 /// 例:
-/// ```ignore
+/// ```text
 /// let _work = expert_vram::reserve_work_area(1500 << 20);
 /// // prefill (この中の確保は、予約で空けたチャンクを使う)
 /// // drop で release。解放したチャンクは通常の LRU が後で埋め直す。

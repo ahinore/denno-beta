@@ -655,6 +655,20 @@ fn open_synth(dir: &TempDir, name: &str, zero_ple: bool) -> GgufFile {
     GgufFile::open(&path).expect("合成 GGUF を開けない")
 }
 
+/// このファイルのテストはどれも「バッチ経路と逐次経路のビット一致」を見る。
+/// 速さのための近似 (2026-10-28 の AVX-512 VNNI の int8 内積、task 119 の BF16 / F32 の FMA 行
+/// カーネル) はバッチ経路にだけ効いて丸め順序を変えるので、厳密な
+/// 計算に揃えてから比べる。3 つともプロセスで 1 回だけ env を読むので、どの
+/// テストも最初にこれを呼ぶ (`Once` で 1 回だけ設定する)。
+fn exact_math() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("DENNO_VNNI", "0");
+        std::env::set_var("DENNO_BF16_EXACT", "1");
+        std::env::set_var("DENNO_F32_EXACT", "1");
+    });
+}
+
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
@@ -725,6 +739,7 @@ fn real_params() -> Qwen4ExpParams {
 /// ssm 層が静かに別の次元で回る。
 #[test]
 fn gdn_params_of_real_metadata_matches_qwen4exp_preset() {
+    exact_math();
     let p = real_params();
     let g = gdn_params(&p).expect("gdn_params");
     let want = GdnParams::qwen4exp();
@@ -750,6 +765,7 @@ fn gdn_params_of_real_metadata_matches_qwen4exp_preset() {
 
 #[test]
 fn ssm_attn_assigns_ssm_and_full_layers() {
+    exact_math();
     let dir = TempDir::new("kinds");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -791,6 +807,7 @@ fn ssm_attn_assigns_ssm_and_full_layers() {
 
 #[test]
 fn forward_token_traces_four_layers_and_all_finite() {
+    exact_math();
     let dir = TempDir::new("trace");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -852,6 +869,7 @@ fn forward_token_traces_four_layers_and_all_finite() {
 
 #[test]
 fn fresh_ssm_state_is_bit_identical() {
+    exact_math();
     let dir = TempDir::new("fresh");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -878,6 +896,7 @@ fn fresh_ssm_state_is_bit_identical() {
 
 #[test]
 fn second_call_with_same_input_differs() {
+    exact_math();
     let dir = TempDir::new("hist");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -901,6 +920,7 @@ fn second_call_with_same_input_differs() {
 
 #[test]
 fn ssm_attn_differs_from_identity() {
+    exact_math();
     let dir = TempDir::new("ident");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -925,6 +945,7 @@ fn ssm_attn_differs_from_identity() {
 
 #[test]
 fn ple_embedding_is_nonzero_and_changes_layer_one() {
+    exact_math();
     let dir = TempDir::new("ple");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -987,6 +1008,7 @@ fn ple_embedding_is_nonzero_and_changes_layer_one() {
 
 #[test]
 fn forward_rejects_out_of_range_layer() {
+    exact_math();
     let dir = TempDir::new("range");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -1012,6 +1034,7 @@ fn forward_rejects_out_of_range_layer() {
 /// (`attend_batch_calls` が増えること) も併せて確認する。
 #[test]
 fn ssm_attn_full_layer_batch_matches_sequential() {
+    exact_math();
     let dir = TempDir::new("fullbatch");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");
@@ -1060,6 +1083,7 @@ fn ssm_attn_full_layer_batch_matches_sequential() {
 /// 始まる (位置が進んだ状態のバッチ attention が通る)。
 #[test]
 fn prefill_batch_with_full_attention_matches_sequential() {
+    exact_math();
     let dir = TempDir::new("fullprefill");
     let f = open_synth(&dir, "model.gguf", false);
     let p = validate(&f).expect("validate");

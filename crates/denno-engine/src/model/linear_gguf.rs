@@ -1726,6 +1726,8 @@ mod tests {
     /// 実形状 4 本で旧経路と新経路がビット一致し、期待どおりの側に落ちること。
     #[test]
     fn cpu_gemv_par_bitwise_on_real_shapes() {
+        // VNNI / F32 の上書きはプロセス全体で 1 個。触るテストは直列にする。
+        let _ovr_lock = crate::model::moe_expert::moe_test_lock();
         use crate::model::moe_expert::set_f32_exact_for_test;
         let _g = par_test_lock();
         let _p = ParGuard::new();
@@ -2380,6 +2382,8 @@ mod tests {
     #[test]
     #[cfg(feature = "par")]
     fn f32_router_fma_matches_classic_within_tolerance() {
+        // VNNI / F32 の上書きはプロセス全体で 1 個。触るテストは直列にする。
+        let _ovr_lock = crate::model::moe_expert::moe_test_lock();
         use crate::model::moe_expert::{set_f32_exact_for_test, F32_FMA_CALLS};
         let _g = par_test_lock();
         for (name, k, n) in [("ルータ実形", 2560usize, 512usize), ("par 下限", 256, 64)] {

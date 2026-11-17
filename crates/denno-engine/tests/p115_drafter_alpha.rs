@@ -369,6 +369,11 @@ fn p115_drafter_feasibility() {
     );
 
     // ---- drafter を読む (どちらのモードでも必須) ----
+    // 手元に drafter (9B) が無い環境 (CI など) では、他の実モデル測定と同じく skip。
+    if !cfg.drafter_dir.exists() {
+        eprintln!("drafter {} が無いので skip", cfg.drafter_dir.display());
+        return;
+    }
     let t0 = Instant::now();
     let (mut drafter, dtok) = load_drafter(&cfg.drafter_dir).expect("drafter ロード失敗");
     let load_s = t0.elapsed().as_secs_f64();
