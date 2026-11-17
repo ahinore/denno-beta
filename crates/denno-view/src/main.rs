@@ -240,6 +240,8 @@ fn build_router(app: AppState) -> Router {
         .route("/3d", get(dashboard3d))
         .route("/frames.mjs", get(frames_mjs))
         .route("/view2d.mjs", get(view2d_mjs))
+        .route("/arch2d.mjs", get(arch2d_mjs))
+        .route("/nodes2d.mjs", get(nodes2d_mjs))
         .route("/vendor/*path", get(vendor))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
@@ -517,6 +519,25 @@ async fn view2d_mjs() -> axum::response::Response {
             include_str!("view2d.mjs").as_bytes().to_vec(),
         ))
         .unwrap()
+}
+
+fn js_response(src: &'static str) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/javascript; charset=utf-8")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from(src.as_bytes().to_vec()))
+        .unwrap()
+}
+
+/// GET /arch2d.mjs — /2d の構成図 (配置・当たり判定・描画。DOM 非依存)。
+async fn arch2d_mjs() -> axum::response::Response {
+    js_response(include_str!("arch2d.mjs"))
+}
+
+/// GET /nodes2d.mjs — /2d のノードツリーと選択式 (DSL)。DOM 非依存。
+async fn nodes2d_mjs() -> axum::response::Response {
+    js_response(include_str!("nodes2d.mjs"))
 }
 
 /// GET /frames.mjs — 3D ビューアが import するフレームデコーダ。
@@ -812,6 +833,24 @@ mod tests {
         let js = r.text().await.unwrap();
         assert!(js.contains("export function layoutFromShape"));
         assert!(js.contains("export function createMockStore"));
+
+        // 構成図とノード選択式のモジュール
+        for (p, needle) in [
+            ("/arch2d.mjs", "export function archLayout"),
+            ("/nodes2d.mjs", "export function runDsl"),
+        ] {
+            assert!(html.contains(p), "/2d must import {p}");
+            let r = c.get(format!("{base}{p}")).send().await.unwrap();
+            assert_eq!(r.status(), 200, "{p}");
+            assert!(r
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript"));
+            assert!(r.text().await.unwrap().contains(needle), "{p}");
+        }
 
         // 既存の 2 ページは壊していない
         for p in ["/", "/3d", "/frames.mjs"] {
