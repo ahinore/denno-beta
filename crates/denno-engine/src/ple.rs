@@ -644,6 +644,82 @@ fn ple_par_parts(rows: usize) -> usize {
     n.max(1)
 }
 
+/// task 410: `DENNO_DEC_PLE_PAR` の上限 (1 トークンの行数は実ファイルで 16)。
+const DEC_PLE_PAR_MAX: usize = 64;
+
+/// task 410: decode の PLE gather の並列度 (`DENNO_DEC_PLE_PAR`) の解釈 (純関数)。
+///
+/// 未設定・`0`・`off`・不正値・範囲外は 0 (= 従来の逐次) に落ちる。
+fn dec_ple_par_from_value(v: Option<&str>) -> usize {
+    match v {
+        None => 0,
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(n) => n.min(DEC_PLE_PAR_MAX),
+            Err(_) => 0,
+        },
+    }
+}
+
+/// task 410: テストが env を立てずに並列度を強制するための上書き
+/// (`usize::MAX` = env に従う)。
+static DEC_PLE_PAR_FORCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// task 410: decode の gather を `parts > 1` で引いた回数 (プロセス通算)。
+///
+/// 「ゲートが本当に発火したか」をテストと lab のログで数えるための計器。
+/// 値の経路は parts を変えてもビット一致 (行は独立・同じバイト列)。
+static DEC_PLE_PAR_GATHERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 410: [`DEC_PLE_PAR_GATHERS`] の読み出し (診断用)。
+pub fn dec_ple_par_gathers() -> u64 {
+    DEC_PLE_PAR_GATHERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 410: テスト用に `DENNO_DEC_PLE_PAR` を差し替える (`None` で env に戻す)。
+///
+/// 戻り値は設定前の値 (`None` = env に従っていた)。
+#[doc(hidden)]
+pub fn set_dec_ple_par_for_test(n: Option<usize>) -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    let new = n.map(|v| v.min(DEC_PLE_PAR_MAX)).unwrap_or(usize::MAX);
+    let prev = DEC_PLE_PAR_FORCE.swap(new, Ordering::Relaxed);
+    if prev == usize::MAX {
+        None
+    } else {
+        Some(prev)
+    }
+}
+
+/// task 410: decode の PLE gather の並列度 (`DENNO_DEC_PLE_PAR`、既定 0 = 逐次)。
+///
+/// 背景 (task 410): [`ple_par_parts`] は 64 行未満を逐次にする
+/// (`PLE_PAR_MIN_ROWS`) ので、decode の 1 トークン (実ファイルは `n_heads` = 16 行)
+/// は 90 B のランダム pread を **1 本ずつ直列に**出していた。page cache が
+/// 冷えているとき (長い prefill の後) は 1 本 50-130 us かかり、lab t406c の
+/// `[q4prof] ple` は 14k で 0.80 ms/token、2k で 2.08 ms/token だった
+/// (温かいと 0.02 ms/token)。行は独立なので並列度を上げても値はビット一致。
+fn dec_ple_par() -> usize {
+    use std::sync::atomic::Ordering;
+    let forced = DEC_PLE_PAR_FORCE.load(Ordering::Relaxed);
+    if forced != usize::MAX {
+        return forced;
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| dec_ple_par_from_value(std::env::var("DENNO_DEC_PLE_PAR").ok().as_deref()))
+}
+
+/// task 410: decode の gather で使う parts (`want` は env の値、`rows` は行数)。
+///
+/// `want == 0` (ゲート off) と 1 行以下は 1 (= 従来どおり逐次)。
+pub(crate) fn dec_gather_parts(rows: usize, want: usize) -> usize {
+    if want == 0 || rows <= 1 {
+        1
+    } else {
+        want.min(rows)
+    }
+}
+
 /// n-gram 索引の異常値を弾くための上限。
 ///
 /// 実ファイル (Qwen3.5-27B Flash-Next 系) は `n_gram = 3`, `n_heads = 16`。
@@ -906,8 +982,13 @@ impl PleNgram {
     /// 索引 → [`PleTable::gather_rows`] → `n_heads * n_dim` の f32。
     ///
     /// 表の範囲外を指す索引は `gather_rows` がエラーにする (黙って 0 にしない)。
+    ///
+    /// task 410: これは decode の経路 (1 トークン = 1 窓) なので、
+    /// `DENNO_DEC_PLE_PAR` の並列度を [`gather_many`](Self::gather_many) に渡す。
+    /// 64 行未満は [`ple_par_parts`] が逐次にするため、既定 (0) のままでは
+    /// 冷えた page cache で 16 本の 90 B pread が直列に並ぶ。
     pub fn gather(&self, table: &PleTable, ctx: &[u32]) -> Result<Vec<f32>> {
-        self.gather_many(table, &[ctx])
+        self.gather_many_impl(table, &[ctx], dec_ple_par())
     }
 
     /// 複数の窓をまとめて引く (P78)。
@@ -926,6 +1007,17 @@ impl PleNgram {
     /// 行の読み順・重複の有無に関わらず値は `gather` とビット一致する
     /// (行長はブロック長の倍数 = 行境界がブロック境界に乗る)。
     pub fn gather_many(&self, table: &PleTable, ctxs: &[&[u32]]) -> Result<Vec<f32>> {
+        self.gather_many_impl(table, ctxs, 0)
+    }
+
+    /// [`gather_many`](Self::gather_many) の本体。`extra_parts` は decode の
+    /// 並列度 (`DENNO_DEC_PLE_PAR`、0 = 従来)。prefill は 0 を渡す。
+    fn gather_many_impl(
+        &self,
+        table: &PleTable,
+        ctxs: &[&[u32]],
+        extra_parts: usize,
+    ) -> Result<Vec<f32>> {
         let n_heads = self.n_heads();
         let n_dim = table.n_dim();
         let per_ctx = n_heads
@@ -960,7 +1052,15 @@ impl PleNgram {
         crate::model::prekprof::mark(t_sort, crate::model::prekprof::PLE_SORT);
 
         // 3. 表を 1 行 1 回だけ読む。
-        let parts = ple_par_parts(uniq.len());
+        let mut parts = ple_par_parts(uniq.len());
+        // task 410: decode (`gather`) からの要求だけ、64 行未満でも並列にする。
+        let extra = dec_gather_parts(uniq.len(), extra_parts);
+        if extra > parts {
+            parts = extra;
+        }
+        if extra > 1 {
+            DEC_PLE_PAR_GATHERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let need = uniq.len() * n_dim;
         let reuse = pf_ple_par_on();
         // task 189: ゲートが on なら作業域をスレッドローカルで使い回す。実形は
@@ -1017,6 +1117,34 @@ mod tests {
         set_pf_ple_par_for_test(Some(false));
         assert!(!pf_ple_par_on());
         set_pf_ple_par_for_test(None);
+    }
+
+    /// task 410: `DENNO_DEC_PLE_PAR` (decode の PLE gather の並列度) の真理値表と、
+    /// parts の選び方。未設定・`0`・偽値・不正値は従来 (逐次) に落ちる。
+    #[test]
+    fn dec_ple_par_gate_truth_table() {
+        assert_eq!(dec_ple_par_from_value(None), 0, "未設定は従来 (逐次)");
+        for v in ["0", "off", "false", "no", "", " off ", "-1", "x"] {
+            assert_eq!(dec_ple_par_from_value(Some(v)), 0, "{v:?} が逐次でない");
+        }
+        assert_eq!(dec_ple_par_from_value(Some("8")), 8);
+        assert_eq!(dec_ple_par_from_value(Some(" 16 ")), 16);
+        // 上限 (64) を超える値は丸める (行数は実ファイルで 16)。
+        assert_eq!(dec_ple_par_from_value(Some("1000")), DEC_PLE_PAR_MAX);
+
+        // parts の選び方: 0 (ゲート off) と 1 行以下は 1、それ以外は min(want, rows)。
+        assert_eq!(dec_gather_parts(16, 0), 1, "ゲート off は逐次");
+        assert_eq!(dec_gather_parts(0, 8), 1);
+        assert_eq!(dec_gather_parts(1, 8), 1);
+        assert_eq!(dec_gather_parts(16, 8), 8);
+        assert_eq!(dec_gather_parts(4, 16), 4);
+        assert_eq!(dec_gather_parts(16, 16), 16);
+
+        // テスト上書きが env より優先され、None で env に戻る。
+        set_dec_ple_par_for_test(Some(8));
+        assert_eq!(dec_ple_par(), 8);
+        assert_eq!(set_dec_ple_par_for_test(None), Some(8));
+        assert_eq!(dec_ple_par(), dec_ple_par_from_value(None));
     }
 
     #[test]
