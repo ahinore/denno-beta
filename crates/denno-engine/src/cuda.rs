@@ -17961,10 +17961,100 @@ pub fn gdn_state_restore_host(kv: u64, li: usize, conv: &mut [f32], ssm: &mut [f
     })
 }
 
+thread_local! {
+    /// task 397: 状態の書き戻しを受ける pinned の受け皿 (層ごとに使い回す)。
+    static GDN_WB_STAGE: std::cell::RefCell<Option<PinMem>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// task 397: 状態の書き戻しを `cuMemcpyDtoHAsync` + 自ストリームの待ちで行う。
+///
+/// `cuMemcpyDtoH` (= [`DevBuffer::to_slice`]) はコンテキスト全体の完了を待つので、
+/// mix の別ストリームと expert の上げストリームの残りまで待ってしまう。
+/// pinned へ非同期で落としてから [`pf_sync_own_stream`] で null ストリームだけを
+/// 待てば、**ホストへ載るバイト列は同じ**で待ちの範囲だけが狭くなる。
+/// 戻り値 `false` は「この経路を使わなかった」(呼び出し側は従来の同期コピーへ)。
+fn gdn_wb_async_copy(
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    conv_ptr: CUdeviceptr,
+    ssm_ptr: CUdeviceptr,
+) -> Result<bool> {
+    let cb = std::mem::size_of_val(conv_st);
+    let sb = std::mem::size_of_val(ssm_st);
+    let bytes = cb + sb;
+    if bytes == 0 {
+        return Ok(false);
+    }
+    GDN_WB_STAGE.with(|cell| -> Result<bool> {
+        let mut g = cell.borrow_mut();
+        let need = match g.as_ref() {
+            Some(p) => p.bytes < bytes,
+            None => true,
+        };
+        if need {
+            // 古い 1 本を落としてから取り直す (pinned を二重に持たない)。
+            *g = None;
+            match PinMem::alloc(bytes) {
+                Ok(p) => *g = Some(p),
+                Err(_) => return Ok(false),
+            }
+        }
+        let pin = g.as_ref().expect("確保済み").ptr;
+        let lib = lib()?;
+        unsafe {
+            if check(
+                (lib.memcpy_dtoh_async)(pin, conv_ptr, cb, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (gdn conv)",
+            )
+            .is_err()
+            {
+                return Ok(false);
+            }
+            if check(
+                (lib.memcpy_dtoh_async)(
+                    (pin as *mut u8).add(cb) as *mut c_void,
+                    ssm_ptr,
+                    sb,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (gdn ssm)",
+            )
+            .is_err()
+            {
+                return Ok(false);
+            }
+        }
+        // 自ストリーム (null) の完了だけを待つ。失敗したら呼び出し側が
+        // 同期コピーで丸ごとやり直す (待たないまま読まない)。
+        if pf_sync_own_stream().is_err() {
+            return Ok(false);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(pin as *const u8, conv_st.as_mut_ptr() as *mut u8, cb);
+            std::ptr::copy_nonoverlapping(
+                (pin as *const u8).add(cb),
+                ssm_st.as_mut_ptr() as *mut u8,
+                sb,
+            );
+        }
+        Ok(true)
+    })
+}
+
 // 従来動作のホスト書き戻し (デバイス正本を使わないときだけ)。
 fn gdn_host_writeback(conv_st: &mut [f32], ssm_st: &mut [f32]) -> Result<()> {
     GDN_SCRATCH.with(|cell| -> Result<()> {
         let s = cell.borrow();
+        // task 397: `DENNO_PF_GDN_WB_ASYNC` は非同期 + 自ストリームの待ち。
+        // 失敗 (pinned が取れない / 転送エラー) は下の同期経路でやり直す。
+        if crate::model::exp_pf::gdn_wb_async_on() {
+            let cp = s.buf(GdnBuf::ConvOut).ptr();
+            let sp = s.buf(GdnBuf::SsmOut).ptr();
+            if gdn_wb_async_copy(conv_st, ssm_st, cp, sp)? {
+                return Ok(());
+            }
+        }
         if crate::model::exp_pf::gdn_wb_direct_on() {
             // task 334: `to_vec` は 1.6 MB の Vec を確保して D2H したあと
             // `copy_from_slice` でもう 1 回写す (毎チャンク 2 本 x 48 層 x 7)。
@@ -50534,6 +50624,98 @@ fn gdn_pf_wy4_kernels() -> Option<&'static GdnPfWyKernels> {
     .as_ref()
 }
 
+// ---------------------------------------------------------------------------
+// task 397: WY スキャンの従属連鎖を短くした版 (`DENNO_PF_SCAN_WY5`)
+// ---------------------------------------------------------------------------
+//
+// 起動形 (256 スレッド x (nv, 4) ブロック) も共有メモリ (29,572 B) も wy4 と
+// 同じで、**カーネルの中の従属連鎖だけ**が違う (A/G をワープ並列・P/QP を 4
+// アキュムレータ・conv の入力を先読み)。よってゲートは env 1 本で、落ちれば
+// wy4 へ戻る (wy4 が既定 on)。
+pub(crate) const GDN_PF_WY5_SMEM_FLOATS: usize = GDN_PF_WY4_SMEM_FLOATS;
+pub(crate) const GDN_PF_WY5_SMEM_BYTES: usize = GDN_PF_WY5_SMEM_FLOATS * 4;
+
+fn gdn_pf_wy5_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SCAN_WY5_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf_wy5.ptx"),
+    }
+}
+
+fn gdn_pf_wy5_kernels() -> Option<&'static GdnPfWyKernels> {
+    static K: OnceLock<Option<GdnPfWyKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        gdn_wy_load(
+            gdn_pf_wy5_ptx_path(),
+            b"dno_gdn_pf_wy5\0",
+            GDN_PF_WY5_SMEM_BYTES,
+            "[gdn-pf-wy5]",
+            GDN_PF_WY_SMEM_LIMIT,
+            false,
+        )
+    })
+    .as_ref()
+}
+
+#[cfg(test)]
+static WY5_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_gdn_pf_wy5_for_test(v: Option<bool>) {
+    WY5_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_PF_SCAN_WY5` の解釈 (純関数)。**lab t397b で採ったので既定 on**。
+///
+/// lab 実測 (既定モデル、depth8k、PROFILE=1、`[q4ledger-pf]` の `ssm` 段の
+/// `busy`): 3,826 cold 433.3/433.1 (b1/b2) -> **370.9** (wy5) = -14.4%、
+/// 14k cold 1,554.5/1,557.9 -> **1,330.9** = -14.5%。decode は 15.5-15.9 ms/tok で
+/// 不変、errors 0、text sane。md5 は turn2 の 2 本だけ DIFF (A/G と P/QP の
+/// 和の木を変えた丸め差。cold の text は同じ)。切り戻しは `DENNO_PF_SCAN_WY5=0`。
+pub(crate) fn gdn_pf_wy5_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// 従属連鎖を短くした WY スキャンを使うか (既定 on)。
+pub(crate) fn gdn_pf_wy5_on() -> bool {
+    #[cfg(test)]
+    {
+        match WY5_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf_wy5_from_value(std::env::var("DENNO_PF_SCAN_WY5").ok().as_deref()))
+}
+
+/// 従属連鎖を短くした WY スキャンが受ける形か (wy4 と同じ前提)。
+pub(crate) fn gdn_pf_wy5_ok(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) -> bool {
+    gdn_pf_wy4_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+}
+
 
 #[cfg(test)]
 static WY4_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -50879,6 +51061,114 @@ mod pf228_wy_tests {
         }
         // 最後の区画 (WY4_LL = 1 本) の終端が WY4_TOTAL。
         assert_eq!(offs.last().unwrap().1 + 1, GDN_PF_WY4_SMEM_FLOATS);
+    }
+
+    /// task 397: wy5 のゲート (lab t397b で採ったので既定 on)・形の前提・共有メモリ。
+    #[test]
+    fn task397_scan_wy5_gate_and_shape() {
+        assert!(gdn_pf_wy5_from_value(None), "既定 on (lab t397b)");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!gdn_pf_wy5_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(gdn_pf_wy5_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        set_gdn_pf_wy5_for_test(Some(true));
+        assert!(gdn_pf_wy5_on());
+        set_gdn_pf_wy5_for_test(Some(false));
+        assert!(!gdn_pf_wy5_on());
+        set_gdn_pf_wy5_for_test(None);
+        assert!(gdn_pf_wy5_on(), "FORCE を戻したら既定 on");
+        // 形の前提は wy4 と同じ (dv = 128 = 4 x 32)。
+        let conv_dim = 2 * 16 * 128 + 48 * 128;
+        assert!(gdn_pf_wy5_ok(2048, 16, 48, 128, 128, 4, conv_dim));
+        assert!(gdn_pf_wy5_ok(3826, 16, 48, 128, 128, 4, conv_dim));
+        assert!(
+            !gdn_pf_wy5_ok(2048, 16, 48, 128, 64, 4, 2 * 16 * 128 + 48 * 64),
+            "dv=64 は受けない"
+        );
+        assert!(!gdn_pf_wy5_ok(0, 16, 48, 128, 128, 4, conv_dim), "n=0 は受けない");
+        // 共有メモリ・起動形は wy4 と同一 (作業域を増やしていない)。
+        assert_eq!(GDN_PF_WY5_SMEM_FLOATS, GDN_PF_WY4_SMEM_FLOATS);
+        assert_eq!(GDN_PF_WY5_SMEM_BYTES, 29_572);
+        // .cu の WY5_TOTAL / 区画 / C が Rust 側の前提と一致すること。
+        let src = include_str!("../kernels/kernels_gdn_pf_wy5.cu");
+        let mut get = |name: &str| -> usize {
+            let key = format!("#define {name} ");
+            for line in src.lines() {
+                if let Some(rest) = line.strip_prefix(&key) {
+                    return rest
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{name} が数値でない"));
+                }
+            }
+            panic!("{name} が .cu に無い");
+        };
+        assert_eq!(get("WY5_TOTAL"), GDN_PF_WY5_SMEM_FLOATS);
+        assert_eq!(get("WY5_DV"), GDN_PF_WY4_DV);
+        assert_eq!(get("WY5_THREADS"), GDN_PF_WY4_THREADS);
+        assert_eq!(get("WY5_C"), 8, "チャンク長は wy4 と同じ 8");
+        assert_eq!(get("WY5_WARPS") * 32, GDN_PF_WY4_THREADS);
+        assert_eq!(GDN_PF_WY4_BLOCKS * GDN_PF_WY4_DV, get("WY5_DK"));
+        // 区画の並びが wy4 と同じ (オフセットが 1 つずつ同じ値)。
+        let src4 = include_str!("../kernels/kernels_gdn_pf_wy4.cu");
+        let get4 = |name: &str| -> usize {
+            let key = format!("#define {name} ");
+            for line in src4.lines() {
+                if let Some(rest) = line.strip_prefix(&key) {
+                    return rest
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{name} が数値でない"));
+                }
+            }
+            panic!("{name} が .cu に無い");
+        };
+        for (wy5, wy4) in [
+            ("WY5_S", "WY4_S"),
+            ("WY5_KC", "WY4_KC"),
+            ("WY5_QC", "WY4_QC"),
+            ("WY5_VC", "WY4_VC"),
+            ("WY5_DC", "WY4_DC"),
+            ("WY5_PC", "WY4_PC"),
+            ("WY5_QPC", "WY4_QPC"),
+            ("WY5_RDEC", "WY4_RDEC"),
+            ("WY5_AC", "WY4_AC"),
+            ("WY5_GC", "WY4_GC"),
+            ("WY5_LAM", "WY4_LAM"),
+            ("WY5_RL", "WY4_RL"),
+            ("WY5_EG", "WY4_EG"),
+            ("WY5_BC", "WY4_BC"),
+            ("WY5_LL", "WY4_LL"),
+        ] {
+            assert_eq!(get(wy5), get4(wy4), "{wy5} のオフセットが wy4 と違う");
+        }
+        // 直した 3 点がカーネルに入っていること (落とすと wy4 と同じ速度に戻る)。
+        assert!(src.contains("__shfl_down_sync"), "A/G がワープ並列でない");
+        assert!(src.contains("float xq[WY5_C];"), "conv の先読みが無い");
+        assert_eq!(
+            src.matches("float sk0 = 0.0f;").count(),
+            1,
+            "P/QP の 4 アキュムレータが無い"
+        );
+    }
+
+    /// task 397: 状態の書き戻しの非同期化ゲート (既定 off)。
+    #[test]
+    fn task397_gdn_wb_async_gate_defaults() {
+        use crate::model::exp_pf::{
+            gdn_wb_async_from_value, DEFAULT_GDN_WB_ASYNC, GDN_WB_ASYNC_ENV,
+        };
+        assert_eq!(GDN_WB_ASYNC_ENV, "DENNO_PF_GDN_WB_ASYNC");
+        assert!(!DEFAULT_GDN_WB_ASYNC, "既定 off");
+        assert!(!gdn_wb_async_from_value(None), "未設定は既定 off");
+        for v in ["", "0", "off", "false", "no", " off "] {
+            assert!(!gdn_wb_async_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes"] {
+            assert!(gdn_wb_async_from_value(Some(v)), "{v:?} が off のまま");
+        }
     }
 }
 
@@ -51834,7 +52124,15 @@ pub fn gdn_pf_chain(
     // まだ何も書いていないここで降りる (呼び出し側は従来経路で計算し直す)。
     // 既定の順は task 173/186/225/228/311 のまま: WY8 (opt-in) → WY4 (opt-in)
     // → WY (opt-in) → v3 → v2 → v1。
-    let pf_scan_wy4 = if gdn_pf_wy4_on() && gdn_pf_wy4_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+    let pf_scan_wy5 = if gdn_pf_wy5_on() && gdn_pf_wy5_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+        gdn_pf_wy5_kernels()
+    } else {
+        None
+    };
+    let pf_scan_wy4 = if pf_scan_wy5.is_none()
+        && gdn_pf_wy4_on()
+        && gdn_pf_wy4_ok(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
         gdn_pf_wy4_kernels()
     } else {
         None
@@ -51872,6 +52170,7 @@ pub fn gdn_pf_chain(
         None
     };
     if nt >= GDN_CHUNK_MIN_TOKENS
+        && pf_scan_wy5.is_none()
         && pf_scan_wy4.is_none()
         && pf_scan_wy.is_none()
         && pf_scan_fast3.is_none()
@@ -52103,7 +52402,15 @@ pub fn gdn_pf_chain(
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();
-        if let Some(fns) = pf_scan_wy4 {
+        if let Some(fns) = pf_scan_wy5 {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf_wy_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+                GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY5_SMEM_BYTES as u32,
+            )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else if let Some(fns) = pf_scan_wy4 {
             gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
             gdn_pf_wy_launch(
                 &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],

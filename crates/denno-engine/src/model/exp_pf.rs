@@ -969,6 +969,39 @@ pub fn gdn_wb_last_on() -> bool {
     *ON.get_or_init(|| gdn_wb_last_from_value(std::env::var(GDN_WB_LAST_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_GDN_WB_ASYNC`: 状態の書き戻し (conv 窓 + ssm 状態) を
+/// `cuMemcpyDtoHAsync` (pinned) + **null ストリームだけの待ち**にする (task 397)。
+///
+/// # なぜ要るか
+///
+/// `DevBuffer::to_slice` は `cuMemcpyDtoH` で、この API は**コンテキスト全体**
+/// の完了を待つ (task 369 が full 層の k/v で測ったのと同じ性質)。14k の
+/// prefill は層の最終チャンクで 1 回 = 36 回この待ちが入り、`[q4ledger-pf]` の
+/// `ssm` 段の exposed 900 ms がここに乗っていた。pinned へ非同期で落としてから
+/// null ストリームのイベントだけを待てば、**デバイスから出るバイト列は同じ**で
+/// 待ちの範囲だけが狭くなる (mix の別ストリーム / expert の上げストリームを
+/// 待たない)。
+///
+/// 既定 **off** (lab で採否を決める。既定 on は採ったあと)。
+pub const GDN_WB_ASYNC_ENV: &str = "DENNO_PF_GDN_WB_ASYNC";
+
+/// [`GDN_WB_ASYNC_ENV`] の既定 (測るまで off)。
+pub const DEFAULT_GDN_WB_ASYNC: bool = false;
+
+/// [`GDN_WB_ASYNC_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn gdn_wb_async_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+        None | Some("") => DEFAULT_GDN_WB_ASYNC,
+    }
+}
+
+/// 状態の書き戻しを非同期 D2H で行うか (プロセスで 1 回だけ env を読む)。
+pub fn gdn_wb_async_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gdn_wb_async_from_value(std::env::var(GDN_WB_ASYNC_ENV).ok().as_deref()))
+}
+
 /// `DENNO_PF_STREAM_FIRST_G=<n>`: 層の**先頭グループ**の expert 数を n 本に絞る
 /// (task 324、既定 0 = 絞らない。`DENNO_PF_UP_GPUWAIT=1` のときだけ効く)。
 ///
