@@ -48612,6 +48612,61 @@ pub fn gdn_pf_chain_shape_ok(
 
 /// task 167: デバイス入出力の GGUF GEMM を 1 発だけ撃つ (コピーもしない)。
 /// カーネル・引数・グリッドは [`CudaCtx::moe_gemm_dev`] と同一。
+// ---------------------------------------------------------------------------
+// task 407: GDN 連鎖の投影 GEMM を br169 (tc, bf16 テンソルコア) 側で撃つ
+// (`DENNO_PF_GDN_TC1`、**lab t407c で採ったので既定 on**)
+// ---------------------------------------------------------------------------
+//
+// 既定モデル (UD-IQ3_XXS) の ssm 層の投影は Q8_0 で、`gguf_gemm_dev_launch` は
+// まず v2 カーネル (tc2, 128x128 タイル・2 段プリフェッチ) を選ぶ。lab t407c で
+// `DENNO_PF_TC_GEMM2=0` にして br169 (tc, 128x64) へ落とすと、同じ run の対で
+// 3,826 cold の `ssm` busy が **371.4 / 371.2 -> 360.7 / 360.8 (-2.9 / -2.8%)**、
+// 内訳は qkv_gemm 71.9 -> 66.6 ms (-7.4%)、z_gemm 46.1 -> 40.7 ms (-11.7%)、
+// out_gemm 43.1 -> 43.2 (不変)、scan 193.5 -> 193.5 (不変)。`full` busy も
+// 88.9 -> 87.1 と一緒に下がった。decode 15.5 -> 15.4、**md5 は全 COND SAME**、
+// errors 0、text sane。14k は qkv 251.2 -> 243.9 / z 158.6 -> 152.7 で、
+// ssm busy は 1,330.0 -> 1,318.0 (-0.9%。
+//
+// task 176 は tc2 を「qkv_pf 6,268 -> 579 ms」で採っているが、それは旧既定
+// モデル (swift15-abl-IQ3_S) の測定で、いまの既定モデルでは投影が Q8_0・
+// 形も違う。**モデル全体の既定は動かさず** (`DENNO_PF_TC_GEMM2` は既定 on の
+// まま)、GDN 連鎖の投影 2 本だけこのゲートで tc に落とす。
+pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static GDN_PF_TC1_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_gdn_pf_tc1_for_test(v: Option<bool>) {
+    GDN_PF_TC1_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// GDN 連鎖の投影を tc (br169) 側で撃つか (**既定 on**、`=0` で tc2 に戻る)。
+pub(crate) fn gdn_pf_tc1_on() -> bool {
+    #[cfg(test)]
+    {
+        match GDN_PF_TC1_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf_tc1_from_value(std::env::var("DENNO_PF_GDN_TC1").ok().as_deref()))
+}
+
 fn gguf_gemm_dev_launch(
     ctx: &CudaCtx,
     ty: crate::kquant::GgmlType,
@@ -48621,12 +48676,16 @@ fn gguf_gemm_dev_launch(
     nt: usize,
     n_in: usize,
     n_out: usize,
+    // task 407: true なら v2 (tc2) を飛ばして br169 (tc) を先に撃つ
+    // (`DENNO_PF_GDN_TC1`)。形が合わなければ従来どおり下へ落ちる。
+    prefer_tc1: bool,
 ) -> Result<bool> {
     use crate::kquant::GgmlType as T;
     const ROWS: usize = 16; // kernels_gemm.cu の GEMM_ROWS
     const NTG_MAX: usize = 8; // kernels_gemm.cu の GEMM_NTG_MAX
     // task 176: v2 カーネル (Q8_0 / Q4_K / Q5_K・出力行 128・2 段プリフェッチ)。
-    if pf_tc2_gemm_on() && pf_tc2_eligible(ty, nt, n_in, n_out, pf_tc_min_m()) {
+    // task 407: `prefer_tc1` のときは飛ばす (br169 の方が速い形がある)。
+    if !prefer_tc1 && pf_tc2_gemm_on() && pf_tc2_eligible(ty, nt, n_in, n_out, pf_tc_min_m()) {
         if let Some(rb) = gguf_row_bytes(ty, n_in) {
             if let Some(tc) = tc2_gemm_kernels() {
                 tc2_gemm_launch(ctx, tc, ty, wptr, xptr, optr, nt, n_in, n_out, rb)?;
@@ -52686,7 +52745,7 @@ pub fn gdn_pf_chain(
                     gdn_pf_kprof::Z_GEMM
                 };
                 gdn_pf_kprof::begin(kp);
-                let r = gguf_gemm_dev_launch(&ctx, wty, w, xo, o, m, e, n_out);
+                let r = gguf_gemm_dev_launch(&ctx, wty, w, xo, o, m, e, n_out, gdn_pf_tc1_on());
                 gdn_pf_kprof::end(kp);
                 match r {
                     Ok(true) => {}
@@ -52898,7 +52957,7 @@ pub fn gdn_pf_chain(
             let yo = py + (t0 * vd * 4) as CUdeviceptr;
             let oo = po + (t0 * e * 4) as CUdeviceptr;
             gdn_pf_kprof::begin(gdn_pf_kprof::OUT_GEMM);
-            let r = gguf_gemm_dev_launch(&ctx, wout.ty, wo.buf.ptr(), yo, oo, m, vd, e);
+            let r = gguf_gemm_dev_launch(&ctx, wout.ty, wo.buf.ptr(), yo, oo, m, vd, e, gdn_pf_tc1_on());
             gdn_pf_kprof::end(gdn_pf_kprof::OUT_GEMM);
             match r {
                 Ok(true) => {}
@@ -60805,5 +60864,23 @@ mod task407_tests {
         assert!(src7q.contains("Pp[warp * WY7Q_C * WY7Q_DV + i * WY7Q_DV + c] = sk[i];"));
         assert!(src7q.contains("for (int w = 0; w < WY7Q_WARPS; ++w) {"));
         assert!(src7q.contains("const int rn = WY7Q_DK / WY7Q_WARPS;"));
+    }
+
+    /// ゲート `DENNO_PF_GDN_TC1` (**既定 on**) の真理値表。
+    #[test]
+    fn task407_gdn_tc1_gate_defaults() {
+        assert!(gdn_pf_tc1_from_value(None), "既定 on (lab t407c)");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!gdn_pf_tc1_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(gdn_pf_tc1_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        set_gdn_pf_tc1_for_test(Some(false));
+        assert!(!gdn_pf_tc1_on(), "FORCE off が効いていない");
+        set_gdn_pf_tc1_for_test(Some(true));
+        assert!(gdn_pf_tc1_on(), "FORCE on が効いていない");
+        set_gdn_pf_tc1_for_test(None);
+        assert!(gdn_pf_tc1_on(), "FORCE を戻したら既定 on");
     }
 }

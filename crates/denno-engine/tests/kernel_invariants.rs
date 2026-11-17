@@ -12270,3 +12270,60 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
+
+/// task 407 (3 本目): GDN 連鎖の投影だけ br169 (tc) 側で撃つゲート
+/// (`DENNO_PF_GDN_TC1`、lab t407c で既定 on)。
+///
+/// 見るもの: ゲート名 / `gguf_gemm_dev_launch` に `prefer_tc1` が入っていて
+/// v2 (tc2) の分岐を飛ばせること / GDN 連鎖の 2 か所がゲートを渡すこと /
+/// **モデル全体の既定 (`DENNO_PF_TC_GEMM2`) は動かしていない**こと。
+#[test]
+fn task407_gdn_tc1_gate_is_wired() {
+    assert!(
+        CUDA_RS.contains("std::env::var(\"DENNO_PF_GDN_TC1\")"),
+        "env 名が DENNO_PF_GDN_TC1 でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {"),
+        "純関数が無い"
+    );
+    // 既定 on (未設定で true) であること。
+    let f = CUDA_RS
+        .split("pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {")
+        .nth(1)
+        .expect("純関数の本体が無い");
+    let body = &f[..f.find("\n}\n").expect("本体の終わりが無い")];
+    assert!(body.contains("None => true"), "未設定の既定が on でない");
+    assert!(body.contains("\"0\" | \"off\" | \"false\" | \"no\" | \"\""), "偽値の集合が違う");
+    // tc2 の分岐が prefer_tc1 で飛ばせること。
+    let g = CUDA_RS
+        .split("fn gguf_gemm_dev_launch(")
+        .nth(1)
+        .expect("gguf_gemm_dev_launch が無い");
+    let gbody = &g[..g.find("\n}\n").expect("本体の終わりが無い")];
+    assert!(gbody.contains("prefer_tc1: bool"), "prefer_tc1 引数が無い");
+    assert!(
+        gbody.contains("if !prefer_tc1 && pf_tc2_gemm_on() && pf_tc2_eligible("),
+        "prefer_tc1 で v2 を飛ばしていない"
+    );
+    assert!(
+        gbody.contains("if matches!(ty, T::Q8_0)\n        && pf_tc_gemm_on()"),
+        "br169 (tc) の分岐が無い"
+    );
+    // GDN 連鎖の 2 か所 (qkv/z と out) がゲートを渡すこと。
+    assert_eq!(
+        CUDA_RS
+            .matches("n_out, gdn_pf_tc1_on())")
+            .count()
+            + CUDA_RS.matches("vd, e, gdn_pf_tc1_on())").count(),
+        2,
+        "GDN 連鎖の 2 か所がゲートを渡していない"
+    );
+    // モデル全体の既定は動かさない (tc2 は既定 on のまま)。
+    let t = CUDA_RS
+        .split("pub(crate) fn pf_tc2_gemm_from_value(v: Option<&str>) -> bool {")
+        .nth(1)
+        .expect("tc2 のゲートが無い");
+    let tbody = &t[..t.find("\n}\n").expect("本体の終わりが無い")];
+    assert!(tbody.contains("None => true"), "TC_GEMM2 の既定を動かしている");
+}
