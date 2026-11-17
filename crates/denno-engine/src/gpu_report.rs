@@ -49,6 +49,21 @@ pub fn gdn_ba_par_reset() {
     crate::cuda::gdn_ba_par_reset();
 }
 
+/// task 392: GDN の入力 `cur` の H2D を mix の device 出力で置き換えた層数の行
+/// (`DENNO_GDN_X_MIX=1` のときだけ 1 行 = 分岐が発火した証拠)。
+pub fn gdn_x_mix_line() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    return crate::cuda::gdn_x_mix_line();
+    #[cfg(not(feature = "cuda"))]
+    None
+}
+
+/// task 392: [`gdn_x_mix_line`] の積算を 0 に戻す。
+pub fn gdn_x_mix_reset() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::gdn_x_mix_reset();
+}
+
 /// task 382: [`mix_zc_hits`] を 0 に戻す。
 pub fn mix_zc_reset() {
     #[cfg(feature = "cuda")]
