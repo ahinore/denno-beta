@@ -2526,6 +2526,202 @@ pub fn lm_reload_evicted() -> bool {
     })
 }
 
+/// task 394: 層優先 prefill の終端で戻す expert の転送を**複数スレッド**で行う
+/// (`DENNO_PF_RESTORE_MT`)。**既定 on** (lab t394a / t394c で採った)。
+///
+/// # なぜ要るか (lab t390b / REPORT_P390 §1 の実測)
+///
+/// UD-Q4_K_XL の 14k cold では、prefill の終端で 1,057 本 (3,310 MiB) を LRU へ
+/// 戻すのに `other` 段の未分類ぶんを使っていた。戻しの 1 本は「gate/up/down を
+/// 3 回の同期 H2D」で、待ちが直列に並ぶ。ページは page cache に載っているので
+/// (P390 §1 の先読みは 3.3 GB を 2 ms で触った)、律速は I/O ではなく
+/// **同期転送 3 回 + 確保** の側にある。
+///
+/// ここでは [`crate::model::expert_vram::acquire_deferred`] (転送を LRU のロックの
+/// 外で行う版。task 214 が背景の上げ直しで使っている) を N 本のスレッドで回し、
+/// 同期の待ちを重ねる。VRAM へ渡るバイト列・LRU の内容は 1 本ずつの経路と同一で、
+/// 変わるのは**順序と重なり**だけ。
+///
+/// # 実測 (lab t394a / t394c、`[pf-restore]` の ms)
+///
+/// | 条件 | 戻す本数 | mt=0 | mt=1 (8 本) | mt=1 (16 本) |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | UD 3,826 (2 ラウンド) | 289 | 70 / 72 | **55 / 53** | 59 / 57 |
+/// | UD 14k | 1,057 | 549 | **213** | 177 |
+/// | 既定モデル 14k | 827 | 121 | **71** | — |
+///
+/// 壁時計への寄与は小さい (戻しは 14k の壁の 2%) が、段は 2 ラウンドとも
+/// 2 割以上速く、decode・md5・既定モデルの数字はどれも変わらなかった
+/// (t394c の既定モデルは 4 COND 全リクエストで md5 SAME)。
+pub const PF_RESTORE_MT_ENV: &str = "DENNO_PF_RESTORE_MT";
+
+/// [`PF_RESTORE_MT_ENV`] の既定 (on)。
+pub const DEFAULT_PF_RESTORE_MT: bool = true;
+
+/// [`PF_RESTORE_MT_ENV`] の解釈 (純関数)。未設定は既定 (on)、
+/// **明示的な偽値だけ off** (`pf_pool_big_from_value` と同じ規約)。
+pub fn pf_restore_mt_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PF_RESTORE_MT,
+        Some(s) => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
+}
+
+/// 戻しを複数スレッドで行うか (プロセスで 1 回だけ env を読む)。
+pub fn pf_restore_mt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_restore_mt_from_value(std::env::var(PF_RESTORE_MT_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_RESTORE_THREADS`: 戻しを回すスレッド数 (既定 8)。
+///
+/// 1 本あたり 3.1 MB のホスト写し (DDR) と DMA (PCIe) なので、本数を増やしても
+/// 帯域で頭打ちになる。8 は DDR の 21 GB/s と PCIe の 52 GB/s に対して
+/// 「1 本 0.2 ms」近くまで詰められる見込みの値 (推定)。
+pub const PF_RESTORE_THREADS_ENV: &str = "DENNO_PF_RESTORE_THREADS";
+
+/// [`PF_RESTORE_THREADS_ENV`] の既定値。
+pub const DEFAULT_PF_RESTORE_THREADS: usize = 8;
+
+/// [`PF_RESTORE_THREADS_ENV`] の解釈 (純関数)。1..=32 に丸める。0 も 1 にする。
+pub fn pf_restore_threads_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_PF_RESTORE_THREADS;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.clamp(1, 32),
+        Err(_) => DEFAULT_PF_RESTORE_THREADS,
+    }
+}
+
+/// 戻しのスレッド数 (プロセスで 1 回だけ env を読む)。
+pub fn pf_restore_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pf_restore_threads_from_value(std::env::var(PF_RESTORE_THREADS_ENV).ok().as_deref())
+    })
+}
+
+/// task 394: 層優先 prefill で、**次の層の expert 重み全体**をページキャッシュへ
+/// 先読みする (`DENNO_PF_LAYER_PRE`)。**既定 off** (測ってから決める)。
+///
+/// # なぜ要るか (lab t394a の実測)
+///
+/// 3,826 cold の壁 9.43-9.66 s に対し、`[exp-pf-stream] copy_s` は 7.11-8.22 s
+/// (warm な回は 7.11 s = 6.24 GB/s で、P325 が測ったこのデバイスの上限 6.2 GB/s
+/// と一致する)。つまり **壁はディスクで決まっていて、それ以上は読めない**。
+/// ところが層ループは「attention (phase 1) → MoE (phase 2)」の順で、expert の
+/// 読みは phase 2 の routing が決まってからしか始まらない。phase 1 のあいだ
+/// ディスクは遊んでいる (3,826 で 1.2 s / 14k で 4.5 s、14k の `copy_s` は
+/// 12.2-12.6 s で壁 25.3 s の 49%)。
+///
+/// ここでは routing ではなく「**その層の expert は全部要る**」という前提で
+/// 1 層先を読む。読むのはページキャッシュへで、Linux の `readahead(2)` を使う
+/// (ユーザー側の写しを伴わない)。
+///
+/// # 結果: **効かなかったので既定 off** (lab t394b、`ADOPT: no`)
+///
+/// 前提が外れていた。3,826 の `[exp-pf-stream] experts=14192 / 48 層 = 296 本`
+/// に対し、層の全数は **512 本** (`lpre_MB` 77,018 MB / 48 層 / 3.13 MB = 512)。
+/// つまり routing は 58% しか使わない。全数を読むと 44.4 GB の 1.73 倍 =
+/// 77 GB を投げることになり、ディスクの空き (3,826 の `copy_s` は壁の 75-78%)
+/// を無駄読みが食う。t394b の round 2 は b1 copy_s 7.36 / lp 7.25 / b2 7.20 で
+/// **区別できない** (round 1 の -8% は b2 の位置効果)。
+///
+/// 予測で絞る道は task 337 が否定済み。この枝は閉じる。
+pub const LAYER_PRE_ENV: &str = "DENNO_PF_LAYER_PRE";
+
+/// [`LAYER_PRE_ENV`] の既定 (off)。
+pub const DEFAULT_LAYER_PRE: bool = false;
+
+/// [`LAYER_PRE_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn layer_pre_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_LAYER_PRE,
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// 次の層を先読みするか (プロセスで 1 回だけ env を読む)。
+pub fn layer_pre() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| layer_pre_from_value(std::env::var(LAYER_PRE_ENV).ok().as_deref()))
+}
+
+/// 先読みの台帳 (層数 / バイト / 呼び出し回数)。
+static LAYER_PRE_LAYERS: AtomicU64 = AtomicU64::new(0);
+static LAYER_PRE_BYTES: AtomicU64 = AtomicU64::new(0);
+static LAYER_PRE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// 1 層ぶんの先読みを積んだ (診断用)。`bytes` は投げたバイト数。
+pub fn note_layer_pre(bytes: usize, calls: usize) {
+    LAYER_PRE_LAYERS.fetch_add(1, Ordering::Relaxed);
+    LAYER_PRE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    LAYER_PRE_CALLS.fetch_add(calls as u64, Ordering::Relaxed);
+}
+
+/// `[exp-pf-stream]` の末尾へ足す先読みの台帳 (発火していなければ空)。
+pub fn layer_pre_stats() -> String {
+    let n = LAYER_PRE_LAYERS.load(Ordering::Relaxed);
+    if n == 0 {
+        return String::new();
+    }
+    let mb = LAYER_PRE_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+    format!(
+        " lpre_layers={n} lpre_MB={mb:.1} lpre_calls={}",
+        LAYER_PRE_CALLS.load(Ordering::Relaxed)
+    )
+}
+
+/// 先読みの台帳を 0 に戻す。
+pub fn layer_pre_stats_reset() {
+    for c in [&LAYER_PRE_LAYERS, &LAYER_PRE_BYTES, &LAYER_PRE_CALLS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+/// `part` の `off..off+len` をページキャッシュへ先に読む (Linux の `readahead(2)`)。
+///
+/// - ユーザー側のバッファを持たない (カーネルがページキャッシュを埋めるだけ)。
+/// - 戻り値は**投げたバイト数** (0 = パートが開けていない / Linux 以外)。
+/// - 呼び出しは待たない (カーネルが非同期に読む)。読み終わっていないページを
+///   触ると、あとからの `pread` はそのページの完了を待つだけ (二重読みはしない)。
+pub fn readahead_part(part: u32, off: u64, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let Some(Some(f)) = PARTS.get().and_then(|v| v.get(part as usize)) else {
+        return 0;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn readahead(fd: i32, offset: i64, count: usize) -> isize;
+        }
+        const PER_CALL: usize = 1 << 30; // 1 GiB ずつ投げる (巨大範囲を分割)
+        let fd = f.as_raw_fd();
+        let mut done = 0usize;
+        while done < len {
+            let n = (len - done).min(PER_CALL);
+            let r = unsafe { readahead(fd, (off + done as u64) as i64, n) };
+            if r < 0 {
+                break;
+            }
+            done += n;
+        }
+        done
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (f, off);
+        0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1 リクエストぶんの観測 (REPORT 用)
 // ---------------------------------------------------------------------------
@@ -2902,6 +3098,8 @@ pub fn stats_line() -> Option<String> {
         // task 325: 1 回目の読みの経路 (pread / 先読み) が発火したかの台帳。
         out.push_str(&pread_stats());
         out.push_str(&ra_stats());
+        // task 394: 次の層の先読みが発火したかの台帳。
+        out.push_str(&layer_pre_stats());
     }
     Some(out)
 }
@@ -2955,6 +3153,8 @@ pub fn stats_reset() {
     // task 325: 1 回目の読みの台帳もリクエスト単位にする。
     pread_stats_reset();
     ra_stats_reset();
+    // task 394: 次の層の先読みの台帳もリクエスト単位にする。
+    layer_pre_stats_reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -3043,6 +3243,60 @@ pub fn upload_budget_experts() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task 394: 戻しの並列化のゲートは既定 on (lab t394a / t394c で採った)。
+    /// 明示的な偽値だけ off。スレッド数は 1..=32 に丸める。
+    #[test]
+    fn restore_mt_gate_truth_table() {
+        assert!(DEFAULT_PF_RESTORE_MT, "lab で採ったのに既定 off に戻っている");
+        assert!(pf_restore_mt_from_value(None), "未設定は既定 (on)");
+        assert!(pf_restore_mt_from_value(Some("")), "空も既定 (on)");
+        assert!(!pf_restore_mt_from_value(Some("0")));
+        assert!(!pf_restore_mt_from_value(Some("off")));
+        assert!(!pf_restore_mt_from_value(Some("false")));
+        assert!(!pf_restore_mt_from_value(Some("no")));
+        assert!(!pf_restore_mt_from_value(Some(" OFF ")));
+        assert!(pf_restore_mt_from_value(Some("1")));
+        assert!(pf_restore_mt_from_value(Some("on")));
+        assert!(pf_restore_mt_from_value(Some(" true ")));
+        assert!(pf_restore_mt_from_value(Some("YES")));
+        // スレッド数: 未設定は既定 8、0 も 1 (0 本のプールは作れない)、上限 32。
+        assert_eq!(DEFAULT_PF_RESTORE_THREADS, 8);
+        assert_eq!(pf_restore_threads_from_value(None), 8);
+        assert_eq!(pf_restore_threads_from_value(Some("")), 8);
+        assert_eq!(pf_restore_threads_from_value(Some("0")), 1);
+        assert_eq!(pf_restore_threads_from_value(Some("1")), 1);
+        assert_eq!(pf_restore_threads_from_value(Some(" 12 ")), 12);
+        assert_eq!(pf_restore_threads_from_value(Some("999")), 32);
+        assert_eq!(pf_restore_threads_from_value(Some("x")), 8);
+    }
+
+    /// task 394: 次の層の先読みのゲートは既定 off、明示の真値だけ on。
+    #[test]
+    fn layer_pre_gate_truth_table() {
+        assert!(!DEFAULT_LAYER_PRE, "既定が on になっている");
+        assert!(!layer_pre_from_value(None), "未設定は既定 (off)");
+        assert!(!layer_pre_from_value(Some("")), "空も既定 (off)");
+        assert!(!layer_pre_from_value(Some("0")));
+        assert!(!layer_pre_from_value(Some("off")));
+        assert!(!layer_pre_from_value(Some("false")));
+        assert!(!layer_pre_from_value(Some("no")));
+        assert!(layer_pre_from_value(Some("1")));
+        assert!(layer_pre_from_value(Some("on")));
+        assert!(layer_pre_from_value(Some(" TRUE ")));
+        assert!(layer_pre_from_value(Some("yes")));
+        // 台帳は積んだぶんだけ増え、0 に戻せる。
+        layer_pre_stats_reset();
+        assert_eq!(layer_pre_stats(), "", "発火していないのに台帳が出る");
+        note_layer_pre(1000, 3);
+        note_layer_pre(2000, 3);
+        let s = layer_pre_stats();
+        assert!(s.contains("lpre_layers=2"), "{s}");
+        assert!(s.contains("lpre_calls=6"), "{s}");
+        assert!(s.contains("lpre_MB=0.0"), "{s}");
+        layer_pre_stats_reset();
+        assert_eq!(layer_pre_stats(), "");
+    }
 
     /// task 325: `DENNO_PF_RA_GROUPS` の真理値表 (未設定は off)。
     #[test]
