@@ -2245,6 +2245,8 @@ mod tests {
     /// とビット一致するはず。env 掃引の前にここで固定する。
     #[test]
     fn bf16_chunk_override_bit_matches_auto() {
+        // BF16 の上書き (exact / fast) はプロセス全体で 1 個。触るテストは直列にする。
+        let _bf16_lock = crate::model::moe_expert::moe_test_lock();
         use crate::model::moe_expert::{
             set_bf16_chunk_for_test, set_bf16_exact_for_test, set_bf16_fast_for_test,
         };
@@ -2317,6 +2319,8 @@ mod tests {
     /// (`BF16_EXACT_OVERRIDE` を立てる。テスト終わりに戻す)。
     #[test]
     fn bf16_group_pf_bit_matches_classic() {
+        // BF16 の上書き (exact / fast) はプロセス全体で 1 個。触るテストは直列にする。
+        let _bf16_lock = crate::model::moe_expert::moe_test_lock();
         use crate::model::moe_expert::{
             set_bf16_exact_for_test, set_bf16_group_for_test, set_bf16_pf_for_test,
         };
@@ -2456,6 +2460,8 @@ mod tests {
     #[test]
     #[ignore = "実形状の CPU マイクロベンチ (手動)"]
     fn bench_bf16_fma() {
+        // BF16 の上書き (exact / fast) はプロセス全体で 1 個。触るテストは直列にする。
+        let _bf16_lock = crate::model::moe_expert::moe_test_lock();
         use crate::model::moe_expert::{
             expert_gemv_bf16, set_bf16_acc_for_test, set_bf16_exact_for_test,
             set_bf16_group_for_test, set_bf16_pf_for_test, set_f32_exact_for_test,

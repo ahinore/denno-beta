@@ -1263,6 +1263,18 @@ pub use gpu::{
     ExpertShape,
 };
 
+/// CUDA 無しのビルドには VRAM の expert キャッシュが無い (使用量は `None`)。
+#[cfg(not(feature = "cuda"))]
+pub fn cache_usage() -> Option<(usize, usize)> {
+    None
+}
+
+/// CUDA 無しのビルドには VRAM の expert キャッシュが無い (載っている鍵は空)。
+#[cfg(not(feature = "cuda"))]
+pub fn keys() -> Vec<ExpertKey> {
+    Vec::new()
+}
+
 #[cfg(feature = "cuda")]
 mod gpu {
     use super::*;
@@ -3088,6 +3100,7 @@ mod tests {
     /// UD-Q4_K_XL の実形 (hidden 2560 / expert FF 640、gate/up = Q4_K、
     /// down = Q5_1) で 1 本 = 3,072,000 B。`bytes()` が型で落ちると
     /// 起動プランが VRAM に 1 本も載せられない (t263c でそう読めた)。
+    #[cfg(feature = "cuda")]
     #[test]
     fn plan_bytes_cover_k_and_legacy_types() {
         use crate::kquant::GgmlType as T;

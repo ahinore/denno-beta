@@ -654,22 +654,22 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     // task 382: silu + up + hc_mixed の融合版 (`DENNO_MIX_UPQ8`) の発火回数と、
     // `=check` の比較結果 (積んでいるときだけ)。
     {
-        let n = denno_engine::cuda::mix_upq8_hits();
+        let n = denno_engine::gpu_report::mix_upq8_hits();
         if n != 0 {
             eprintln!("[mix-upq8] fused={n} ({tag})");
-            denno_engine::cuda::mix_upq8_reset();
+            denno_engine::gpu_report::mix_upq8_reset();
         }
-        if let Some(line) = denno_engine::cuda::mix_upq8_check_line() {
+        if let Some(line) = denno_engine::gpu_report::mix_upq8_check_line() {
             eprintln!("{line}");
         }
     }
     // task 382: mix の鎖から H2D / D2H を消した回数 (`DENNO_MIX_ZC` のときだけ)。
     // ここが 0 のままなら鎖は従来経路で、測った数字は ZC の効果ではない。
     {
-        let (zx, zo) = denno_engine::cuda::mix_zc_hits();
+        let (zx, zo) = denno_engine::gpu_report::mix_zc_hits();
         if zx != 0 || zo != 0 {
             eprintln!("[mix-zc] no_h2d={zx} no_d2h={zo} ({tag})");
-            denno_engine::cuda::mix_zc_reset();
+            denno_engine::gpu_report::mix_zc_reset();
         }
     }
     // task 187: decode の IQ expert 段の層内 GPU 時間 (PROFILE のときだけ)。
@@ -756,10 +756,10 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     denno_engine::model::exp_iq::sum_zc_reset();
     // task 368: decode の待ちを null ストリームのイベントへ狭めた回数
     // (`DENNO_DEC_SYNC_STREAM=1` のときだけ 1 行 = 分岐が発火した証拠)。
-    if let Some(line) = denno_engine::cuda::dec_sync_stream_line() {
+    if let Some(line) = denno_engine::gpu_report::dec_sync_stream_line() {
         eprintln!("{line}");
     }
-    denno_engine::cuda::dec_sync_stream_reset();
+    denno_engine::gpu_report::dec_sync_stream_reset();
     // task 266: decode の先読み (`DENNO_DEC_PREF` のときだけ 1 行)。
     if let Some(line) = denno_engine::model::exp_prefetch::stats_line() {
         eprintln!("{line}");
@@ -771,10 +771,10 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     }
     denno_engine::model::qwen4exp::mix_qchain_reset();
     // task 358: pinned バウンス (`DENNO_PF_PIN_STAGE`) が流した量 (発火しなければ出ない)。
-    if let Some(line) = denno_engine::cuda::pf_pin_line() {
+    if let Some(line) = denno_engine::gpu_report::pf_pin_line() {
         eprintln!("{line}");
     }
-    denno_engine::cuda::pf_pin_reset();
+    denno_engine::gpu_report::pf_pin_reset();
     if !q4prof::enabled() {
         return;
     }

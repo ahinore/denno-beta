@@ -677,6 +677,7 @@ fn real_model_dump_gdn0() {
 ///
 /// 同じプロンプトを 2 つのインスタンスに流し、出力 logits を `to_bits()` で
 /// 突き合わせてから時間を比べる。数値が一致しなければ時間は出さない。
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore]
 fn real_model_prefill_timings() {

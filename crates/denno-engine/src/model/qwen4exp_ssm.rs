@@ -2019,10 +2019,15 @@ mod tests {
         let got = bat.forward_batch(&curs).expect("forward_batch");
         crate::model::qwen4exp::set_pf_gdn_chain_for_test(None);
         let after = PF_CHAIN_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        // 入口のカウンタは cuda 版の `forward_batch_chain` の中でだけ増える
+        // (CPU だけのビルドには連鎖の入口そのものが無い)。
+        #[cfg(feature = "cuda")]
         assert!(
             after > before,
             "連鎖の入口に来ていない (ゲートが効いていない)"
         );
+        #[cfg(not(feature = "cuda"))]
+        let _ = (before, after);
         for t in 0..70 {
             assert_eq!(
                 bits(&got[t]),

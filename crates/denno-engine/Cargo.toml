@@ -52,3 +52,7 @@ required-features = ["cuda"]
 [[example]]
 name = "bench_gdn"
 required-features = ["cuda"]
+
+[[example]]
+name = "pf_dma_probe"
+required-features = ["cuda"]

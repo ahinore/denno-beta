@@ -4018,6 +4018,7 @@ mod tests {
         assert_eq!(chunk_override_from_value(Some("1")), Some(1));
         // task 197: 既定 1536 は ssm のデバイス連鎖の形の境界 (< 2048) の内側にある。
         assert_eq!(DEFAULT_PF_CHUNK_STREAM, 1536, "lab t197a の最良");
+        #[cfg(feature = "cuda")]
         assert!(
             DEFAULT_PF_CHUNK_STREAM < crate::cuda::GDN_CHUNK_MIN_TOKENS,
             "既定チャンクが GDN 連鎖の境界 (2048) に触ると ssm がホスト経路へ落ちる"
@@ -4047,6 +4048,7 @@ mod tests {
         assert!(!chunk_balance_from_value(Some("0")));
         assert!(chunk_balance_from_value(Some("1")));
         assert!(chunk_balance_from_value(Some(" on ")));
+        #[cfg(feature = "cuda")]
         assert_eq!(
             CHUNK_BALANCE_CAP + 1,
             crate::cuda::GDN_CHUNK_MIN_TOKENS,

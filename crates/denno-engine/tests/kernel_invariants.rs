@@ -11295,6 +11295,7 @@ fn t357_ple_threads_gate_is_wired_to_the_pool() {
 /// 4. 呼び出し側が `AttnCache::push` を `pf_full_out` の後ろへ回す分岐を持つ、
 /// 5. 積んだ転送を必ず回収する (copy か discard) ことを確かめる。
 /// 発火そのものは lab の台帳 (`full` の d2h 呼び出し数) で数える。
+#[cfg(feature = "cuda")]
 #[test]
 fn t369_kv_async_is_wired() {
     use denno_engine::cuda::pf_kv_wb_pending;

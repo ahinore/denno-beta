@@ -2640,6 +2640,7 @@ impl HostExpert {
 /// すでに VRAM に載っている expert では RAM tier を**触らない** (触ると
 /// ミスのたびに 3 MB の pread が走る)。ミスのときだけ tier を引き、
 /// tier にも無ければ pread で埋めてからその区間を DMA する (fill from use)。
+#[cfg(feature = "cuda")]
 fn acquire_expert(
     lw: &LayerW,
     ei: usize,
@@ -7760,6 +7761,7 @@ fn ple_project_kv(
     // 上の量子型専用経路は形の段階で断られる (t172b/t172c)。F32 は同じ
     // `dno_gemm_f32_mt` のバッチ GEMM に載せる (`DENNO_PF_PLE_F32_GPU`)。
     // 片方でも GPU に載らなければ両方 CPU で回し直す (混在させない)。
+    #[cfg(feature = "cuda")]
     if !ple_dev && pf_ple_f32_gpu_on() && nt >= PF_PLE_F32_GPU_MIN_TOK {
         // 実ファイルの型は F32 か BF16 (目録は Q8_0)。BF16 は f32 に開いてから
         // 同じカーネルに載せる (VRAM は f32 で 2 倍になるが 105 MB 程度)。
@@ -12869,6 +12871,11 @@ fn moe_experts_seg_gpu_batched(
 /// task 144: この層の 3 行列が全部 IQ カーネルで読める型か (かつゲートが on)。
 ///
 /// 型はテンソル単位で決まるので層ごとに同じ値になるが、層ごとに呼んで安い。
+#[cfg(not(feature = "cuda"))]
+fn iq_expert_mode(_lw: &LayerW) -> bool {
+    false
+}
+
 #[cfg(feature = "cuda")]
 fn iq_expert_mode(lw: &LayerW) -> bool {
     crate::model::exp_iq::iq_gpu_enabled()
@@ -18455,6 +18462,8 @@ fn lm_decline_detail() -> String {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn moe_ffn_quant_batch_lm_dev_at(
     p: &Qwen4ExpParams,
     lw: &LayerW,
@@ -23756,6 +23765,7 @@ mod tests {
 
     /// task 260: ホスト RAM tier のミス計算が mmap とビット一致し、1 回目で
     /// 埋まり 2 回目はヒットすること (分岐が発火した回数を数える)。
+    #[cfg(feature = "cuda")]
     #[test]
     fn task260_ram_tier_miss_path_is_bit_identical_and_fills_on_use() {
         let _g = moe_test_guard();
@@ -26283,6 +26293,9 @@ mod tests {
         /// before/after で見ると、同じカウンタを使う他のテストと並列実行で干渉する)。
         #[test]
         fn hc_mix_iq4xs_down_takes_row_parallel_bitexact() {
+            // 行並列の計数と BF16 の上書きはプロセス全体で 1 個なので、それを触る
+            // テスト (moe_expert の bf16_tests など) と直列にする。
+            let _g = crate::model::moe_expert::moe_test_lock();
             use mix_kprof::rowpar;
             let hc = 4usize;
             let e = 2560usize;
@@ -26339,6 +26352,9 @@ mod tests {
         /// region 計上は `mix_kprof::rowpar` のラベル方式で見る ([`rowpar::stats`])。
         #[test]
         fn hc_mix_bf16_down_up_take_row_parallel_bitexact() {
+            // 行並列の計数と BF16 の上書きはプロセス全体で 1 個なので、それを触る
+            // テスト (moe_expert の bf16_tests など) と直列にする。
+            let _g = crate::model::moe_expert::moe_test_lock();
             use mix_kprof::rowpar;
             let hc = 4usize;
             let e = 2560usize;
@@ -26400,6 +26416,7 @@ mod tests {
         /// 「緑 = 分岐が発火した証拠」にしないため、入口のカウンタ ([`crate::cuda::
         /// mix_dev_attempts`]) が増えたことを数える。GPU が無い環境では従来経路の
         /// 値が ref とビット一致する (縮約はツリーに変わらない = デバイスは走らない)。
+        #[cfg(feature = "cuda")]
         #[test]
         fn mix_dec_dev_gate_attempts_then_falls_back_without_gpu() {
             let _lk = mix_gpu_test_lock();
@@ -26442,6 +26459,9 @@ mod tests {
         /// 適用できない (REPORT の判定を参照)。
         #[test]
         fn hc_mix_bf16_inject_takes_fused_kernel_bitexact() {
+            // 行並列の計数と BF16 の上書きはプロセス全体で 1 個なので、それを触る
+            // テスト (moe_expert の bf16_tests など) と直列にする。
+            let _g = crate::model::moe_expert::moe_test_lock();
             use crate::model::moe_expert::{
                 set_bf16_exact_for_test, set_bf16_fast_for_test, BF16_FUSED_CALLS,
             };
@@ -26508,6 +26528,8 @@ mod tests {
         /// ビット一致しない。moe_expert.rs の `bf16_tests` と同じ契約)。
         #[test]
         fn hc_mix_bf16_fma_fires_and_exact_gate_restores_sequential() {
+            // BF16 の上書き (exact / fast) はプロセス全体で 1 個。触るテストは直列にする。
+            let _bf16_lock = crate::model::moe_expert::moe_test_lock();
             use crate::model::moe_expert::{
                 set_bf16_exact_for_test, BF16_FMA_CALLS, BF16_FUSED_CALLS,
             };
@@ -26585,6 +26607,8 @@ mod tests {
         /// 明示版は down と同じ門番 64 を使う (up は two_row で既定門番 512 を通る)。
         #[test]
         fn hc_bf16_gemv_real_shape_bitexact_across_paths() {
+            // BF16 の上書き (exact / fast) はプロセス全体で 1 個。触るテストは直列にする。
+            let _bf16_lock = crate::model::moe_expert::moe_test_lock();
             use crate::model::moe_expert::set_bf16_exact_for_test;
             // task 119: 既定が FMA (逐次参照 bf16_gemv_seq と非ビット一致) になったので、
             // このテストは exact を強制して従来カーネルで見る (期待値は変えない)。

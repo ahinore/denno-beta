@@ -2305,6 +2305,10 @@ fn metrics_endpoint_counts_match_reply_usage() {
     let before = super::metrics::render();
     let p0 = metric_value(&before, "vllm:prompt_tokens_total");
     let g0 = metric_value(&before, "vllm:generation_tokens_total");
+    // カウンタはプロセス全体で共有なので、累計ではなくこのテストの増分で比べる
+    // (先に走ったテストの要求には、最初のトークンの前に終わって e2e だけ数えたものがある)。
+    let ttft0 = metric_value(&before, "vllm:time_to_first_token_seconds_count");
+    let e2e0 = metric_value(&before, "vllm:e2e_request_latency_seconds_count");
 
     let mut prompt_sum = 0u64;
     let mut out_sum = 0u64;
@@ -2338,15 +2342,10 @@ fn metrics_endpoint_counts_match_reply_usage() {
     );
 
     // 履歴 (ヒストグラム) と直近の速度が入っている。
-    assert!(
-        metric_value(&after, "vllm:time_to_first_token_seconds_count") >= 2.0,
-        "TTFT のサンプルが 2 本未満"
-    );
-    assert_eq!(
-        metric_value(&after, "vllm:e2e_request_latency_seconds_count"),
-        metric_value(&after, "vllm:time_to_first_token_seconds_count"),
-        "e2e と TTFT のサンプル数が違う"
-    );
+    let ttft = metric_value(&after, "vllm:time_to_first_token_seconds_count") - ttft0;
+    let e2e = metric_value(&after, "vllm:e2e_request_latency_seconds_count") - e2e0;
+    assert!(ttft >= 2.0, "TTFT のサンプルの増分が 2 本未満: {ttft}");
+    assert_eq!(e2e, ttft, "この 2 要求の e2e と TTFT のサンプル数が違う");
     assert!(metric_value(&after, "denno_last_decode_ms_per_token") > 0.0);
     assert!(metric_value(&after, "denno_last_prefill_tokens_per_second") > 0.0);
     // kv_cache_usage_perc は 0..1。

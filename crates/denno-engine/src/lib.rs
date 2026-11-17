@@ -29,6 +29,9 @@ pub mod toolmask;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+/// GPU の計器の読み出し口 (`cuda` feature の有無を問わず呼べる)。
+pub mod gpu_report;
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testutil;
 
