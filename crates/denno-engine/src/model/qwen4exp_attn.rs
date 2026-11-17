@@ -383,6 +383,44 @@ impl AttnCache {
         Ok(())
     }
 
+    /// task 393: `n` 位置ぶんをまとめて積む (`push` を `n` 回呼ぶのと同じ結果)。
+    ///
+    /// `push` は 1 位置ごとに `len` / `row` を引いて 1 KB ずつ写すので、
+    /// prefill の full 層 (14k で 12 層 x 7 チャンク x 2,048 位置 = 17 万回) では
+    /// 呼び出しと小さな `copy_from_slice` の固定費が積み上がる。ここでは
+    /// **1 回の `copy_from_slice`** で `n * row` 要素を写す (値も順序も同じ)。
+    /// `k` / `v` は先頭 `n * row` 要素だけ読む。
+    pub fn push_many(&mut self, layer: usize, k: &[f32], v: &[f32], n: usize) -> Result<()> {
+        let row = self.row();
+        let cur = self.len(layer)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let src = n * row;
+        if k.len() < src || v.len() < src {
+            bail!(
+                "AttnCache::push_many: 層 {layer} の k/v 長 {} / {} が {src} (n = {n} x row = {row}) より短い",
+                k.len(),
+                v.len()
+            );
+        }
+        if cur + n > self.max_ctx {
+            bail!(
+                "AttnCache::push_many: 層 {layer} が容量 max_ctx = {} を超える ({cur} + {n})",
+                self.max_ctx
+            );
+        }
+        let need = (cur + n) * row;
+        if self.k[layer].len() < need {
+            self.k[layer].resize(need, 0.0);
+            self.v[layer].resize(need, 0.0);
+        }
+        self.k[layer][cur * row..need].copy_from_slice(&k[..src]);
+        self.v[layer][cur * row..need].copy_from_slice(&v[..src]);
+        self.len[layer] = cur + n;
+        Ok(())
+    }
+
     /// 層 `layer` を空にする (確保済みの領域は残す)。
     pub fn clear(&mut self, layer: usize) -> Result<()> {
         self.len(layer)?;
@@ -436,12 +474,200 @@ impl Drop for AttnCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 393: full 層 KV のホストミラーへの積み方 (`DENNO_PF_KV_BULK`)
+// ---------------------------------------------------------------------------
+//
+// 14k cold prefill の `[q4ledger-pf]` では `full` が wall 1,140.4 ms / cpu 655.1 ms
+// / exposed 501.6 ms で、CPU の内訳は「チャンクごとに `vec![0f32; nt*kv]` を 2 本
+// 作る」(12 層 x 7 チャンク x 8 MB = 672 MB の新しいページ) と「pinned から
+// `ks`/`vs` へ写す」(689 MB) と「2,048 回の `AttnCache::push`」(689 MB を 2 KB
+// ずつ) だった。ここでは **積み方だけ**を変える:
+//
+// - k / v の一時バッファをスレッド局所で使い回す (grow-only)
+// - pinned の保留をそのまま `push_many` で 1 回の `copy_from_slice` にする
+//
+// デバイスへ渡るバイト列・ホストミラーのバイト列・積む順序は同じ (md5 は動かない)。
+
+/// task 393: `DENNO_PF_KV_BULK` の env 名。
+pub const PF_KV_BULK_ENV: &str = "DENNO_PF_KV_BULK";
+
+/// 未設定のときの既定 (**lab で採ったので on**)。`=0` で切り戻す。
+///
+/// 実測 (lab t393a / t393b、model=flash-next-UD-IQ3_XXS、depth8k、2 ラウンドずつ):
+/// 3,826 の `full` 段が wall 134.2-138.5 -> 126.8-129.6 ms (-3.4% / -7.9% /
+/// -7.0% / -7.2% の 4 サンプル)。14k は 881.7 -> 880.5 ms (差なし)。
+/// 壁は 3,826 で -0.1% / -0.5%、14k で ±0.1%。decode と md5 は全 COND 不変。
+pub const DEFAULT_PF_KV_BULK: bool = true;
+
+/// [`PF_KV_BULK_ENV`] の解釈 (未設定・空は [`DEFAULT_PF_KV_BULK`])。
+pub(crate) fn pf_kv_bulk_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PF_KV_BULK,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// KV をまとめて積むか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_kv_bulk_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_kv_bulk_from_value(std::env::var(PF_KV_BULK_ENV).ok().as_deref()))
+}
+
+thread_local! {
+    /// task 393: full 層 1 チャンクぶんの k / v の使い回し (`DENNO_PF_KV_BULK`)。
+    static KV_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// 長さ `need` の k / v を借りる (足りなければ育つ)。
+fn pf_kv_scratch_take(need: usize) -> (Vec<f32>, Vec<f32>) {
+    KV_SCRATCH.with(|c| {
+        let mut g = c.borrow_mut();
+        let mut k = std::mem::take(&mut g.0);
+        let mut v = std::mem::take(&mut g.1);
+        if k.len() < need {
+            k.resize(need, 0.0);
+        } else {
+            k.truncate(need);
+        }
+        if v.len() < need {
+            v.resize(need, 0.0);
+        } else {
+            v.truncate(need);
+        }
+        (k, v)
+    })
+}
+
+/// 借りた k / v を返す (grow-only。容量は捨てない)。
+fn pf_kv_scratch_return(k: Vec<f32>, v: Vec<f32>) {
+    KV_SCRATCH.with(|c| {
+        let mut g = c.borrow_mut();
+        g.0 = k;
+        g.1 = v;
+    });
+}
+
+/// task 393: full 層 1 チャンクの k / v バッファ。
+///
+/// ゲート on ではスレッド局所の 2 本を使い回し、drop で返す (途中で
+/// `Ok(None)` に落ちる経路でも取りこぼさない)。off では従来どおり
+/// チャンクごとに `vec![0f32; n]` を作る。
+struct KvBulkScratch {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    reuse: bool,
+}
+
+impl KvBulkScratch {
+    fn take(need: usize, reuse: bool) -> Self {
+        if reuse {
+            let (k, v) = pf_kv_scratch_take(need);
+            Self { k, v, reuse }
+        } else {
+            Self {
+                k: vec![0.0f32; need],
+                v: vec![0.0f32; need],
+                reuse,
+            }
+        }
+    }
+}
+
+impl Drop for KvBulkScratch {
+    fn drop(&mut self) {
+        if self.reuse {
+            let k = std::mem::take(&mut self.k);
+            let v = std::mem::take(&mut self.v);
+            pf_kv_scratch_return(k, v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod attn_cache_tests {
     use super::AttnCache;
 
     /// この 2 本はプロセス共通のゲートを触るので直列化する (並走で揺らさない)。
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// task 393: `push_many` は `push` を n 回呼ぶのと同じバイト列を作る
+    /// (まとめ積みが値を変えないことの CPU 側の証拠)。
+    #[test]
+    fn push_many_matches_push_one_by_one() {
+        let row = 2 * 8; // n_head_kv = 2, head_dim = 8
+        let nt = 5usize;
+        let mut a = AttnCache::new(1, 2, 8, 16).expect("cache");
+        let mut b = AttnCache::new(1, 2, 8, 16).expect("cache");
+        let k: Vec<f32> = (0..nt * row).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let v: Vec<f32> = (0..nt * row).map(|i| -(i as f32) * 0.25 + 1.0).collect();
+        for t in 0..nt {
+            a.push(0, &k[t * row..(t + 1) * row], &v[t * row..(t + 1) * row])
+                .expect("push");
+        }
+        b.push_many(0, &k, &v, nt).expect("push_many");
+        assert_eq!(a.len(0).unwrap(), b.len(0).unwrap(), "長さが違う");
+        assert_eq!(a.k(0).unwrap(), b.k(0).unwrap(), "k が違う");
+        assert_eq!(a.v(0).unwrap(), b.v(0).unwrap(), "v が違う");
+        // 追記 (既存の後ろに積む) も同じ。
+        a.push(0, &k[..row], &v[..row]).expect("push2");
+        b.push_many(0, &k[..row], &v[..row], 1).expect("push_many2");
+        assert_eq!(a.k(0).unwrap(), b.k(0).unwrap(), "追記後の k が違う");
+        assert_eq!(a.v(0).unwrap(), b.v(0).unwrap(), "追記後の v が違う");
+        // 容量を超える要求はエラー (黙って伸ばさない)。
+        let over = vec![0.0f32; 16 * row];
+        assert!(
+            b.push_many(0, &over, &over, 16).is_err(),
+            "max_ctx 超過が通った"
+        );
+        // 短い入力もエラー。
+        assert!(
+            b.push_many(0, &k[..row - 1], &v[..row], 1).is_err(),
+            "短い k が通った"
+        );
+    }
+
+    /// task 393: ゲートの真理値表 (未設定・空は既定、明示的な偽値だけ off)。
+    #[test]
+    fn kv_bulk_gate_truth_table() {
+        assert!(
+            super::pf_kv_bulk_from_value(None),
+            "未設定が off になった (lab で採ったので既定 on)"
+        );
+        assert!(super::pf_kv_bulk_from_value(Some("")));
+        for v in ["0", "off", "false", "no", " off "] {
+            assert!(!super::pf_kv_bulk_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(super::pf_kv_bulk_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        if std::env::var_os(super::PF_KV_BULK_ENV).is_none() {
+            assert!(super::pf_kv_bulk_on(), "未設定で既定 on になっていない");
+        }
+    }
+
+    /// task 393: スレッド局所の k / v は要求長で返り、返したものが再利用される。
+    #[test]
+    fn kv_scratch_reuses_and_resizes() {
+        let (k, v) = super::pf_kv_scratch_take(8);
+        assert_eq!((k.len(), v.len()), (8, 8));
+        super::pf_kv_scratch_return(k, v);
+        // 小さい要求は同じ容量のまま (truncate)、大きい要求は育つ。
+        let (k, v) = super::pf_kv_scratch_take(4);
+        assert_eq!((k.len(), v.len()), (4, 4));
+        assert!(k.capacity() >= 8, "容量を捨てた");
+        super::pf_kv_scratch_return(k, v);
+        let (k, v) = super::pf_kv_scratch_take(12);
+        assert_eq!((k.len(), v.len()), (12, 12));
+        super::pf_kv_scratch_return(k, v);
+        let s = super::KvBulkScratch::take(6, true);
+        assert_eq!((s.k.len(), s.v.len()), (6, 6));
+        drop(s);
+        let s = super::KvBulkScratch::take(6, false);
+        assert_eq!((s.k.len(), s.v.len()), (6, 6));
+        drop(s);
+    }
 
     /// task 210: cache を捨てたらミラーの解放口を呼ぶ (VRAM が実際に返るかは GPU 実機)。
     ///
@@ -2152,8 +2378,11 @@ impl FullAttn {
                 return Ok(None);
             }
         };
-        let mut ks = vec![0f32; nt * kv];
-        let mut vs = vec![0f32; nt * kv];
+        // task 393: `DENNO_PF_KV_BULK` では k / v の一時バッファをスレッドで
+        // 使い回す (チャンクごとの `vec![0f32; n]` は 14k で 84 回 x 8 MB =
+        // 672 MB の新しいページを踏み、マイナーフォルトとして露出する)。
+        let kv_bulk = pf_kv_bulk_on();
+        let mut kv_scratch = KvBulkScratch::take(nt * kv, kv_bulk);
         let cache_id = self.cache.id();
         let n_layer = self.cache.n_layer();
         let gen = self.cache.gen(layer)?;
@@ -2182,8 +2411,8 @@ impl FullAttn {
                 gen,
                 t_total,
                 base,
-                &mut ks,
-                &mut vs,
+                &mut kv_scratch.k,
+                &mut kv_scratch.v,
             )
         } else {
             let parts = l.qkv.parts();
@@ -2213,8 +2442,8 @@ impl FullAttn {
                 gen,
                 t_total,
                 base,
-                &mut ks,
-                &mut vs,
+                &mut kv_scratch.k,
+                &mut kv_scratch.v,
             )
         };
         if !ok {
@@ -2227,10 +2456,18 @@ impl FullAttn {
         let wb_deferred = crate::cuda::pf_full_mirror_direct(cache_id, layer, gen, base + nt, kv);
         // KV は従来経路と同じ順序・同じ値でホストのキャッシュへ積む。
         if !wb_deferred {
-            crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);
-            for t in 0..nt {
+            crate::cuda::pf_kv_wb_copy_into(&mut kv_scratch.k, &mut kv_scratch.v);
+            if kv_bulk {
                 self.cache
-                    .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+                    .push_many(layer, &kv_scratch.k, &kv_scratch.v, nt)?;
+            } else {
+                for t in 0..nt {
+                    self.cache.push(
+                        layer,
+                        &kv_scratch.k[t * kv..(t + 1) * kv],
+                        &kv_scratch.v[t * kv..(t + 1) * kv],
+                    )?;
+                }
             }
         }
         let kb = self.cache.k(layer)?;
@@ -2284,9 +2521,17 @@ impl FullAttn {
         if wb_deferred {
             // ここで初めて転送を待つ (attention と out のカーネルの裏に隠れる)。
             // `DENNO_PF_KV_PUSH` では pinned から直接積む (ks/vs への写しを省く)。
+            // task 393: `DENNO_PF_KV_BULK` では pinned から **1 回の写し**で積む
+            // (2,048 回の `push` を 1 回の `push_many` にする。値は同じ)。
             let mut err = None;
-            let used = crate::cuda::pf_kv_push_on()
+            let used = (crate::cuda::pf_kv_push_on() || kv_bulk)
                 && crate::cuda::pf_kv_wb_with(|k: &[f32], v: &[f32]| {
+                    if kv_bulk {
+                        if let Err(e) = self.cache.push_many(layer, k, v, nt) {
+                            err = Some(e);
+                        }
+                        return;
+                    }
                     for t in 0..nt {
                         if let Err(e) = self.cache.push(
                             layer,
@@ -2299,10 +2544,18 @@ impl FullAttn {
                     }
                 });
             if !used {
-                crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);
-                for t in 0..nt {
+                crate::cuda::pf_kv_wb_copy_into(&mut kv_scratch.k, &mut kv_scratch.v);
+                if kv_bulk {
                     self.cache
-                        .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+                        .push_many(layer, &kv_scratch.k, &kv_scratch.v, nt)?;
+                } else {
+                    for t in 0..nt {
+                        self.cache.push(
+                            layer,
+                            &kv_scratch.k[t * kv..(t + 1) * kv],
+                            &kv_scratch.v[t * kv..(t + 1) * kv],
+                        )?;
+                    }
                 }
             }
             if let Some(e) = err {

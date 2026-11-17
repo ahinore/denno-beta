@@ -17431,6 +17431,109 @@ enum GdnBuf {
 }
 
 // ---------------------------------------------------------------------------
+// task 393: GDN の重み 4 本 (conv / a / dt / norm) を層ごとに上げ直さない
+// (`DENNO_PF_GDN_WSTAT`)
+// ---------------------------------------------------------------------------
+//
+// 層優先 prefill は **層ごとに全チャンク** を回す (task 250) のに、
+// `gdn_pf_chain` は呼ばれるたびに重み 4 本を `DevBuffer::copy_from` で
+// 上げ直していた。`copy_from` は pageable の **同期** H2D で、
+// **呼び出し時点でコンテキスト全体の完了を待つ** (task 369 が D2H で見つけた
+// のと同じ性質)。つまりチャンクごとに GPU のキューを吐き切っていた。
+//
+// 実測 (lab t393a の b2、14k): `[q4ledger-pf]` の ssm は
+// wall 2,460.3 / busy 1,558.2 / exposed 902.1 ms で、CPU は 28 ms しかない。
+// 36 層 x 7 チャンク x 4 本 = 1,008 回の H2D が 0.9 ms ずつ待っている計算になる
+// (3,826 は 36 層 x 2 チャンク x 4 = 288 回で exposed 26.7 ms = 0.09 ms/回。
+// 待ちの長さはキューの深さに比例する)。
+//
+// 同じ層の重みは 4 本とも**同じバイト列**なので、置き場が同じままなら
+// 上げ直さなくてよい。値は 1 bit も変わらない。
+
+/// task 393: `DENNO_PF_GDN_WSTAT` の env 名。
+pub const GDN_WSTAT_ENV: &str = "DENNO_PF_GDN_WSTAT";
+
+/// 未設定のときの既定 (**off のまま**)。
+///
+/// 実測 (lab t393b、depth8k): ゲートは発火した (ssm の H2D 159.18 MB / 1,080 回
+/// -> 123.60 MB / 216 回 = 36 層 x 6 チャンク x 4 本を飛ばした) が、ssm 段の壁は
+/// 14k 2,459.8 -> 2,433.8 ms (-1.1%)、3,826 454.9 -> 452.3 ms (-0.6%) だけで、
+/// 壁は -0.1% / -0.0%。**同期 H2D の待ちは ssm の露出の正体ではなかった**
+/// (露出 900 ms は GPU の待ち)。採否規則 (段で 2% 以上) に届かないので off。
+pub const DEFAULT_GDN_WSTAT: bool = false;
+
+/// [`GDN_WSTAT_ENV`] の解釈 (未設定・空は [`DEFAULT_GDN_WSTAT`])。
+pub(crate) fn gdn_wstat_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_GDN_WSTAT,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// 重みの上げ直しを飛ばすか (プロセスで 1 回だけ env を読む)。
+pub fn gdn_wstat_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_wstat_from_value(std::env::var(GDN_WSTAT_ENV).ok().as_deref()))
+}
+
+thread_local! {
+    /// 直前に 4 本を上げた組み合わせ: (層, 転送元 4 本の (ptr, 要素数), 置き場 4 本の ptr)。
+    /// 一致したら上げ直さない。3 つの呼び出し口 (層優先 / チャンク優先 / decode) が
+    /// 同じ置き場を共有するので、鍵も 1 本で持つ。
+    static GDN_WSTAT_KEY: std::cell::Cell<Option<[usize; 13]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// task 393: 上げ直しを飛ばしてよいかの鍵 (純関数)。
+///
+/// 「同じ層の、同じバイト列 (転送元のポインタと要素数) を、同じ置き場へ」だけを
+/// 一致と見る。置き場が `grow` で差し替わればポインタが変わるので必ず上げ直す。
+fn gdn_wstat_key(li: usize, src: [(usize, usize); 4], dst: [usize; 4]) -> [usize; 13] {
+    let mut key = [0usize; 13];
+    key[0] = li;
+    for i in 0..4 {
+        key[1 + i * 2] = src[i].0;
+        key[2 + i * 2] = src[i].1;
+        key[9 + i] = dst[i];
+    }
+    key
+}
+
+/// task 393: 重み 4 本 (`wc` / `wa` / `wd` / `wn` の順) をスクラッチへ上げる。
+///
+/// [`gdn_wstat_on`] が on で、直前に同じ層の同じバイト列を同じ置き場へ
+/// 上げていれば 4 本とも飛ばす (飛ばした回数は台帳に出さない — 効果は
+/// `[q4ledger-pf]` の ssm exposed で読む)。
+fn gdn_put_weights(s: &GdnScratch, li: usize, src: [&[f32]; 4]) -> Result<()> {
+    let dst = [
+        s.wc.as_ref().map(|b| b.ptr() as usize).unwrap_or(0),
+        s.wa.as_ref().map(|b| b.ptr() as usize).unwrap_or(0),
+        s.wd.as_ref().map(|b| b.ptr() as usize).unwrap_or(0),
+        s.wn.as_ref().map(|b| b.ptr() as usize).unwrap_or(0),
+    ];
+    let key = gdn_wstat_key(
+        li,
+        [
+            (src[0].as_ptr() as usize, src[0].len()),
+            (src[1].as_ptr() as usize, src[1].len()),
+            (src[2].as_ptr() as usize, src[2].len()),
+            (src[3].as_ptr() as usize, src[3].len()),
+        ],
+        dst,
+    );
+    if gdn_wstat_on() && GDN_WSTAT_KEY.with(|c| c.get()) == Some(key) {
+        return Ok(());
+    }
+    // 置き場が無い (未確保) のは呼び出し側のバグ。従来どおり panic させる。
+    s.wc.as_ref().expect("GdnScratch: 未確保").copy_from(src[0])?;
+    s.wa.as_ref().expect("GdnScratch: 未確保").copy_from(src[1])?;
+    s.wd.as_ref().expect("GdnScratch: 未確保").copy_from(src[2])?;
+    s.wn.as_ref().expect("GdnScratch: 未確保").copy_from(src[3])?;
+    GDN_WSTAT_KEY.with(|c| c.set(Some(key)));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // s89 (P1-1): GDN スキャンのデバイス常駐状態
 //
 // 動機: s88 の計測で prefill の `d2h_state` が大きいのは GDN 状態の往復
@@ -47904,10 +48007,7 @@ fn gdn_scan_impl(
         s.z.as_ref().unwrap().copy_from(z)?;
         s.beta.as_ref().unwrap().copy_from(beta)?;
         s.alpha.as_ref().unwrap().copy_from(alpha)?;
-        s.wc.as_ref().unwrap().copy_from(wconv)?;
-        s.wa.as_ref().unwrap().copy_from(wa)?;
-        s.wd.as_ref().unwrap().copy_from(wdt)?;
-        s.wn.as_ref().unwrap().copy_from(wnorm)?;
+        gdn_put_weights(&s, li, [wconv, wa, wdt, wnorm])?;
         Ok(s.ptrs())
     })?;
     // s131: conv / ssm の正本はデバイス。未確定のときだけホストから 1 回 seed。
@@ -51667,10 +51767,7 @@ pub fn gdn_pf_chain(
         // スキャンカーネルは「書かない領域」を残すので従来どおりゼロ埋め。
         s.buf(GdnBuf::ConvOut).fill_zero()?;
         s.buf(GdnBuf::SsmOut).fill_zero()?;
-        s.wc.as_ref().unwrap().copy_from(wconv)?;
-        s.wa.as_ref().unwrap().copy_from(wa)?;
-        s.wd.as_ref().unwrap().copy_from(wdt)?;
-        s.wn.as_ref().unwrap().copy_from(wnorm)?;
+        gdn_put_weights(&s, li, [wconv, wa, wdt, wnorm])?;
         Ok(s.chain_ptrs())
     })?;
     // task 186: beta/alpha をデバイスで作る場合の重み常駐 (失敗は None → ホスト経路)。
@@ -55048,10 +55145,7 @@ fn gdn_scan_chunked_impl(
             s.beta.as_ref().unwrap().copy_from(beta)?;
             s.alpha.as_ref().unwrap().copy_from(alpha)?;
         }
-        s.wc.as_ref().unwrap().copy_from(wconv)?;
-        s.wa.as_ref().unwrap().copy_from(wa)?;
-        s.wd.as_ref().unwrap().copy_from(wdt)?;
-        s.wn.as_ref().unwrap().copy_from(wnorm)?;
+        gdn_put_weights(&s, li, [wconv, wa, wdt, wnorm])?;
         Ok(p)
     })?;
     // Dev のときは入力 4 本のポインタだけ差し替える (他はスクラッチのまま)。
@@ -59319,6 +59413,52 @@ mod task379_tests {
                 !pf_gdn_last_chunk_skippable(0),
                 "最終チャンクで飛ばしてはいけない"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod task393_tests {
+    use super::*;
+
+    /// task 393: `DENNO_PF_GDN_WSTAT` の真理値表 (既定 off、明示的な真値だけ on)。
+    #[test]
+    fn gdn_wstat_gate_truth_table() {
+        assert!(
+            !gdn_wstat_from_value(None),
+            "未設定が on になった (既定 off のはず)"
+        );
+        assert!(!gdn_wstat_from_value(Some("")));
+        for v in ["0", "off", "false", "no", " off "] {
+            assert!(!gdn_wstat_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(gdn_wstat_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        if std::env::var_os(GDN_WSTAT_ENV).is_none() {
+            assert!(!gdn_wstat_on(), "未設定で既定 off になっていない");
+        }
+    }
+
+    /// task 393: 鍵は「層・転送元 4 本 (ptr と要素数)・置き場 4 本」のどれが
+    /// 変わっても別になる (上げ直しを飛ばしてよい条件を緩めない)。
+    #[test]
+    fn gdn_wstat_key_covers_layer_src_and_dst() {
+        let src = [(0x1000usize, 8usize), (0x2000, 4), (0x3000, 4), (0x4000, 4)];
+        let dst = [0x9000usize, 0xa000, 0xb000, 0xc000];
+        let base = gdn_wstat_key(5, src, dst);
+        assert_eq!(base, gdn_wstat_key(5, src, dst), "同じ入力で鍵が揺れた");
+        assert_ne!(base, gdn_wstat_key(6, src, dst), "層が鍵に入っていない");
+        for i in 0..4 {
+            let mut s = src;
+            s[i].0 += 0x10;
+            assert_ne!(base, gdn_wstat_key(5, s, dst), "転送元 {i} の ptr が鍵に無い");
+            let mut s = src;
+            s[i].1 += 1;
+            assert_ne!(base, gdn_wstat_key(5, s, dst), "転送元 {i} の長さが鍵に無い");
+            let mut d = dst;
+            d[i] += 0x10;
+            assert_ne!(base, gdn_wstat_key(5, src, d), "置き場 {i} が鍵に無い");
         }
     }
 }

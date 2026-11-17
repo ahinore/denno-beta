@@ -11340,9 +11340,10 @@ fn t369_kv_async_is_wired() {
         .expect("遅延 push の分岐が無い");
     assert!(defer_pos > out_pos, "遅延 push が pf_full_out より前にある");
     // 回収: 先に積む枝と後ろへ回す枝の両方で copy し、落ちた枝では捨てる。
+    // (task 393 で宛先が `ks`/`vs` からスレッド局所の `kv_scratch` に変わった)
     assert_eq!(
         ATTN_SRC
-            .matches("crate::cuda::pf_kv_wb_copy_into(&mut ks, &mut vs);")
+            .matches("crate::cuda::pf_kv_wb_copy_into(&mut kv_scratch.k, &mut kv_scratch.v);")
             .count(),
         2,
         "copy_into の呼び出しが 2 箇所でない"
@@ -11514,5 +11515,239 @@ fn task379_gdn_wb_last_is_visible_in_the_stream_ledger() {
     assert!(
         EXP_PF_SRC.contains("&GDN_WB_SKIPS,"),
         "stats_reset が飛ばした回数を戻していない"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 393: 既定モデル prefill のホスト仕事を減らす 2 本
+//
+// 14k cold の `[q4ledger-pf]` (lab t402b の b2、model=flash-next-UD-IQ3_XXS) は
+// `full` wall 1,140.4 / cpu 655.1 / exposed 501.6 ms と
+// `other` wall 1,091.4 / cpu 1,091.4 / exposed 919.8 ms で、後者の中は
+// `res_up=201.0 [h=1148.4MB/14 d=645.3MB/8]` と `ple=202.4 [d=717.7MB/14]`。
+// どちらも「チャンクごとに作り直す大きな Vec」と「pageable の同期コピー」で、
+// ゲート 2 本 (`DENNO_PF_KV_BULK` / `DENNO_PF_PLE_PIN`) の内側で形だけ変える。
+// ---------------------------------------------------------------------------
+
+/// `DENNO_PF_KV_BULK`: 既定 off、env 名は 1 箇所、積む先は `push_many`。
+///
+/// 緑は発火の証拠ではない (lab の `full` 段の cpu / exposed で数える)。
+#[cfg(feature = "cuda")]
+#[test]
+fn task393_kv_bulk_is_wired_through_push_many() {
+    assert_eq!(
+        ATTN_SRC
+            .matches("pub const PF_KV_BULK_ENV: &str = \"DENNO_PF_KV_BULK\";")
+            .count(),
+        1,
+        "env 名の宣言が 1 箇所でない"
+    );
+    assert!(
+        ATTN_SRC.contains("pub const DEFAULT_PF_KV_BULK: bool = true;"),
+        "既定が on でない (lab t393a/t393b で採った)"
+    );
+    // 解釈は「未設定・空は既定 (off)、明示的な真値だけ on」。
+    let f = ATTN_SRC
+        .split("pub(crate) fn pf_kv_bulk_from_value(")
+        .nth(1)
+        .expect("解釈が無い");
+    let head = &f[..f.find('}').expect("本体が無い")];
+    assert!(
+        head.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+        "真値の集合が変わった"
+    );
+    assert!(
+        head.contains("None | Some(\"\") => DEFAULT_PF_KV_BULK"),
+        "未設定・空が既定へ落ちていない"
+    );
+    // 呼び出し側: 一時バッファはスクラッチから取り、まとめ積みは push_many。
+    assert!(
+        ATTN_SRC.contains("let kv_bulk = pf_kv_bulk_on();"),
+        "呼び出し側がゲートを見ていない"
+    );
+    assert!(
+        ATTN_SRC.contains("let mut kv_scratch = KvBulkScratch::take(nt * kv, kv_bulk);"),
+        "一時バッファがスクラッチ経由でない"
+    );
+    assert!(
+        !ATTN_SRC.contains("let mut ks = vec![0f32; nt * kv];\n        let mut vs = vec![0f32; nt * kv];\n        let cache_id"),
+        "dev 連鎖の経路にチャンクごとの Vec が残っている"
+    );
+    assert!(
+        ATTN_SRC.contains("if let Err(e) = self.cache.push_many(layer, k, v, nt) {"),
+        "pinned 直送の枝が push_many を使っていない"
+    );
+    assert_eq!(
+        ATTN_SRC
+            .matches(".push_many(layer, &kv_scratch.k, &kv_scratch.v, nt)?")
+            .count(),
+        2,
+        "落ちた枝 (先に積む / 後ろへ回す) の両方で push_many になっていない"
+    );
+    // スクラッチは drop で返す (途中で Ok(None) に落ちても取りこぼさない)。
+    assert!(
+        ATTN_SRC.contains("impl Drop for KvBulkScratch {"),
+        "スクラッチの返却が Drop でない"
+    );
+    assert!(
+        ATTN_SRC.contains("if self.reuse {\n            let k = std::mem::take(&mut self.k);"),
+        "Drop が使い回しのときだけ返していない"
+    );
+}
+
+/// `DENNO_PF_PLE_PIN`: 既定 off、往復バッファが pinned (`PfHostBuf`) になる。
+///
+/// 台帳 (`SUB_RES_UP`) のバイト数は変わらないので、効いたかは lab の
+/// `res_up` / `ple` の ms で見る。
+#[cfg(feature = "cuda")]
+#[test]
+fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
+    assert_eq!(
+        QWEN_SRC
+            .matches("pub const PLE_PIN_ENV: &str = \"DENNO_PF_PLE_PIN\";")
+            .count(),
+        1,
+        "env 名の宣言が 1 箇所でない"
+    );
+    assert!(
+        QWEN_SRC.contains("pub const DEFAULT_PLE_PIN: bool = true;"),
+        "既定が on でない (lab t393a/t393b で採った)"
+    );
+    let f = QWEN_SRC
+        .split("pub(crate) fn pf_ple_pin_from_value(")
+        .nth(1)
+        .expect("解釈が無い");
+    let head = &f[..f.find('}').expect("本体が無い")];
+    assert!(
+        head.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+        "真値の集合が変わった"
+    );
+    assert!(
+        head.contains("None | Some(\"\") => DEFAULT_PLE_PIN"),
+        "未設定・空が既定へ落ちていない"
+    );
+    // 取る側: ゲート on なら pinned の 1 本を使い回す (長さは要求どおり)。
+    let take = QWEN_SRC
+        .split("fn pf_ple_back_take_with(")
+        .nth(1)
+        .expect("take が無い");
+    assert!(
+        take[..take.find("\n}\n").expect("本体が無い")]
+            .contains("pf_ple_back_take_pin(len, reuse, pf_ple_pin_on())"),
+        "take がゲートを見ていない"
+    );
+    let pin = QWEN_SRC
+        .split("fn pf_ple_back_take_pin(")
+        .nth(1)
+        .expect("pinned の枝が無い");
+    let pbody = &pin[..pin.find("\n}\n").expect("本体が無い")];
+    assert!(pbody.contains("if pinned {"), "pinned の枝が無い");
+    assert!(
+        pbody.contains("PlePinBuf::new(len)"),
+        "pinned の確保が無い"
+    );
+    assert!(
+        QWEN_SRC.contains("type PlePinBuf = crate::cuda::PfHostBuf;"),
+        "pinned の実体が PfHostBuf でない"
+    );
+    assert!(
+        pbody.contains("Some(b) if b.len() >= len => b"),
+        "grow-only の使い回しでない"
+    );
+    // 返す側: pinned は pinned の置き場へ、Vec は Vec の置き場へ。
+    let ret = QWEN_SRC
+        .split("fn pf_ple_back_return(")
+        .nth(1)
+        .expect("return が無い");
+    let rbody = &ret[..ret.find("\n}\n").expect("本体が無い")];
+    assert!(
+        rbody.contains("Some(buf) => PLE_BACK_PIN.with(|c| *c.borrow_mut() = Some(buf)),"),
+        "pinned を返していない"
+    );
+    assert!(
+        rbody.contains("None => PLE_BACK_BUF.with(|c| *c.borrow_mut() = v),"),
+        "Vec を返していない"
+    );
+    // 呼び出し側は今までどおりスライスとして使う (Deref/DerefMut)。
+    assert!(
+        QWEN_SRC.contains("impl std::ops::DerefMut for PleBack {"),
+        "DerefMut が無い (呼び出し側が &mut [f32] を受ける前提が壊れる)"
+    );
+    // 往復の 2 本のコピーは今までどおり `pf_download_res` / `pf_upload_res`。
+    let uses = QWEN_SRC.matches("crate::cuda::pf_download_res(&mut back)").count();
+    assert_eq!(
+        uses, 2,
+        "PLE 層の res D2H が 2 箇所 (層優先 / チャンク優先) に無い"
+    );
+}
+
+/// `DENNO_PF_GDN_WSTAT`: GDN の重み 4 本のアップロードが **鍵を通る 1 本**に
+/// まとまっていて、3 つの呼び出し口 (層優先 prefill / チャンク優先 / decode) が
+/// 同じ関数を使っていること。
+///
+/// 飛ばす条件は「同じ層・同じバイト列・同じ置き場」だけ (テストは
+/// `cuda::task393_tests::gdn_wstat_key_covers_layer_src_and_dst` が固定する)。
+/// 緑は発火の証拠ではないので、効いたかは lab の `[q4ledger-pf]` ssm exposed で見る。
+#[cfg(feature = "cuda")]
+#[test]
+fn task393_gdn_wstat_is_wired_through_one_helper() {
+    assert_eq!(
+        CUDA_RS
+            .matches("pub const GDN_WSTAT_ENV: &str = \"DENNO_PF_GDN_WSTAT\";")
+            .count(),
+        1,
+        "env 名の宣言が 1 箇所でない"
+    );
+    assert!(
+        CUDA_RS.contains("pub const DEFAULT_GDN_WSTAT: bool = false;"),
+        "既定が off でない (lab で採るまで off)"
+    );
+    let f = CUDA_RS
+        .split("pub(crate) fn gdn_wstat_from_value(")
+        .nth(1)
+        .expect("解釈が無い");
+    let head = &f[..f.find('}').expect("本体が無い")];
+    assert!(
+        head.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+        "真値の集合が変わった"
+    );
+    assert!(
+        head.contains("None | Some(\"\") => DEFAULT_GDN_WSTAT"),
+        "未設定・空が既定へ落ちていない"
+    );
+    // 生の copy_from は 0、鍵を通る呼び出しが 3 箇所。
+    assert_eq!(
+        CUDA_RS
+            .matches("s.wc.as_ref().unwrap().copy_from(wconv)?")
+            .count(),
+        0,
+        "鍵を通らない重みのアップロードが残っている"
+    );
+    assert_eq!(
+        CUDA_RS
+            .matches("gdn_put_weights(&s, li, [wconv, wa, wdt, wnorm])?")
+            .count(),
+        3,
+        "重みのアップロードが 3 箇所 (層優先 / チャンク優先 / decode) でない"
+    );
+    // 鍵は純関数で、層・転送元・置き場の全部を見る。
+    let k = CUDA_RS
+        .split("fn gdn_wstat_key(")
+        .nth(1)
+        .expect("鍵の関数が無い");
+    let kbody = &k[..k.find("\n}\n").expect("本体が無い")];
+    assert!(kbody.contains("key[0] = li;"), "層が鍵に入っていない");
+    assert!(kbody.contains("src[i].0"), "転送元のポインタが鍵に入っていない");
+    assert!(kbody.contains("src[i].1"), "転送元の長さが鍵に入っていない");
+    assert!(kbody.contains("dst[i]"), "置き場が鍵に入っていない");
+    // ゲート off では必ず上げ直す (鍵を読まない)。
+    let put = CUDA_RS
+        .split("fn gdn_put_weights(")
+        .nth(1)
+        .expect("上げ直しの関数が無い");
+    let pbody = &put[..put.find("\n}\n").expect("本体が無い")];
+    assert!(
+        pbody.contains("if gdn_wstat_on() && GDN_WSTAT_KEY.with(|c| c.get()) == Some(key) {"),
+        "ゲートと鍵の両方を見ていない (off でも飛ばす可能性がある)"
     );
 }

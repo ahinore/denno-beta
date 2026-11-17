@@ -7853,37 +7853,190 @@ pub(crate) fn pf_ple_reuse_on() -> bool {
     *ON.get_or_init(|| pf_ple_reuse_from_value(std::env::var(PLE_REUSE_ENV).ok().as_deref()))
 }
 
+/// task 393: `DENNO_PF_PLE_PIN` — PLE 層の res 往復バッファを pinned にする。
+///
+/// prefill は PLE 層 (このモデルは 48 層中 2 層) で残差を **ホストへ降ろして
+/// PLE を注入し、上げ直す**。14k のチャンクは 1 件 82 MB で、
+/// `[q4ledger-pf] sub other` の実測 (t402b b2、14k) は
+/// `res_up 201.0 ms [h=1148.4MB/14 d=645.3MB/8]` / `ple 202.4 ms [d=717.7MB/14]`。
+/// pageable の同期 H2D/D2H はこのホストで 3.5-5.7 GB/s しか出ないので、
+/// バッファ自体を pinned (`PfHostBuf`) にすれば DMA がそのまま速くなる
+/// (追加の写しを挟まない。task 318 の `DENNO_PF_PIN_STAGE` は逆に
+/// 「pinned へ写してから同期コピー」で写しを 1 回増やしていた)。
+pub const PLE_PIN_ENV: &str = "DENNO_PF_PLE_PIN";
+
+/// [`PLE_PIN_ENV`] の既定 (**lab で採ったので on**)。`=0` で切り戻す。
+///
+/// 実測 (lab t393a / t393b、depth8k、2 ラウンドずつ): 3,826 の `other` 段が
+/// wall 409.3 / 238.9 (base) -> 226.2 / 226.1 ms (`other` の内側は
+/// res_up 44.9-46.2 -> 32.1-33.0、ple 111.3 -> 101.3-101.9)。
+/// 14k は `other` 764.6 -> 743.2 ms、`res_up` 206.0 -> 163.1 ms。
+/// 壁は 3,826 で -0.6%、14k で -0.1%。decode と md5 は全 COND 不変。
+pub const DEFAULT_PLE_PIN: bool = true;
+
+/// [`PLE_PIN_ENV`] の解釈 (未設定・空は [`DEFAULT_PLE_PIN`])。
+pub(crate) fn pf_ple_pin_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PLE_PIN,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// PLE の res 往復バッファを pinned にするか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_ple_pin_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_ple_pin_from_value(std::env::var(PLE_PIN_ENV).ok().as_deref()))
+}
+
+/// task 393: pinned 版のバッファ型 (cuda feature が無いときは `Vec` で代替する)。
+///
+/// prefill の GPU 経路自体が cuda feature の内側なので、feature 無しでは
+/// このバッファは使われない。それでも `cargo build --workspace` が通るように
+/// 同じ口 (`new` / `len` / `as_slice` / `as_mut_slice`) だけを持つ器を置く。
+#[cfg(feature = "cuda")]
+type PlePinBuf = crate::cuda::PfHostBuf;
+
+#[cfg(not(feature = "cuda"))]
+struct PlePinBuf {
+    v: Vec<f32>,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl PlePinBuf {
+    fn new(len: usize) -> Self {
+        Self {
+            v: vec![0.0f32; len],
+        }
+    }
+    fn len(&self) -> usize {
+        self.v.len()
+    }
+    fn as_slice(&self) -> &[f32] {
+        &self.v
+    }
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.v
+    }
+}
+
 thread_local! {
     /// task 300: PLE の res 往復バッファ (`nt × hc_dim`)。grow-only。
     static PLE_BACK_BUF: std::cell::RefCell<Vec<f32>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// task 393: 同じバッファの pinned 版 (`DENNO_PF_PLE_PIN`)。grow-only。
+    static PLE_BACK_PIN: std::cell::RefCell<Option<PlePinBuf>> =
+        const { std::cell::RefCell::new(None) };
     /// task 300: PLE の射影バッファ (`key` / `value`)。grow-only。
     static PLE_KV_BUF: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// task 393: PLE の res 往復バッファ (スライスとして長さ `len` ちょうど).
+///
+/// pinned のときは `PfHostBuf` (使い回し) を、そうでなければ `Vec` を持つ。
+/// どちらも `Deref` で `[f32]` になるので、呼び出し側は今までどおり
+/// `&mut back` / `&back` / `back[a..b]` と書ける。
+struct PleBack {
+    pin: Option<PlePinBuf>,
+    v: Vec<f32>,
+    len: usize,
+}
+
+impl PleBack {
+    fn as_slice(&self) -> &[f32] {
+        match &self.pin {
+            Some(b) => &b.as_slice()[..self.len],
+            None => &self.v[..self.len],
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        match &mut self.pin {
+            Some(b) => &mut b.as_mut_slice()[..self.len],
+            None => &mut self.v[..self.len],
+        }
+    }
+}
+
+impl std::ops::Deref for PleBack {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for PleBack {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        self.as_mut_slice()
+    }
+}
+
 /// task 300: PLE の res バッファを取る。2 つ目の戻り値が「使い回しか」。
-fn pf_ple_back_take(len: usize) -> (Vec<f32>, bool) {
+fn pf_ple_back_take(len: usize) -> (PleBack, bool) {
     pf_ple_back_take_with(len, pf_ple_reuse_on())
 }
 
 /// task 300: [`pf_ple_back_take`] の実体 (テストから直接叩けるように分けた)。
-fn pf_ple_back_take_with(len: usize, reuse: bool) -> (Vec<f32>, bool) {
+///
+/// task 393: [`pf_ple_pin_on`] のときは pinned の 1 本を使い回す
+/// (`PfHostBuf::new` はスレッド局所の空きリストから借りるので、2 回目以降は
+/// 確保もしない)。返る長さは常に `len` ちょうど。
+fn pf_ple_back_take_with(len: usize, reuse: bool) -> (PleBack, bool) {
+    pf_ple_back_take_pin(len, reuse, pf_ple_pin_on())
+}
+
+/// [`pf_ple_back_take_with`] の本体 (`pinned` を引数にして CPU テストから
+/// 両方の枝を通せるようにした)。
+fn pf_ple_back_take_pin(len: usize, reuse: bool, pinned: bool) -> (PleBack, bool) {
     if !reuse || len == 0 {
-        return (vec![0.0f32; len], false);
+        return (
+            PleBack {
+                pin: None,
+                v: vec![0.0f32; len],
+                len,
+            },
+            false,
+        );
+    }
+    if pinned {
+        let cur = PLE_BACK_PIN.with(|c| c.borrow_mut().take());
+        let buf = match cur {
+            Some(b) if b.len() >= len => b,
+            _ => PlePinBuf::new(len),
+        };
+        return (
+            PleBack {
+                pin: Some(buf),
+                v: Vec::new(),
+                len,
+            },
+            true,
+        );
     }
     let mut v = PLE_BACK_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
     if v.len() < len {
         v.resize(len, 0.0);
     }
     v.truncate(len);
-    (v, true)
+    (
+        PleBack {
+            pin: None,
+            v,
+            len,
+        },
+        true,
+    )
 }
 
 /// task 300: 使い回した res バッファを返す。
-fn pf_ple_back_return(v: Vec<f32>, reused: bool) {
-    if reused {
-        PLE_BACK_BUF.with(|c| *c.borrow_mut() = v);
+fn pf_ple_back_return(b: PleBack, reused: bool) {
+    if !reused {
+        return;
+    }
+    let PleBack { pin, v, len: _ } = b;
+    match pin {
+        Some(buf) => PLE_BACK_PIN.with(|c| *c.borrow_mut() = Some(buf)),
+        None => PLE_BACK_BUF.with(|c| *c.borrow_mut() = v),
     }
 }
 
@@ -25372,6 +25525,17 @@ mod tests {
             assert!(pf_ple_reuse_from_value(Some(" on ")));
             assert!(pf_ple_reuse_from_value(Some("TRUE")));
 
+            // task 393: `DENNO_PF_PLE_PIN` は lab で採ったので既定 on
+            // (明示的な偽値だけ off)。
+            assert!(pf_ple_pin_from_value(None), "未設定が off になった");
+            assert!(pf_ple_pin_from_value(Some("")));
+            for v in ["0", "off", "false", "no"] {
+                assert!(!pf_ple_pin_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_ple_pin_from_value(Some(v)), "{v:?} が off のまま");
+            }
+
             // off: 毎回新しい Vec (長さはちょうど)。
             let (a, r) = pf_ple_back_take_with(8, false);
             assert!(!r);
@@ -25410,6 +25574,42 @@ mod tests {
             let ((k3, v3), r5) = pf_ple_kv_take_with(0, 0, true);
             assert!(!r5);
             assert!(k3.is_empty() && v3.is_empty());
+        }
+
+        /// task 393: pinned の枝 (`DENNO_PF_PLE_PIN`) の契約。
+        ///
+        /// - 返る長さは要求ちょうど (大きいチャンクの後で小さいチャンクが来ても切る)
+        /// - 返却した 1 本を次の take がそのまま使う (同じポインタ)
+        /// - 大きい要求は育つ
+        ///
+        /// このコンテナには CUDA ドライバが無いので `PfHostBuf` は `Vec` に落ちるが、
+        /// 契約 (長さ・使い回し・書き込み) はどちらの実体でも同じ。
+        #[test]
+        fn ple_pin_back_contract() {
+            let (mut a, r) = pf_ple_back_take_pin(8, true, true);
+            assert!(r, "使い回しの印が立っていない");
+            assert_eq!(a.len(), 8);
+            a.fill(3.5);
+            let ptr = a.as_ptr();
+            assert!(a.iter().all(|v| *v == 3.5), "全要素を書けない");
+            pf_ple_back_return(a, true);
+
+            let (mut b, r2) = pf_ple_back_take_pin(4, true, true);
+            assert!(r2);
+            assert_eq!(b.len(), 4, "長さは要求どおりに切り詰める");
+            assert_eq!(b.as_ptr(), ptr, "同じ領域を使い回す");
+            b.fill(0.0);
+            pf_ple_back_return(b, true);
+
+            // 大きい要求は育つ。
+            let (c, r3) = pf_ple_back_take_pin(16, true, true);
+            assert!(r3);
+            assert_eq!(c.len(), 16);
+            pf_ple_back_return(c, true);
+            // reuse=false は使い回さない (毎回新しいバッファ)。
+            let (d, r4) = pf_ple_back_take_pin(4, false, true);
+            assert!(!r4);
+            assert_eq!(d.len(), 4);
         }
 
         /// task 195: 並列版 (`ple_inject_batch_par`) も逐次版とビット一致すること。
