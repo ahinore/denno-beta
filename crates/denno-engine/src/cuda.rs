@@ -15094,14 +15094,16 @@ mod pf_exp_ktc_tests {
         assert!(!ktc_shapes_ok(Some(k0), Some(k0 + 3), true, 0, 1536, 1536, 2560));
     }
 
-    /// ゲートの真理値表 (既定 off・明示的な真値だけ on)。
+    /// ゲートの真理値表 (task 416: lab t416b で採って既定 on。明示的な偽値だけ off)。
     #[test]
-    fn tc_exp_k_gate_is_strictly_opt_in() {
-        use crate::model::exp_pf::tc_exp_k_from_value;
-        assert!(!tc_exp_k_from_value(None));
-        assert!(!tc_exp_k_from_value(Some("")));
+    fn tc_exp_k_gate_defaults_on() {
+        use crate::model::exp_pf::{tc_exp_k_from_value, DEFAULT_TC_EXP_K_ON};
+        assert!(DEFAULT_TC_EXP_K_ON, "既定 off に戻っている");
+        assert!(tc_exp_k_from_value(None));
+        assert!(tc_exp_k_from_value(Some("")));
         assert!(!tc_exp_k_from_value(Some("0")));
         assert!(!tc_exp_k_from_value(Some("off")));
+        assert!(!tc_exp_k_from_value(Some(" false ")));
         assert!(!tc_exp_k_from_value(Some("no")));
         assert!(tc_exp_k_from_value(Some("1")));
         assert!(tc_exp_k_from_value(Some("on")));
