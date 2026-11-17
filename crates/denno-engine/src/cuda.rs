@@ -33451,7 +33451,7 @@ pub fn maybe_gpu_mix_q_chain_into(
         }
         // task 392: この鎖が作った `mixed` (= 次の段の入力 cur) のデバイス
         // コピーを控える。ssm 層の GDN submission が同じバイト列を H2D で
-        // 上げ直さずに読めるようにするため (`DENNO_GDN_X_MIX`、既定 off)。
+        // 上げ直さずに読めるようにするため (`DENNO_GDN_X_MIX`、既定 on)。
         if crate::cuda::gdn_x_mix_on() {
             crate::cuda::gdn_x_in_mix_arm(mdev, e);
         }
@@ -43293,14 +43293,14 @@ mod tests {
         }
     }
 
-    /// task 392: `DENNO_GDN_X_MIX` も既定 off・明示的な真値だけ on。
+    /// task 392: `DENNO_GDN_X_MIX` は既定 on (lab t392c で採否)・明示的な偽値だけ off。
     #[test]
     fn gdn_x_mix_gate_truth_table() {
-        assert!(!gdn_x_mix_from_value(None), "未設定は既定 off");
-        for v in ["", "0", "off", "false", "no", "2", " on?"] {
+        assert!(gdn_x_mix_from_value(None), "未設定は既定 on (lab t392c で採否)");
+        for v in ["0", "off", "false", "no", " OFF ", " False "] {
             assert!(!gdn_x_mix_from_value(Some(v)), "raw={v:?}");
         }
-        for v in ["1", "on", "true", " ON ", " TRUE ", "yes", " YES "] {
+        for v in ["", "1", "on", "true", " ON ", " TRUE ", "yes"] {
             assert!(gdn_x_mix_from_value(Some(v)), "raw={v:?}");
         }
     }
@@ -57525,11 +57525,13 @@ fn gdn_ba_par_join() -> Result<()> {
 // 従来どおり H2D する (fail closed)。
 pub const GDN_X_MIX_ENV: &str = "DENNO_GDN_X_MIX";
 
-/// [`GDN_X_MIX_ENV`] の解釈 (純関数)。**既定 off** (明示的な真値だけ on)。
+/// [`GDN_X_MIX_ENV`] の解釈 (純関数)。**既定 on** (lab t392c で採否 yes)。
+///
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
 fn gdn_x_mix_from_value(v: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
