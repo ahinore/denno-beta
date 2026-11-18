@@ -91,8 +91,8 @@ shared 0.62 / head 0.61 / router 0.17 (合計 11.25、step 11.48)。
   | `dno_mix_upmix_q8_up4x` | 4 | 320 | 640 | `__expf` |
 - PTX は lab の nvcc 12.9 / compute_75 / -fmad=false で生成したもの (t437d の
   `ptx/kernels_mix_up4.ptx`) を commit。検査: **4 entry / 各 8 引数** /
-  `shfl.sync` 6 本 (カーネルごとに xor 1,2 の 2 本) / local メモリ無し /
-  up4 は `fma.rn.f64` 35 本 + `ex2.approx` 0、up4f は逆 (0 / 9)。
+  `shfl.sync` は 1 カーネル 2 本 (xor 1,2) x 4 = **8 本** / local メモリ無し /
+  up4 と up4w は `fma.rn.f64` 35 本 + `ex2.approx` 0、up4f と up4x は逆 (0 / 9)。
   **commit したファイル = t437d が測ったファイル** (lab が eee52ea5b から再生成した
   ものをそのまま入れ、up4/up4f/up4w のセクションが t437b の生成物とバイト一致な
   ことも確認した。差分は up4x の追加だけ)。
