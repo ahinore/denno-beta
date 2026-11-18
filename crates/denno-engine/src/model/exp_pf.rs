@@ -2110,13 +2110,18 @@ pub const PLE_THREADS_ENV: &str = "DENNO_PF_PLE_THREADS";
 /// pread はカーネル内で待つので、128 本でも CPU は遊んでいる。
 pub const DEFAULT_PLE_THREADS: usize = 128;
 
-/// [`PLE_THREADS_ENV`] の解釈 (純関数)。1..=128 に丸める。未設定・解析不能は既定。
+/// [`PLE_THREADS_ENV`] の解釈 (純関数)。1..=512 に丸める。未設定・解析不能は既定。
+///
+/// task 423: 上限を 128 から **512** に上げた。gather は 90 B の pread が
+/// カーネル内で待つ形で、本数 (`task 357`: 32 本 681 ms / 64 本 488 / 96 本 425、
+/// `task 419`: 128 本 381-415) を増やすほど単調に縮んでいる。128 本は
+/// デバイスのキューが埋まった値ではなく、コード側の丸めだった。
 pub fn ple_threads_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_PLE_THREADS;
     };
     match s.parse::<usize>() {
-        Ok(n) if n > 0 => n.min(128),
+        Ok(n) if n > 0 => n.min(512),
         _ => DEFAULT_PLE_THREADS,
     }
 }
@@ -2195,6 +2200,38 @@ pub fn embed_ovl_from_value(v: Option<&str>) -> bool {
 pub fn embed_ovl() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| embed_ovl_from_value(std::env::var(EMBED_OVL_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_PLE_LJOIN`: 背景に出す PLE の gather を **層ループの PLE 層まで
+/// 待たない** (task 423)。
+///
+/// 層優先 prefill は埋め込みの裏で gather を走らせる (`DENNO_PF_EMBED_OVL`) が、
+/// 層ループへ入る**前に join** していた。gather は 90 B の pread が IOPS 律速で
+/// 14k で約 390 ms / 3,826 で約 170 ms かかり、その待ちが丸ごと GPU の遊びになる。
+/// PLE 層は層 1 で、行を使うのはその層の入口だけなので、join をそこまで遅らせると
+/// 層 0 の 1 層ぶん (14k で約 110 ms / 3,826 で約 45 ms) が gather と重なる。
+/// 読む行・綴じ方は変えない (値はビット一致)。
+///
+/// `DENNO_PF_EMBED_OVL` が off のとき (背景スレッドが居ないとき) は効かない。
+pub const PLE_LJOIN_ENV: &str = "DENNO_PF_PLE_LJOIN";
+
+/// [`PLE_LJOIN_ENV`] の既定値。
+///
+/// **off** (未測定。lab で採ってから既定にする)。
+pub const DEFAULT_PLE_LJOIN: bool = false;
+
+/// [`PLE_LJOIN_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+pub fn ple_ljoin_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1") | Some("on") | Some("true") | Some("yes") => true,
+        _ => DEFAULT_PLE_LJOIN,
+    }
+}
+
+/// PLE の gather を層ループの PLE 層まで待たないか (プロセスで 1 回だけ env を読む)。
+pub fn ple_ljoin() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ple_ljoin_from_value(std::env::var(PLE_LJOIN_ENV).ok().as_deref()))
 }
 
 /// パート番号ごとの読み口 (pread 経路だけが使う)。
@@ -3694,6 +3731,22 @@ mod tests {
         assert!(DEFAULT_EMBED_OVL);
     }
 
+    /// task 423: `DENNO_PF_PLE_LJOIN` は既定 off、明示的な真値だけ on。
+    #[test]
+    fn task423_ple_ljoin_gate_truth_table() {
+        assert!(!ple_ljoin_from_value(None), "未設定は既定 (off)");
+        assert!(!ple_ljoin_from_value(Some("")), "空も既定 (off)");
+        assert!(!ple_ljoin_from_value(Some("x")), "解析不能は既定 (off)");
+        assert!(!ple_ljoin_from_value(Some("0")));
+        assert!(!ple_ljoin_from_value(Some("off")));
+        assert!(ple_ljoin_from_value(Some("1")));
+        assert!(ple_ljoin_from_value(Some("on")));
+        assert!(ple_ljoin_from_value(Some(" TRUE ")));
+        assert!(ple_ljoin_from_value(Some("yes")));
+        assert_eq!(PLE_LJOIN_ENV, "DENNO_PF_PLE_LJOIN");
+        assert!(!DEFAULT_PLE_LJOIN, "lab で採るまで既定 off");
+    }
+
     /// task 349 / 353: `DENNO_PF_PLE_PIPE` は既定 on (t353a で採用)、`0` 系だけが偽。
     #[test]
     fn ple_pipe_gate_truth_table() {
@@ -3710,7 +3763,7 @@ mod tests {
         assert!(DEFAULT_PLE_PIPE);
     }
 
-    /// task 357 / 419: `DENNO_PF_PLE_THREADS` の丸めと既定 (128 本)。
+    /// task 357 / 419 / 423: `DENNO_PF_PLE_THREADS` の丸めと既定 (128 本)。
     #[test]
     fn ple_threads_rounds_and_defaults() {
         assert_eq!(ple_threads_from_value(None), 128, "未設定は既定 128");
@@ -3719,7 +3772,9 @@ mod tests {
         assert_eq!(ple_threads_from_value(Some("0")), 128, "0 は既定へ");
         assert_eq!(ple_threads_from_value(Some("64")), 64);
         assert_eq!(ple_threads_from_value(Some(" 32 ")), 32, "切り戻しは 32");
-        assert_eq!(ple_threads_from_value(Some("999")), 128, "上限 128");
+        assert_eq!(ple_threads_from_value(Some("192")), 192, "task 423: 128 超も通す");
+        assert_eq!(ple_threads_from_value(Some("256")), 256);
+        assert_eq!(ple_threads_from_value(Some("999")), 512, "上限 512");
         assert_eq!(PLE_THREADS_ENV, "DENNO_PF_PLE_THREADS");
         assert_eq!(DEFAULT_PLE_THREADS, 128, "task 419 で 128 にした");
     }

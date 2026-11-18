@@ -5281,6 +5281,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             }));
         }
         let mut ples_all: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(ranges.len());
+        // task 423: 背景の gather を層ループの PLE 層まで待つための持越し
+        // (`DENNO_PF_PLE_LJOIN`。off のときは None のまま)。
+        let mut ple_pending: Option<std::thread::JoinHandle<Result<Vec<Vec<Option<Vec<f32>>>>>>> =
+            None;
         for &(start, end) in &ranges {
             let t_emb = prekprof::stamp();
             if embed_par > 1 {
@@ -5318,34 +5322,43 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         }
         if ple_wide {
             // 専用プールの本数がそのまま同時に飛ぶ pread の数になる
-            // (`ple_par_parts` が `DENNO_PF_PLE_THREADS` (既定 96) と
-            // `current_num_threads()` の小さいほうを見る。task 357)。
-            let t_ple = prekprof::stamp();
-            ples_all = match ple_bg {
-                // task 415: 背景で読み終わっている (埋め込みと重ねた)。
-                Some(h) => h.join().map_err(|_| one("PLE の先読みスレッドが落ちた"))??,
-                None => {
-                    let ple_threads = crate::model::exp_pf::ple_threads().max(1);
-                    let rt = self.ple.as_ref().map(std::sync::Arc::clone);
-                    let chunk_list: Vec<(usize, usize)> = ranges.to_vec();
-                    let run = || -> Result<Vec<Vec<Option<Vec<f32>>>>> {
-                        let mut out: Vec<Vec<Option<Vec<f32>>>> =
-                            Vec::with_capacity(chunk_list.len());
-                        for &(start, end) in &chunk_list {
-                            out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);
+            // (`ple_par_parts` が `DENNO_PF_PLE_THREADS` (既定 128) と
+            // `current_num_threads()` の小さいほうを見る。task 357 / 419)。
+            //
+            // task 423: `DENNO_PF_PLE_LJOIN` では背景の gather を**ここで待たない**。
+            // 待つ場所は下の層ループの PLE 層の入口 (層 0 の 1 層ぶんが重なる)。
+            let mut bg = ple_bg;
+            if bg.is_some() && crate::model::exp_pf::ple_ljoin() {
+                ple_pending = bg.take();
+            }
+            if bg.is_some() || ple_pending.is_none() {
+                let t_ple = prekprof::stamp();
+                ples_all = match bg {
+                    // task 415: 背景で読み終わっている (埋め込みと重ねた)。
+                    Some(h) => h.join().map_err(|_| one("PLE の先読みスレッドが落ちた"))??,
+                    None => {
+                        let ple_threads = crate::model::exp_pf::ple_threads().max(1);
+                        let rt = self.ple.as_ref().map(std::sync::Arc::clone);
+                        let chunk_list: Vec<(usize, usize)> = ranges.to_vec();
+                        let run = || -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+                            let mut out: Vec<Vec<Option<Vec<f32>>>> =
+                                Vec::with_capacity(chunk_list.len());
+                            for &(start, end) in &chunk_list {
+                                out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);
+                            }
+                            Ok(out)
+                        };
+                        match rayon::ThreadPoolBuilder::new()
+                            .num_threads(ple_threads)
+                            .build()
+                        {
+                            Ok(p) => p.install(run)?,
+                            Err(_) => run()?,
                         }
-                        Ok(out)
-                    };
-                    match rayon::ThreadPoolBuilder::new()
-                        .num_threads(ple_threads)
-                        .build()
-                    {
-                        Ok(p) => p.install(run)?,
-                        Err(_) => run()?,
                     }
-                }
-            };
-            prekprof::mark(t_ple, prekprof::PLE);
+                };
+                prekprof::mark(t_ple, prekprof::PLE);
+            }
         }
         // task 233: デバイス経路を諦めたときだけ要るホストの控え (普段は確保しない)。
         let mut mixed_buf: Option<PfHostBuf> = None;
@@ -5396,6 +5409,13 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
                 // 1.1 PLE 注入 (層 1 のみ)。ホストで回すので、この層だけ往復する。
                 if let Some(pw) = &lw.ple {
+                    // task 423: `DENNO_PF_PLE_LJOIN` では背景の gather をここで待つ
+                    // (層 0 の 1 層ぶんが gather と重なる)。待ちは台帳の `ple` に積む。
+                    if let Some(h) = ple_pending.take() {
+                        let t_ple = prekprof::stamp();
+                        ples_all = h.join().map_err(|_| one("PLE の先読みスレッドが落ちた"))??;
+                        prekprof::mark(t_ple, prekprof::PLE);
+                    }
                     // task 300: `DENNO_PF_PLE_REUSE` では res の往復バッファを使い回す。
                     let (mut back, back_reused) = pf_ple_back_take(nt * hc_dim);
                     if !crate::cuda::pf_download_res(&mut back) {
