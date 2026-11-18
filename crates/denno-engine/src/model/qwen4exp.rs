@@ -5166,6 +5166,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let mut evicted: Vec<crate::model::expert_cache::ExpertKey> = Vec::new();
         // task 250: 作業域の外部予約 (`DENNO_PF_LM_RESERVE=1`)。層ループの間だけ持つ。
         let mut reserve_guard: Option<crate::model::expert_vram::ExternalReserve> = None;
+        // task 419: 層ループ入口の確保と追い出し階段を分けて数える (診断)。
+        let sub_setup = q4ledger::sub(q4ledger::SUB_PF_SETUP);
         {
             let k = self.p.n_expert_used;
             let ff = self.p.n_ff_exp;
@@ -5240,6 +5242,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             Self::pf_note_decline("活性の置き場を確保できない");
             return Ok(None);
         }
+        drop(sub_setup);
         let ple_batch = ple_batch_enabled();
         // 埋め込みと PLE は層ループの外で 1 回だけ (全トークン)。
         // task 415: 埋め込みは**行独立**なので N 本で引ける (`DENNO_PF_EMBED_PAR`)。
@@ -5373,6 +5376,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             // ---- 1. 全チャンクの mix / attn / ssm ----
             for (ci, &(start, end)) in ranges.iter().enumerate() {
                 let nt = end - start;
+                // task 419: 1 回転のうち名前付き区間に入らない時間を測る (診断)。
+                let t_iter = q4ledger::iter_begin();
                 // 残差をデバイスへ (層 0 はホストの初期値、それ以降は退避域から)。
                 if il == 0 {
                     if !crate::cuda::pf_upload_res(&res_all[start * hc_dim..end * hc_dim]) {
@@ -5497,6 +5502,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
                 q4prof::add(&q4prof::MIX, t_mix);
                 let mixed_attn: &[f32] = &attn_buf.as_slice()[..nt * e];
+                // task 419: attn 入口の切り替え (誰の区間でもない) を分けて数える。
+                let sub_attnpre = q4ledger::sub(q4ledger::SUB_PF_ATTPRE);
                 let attn_dev = flat_attn && pf_attn_devres_on() && roles.is_none();
                 let curs: Vec<Vec<f32>> = if flat_attn {
                     Vec::new()
@@ -5506,6 +5513,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 let t_attn = std::time::Instant::now();
                 crate::cuda::pf_attn_dev_clear();
                 crate::cuda::pf_attn_dev_request(attn_dev);
+                drop(sub_attnpre);
                 let flat_outs = {
                     let item = if q4ledger::enabled() {
                         match self.p.layer_kind(il) {
@@ -5587,6 +5595,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 if !crate::cuda::pf_res_park_save(ci, nt, hc, e) {
                     Self::pf_bail("res の退避に失敗")?;
                 }
+                q4ledger::iter_end(t_iter);
             }
             // ---- 2. 層で 1 回の MoE (expert 重みはここでしか運ばれない) ----
             let t_moe = std::time::Instant::now();
@@ -5741,6 +5750,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             eprintln!("[pf-lm-dbg] layers={n_layer} fallback={lm_fallback}");
         }
         // task 233: 置き場と MoE の作業域 (14k で合計 約 3.5 GB) を decode に返す。
+        // task 419: 後片付け (解放・返却・追い出した expert の戻し) を分けて数える。
+        let sub_td = q4ledger::sub(q4ledger::SUB_PF_TEARDOWN);
         crate::cuda::pf_lm_release();
         crate::cuda::pf_scratch_drop();
         crate::cuda::pf_release();
@@ -5783,6 +5794,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         if steer_rec {
             steer::merge_device();
         }
+        drop(sub_td);
         let mut ress: Vec<HyperStreams> = Vec::with_capacity(lnt);
         for t in 0..lnt {
             ress.push(HyperStreams {
@@ -17281,10 +17293,21 @@ fn moe_experts_iq_pf_batch(
         }
         // task 309: 行の少ない expert は CPU に残す (重み 1 本 3 MB の転送が
         // 計算より高い)。K 系のときだけ (IQ 系の既存の挙動は変えない)。
-        let min_rows = crate::model::exp_pf::k_min_rows();
-        let split = !iq_expert_mode(lw)
-            && crate::model::exp_pf::k_enabled()
-            && min_rows > 0
+        // task 419: IQ 系にも同じ床を置けるようにした (`DENNO_PF_EXP_IQ_MIN_ROWS`。
+        // 既定 0 = 従来どおり IQ は全部上げる)。既定モデルの expert は IQ 系の
+        // 混在なので、行が少ない expert の 2 MB を上げるか CPU で回すかを選べる。
+        let iq_mode = iq_expert_mode(lw);
+        let min_rows = if iq_mode {
+            crate::model::exp_pf::iq_min_rows()
+        } else {
+            crate::model::exp_pf::k_min_rows()
+        };
+        let floor_on = if iq_mode {
+            min_rows > 0
+        } else {
+            crate::model::exp_pf::k_enabled() && min_rows > 0
+        };
+        let split = floor_on
             && by_expert.iter().any(|p| {
                 !p.is_empty() && !crate::model::exp_pf::k_expert_pays(p.len(), min_rows)
             });
