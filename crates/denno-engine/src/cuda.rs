@@ -39723,9 +39723,35 @@ pub(crate) fn fdec_tile_from_kernel(k: Q4AttnKernel) -> bool {
     }
 }
 
-/// task 448: タイル版で回すか (`DENNO_Q4_GPU_ATTN_KERNEL`)。
+/// task 448: タイル版の on/off の **新しい env** (`DENNO_ATTN_FLASHDEC2`)。
+///
+/// 純関数。未設定・空は `None` (カーネル選択に委ねる)。lab の COND は新しい env 名
+/// でも届くが、既存名 (`DENNO_Q4_GPU_ATTN_KERNEL`) の上書きは届かない回があった
+/// (t448a では `tile` が効かず v1 が走った) ので、A/B はこちらで取る。
+pub(crate) fn fdec_tile_from_env(v: Option<&str>) -> Option<bool> {
+    let t = v?.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    match t.as_str() {
+        "1" | "on" | "tile" | "true" | "yes" => Some(true),
+        _ => Some(false),
+    }
+}
+
+/// `DENNO_ATTN_FLASHDEC2` の実値 (1 回だけ読む)。
+fn attn_fdec_tile_env() -> Option<bool> {
+    static V: OnceLock<Option<bool>> = OnceLock::new();
+    *V.get_or_init(|| fdec_tile_from_env(std::env::var("DENNO_ATTN_FLASHDEC2").ok().as_deref()))
+}
+
+/// task 448: タイル版で回すか (`DENNO_ATTN_FLASHDEC2` が優先、未設定なら
+/// `DENNO_Q4_GPU_ATTN_KERNEL`)。
 fn attn_fdec_tile_on() -> bool {
-    fdec_tile_from_kernel(q4_gpu_attn_kernel())
+    match attn_fdec_tile_env() {
+        Some(b) => b,
+        None => fdec_tile_from_kernel(q4_gpu_attn_kernel()),
+    }
 }
 
 /// タイル版のカーネル 1 本。読み込み失敗は `None` を焼き付ける (v1 へ落ちる)。
@@ -39783,9 +39809,23 @@ fn fdt_kernels() -> Option<&'static FdtKernels> {
                 return None;
             }
         }
-        Some(FdtKernels { _module: module, f_t })
+        let k = FdtKernels { _module: module, f_t };
+        fdt_loaded_log();
+        Some(k)
     })
     .as_ref()
+}
+
+/// モジュールが載ったことを 1 回だけログる (発火の証拠。tile 行数と env も出す)。
+fn fdt_loaded_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[attn-fdec2] PTX ok: dno_attn_flashdec_t nargs={} tile={} (DENNO_ATTN_FLASHDEC2)",
+            FDT_NARGS,
+            attn_fdec_tile()
+        );
+    });
 }
 
 /// タイル版の分割・tile を 1 回だけログる (発火の証拠。tile か n_split が
@@ -63478,6 +63518,18 @@ mod task448_tests {
         set_q4_gpu_attn_kernel_for_test(Some(Q4AttnKernel::Fdec1));
         assert!(!attn_fdec_tile_on(), "FORCE fdec1 が効いていない");
         set_q4_gpu_attn_kernel_for_test(None);
+
+        // 新しい env (`DENNO_ATTN_FLASHDEC2`) の真理値表。未設定・空は None
+        // (カーネル選択に委ねる)、それ以外は on/off を明示する。
+        assert_eq!(fdec_tile_from_env(None), None);
+        assert_eq!(fdec_tile_from_env(Some("")), None);
+        assert_eq!(fdec_tile_from_env(Some("  ")), None);
+        for v in ["1", "on", "tile", "true", "yes", " ON "] {
+            assert_eq!(fdec_tile_from_env(Some(v)), Some(true), "{v:?} が on でない");
+        }
+        for v in ["0", "off", "false", "no", "v1", "x"] {
+            assert_eq!(fdec_tile_from_env(Some(v)), Some(false), "{v:?} が off でない");
+        }
     }
 
     /// tile 行数の解釈 (既定 16・4..=64 に丸め)。
