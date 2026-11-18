@@ -10835,11 +10835,11 @@ fn task286_mix_gemv_v5_is_wired() {
         CUDA_RS.contains("let (mut rows, mut lanes) = (plan.rows_per_block as c_int, plan.lanes as c_int);"),
         "launch_mix_v5 が rows/lanes を渡していない"
     );
-    // 既定は task 418 で down だけ dn5、up は v5。`v5` / `1` / `both` で
+    // 既定は task 422 で down だけ dn6、up は v5。`v5` / `1` / `both` で
     // v5 両方向 (task 286 の形) へ戻せる。
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::Dn5, MixGemv::V5),"),
-        "既定が (Dn5, V5) になっていない"
+        CUDA_RS.contains("_ => (MixGemv::Dn6, MixGemv::V5),"),
+        "既定が (Dn6, V5) になっていない"
     );
     assert!(
         CUDA_RS.contains("Some(\"1\") | Some(\"both\") | Some(\"v5\") => (MixGemv::V5, MixGemv::V5),"),
@@ -12373,9 +12373,10 @@ fn task418_mix_dn5_kernel_is_wired() {
         CUDA_RS.contains("Some(\"dn5\") | Some(\"d5\") => (MixGemv::Dn5, MixGemv::V5),"),
         "ゲートの解釈が無い"
     );
+    // task 422: 既定は dn6 になったので、dn5 は明示したときだけ (切り戻し段)。
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::Dn5, MixGemv::V5),"),
-        "既定が (Dn5, V5) になっていない"
+        CUDA_RS.contains("_ => (MixGemv::Dn6, MixGemv::V5),"),
+        "既定が dn6 になっていない"
     );
     // 形の門番と launch (block = 32 * warps)。
     assert!(CUDA_RS.contains("pub fn mix_dn5_warps(n_in: usize) -> Option<usize> {"));
@@ -12456,6 +12457,12 @@ fn task422_mix_dn6_kernel_is_wired() {
         CUDA_RS.contains("pub(crate) fn gdn_dec_gemv_dn6_on() -> bool {"),
         "GDN の dn6 判定が無い"
     );
+    // task 422: GDN の既定も dn6 (lab t422c で ssm -19%。切り戻しは v5)。
+    assert!(
+        CUDA_RS.contains("const GDN_DEC_GEMV_DN6_DEFAULT: bool = true;"),
+        "GDN の既定が dn6 でない"
+    );
+    assert!(CUDA_RS.contains("GDN_DEC_GEMV_DN6_DEFAULT"), "既定の分岐が無い");
     assert_eq!(
         CUDA_RS.matches("match gdn_dn6_plan(").count(),
         2,

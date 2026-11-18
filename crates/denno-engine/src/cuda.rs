@@ -1613,10 +1613,19 @@ pub(crate) mod dec_kprof {
         /// 合わない単位は v4 へ落ちるので、既定は「v5 を試す」でよい。
         #[test]
         fn gdn_dec_gemv_parse_truth_table() {
-            // 未設定・空・未知の値は既定 (v5)。
+            // task 422: 未設定・空・未知の値は既定 (dn6。rows は 2)。
             for raw in [None, Some(""), Some("  "), Some("x")] {
-                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::V5, "raw={raw:?}");
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Dn6, "raw={raw:?}");
             }
+            assert_eq!(gdn_dn6_rows_from_value(None), 2, "既定は 2 行");
+            assert_eq!(gdn_dn6_rows_from_value(Some("dn6r4")), 4);
+            assert_eq!(gdn_dn6_rows_from_value(Some("dn6r6")), 6);
+            // dn6 の値は全部 Dn6 へ (rows だけが変わる)。
+            for raw in ["dn6", "d6", "dn6r1", "dn6r2", "dn6r4", "dn6r6"] {
+                assert_eq!(parse_gdn_dec_gemv(Some(raw)), GdnDecGemv::Dn6, "raw={raw:?}");
+            }
+            // dn6 のときも v5 の計画は生かす (形が合わない単位の受け皿)。
+            assert!(gdn_dec_gemv_v5_on());
             // 明示 off は v5 以前の既定 = v4。
             for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
                 assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::V4, "raw={raw:?}");
@@ -6452,6 +6461,16 @@ enum GdnDecGemv {
 /// その層は v4 のまま (53.6 us で不変)。戻すのは `DENNO_GDN_DEC_GEMV=v4`。
 const GDN_DEC_GEMV5_DEFAULT: bool = true;
 
+/// task 422: GDN の qkv/out の既定を dn6 (1 ブロック 2 行 / 1 レーン 1 対) にする。
+///
+/// lab t422c (8aed5bd7b、depth8k、既定モデル) の同じ run の対で、`DENNO_MIX_QK`
+/// の既定 (dn6) に重ねて **ssm 段 3.40 (base / base2 とも) -> 2.75 (-19%)**、
+/// 短い decode 12.5 -> 12.0 (-4.0%)、14k 後 14.2 -> 13.8、md5 は全 SAME。
+/// ただしこの値は **1 ラウンド (t422c) だけ**の実測で、rows=6 は t422b で悪化
+/// (+2.1%、ssm 3.39 -> 3.65) だった。カーネル自体 (mix の down) は t422b/t422c の
+/// 2 ラウンドで採っている。戻すのは `DENNO_GDN_DEC_GEMV=v5`。
+const GDN_DEC_GEMV_DN6_DEFAULT: bool = true;
+
 /// `DENNO_GDN_DEC_GEMV` の解釈 (未設定・空・`0`/`off` は既定 = v4)。
 fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
@@ -6461,7 +6480,7 @@ fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
         Some("v4") => GdnDecGemv::V4,
         Some("v5") => GdnDecGemv::V5,
         // task 422: dn6 (1 ブロック rows 行 / 1 レーン 1 対)。rows は
-        // `gdn_dn6_rows_from_value` が決める (既定 6 = block 960)。
+        // `gdn_dn6_rows_from_value` が決める (既定 2。t422c で rows=2 が最良)。
         Some("dn6") | Some("d6") | Some("dn6r1") | Some("dn6r2") | Some("dn6r4")
         | Some("dn6r6") | Some("d6r1") | Some("d6r2") | Some("d6r4") | Some("d6r6") => {
             GdnDecGemv::Dn6
@@ -6469,7 +6488,9 @@ fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
         // 明示 off は「v5 以前の既定」= v4 (task 179 の既定)。
         Some("0") | Some("off") | Some("false") | Some("no") => GdnDecGemv::V4,
         _ => {
-            if GDN_DEC_GEMV5_DEFAULT {
+            if GDN_DEC_GEMV_DN6_DEFAULT {
+                GdnDecGemv::Dn6
+            } else if GDN_DEC_GEMV5_DEFAULT {
                 GdnDecGemv::V5
             } else {
                 GdnDecGemv::Default
@@ -6524,10 +6545,10 @@ pub(crate) fn gdn_dec_gemv_dn6_on() -> bool {
 pub fn gdn_dn6_rows_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("dn6r1") | Some("d6r1") => 1,
-        Some("dn6r2") | Some("d6r2") => 2,
         Some("dn6r4") | Some("d6r4") => 4,
         Some("dn6r6") | Some("d6r6") => 6,
-        _ => 6,
+        // task 422: 既定 (未設定 / dn6 / それ以外) は 2 行 (t422c で rows=2 が最良)。
+        _ => 2,
     }
 }
 
@@ -44603,8 +44624,10 @@ mod tests {
     /// `0` で旧 GEMV に戻り、`down` / `up` / `seg` で向きごとに選べる。
     #[test]
     fn mix_qk_gate_defaults_on() {
-        // task 418: 既定は down だけ dn5 (lab t418b で採否)、up は v5。
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn5, MixGemv::V5), "未設定が既定");
+        // task 422: 既定は down だけ dn6 (lab t422b で採否)、up は v5。
+        // dn5 (task 418) は `DENNO_MIX_QK=dn5` で選ぶ切り戻し段。
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5), "未設定が既定");
+        assert_eq!(mix_qk_from_value(Some("dn5")), (MixGemv::Dn5, MixGemv::V5));
         // task 286 の形 (両方向 v5) へは明示的に戻す。
         assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::V5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some(" both ")), (MixGemv::V5, MixGemv::V5));
@@ -44801,9 +44824,9 @@ mod tests {
         assert_eq!(mix_dn6_rows_from_value(Some("dn5")), 2);
         // GDN の qkv/out の既定は 6 行 (block 960)。
         assert_eq!(gdn_dn6_rows_from_value(Some("dn6r1")), 1);
-        assert_eq!(gdn_dn6_rows_from_value(Some("dn6r4")), 4);
-        assert_eq!(gdn_dn6_rows_from_value(Some("dn6")), 6);
-        assert_eq!(gdn_dn6_rows_from_value(None), 6);
+        assert_eq!(gdn_dn6_rows_from_value(Some("dn6r6")), 6);
+        assert_eq!(gdn_dn6_rows_from_value(Some("dn6")), 2);
+        assert_eq!(gdn_dn6_rows_from_value(None), 2);
         // warp 数 = ceil(np / 32) (dn5 の np/32 と違い、割り切れない形も載る)。
         assert_eq!(mix_dn6_warps(10240), Some(5), "対 160 -> 5 warp");
         assert_eq!(mix_dn6_warps(5120), Some(3), "対 80 -> ceil(80/32) = 3");
