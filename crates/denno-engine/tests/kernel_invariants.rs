@@ -10835,10 +10835,15 @@ fn task286_mix_gemv_v5_is_wired() {
         CUDA_RS.contains("let (mut rows, mut lanes) = (plan.rows_per_block as c_int, plan.lanes as c_int);"),
         "launch_mix_v5 が rows/lanes を渡していない"
     );
-    // 既定は v5 両方向、`blk` で task 282 の形へ戻せる。
+    // 既定は task 418 で down だけ dn5、up は v5。`v5` / `1` / `both` で
+    // v5 両方向 (task 286 の形) へ戻せる。
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::V5, MixGemv::V5),"),
-        "既定が v5 になっていない"
+        CUDA_RS.contains("_ => (MixGemv::Dn5, MixGemv::V5),"),
+        "既定が (Dn5, V5) になっていない"
+    );
+    assert!(
+        CUDA_RS.contains("Some(\"1\") | Some(\"both\") | Some(\"v5\") => (MixGemv::V5, MixGemv::V5),"),
+        "v5 両方向への切り戻しが無い"
     );
     assert!(
         CUDA_RS.contains("Some(\"blk\") | Some(\"r8\") => (MixGemv::Blk, MixGemv::R8)"),
@@ -12332,7 +12337,7 @@ fn task407_gdn_tc1_gate_is_wired() {
 /// (`DENNO_MIX_QK=dn5`、既定 off) の配線。
 ///
 /// 見るもの: `.cu` とホストの定数 (名前 / 引数 6 本 / warp の上限) が一致 /
-/// 起動形が grid = n_out・block = 32 * warps / ゲートの既定は v5 のまま /
+/// 起動形が grid = n_out・block = 32 * warps / 既定は (Dn5, V5) /
 /// build_ptx.sh の target / targets_all に足してある (末尾は動かさない) /
 /// 収録済みの PTX があるなら entry と引数の数が一致。
 #[test]
@@ -12369,8 +12374,8 @@ fn task418_mix_dn5_kernel_is_wired() {
         "ゲートの解釈が無い"
     );
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::V5, MixGemv::V5),"),
-        "既定を v5 から動かしている"
+        CUDA_RS.contains("_ => (MixGemv::Dn5, MixGemv::V5),"),
+        "既定が (Dn5, V5) になっていない"
     );
     // 形の門番と launch (block = 32 * warps)。
     assert!(CUDA_RS.contains("pub fn mix_dn5_warps(n_in: usize) -> Option<usize> {"));
