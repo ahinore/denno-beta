@@ -161,6 +161,16 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_GEMV_V5_PTX",
         on: crate::cuda::mix_qk_gate_on,
     },
+    // task 418: mix の down の既定は **dn5** (1 ブロック 1 行、lab t418b で採否)。
+    // PTX が欠けると `mix_dn5_warps` の門番で v5 へ静かに落ちる (遅い) ので台帳に
+    // 載せる。up 側は v5 (`kernels_moe_v5.ptx`) のままなので、上の行と 2 本立て。
+    GatePtx {
+        env: "DENNO_MIX_QK",
+        ptx: "kernels_mix_dn5.ptx",
+        entries: &["dno_mix_gemv_q8_0_dn5"],
+        path_env: "DENNO_MIX_DN5_PTX",
+        on: crate::cuda::mix_qk_gate_on,
+    },
     // task 382: mix の silu + up (Q8_0) + hc_mixed を 1 本に畳む版 (既定 on、
     // lab t382b で採否 yes)。PTX が欠けると静かに従来の 3 本経路へ落ちる (遅い) ので
     // 台帳に載せる。`DENNO_MIX_UPQ8=check` は比較モードで、これも融合版の PTX を使う。
