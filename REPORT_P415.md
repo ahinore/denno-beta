@@ -4,9 +4,10 @@ ADOPT: yes t415b t415c
 
 branch `br415` = 開始時の `int-auto` `ff1a1eccb` (**br411 は merge していない**: 中身は
 `DENNO_PF_LM_PIPE` の既定 off のゲートと切り出しだけで `ADOPT: no`。この task の変更は
-それを必要としない)。作業中に int-auto は `ad1cfe1b5` (merge: br420 = UD-Q4_K_XL の
-14k cold -23%) へ動いたので終端で merge した (衝突なし。br420 は `exp_pf.rs` /
-`qwen4exp.rs` も触っているが、こちらは層ループ前の埋め込みだけ)。
+それを必要としない)。作業中に int-auto は 2 回動いた: `ad1cfe1b5` (merge: br420 =
+UD-Q4_K_XL の 14k cold -23%) と `c5bfab6f9` (merge: br418 = mix down の dn5 カーネル)。
+どちらも終端で merge した (br420 は衝突なし。br418 は `kernel_invariants.rs` の末尾だけ
+衝突 = 両側がテストを追記 -> 両方残した)。
 
 数値はすべて GPU ラボの実測 (`SCENARIO=depth8k`、`PROFILE=1`、`model=flash-next-UD-IQ3_XXS`、
 `ptx=none`)。lab 名と測った SHA:
@@ -178,18 +179,20 @@ page cache を COND ごとに落として**位置効果を消した** A/B (task 
 
 ## 5. テスト
 
-int-auto `ad1cfe1b5` を merge した後の最終 HEAD で:
+int-auto `c5bfab6f9` (merge: br418) を merge した後の最終 HEAD で:
 
 ```
 CARGO_TARGET_DIR=/tmp/t415 cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1
-  -> 1300 passed / 0 failed / 103 ignored
+  -> 1302 passed / 0 failed / 103 ignored
 CARGO_TARGET_DIR=/tmp/t415 cargo test --release -p denno-engine --features cuda --test kernel_invariants
-  -> 121 passed / 0 failed
+  -> 122 passed / 0 failed (task 415 の 1 本 + br418 の 1 本を含む)
 CARGO_TARGET_DIR=/tmp/t415-nocuda cargo build --workspace --release            (cuda feature 無し)
   -> ok
 CARGO_TARGET_DIR=/tmp/t415-nocuda CUDA_VISIBLE_DEVICES=-1 cargo test --workspace --release -- --test-threads=1
   -> §5.1
 ```
+
+merge の衝突は `kernel_invariants.rs` の末尾だけ (両側がテストを追記)。両側を残した。
 
 追加した 4 本:
 - `task415_embed_rows_into_matches_serial` (lib) — Q8_0 / F32 / F16 で、本数 0/1/2/4 の
@@ -217,8 +220,15 @@ CARGO_TARGET_DIR=/tmp/t415-nocuda cargo build --workspace --release
   -> ok
 CARGO_TARGET_DIR=/tmp/t415-nocuda CUDA_VISIBLE_DEVICES=-1 \
   cargo test --workspace --release -- --test-threads=1
-  -> 63 スイート / 1,474 passed / 0 failed (exit 0)
+  -> 1 回目: 1 本だけ落ちた
+     denno-server --test admit_error_message :: all_slots_busy_returns_429_with_capacity_message
+     ("応答が返らない: Elapsed" / このスイートが 274.5 s かかった)
+  -> 単体で再実行: 7 passed / 0 failed (45.0 s)
+  -> 2 回目 (workspace 全体): 63 スイート / 1,475 passed / 0 failed (exit 0)
 ```
+このタスクの変更は engine の prefill 経路 (層ループ前の埋め込み) だけで、
+denno-server の受理制御は触っていない。全体実行の負荷でスロット待ちの
+タイムアウトが 1 本出た **flaky** と判断した (P411 の `slot_leak` と同じ扱い)。
 
 ## 6. 分かったこと (次の担当者へ)
 
