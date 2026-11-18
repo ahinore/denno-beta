@@ -69,6 +69,50 @@ Where the time goes, rtx5090 / UD-IQ3_XXS (warm, measured on the development bra
 | Prefill 3,826 | 2.45 s | experts 1.32 s (1.09 s waiting for uploads) / ssm 0.62 / other (PLE etc.) 0.24 / mix 0.14 / full attention 0.14 |
 | Prefill 14k | 6.44 s | ssm 2.61 s / experts 1.88 / other 1.05 / full attention 0.88 |
 
+### RTX 3080 10 GB (Docker on WSL2 on Windows, measured 2026-11-18)
+
+To see how far a 10 GB GPU gets, the same procedure as above (two short questions, 3,826 tokens, 14,018 tokens) was run in Docker on WSL2 on Windows. The output md5 of the two short requests, the 3,826 and the 14k all match the rtx5090.
+
+Hardware:
+
+| Item | Details |
+|---|---|
+| GPU | GeForce RTX 3080 10 GB (Ampere, sm_86), PCIe Gen4 x16 |
+| CPU | Core i9-13900K (8 P-cores + 16 E-cores) |
+| RAM | DDR4-3200 32 GB × 2 = 64 GB (56 GB given to WSL2) |
+| Motherboard | ASUS TUF GAMING B660-PLUS WIFI D4 |
+| Storage | Samsung 970 EVO Plus 2 TB (NVMe), holding the WSL2 virtual disk and the weights |
+
+Software:
+
+| Item | Details |
+|---|---|
+| Windows | Windows 11 Pro (build 26300), NVIDIA driver 617.42 |
+| WSL | WSL 3.0.5, kernel 6.18.58.1-microsoft-standard-WSL2, Ubuntu 24.04.5 LTS |
+| `.wslconfig` | `memory=56GB`, `processors=24` |
+| Docker | Docker Engine 29.9.3 (inside WSL), NVIDIA Container Toolkit 1.20.1, `docker run --gpus all --ipc=host` |
+| Build and run image | `nvidia/cuda:12.9.1-devel-ubuntu22.04` (nvcc 12.9.86) + Rust 1.99.0 |
+| Code | `ad1cfe1b5` on the development branch int-auto (newer than this README commit, not yet published) |
+| Weights | UD-IQ3_XXS (78 GB), on ext4 inside WSL |
+
+What the 3080 needed:
+
+- `crates/denno-engine/kernels/build_ptx.sh` builds 19 PTX files fixed at `compute_90`, which do not load on sm_86. They were rebuilt with `compute_90` replaced by `compute_86`.
+- Prefill needs `DENNO_EXPERT_IQ_GPU=1`. Without it the GPU MoE path is not used and the experts run on the CPU.
+- Decode is the opposite: it was fastest with the experts left on the CPU and `RAYON_NUM_THREADS=8`. With 24 threads it drops to 170 ms/tok (likely because the work spreads onto the E-cores).
+- Every condition used `DENNO_GPU_WEIGHT_MB=5000` and `DENNO_EXPERT_GPU_MIN_HIT=0`.
+
+| Condition | Decode (short chat) | Prefill 3,826 tokens | Prefill 14,018 tokens |
+|---|---|---|---|
+| Experts on the CPU, `RAYON_NUM_THREADS=8` | **116 ms/tok (8.6 tok/s)** | 55–62 s | about 200 s |
+| `DENNO_EXPERT_IQ_GPU=1`, 1,500 MB expert VRAM budget, `RAYON_NUM_THREADS=8` | 145–150 ms/tok | **9.4 s (410 tok/s)** | 36–105 s |
+| Same, 800 MB expert VRAM budget | — | 10.4 s | **27.3 s (510 tok/s)** |
+
+- The 78 GB of weights do not fit in the 56 GB given to WSL, so timings move a lot with what is left in the page cache. Under the same condition the 3,826-token prefill ranged from 9 to 57 s. Bold values are the best warm runs.
+- Only 1.5–2.2 GB of experts fit in VRAM, with a 21–37 % hit rate. The swapping adds about 38 MB of transfer per token, so for decode the GPU expert cache is slower, not faster.
+- Against a nearby rtx5090 build (int-auto `ff1a1ec`: 12.6 ms/tok, 2.38 s for 3,826, 5.98 s for 14k), decode is about 9× slower and prefill about 4–4.6× slower.
+- In the second round with the 800 MB budget, the second-turn md5 differed once (every other run matched). The cause has not been investigated yet.
+
 ### Other models (older measurements)
 
 | Model | Prefill | Decode |
