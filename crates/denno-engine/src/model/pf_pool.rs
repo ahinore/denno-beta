@@ -1107,4 +1107,46 @@ mod tests {
         let base_total = layout(&n).expect("従来").total;
         assert!(choose_big(&n, base_total - 1, DEFAULT_BIG_CHUNK).is_none());
     }
+
+    /// task 420: UD-Q4_K_XL (e = 2560 / k = 10 / ff = 640 / ne = 512) の 14k。
+    ///
+    /// プール計画が g / u を取り (IQ 版の判定) 余白が CPU 経路の 3,072 MiB だと、
+    /// 実空き 2,913 MiB では **1 パスに届かない** (lab t420a の base と同じ 7,009)。
+    /// g / u を取らず (K 版の TC に乗る) 余白が dev 経路の 1,024 MiB なら 1 パス。
+    #[test]
+    fn ud_k_model_one_pass_needs_the_k_tc_plan() {
+        let base = Need {
+            nt_all: 14018,
+            tile: 5120,
+            k: 10,
+            e: 2560,
+            ff: 640,
+            sff: 1024,
+            hc: 4,
+            lr: 256,
+            chunk: 1536,
+            ne: 512,
+            tc: true,
+            stage_bytes: 512 << 20,
+            stage_slots: 3,
+        };
+        let (free, cap) = (2913usize << 20, DEFAULT_POOL_BIG_MB << 20);
+        // 旧: g / u を取り、余白 3,072 MiB (CPU 経路と誤判定)。
+        let old_budget = pool_budget(
+            cap,
+            Some(free),
+            cap,
+            DEFAULT_POOL_RESERVE_CPU_MB << 20,
+        );
+        let (_, t_old, _) =
+            choose_big(&Need { tc: false, ..base }, old_budget, DEFAULT_BIG_CHUNK)
+                .expect("2 パスは収まる");
+        assert_eq!(t_old, 7009, "旧計画は 2 パス (lab t420a の base と同じ)");
+        // 新: g / u を取らず、余白 1,024 MiB (dev 経路)。
+        let new_budget = pool_budget(cap, Some(free), cap, DEFAULT_POOL_RESERVE_MB << 20);
+        let (_, t_new, l_new) = choose_big(&base, new_budget, DEFAULT_BIG_CHUNK)
+            .expect("1 パスが収まる");
+        assert_eq!(t_new, base.nt_all, "新計画は 1 パス");
+        assert!(l_new.total < (4779usize << 20), "作業域も旧の 4,779 MiB より小さい");
+    }
 }
