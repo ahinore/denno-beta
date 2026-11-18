@@ -2110,18 +2110,17 @@ pub const PLE_THREADS_ENV: &str = "DENNO_PF_PLE_THREADS";
 /// pread はカーネル内で待つので、128 本でも CPU は遊んでいる。
 pub const DEFAULT_PLE_THREADS: usize = 128;
 
-/// [`PLE_THREADS_ENV`] の解釈 (純関数)。1..=512 に丸める。未設定・解析不能は既定。
+/// [`PLE_THREADS_ENV`] の解釈 (純関数)。1..=128 に丸める。未設定・解析不能は既定。
 ///
-/// task 423: 上限を 128 から **512** に上げた。gather は 90 B の pread が
-/// カーネル内で待つ形で、本数 (`task 357`: 32 本 681 ms / 64 本 488 / 96 本 425、
-/// `task 419`: 128 本 381-415) を増やすほど単調に縮んでいる。128 本は
-/// デバイスのキューが埋まった値ではなく、コード側の丸めだった。
+/// task 423: 上限を 512 に上げて 256 本を lab t423a で測ったが、`ple_par_parts`
+/// (ple.rs) 側にも 128 の丸めがあり、**ゲートを上げても 128 本のまま**だった
+/// (ple 段 239.8 -> 241.2 ms で差なし)。ここは 128 に戻す。
 pub fn ple_threads_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_PLE_THREADS;
     };
     match s.parse::<usize>() {
-        Ok(n) if n > 0 => n.min(512),
+        Ok(n) if n > 0 => n.min(128),
         _ => DEFAULT_PLE_THREADS,
     }
 }
@@ -2207,24 +2206,33 @@ pub fn embed_ovl() -> bool {
 ///
 /// 層優先 prefill は埋め込みの裏で gather を走らせる (`DENNO_PF_EMBED_OVL`) が、
 /// 層ループへ入る**前に join** していた。gather は 90 B の pread が IOPS 律速で
-/// 14k で約 390 ms / 3,826 で約 170 ms かかり、その待ちが丸ごと GPU の遊びになる。
-/// PLE 層は層 1 で、行を使うのはその層の入口だけなので、join をそこまで遅らせると
-/// 層 0 の 1 層ぶん (14k で約 110 ms / 3,826 で約 45 ms) が gather と重なる。
+/// 14k で約 380 ms / 3,826 で約 200 ms かかり、その待ちが丸ごと GPU の遊びになる。
+/// PLE 層は層 1 で、行を使うのはその層の入口だけなので、join をそこへ移すと
+/// 層 0 の 1 層ぶん (14k で約 140 ms / 3,826 で約 170 ms) が gather と重なる。
+/// 受け渡しは**チャンクごと** (背景スレッドがチャンク順に送り、PLE 層が 1 チャンク
+/// ずつ受ける) なので、層 1 の後半のチャンクは更に待たない。
 /// 読む行・綴じ方は変えない (値はビット一致)。
 ///
-/// `DENNO_PF_EMBED_OVL` が off のとき (背景スレッドが居ないとき) は効かない。
+/// # 実測 (lab t423a / t423b、既定モデル、depth8k、全 COND `DROP_CACHE=1`)
+///
+/// `[pre-kprof]` の **ple 段 (join の待ち)**: 14k 378.8 / 377.8 -> **239.8 / 241.2 ms**
+/// (-37%)、3,826 200.4 / 200.9 -> **27.1 / 37.8 ms** (-85%)。壁は 14k
+/// 6.97 / 6.98 -> **6.88 / 6.86 s** (-1.3 / -1.7%、候補が先に走る対)、
+/// 3,826 8.31 / 8.34 -> 8.32 / 8.30 (同値。3,826 は expert の読みで詰まっており、
+/// gather を層ループへ移すとそのぶん層が伸びる)、decode 12.0 ms/tok 不変、
+/// md5 は全 COND・全 6 文脈で SAME、errors 0、text sane。
+/// **既定 on** (t423c で既定のまま確認)。
 pub const PLE_LJOIN_ENV: &str = "DENNO_PF_PLE_LJOIN";
 
-/// [`PLE_LJOIN_ENV`] の既定値。
-///
-/// **off** (未測定。lab で採ってから既定にする)。
-pub const DEFAULT_PLE_LJOIN: bool = false;
+/// [`PLE_LJOIN_ENV`] の既定値 (on)。
+pub const DEFAULT_PLE_LJOIN: bool = true;
 
-/// [`PLE_LJOIN_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+/// [`PLE_LJOIN_ENV`] の解釈 (純関数)。未設定・空・解析不能は既定 (on)、
+/// `0` 系の明示値だけ off。
 pub fn ple_ljoin_from_value(v: Option<&str>) -> bool {
-    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("1") | Some("on") | Some("true") | Some("yes") => true,
-        _ => DEFAULT_PLE_LJOIN,
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PLE_LJOIN,
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
     }
 }
 
@@ -3731,20 +3739,20 @@ mod tests {
         assert!(DEFAULT_EMBED_OVL);
     }
 
-    /// task 423: `DENNO_PF_PLE_LJOIN` は既定 off、明示的な真値だけ on。
+    /// task 423: `DENNO_PF_PLE_LJOIN` は既定 on (t423a/t423b で採用)、`0` 系だけが偽。
     #[test]
     fn task423_ple_ljoin_gate_truth_table() {
-        assert!(!ple_ljoin_from_value(None), "未設定は既定 (off)");
-        assert!(!ple_ljoin_from_value(Some("")), "空も既定 (off)");
-        assert!(!ple_ljoin_from_value(Some("x")), "解析不能は既定 (off)");
+        assert!(ple_ljoin_from_value(None), "未設定は既定 (on)");
+        assert!(ple_ljoin_from_value(Some("")), "空も既定 (on)");
+        assert!(ple_ljoin_from_value(Some("x")), "解析不能は既定 (on)");
         assert!(!ple_ljoin_from_value(Some("0")));
         assert!(!ple_ljoin_from_value(Some("off")));
+        assert!(!ple_ljoin_from_value(Some(" FALSE ")));
+        assert!(!ple_ljoin_from_value(Some("no")));
         assert!(ple_ljoin_from_value(Some("1")));
         assert!(ple_ljoin_from_value(Some("on")));
-        assert!(ple_ljoin_from_value(Some(" TRUE ")));
-        assert!(ple_ljoin_from_value(Some("yes")));
         assert_eq!(PLE_LJOIN_ENV, "DENNO_PF_PLE_LJOIN");
-        assert!(!DEFAULT_PLE_LJOIN, "lab で採るまで既定 off");
+        assert!(DEFAULT_PLE_LJOIN, "lab t423a/t423b で採ったので既定 on");
     }
 
     /// task 349 / 353: `DENNO_PF_PLE_PIPE` は既定 on (t353a で採用)、`0` 系だけが偽。
@@ -3763,7 +3771,7 @@ mod tests {
         assert!(DEFAULT_PLE_PIPE);
     }
 
-    /// task 357 / 419 / 423: `DENNO_PF_PLE_THREADS` の丸めと既定 (128 本)。
+    /// task 357 / 419: `DENNO_PF_PLE_THREADS` の丸めと既定 (128 本)。
     #[test]
     fn ple_threads_rounds_and_defaults() {
         assert_eq!(ple_threads_from_value(None), 128, "未設定は既定 128");
@@ -3772,9 +3780,7 @@ mod tests {
         assert_eq!(ple_threads_from_value(Some("0")), 128, "0 は既定へ");
         assert_eq!(ple_threads_from_value(Some("64")), 64);
         assert_eq!(ple_threads_from_value(Some(" 32 ")), 32, "切り戻しは 32");
-        assert_eq!(ple_threads_from_value(Some("192")), 192, "task 423: 128 超も通す");
-        assert_eq!(ple_threads_from_value(Some("256")), 256);
-        assert_eq!(ple_threads_from_value(Some("999")), 512, "上限 512");
+        assert_eq!(ple_threads_from_value(Some("999")), 128, "上限 128");
         assert_eq!(PLE_THREADS_ENV, "DENNO_PF_PLE_THREADS");
         assert_eq!(DEFAULT_PLE_THREADS, 128, "task 419 で 128 にした");
     }

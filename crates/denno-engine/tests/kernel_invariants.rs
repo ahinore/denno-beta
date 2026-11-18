@@ -11486,10 +11486,25 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
     );
     // task 415: `DENNO_PF_EMBED_OVL` では同じ gather を背景スレッドで回し、
     // 埋め込みと重ねる (gather 本体もプールも同じ)。
+    // task 423: 受け渡しはチャネル (チャンクごと)。off のときは層ループの前に
+    // 全部受け、`DENNO_PF_PLE_LJOIN` では層ループの PLE 層で 1 チャンクずつ受ける。
     assert!(
-        QWEN_SRC.contains("ples_all = match ple_bg {")
-            && QWEN_SRC.contains("Some(h) => h.join()"),
-        "背景の gather の結果を ples_all へ入れていない"
+        QWEN_SRC.contains("let (tx, rx) = std::sync::mpsc::channel::<PleChunk>();")
+            && QWEN_SRC.contains("if tx.send(r).is_err() || bad {"),
+        "背景の gather がチャンクを送っていない"
+    );
+    assert!(
+        QWEN_SRC.contains("if ple_wide && !ljoin {")
+            && QWEN_SRC.contains("rx.recv().map_err(|_| one(\"PLE の先読みスレッドが落ちた\"))??"),
+        "LJOIN off のときに層ループの前で受けていない"
+    );
+    assert!(
+        QWEN_SRC.contains("let ljoin = ple_ovl && crate::model::exp_pf::ple_ljoin();"),
+        "LJOIN のゲートが配線されていない"
+    );
+    assert!(
+        QWEN_SRC.contains("ples_all.push(chunk_rows);"),
+        "LJOIN on のときに PLE 層でチャンクを受けていない"
     );
     // 値は変えない: 同じ gather 本体を通る。
     assert!(
