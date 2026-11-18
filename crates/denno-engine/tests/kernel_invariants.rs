@@ -12327,3 +12327,71 @@ fn task407_gdn_tc1_gate_is_wired() {
     let tbody = &t[..t.find("\n}\n").expect("本体の終わりが無い")];
     assert!(tbody.contains("None => true"), "TC_GEMM2 の既定を動かしている");
 }
+
+/// task 415: 層優先 prefill の**埋め込み**を N 本で引く経路 (`DENNO_PF_EMBED_PAR`) と、
+/// PLE の gather を背景スレッドへ出して埋め込みと重ねる経路 (`DENNO_PF_EMBED_OVL`)、
+/// および値の契約 (行ごとに `dequant_row_into` をそのまま呼ぶ) を対で固定する。
+///
+/// 埋め込みは層ループの**前**に全トークンぶん直列で走るので、ここが遅いと
+/// GPU が遊んだままになる (`[pre-kprof] embed` が 14k で 112-326 ms)。
+#[test]
+fn task415_embed_par_and_overlap_are_wired() {
+    const LINEAR_RS: &str = include_str!("../src/model/linear_gguf.rs");
+    // 1. ゲートは両方とも既定 off (A/B のため)。名前も固定する。
+    assert!(
+        EXP_PF_SRC.contains("pub const EMBED_PAR_ENV: &str = \"DENNO_PF_EMBED_PAR\";"),
+        "EMBED_PAR の env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const DEFAULT_EMBED_PAR: usize = 0;"),
+        "EMBED_PAR の既定が直列でない"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const EMBED_OVL_ENV: &str = \"DENNO_PF_EMBED_OVL\";"),
+        "EMBED_OVL の env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const DEFAULT_EMBED_OVL: bool = false;"),
+        "EMBED_OVL の既定が on になっている"
+    );
+    let p = fn_body(EXP_PF_SRC, "pub fn embed_par_from_value(");
+    assert!(p.contains("Ok(0) => 0"), "0 を直列として扱っていない");
+    assert!(p.contains(".min(64)"), "本数の上限が無い");
+    let o = fn_body(EXP_PF_SRC, "pub fn embed_ovl_from_value(");
+    assert!(
+        o.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
+        "明示の真値だけ on になっていない"
+    );
+    // 2. 層優先の prefill が (a) ゲートを読み、(b) 並列の引き口を呼び、
+    //    (c) 背景の gather を join し、(d) 直列の従来経路も残していること。
+    let f = fn_body(QWEN4EXP_RS, "fn forward_prefill_batch_resident_lm(");
+    assert!(
+        f.contains("crate::model::exp_pf::embed_par()"),
+        "埋め込みの本数を読んでいない"
+    );
+    assert!(
+        f.contains("crate::model::exp_pf::embed_ovl()"),
+        "重ねるゲートを読んでいない"
+    );
+    assert!(
+        f.contains("crate::model::linear_gguf::embed_rows_into("),
+        "並列の埋め込み引きを呼んでいない"
+    );
+    assert!(
+        f.contains("std::thread::spawn") && f.contains("h.join()"),
+        "PLE の gather を背景へ出して join していない"
+    );
+    assert!(
+        f.contains("self.forward_embed(&ctx[..=i], &hp)?"),
+        "直列の従来経路 (切り戻し) が消えている"
+    );
+    assert!(
+        f.contains("vec![0.0; nt_all * hc_dim]"),
+        "残差の置き場を先に確保していない (並列の書き先が無い)"
+    );
+    // 3. 値の契約: 行ごとに `dequant_row_into` をそのまま呼ぶ (丸めを変えない)。
+    let g = fn_body(LINEAR_RS, "pub fn embed_rows_into(");
+    assert!(g.contains("dequant_row_into("), "行の展開が dequant_row_into でない");
+    assert!(g.contains("par_chunks_mut(hc * e)"), "行を分けていない");
+    assert!(g.contains("for s in 0..hc"), "hc 本への複製が無い");
+}

@@ -980,6 +980,80 @@ impl GgufLinear {
     }
 }
 
+/// task 415: `tokens` の行を f32 へ展開し、`hc` 本に複製して `out` へ書く。
+///
+/// `out.len() == tokens.len() * hc * e` (`e` = `l.k()`)。1 行の展開は
+/// [`dequant_row_into`] をそのまま呼ぶので、直列の [`GgufLinear::dequant_row`] +
+/// `HyperStreams::from_embed` と **ビット一致**する (行は互いに独立)。
+///
+/// 層優先 prefill の埋め込みは 1 トークン 1 回の**直列**ループで、1 行は
+/// 2,100 B (Q6_K) のランダム読み。表がページキャッシュから落ちていると 1 本
+/// 100 us の待ちがトークン数だけ並ぶので、`threads` 本で引けるようにする。
+/// `threads <= 1` は従来と同じ逐次 (プールを作らない)。
+pub fn embed_rows_into(
+    l: &GgufLinear,
+    tokens: &[u32],
+    hc: usize,
+    out: &mut [f32],
+    threads: usize,
+) -> Result<()> {
+    use rayon::prelude::*;
+    let e = l.k();
+    let n = l.n();
+    if hc == 0 || e == 0 || tokens.is_empty() {
+        bail!(
+            "embed_rows_into: 形が 0 (tokens={}, hc={hc}, e={e})",
+            tokens.len()
+        );
+    }
+    let want = tokens
+        .len()
+        .checked_mul(hc)
+        .and_then(|v| v.checked_mul(e))
+        .ok_or_else(|| anyhow::anyhow!("embed_rows_into: out の長さが usize を溢れる"))?;
+    if out.len() != want {
+        bail!(
+            "embed_rows_into: out の長さ {} が tokens {} * hc {hc} * e {e} = {want} と違う",
+            out.len(),
+            tokens.len()
+        );
+    }
+    if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= n) {
+        bail!("embed_rows_into: 行 {bad} が n={n} の範囲外");
+    }
+    let rb = row_bytes_any(l.ty(), e)?;
+    let ty = l.ty();
+    let blocks = l.blocks().as_slice();
+    /// 1 行を引いて `hc` 本に複製する (行の中身は [dequant_row_into] が全部書く)。
+    fn one(ty: GgmlType, blocks: &[u8], rb: usize, e: usize, hc: usize, dst: &mut [f32], tok: u32, row: &mut [f32]) {
+        let j = tok as usize;
+        dequant_row_into(ty, &blocks[j * rb..(j + 1) * rb], row);
+        for s in 0..hc {
+            dst[s * e..(s + 1) * e].copy_from_slice(row);
+        }
+    }
+    if threads <= 1 || tokens.len() == 1 {
+        let mut row = vec![0f32; e];
+        for (dst, &tok) in out.chunks_mut(hc * e).zip(tokens) {
+            one(ty, blocks, rb, e, hc, dst, tok, &mut row);
+        }
+        return Ok(());
+    }
+    let mut run = || {
+        out.par_chunks_mut(hc * e)
+            .zip(tokens.par_iter())
+            .for_each_init(
+                || vec![0f32; e],
+                |row, (dst, &tok)| one(ty, blocks, rb, e, hc, dst, tok, row),
+            );
+    };
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(p) => p.install(run),
+        Err(_) => run(),
+    }
+    Ok(())
+}
+
 /// task 72: 同じ入力 `x` を取る複数の投影を、行方向に連結して 1 本の GEMV にする。
 ///
 /// 行は互いに独立で、1 行の内積は `i` の昇順に f32 で加算する (個別に呼んだ
@@ -1591,6 +1665,39 @@ mod tests {
             assert_eq!(row, direct);
         }
         assert!(lin.dequant_row(N).is_err());
+    }
+
+    /// task 415: 並列の埋め込み引き (`embed_rows_into`) が直列
+    /// (`dequant_row` + hc 回の複製) と **ビット一致**すること。
+    ///
+    /// 行は互いに独立なので、本数を変えても (プール無し/1/2/4) 値は動かない。
+    #[test]
+    fn task415_embed_rows_into_matches_serial() {
+        for ty in [GgmlType::Q8_0, GgmlType::F32, GgmlType::F16] {
+            let w = make_matrix(ty, K, N, 17);
+            let lin = GgufLinear::from_slice(ty, K, N, &w).unwrap();
+            let hc = 2;
+            // 端の行・重複・順序の入れ替えを混ぜる (行独立の確認)。
+            let tokens: Vec<u32> = vec![0, 3, (N - 1) as u32, 1, 3, 0];
+            let mut want: Vec<f32> = Vec::with_capacity(tokens.len() * hc * K);
+            for &t in &tokens {
+                let row = lin.dequant_row(t as usize).unwrap();
+                for _ in 0..hc {
+                    want.extend_from_slice(&row);
+                }
+            }
+            for threads in [0usize, 1, 2, 4] {
+                let mut got = vec![0.0f32; tokens.len() * hc * K];
+                embed_rows_into(&lin, &tokens, hc, &mut got, threads).unwrap();
+                assert_eq!(got, want, "ty={ty:?} threads={threads}");
+            }
+            // 形の門 (fail closed): 長さ違い / 行の範囲外。
+            let mut short = vec![0.0f32; tokens.len() * hc * K - 1];
+            assert!(embed_rows_into(&lin, &tokens, hc, &mut short, 4).is_err());
+            let mut one = vec![0.0f32; hc * K];
+            assert!(embed_rows_into(&lin, &[N as u32], hc, &mut one, 4).is_err());
+            assert!(embed_rows_into(&lin, &[], hc, &mut [], 4).is_err());
+        }
     }
 
     #[test]

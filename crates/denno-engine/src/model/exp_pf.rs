@@ -2023,6 +2023,66 @@ pub fn ple_threads() -> usize {
     *N.get_or_init(|| ple_threads_from_value(std::env::var(PLE_THREADS_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_EMBED_PAR`: 層優先 prefill の**埋め込み** (`token_embd` の行デコード)
+/// を引く本数 (task 415)。
+///
+/// 層優先の prefill は層ループの前に全トークンぶんの埋め込みを引く。ここは
+/// **1 トークン 1 回の直列ループ**で、1 行は 2,100 B (Q6_K) のランダム読み。
+/// 表は 317 MB あるのでページキャッシュから落ちていることがあり、そのときは
+/// 1 本 100 us のディスク待ちがトークン数だけ並ぶ (14k で 1.4 s 相当)。
+/// 行は互いに独立なので N 本で引ける (値はビット一致)。
+///
+/// 既定 0 = 従来の直列 (A/B のため)。1 も直列。
+pub const EMBED_PAR_ENV: &str = "DENNO_PF_EMBED_PAR";
+
+/// [`EMBED_PAR_ENV`] の既定値 (0 = 直列)。
+pub const DEFAULT_EMBED_PAR: usize = 0;
+
+/// [`EMBED_PAR_ENV`] の解釈 (純関数)。未設定・空・解析不能は既定、1..=64 に丸める。
+pub fn embed_par_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_EMBED_PAR;
+    };
+    match s.parse::<usize>() {
+        Ok(0) => 0,
+        Ok(n) => n.min(64),
+        Err(_) => DEFAULT_EMBED_PAR,
+    }
+}
+
+/// 埋め込みを引く本数 (プロセスで 1 回だけ env を読む)。
+pub fn embed_par() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| embed_par_from_value(std::env::var(EMBED_PAR_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_EMBED_OVL`: PLE の gather を背景スレッドへ出し、その裏で埋め込みを
+/// 引く (task 415)。
+///
+/// どちらもホストの**ファイル読み**で、待ちはカーネル内 (pread) かページフォルト。
+/// 埋め込み (直列) と gather (96 本) は同じディスクを別々に叩くので、重ねると
+/// 短いほうが丸ごと隠れる。読む行・綴じ方は変わらない (値はビット一致)。
+///
+/// 既定 off。`DENNO_PF_EMBED_PAR` が 1 以下のときは効かない (重ねる相手が無い)。
+pub const EMBED_OVL_ENV: &str = "DENNO_PF_EMBED_OVL";
+
+/// [`EMBED_OVL_ENV`] の既定値。
+pub const DEFAULT_EMBED_OVL: bool = false;
+
+/// [`EMBED_OVL_ENV`] の解釈 (純関数)。**明示的な真値だけ on**、未設定は既定。
+pub fn embed_ovl_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_EMBED_OVL,
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// PLE gather と埋め込みを重ねるか (プロセスで 1 回だけ env を読む)。
+pub fn embed_ovl() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| embed_ovl_from_value(std::env::var(EMBED_OVL_ENV).ok().as_deref()))
+}
+
 /// パート番号ごとの読み口 (pread 経路だけが使う)。
 ///
 /// モデルの構築時に 1 回だけ開く。開けなかったパートは `None` で、その
@@ -3472,6 +3532,33 @@ mod tests {
         assert!(stream_pread_from_value(Some("on")));
         assert!(stream_pread_from_value(Some("TRUE")));
         assert!(stream_pread_from_value(Some(" yes ")));
+    }
+
+    /// task 415: `DENNO_PF_EMBED_PAR` の丸めと既定 (0 = 直列)。
+    #[test]
+    fn task415_embed_par_rounds_and_defaults() {
+        assert_eq!(embed_par_from_value(None), 0, "未設定は直列");
+        assert_eq!(embed_par_from_value(Some("")), 0);
+        assert_eq!(embed_par_from_value(Some("x")), 0, "解析不能は直列");
+        assert_eq!(embed_par_from_value(Some("1")), 1, "1 も直列 (プールを作らない)");
+        assert_eq!(embed_par_from_value(Some(" 16 ")), 16);
+        assert_eq!(embed_par_from_value(Some("999")), 64, "上限 64");
+        assert_eq!(EMBED_PAR_ENV, "DENNO_PF_EMBED_PAR");
+        assert_eq!(DEFAULT_EMBED_PAR, 0);
+    }
+
+    /// task 415: `DENNO_PF_EMBED_OVL` は既定 off、明示の真値だけ on。
+    #[test]
+    fn task415_embed_ovl_gate_truth_table() {
+        assert!(!embed_ovl_from_value(None), "未設定は既定 (off)");
+        assert!(!embed_ovl_from_value(Some("")), "空も既定 (off)");
+        assert!(!embed_ovl_from_value(Some("x")), "解析不能は off");
+        assert!(!embed_ovl_from_value(Some("0")));
+        assert!(embed_ovl_from_value(Some("1")));
+        assert!(embed_ovl_from_value(Some("on")));
+        assert!(embed_ovl_from_value(Some(" TRUE ")));
+        assert_eq!(EMBED_OVL_ENV, "DENNO_PF_EMBED_OVL");
+        assert!(!DEFAULT_EMBED_OVL);
     }
 
     /// task 349 / 353: `DENNO_PF_PLE_PIPE` は既定 on (t353a で採用)、`0` 系だけが偽。

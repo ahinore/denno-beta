@@ -5178,18 +5178,60 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         }
         let ple_batch = ple_batch_enabled();
         // 埋め込みと PLE は層ループの外で 1 回だけ (全トークン)。
-        let mut res_all: Vec<f32> = Vec::with_capacity(nt_all * hc_dim);
+        // task 415: 埋め込みは**行独立**なので N 本で引ける (`DENNO_PF_EMBED_PAR`)。
+        // 1 本あたり 2,100 B のランダム読みなので、表がページキャッシュから落ちて
+        // いると 1 トークン 100 us の待ちが直列に並ぶ (層ループの前 = GPU は遊ぶ)。
+        let embed_par = crate::model::exp_pf::embed_par();
+        let mut res_all: Vec<f32> = vec![0.0; nt_all * hc_dim];
         // task 349: `DENNO_PF_PLE_PIPE` では埋め込み (直列) と gather を分け、
         // gather を広い専用プールで引く。冷えた page cache では 1 行 90 B の
         // ランダム pread が IOPS 律速 (14k で 1,848 ms、wall の 20%) なので、
         // queue を深くする。読む行・綴じ方は同じ。
         let ple_wide = ple_batch && crate::model::exp_pf::ple_pipe();
+        // task 415: `DENNO_PF_EMBED_OVL` では gather を背景スレッドへ出し、その裏で
+        // 埋め込みを引く (どちらも同じファイルの待ちなので重ねられる)。
+        let ple_ovl = ple_wide && embed_par > 1 && crate::model::exp_pf::embed_ovl();
+        let mut ple_bg: Option<std::thread::JoinHandle<Result<Vec<Vec<Option<Vec<f32>>>>>>> = None;
+        if ple_ovl {
+            let c: Vec<u32> = ctx.to_vec();
+            let rt = self.ple.as_ref().map(std::sync::Arc::clone);
+            let chunk_list: Vec<(usize, usize)> = ranges.to_vec();
+            let threads = crate::model::exp_pf::ple_threads().max(1);
+            ple_bg = Some(std::thread::spawn(move || {
+                let run = || -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+                    let mut out: Vec<Vec<Option<Vec<f32>>>> =
+                        Vec::with_capacity(chunk_list.len());
+                    for &(start, end) in &chunk_list {
+                        out.push(gather_ple_many_rt(rt.as_deref(), &c[..end], start)?);
+                    }
+                    Ok(out)
+                };
+                // 専用プールの本数がそのまま同時に飛ぶ pread の数になる (task 357)。
+                match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                    Ok(p) => p.install(run),
+                    Err(_) => run(),
+                }
+            }));
+        }
         let mut ples_all: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(ranges.len());
         for &(start, end) in &ranges {
             let t_emb = prekprof::stamp();
-            for i in start..end {
-                let r = self.forward_embed(&ctx[..=i], &hp)?;
-                res_all.extend_from_slice(&r.data);
+            if embed_par > 1 {
+                // 行が独立なので N 本で引く (値は直列の `forward_embed` と一致)。
+                crate::model::linear_gguf::embed_rows_into(
+                    &self.tok_embd,
+                    &ctx[start..end],
+                    hc,
+                    &mut res_all[start * hc_dim..end * hc_dim],
+                    embed_par,
+                )
+                .map_err(|e| one(format!("埋め込みの並列引きに失敗: {e:#}")))?;
+            } else {
+                for i in start..end {
+                    let r = self.forward_embed(&ctx[..=i], &hp)?;
+                    let o = start * hc_dim + (i - start) * hc_dim;
+                    res_all[o..o + hc_dim].copy_from_slice(&r.data);
+                }
             }
             prekprof::mark(t_emb, prekprof::EMBED);
             if !ple_wide {
@@ -5209,26 +5251,33 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         }
         if ple_wide {
             // 専用プールの本数がそのまま同時に飛ぶ pread の数になる
-            // (`ple_par_parts` が `DENNO_PF_PLE_THREADS` (既定 32) と
+            // (`ple_par_parts` が `DENNO_PF_PLE_THREADS` (既定 96) と
             // `current_num_threads()` の小さいほうを見る。task 357)。
-            let ple_threads = crate::model::exp_pf::ple_threads().max(1);
             let t_ple = prekprof::stamp();
-            let rt = self.ple.as_ref().map(std::sync::Arc::clone);
-            let chunk_list: Vec<(usize, usize)> = ranges.to_vec();
-            let run = || -> Result<Vec<Vec<Option<Vec<f32>>>>> {
-                let mut out: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(chunk_list.len());
-                for &(start, end) in &chunk_list {
-                    out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);
+            ples_all = match ple_bg {
+                // task 415: 背景で読み終わっている (埋め込みと重ねた)。
+                Some(h) => h.join().map_err(|_| one("PLE の先読みスレッドが落ちた"))??,
+                None => {
+                    let ple_threads = crate::model::exp_pf::ple_threads().max(1);
+                    let rt = self.ple.as_ref().map(std::sync::Arc::clone);
+                    let chunk_list: Vec<(usize, usize)> = ranges.to_vec();
+                    let run = || -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+                        let mut out: Vec<Vec<Option<Vec<f32>>>> =
+                            Vec::with_capacity(chunk_list.len());
+                        for &(start, end) in &chunk_list {
+                            out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);
+                        }
+                        Ok(out)
+                    };
+                    match rayon::ThreadPoolBuilder::new()
+                        .num_threads(ple_threads)
+                        .build()
+                    {
+                        Ok(p) => p.install(run)?,
+                        Err(_) => run()?,
+                    }
                 }
-                Ok(out)
             };
-            match rayon::ThreadPoolBuilder::new()
-                .num_threads(ple_threads)
-                .build()
-            {
-                Ok(p) => ples_all = p.install(run)?,
-                Err(_) => ples_all = run()?,
-            }
             prekprof::mark(t_ple, prekprof::PLE);
         }
         // task 233: デバイス経路を諦めたときだけ要るホストの控え (普段は確保しない)。
