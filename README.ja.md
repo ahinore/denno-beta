@@ -69,6 +69,50 @@ rtx5090 / UD-IQ3_XXS の段ごとの内訳(温まった状態、`8ae66f334` の 
 | prefill 3,826 | 2.45 s | expert 1.32 s(転送待ち 1.09 s)/ ssm 0.62 / その他(PLE など)0.24 / mix 0.14 / full attention 0.14 |
 | prefill 14k | 6.44 s | ssm 2.61 s / expert 1.88 / その他 1.05 / full attention 0.88 |
 
+### RTX 3080 10 GB での計測(Windows の WSL2 上の Docker、2026-11-18 実測)
+
+VRAM 10 GB の GPU でどこまで出るかを見るため、上と同じ手順(短い質問 2 本、3,826 トークン、14,018 トークン)を Windows の WSL2 上の Docker で回した。出力の md5 は、短い 2 本、3,826、14k のどれも rtx5090 と一致した。
+
+機器構成:
+
+| 項目 | 内容 |
+|---|---|
+| GPU | GeForce RTX 3080 10 GB(Ampere、sm_86)、PCIe Gen4 x16 |
+| CPU | Core i9-13900K(P コア 8 + E コア 16) |
+| RAM | DDR4-3200 32 GB × 2 = 64 GB(うち 56 GB を WSL2 に割り当て) |
+| マザーボード | ASUS TUF GAMING B660-PLUS WIFI D4 |
+| ストレージ | Samsung 970 EVO Plus 2 TB(NVMe)。WSL2 の仮想ディスクと重みはここに置いた |
+
+ソフトウェア構成:
+
+| 項目 | 内容 |
+|---|---|
+| Windows | Windows 11 Pro(ビルド 26300)、NVIDIA ドライバ 617.42 |
+| WSL | WSL 3.0.5、カーネル 6.18.58.1-microsoft-standard-WSL2、Ubuntu 24.04.5 LTS |
+| `.wslconfig` | `memory=56GB`、`processors=24` |
+| Docker | Docker Engine 29.9.3(WSL の中)、NVIDIA Container Toolkit 1.20.1、`docker run --gpus all --ipc=host` |
+| ビルドと実行のイメージ | `nvidia/cuda:12.9.1-devel-ubuntu22.04`(nvcc 12.9.86)+ Rust 1.99.0 |
+| コード | 開発ブランチ int-auto の `ad1cfe1b5`(この README の commit より新しい未公開の版) |
+| 重み | UD-IQ3_XXS(78 GB)、WSL の ext4 上 |
+
+3080 で動かすのに必要だった設定:
+
+- `crates/denno-engine/kernels/build_ptx.sh` は 19 本の PTX を `compute_90` 固定で作るので、sm_86 では読み込めない。`compute_90` を `compute_86` に置き換えて作り直した。
+- prefill には `DENNO_EXPERT_IQ_GPU=1` が要る。無いと GPU 側の MoE が使えず、expert を CPU で計算する。
+- decode は逆に、expert を CPU に置いたまま `RAYON_NUM_THREADS=8` にしたときが最速だった。24 スレッドでは 170 ms/tok に落ちる(E コアに仕事が分かれるためと見ている)。
+- どの条件も `DENNO_GPU_WEIGHT_MB=5000`、`DENNO_EXPERT_GPU_MIN_HIT=0`。
+
+| 条件 | 生成(短い会話) | prefill 3,826 トークン | prefill 14,018 トークン |
+|---|---|---|---|
+| expert を CPU、`RAYON_NUM_THREADS=8` | **116 ms/tok(8.6 tok/s)** | 55〜62 s | 約 200 s |
+| `DENNO_EXPERT_IQ_GPU=1`、expert の VRAM 枠 1,500 MB、`RAYON_NUM_THREADS=8` | 145〜150 ms/tok | **9.4 s(410 tok/s)** | 36〜105 s |
+| 同上、expert の VRAM 枠 800 MB | — | 10.4 s | **27.3 s(510 tok/s)** |
+
+- 重み 78 GB が WSL の 56 GB に収まらないので、ページキャッシュにどれだけ残っているかで時間が大きく動く。同じ条件でも 3,826 トークンの prefill は 9〜57 s の幅があった。表の太字は温まったときの最速値。
+- VRAM に載る expert は 1.5〜2.2 GB だけで命中率は 21〜37 %。入れ替えの転送(1 トークンあたり約 38 MB)が増えるので、decode では GPU の expert キャッシュがかえって遅い。
+- 近い版の rtx5090(int-auto `ff1a1ec`:12.6 ms/tok、3,826 で 2.38 s、14k で 5.98 s)と比べると、decode は約 9 倍、prefill は約 4〜4.6 倍遅い。
+- VRAM 枠 800 MB の 2 周目で、2 ターン目の md5 が 1 回だけ違った(ほかの回はすべて一致)。原因はまだ調べていない。
+
 ### その他のモデル(旧計測)
 
 | モデル | prefill | decode |
