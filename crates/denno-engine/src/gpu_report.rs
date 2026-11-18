@@ -18,6 +18,20 @@ pub fn mix_upq8_reset() {
     crate::cuda::mix_upq8_reset();
 }
 
+/// task 437: `DENNO_MIX_UPQ8=u4` 系 (1 対 = 4 レーンの up) が発火した回数。
+pub fn mix_up4_hits() -> u64 {
+    #[cfg(feature = "cuda")]
+    return crate::cuda::mix_up4_hits();
+    #[cfg(not(feature = "cuda"))]
+    0
+}
+
+/// task 437: [`mix_up4_hits`] を 0 に戻す。
+pub fn mix_up4_reset() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_up4_reset();
+}
+
 /// task 382: `DENNO_MIX_UPQ8=check` の比較結果 (積んでいるときだけ)。
 pub fn mix_upq8_check_line() -> Option<String> {
     #[cfg(feature = "cuda")]
