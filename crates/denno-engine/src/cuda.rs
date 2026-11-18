@@ -33324,10 +33324,15 @@ pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
         Some("1") | Some("both") | Some("v5") => (MixGemv::V5, MixGemv::V5),
         // task 422: lab t422b で短い decode 12.9 -> 12.5 (-3.1%)、14k 後 -4.1%、
         // mix 段 -6.7%、md5 全 SAME (rows=2 が rows=4 より全点で良かった) なので
-        // **down の既定を dn6 (rows=2) にした**。形が合わない型・k (up の 320 や
-        // PTX 欠け) は `mix_dn6_plan` の門番で v5 へ落ちる。
-        // 切り戻しは `DENNO_MIX_QK=dn5` (task 418) か `v5` (task 286)。
-        _ => (MixGemv::Dn6, MixGemv::V5),
+        // **down の既定を dn6 (rows=2) にした**。
+        // task 431: lab t431c で 1 対 4 レーンの dn7 が mix 段 -5〜-7%
+        // (8 リクエスト中 7 本。最初の 1 本だけは新カーネルの初回ロードで +13%)、
+        // 短い decode -1.0%、14k 後 -2.3%、prefill +0.9%、md5 全 SAME、
+        // errors 0 だったので **既定を dn7 にした**。形が合わない型・k
+        // (np が 8 の倍数でない / 1 行 1024 超) や PTX 欠けは `mix_dn7_plan` の
+        // 門番で dn6 へ落ちる。
+        // 切り戻しは `DENNO_MIX_QK=dn6` / `dn5` (task 418) / `v5` (task 286)。
+        _ => (MixGemv::Dn7, MixGemv::V5),
     }
 }
 
@@ -33346,7 +33351,7 @@ pub fn mix_qk_gate_on() -> bool {
 /// mix の down (`DENNO_MIX_QK=dn6`) か GDN (`DENNO_GDN_DEC_GEMV=dn6`) の
 /// どちらかで選ばれたら true。
 pub fn mix_dn6_gate_on() -> bool {
-    mix_qk_enabled().0 == MixGemv::Dn6 || gdn_dec_gemv_dn6_on()
+    matches!(mix_qk_enabled().0, MixGemv::Dn6 | MixGemv::Dn7) || gdn_dec_gemv_dn6_on()
 }
 
 /// task 282: 高速 GEMV が実際に撃たれた回数 (診断用。プロセス通算)。
@@ -45185,7 +45190,7 @@ mod tests {
     fn mix_qk_gate_defaults_on() {
         // task 422: 既定は down だけ dn6 (lab t422b で採否)、up は v5。
         // dn5 (task 418) は `DENNO_MIX_QK=dn5` で選ぶ切り戻し段。
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5), "未設定が既定");
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5), "未設定が既定");
         assert_eq!(mix_qk_from_value(Some("dn5")), (MixGemv::Dn5, MixGemv::V5));
         // task 286 の形 (両方向 v5) へは明示的に戻す。
         assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::V5, MixGemv::V5));
@@ -45206,7 +45211,7 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("v5u")), (MixGemv::Blk, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
         // 未知の値は既定 (task 422 で dn6) へ倒す。切り戻しは `dn5` / `v5` / `0`。
-        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::Dn6, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::Dn7, MixGemv::V5));
     }
 
     /// task 418: `DENNO_MIX_QK=dn5` の解釈と形の門番。
@@ -45214,7 +45219,7 @@ mod tests {
     #[test]
     fn mix_dn5_gate_and_shape() {
         // task 422: 未設定は dn6 (既定)。dn5 は明示したときだけ (切り戻し段)。
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("DN5")), (MixGemv::Dn5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some(" d5 ")), (MixGemv::Dn5, MixGemv::V5));
@@ -45362,7 +45367,7 @@ mod tests {
     /// 起動形の門番 (1 ブロック rows 行 / 1 レーン 1 対)。
     #[test]
     fn mix_dn6_gate_and_shape() {
-        // mix の down: dn6 系の値はすべて (Dn6, V5)。既定は dn5 のまま。
+        // mix の down: dn6 系の値はすべて (Dn6, V5)。既定は task 431 で dn7。
         for v in ["dn6", "d6", "DN6", " dn6r1 ", "dn6r2", "dn6r6", "dn6r8"] {
             assert_eq!(
                 mix_qk_from_value(Some(v)),
@@ -45370,7 +45375,7 @@ mod tests {
                 "raw={v:?}"
             );
         }
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("dn5")), (MixGemv::Dn5, MixGemv::V5));
         // rows の解釈 (mix の down の既定は 2 行。t422b で rows=2 が最良)。
@@ -45676,7 +45681,7 @@ mod tests {
         // ゲートは既存 env の新しい値。up は v5 のまま。
         assert_eq!(mix_qk_from_value(Some("dn7")), (MixGemv::Dn7, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some(" D7 ")), (MixGemv::Dn7, MixGemv::V5));
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5), "既定は dn6");
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5), "既定は dn7");
         // 発火の計数はリセットできる。
         mix_dn7_reset();
         assert_eq!(mix_dn7_hits(), 0);
