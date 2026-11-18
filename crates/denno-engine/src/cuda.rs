@@ -26963,6 +26963,10 @@ struct MixGpuScratch {
     /// task 382: `DENNO_MIX_UPQ8=check` の比較用 (融合版の出力 / その受け皿)。
     chk: Option<DevBuffer>,
     hchk: Option<PinMem>,
+    /// task 431: `DENNO_MIX_ZC=stream` の H2D 専用ストリーム + 完了イベント。
+    /// 鎖のカーネルは null ストリームのまま (発行順も同期点も変えない)。
+    cstream: Option<CopyStream>,
+    cev: Option<CopyEvent>,
 }
 
 thread_local! {
@@ -26980,7 +26984,39 @@ thread_local! {
             omap: None,
             chk: None,
             hchk: None,
+            cstream: None,
+            cev: None,
         });
+}
+
+/// task 431: H2D 専用の非ブロッキングストリーム + 完了イベントを用意する
+/// (`DENNO_MIX_ZC=stream` のときだけ呼ばれる)。作れなければ `None` = 従来経路。
+fn mix_h2s_ensure(s: &mut MixGpuScratch) -> Option<(CUstream, CUevent)> {
+    if let (Some(st), Some(ev)) = (s.cstream.as_ref(), s.cev.as_ref()) {
+        return Some((st.0, ev.0));
+    }
+    const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+    const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+    let l = lib().ok()?;
+    let (Some(stream_create), Some(event_create)) = (l.stream_create, l.event_create) else {
+        return None;
+    };
+    let mut st: CUstream = std::ptr::null_mut();
+    if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+        return None;
+    }
+    let mut ev: CUevent = std::ptr::null_mut();
+    if unsafe { event_create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+        unsafe {
+            if let Some(f) = l.stream_destroy {
+                let _ = f(st);
+            }
+        }
+        return None;
+    }
+    s.cstream = Some(CopyStream(st));
+    s.cev = Some(CopyEvent(ev));
+    Some((st, ev))
 }
 
 /// task 121: mix GPU で並列リダクション版 (`dno_matvec_f32_r`) に切り替える
@@ -33244,6 +33280,10 @@ pub enum MixGemv {
     /// 載せて rows 行で使い回す。行ごとの積和と縮約順は dn5 と同一なので、
     /// **値は dn5 と 1 ビットも変わらない**。
     Dn6,
+    /// task 431: 1 対 = 4 レーン (`kernels_mix_dn7.cu`)。1 レーン = 1 対では
+    /// スレッド数が n_out * n_pairs で頭打ちになり 9.4 warp/SM しか出ないため、
+    /// 16 要素ずつ 4 レーンに割って 4 倍のスレッドを出す (丸め順が変わる)。
+    Dn7,
 }
 
 /// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` の種別。
@@ -33271,6 +33311,8 @@ pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
         Some("ups") => (MixGemv::Blk, MixGemv::Seg),
         // task 418: down だけ 1 ブロック 1 行・1 レーン 1 対の新カーネル。
         Some("dn5") | Some("d5") => (MixGemv::Dn5, MixGemv::V5),
+        // task 431: 1 対 = 4 レーンの dn7 (丸め順が変わる)。
+        Some("dn7") | Some("d7") => (MixGemv::Dn7, MixGemv::V5),
         // task 422: down を「1 ブロック rows 行」に一般化した dn6
         // (`mix_dn6_rows_from_value` が rows を決める。値は dn5 と同一)。
         Some("dn6") | Some("d6") | Some("dn6r1") | Some("dn6r2") | Some("dn6r4")
@@ -33282,10 +33324,15 @@ pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
         Some("1") | Some("both") | Some("v5") => (MixGemv::V5, MixGemv::V5),
         // task 422: lab t422b で短い decode 12.9 -> 12.5 (-3.1%)、14k 後 -4.1%、
         // mix 段 -6.7%、md5 全 SAME (rows=2 が rows=4 より全点で良かった) なので
-        // **down の既定を dn6 (rows=2) にした**。形が合わない型・k (up の 320 や
-        // PTX 欠け) は `mix_dn6_plan` の門番で v5 へ落ちる。
-        // 切り戻しは `DENNO_MIX_QK=dn5` (task 418) か `v5` (task 286)。
-        _ => (MixGemv::Dn6, MixGemv::V5),
+        // **down の既定を dn6 (rows=2) にした**。
+        // task 431: lab t431c で 1 対 4 レーンの dn7 が mix 段 -5〜-7%
+        // (8 リクエスト中 7 本。最初の 1 本だけは新カーネルの初回ロードで +13%)、
+        // 短い decode -1.0%、14k 後 -2.3%、prefill +0.9%、md5 全 SAME、
+        // errors 0 だったので **既定を dn7 にした**。形が合わない型・k
+        // (np が 8 の倍数でない / 1 行 1024 超) や PTX 欠けは `mix_dn7_plan` の
+        // 門番で dn6 へ落ちる。
+        // 切り戻しは `DENNO_MIX_QK=dn6` / `dn5` (task 418) / `v5` (task 286)。
+        _ => (MixGemv::Dn7, MixGemv::V5),
     }
 }
 
@@ -33304,7 +33351,7 @@ pub fn mix_qk_gate_on() -> bool {
 /// mix の down (`DENNO_MIX_QK=dn6`) か GDN (`DENNO_GDN_DEC_GEMV=dn6`) の
 /// どちらかで選ばれたら true。
 pub fn mix_dn6_gate_on() -> bool {
-    mix_qk_enabled().0 == MixGemv::Dn6 || gdn_dec_gemv_dn6_on()
+    matches!(mix_qk_enabled().0, MixGemv::Dn6 | MixGemv::Dn7) || gdn_dec_gemv_dn6_on()
 }
 
 /// task 282: 高速 GEMV が実際に撃たれた回数 (診断用。プロセス通算)。
@@ -33844,6 +33891,171 @@ fn mix_dn6_rows() -> usize {
 }
 
 // ===========================================================================
+// task 431: mix の down を 1 対 = 4 レーンで回す (`DENNO_MIX_QK=dn7`)
+// ===========================================================================
+//
+// lab t431a の mix band (`[dec-kprof-avg]`、1 呼び出しあたり) は
+//   H2D@a 10.3 / down 14.0 / up 10.8 / router 6.9 / D2H@a 5.4 us
+// で、down は 3.48 MB を 245 GB/s。**同じ dn6 の PTX を GDN の qkv
+// (grid 1,280 x 192) で撃つと 962 GB/s** 出るので、差はカーネルの中身ではなく
+// 同時に走る warp 数 (mix down は 9.4 warp/SM)。1 レーン = 1 対のままだと
+// スレッド数が n_out * n_pairs で固定されるため、dn7 は 1 対を 4 レーンに割る
+// (`kernels_mix_dn7.cu`)。実形で 204,800 スレッド = 37.6 warp/SM。
+//
+// 値は丸め順だけが変わる (1 行の和を 16 要素ずつ 4 レーンに分けて足す)。
+// ゲートは既存 env の新しい値 `DENNO_MIX_QK=dn7`。形が合わなければ dn6 へ落ちる。
+
+/// 新カーネル名 (`kernels_mix_dn7.cu`)。
+const MIX_DN7_KERNEL_NAME: &str = "dno_mix_gemv_q8_0_dn7";
+/// 引数の数 (w, x, out, n_in, n_out, row_bytes, rows)。
+const MIX_DN7_NARGS: usize = 7;
+/// 1 ブロックのスレッド上限。
+const MIX_DN7_MAX_THREADS: usize = 1024;
+/// 1 レーンが担当する要素数 (`.cu` の `16 * sub`)。
+const MIX_DN7_LANES: usize = 4;
+
+struct MixDn7Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixDn7Kernels {}
+unsafe impl Sync for MixDn7Kernels {}
+
+static MIX_DN7_KERNELS: OnceLock<Option<MixDn7Kernels>> = OnceLock::new();
+
+fn mix_dn7_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_DN7_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_dn7.ptx"),
+    }
+}
+
+/// 新カーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_dn7_kernels() -> Option<&'static MixDn7Kernels> {
+    MIX_DN7_KERNELS
+        .get_or_init(|| {
+            let path = mix_dn7_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_DN7_KERNEL_NAME) != Some(MIX_DN7_NARGS) {
+                eprintln!(
+                    "[mix-dn7] PTX の引数が {MIX_DN7_NARGS} 本でない → dn6 / dn5 / v5 へ。\
+                     `bash build_ptx.sh mix_dn7` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_DN7_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-dn7] PTX に {MIX_DN7_KERNEL_NAME} が無い → dn6 / dn5 / v5 へ");
+                    return None;
+                }
+                Some(MixDn7Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 新カーネルが載っているか (テスト / 診断用)。
+pub fn mix_dn7_loaded() -> bool {
+    mix_dn7_kernels().is_some()
+}
+
+/// 起動形 (純関数)。`Some((rows, threads))` なら撃てる。
+///
+/// `.cu` の前提は「Q8_0 / n_in % 64 == 0 / 1 行あたり np*4 スレッド
+/// (np = n_in/64) が 32 の倍数 = np % 8 == 0 / np*4 <= 1024 / warp 数 <= 32」。
+/// 実形 (n_in = 10,240) は np = 160 で 1 行 640 スレッド・20 warp。
+pub fn mix_dn7_plan(n_in: usize, n_out: usize) -> Option<(usize, usize)> {
+    if n_in == 0 || n_out == 0 || n_in % 64 != 0 {
+        return None;
+    }
+    let np = n_in / 64;
+    if np == 0 || np % 8 != 0 {
+        return None;
+    }
+    let per_row = np * MIX_DN7_LANES;
+    if per_row > MIX_DN7_MAX_THREADS || per_row / 32 > 32 {
+        return None;
+    }
+    // 1 ブロックは 1 行 (rows=1)。2 行にすると per_row*2 が上限を超える実形がある。
+    let rows = 1;
+    if n_out.div_ceil(rows) > u32::MAX as usize {
+        return None;
+    }
+    Some((rows, per_row))
+}
+
+/// 新カーネルを 1 本積む (grid = ceil(n_out / rows)、block = rows * np * 4)。
+fn launch_mix_dn7(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    x: CUdeviceptr,
+    o: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+    rows: usize,
+    threads: usize,
+) -> Result<()> {
+    let k = mix_dn7_kernels().ok_or_else(|| anyhow::anyhow!("dn7 のカーネルが無い"))?;
+    let (mut pw, mut px, mut po) = (w, x, o);
+    let (mut ni, mut no, mut rb) = (n_in as c_int, n_out as c_int, row_bytes as c_int);
+    let mut rw = rows as c_int;
+    let mut args = [
+        &mut pw as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut po as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut no as *mut _ as *mut c_void,
+        &mut rb as *mut _ as *mut c_void,
+        &mut rw as *mut _ as *mut c_void,
+    ];
+    // block = rows (1) * threads。grid は行数。
+    unsafe {
+        ctx.launch_async(
+            k.f,
+            (n_out.div_ceil(rows) as u32, 1, 1),
+            (threads as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// dn7 を撃った回数 (診断。`[mix-qchain]` の `dn7=` に出る)。
+static MIX_DN7_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// dn7 を撃った回数。
+pub fn mix_dn7_hits() -> u64 {
+    MIX_DN7_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 集計を 0 に戻す。
+pub fn mix_dn7_reset() {
+    MIX_DN7_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ===========================================================================
 // task 382: mix の silu + up + hc_mixed を 1 本に畳む (`DENNO_MIX_UPQ8`)
 // ===========================================================================
 //
@@ -34054,13 +34266,43 @@ pub fn mix_upq8_check_line() -> Option<String> {
 /// - `x` / `in`: H2D だけ消す (`down` がホストの `xn` を PCIe 越しに読む)。
 /// - `out`: D2H だけ消す (`hc_mixed` がホストメモリへ直接書く)。
 /// - `1` / `on` / `both`: 両方。
+/// - task 431: `os` / `outstream` / `all` は「D2H を消す + H2D を別ストリームへ」
+///   (H2D は消さない。下の [`mix_zc_h2d_stream_from_value`] を見る)。
 pub fn mix_zc_from_value(v: Option<&str>) -> (bool, bool) {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("x") | Some("in") => (true, false),
         Some("out") => (false, true),
         Some("1") | Some("on") | Some("true") | Some("yes") | Some("both") => (true, true),
+        // task 431: 第 3 の指定 (`H2D を別ストリーム`) と組む値。
+        Some("os") | Some("outstream") | Some("all") => (false, true),
         _ => (false, false),
     }
+}
+
+/// task 431: `DENNO_MIX_ZC` の第 3 の指定 — **xn の H2D を専用の
+/// 非ブロッキングストリームへ出す** (純関数)。
+///
+/// なぜ要るか (lab t431a の `[dec-kprof-avg]` mix band、1 呼び出しあたり):
+///   H2D@a 10.3 us / down 14.0 / up 10.8 / router 6.9 / D2H@a 5.4
+/// で、**41 KB の H2D が 10.3 us** かかっている。中身は転送 (0.8 us) ではなく
+/// 「null ストリームの前の仕事 (attention) が終わるまでの待ち」なので、
+/// コピーだけ別ストリームへ出せば前の仕事と重なって消える。鎖のカーネルは
+/// null ストリームのままで、コピーの完了イベントを 1 本待たせるだけ。
+/// 値は 1 ビットも変わらない (同じバイトが同じ場所へ行く)。
+///
+/// 値: `stream` / `s` (H2D だけ別ストリーム) と、上の `os` / `outstream` / `all`
+/// (D2H も消す)。既定 off。
+pub fn mix_zc_h2d_stream_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("stream")
+            | Some("s")
+            | Some("os")
+            | Some("outstream")
+            | Some("all")
+            | Some("sx")
+            | Some("instream")
+    )
 }
 
 pub const MIX_ZC_ENV: &str = "DENNO_MIX_ZC";
@@ -34086,8 +34328,41 @@ pub(crate) fn mix_zc_set_for_test(v: Option<(bool, bool)>) {
     MIX_ZC_FORCE.with(|c| c.set(v));
 }
 
+/// task 431: H2D を別ストリームへ出すかの実値 (プロセスで 1 回だけ env を読む)。
+pub fn mix_zc_h2d_stream() -> bool {
+    #[cfg(test)]
+    if let Some(v) = MIX_ZC_H2S_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_zc_h2d_stream_from_value(std::env::var(MIX_ZC_ENV).ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIX_ZC_H2S_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト用: [`mix_zc_h2d_stream`] の強制 (`None` = env の解釈)。
+#[cfg(test)]
+pub(crate) fn mix_zc_h2d_stream_set_for_test(v: Option<bool>) {
+    MIX_ZC_H2S_FORCE.with(|c| c.set(v));
+}
+
 static MIX_ZC_X_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MIX_ZC_OUT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// task 431: xn の H2D を別ストリームへ出した回数 (発火の証拠)。
+static MIX_H2S_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 431: 別ストリームへ出した H2D の回数 (診断)。
+pub fn mix_h2s_hits() -> u64 {
+    MIX_H2S_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 431: 計数を 0 に戻す (リクエスト終端)。
+pub fn mix_h2s_reset() {
+    MIX_H2S_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// 実際に H2D を省いた回数 / D2H を省いた回数 (診断)。
 pub fn mix_zc_hits() -> (u64, u64) {
@@ -34233,6 +34508,13 @@ pub fn maybe_gpu_mix_q_chain_into(
             3,
         );
         let mut s = cell.borrow_mut();
+        // task 431: H2D を別ストリームへ出すか (既定 off)。ストリームと
+        // イベントは `&mut *s` を分解する前に取る。
+        let h2s = if mix_zc_h2d_stream() {
+            mix_h2s_ensure(&mut s)
+        } else {
+            None
+        };
         let MixGpuScratch {
             x: dx,
             lo: dlo,
@@ -34248,6 +34530,8 @@ pub fn maybe_gpu_mix_q_chain_into(
             hchk,
             ..
         } = &mut *s;
+        // この H2D を積むストリーム (`h2s` が無ければ null = 従来)。
+        let h2d_stream: CUstream = h2s.map(|(st, _)| st).unwrap_or(std::ptr::null_mut());
         // task 382: 鎖の両端の往復 (H2D xn / D2H mixed) を消すかの実値。
         // H2D を消せるのは down/up が両方 v5 のときだけ (stage の前置きを
         // 読むのは Blk / Seg のカーネルで、v5 は重みポインタを引数で受ける)。
@@ -34291,7 +34575,17 @@ pub fn maybe_gpu_mix_q_chain_into(
         } else {
             None
         };
+        // task 431: dn7 (1 対 4 レーン) の起動形。門番は `mix_dn7_plan`。
+        let dn7_plan = if want_down == MixGemv::Dn7
+            && down_ty == crate::kquant::GgmlType::Q8_0
+            && mix_dn7_kernels().is_some()
+        {
+            mix_dn7_plan(k1, n1)
+        } else {
+            None
+        };
         let down_kind = match (want_down, kern, rd) {
+            (MixGemv::Dn7, _, _) if dn7_plan.is_some() => MixGemv::Dn7,
             (MixGemv::Dn6, _, _) if dn6_plan.is_some() => MixGemv::Dn6,
             (MixGemv::Dn5, _, _) if dn5_warps.is_some() => MixGemv::Dn5,
             (MixGemv::V5, _, _) if v5_down.is_some() => MixGemv::V5,
@@ -34351,6 +34645,8 @@ pub fn maybe_gpu_mix_q_chain_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        // task 431: 実際に積んだ H2D の本数 (0 ならイベントを待たせない)。
+        let mut h2d_copies = 0usize;
         if need_stage && zc_x {
             // task 382: xn を device から見える pinned へ置くだけ (転送命令なし)。
             dec_kprof::step("mix_h2d_pack", || {
@@ -34385,12 +34681,13 @@ pub fn maybe_gpu_mix_q_chain_into(
                         st.ptr(),
                         hs.ptr as *const c_void,
                         MIX_QK_PROLOGUE + k1 * 4,
-                        std::ptr::null_mut(),
+                        h2d_stream,
                     ),
                     "cuMemcpyHtoDAsync (mix qk)",
                 )?;
             }
             dec_kprof::op_end(kp_cp);
+            h2d_copies += 1;
         } else {
             dec_kprof::step("mix_h2d_pack", || {
                 hx.as_mut_slice::<f32>()[..k1].copy_from_slice(xn)
@@ -34408,12 +34705,13 @@ pub fn maybe_gpu_mix_q_chain_into(
                         dx.ptr(),
                         hx.ptr as *const c_void,
                         k1 * 4,
-                        std::ptr::null_mut(),
+                        h2d_stream,
                     ),
                     "cuMemcpyHtoDAsync (mix q chain)",
                 )?;
             }
             dec_kprof::op_end(kp_cp);
+            h2d_copies += 1;
         }
         // down が旧 GEMV のときは xn を従来どおり dx にも送る (前置き側の xn は
         // 使わない。up だけ高速にする組合せのための 40 KB の二重送り)。
@@ -34434,12 +34732,33 @@ pub fn maybe_gpu_mix_q_chain_into(
                         dx.ptr(),
                         hx.ptr as *const c_void,
                         k1 * 4,
-                        std::ptr::null_mut(),
+                        h2d_stream,
                     ),
                     "cuMemcpyHtoDAsync (mix q chain)",
                 )?;
             }
             dec_kprof::op_end(kp_cp);
+            h2d_copies += 1;
+        }
+        // task 431: 別ストリームへ出した H2D を、鎖のカーネル (null ストリーム)
+        // の前に 1 本のイベントで待たせる。ここまではホスト側の仕事だけで、
+        // コピーは前の層の GPU 仕事と重なって走る。
+        if let Some((st_side, ev_side)) = h2s {
+            if h2d_copies > 0 {
+                let ok = match (lib.event_record, lib.stream_wait_event) {
+                    (Some(rec), Some(wev)) => unsafe {
+                        rec(ev_side, st_side) == CUDA_SUCCESS
+                            && wev(std::ptr::null_mut(), ev_side, 0) == CUDA_SUCCESS
+                    },
+                    _ => false,
+                };
+                if ok {
+                    MIX_H2S_HITS.fetch_add(1, AO::Relaxed);
+                } else {
+                    // 順序が取れない環境では安全側に倒す (ホストで待つ)。
+                    ctx.sync()?;
+                }
+            }
         }
         // デバイス側の xn の置き場所 (down が高速なら前置きバッファの末尾)。
         let xdev = if zc_x {
@@ -34466,6 +34785,12 @@ pub fn maybe_gpu_mix_q_chain_into(
                         let (warps, rows) = dn6_plan.expect("検査済み");
                         launch_mix_dn6(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps, rows)?;
                         MIX_DN6_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    MixGemv::Dn7 => {
+                        // task 431: 1 対 4 レーン (スレッド数 4 倍、丸め順が変わる)。
+                        let (rows, threads) = dn7_plan.expect("検査済み");
+                        launch_mix_dn7(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, rows, threads)?;
+                        MIX_DN7_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     MixGemv::V5 => {
                         // task 286: v5 形 (68 B の対読み + 先読み)。重みは生ポインタ。
@@ -34535,10 +34860,20 @@ pub fn maybe_gpu_mix_q_chain_into(
             Scratch::ensure(dchk, e * 4)?;
             Scratch::ensure_pin(hchk, e * 4)?;
         }
+        // 4. hc_mixed (xn と gate から mixed) の行き先。
+        // task 382: zc_out のときはホストの pinned へ直接書く (D2H を消す)。
+        // task 431: 融合版 (`DENNO_MIX_UPQ8`) は **この mdev をそのまま受け取る**
+        // ようにした (それまでは融合版だけ `dm` へ書いていて、zc_out と併用すると
+        // D2H を省いた先が空のままだった = 併用できなかった)。
+        let mdev = if zc_out {
+            omap.as_ref().expect("確保済み").dev
+        } else {
+            dm.ptr()
+        };
         if fu {
             let f = mix_upq8_kernels().expect("直前に確認").f;
             let pout = if fu_use {
-                dm.ptr()
+                mdev
             } else {
                 dchk.as_ref().expect("確保済み").ptr()
             };
@@ -34653,13 +34988,7 @@ pub fn maybe_gpu_mix_q_chain_into(
                 return Err(anyhow::anyhow!("up の GEMV 計画が無い"));
             }
         }
-        // 4. hc_mixed (xn と gate から mixed)
-        // task 382: zc_out のときはホストの pinned へ直接書く (D2H を消す)。
-        let mdev = if zc_out {
-            omap.as_ref().expect("確保済み").dev
-        } else {
-            dm.ptr()
-        };
+        // 4. hc_mixed (xn と gate から mixed) — 行き先は上で決めた `mdev`。
         if !fu_use {
             unsafe {
                 let (mut px, mut pg, mut pm) = (xdev, dout.ptr(), mdev);
@@ -44861,7 +45190,7 @@ mod tests {
     fn mix_qk_gate_defaults_on() {
         // task 422: 既定は down だけ dn6 (lab t422b で採否)、up は v5。
         // dn5 (task 418) は `DENNO_MIX_QK=dn5` で選ぶ切り戻し段。
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5), "未設定が既定");
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5), "未設定が既定");
         assert_eq!(mix_qk_from_value(Some("dn5")), (MixGemv::Dn5, MixGemv::V5));
         // task 286 の形 (両方向 v5) へは明示的に戻す。
         assert_eq!(mix_qk_from_value(Some("1")), (MixGemv::V5, MixGemv::V5));
@@ -44882,7 +45211,7 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("v5u")), (MixGemv::Blk, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
         // 未知の値は既定 (task 422 で dn6) へ倒す。切り戻しは `dn5` / `v5` / `0`。
-        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::Dn6, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::Dn7, MixGemv::V5));
     }
 
     /// task 418: `DENNO_MIX_QK=dn5` の解釈と形の門番。
@@ -44890,7 +45219,7 @@ mod tests {
     #[test]
     fn mix_dn5_gate_and_shape() {
         // task 422: 未設定は dn6 (既定)。dn5 は明示したときだけ (切り戻し段)。
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("DN5")), (MixGemv::Dn5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some(" d5 ")), (MixGemv::Dn5, MixGemv::V5));
@@ -45038,7 +45367,7 @@ mod tests {
     /// 起動形の門番 (1 ブロック rows 行 / 1 レーン 1 対)。
     #[test]
     fn mix_dn6_gate_and_shape() {
-        // mix の down: dn6 系の値はすべて (Dn6, V5)。既定は dn5 のまま。
+        // mix の down: dn6 系の値はすべて (Dn6, V5)。既定は task 431 で dn7。
         for v in ["dn6", "d6", "DN6", " dn6r1 ", "dn6r2", "dn6r6", "dn6r8"] {
             assert_eq!(
                 mix_qk_from_value(Some(v)),
@@ -45046,7 +45375,7 @@ mod tests {
                 "raw={v:?}"
             );
         }
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("dn5")), (MixGemv::Dn5, MixGemv::V5));
         // rows の解釈 (mix の down の既定は 2 行。t422b で rows=2 が最良)。
@@ -45330,6 +45659,60 @@ mod tests {
         assert_eq!(mix_zc_from_value(Some("ON")), (true, true));
         // 未知の値は既定 (従来経路) へ倒す。
         assert_eq!(mix_zc_from_value(Some("nope")), (false, false));
+    }
+
+    /// task 431: dn7 (1 対 = 4 レーン) の起動形とゲート。
+    ///
+    /// 実形 (mix down: n_in = 10,240 / n_out = 320) は np = 160 で
+    /// 1 行 640 スレッド (20 warp)・320 ブロック = 204,800 スレッド。
+    /// 形が合わない (np が 8 の倍数でない / 1024 超) は None = dn6 へ落ちる。
+    #[test]
+    fn mix_dn7_plan_and_gate_match_the_ud_mix_down() {
+        assert_eq!(mix_dn7_plan(10240, 320), Some((1, 640)), "実形が撃てない");
+        // np = n_in/64 が 8 の倍数でない / 0 は落とす。
+        assert_eq!(mix_dn7_plan(320, 10240), None, "up の形 (np=5) は対象外");
+        assert_eq!(mix_dn7_plan(64 * 4, 8), None, "np=4 (per_row が 32 の倍数でない)");
+        assert_eq!(mix_dn7_plan(0, 8), None);
+        assert_eq!(mix_dn7_plan(10240, 0), None);
+        // 1 行 1024 スレッド超 (np = 264 -> 1056) は落とす。
+        assert_eq!(mix_dn7_plan(64 * 264, 8), None);
+        // 1 行 1024 スレッドちょうど (np = 256) は通る。
+        assert_eq!(mix_dn7_plan(64 * 256, 8), Some((1, 1024)));
+        // ゲートは既存 env の新しい値。up は v5 のまま。
+        assert_eq!(mix_qk_from_value(Some("dn7")), (MixGemv::Dn7, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some(" D7 ")), (MixGemv::Dn7, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn7, MixGemv::V5), "既定は dn7");
+        // 発火の計数はリセットできる。
+        mix_dn7_reset();
+        assert_eq!(mix_dn7_hits(), 0);
+    }
+
+    /// task 431: `DENNO_MIX_ZC` の第 3 の指定 (H2D を別ストリームへ) の真理値表。
+    /// 既定 off、`stream` / `s` で H2D だけ、`os` / `outstream` / `all` で
+    /// D2H も消す。既存の値 (`x` / `out` / `1`) はストリームを立てない。
+    #[test]
+    fn mix_zc_h2d_stream_gate_parses_explicitly() {
+        assert!(!mix_zc_h2d_stream_from_value(None), "未設定は従来経路");
+        assert!(!mix_zc_h2d_stream_from_value(Some("")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("0")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("off")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("x")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("out")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("1")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("nope")));
+        assert!(mix_zc_h2d_stream_from_value(Some("stream")));
+        assert!(mix_zc_h2d_stream_from_value(Some(" S ")));
+        assert!(mix_zc_h2d_stream_from_value(Some("sx")));
+        assert!(mix_zc_h2d_stream_from_value(Some("instream")));
+        // `os` / `outstream` / `all` は D2H も消す (両方の表で真)。
+        for v in ["os", "outstream", "all"] {
+            assert!(mix_zc_h2d_stream_from_value(Some(v)), "{v}");
+            assert_eq!(mix_zc_from_value(Some(v)), (false, true), "{v}");
+        }
+        assert_eq!(mix_zc_from_value(Some("stream")), (false, false));
+        // 発火の計数はリセットできる。
+        mix_h2s_reset();
+        assert_eq!(mix_h2s_hits(), 0);
     }
 
     /// task 382: ZC のゲートを立てても、CUDA が無い環境では鎖そのものが
