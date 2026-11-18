@@ -126,19 +126,23 @@ const LE_LAT: [f64; 12] = [
     0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0,
 ];
 
-static TTFT_BUCKETS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// le の数 + 1 (+Inf の枠)。observe() は le.len() 番目に +Inf を積むので、
+/// 12 個だと 128 秒を超えた 1 件で index out of bounds の panic になる。
+const N_LAT: usize = LE_LAT.len() + 1;
+
+static TTFT_BUCKETS: [AtomicU64; N_LAT] = [const { AtomicU64::new(0) }; N_LAT];
 static TTFT_SUM_NS: AtomicU64 = AtomicU64::new(0);
 static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-static E2E_BUCKETS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static E2E_BUCKETS: [AtomicU64; N_LAT] = [const { AtomicU64::new(0) }; N_LAT];
 static E2E_SUM_NS: AtomicU64 = AtomicU64::new(0);
 static E2E_COUNT: AtomicU64 = AtomicU64::new(0);
 
-static INTER_BUCKETS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static INTER_BUCKETS: [AtomicU64; N_LAT] = [const { AtomicU64::new(0) }; N_LAT];
 static INTER_SUM_NS: AtomicU64 = AtomicU64::new(0);
 static INTER_COUNT: AtomicU64 = AtomicU64::new(0);
 
-static PREFILL_BUCKETS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static PREFILL_BUCKETS: [AtomicU64; N_LAT] = [const { AtomicU64::new(0) }; N_LAT];
 static PREFILL_SUM_NS: AtomicU64 = AtomicU64::new(0);
 static PREFILL_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -768,6 +772,18 @@ mod tests {
         assert_eq!(b[2].load(Ordering::Relaxed), 1);
         assert_eq!(c.load(Ordering::Relaxed), 3);
         assert_eq!(s.load(Ordering::Relaxed), 5_550_000_000);
+    }
+
+    /// 128 秒 (LE_LAT の末尾) を超える値でも panic しない (+Inf の枠がある)。
+    #[test]
+    fn histogram_over_last_bound_does_not_panic() {
+        assert_eq!(TTFT_BUCKETS.len(), LE_LAT.len() + 1);
+        assert_eq!(E2E_BUCKETS.len(), LE_LAT.len() + 1);
+        assert_eq!(INTER_BUCKETS.len(), LE_LAT.len() + 1);
+        assert_eq!(PREFILL_BUCKETS.len(), LE_LAT.len() + 1);
+        let before = PREFILL_BUCKETS[LE_LAT.len()].load(Ordering::Relaxed);
+        observe(&LE_LAT, &PREFILL_BUCKETS, &PREFILL_SUM_NS, &PREFILL_COUNT, 200.0);
+        assert_eq!(PREFILL_BUCKETS[LE_LAT.len()].load(Ordering::Relaxed), before + 1);
     }
 
     #[test]
