@@ -39339,10 +39339,12 @@ const Q4_GPU_ATTN_KERNEL_DEFAULT: Q4AttnKernel = Q4AttnKernel::Split;
 
 /// task 448: flash decoding を **タイル版** (`dno_attn_flashdec_t`) で回すか。
 ///
-/// `DENNO_Q4_GPU_ATTN_KERNEL=tile` (または `fdec2` / `fdt`) で on、
-/// `fdec1` / `fdec` で v1 を強制する。未設定・その他の値ではこの既定に従う
-/// (タスク 448 の lab で採否を決めるまで off = v1 のまま)。
-const ATTN_FLASHDEC_TILE_DEFAULT: bool = false;
+/// `DENNO_ATTN_FLASHDEC_TILE` (0/off で v1、4..=64 で on) が最優先、
+/// 次に `DENNO_ATTN_FLASHDEC2`、未設定なら `DENNO_Q4_GPU_ATTN_KERNEL`
+/// (`tile` で on、`fdec1` で v1) を見る。どれも未設定ならこの既定。
+/// task 448 の lab t448d の A/B (これ = タイル版 vs `DENNO_ATTN_FLASHDEC_TILE=0`
+/// = v1) で採否を決めた。
+const ATTN_FLASHDEC_TILE_DEFAULT: bool = true;
 
 /// t の分割数 (`DENNO_Q4_GPU_ATTN_SPLIT`, 1..=64)。
 ///
@@ -39779,6 +39781,23 @@ fn attn_fdec_tile_on() -> bool {
         Some(b) => b,
         None => fdec_tile_from_kernel(q4_gpu_attn_kernel()),
     }
+}
+
+/// task 448: 起動時の 1 行 (診断)。lab の COND で env が届いたか、測った
+/// バイナリが新しいかをログだけで判別できるようにする。数値経路には触らない。
+pub fn attn_fdec_boot_line() -> String {
+    let tile_on = attn_fdec_tile_on();
+    let k = match q4_gpu_attn_kernel() {
+        Q4AttnKernel::Decode => "decode",
+        Q4AttnKernel::Prefill => "pf",
+        Q4AttnKernel::Split => "split",
+        Q4AttnKernel::Tile => "tile",
+        Q4AttnKernel::Fdec1 => "fdec1",
+    };
+    format!(
+        "[attn-fdec] kernel={k} fdt_on={tile_on} tile={} fdtv=3 (task 448)",
+        attn_fdec_tile()
+    )
 }
 
 /// 門の判定を 1 回だけログる (発火しなかった回の原因を lab の log で見るため)。

@@ -3118,6 +3118,9 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         "[flash] exp miss rows: {} (DENNO_EXP_MISS_ROWS)",
         denno_engine::model::qwen4exp::exp_miss_rows_report()
     );
+    // task 448: decode の flash decoding の実装選択を 1 行で出す (COND の env が
+    // 届いたか、ビルドが新しいかをログで確かめる。数値経路には触らない)。
+    eprintln!("{}", denno_engine::cuda::attn_fdec_boot_line());
     // task 356: expert 段の寄与 D2H を専用ストリームへ出すゲート
     // (`DENNO_DEC_EXP_D2H_STREAM`、既定 off)。COND の env が届いたかをログで確かめる。
     eprintln!(
