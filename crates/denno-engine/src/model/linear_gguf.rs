@@ -1047,9 +1047,19 @@ pub fn embed_rows_into(
                 |row, (dst, &tok)| one(ty, blocks, rb, e, hc, dst, tok, row),
             );
     };
-    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-        Ok(p) => p.install(run),
-        Err(_) => run(),
+    // プールは 1 回だけ作る (層優先の prefill はチャンクごとに呼ぶので、
+    // 呼び出しごとに 16 本を起動すると固定費が効く)。本数はゲートで 1 回だけ
+    // 決まるので、最初の呼び出しの値を使い回してよい。
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok()
+    });
+    match pool {
+        Some(p) => p.install(run),
+        None => run(),
     }
     Ok(())
 }
