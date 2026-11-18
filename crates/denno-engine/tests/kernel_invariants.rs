@@ -11466,7 +11466,7 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
         ple.contains(".clamp(1, 128);"),
         "並列度の上限 128 が無い"
     );
-    // 層優先の先頭 gather が専用プールで回る (埋め込みは直列のまま)。
+    // 層優先の先頭 gather が専用プールで回る (task 415 で埋め込みも N 本になった)。
     assert!(
         QWEN_SRC.contains("let ple_wide = ple_batch && crate::model::exp_pf::ple_pipe();"),
         "LM 経路がゲートを見ていない"
@@ -11476,8 +11476,15 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
         "専用プールの本数が env から来ていない"
     );
     assert!(
-        QWEN_SRC.contains("Ok(p) => ples_all = p.install(run)?,"),
+        QWEN_SRC.contains("Ok(p) => p.install(run)?,"),
         "専用プールで gather を回していない"
+    );
+    // task 415: `DENNO_PF_EMBED_OVL` では同じ gather を背景スレッドで回し、
+    // 埋め込みと重ねる (gather 本体もプールも同じ)。
+    assert!(
+        QWEN_SRC.contains("ples_all = match ple_bg {")
+            && QWEN_SRC.contains("Some(h) => h.join()"),
+        "背景の gather の結果を ples_all へ入れていない"
     );
     // 値は変えない: 同じ gather 本体を通る。
     assert!(
