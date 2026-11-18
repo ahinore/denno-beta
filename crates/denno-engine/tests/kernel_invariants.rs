@@ -11505,15 +11505,16 @@ fn t357_ple_threads_gate_is_wired_to_the_pool() {
         ple_threads_from_value, DEFAULT_PLE_THREADS, PLE_THREADS_ENV,
     };
     assert_eq!(PLE_THREADS_ENV, "DENNO_PF_PLE_THREADS");
-    assert_eq!(DEFAULT_PLE_THREADS, 96, "既定は lab t357a/t357b の 96 本");
-    assert_eq!(ple_threads_from_value(None), 96);
+    // task 419: lab t419b で 128 本が ple 段 -8% だったので既定を 128 にした。
+    assert_eq!(DEFAULT_PLE_THREADS, 128, "既定は lab t419b の 128 本");
+    assert_eq!(ple_threads_from_value(None), 128);
     assert_eq!(ple_threads_from_value(Some("64")), 64);
     assert_eq!(
         ple_threads_from_value(Some("32")),
         32,
         "切り戻しは 32 (task 353 の値)"
     );
-    assert_eq!(ple_threads_from_value(Some("0")), 96, "0 は既定へ (逐次にはしない)");
+    assert_eq!(ple_threads_from_value(Some("0")), 128, "0 は既定へ (逐次にはしない)");
     assert_eq!(ple_threads_from_value(Some("4096")), 128, "上限 128");
     // プールの生成に env の本数が渡る (定数で固定されていない)。
     assert!(
