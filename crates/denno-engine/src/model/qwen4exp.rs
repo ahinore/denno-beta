@@ -6366,8 +6366,13 @@ pub fn mix_qchain_line() -> Option<String> {
     let dn5 = crate::cuda::mix_dn5_hits();
     #[cfg(not(feature = "cuda"))]
     let dn5 = 0u64;
+    // task 422: down を「1 ブロック rows 行」の dn6 で撃った回数。0 なら dn5/v5。
+    #[cfg(feature = "cuda")]
+    let dn6 = crate::cuda::mix_dn6_hits();
+    #[cfg(not(feature = "cuda"))]
+    let dn6 = 0u64;
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6382,6 +6387,9 @@ pub fn mix_qchain_reset() {
     // task 418: dn5 の計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::mix_dn5_reset();
+    // task 422: dn6 の計数も同じ区切りで 0 に戻す。
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_dn6_reset();
     // task 364: ルータを鎖に積んだ回数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::router_in_mix_qchain_reset();

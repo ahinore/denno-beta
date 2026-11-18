@@ -6438,6 +6438,9 @@ enum GdnDecGemv {
     V4,
     /// v5 (ベクタロード + 複数アキュムレータ + 先読み。`kernels_moe_v5.cu`)。
     V5,
+    /// task 422: dn6 (`kernels_mix_dn6.cu` = 1 ブロック rows 行 / 1 レーン 1 対)。
+    /// Q8_0 だけ。形が合わない単位は v5 へ落ちる (CPU へは落とさない)。
+    Dn6,
 }
 
 /// task 184: v5 を既定にするか。
@@ -6457,6 +6460,12 @@ fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
         Some("fp16") => GdnDecGemv::Fp16,
         Some("v4") => GdnDecGemv::V4,
         Some("v5") => GdnDecGemv::V5,
+        // task 422: dn6 (1 ブロック rows 行 / 1 レーン 1 対)。rows は
+        // `gdn_dn6_rows_from_value` が決める (既定 6 = block 960)。
+        Some("dn6") | Some("d6") | Some("dn6r1") | Some("dn6r2") | Some("dn6r4")
+        | Some("dn6r6") | Some("d6r1") | Some("d6r2") | Some("d6r4") | Some("d6r6") => {
+            GdnDecGemv::Dn6
+        }
         // 明示 off は「v5 以前の既定」= v4 (task 179 の既定)。
         Some("0") | Some("off") | Some("false") | Some("no") => GdnDecGemv::V4,
         _ => {
@@ -6493,14 +6502,50 @@ fn gdn_dec_gemv_mode_eff() -> GemvKernelMode {
 pub(crate) fn gdn_dec_gemv_v4_on() -> bool {
     match gdn_dec_gemv_choice() {
         // task 184: v5 の形が合わない単位は v4 へ落とす (CPU へは落とさない)。
-        GdnDecGemv::V4 | GdnDecGemv::V5 | GdnDecGemv::Default => true,
+        GdnDecGemv::V4 | GdnDecGemv::V5 | GdnDecGemv::Dn6 | GdnDecGemv::Default => true,
         GdnDecGemv::V2 | GdnDecGemv::V3 | GdnDecGemv::Fp16 => false,
     }
 }
 
 /// task 184: v5 を選んでいるか。
+///
+/// task 422: dn6 のときも true (dn6 の形に合わない単位・型は v5 の計画で撃つ。
+/// 撃ち分けは `gdn_dn6_plan` を見る起動側で行う)。
 pub(crate) fn gdn_dec_gemv_v5_on() -> bool {
-    matches!(gdn_dec_gemv_choice(), GdnDecGemv::V5)
+    matches!(gdn_dec_gemv_choice(), GdnDecGemv::V5 | GdnDecGemv::Dn6)
+}
+
+/// task 422: dn6 を選んでいるか (`DENNO_GDN_DEC_GEMV=dn6`)。
+pub(crate) fn gdn_dec_gemv_dn6_on() -> bool {
+    matches!(gdn_dec_gemv_choice(), GdnDecGemv::Dn6)
+}
+
+/// task 422: GDN の qkv/out 用の rows (純関数。既定 6 = block 960)。
+pub fn gdn_dn6_rows_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("dn6r1") | Some("d6r1") => 1,
+        Some("dn6r2") | Some("d6r2") => 2,
+        Some("dn6r4") | Some("d6r4") => 4,
+        Some("dn6r6") | Some("d6r6") => 6,
+        _ => 6,
+    }
+}
+
+/// task 422: GDN の qkv/out を dn6 で撃つときの `(warps, rows)`。
+///
+/// Q8_0 だけで、ゲートが dn6 のときだけ。形が合わなければ `None`
+/// (呼び出し側は v5 の `gdn_launch_gemv_dev` へ)。
+fn gdn_dn6_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<(usize, usize)> {
+    if ty != crate::kquant::GgmlType::Q8_0
+        || !gdn_dec_gemv_dn6_on()
+        || mix_dn6_kernels().is_none()
+    {
+        return None;
+    }
+    let want = gdn_dn6_rows_from_value(
+        std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref(),
+    );
+    mix_dn6_plan(k, n, want)
 }
 
 /// task 192: `DENNO_GDN_DEC_GEMV_Q5K` の解釈 (純関数。真理値表はテストで固定)。
@@ -32999,6 +33044,11 @@ pub enum MixGemv {
     /// x 64 スレッドに対し 320 ブロック x 160 スレッド = 5 倍のスレッドで、
     /// ループも先読みも無い。合計順が v5 と違う (丸めだけ)。
     Dn5,
+    /// task 422: 1 ブロック = rows 行・1 レーン = 1 対 (`kernels_mix_dn6.cu`)。
+    /// dn5 を「複数行」に一般化した形で、x の 64 要素をレジスタに 1 回だけ
+    /// 載せて rows 行で使い回す。行ごとの積和と縮約順は dn5 と同一なので、
+    /// **値は dn5 と 1 ビットも変わらない**。
+    Dn6,
 }
 
 /// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` の種別。
@@ -33026,6 +33076,12 @@ pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
         Some("ups") => (MixGemv::Blk, MixGemv::Seg),
         // task 418: down だけ 1 ブロック 1 行・1 レーン 1 対の新カーネル。
         Some("dn5") | Some("d5") => (MixGemv::Dn5, MixGemv::V5),
+        // task 422: down を「1 ブロック rows 行」に一般化した dn6
+        // (`mix_dn6_rows_from_value` が rows を決める。値は dn5 と同一)。
+        Some("dn6") | Some("d6") | Some("dn6r1") | Some("dn6r2") | Some("dn6r6")
+        | Some("dn6r8") | Some("d6r1") | Some("d6r2") | Some("d6r6") | Some("d6r8") => {
+            (MixGemv::Dn6, MixGemv::V5)
+        }
         // task 286 の形へ明示的に戻す逃げ道 (task 418 の切り戻し)。
         Some("1") | Some("both") | Some("v5") => (MixGemv::V5, MixGemv::V5),
         // task 418: lab t418b で short decode -2.3% / 14k 後 -2.7% (mix 段 -10.7%)、
@@ -33044,6 +33100,13 @@ pub fn mix_qk_enabled() -> (MixGemv, MixGemv) {
 /// gate_audit の台帳用 (既定 on のゲート)。どちらかが seg_k 系なら true。
 pub fn mix_qk_gate_on() -> bool {
     mix_qk_enabled() != (MixGemv::Old, MixGemv::Old)
+}
+
+/// task 422: dn6 が選ばれているか (gate_audit の台帳用)。
+/// mix の down (`DENNO_MIX_QK=dn6`) か GDN (`DENNO_GDN_DEC_GEMV=dn6`) の
+/// どちらかで選ばれたら true。
+pub fn mix_dn6_gate_on() -> bool {
+    mix_qk_enabled().0 == MixGemv::Dn6 || gdn_dec_gemv_dn6_on()
 }
 
 /// task 282: 高速 GEMV が実際に撃たれた回数 (診断用。プロセス通算)。
@@ -33312,6 +33375,205 @@ pub fn mix_dn5_hits() -> u64 {
 /// task 418: 集計を 0 に戻す (リクエスト終端)。
 pub fn mix_dn5_reset() {
     MIX_DN5_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ===========================================================================
+// task 422: `dno_mix_gemv_q8_0_dn6` — dn5 を「1 ブロック = rows 行」に一般化
+// (`DENNO_MIX_QK=dn6` / `DENNO_GDN_DEC_GEMV=dn6`)
+// ===========================================================================
+//
+// lab t422a の `[dec-kprof-avg]` (band 0、既定モデル) で、Q8_0 の GEMV は 2 か所が
+// 残っていた:
+//   - mix の down (`dn5`): 320 x 160 = 15.4 us。重み 3.48 MB + **x 13.1 MB**
+//     (320 ブロックが同じ 41 KB を読む) = 16.6 MB を 1.08 TB/s。
+//   - GDN の qkv/out (`dno_gemv_q8_0_v5`): 320 x 256 が 2 本/層で 35.4 us ずつ。
+//     v5 は 8 行 1 ブロック・1 レーンが 5 対を逐次ループ (重み 27.9 MB を 787 GB/s)。
+// dn6 は 1 レーン = 1 対のまま、**1 ブロックが rows 行を持つ**ので
+//   (a) 1 レーンの逐次ループが無くなる (v5 の 5 対 -> 1 対)
+//   (b) x の 64 要素をレジスタに 1 回だけ載せて rows 行で使い回す (x が 1/rows)
+// を行う。行ごとの積和と縮約の順は dn5 と同一なので、**値は dn5 と 1 ビットも
+// 変わらない** (v5 から切り替えたときだけ合計順が変わる = 丸めだけ)。
+
+/// 新カーネルの名前。
+const MIX_DN6_KERNEL_NAME: &str = "dno_mix_gemv_q8_0_dn6";
+
+/// 新カーネルの引数の数 (w, x, out, n_in, n_out, row_bytes, rows)。
+const MIX_DN6_NARGS: usize = 7;
+
+/// `.cu` の `part[8][8]` (warp の部分和 / 行の上限)。
+const MIX_DN6_MAX_WARPS: usize = 8;
+const MIX_DN6_MAX_ROWS: usize = 8;
+
+/// 1 ブロックのスレッド上限 (rows * 32 * warps)。
+const MIX_DN6_MAX_THREADS: usize = 1024;
+
+struct MixDn6Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixDn6Kernels {}
+unsafe impl Sync for MixDn6Kernels {}
+
+static MIX_DN6_KERNELS: OnceLock<Option<MixDn6Kernels>> = OnceLock::new();
+
+fn mix_dn6_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_DN6_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_dn6.ptx"),
+    }
+}
+
+/// 新カーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_dn6_kernels() -> Option<&'static MixDn6Kernels> {
+    MIX_DN6_KERNELS
+        .get_or_init(|| {
+            let path = mix_dn6_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_DN6_KERNEL_NAME) != Some(MIX_DN6_NARGS) {
+                eprintln!(
+                    "[mix-dn6] PTX の引数が {MIX_DN6_NARGS} 本でない → dn5 / v5 へ。\
+                     `bash build_ptx.sh mix_dn6` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_DN6_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-dn6] PTX に {MIX_DN6_KERNEL_NAME} が無い → dn5 / v5 へ");
+                    return None;
+                }
+                Some(MixDn6Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 新カーネルが載っているか (テスト / 診断用)。
+pub fn mix_dn6_loaded() -> bool {
+    mix_dn6_kernels().is_some()
+}
+
+/// 形の門番 (純関数)。`.cu` の前提は
+/// 「Q8_0 / n_in % 64 == 0 / 対の数 np = n_in / 64 が 1 以上 /
+///   warps = ceil(np / 32) が 8 以下」。返り値は 1 行あたりの warp 数。
+pub fn mix_dn6_warps(n_in: usize) -> Option<usize> {
+    if n_in == 0 || n_in % 64 != 0 {
+        return None;
+    }
+    let np = n_in / 64;
+    if np == 0 {
+        return None;
+    }
+    let warps = np.div_ceil(32);
+    if warps == 0 || warps > MIX_DN6_MAX_WARPS {
+        return None;
+    }
+    Some(warps)
+}
+
+/// 起動形 (純関数)。`Some((warps, rows))` なら撃てる。
+///
+/// `want_rows` は 1 ブロックが持つ行数の希望。`rows * 32 * warps <= 1024` と
+/// `rows <= 8` に丸める (丸めた結果が 1 未満なら撃たない)。
+pub fn mix_dn6_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<(usize, usize)> {
+    if n_out == 0 {
+        return None;
+    }
+    let warps = mix_dn6_warps(n_in)?;
+    let fit = MIX_DN6_MAX_THREADS / (32 * warps);
+    let rows = want_rows.clamp(1, fit.min(MIX_DN6_MAX_ROWS));
+    if rows == 0 {
+        return None;
+    }
+    let grid = n_out.div_ceil(rows);
+    if grid == 0 || grid > u32::MAX as usize {
+        return None;
+    }
+    Some((warps, rows))
+}
+
+/// 新カーネルを 1 本積む (grid = ceil(n_out / rows)、block = 32 * warps * rows)。
+fn launch_mix_dn6(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    x: CUdeviceptr,
+    o: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+    warps: usize,
+    rows: usize,
+) -> Result<()> {
+    let k = mix_dn6_kernels().ok_or_else(|| anyhow::anyhow!("dn6 のカーネルが無い"))?;
+    let (mut pw, mut px, mut po) = (w, x, o);
+    let (mut ni, mut no, mut rb) = (n_in as c_int, n_out as c_int, row_bytes as c_int);
+    let mut rw = rows as c_int;
+    let mut args = [
+        &mut pw as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut po as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut no as *mut _ as *mut c_void,
+        &mut rb as *mut _ as *mut c_void,
+        &mut rw as *mut _ as *mut c_void,
+    ];
+    let grid = n_out.div_ceil(rows).max(1) as u32;
+    let block = (32 * warps * rows) as u32;
+    unsafe { ctx.launch_async(k.f, (grid, 1, 1), (block, 1, 1), 0, &mut args) }
+}
+
+/// task 422: dn6 を撃った回数 (診断。`[mix-qchain]` の `dn6=` に出る)。
+static MIX_DN6_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 422: dn6 を撃った回数。
+pub fn mix_dn6_hits() -> u64 {
+    MIX_DN6_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 422: 集計を 0 に戻す。
+pub fn mix_dn6_reset() {
+    MIX_DN6_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `DENNO_MIX_QK` / `DENNO_GDN_DEC_GEMV` の値から dn6 の rows を決める (純関数)。
+///
+/// `dn6` / `d6` = 4 行 (実測で選ぶ)、`dn6r2` = 2 行、`dn6r6` = 6 行
+/// (GDN の qkv/out は 6 行 = block 960)。それ以外は既定 4。
+pub fn mix_dn6_rows_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("dn6r2") | Some("d6r2") => 2,
+        Some("dn6r6") | Some("d6r6") => 6,
+        Some("dn6r1") | Some("d6r1") => 1,
+        _ => 4,
+    }
+}
+
+/// dn6 の rows (mix の down 用。env から 1 回だけ読む)。
+fn mix_dn6_rows() -> usize {
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        mix_dn6_rows_from_value(std::env::var(MIX_QK_ENV).ok().as_deref())
+    })
 }
 
 // ===========================================================================
@@ -33752,7 +34014,18 @@ pub fn maybe_gpu_mix_q_chain_into(
         } else {
             None
         };
+        // task 422: dn6 (1 ブロック rows 行) は dn5 の一般化。rows は
+        // `DENNO_MIX_QK` の値 (`dn6` = 4 行) から。
+        let dn6_plan = if want_down == MixGemv::Dn6
+            && down_ty == crate::kquant::GgmlType::Q8_0
+            && mix_dn6_kernels().is_some()
+        {
+            mix_dn6_plan(k1, n1, mix_dn6_rows())
+        } else {
+            None
+        };
         let down_kind = match (want_down, kern, rd) {
+            (MixGemv::Dn6, _, _) if dn6_plan.is_some() => MixGemv::Dn6,
             (MixGemv::Dn5, _, _) if dn5_warps.is_some() => MixGemv::Dn5,
             (MixGemv::V5, _, _) if v5_down.is_some() => MixGemv::V5,
             (MixGemv::Blk, Some(k), Some(_)) if k.mix_rowblk.is_some() => MixGemv::Blk,
@@ -33920,6 +34193,12 @@ pub fn maybe_gpu_mix_q_chain_into(
                         let warps = dn5_warps.expect("検査済み");
                         launch_mix_dn5(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps)?;
                         MIX_DN5_HITS.fetch_add(1, AO::Relaxed);
+                    }
+                    MixGemv::Dn6 => {
+                        // task 422: 1 ブロック rows 行・1 レーン 1 対 (dn5 と同じ値)。
+                        let (warps, rows) = dn6_plan.expect("検査済み");
+                        launch_mix_dn6(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps, rows)?;
+                        MIX_DN6_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     MixGemv::V5 => {
                         // task 286: v5 形 (68 B の対読み + 先読み)。重みは生ポインタ。
@@ -44483,6 +44762,188 @@ mod tests {
             );
             // 決定的であること (同じ入力で 2 回)。
             assert_eq!(a.to_bits(), dn5(r).to_bits(), "dn5 が決定的でない");
+        }
+    }
+
+    /// task 422: `DENNO_MIX_QK=dn6` / `DENNO_GDN_DEC_GEMV=dn6` の解釈と
+    /// 起動形の門番 (1 ブロック rows 行 / 1 レーン 1 対)。
+    #[test]
+    fn mix_dn6_gate_and_shape() {
+        // mix の down: dn6 系の値はすべて (Dn6, V5)。既定は dn5 のまま。
+        for v in ["dn6", "d6", "DN6", " dn6r1 ", "dn6r2", "dn6r6", "dn6r8"] {
+            assert_eq!(
+                mix_qk_from_value(Some(v)),
+                (MixGemv::Dn6, MixGemv::V5),
+                "raw={v:?}"
+            );
+        }
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
+        // rows の解釈 (mix の down の既定は 4 行)。
+        assert_eq!(mix_dn6_rows_from_value(Some("dn6r1")), 1);
+        assert_eq!(mix_dn6_rows_from_value(Some("dn6r2")), 2);
+        assert_eq!(mix_dn6_rows_from_value(Some("dn6r6")), 6);
+        assert_eq!(mix_dn6_rows_from_value(Some("dn6")), 4);
+        assert_eq!(mix_dn6_rows_from_value(None), 4);
+        assert_eq!(mix_dn6_rows_from_value(Some("dn5")), 4);
+        // GDN の qkv/out の既定は 6 行 (block 960)。
+        assert_eq!(gdn_dn6_rows_from_value(Some("dn6r1")), 1);
+        assert_eq!(gdn_dn6_rows_from_value(Some("dn6r4")), 4);
+        assert_eq!(gdn_dn6_rows_from_value(Some("dn6")), 6);
+        assert_eq!(gdn_dn6_rows_from_value(None), 6);
+        // warp 数 = ceil(np / 32) (dn5 の np/32 と違い、割り切れない形も載る)。
+        assert_eq!(mix_dn6_warps(10240), Some(5), "対 160 -> 5 warp");
+        assert_eq!(mix_dn6_warps(5120), Some(3), "対 80 -> ceil(80/32) = 3");
+        assert_eq!(mix_dn6_warps(2048), Some(1), "対 32 -> 1 warp");
+        assert_eq!(mix_dn6_warps(320), Some(1), "対 5 -> 1 warp");
+        assert_eq!(mix_dn6_warps(64 * 256), Some(8));
+        assert_eq!(mix_dn6_warps(64 * 288), None, "9 warp は part[8] を越える");
+        assert_eq!(mix_dn6_warps(0), None);
+        assert_eq!(mix_dn6_warps(1024 + 32), None, "64 で割れない");
+        // 起動形: rows * 32 * warps <= 1024 に丸める。
+        assert_eq!(mix_dn6_plan(10240, 320, 4), Some((5, 4)), "mix の down");
+        assert_eq!(mix_dn6_plan(10240, 320, 8), Some((5, 6)), "1024 / 160 = 6 行");
+        assert_eq!(mix_dn6_plan(10240, 2560, 6), Some((5, 6)), "GDN の qkv");
+        assert_eq!(mix_dn6_plan(10240, 0, 4), None, "n_out = 0");
+        assert_eq!(mix_dn6_plan(1024 + 32, 320, 4), None, "形が合わない");
+    }
+
+    /// task 422: dn6 (1 ブロック rows 行・x をレジスタで使い回す) の合計順を
+    /// CPU で写し、**dn5 (1 ブロック 1 行) と 1 ビット一致**すること、
+    /// f64 の真値に 1e-4 + 1e-5*|ref| で一致することを固定する。
+    #[test]
+    fn mix_dn6_cpu_mirror_is_bit_identical_to_dn5() {
+        let n_in = 10240usize;
+        let n_out = 8usize;
+        let nb = n_in / 32;
+        let rb = nb * 34;
+        let mut w = vec![0u8; rb * n_out];
+        for r in 0..n_out {
+            for b in 0..nb {
+                let o = r * rb + b * 34;
+                w[o] = 0x00;
+                w[o + 1] = 0x38; // f16 0.5
+                for j in 0..32 {
+                    let q = ((b * 32 + j + 5 * r) % 255) as i32 - 127;
+                    w[o + 2 + j] = q as i8 as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..n_in).map(|i| ((i * 41 % 1013) as f32 - 506.0) / 991.0).collect();
+        // 1 対 (68 B) の積和。式も 4 アキュムレータも `.cu` と同じ。
+        let dot = |r: usize, pair: usize| -> f32 {
+            let base = r * rb + pair * 68;
+            let d0 = f16_bits_to_f32(u16::from_le_bytes([w[base], w[base + 1]]));
+            let d1 = f16_bits_to_f32(u16::from_le_bytes([w[base + 34], w[base + 35]]));
+            let mut acc = [0.0f32; 4];
+            for j in 0..32 {
+                let q = w[base + 2 + j] as i8 as f32;
+                let y = q * d0;
+                acc[j & 3] += y * x[pair * 64 + j];
+            }
+            for j in 0..32 {
+                let q = w[base + 34 + 2 + j] as i8 as f32;
+                let y = q * d1;
+                acc[j & 3] += y * x[pair * 64 + 32 + j];
+            }
+            (acc[0] + acc[1]) + (acc[2] + acc[3])
+        };
+        // 木の縮約 (offset 16..1) と warp の逐次加算。
+        let reduce = |lane: &mut [f32; 32]| -> f32 {
+            let mut off = 16;
+            while off > 0 {
+                for l in 0..off {
+                    lane[l] += lane[l + off];
+                }
+                off >>= 1;
+            }
+            lane[0]
+        };
+        let np = n_in / 64;
+        let warps = np / 32;
+        // dn5: 1 ブロック 1 行。
+        let dn5 = |r: usize| -> f32 {
+            let mut part = [0.0f32; 8];
+            for wid in 0..warps {
+                let mut lane = [0.0f32; 32];
+                for l in 0..32 {
+                    lane[l] = dot(r, wid * 32 + l);
+                }
+                part[wid] = reduce(&mut lane);
+            }
+            let mut s = part[0];
+            for i in 1..warps {
+                s += part[i];
+            }
+            s
+        };
+        // dn6: 1 ブロック rows 行。x は 1 レーン 1 回だけ読んで行で使い回す
+        // (カーネルと同じ構造。丸めの順は行ごとに dn5 と同一)。
+        let dn6 = |rows: usize| -> Vec<f32> {
+            let mut out: Vec<f32> = Vec::with_capacity(n_out);
+            let blocks = n_out.div_ceil(rows);
+            for b in 0..blocks {
+                let mut part = [[0.0f32; 8]; 8];
+                for r in 0..rows {
+                    let row = b * rows + r;
+                    if row >= n_out {
+                        continue;
+                    }
+                    for wid in 0..warps {
+                        let mut lane = [0.0f32; 32];
+                        for l in 0..32 {
+                            lane[l] = dot(row, wid * 32 + l);
+                        }
+                        part[r][wid] = reduce(&mut lane);
+                    }
+                }
+                for r in 0..rows {
+                    let row = b * rows + r;
+                    if row >= n_out {
+                        continue;
+                    }
+                    let mut s = part[r][0];
+                    for i in 1..warps {
+                        s += part[r][i];
+                    }
+                    out.push(s);
+                }
+            }
+            out
+        };
+        let reference = |r: usize| -> f64 {
+            let mut s = 0.0f64;
+            for pair in 0..np {
+                let base = r * rb + pair * 68;
+                let d0 = f16_bits_to_f32(u16::from_le_bytes([w[base], w[base + 1]])) as f64;
+                let d1 = f16_bits_to_f32(u16::from_le_bytes([w[base + 34], w[base + 35]])) as f64;
+                for j in 0..32 {
+                    s += (w[base + 2 + j] as i8 as f64) * d0 * x[pair * 64 + j] as f64;
+                }
+                for j in 0..32 {
+                    s += (w[base + 34 + 2 + j] as i8 as f64) * d1 * x[pair * 64 + 32 + j] as f64;
+                }
+            }
+            s
+        };
+        for rows in [1usize, 2, 4, 6] {
+            let got = dn6(rows);
+            assert_eq!(got.len(), n_out, "行数が違う (rows={rows})");
+            for r in 0..n_out {
+                let a = got[r];
+                let b = dn5(r);
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dn6(rows={rows}) と dn5 が 1 ビットでも違う: row={r} dn6={a} dn5={b}"
+                );
+                let rf = reference(r);
+                let tol = 1e-4 + 1e-5 * rf.abs();
+                assert!(
+                    (a as f64 - rf).abs() <= tol,
+                    "dn6 が真値から外れた: rows={rows} row={r} dn6={a} ref={rf}"
+                );
+            }
         }
     }
 
@@ -59979,15 +60440,32 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             gdn_ba_par_mark_done()?;
         }
         for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
-            gdn_launch_gemv_dev(
-                ctx,
-                cfg,
-                &qw[i].buf,
-                px,
-                e.qkv.ptr() + (*row * 4) as CUdeviceptr,
-                u.k,
-                u.n,
-            )?;
+            // task 422: Q8_0 で形が合えば dn6 (1 ブロック rows 行 / 1 レーン 1 対)。
+            match gdn_dn6_plan(u.ty, u.k, u.n) {
+                Some((warps, rows)) => {
+                    launch_mix_dn6(
+                        ctx,
+                        qw[i].buf.ptr(),
+                        px,
+                        e.qkv.ptr() + (*row * 4) as CUdeviceptr,
+                        u.k,
+                        u.n,
+                        cfg.rb,
+                        warps,
+                        rows,
+                    )?;
+                    MIX_DN6_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                None => gdn_launch_gemv_dev(
+                    ctx,
+                    cfg,
+                    &qw[i].buf,
+                    px,
+                    e.qkv.ptr() + (*row * 4) as CUdeviceptr,
+                    u.k,
+                    u.n,
+                )?,
+            }
             stage_sync!(format!("qkv_gemv[{i}]"));
         }
         let (mut pq, mut pz) = (
@@ -60054,7 +60532,32 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         }
         scan_launched.set(true);
         stage_sync!("scan");
-        gdn_launch_gemv_dev(ctx, &ocfg, &ow.buf, e.y.ptr(), e.out.ptr(), req.nv * req.dv, req.n_embd)?;
+        // task 422: out 投影も Q8_0 で形が合えば dn6。
+        match gdn_dn6_plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n) {
+            Some((warps, rows)) => {
+                launch_mix_dn6(
+                    ctx,
+                    ow.buf.ptr(),
+                    e.y.ptr(),
+                    e.out.ptr(),
+                    req.out_unit.k,
+                    req.out_unit.n,
+                    ocfg.rb,
+                    warps,
+                    rows,
+                )?;
+                MIX_DN6_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => gdn_launch_gemv_dev(
+                ctx,
+                &ocfg,
+                &ow.buf,
+                e.y.ptr(),
+                e.out.ptr(),
+                req.nv * req.dv,
+                req.n_embd,
+            )?,
+        }
         stage_sync!("out_gemv");
         let out = e.out.to_vec::<f32>(req.n_embd)?;
         // 診断 (DENNO_GDN_GPU_CHECK): scan 後のデバイス状態も読む。
