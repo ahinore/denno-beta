@@ -1252,6 +1252,37 @@ pub fn k_min_rows() -> usize {
     *N.get_or_init(|| k_min_rows_from_value(std::env::var(K_MIN_ROWS_ENV).ok().as_deref()))
 }
 
+/// task 419: `DENNO_PF_EXP_IQ_MIN_ROWS` — **IQ 系**の expert にも行数の床を置く。
+///
+/// [`K_MIN_ROWS_ENV`] は K 系 (`UD-Q4_K_XL`) にしか効かない
+/// (`!iq_expert_mode(lw)` の条件)。既定モデルの expert は
+/// IQ3_XXS / IQ2_S / IQ4_NL / IQ4_XS / type 42 の混在 = **IQ 系**なので、
+/// 行が 1-2 本しかない expert でも重み 2 MB を丸ごと GPU へ上げている
+/// (lab t419a の `[exp-pf-stream]`: 14k で 13,616 本 27.9 GB、
+/// 3,826 で 10,938 本 22.4 GB。1 本あたり 2.05 MB)。
+/// 上げた重みで計算する行数が床未満なら、CPU の flat 経路
+/// (`moe_experts_flat`) のほうが安い。
+///
+/// 既定 **0** (床なし = 従来どおり全部上げる)。lab の採否で決める。
+pub const IQ_MIN_ROWS_ENV: &str = "DENNO_PF_EXP_IQ_MIN_ROWS";
+
+/// [`IQ_MIN_ROWS_ENV`] の既定値 (床なし)。
+pub const DEFAULT_IQ_MIN_ROWS: usize = 0;
+
+/// [`IQ_MIN_ROWS_ENV`] の解釈 (純関数)。
+pub fn iq_min_rows_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) if !s.is_empty() => s.parse().unwrap_or(DEFAULT_IQ_MIN_ROWS),
+        _ => DEFAULT_IQ_MIN_ROWS,
+    }
+}
+
+/// IQ 系の行数の床 (プロセスで 1 回だけ env を読む)。
+pub fn iq_min_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| iq_min_rows_from_value(std::env::var(IQ_MIN_ROWS_ENV).ok().as_deref()))
+}
+
 /// この expert の行数を GPU に回すか (純関数。`min_rows = 0` は全部 GPU)。
 pub fn k_expert_pays(rows: usize, min_rows: usize) -> bool {
     rows > 0 && rows >= min_rows
@@ -3996,6 +4027,23 @@ mod tests {
         assert_eq!(row_bytes(T::Q5_1, 640), Some(480));
         assert_eq!(row_bytes(T::Q8_0, 2560), Some(2720));
         assert_eq!(row_bytes(T::Q6K, 2560), Some(2100));
+    }
+
+    /// task 419: IQ 系の行数の床は既定 0 (床なし)。値はそのまま読む。
+    #[test]
+    fn iq_min_rows_truth_table() {
+        assert_eq!(iq_min_rows_from_value(None), 0, "未設定は床なし");
+        assert_eq!(iq_min_rows_from_value(Some("")), 0);
+        assert_eq!(iq_min_rows_from_value(Some("x")), 0, "解析不能は床なし");
+        assert_eq!(iq_min_rows_from_value(Some("0")), 0, "0 は床なし");
+        assert_eq!(iq_min_rows_from_value(Some("16")), 16);
+        assert_eq!(iq_min_rows_from_value(Some(" 32 ")), 32, "空白は落とす");
+        assert_eq!(DEFAULT_IQ_MIN_ROWS, 0, "既定が動いている");
+        assert_eq!(IQ_MIN_ROWS_ENV, "DENNO_PF_EXP_IQ_MIN_ROWS");
+        // 床の判定は K 系と同じ関数 (行 0 は回さない)。
+        assert!(!k_expert_pays(15, 16));
+        assert!(k_expert_pays(16, 16));
+        assert!(k_expert_pays(1, 0), "床 0 は全部 GPU");
     }
 
     /// task 309: K 系のゲートは IQ ゲートの内側・既定 off・明示の真値だけ on。

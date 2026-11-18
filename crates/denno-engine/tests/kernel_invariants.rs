@@ -12484,3 +12484,51 @@ fn task418_mix_dn5_kernel_is_wired() {
         assert_eq!(got, 6, "PTX の引数が {got} 個 (ホスト側は 6 個)");
     }
 }
+
+/// task 419: IQ 系の行数の床 (`DENNO_PF_EXP_IQ_MIN_ROWS`) の配線。
+///
+/// 既定モデルの expert は IQ 系の混在なので、K 系にしか効かない
+/// `DENNO_PF_EXP_K_MIN_ROWS` では「行が 1-2 本の expert に 2 MB を上げる」のを
+/// 止められない。床は既定 0 (従来) で、明示したときだけ効く。
+#[test]
+fn task419_iq_min_rows_is_wired_into_the_stream_split() {
+    // 1. ゲートの名前・既定・読み口。
+    assert!(
+        EXP_PF_SRC.contains("pub const IQ_MIN_ROWS_ENV: &str = \"DENNO_PF_EXP_IQ_MIN_ROWS\";"),
+        "IQ の床の env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub const DEFAULT_IQ_MIN_ROWS: usize = 0;"),
+        "IQ の床の既定が 0 でない (既定は従来 = 全部上げる)"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn iq_min_rows() -> usize {"),
+        "IQ の床の読み口が無い"
+    );
+    let v = fn_body(EXP_PF_SRC, "pub fn iq_min_rows_from_value(");
+    assert!(v.contains("s.parse().unwrap_or(DEFAULT_IQ_MIN_ROWS)"), "解析の失敗先が既定でない");
+    // 2. ストリーム経路: IQ モードのとき IQ の床を読み、床未満を CPU の列へ回す。
+    //    K 系の床と CPU の flat 経路はそのまま残っていること。
+    let f = fn_body(QWEN4EXP_RS, "fn moe_experts_iq_pf_batch(");
+    assert!(f.contains("let iq_mode = iq_expert_mode(lw);"), "IQ 判定が無い");
+    assert!(
+        f.contains("crate::model::exp_pf::iq_min_rows()"),
+        "IQ の床を読んでいない"
+    );
+    assert!(
+        f.contains("crate::model::exp_pf::k_min_rows()"),
+        "K 系の床が消えている"
+    );
+    assert!(
+        f.contains("crate::model::exp_pf::k_expert_pays(p.len(), min_rows)"),
+        "床の判定が無い"
+    );
+    assert!(
+        f.contains("cpu_be.push(picks.clone())"),
+        "床未満を CPU の列へ回していない"
+    );
+    assert!(
+        f.contains("moe_experts_flat("),
+        "CPU の flat 経路を呼んでいない"
+    );
+}

@@ -17277,10 +17277,21 @@ fn moe_experts_iq_pf_batch(
         }
         // task 309: 行の少ない expert は CPU に残す (重み 1 本 3 MB の転送が
         // 計算より高い)。K 系のときだけ (IQ 系の既存の挙動は変えない)。
-        let min_rows = crate::model::exp_pf::k_min_rows();
-        let split = !iq_expert_mode(lw)
-            && crate::model::exp_pf::k_enabled()
-            && min_rows > 0
+        // task 419: IQ 系にも同じ床を置けるようにした (`DENNO_PF_EXP_IQ_MIN_ROWS`。
+        // 既定 0 = 従来どおり IQ は全部上げる)。既定モデルの expert は IQ 系の
+        // 混在なので、行が少ない expert の 2 MB を上げるか CPU で回すかを選べる。
+        let iq_mode = iq_expert_mode(lw);
+        let min_rows = if iq_mode {
+            crate::model::exp_pf::iq_min_rows()
+        } else {
+            crate::model::exp_pf::k_min_rows()
+        };
+        let floor_on = if iq_mode {
+            min_rows > 0
+        } else {
+            crate::model::exp_pf::k_enabled() && min_rows > 0
+        };
+        let split = floor_on
             && by_expert.iter().any(|p| {
                 !p.is_empty() && !crate::model::exp_pf::k_expert_pays(p.len(), min_rows)
             });
