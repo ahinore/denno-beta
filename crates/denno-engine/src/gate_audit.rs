@@ -171,10 +171,10 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_MIX_DN5_PTX",
         on: crate::cuda::mix_qk_gate_on,
     },
-    // task 422: dn6 (`DENNO_MIX_QK=dn6` / `DENNO_GDN_DEC_GEMV=dn6`)。
-    // 1 ブロック rows 行・1 レーン 1 対で、PTX が欠けると dn5 / v5 へ静かに
-    // 落ちる (遅い) ので台帳に載せる。既定はまだ dn5 / v5 なので on は
-    // 「どちらかの選択が dn6 のとき」だけ真。
+    // task 422: mix の down の既定は **dn6** (1 ブロック 2 行 / 1 レーン 1 対、
+    // lab t422b で採否)。dn5 の一般化で、PTX が欠けると `mix_dn6_plan` の門番で
+    // v5 へ静かに落ちる (遅い) ので台帳に載せる。GDN 側 (`DENNO_GDN_DEC_GEMV=dn6`)
+    // は lab で悪化したので既定 off。
     GatePtx {
         env: "DENNO_MIX_QK",
         ptx: "kernels_mix_dn6.ptx",

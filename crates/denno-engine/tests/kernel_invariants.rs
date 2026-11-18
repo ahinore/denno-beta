@@ -12390,7 +12390,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "build_ptx.sh に target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 gdn_pf_wy5"),
+        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5"),
         "targets_all に足していない"
     );
     assert!(
@@ -12449,7 +12449,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         CUDA_RS.contains("Some(\"dn6\") | Some(\"d6\")"),
         "mix のゲートの解釈が無い"
     );
-    assert!(CUDA_RS.contains("_ => (MixGemv::Dn5, MixGemv::V5),"), "既定が変わっている");
+    assert!(CUDA_RS.contains("_ => (MixGemv::Dn6, MixGemv::V5),"), "既定が dn6 でない");
     // GDN 側: 新しい値 dn6 と、起動点 2 か所 (qkv / out) が dn6 を通る。
     assert!(CUDA_RS.contains("Some(\"dn6\") | Some(\"d6\") | Some(\"dn6r1\")"), "GDN のゲートが無い");
     assert!(

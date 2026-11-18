@@ -6531,6 +6531,14 @@ pub fn gdn_dn6_rows_from_value(v: Option<&str>) -> usize {
     }
 }
 
+/// GDN の dn6 の rows (env から 1 回だけ読む。層 x トークンごとに引かない)。
+fn gdn_dn6_rows() -> usize {
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        gdn_dn6_rows_from_value(std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref())
+    })
+}
+
 /// task 422: GDN の qkv/out を dn6 で撃つときの `(warps, rows)`。
 ///
 /// Q8_0 だけで、ゲートが dn6 のときだけ。形が合わなければ `None`
@@ -6542,10 +6550,7 @@ fn gdn_dn6_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<(usiz
     {
         return None;
     }
-    let want = gdn_dn6_rows_from_value(
-        std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref(),
-    );
-    mix_dn6_plan(k, n, want)
+    mix_dn6_plan(k, n, gdn_dn6_rows())
 }
 
 /// task 192: `DENNO_GDN_DEC_GEMV_Q5K` の解釈 (純関数。真理値表はテストで固定)。
@@ -33078,16 +33083,19 @@ pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
         Some("dn5") | Some("d5") => (MixGemv::Dn5, MixGemv::V5),
         // task 422: down を「1 ブロック rows 行」に一般化した dn6
         // (`mix_dn6_rows_from_value` が rows を決める。値は dn5 と同一)。
-        Some("dn6") | Some("d6") | Some("dn6r1") | Some("dn6r2") | Some("dn6r6")
-        | Some("dn6r8") | Some("d6r1") | Some("d6r2") | Some("d6r6") | Some("d6r8") => {
+        Some("dn6") | Some("d6") | Some("dn6r1") | Some("dn6r2") | Some("dn6r4")
+        | Some("dn6r6") | Some("dn6r8") | Some("d6r1") | Some("d6r2") | Some("d6r4")
+        | Some("d6r6") | Some("d6r8") => {
             (MixGemv::Dn6, MixGemv::V5)
         }
         // task 286 の形へ明示的に戻す逃げ道 (task 418 の切り戻し)。
         Some("1") | Some("both") | Some("v5") => (MixGemv::V5, MixGemv::V5),
-        // task 418: lab t418b で short decode -2.3% / 14k 後 -2.7% (mix 段 -10.7%)、
-        // md5 全 SAME だったので **down の既定を dn5 にした**。形が合わない型・k
-        // (up の 320 や PTX 欠け) は `mix_dn5_warps` の門番で v5 へ落ちる。
-        _ => (MixGemv::Dn5, MixGemv::V5),
+        // task 422: lab t422b で短い decode 12.9 -> 12.5 (-3.1%)、14k 後 -4.1%、
+        // mix 段 -6.7%、md5 全 SAME (rows=2 が rows=4 より全点で良かった) なので
+        // **down の既定を dn6 (rows=2) にした**。形が合わない型・k (up の 320 や
+        // PTX 欠け) は `mix_dn6_plan` の門番で v5 へ落ちる。
+        // 切り戻しは `DENNO_MIX_QK=dn5` (task 418) か `v5` (task 286)。
+        _ => (MixGemv::Dn6, MixGemv::V5),
     }
 }
 
@@ -33561,10 +33569,13 @@ pub fn mix_dn6_reset() {
 /// (GDN の qkv/out は 6 行 = block 960)。それ以外は既定 4。
 pub fn mix_dn6_rows_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("dn6r2") | Some("d6r2") => 2,
-        Some("dn6r6") | Some("d6r6") => 6,
         Some("dn6r1") | Some("d6r1") => 1,
-        _ => 4,
+        Some("dn6r4") | Some("d6r4") => 4,
+        Some("dn6r6") | Some("d6r6") => 6,
+        Some("dn6r8") | Some("d6r8") => 8,
+        // task 422: 既定 (未設定 / dn6 / d6 / それ以外) は 2 行。
+        // lab t422b で rows=2 が rows=4 より短い decode・14k 後とも良かった。
+        _ => 2,
     }
 }
 
@@ -44612,16 +44623,16 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("V5D")), (MixGemv::V5, MixGemv::R8));
         assert_eq!(mix_qk_from_value(Some("v5u")), (MixGemv::Blk, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
-        // 未知の値は既定 (dn5) へ倒す。切り戻しは `v5` か `0`。
-        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::Dn5, MixGemv::V5));
+        // 未知の値は既定 (task 422 で dn6) へ倒す。切り戻しは `dn5` / `v5` / `0`。
+        assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::Dn6, MixGemv::V5));
     }
 
     /// task 418: `DENNO_MIX_QK=dn5` の解釈と形の門番。
     /// 既定は v5 (dn5 は既定 off)、実形 k=10240 だけを dn5 に載せる。
     #[test]
     fn mix_dn5_gate_and_shape() {
-        // 未設定は dn5 (task 418 で既定 on)。切り戻しは v5。
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn5, MixGemv::V5));
+        // task 422: 未設定は dn6 (既定)。dn5 は明示したときだけ (切り戻し段)。
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("DN5")), (MixGemv::Dn5, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some(" d5 ")), (MixGemv::Dn5, MixGemv::V5));
@@ -44777,15 +44788,17 @@ mod tests {
                 "raw={v:?}"
             );
         }
-        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5));
         assert_eq!(mix_qk_from_value(Some("v5")), (MixGemv::V5, MixGemv::V5));
-        // rows の解釈 (mix の down の既定は 4 行)。
+        assert_eq!(mix_qk_from_value(Some("dn5")), (MixGemv::Dn5, MixGemv::V5));
+        // rows の解釈 (mix の down の既定は 2 行。t422b で rows=2 が最良)。
         assert_eq!(mix_dn6_rows_from_value(Some("dn6r1")), 1);
         assert_eq!(mix_dn6_rows_from_value(Some("dn6r2")), 2);
         assert_eq!(mix_dn6_rows_from_value(Some("dn6r6")), 6);
-        assert_eq!(mix_dn6_rows_from_value(Some("dn6")), 4);
-        assert_eq!(mix_dn6_rows_from_value(None), 4);
-        assert_eq!(mix_dn6_rows_from_value(Some("dn5")), 4);
+        assert_eq!(mix_dn6_rows_from_value(Some("dn6")), 2);
+        assert_eq!(mix_dn6_rows_from_value(Some("dn6r4")), 4);
+        assert_eq!(mix_dn6_rows_from_value(None), 2);
+        assert_eq!(mix_dn6_rows_from_value(Some("dn5")), 2);
         // GDN の qkv/out の既定は 6 行 (block 960)。
         assert_eq!(gdn_dn6_rows_from_value(Some("dn6r1")), 1);
         assert_eq!(gdn_dn6_rows_from_value(Some("dn6r4")), 4);
@@ -44801,7 +44814,8 @@ mod tests {
         assert_eq!(mix_dn6_warps(0), None);
         assert_eq!(mix_dn6_warps(1024 + 32), None, "64 で割れない");
         // 起動形: rows * 32 * warps <= 1024 に丸める。
-        assert_eq!(mix_dn6_plan(10240, 320, 4), Some((5, 4)), "mix の down");
+        assert_eq!(mix_dn6_plan(10240, 320, 2), Some((5, 2)), "mix の down (既定)");
+        assert_eq!(mix_dn6_plan(10240, 320, 4), Some((5, 4)));
         assert_eq!(mix_dn6_plan(10240, 320, 8), Some((5, 6)), "1024 / 160 = 6 行");
         assert_eq!(mix_dn6_plan(10240, 2560, 6), Some((5, 6)), "GDN の qkv");
         assert_eq!(mix_dn6_plan(10240, 0, 4), None, "n_out = 0");
