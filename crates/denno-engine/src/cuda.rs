@@ -34185,6 +34185,12 @@ pub fn mix_up4_loaded() -> bool {
     mix_up4_kernels().is_some()
 }
 
+/// 台帳 (`gate_audit::DEFAULT_ON_GATES`) 用の bool。
+/// 1 対 = 4 レーンの up を選ぶ値 (u4 / u4f / u4w / u4x) のときだけ true。
+pub fn mix_up4_gate_on() -> bool {
+    mix_up4_plan(mix_upq8_on()).is_some()
+}
+
 /// `mix_upq8_on()` の 3/4/5/6 を (種類 0=u4 1=u4f 2=u4w 3=u4x, JC, threads) へ。
 /// 0/1/2 とその他は `None` (従来経路)。
 pub fn mix_up4_plan(v: u8) -> Option<(u8, usize, u32)> {

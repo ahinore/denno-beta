@@ -12947,6 +12947,7 @@ fn task437_up4_four_lanes_per_pair_up_is_wired() {
             "dno_mix_upmix_q8_up4",
             "dno_mix_upmix_q8_up4f",
             "dno_mix_upmix_q8_up4w",
+            "dno_mix_upmix_q8_up4x",
         ] {
             let pat = format!(".entry {name}(");
             let i = text
