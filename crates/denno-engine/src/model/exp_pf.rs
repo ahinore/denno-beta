@@ -1252,6 +1252,46 @@ pub fn k_min_rows() -> usize {
     *N.get_or_init(|| k_min_rows_from_value(std::env::var(K_MIN_ROWS_ENV).ok().as_deref()))
 }
 
+/// task 419: `DENNO_PF_EXP_IQ_MIN_ROWS` — **IQ 系**の expert にも行数の床を置く。
+///
+/// [`K_MIN_ROWS_ENV`] は K 系 (`UD-Q4_K_XL`) にしか効かない
+/// (`!iq_expert_mode(lw)` の条件)。既定モデルの expert は
+/// IQ3_XXS / IQ2_S / IQ4_NL / IQ4_XS / type 42 の混在 = **IQ 系**なので、
+/// 行が 1-2 本しかない expert でも重み 2 MB を丸ごと GPU へ上げている
+/// (lab t419a の `[exp-pf-stream]`: 14k で 13,616 本 27.9 GB、
+/// 3,826 で 10,938 本 22.4 GB。1 本あたり 2.05 MB)。
+/// 上げた重みで計算する行数が床未満なら、CPU の flat 経路
+/// (`moe_experts_flat`) のほうが安い。
+///
+/// 既定 **0** (床なし = 従来どおり全部上げる)。
+///
+/// # 結果: **採らなかった** (lab t419c、`ADOPT: no`)
+///
+/// 既定モデル (UD-IQ3_XXS、depth8k、PROFILE=1、全 COND `DENNO_START_DROP_CACHE=1`):
+/// 床 16 で 3,826 が 8.32 -> 12.43 s / 14k が 7.05 -> 13.38 s と **大幅に悪化**した
+/// (CPU の flat 経路に回した expert の数だけ損をする。1 本 2 MB の読みより
+/// そちらのほうが高い)。床 32 / 64 は 8.32 / 7.02 s で baseline と同じ
+/// (分割が立っても差が出ない = CPU に回す量が変わるだけで得が無い)。
+/// 掃引は 3 ラウンド目を使い切ったので、この枝は閉じる。
+pub const IQ_MIN_ROWS_ENV: &str = "DENNO_PF_EXP_IQ_MIN_ROWS";
+
+/// [`IQ_MIN_ROWS_ENV`] の既定値 (床なし)。
+pub const DEFAULT_IQ_MIN_ROWS: usize = 0;
+
+/// [`IQ_MIN_ROWS_ENV`] の解釈 (純関数)。
+pub fn iq_min_rows_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) if !s.is_empty() => s.parse().unwrap_or(DEFAULT_IQ_MIN_ROWS),
+        _ => DEFAULT_IQ_MIN_ROWS,
+    }
+}
+
+/// IQ 系の行数の床 (プロセスで 1 回だけ env を読む)。
+pub fn iq_min_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| iq_min_rows_from_value(std::env::var(IQ_MIN_ROWS_ENV).ok().as_deref()))
+}
+
 /// この expert の行数を GPU に回すか (純関数。`min_rows = 0` は全部 GPU)。
 pub fn k_expert_pays(rows: usize, min_rows: usize) -> bool {
     rows > 0 && rows >= min_rows
@@ -2055,16 +2095,20 @@ pub fn ple_pipe() -> bool {
 /// 245k IOPS、1 本あたり 79 us)。ホストは 8C/16T だが pread はカーネル内で
 /// 待つので、本数を増やすとデバイスのキューに同時に乗る読みが増える
 /// (CPU は遊んだまま)。task 357 の lab t357a/t357b で 64/96/128 を測り、
-/// **既定 96** にした ([`DEFAULT_PLE_THREADS`])。
+/// task 419 の lab t419b で 128 本も測り、そちらが 8% 速かったので
+/// **既定 128** にした ([`DEFAULT_PLE_THREADS`])。
 pub const PLE_THREADS_ENV: &str = "DENNO_PF_PLE_THREADS";
 
-/// [`PLE_THREADS_ENV`] の既定値 (task 357 の lab t357a/t357b で採ったので 96 本)。
+/// [`PLE_THREADS_ENV`] の既定値 (**128 本**)。
 ///
-/// 14k cold の gather は 32 本で 680 ms、64 本で 488 ms、96 本で 425 ms
-/// (t357a の `[pre-kprof]` ple)。128 本は 386 ms まで下がるが、lab t357b の
-/// 1 回目は 14k が 11.21 s に跳ねた (ホストの外乱。decode も 33.9 ms/tok) ので
-/// 既定は 96 にした。pread はカーネル内で待つので、96 本でも CPU は遊んでいる。
-pub const DEFAULT_PLE_THREADS: usize = 96;
+/// task 357 が 96 本を既定にした (14k cold の gather は 32 本で 680 ms、
+/// 64 本で 488 ms、96 本で 425 ms)。task 419 の lab t419b で 128 本を
+/// 2 COND x 2 ラウンド測り、**ple 段が 14k 415.3 / 414.2 -> 381.4 / 382.9 ms
+/// (-8.1%)、3,826 215.4 / 213.9 -> 197.4 / 196.9 ms (-8.2%)** と両方で
+/// 同じだけ下がったので既定を 128 にした。壁への寄与は 14k で -0.4%
+/// (7.02 -> 6.99 s)、3,826 は 0 (壁は expert の読み)、md5 は全 COND SAME。
+/// pread はカーネル内で待つので、128 本でも CPU は遊んでいる。
+pub const DEFAULT_PLE_THREADS: usize = 128;
 
 /// [`PLE_THREADS_ENV`] の解釈 (純関数)。1..=128 に丸める。未設定・解析不能は既定。
 pub fn ple_threads_from_value(v: Option<&str>) -> usize {
@@ -3666,18 +3710,18 @@ mod tests {
         assert!(DEFAULT_PLE_PIPE);
     }
 
-    /// task 357: `DENNO_PF_PLE_THREADS` の丸めと既定 (96 本)。
+    /// task 357 / 419: `DENNO_PF_PLE_THREADS` の丸めと既定 (128 本)。
     #[test]
     fn ple_threads_rounds_and_defaults() {
-        assert_eq!(ple_threads_from_value(None), 96, "未設定は既定 96");
-        assert_eq!(ple_threads_from_value(Some("")), 96);
-        assert_eq!(ple_threads_from_value(Some("x")), 96, "解析不能は既定");
-        assert_eq!(ple_threads_from_value(Some("0")), 96, "0 は既定へ");
+        assert_eq!(ple_threads_from_value(None), 128, "未設定は既定 128");
+        assert_eq!(ple_threads_from_value(Some("")), 128);
+        assert_eq!(ple_threads_from_value(Some("x")), 128, "解析不能は既定");
+        assert_eq!(ple_threads_from_value(Some("0")), 128, "0 は既定へ");
         assert_eq!(ple_threads_from_value(Some("64")), 64);
         assert_eq!(ple_threads_from_value(Some(" 32 ")), 32, "切り戻しは 32");
         assert_eq!(ple_threads_from_value(Some("999")), 128, "上限 128");
         assert_eq!(PLE_THREADS_ENV, "DENNO_PF_PLE_THREADS");
-        assert_eq!(DEFAULT_PLE_THREADS, 96);
+        assert_eq!(DEFAULT_PLE_THREADS, 128, "task 419 で 128 にした");
     }
 
     /// task 325 / 358: `DENNO_PF_PREAD_THREADS` の丸めと既定 (32 本)。
@@ -3996,6 +4040,23 @@ mod tests {
         assert_eq!(row_bytes(T::Q5_1, 640), Some(480));
         assert_eq!(row_bytes(T::Q8_0, 2560), Some(2720));
         assert_eq!(row_bytes(T::Q6K, 2560), Some(2100));
+    }
+
+    /// task 419: IQ 系の行数の床は既定 0 (床なし)。値はそのまま読む。
+    #[test]
+    fn iq_min_rows_truth_table() {
+        assert_eq!(iq_min_rows_from_value(None), 0, "未設定は床なし");
+        assert_eq!(iq_min_rows_from_value(Some("")), 0);
+        assert_eq!(iq_min_rows_from_value(Some("x")), 0, "解析不能は床なし");
+        assert_eq!(iq_min_rows_from_value(Some("0")), 0, "0 は床なし");
+        assert_eq!(iq_min_rows_from_value(Some("16")), 16);
+        assert_eq!(iq_min_rows_from_value(Some(" 32 ")), 32, "空白は落とす");
+        assert_eq!(DEFAULT_IQ_MIN_ROWS, 0, "既定が動いている");
+        assert_eq!(IQ_MIN_ROWS_ENV, "DENNO_PF_EXP_IQ_MIN_ROWS");
+        // 床の判定は K 系と同じ関数 (行 0 は回さない)。
+        assert!(!k_expert_pays(15, 16));
+        assert!(k_expert_pays(16, 16));
+        assert!(k_expert_pays(1, 0), "床 0 は全部 GPU");
     }
 
     /// task 309: K 系のゲートは IQ ゲートの内側・既定 off・明示の真値だけ on。
