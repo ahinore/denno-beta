@@ -39314,6 +39314,14 @@ pub(crate) enum Q4AttnKernel {
     Prefill,
     /// task 135 で追加した `dno_attention_decode` (t を分割・exp2f)。
     Split,
+    /// task 448: flash decoding 第 2 版 (`kernels_attn_dec2.cu` の
+    /// `dno_attn_flashdec_t`、K/V を shared のタイルへ協調ロード)。
+    /// flash decoding の門 (`DENNO_ATTN_FLASHDEC` と文脈長) は共通で、
+    /// この値は「どちらのカーネルで回すか」だけを選ぶ。
+    Tile,
+    /// task 448: flash decoding 第 1 版 (`dno_attn_flashdec`) を強制する。
+    /// タイル版の A/B と切り戻し用 (数値はどちらも固定分割・固定順)。
+    Fdec1,
 }
 
 /// `DENNO_Q4_GPU_ATTN_KERNEL` の既定。
@@ -39328,6 +39336,13 @@ pub(crate) enum Q4AttnKernel {
 /// `pf` (prefill カーネルを n=1 で使う) は lab t135a で 3.9 倍遅かったので
 /// 既定にはしない (`DENNO_Q4_GPU_ATTN_KERNEL=pf` で選べる)。
 const Q4_GPU_ATTN_KERNEL_DEFAULT: Q4AttnKernel = Q4AttnKernel::Split;
+
+/// task 448: flash decoding を **タイル版** (`dno_attn_flashdec_t`) で回すか。
+///
+/// `DENNO_Q4_GPU_ATTN_KERNEL=tile` (または `fdec2` / `fdt`) で on、
+/// `fdec1` / `fdec` で v1 を強制する。未設定・その他の値ではこの既定に従う
+/// (タスク 448 の lab で採否を決めるまで off = v1 のまま)。
+const ATTN_FLASHDEC_TILE_DEFAULT: bool = false;
 
 /// t の分割数 (`DENNO_Q4_GPU_ATTN_SPLIT`, 1..=64)。
 ///
@@ -39350,6 +39365,9 @@ fn parse_q4_gpu_attn_kernel(v: Option<&str>) -> Q4AttnKernel {
         Some("decode") | Some("dno") => Q4AttnKernel::Decode,
         Some("pf") | Some("prefill") => Q4AttnKernel::Prefill,
         Some("split") | Some("dec") => Q4AttnKernel::Split,
+        // task 448: flash decoding の実装選択 (v1 / タイル版)。
+        Some("tile") | Some("fdt") | Some("fdec2") => Q4AttnKernel::Tile,
+        Some("fdec1") | Some("fdec") => Q4AttnKernel::Fdec1,
         _ => Q4_GPU_ATTN_KERNEL_DEFAULT,
     }
 }
@@ -39620,6 +39638,174 @@ fn fdec_kernels() -> Option<&'static FdecKernels> {
     .as_ref()
 }
 
+// ---- task 448: flash decoding 第 2 版 (K/V を shared のタイルへ協調ロード) ----
+
+/// タイル版の PTX (`kernels_attn_dec2.ptx`)。
+/// `DENNO_ATTN_FLASHDEC2_PTX` で差し替え可 (lab は再生成した PTX をツリーに置く)。
+fn fdt_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_ATTN_FLASHDEC2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_attn_dec2.ptx"),
+    }
+}
+
+/// タイル版カーネルの引数の個数 (`.cu` と一致させる。kernel_invariants が見る)。
+pub(crate) const FDT_NARGS: usize = 11;
+
+/// タイル版の動的 shared の上限 (これを超える形では v1 へ落とす)。
+/// 48 KiB は cuLaunchKernel が opt-in 無しで受け付ける上限。
+pub(crate) const FDT_SMEM_MAX: usize = 48 * 1024;
+
+/// タイル版の tile 行数の既定 (`DENNO_ATTN_FLASHDEC_TILE`、4..=64)。
+const ATTN_FD_TILE_DEFAULT: usize = 16;
+
+/// タイル版の 1 block あたりの動的 shared (バイト)。`.cu` の
+/// `2 * tile * dh * sizeof(float)` と一致させること。
+pub(crate) fn fdt_smem_bytes(tile: usize, dh: usize) -> usize {
+    2 * tile * dh * 4
+}
+
+/// タイル版の形の門番 (純関数)。
+///
+/// `.cu` の前提は「dh が 4 の倍数」「dh <= DNO_FDT_MAXB * 128」「smem <= 48 KiB」。
+/// 1 つでも外れたら v1 へ落とす (v1 はこの形をすべて満たしている)。
+pub(crate) fn fdt_shape_ok(dh: usize, tile: usize) -> bool {
+    dh >= 4
+        && dh % 4 == 0
+        && dh <= ATTN_FDEC_MAXB * 128
+        && (1..=64).contains(&tile)
+        && fdt_smem_bytes(tile, dh) <= FDT_SMEM_MAX
+}
+
+/// `DENNO_ATTN_FLASHDEC_TILE` の解釈 (純関数)。4..=64 に丸める。
+fn parse_attn_fdec_tile(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(4, 64),
+        None => ATTN_FD_TILE_DEFAULT,
+    }
+}
+
+/// タイル版の tile 行数 (`DENNO_ATTN_FLASHDEC_TILE`)。
+fn attn_fdec_tile() -> usize {
+    #[cfg(test)]
+    {
+        let f = FD_TILE_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f.clamp(4, 64);
+        }
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| parse_attn_fdec_tile(std::env::var("DENNO_ATTN_FLASHDEC_TILE").ok().as_deref()))
+}
+
+#[cfg(test)]
+static FD_TILE_FORCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// テスト用: tile 行数を差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_fdec_tile_for_test(n: Option<usize>) {
+    FD_TILE_FORCE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// カーネル選択からタイル版の on/off を決める (純関数)。
+///
+/// `tile` / `fdec2` で on、`fdec1` で off、それ以外 (`split` / `decode` / `pf` /
+/// 未設定) は [`ATTN_FLASHDEC_TILE_DEFAULT`] に従う。
+pub(crate) fn fdec_tile_from_kernel(k: Q4AttnKernel) -> bool {
+    match k {
+        Q4AttnKernel::Tile => true,
+        Q4AttnKernel::Fdec1 => false,
+        _ => ATTN_FLASHDEC_TILE_DEFAULT,
+    }
+}
+
+/// task 448: タイル版で回すか (`DENNO_Q4_GPU_ATTN_KERNEL`)。
+fn attn_fdec_tile_on() -> bool {
+    fdec_tile_from_kernel(q4_gpu_attn_kernel())
+}
+
+/// タイル版のカーネル 1 本。読み込み失敗は `None` を焼き付ける (v1 へ落ちる)。
+struct FdtKernels {
+    /// モジュールはプロセス終了まで保持する (unload しない)。
+    _module: CUmodule,
+    f_t: CUfunction,
+}
+
+unsafe impl Send for FdtKernels {}
+unsafe impl Sync for FdtKernels {}
+
+fn fdt_kernels() -> Option<&'static FdtKernels> {
+    static K: OnceLock<Option<FdtKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = fdt_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[attn-fdec2] PTX が読めない ({}) : {e} → v1 の flashdec へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        // ABI: 引数の個数が違う PTX を起動すると、足りない引数は不定のまま読まれる。
+        // モジュールを載せる前に数えられないと分からないので、ここで弾く。
+        let text = String::from_utf8_lossy(&image).into_owned();
+        if ptx_entry_params(&text, "dno_attn_flashdec_t") != Some(FDT_NARGS) {
+            eprintln!(
+                "[attn-fdec2] PTX の dno_attn_flashdec_t が {FDT_NARGS} 引数でない \
+                 (再生成が必要) → v1 の flashdec へ"
+            );
+            return None;
+        }
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[attn-fdec2] cuModuleLoadData 失敗 → v1 の flashdec へ");
+                return None;
+            }
+        }
+        let mut f_t: CUfunction = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_get_function)(
+                &mut f_t,
+                module,
+                b"dno_attn_flashdec_t\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[attn-fdec2] PTX に dno_attn_flashdec_t が無い → v1 の flashdec へ");
+                return None;
+            }
+        }
+        Some(FdtKernels { _module: module, f_t })
+    })
+    .as_ref()
+}
+
+/// タイル版の分割・tile を 1 回だけログる (発火の証拠。tile か n_split が
+/// 変わったときだけ出す)。
+fn fdt_log(len: usize, n_split: usize, chunk: usize, dh: usize, tile: usize) {
+    static LAST: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let key = n_split.wrapping_mul(1024).wrapping_add(tile);
+    if LAST.load(std::sync::atomic::Ordering::Relaxed) == key {
+        return;
+    }
+    if LAST.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+        eprintln!(
+            "[attn-fdec2] len={len} n_split={n_split} chunk={chunk} dh={dh} tile={tile} \
+             smem={}KiB",
+            fdt_smem_bytes(tile, dh) / 1024
+        );
+    }
+}
+
 #[cfg(test)]
 static Q4_ATTN_KERNEL_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 #[cfg(test)]
@@ -39635,6 +39821,8 @@ pub fn set_q4_gpu_attn_kernel_for_test(k: Option<Q4AttnKernel>) {
             Some(Q4AttnKernel::Decode) => 0,
             Some(Q4AttnKernel::Prefill) => 1,
             Some(Q4AttnKernel::Split) => 2,
+            Some(Q4AttnKernel::Tile) => 3,
+            Some(Q4AttnKernel::Fdec1) => 4,
             None => -1,
         },
         std::sync::atomic::Ordering::Relaxed,
@@ -39657,6 +39845,8 @@ pub(crate) fn q4_gpu_attn_kernel() -> Q4AttnKernel {
             return match f {
                 1 => Q4AttnKernel::Prefill,
                 2 => Q4AttnKernel::Split,
+                3 => Q4AttnKernel::Tile,
+                4 => Q4AttnKernel::Fdec1,
                 _ => Q4AttnKernel::Decode,
             };
         }
@@ -40302,6 +40492,14 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     // 速いので `DENNO_ATTN_FLASHDEC_MIN_CTX` で切る。PTX 不在・形状不一致は
     // 静かに従来経路へ (数値の契約は同じ緩和枠)。
     if attn_flashdec_enabled() && a.len >= attn_flashdec_min_ctx() {
+        // task 448: タイル版 (K/V を shared へ協調ロード) を先に試す。門・形・
+        // PTX のどれかが欠けたら v1 へ落ちる (v1 と 1 ビットも変わらない)。
+        if attn_fdec_tile_on() {
+            if let Some(v) = q4_attn_decode_fdec(a, FdecImpl::Tile) {
+                return Some(v);
+            }
+            q4attn_kprof::note_fdt_fallback();
+        }
         match q4_attn_decode_flashdec(a) {
             Some(v) => return Some(v),
             None => q4attn_kprof::note_fdec_fallback(),
@@ -40313,13 +40511,17 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         // 新カーネルが PTX に無い (未再生成)・形状が合わないときは従来の
         // `dno_attention` で回す。数値の契約は同じ緩和枠なので、経路が変わっても
         // 「静かに遅いだけ」で済む。落ちた回数は [q4attn] の split fallback で見る。
-        Q4AttnKernel::Split => match q4_attn_decode_split(a) {
-            Some(v) => Some(v),
-            None => {
-                q4attn_kprof::note_split_fallback();
-                q4_attn_decode_single(a)
+        // task 448: `tile` / `fdec1` は flashdec の実装選択なので、flashdec の門を
+        // 外れたとき (短い文脈) は split と同じ扱いにする。
+        Q4AttnKernel::Split | Q4AttnKernel::Tile | Q4AttnKernel::Fdec1 => {
+            match q4_attn_decode_split(a) {
+                Some(v) => Some(v),
+                None => {
+                    q4attn_kprof::note_split_fallback();
+                    q4_attn_decode_single(a)
+                }
             }
-        },
+        }
     }
 }
 
@@ -40552,6 +40754,13 @@ fn q4_attn_decode_split(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     Some(out)
 }
 
+/// flash decoding の実装 (v1 / task 448 のタイル版)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FdecImpl {
+    V1,
+    Tile,
+}
+
 /// task 160: decode 1 トークンを flash decoding (`dno_attn_flashdec` +
 /// `dno_attn_flashdec_combine`) で回す。
 ///
@@ -40565,6 +40774,12 @@ fn q4_attn_decode_split(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
 /// 同期は既存 split 経路と同じで層あたり 1 回 (`ctx.sync()`。出力をホストが
 /// 読むため)。カーネル 2 発は同じストリームに積むだけ。
 fn q4_attn_decode_flashdec(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
+    q4_attn_decode_fdec(a, FdecImpl::V1)
+}
+
+/// [`FdecImpl`] を選んで回す本体。分割 (`q4_fdec_split`)・部分和の置き場
+/// (`part`)・combine はどちらの実装でも共通で、**K/V をどう読むかだけ**が違う。
+fn q4_attn_decode_fdec(a: &Q4AttnCall<'_>, imp: FdecImpl) -> Option<Vec<f32>> {
     if a.heads == 0 || a.group == 0 || a.heads % a.group != 0 || a.group > 32 {
         return None;
     }
@@ -40584,10 +40799,34 @@ fn q4_attn_decode_flashdec(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         return None;
     }
     let ctx = chain_ctx()?;
-    let k = fdec_kernels()?;
+    // task 448: タイル版は tile 行と smem の門を通ったときだけ。落ちたら None を
+    // 返し、呼び出し側 ([`q4_attn_decode`]) が v1 で回す。
+    let tile = attn_fdec_tile();
+    let (f_dec, f_cb, shmem, tile_c) = match imp {
+        FdecImpl::V1 => {
+            let k = fdec_kernels()?;
+            (k.f_dec, k.f_cb, 0u32, 0 as c_int)
+        }
+        FdecImpl::Tile => {
+            if !fdt_shape_ok(a.dh, tile) {
+                return None;
+            }
+            let kt = fdt_kernels()?;
+            // combine は v1 のモジュールのものを使う (同じ分割・同じ part 形式)。
+            let kv1 = fdec_kernels()?;
+            (
+                kt.f_t,
+                kv1.f_cb,
+                fdt_smem_bytes(tile, a.dh) as u32,
+                tile as c_int,
+            )
+        }
+    };
     let (n_split, chunk) = q4_fdec_split(a.len, attn_flashdec_chunk());
-    fdec_log(a.len, n_split, chunk, a.kv_dim, a.dh, a.group);
-    let (f_dec, f_cb) = (k.f_dec, k.f_cb);
+    match imp {
+        FdecImpl::V1 => fdec_log(a.len, n_split, chunk, a.kv_dim, a.dh, a.group),
+        FdecImpl::Tile => fdt_log(a.len, n_split, chunk, a.dh, tile),
+    }
 
     // ミラー同期は decode / prefill / split と同一の台帳 (1 行追記)。
     let (kptr, vptr) = q4ok(q4_attn_mirror_prepare(
@@ -40641,6 +40880,11 @@ fn q4_attn_decode_flashdec(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
             &mut scale_c as *mut _ as *mut c_void,
             &mut nsplit_c as *mut _ as *mut c_void,
         ];
+        // task 448: タイル版だけ 11 本目 (tile 行数) を渡す。
+        let mut tile_c = tile_c;
+        if imp == FdecImpl::Tile {
+            args.push(&mut tile_c as *mut _ as *mut c_void);
+        }
         let tl = q4attn_kprof::stamp();
         q4ok(unsafe {
             ctx.launch_async(
@@ -40649,7 +40893,7 @@ fn q4_attn_decode_flashdec(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
                 (n_split as u32, n_kv as u32, 1),
                 // 1 warp = 1 q head
                 ((32 * a.group) as u32, 1, 1),
-                0,
+                shmem,
                 &mut args,
             )
         })?;
@@ -40679,7 +40923,10 @@ fn q4_attn_decode_flashdec(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(qd))?;
         q4attn_kprof::note_d2h(td, qbytes);
         q4attn_kprof::note_call();
-        q4attn_kprof::note_fdec_call();
+        match imp {
+            FdecImpl::V1 => q4attn_kprof::note_fdec_call(),
+            FdecImpl::Tile => q4attn_kprof::note_fdt_call(),
+        }
         Some(outv)
     })?;
     Some(out)
@@ -41067,6 +41314,25 @@ pub mod q4attn_kprof {
         }
     }
 
+    // ---- task 448: flash decoding 第 2 版 (shared タイル) のカウンタ ----------
+    /// `dno_attn_flashdec_t` を回した回数 (= layer x decode token)
+    pub static FDT_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// タイル版を選んだが門 (形 / PTX / ABI) で落ちて v1 へ落ちた回数。
+    /// この値が 0 でない run の decode はタイル版の効果を含まない。
+    pub static FDT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_fdt_call() {
+        if on() {
+            FDT_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn note_fdt_fallback() {
+        if on() {
+            FDT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn note_pf_h2d(t: Option<std::time::Instant>, bytes: usize) {
         if !on() {
             return;
@@ -41143,7 +41409,8 @@ pub mod q4attn_kprof {
              mirror={entries} entries {:.0}MB / {}MB | \
              pf calls={pf_calls} h2d={:.1}MB q={:.1}MB out={:.1}MB | \
              pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms | \
-             split calls={} fallback={} | fdec calls={} fallback={}",
+             split calls={} fallback={} | fdec calls={} fallback={} | \
+             fdt calls={} fallback={} tile={}",
             mb(SEED_BYTES.load(Ordering::Relaxed)),
             mb(ROW_BYTES.load(Ordering::Relaxed)),
             mb(Q_BYTES.load(Ordering::Relaxed)),
@@ -41170,6 +41437,9 @@ pub mod q4attn_kprof {
             SPLIT_FALLBACKS.load(Ordering::Relaxed),
             FDEC_CALLS.load(Ordering::Relaxed),
             FDEC_FALLBACKS.load(Ordering::Relaxed),
+            FDT_CALLS.load(Ordering::Relaxed),
+            FDT_FALLBACKS.load(Ordering::Relaxed),
+            super::attn_fdec_tile(),
         ))
     }
 
@@ -63152,5 +63422,122 @@ mod task407_tests {
         assert!(gdn_pf_tc1_on(), "FORCE on が効いていない");
         set_gdn_pf_tc1_for_test(None);
         assert!(gdn_pf_tc1_on(), "FORCE を戻したら既定 on");
+    }
+}
+
+/// task 448: flash decoding 第 2 版 (shared タイル) のゲート・門番・smem の検証
+/// (GPU 不要)。カーネルそのものは lab で測るので、ここでは (1) `tile` / `fdec1`
+/// の解釈、(2) 形の門番、(3) 動的 shared の見積り、(4) 発火の計数の存在を固定する。
+#[cfg(test)]
+mod task448_tests {
+    use super::*;
+
+    /// `DENNO_Q4_GPU_ATTN_KERNEL` の新しい値 (`tile` / `fdec1`) の真理値表。
+    #[test]
+    fn task448_kernel_value_truth_table() {
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("tile")), Q4AttnKernel::Tile);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("fdt")), Q4AttnKernel::Tile);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("fdec2")), Q4AttnKernel::Tile);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("fdec1")), Q4AttnKernel::Fdec1);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("fdec")), Q4AttnKernel::Fdec1);
+        // 既存の値は 1 つも変わらない。
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("decode")), Q4AttnKernel::Decode);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("split")), Q4AttnKernel::Split);
+        // 未設定・未知は従来どおり Split (= タイル版の既定は off)。
+        assert_eq!(parse_q4_gpu_attn_kernel(None), Q4AttnKernel::Split);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("x")), Q4AttnKernel::Split);
+    }
+
+    /// タイル版を選ぶのは `tile` の 1 値だけ (既定 off) であること。
+    /// 分岐が発火する値の個数を数える (5 値のうち 1 つ)。
+    #[test]
+    fn task448_tile_gate_counts_one_arm() {
+        let all = [
+            Q4AttnKernel::Decode,
+            Q4AttnKernel::Prefill,
+            Q4AttnKernel::Split,
+            Q4AttnKernel::Tile,
+            Q4AttnKernel::Fdec1,
+        ];
+        let on = all.iter().filter(|k| fdec_tile_from_kernel(**k)).count();
+        if ATTN_FLASHDEC_TILE_DEFAULT {
+            // 採用して既定 on にした場合は Decode/Prefill/Split/Tile の 4 値。
+            assert_eq!(on, 4, "既定 on のときは fdec1 以外が on");
+            assert!(!fdec_tile_from_kernel(Q4AttnKernel::Fdec1), "fdec1 は off");
+        } else {
+            assert_eq!(on, 1, "既定 off のときタイル版は tile の 1 値だけ");
+            assert!(fdec_tile_from_kernel(Q4AttnKernel::Tile), "tile が off");
+            assert!(
+                !fdec_tile_from_kernel(Q4AttnKernel::Split),
+                "既定でタイル版が on になっている"
+            );
+        }
+        // env 経由の選択 (テスト用の差し替え) がそのまま判定に出ること。
+        set_q4_gpu_attn_kernel_for_test(Some(Q4AttnKernel::Tile));
+        assert!(attn_fdec_tile_on(), "FORCE tile が効いていない");
+        set_q4_gpu_attn_kernel_for_test(Some(Q4AttnKernel::Fdec1));
+        assert!(!attn_fdec_tile_on(), "FORCE fdec1 が効いていない");
+        set_q4_gpu_attn_kernel_for_test(None);
+    }
+
+    /// tile 行数の解釈 (既定 16・4..=64 に丸め)。
+    #[test]
+    fn task448_tile_rows_parse() {
+        assert_eq!(parse_attn_fdec_tile(None), 16, "既定が 16 でない");
+        assert_eq!(parse_attn_fdec_tile(Some("")), 16);
+        assert_eq!(parse_attn_fdec_tile(Some("8")), 8);
+        assert_eq!(parse_attn_fdec_tile(Some(" 32 ")), 32);
+        assert_eq!(parse_attn_fdec_tile(Some("0")), 4, "下限 4 に丸めていない");
+        assert_eq!(parse_attn_fdec_tile(Some("999")), 64, "上限 64 に丸めていない");
+        assert_eq!(parse_attn_fdec_tile(Some("x")), 16);
+    }
+
+    /// 形の門番と動的 shared の見積り。`.cu` の式 (2 * tile * dh * 4) と
+    /// 48 KiB の上限を固定する。
+    #[test]
+    fn task448_shape_gate_and_smem() {
+        assert_eq!(fdt_smem_bytes(16, 256), 32768, "smem が 32 KiB でない");
+        assert_eq!(fdt_smem_bytes(12, 512), 49152);
+        assert!(fdt_shape_ok(256, 16), "実形 (dh 256 / tile 16) が門で落ちる");
+        assert!(fdt_shape_ok(512, 12), "dh 512 / tile 12 が門で落ちる");
+        assert!(
+            !fdt_shape_ok(256, 32),
+            "48 KiB を超える (dh 256 / tile 32) のに通った"
+        );
+        assert!(
+            !fdt_shape_ok(512, 16),
+            "48 KiB を超える (dh 512 / tile 16) のに通った"
+        );
+        assert!(!fdt_shape_ok(6, 16), "dh が 4 の倍数でないのに通った");
+        assert!(!fdt_shape_ok(0, 16), "dh 0 が通った");
+        assert!(!fdt_shape_ok(256, 0), "tile 0 が通った");
+        assert!(!fdt_shape_ok(256, 65), "tile 65 が通った");
+        // 上限 (dh 512 = ATTN_FDEC_MAXB * 128) を超える形は v1 へ落とす。
+        assert!(!fdt_shape_ok(ATTN_FDEC_MAXB * 128 + 4, 4), "dh の上限が効いていない");
+    }
+
+    /// tile 行数の差し替え (テスト用フック)。
+    #[test]
+    fn task448_tile_force_hook() {
+        set_attn_fdec_tile_for_test(Some(8));
+        assert_eq!(attn_fdec_tile(), 8, "FORCE 8 が効いていない");
+        set_attn_fdec_tile_for_test(Some(100));
+        assert_eq!(attn_fdec_tile(), 64, "FORCE の丸めが効いていない");
+        set_attn_fdec_tile_for_test(None);
+        assert_eq!(attn_fdec_tile(), parse_attn_fdec_tile(std::env::var("DENNO_ATTN_FLASHDEC_TILE").ok().as_deref()));
+    }
+
+    /// 発火の計数 (FDT_CALLS) とログの口があること。GPU 無しでは 0 のまま。
+    #[test]
+    fn task448_counters_exist() {
+        let before = q4attn_kprof::FDT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        q4attn_kprof::note_fdt_call();
+        let after = q4attn_kprof::FDT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        // `[q4attn]` の行は q4prof が有効なときだけ計数する (既定 off では増えない)。
+        assert!(after >= before, "計数が減った");
+        let fb0 = q4attn_kprof::FDT_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
+        q4attn_kprof::note_fdt_fallback();
+        let fb1 = q4attn_kprof::FDT_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(fb1 >= fb0, "fallback の計数が減った");
     }
 }

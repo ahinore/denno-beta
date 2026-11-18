@@ -10650,7 +10650,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12960,5 +12960,181 @@ fn task437_up4_four_lanes_per_pair_up_is_wired() {
                 "{name} の引数が 8 本でない"
             );
         }
+    }
+}
+/// task 448: decode の flash decoding 第 2 版 (`kernels_attn_dec2.cu`) の配線。
+///
+/// 見るもの: (1) 1 key あたりの演算列が v1 (`kernels_attn_dec.cu` の
+/// `DNO_FD_KEY`) と **1 命令も変わらない**こと (値が動かない根拠)、
+/// (2) K/V が shared のタイルへ協調ロードされること (v1 との違いはここだけ)、
+/// (3) ホスト側のゲート・門番・smem・起動引数・計数、(4) build_ptx.sh の target、
+/// (5) PTX があれば ABI が 11 引数であること。
+#[test]
+fn task448_flashdec_tile_kernel_and_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let cu1 = std::fs::read_to_string(root.join("kernels_attn_dec.cu"))
+        .expect("kernels_attn_dec.cu が無い");
+    let cu2 = std::fs::read_to_string(root.join("kernels_attn_dec2.cu"))
+        .expect("kernels_attn_dec2.cu が無い");
+
+    // 1. entry は 1 本だけで、名前が v1 と衝突しない。
+    assert!(
+        cu2.contains("extern \"C\" __global__ void dno_attn_flashdec_t("),
+        "タイル版の entry が無い"
+    );
+    assert!(
+        !cu2.contains("dno_attn_flashdec(") && !cu2.contains("dno_attn_flashdec_combine("),
+        "v1 の entry を上書きしている"
+    );
+    // 引数は 10 + tile の 11 本。
+    assert!(
+        cu2.contains("int kv_dim, int t_total, int group, int dh, float scale, int n_split,"),
+        "v1 と同じ 10 引数の並びが無い"
+    );
+    assert!(cu2.contains("int tile)"), "11 本目 (tile) が無い");
+
+    // 2. K/V は shared のタイルへ協調ロードする (v1 との違いはここだけ)。
+    assert!(
+        cu2.contains("extern __shared__ float sh[];"),
+        "動的 shared の宣言が無い"
+    );
+    assert!(
+        cu2.contains("float *sv = sh + (size_t)tile * (size_t)dh;"),
+        "V のタイルが K の後ろに無い"
+    );
+    assert!(
+        cu2.contains("for (int f = threadIdx.x; f < nf4; f += nthreads)"),
+        "協調ロードのループが無い"
+    );
+    assert!(
+        cu2.contains("*(reinterpret_cast<float4 *>(sk) + (size_t)f) ="),
+        "K の float4 協調ロードが無い"
+    );
+    assert!(
+        cu2.contains("*(reinterpret_cast<float4 *>(sv) + (size_t)f) ="),
+        "V の float4 協調ロードが無い"
+    );
+    assert_eq!(
+        cu2.matches("__syncthreads();").count(),
+        2,
+        "タイルごとの同期が 2 回でない"
+    );
+    assert!(
+        cu2.contains("const float *krow = sk + (size_t)j * (size_t)dh;"),
+        "計算が shared から読んでいない"
+    );
+
+    // 3. **1 key あたりの演算列が v1 と同一**。v1 の `DNO_FD_KEY` の中身と、
+    //    タイル版の key ループの中身を、識別子の揺れ (b_/b, KBUF/kb, VBUF/vb) を
+    //    落として突き合わせる。並びが 1 行でも違えば値が動く。
+    fn key_ops(span: &str) -> Vec<String> {
+        let mut v = Vec::new();
+        for raw in span.lines() {
+            // マクロの行継続 (末尾の `\`) と行内コメントを落としてから比べる。
+            let mut l = raw.trim().trim_end_matches('\\').trim();
+            if let Some(i) = l.find("/*") {
+                l = l[..i].trim();
+            }
+            if let Some(i) = l.find("//") {
+                l = l[..i].trim();
+            }
+            let interesting = l.contains("fmaf(qv[")
+                || l.contains("__shfl_xor_sync(0xffffffffu, s_,")
+                || l.contains("const float sc_ = s_ * scale;")
+                || l.contains("corr_ = exp2f(")
+                || l.contains("corr_ = 1.0f;")
+                || l.contains("m_run = sc_;")
+                || l.contains("p_ = 1.0f;")
+                || l.contains("p_ = exp2f(")
+                || l.contains("l_run = l_run * corr_ + p_;")
+                || (l.contains("acc[b") && l.contains("* corr_ + p_ *"))
+                || (l.contains("const int i") && l.contains("128 + lane * 4"));
+            if !interesting {
+                continue;
+            }
+            let n = l
+                .replace("b_", "b")
+                .replace("i_", "i")
+                .replace("KBUF[b].", "kb.")
+                .replace("VBUF[b].", "vb.")
+                .replace("DNO_FDT_LOG2E", "DNO_FD_LOG2E");
+            v.push(n);
+        }
+        v
+    }
+    let m1 = cu1
+        .find("#define DNO_FD_KEY(KBUF, VBUF)")
+        .expect("v1 の DNO_FD_KEY が無い");
+    let body1 = &cu1[m1..];
+    let b1 = &body1[..body1.find("} while (0)").expect("KEY マクロが閉じない")];
+    let s2 = cu2
+        .find("float s_ = 0.0f;")
+        .expect("タイル版のスコア計算が無い");
+    let body2 = &cu2[s2..];
+    let b2 = &body2[..body2.find("__syncthreads();").expect("key ループが閉じない")];
+    let ops1 = key_ops(b1);
+    let ops2 = key_ops(b2);
+    assert!(ops1.len() >= 15, "v1 の演算列が取れていない ({} 行)", ops1.len());
+    assert_eq!(
+        ops1, ops2,
+        "タイル版の 1 key あたりの演算列が v1 と違う (値が動く)"
+    );
+
+    // 4. ホスト側の配線 (ゲート・門番・smem・起動・計数)。
+    let host = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda.rs"),
+    )
+    .expect("cuda.rs が読めない");
+    for s in [
+        "enum FdecImpl {",
+        "Some(\"tile\") | Some(\"fdt\") | Some(\"fdec2\") => Q4AttnKernel::Tile,",
+        "Some(\"fdec1\") | Some(\"fdec\") => Q4AttnKernel::Fdec1,",
+        "const ATTN_FLASHDEC_TILE_DEFAULT: bool = false;",
+        "pub(crate) fn fdec_tile_from_kernel(k: Q4AttnKernel) -> bool",
+        "const FDT_NARGS: usize = 11;",
+        "pub(crate) fn fdt_smem_bytes(tile: usize, dh: usize) -> usize {",
+        "pub(crate) fn fdt_shape_ok(dh: usize, tile: usize) -> bool {",
+        "fn parse_attn_fdec_tile(v: Option<&str>) -> usize",
+        "b\"dno_attn_flashdec_t\\0\"",
+        "if attn_fdec_tile_on() {",
+        "if !fdt_shape_ok(a.dh, tile) {",
+        "args.push(&mut tile_c as *mut _ as *mut c_void);",
+        "fdt_smem_bytes(tile, a.dh) as u32",
+        "FdecImpl::Tile => q4attn_kprof::note_fdt_call(),",
+        "q4attn_kprof::note_fdt_fallback();",
+        "FDT_CALLS.fetch_add(1",
+        "fdt calls={} fallback={} tile={}",
+    ] {
+        assert!(host.contains(s), "cuda.rs に {s} が無い");
+    }
+    // タイル版の起動は v1 と同じく combine を v1 のモジュールから使う。
+    assert!(
+        host.contains("let kv1 = fdec_kernels()?;"),
+        "combine を v1 のモジュールから取っていない"
+    );
+
+    // 5. build_ptx.sh の target (targets_all の末尾 = merge の衝突を避ける)。
+    assert!(
+        BUILD_PTX_SH.contains("attn_dec2)    echo \"kernels_attn_dec2.cu|nofmad\""),
+        "build_ptx.sh に attn_dec2 の spec が無い"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(targets.contains("attn_dec2"), "targets_all に attn_dec2 が無い");
+
+    // 6. PTX があれば ABI (引数 11 本) を数える。無ければ lab が生成する
+    //    (最初の lab 依頼は PTX=attn_dec2 で出す)。
+    let ptx = root.join("kernels_attn_dec2.ptx");
+    if let Ok(text) = std::fs::read_to_string(&ptx) {
+        let pat = ".entry dno_attn_flashdec_t(";
+        let i = text.find(pat).expect("PTX に entry が無い (再生成が必要)");
+        let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+        assert_eq!(
+            text[i..j].matches(".param .").count(),
+            11,
+            "PTX の引数が 11 本でない"
+        );
     }
 }
