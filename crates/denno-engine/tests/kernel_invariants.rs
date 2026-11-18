@@ -10650,7 +10650,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12177,7 +12177,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12294,7 +12294,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12489,7 +12489,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12583,7 +12583,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12807,8 +12807,9 @@ fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
 #[test]
 fn task431_dn7_down_four_lanes_per_pair_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
+    // task 437 が末尾に mix_up4 を足したので、末尾の 1 つ手前までを見る。
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy7q mix_dn7)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy7q mix_dn7"),
         "build_ptx.sh の targets_all に mix_dn7 が無い"
     );
     assert!(
@@ -12861,5 +12862,103 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
         let i = text.find(pat).expect("PTX に entry が無い (再生成が必要)");
         let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
         assert_eq!(text[i..j].matches(".param .").count(), 7, "PTX の引数が 7 本でない");
+    }
+}
+
+/// task 437: mix の up (silu + up + hc_mixed) を 1 対 = 4 レーンで回す
+/// `dno_mix_upmix_q8_up4` / `_up4f` / `_up4w` の配線。
+///
+/// lab t437a の mix band: down (dn7) 12.1 us / up 11.3 us。up は
+/// grid 427 x block 128 = 10 warp/SM で 3.48 MB を 322 GB/s しか出ていない。
+/// down を dn7 にしたのと同じ理屈 (1 対を 16 要素ずつ 4 レーンに割る) を
+/// up にも当てる。ゲートは既存 env の新しい値 `DENNO_MIX_UPQ8=u4` 系。
+#[test]
+fn task437_up4_four_lanes_per_pair_up_is_wired() {
+    // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
+    assert!(
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4)"),
+        "build_ptx.sh の targets_all に mix_up4 が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_up4)      echo \"kernels_mix_up4.cu|nofmad\" ;;"),
+        "build_ptx.sh に mix_up4 の spec が無い"
+    );
+    let cu = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_mix_up4.cu"),
+    )
+    .expect("kernels_mix_up4.cu が無い");
+    for name in [
+        "dno_mix_upmix_q8_up4",
+        "dno_mix_upmix_q8_up4f",
+        "dno_mix_upmix_q8_up4w",
+        "dno_mix_upmix_q8_up4x",
+    ] {
+        assert!(
+            cu.contains(&format!("extern \"C\" __global__ void {name}(")),
+            "カーネルの entry {name} が無い"
+        );
+    }
+    // 1 対 = 4 レーン (down の dn7 と同じ割り) と 3 種の起動形。
+    assert!(cu.contains("const int pair = within >> 2;"), "対の切り出しが無い");
+    assert!(cu.contains("const int sub = within & 3;"), "レーンの切り出しが無い");
+    assert!(
+        cu.contains("const int qoff = 2 + 16 * sub + ((sub >= 2) ? 2 : 0);"),
+        "レーンごとの qs 先頭が 16 要素ずつになっていない"
+    );
+    assert!(cu.contains("dno_up4_body<false, 6>"), "u4 (JC=6) が無い");
+    assert!(cu.contains("dno_up4_body<true, 6>"), "u4f (JC=6, SFU) が無い");
+    assert!(cu.contains("dno_up4_body<false, 12>"), "u4w (JC=12) が無い");
+    assert!(cu.contains("dno_up4_body<true, 4>"), "u4x (JC=4, SFU) が無い");
+    assert!(cu.contains("#define UP4_XSTRIDE 68"), "x の窓が 68 でない");
+    assert!(
+        cu.contains("#define UP4_LPR (UP4_PAIRS * 4)"),
+        "1 行 20 スレッドでない"
+    );
+    // ホスト側: 3 本の読み込み・門番・起動形・計数・ゲート。
+    assert!(CUDA_RS.contains("const MIX_UP4_KERNEL: &str = \"dno_mix_upmix_q8_up4\";"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC: usize = 6;"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS: u32 = 480;"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC_W: usize = 12;"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS_W: u32 = 960;"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC_X: usize = 4;"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS_X: u32 = 320;"));
+    assert!(CUDA_RS.contains("pub fn mix_up4_plan(v: u8) -> Option<(u8, usize, u32)> {"));
+    assert!(CUDA_RS.contains("Some(\"3\") | Some(\"u4\") | Some(\"up4\") => 3,"));
+    assert!(CUDA_RS.contains("Some(\"4\") | Some(\"u4f\") | Some(\"up4f\") => 4,"));
+    assert!(CUDA_RS.contains("Some(\"5\") | Some(\"u4w\") | Some(\"up4w\") => 5,"));
+    assert!(CUDA_RS.contains("Some(\"6\") | Some(\"u4x\") | Some(\"up4x\") => 6,"));
+    let f = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_q_chain_into(");
+    assert!(
+        f.contains("let up4_plan = if fu_pre.is_some() && mix_up4_kernels().is_some() {"),
+        "u4 の選択が無い"
+    );
+    assert!(f.contains("1 => k.up4f,"), "u4f の選択が無い");
+    assert!(f.contains("2 => k.up4w,"), "u4w の選択が無い");
+    assert!(f.contains("3 => k.up4x,"), "u4x の選択が無い");
+    assert!(
+        f.contains("MIX_UP4_HITS.fetch_add(1, AO::Relaxed)"),
+        "発火の計数が無い"
+    );
+    // PTX が入っていれば 3 本の entry と引数の数を検査する (無い間はスキップ)。
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_mix_up4.ptx");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for name in [
+            "dno_mix_upmix_q8_up4",
+            "dno_mix_upmix_q8_up4f",
+            "dno_mix_upmix_q8_up4w",
+            "dno_mix_upmix_q8_up4x",
+        ] {
+            let pat = format!(".entry {name}(");
+            let i = text
+                .find(&pat)
+                .unwrap_or_else(|| panic!("PTX に {name} が無い (再生成が必要)"));
+            let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+            assert_eq!(
+                text[i..j].matches(".param .").count(),
+                8,
+                "{name} の引数が 8 本でない"
+            );
+        }
     }
 }

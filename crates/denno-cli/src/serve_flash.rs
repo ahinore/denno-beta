@@ -659,6 +659,12 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
             eprintln!("[mix-upq8] fused={n} ({tag})");
             denno_engine::gpu_report::mix_upq8_reset();
         }
+        // task 437: 1 対 = 4 レーンの up (`DENNO_MIX_UPQ8=u4` 系) の発火回数。
+        let n4 = denno_engine::gpu_report::mix_up4_hits();
+        if n4 != 0 {
+            eprintln!("[mix-up4] up4={n4} ({tag})");
+            denno_engine::gpu_report::mix_up4_reset();
+        }
         if let Some(line) = denno_engine::gpu_report::mix_upq8_check_line() {
             eprintln!("{line}");
         }

@@ -192,6 +192,21 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_MIX_UPQ8_PTX",
         on: crate::cuda::mix_upq8_gate_on,
     },
+    // task 437: 同じ env で選ぶ 1 対 = 4 レーンの up (既定 = u4f、lab t437b/t437d で
+    // mix 段 -6.6〜-7.6%)。PTX が欠けると従来の融合版へ静かに落ちる (遅い) ので
+    // こちらも台帳に載せる。
+    GatePtx {
+        env: "DENNO_MIX_UPQ8",
+        ptx: "kernels_mix_up4.ptx",
+        entries: &[
+            "dno_mix_upmix_q8_up4",
+            "dno_mix_upmix_q8_up4f",
+            "dno_mix_upmix_q8_up4w",
+            "dno_mix_upmix_q8_up4x",
+        ],
+        path_env: "DENNO_MIX_UP4_PTX",
+        on: crate::cuda::mix_up4_gate_on,
+    },
     GatePtx {
         env: "DENNO_DEC_EXP_SUMDEV",
         ptx: "kernels_dec_epi.ptx",
