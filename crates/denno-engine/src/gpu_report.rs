@@ -111,3 +111,12 @@ pub fn pf_pin_reset() {
     #[cfg(feature = "cuda")]
     crate::cuda::pf_pin_reset();
 }
+
+/// task 448: decode の flash decoding の実装選択 (起動時に 1 行)。
+/// lab の COND で env が届いたか、測ったバイナリが新しいかをログで判別する。
+pub fn attn_fdec_boot_line() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    return Some(crate::cuda::attn_fdec_boot_line());
+    #[cfg(not(feature = "cuda"))]
+    None
+}
