@@ -10835,11 +10835,11 @@ fn task286_mix_gemv_v5_is_wired() {
         CUDA_RS.contains("let (mut rows, mut lanes) = (plan.rows_per_block as c_int, plan.lanes as c_int);"),
         "launch_mix_v5 が rows/lanes を渡していない"
     );
-    // 既定は task 418 で down だけ dn5、up は v5。`v5` / `1` / `both` で
+    // 既定は task 422 で down だけ dn6、up は v5。`v5` / `1` / `both` で
     // v5 両方向 (task 286 の形) へ戻せる。
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::Dn5, MixGemv::V5),"),
-        "既定が (Dn5, V5) になっていない"
+        CUDA_RS.contains("_ => (MixGemv::Dn6, MixGemv::V5),"),
+        "既定が (Dn6, V5) になっていない"
     );
     assert!(
         CUDA_RS.contains("Some(\"1\") | Some(\"both\") | Some(\"v5\") => (MixGemv::V5, MixGemv::V5),"),
@@ -12449,9 +12449,10 @@ fn task418_mix_dn5_kernel_is_wired() {
         CUDA_RS.contains("Some(\"dn5\") | Some(\"d5\") => (MixGemv::Dn5, MixGemv::V5),"),
         "ゲートの解釈が無い"
     );
+    // task 422: 既定は dn6 になったので、dn5 は明示したときだけ (切り戻し段)。
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::Dn5, MixGemv::V5),"),
-        "既定が (Dn5, V5) になっていない"
+        CUDA_RS.contains("_ => (MixGemv::Dn6, MixGemv::V5),"),
+        "既定が dn6 になっていない"
     );
     // 形の門番と launch (block = 32 * warps)。
     assert!(CUDA_RS.contains("pub fn mix_dn5_warps(n_in: usize) -> Option<usize> {"));
@@ -12466,7 +12467,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "build_ptx.sh に target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 gdn_pf_wy5"),
+        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5"),
         "targets_all に足していない"
     );
     assert!(
@@ -12483,6 +12484,100 @@ fn task418_mix_dn5_kernel_is_wired() {
         let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
         let got = text[i..j].matches(".param .").count();
         assert_eq!(got, 6, "PTX の引数が {got} 個 (ホスト側は 6 個)");
+    }
+
+}
+
+/// task 422: dn6 (`dno_mix_gemv_q8_0_dn6`) が「1 ブロック rows 行 / 1 レーン
+/// 1 対」で、ホスト側の起動形・ゲート・build_ptx.sh の target と揃っていること。
+#[test]
+fn task422_mix_dn6_kernel_is_wired() {
+    let src = include_str!("../kernels/kernels_mix_dn6.cu");
+    assert!(src.contains("dno_mix_gemv_q8_0_dn6"), "カーネル名が無い");
+    assert_eq!(cu_kernel_nargs(src, "dno_mix_gemv_q8_0_dn6"), 7, "引数の数が違う");
+    // `.cu` の前提 (1 レーン = 1 対 = 68 B、x はレジスタに 1 回、行は rows 本)。
+    for line in [
+        "const int r = tid / per_row;",
+        "const int pair = wid * 32 + lane;",
+        "const int np = n_in >> 6;",
+        "__shared__ float part[8][8];",
+        "if (pair < np) dno_dn6_load64(x + (size_t)pair * 64u, xv);",
+        "dno_dn6_load17(cur, rowp + (size_t)pair * 68u);",
+        "v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));",
+        "for (int i = 1; i < warps; ++i) s = __fadd_rn(s, part[tid][i]);",
+    ] {
+        assert!(src.contains(line), "`.cu` に {line} が無い");
+    }
+    // ホスト側: 名前 / 引数の数 / 上限 / PTX のパス。
+    assert!(
+        CUDA_RS.contains("const MIX_DN6_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn6\";"),
+        "cuda.rs のカーネル名が違う"
+    );
+    assert!(CUDA_RS.contains("const MIX_DN6_NARGS: usize = 7;"));
+    assert!(CUDA_RS.contains("const MIX_DN6_MAX_WARPS: usize = 8;"), "`.cu` の part[8]");
+    assert!(CUDA_RS.contains("const MIX_DN6_MAX_ROWS: usize = 8;"));
+    assert_eq!(
+        CUDA_RS.matches(".join(\"kernels_mix_dn6.ptx\")").count(),
+        1,
+        "PTX のパスが違う"
+    );
+    // ゲート: dn6 は明示したときだけ (既定は dn5 / v5 のまま)。
+    assert!(
+        CUDA_RS.contains("Some(\"dn6\") | Some(\"d6\")"),
+        "mix のゲートの解釈が無い"
+    );
+    assert!(CUDA_RS.contains("_ => (MixGemv::Dn6, MixGemv::V5),"), "既定が dn6 でない");
+    // GDN 側: 新しい値 dn6 と、起動点 2 か所 (qkv / out) が dn6 を通る。
+    assert!(CUDA_RS.contains("Some(\"dn6\") | Some(\"d6\") | Some(\"dn6r1\")"), "GDN のゲートが無い");
+    assert!(
+        CUDA_RS.contains("pub(crate) fn gdn_dec_gemv_dn6_on() -> bool {"),
+        "GDN の dn6 判定が無い"
+    );
+    // task 422: GDN の既定も dn6 (lab t422c で ssm -19%。切り戻しは v5)。
+    assert!(
+        CUDA_RS.contains("const GDN_DEC_GEMV_DN6_DEFAULT: bool = true;"),
+        "GDN の既定が dn6 でない"
+    );
+    assert!(CUDA_RS.contains("GDN_DEC_GEMV_DN6_DEFAULT"), "既定の分岐が無い");
+    assert_eq!(
+        CUDA_RS.matches("match gdn_dn6_plan(").count(),
+        2,
+        "GDN の起動点 (qkv / out) が dn6 を通っていない"
+    );
+    // 形の門番と launch (block = 32 * warps * rows、grid = ceil(n_out / rows))。
+    assert!(CUDA_RS.contains("pub fn mix_dn6_warps(n_in: usize) -> Option<usize> {"));
+    assert!(CUDA_RS.contains("pub fn mix_dn6_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<(usize, usize)> {"));
+    assert!(
+        CUDA_RS.contains("let block = (32 * warps * rows) as u32;"),
+        "block が 32 * warps * rows でない"
+    );
+    assert!(
+        CUDA_RS.contains("launch_mix_dn6(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps, rows)?;"),
+        "down の起動点が dn6 を通っていない"
+    );
+    // build_ptx.sh: target と targets_all (末尾の wy7q は動かさない)。
+    assert!(
+        BUILD_PTX_SH.contains("mix_dn6)      echo \"kernels_mix_dn6.cu|nofmad\" ;;"),
+        "build_ptx.sh に target が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5"),
+        "targets_all に足していない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q)"),
+        "targets_all の末尾を動かしている (他ブランチと衝突する)"
+    );
+    // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_mix_dn6.ptx");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let pat = ".entry dno_mix_gemv_q8_0_dn6(";
+        let i = text
+            .find(pat)
+            .unwrap_or_else(|| panic!("PTX に entry が無い (再生成が必要)"));
+        let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+        let got = text[i..j].matches(".param .").count();
+        assert_eq!(got, 7, "PTX の引数が {got} 個 (ホスト側は 7 個)");
     }
 }
 
