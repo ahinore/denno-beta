@@ -39739,19 +39739,59 @@ pub(crate) fn fdec_tile_from_env(v: Option<&str>) -> Option<bool> {
     }
 }
 
-/// `DENNO_ATTN_FLASHDEC2` の実値 (1 回だけ読む)。
-fn attn_fdec_tile_env() -> Option<bool> {
-    static V: OnceLock<Option<bool>> = OnceLock::new();
-    *V.get_or_init(|| fdec_tile_from_env(std::env::var("DENNO_ATTN_FLASHDEC2").ok().as_deref()))
+/// task 448: `DENNO_ATTN_FLASHDEC_TILE` を on/off の門としても使う (純関数)。
+///
+/// - 未設定・空: `None` (既定 [`ATTN_FLASHDEC_TILE_DEFAULT`] に従う)
+/// - `0` / `off` / `false` / `no`: `Some(false)` = タイル版を使わない (v1)
+/// - それ以外 (数値・`on` など): `Some(true)` = タイル版。行数は
+///   [`parse_attn_fdec_tile`] が 4..=64 に丸める
+///
+/// lab の COND は **名前に数字を含む env を落とす** 回がある (t448a の
+/// `DENNO_Q4_GPU_ATTN_KERNEL=tile` と t448b の `DENNO_ATTN_FLASHDEC2=1` は
+/// どちらも届かず v1 が走った。同じ COND の `DENNO_ATTN_FLASHDEC_TILE=24` は
+/// 届いた) ので、A/B は数字を含まないこの名前で取る。
+pub(crate) fn attn_fdec_tile_ctl(v: Option<&str>) -> Option<bool> {
+    let t = v?.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    match t.as_str() {
+        "0" | "off" | "false" | "no" => Some(false),
+        _ => Some(true),
+    }
 }
 
-/// task 448: タイル版で回すか (`DENNO_ATTN_FLASHDEC2` が優先、未設定なら
-/// `DENNO_Q4_GPU_ATTN_KERNEL`)。
+/// `DENNO_ATTN_FLASHDEC_TILE` / `DENNO_ATTN_FLASHDEC2` の実値 (1 回だけ読む)。
+fn attn_fdec_tile_env() -> Option<bool> {
+    static V: OnceLock<Option<bool>> = OnceLock::new();
+    *V.get_or_init(|| {
+        attn_fdec_tile_ctl(std::env::var("DENNO_ATTN_FLASHDEC_TILE").ok().as_deref())
+            .or_else(|| {
+                fdec_tile_from_env(std::env::var("DENNO_ATTN_FLASHDEC2").ok().as_deref())
+            })
+    })
+}
+
+/// task 448: タイル版で回すか (`DENNO_ATTN_FLASHDEC_TILE` が優先、
+/// 次に `DENNO_ATTN_FLASHDEC2`、未設定なら `DENNO_Q4_GPU_ATTN_KERNEL`)。
 fn attn_fdec_tile_on() -> bool {
     match attn_fdec_tile_env() {
         Some(b) => b,
         None => fdec_tile_from_kernel(q4_gpu_attn_kernel()),
     }
+}
+
+/// 門の判定を 1 回だけログる (発火しなかった回の原因を lab の log で見るため)。
+fn fdt_gate_log(tile_on: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[attn-fdec2] gate tile_on={tile_on} tile={} min_ctx={} \
+             (DENNO_ATTN_FLASHDEC_TILE / DENNO_Q4_GPU_ATTN_KERNEL)",
+            attn_fdec_tile(),
+            attn_flashdec_min_ctx()
+        );
+    });
 }
 
 /// タイル版のカーネル 1 本。読み込み失敗は `None` を焼き付ける (v1 へ落ちる)。
@@ -40534,7 +40574,9 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     if attn_flashdec_enabled() && a.len >= attn_flashdec_min_ctx() {
         // task 448: タイル版 (K/V を shared へ協調ロード) を先に試す。門・形・
         // PTX のどれかが欠けたら v1 へ落ちる (v1 と 1 ビットも変わらない)。
-        if attn_fdec_tile_on() {
+        let tile_on = attn_fdec_tile_on();
+        fdt_gate_log(tile_on);
+        if tile_on {
             if let Some(v) = q4_attn_decode_fdec(a, FdecImpl::Tile) {
                 return Some(v);
             }
@@ -63529,6 +63571,18 @@ mod task448_tests {
         }
         for v in ["0", "off", "false", "no", "v1", "x"] {
             assert_eq!(fdec_tile_from_env(Some(v)), Some(false), "{v:?} が off でない");
+        }
+
+        // 実際に lab の COND で使う名前 (`DENNO_ATTN_FLASHDEC_TILE`) の門。
+        // 未設定は None (既定 off)、0/off は明示 off、数値は on。
+        assert_eq!(attn_fdec_tile_ctl(None), None);
+        assert_eq!(attn_fdec_tile_ctl(Some("")), None);
+        assert_eq!(attn_fdec_tile_ctl(Some("  ")), None);
+        for v in ["0", "off", "false", "no", " OFF "] {
+            assert_eq!(attn_fdec_tile_ctl(Some(v)), Some(false), "{v:?} が off でない");
+        }
+        for v in ["16", "24", "4", "64", "on", "1"] {
+            assert_eq!(attn_fdec_tile_ctl(Some(v)), Some(true), "{v:?} が on でない");
         }
     }
 
