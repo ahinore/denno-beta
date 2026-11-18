@@ -12579,3 +12579,85 @@ fn task422_mix_dn6_kernel_is_wired() {
         assert_eq!(got, 7, "PTX の引数が {got} 個 (ホスト側は 7 個)");
     }
 }
+
+/// task 427: 既存の dn6 カーネル (`dno_mix_gemv_q8_0_dn6`) を mix 以外の
+/// 2 か所 (full 層の qkv/wo と head) から撃つ配線。
+///
+/// ゲートは**既存 env に値を足す**形 (lab の COND は新しい env 名を落とす):
+/// `DENNO_FULL_DEC_FAST=dn6*` と `DENNO_DEC_HEAD_FAST=dn6*`。
+/// 既定はどちらも従来 (v5) のまま = 値 0。
+#[test]
+fn task427_dn6_reused_for_full_and_head_is_wired() {
+    // 新しい .cu / .ptx / target は要らない (task 422 のカーネルを再利用する)。
+    assert!(
+        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5"),
+        "build_ptx.sh の targets_all を触っている (再利用なので不要)"
+    );
+    // 呼び出し点の門番と起動。
+    assert!(
+        CUDA_RS.contains("pub(crate) fn dn6_gemv_plan("),
+        "dn6_gemv_plan が無い"
+    );
+    assert!(
+        CUDA_RS.contains("if want_rows == 0 || ty != crate::kquant::GgmlType::Q8_0 {"),
+        "dn6_gemv_plan が Q8_0 以外を通す"
+    );
+    assert!(
+        CUDA_RS.contains("pub(crate) fn launch_dn6_gemv("),
+        "launch_dn6_gemv が無い"
+    );
+    assert!(
+        CUDA_RS.contains("launch_mix_dn6(ctx, w, x, o, n_in, n_out, row_bytes, warps, rows)"),
+        "launch_dn6_gemv が dn6 カーネルを撃っていない"
+    );
+    // full 層: qkv の unit ループと wo の 2 か所が dn6 を通る。
+    assert_eq!(
+        CUDA_RS.matches("dn6_gemv_plan(u.ty, u.k, u.n, dn6_rows())").count(),
+        1,
+        "qkv の unit が dn6 を通っていない"
+    );
+    assert!(
+        CUDA_RS.contains("dn6_gemv_plan(a.wo_ty, a.wo_k, a.wo_n, dn6_rows())"),
+        "wo が dn6 を通っていない"
+    );
+    assert_eq!(
+        CUDA_RS.matches("note_dn6_full_hit();").count(),
+        2,
+        "full 層の発火計数が 2 か所に無い"
+    );
+    // ゲートの解釈 (既定は 0 = v5 のまま)。
+    assert!(
+        CUDA_RS.contains("pub(crate) fn full_dec_dn6_rows_from_value(raw: Option<&str>) -> usize {"),
+        "full 層のゲートが無い"
+    );
+    assert!(
+        CUDA_RS.contains("std::env::var(\"DENNO_FULL_DEC_FAST\").ok().as_deref())"),
+        "full 層が既存 env を見ていない"
+    );
+    // head: dn6 の実行と v5 への落ち方。
+    assert!(
+        CUDA_RS.contains("pub fn head_dn6_rows_from_value(raw: Option<&str>) -> usize {"),
+        "head のゲートが無い"
+    );
+    assert!(
+        CUDA_RS.contains("std::env::var(\"DENNO_DEC_HEAD_FAST\").ok().as_deref())"),
+        "head が既存 env を見ていない"
+    );
+    assert!(
+        CUDA_RS.contains("fn head_gemv_dn6("),
+        "head の dn6 実行が無い"
+    );
+    assert!(
+        CUDA_RS.contains("if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows) {"),
+        "head が dn6 の成否を見ていない"
+    );
+    assert!(
+        CUDA_RS.contains("note_dn6_head_hit();"),
+        "head の発火計数が無い"
+    );
+    // 発火の証拠: `[mix-qchain]` の f6 / h6。
+    assert!(
+        QWEN4EXP_RS.contains("f6={f6} h6={h6}"),
+        "`[mix-qchain]` に f6/h6 が無い"
+    );
+}
