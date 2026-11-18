@@ -32980,6 +32980,11 @@ pub enum MixGemv {
     /// 同じ 3.48 MB を v5 形 (GDN の qkv) は 374 GB/s で読んでいる。
     /// PTX は既にコミット済みなので、この経路は**ホスト側の切り替えだけ**。
     V5,
+    /// task 418: 1 ブロック = 1 行・1 レーン = 1 対 (`kernels_mix_dn5.cu`)。
+    /// down 専用 (n_in = 10,240 / n_out = 320 の形)。v5 の 160 ブロック
+    /// x 64 スレッドに対し 320 ブロック x 160 スレッド = 5 倍のスレッドで、
+    /// ループも先読みも無い。合計順が v5 と違う (丸めだけ)。
+    Dn5,
 }
 
 /// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` の種別。
@@ -32993,6 +32998,7 @@ pub enum MixGemv {
 /// - `v5d` / `v5u`        : 片方向だけ v5 (A/B 用)
 /// - `ups`                : `(Blk, Seg)` = down は task 282 のまま、up だけ
 ///   1 行 1 warp の A/B 用
+/// - `dn5` / `d5`         : `(Dn5, V5)` = task 418 の down (1 ブロック 1 行)。
 pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("0") | Some("off") | Some("false") | Some("no") => (MixGemv::Old, MixGemv::Old),
@@ -33003,6 +33009,8 @@ pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
         Some("v5d") => (MixGemv::V5, MixGemv::R8),
         Some("v5u") => (MixGemv::Blk, MixGemv::V5),
         Some("ups") => (MixGemv::Blk, MixGemv::Seg),
+        // task 418: down だけ 1 ブロック 1 行・1 レーン 1 対の新カーネル。
+        Some("dn5") | Some("d5") => (MixGemv::Dn5, MixGemv::V5),
         _ => (MixGemv::V5, MixGemv::V5),
     }
 }
@@ -33129,6 +33137,161 @@ fn launch_mix_v5(
             &mut args,
         )
     }
+}
+
+// ===========================================================================
+// task 418: mix の down (Q8_0) を 1 ブロック 1 行・1 レーン 1 対で読む
+// (`DENNO_MIX_QK=dn5`)
+// ===========================================================================
+//
+// 実形 (n_in = 10,240 = 160 対、n_out = 320、3.48 MB) を v5 は
+// `lanes=32 / rows=2` = **160 ブロック x 64 スレッド**で撃つ (1 レーンが 5 対を
+// 逐次ループ)。lab t418a の `[dec-kprof-avg]` (band 0) で down は
+// **19.4 us = 180 GB/s** で、同じ band の inject (`dno_matvec_f32_r`、
+// 512 ブロック x 256 スレッド、13 MB) は 7.1 us だった。差は並列度。
+//
+// 新カーネルは 1 ブロック = 1 行、block = 32 * (n_in / 64 / 32) = 160 スレッド
+// (1 レーン = 1 対 = 68 B を 1 回だけ読む)。ループも先読みも無い。
+// 縮約は warp 内の木 -> warp ごとの部分和を共有メモリ -> スレッド 0 が固定順。
+// 合計順が v5 と違う (丸めだけ) ので既定 off。値はゲートで切り戻せる。
+
+/// 新カーネルの名前。
+const MIX_DN5_KERNEL_NAME: &str = "dno_mix_gemv_q8_0_dn5";
+
+/// 新カーネルの引数の数 (w, x, out, n_in, n_out, row_bytes)。
+const MIX_DN5_NARGS: usize = 6;
+
+/// `.cu` の `part[8]` (warp の部分和の上限)。
+const MIX_DN5_MAX_WARPS: usize = 8;
+
+struct MixDn5Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixDn5Kernels {}
+unsafe impl Sync for MixDn5Kernels {}
+
+static MIX_DN5_KERNELS: OnceLock<Option<MixDn5Kernels>> = OnceLock::new();
+
+fn mix_dn5_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_DN5_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_dn5.ptx"),
+    }
+}
+
+/// 新カーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_dn5_kernels() -> Option<&'static MixDn5Kernels> {
+    MIX_DN5_KERNELS
+        .get_or_init(|| {
+            let path = mix_dn5_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_DN5_KERNEL_NAME) != Some(MIX_DN5_NARGS) {
+                eprintln!(
+                    "[mix-dn5] PTX の引数が {MIX_DN5_NARGS} 本でない → v5 の down へ。\
+                     `bash build_ptx.sh mix_dn5` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_DN5_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-dn5] PTX に {MIX_DN5_KERNEL_NAME} が無い → v5 の down へ");
+                    return None;
+                }
+                Some(MixDn5Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 新カーネルが載っているか (テスト / 診断用)。
+pub fn mix_dn5_loaded() -> bool {
+    mix_dn5_kernels().is_some()
+}
+
+/// 形の門番 (純関数)。`.cu` の前提は
+/// 「Q8_0 / n_in % 64 == 0 / 対の数 np = n_in / 64 が 32 の倍数 / np/32 <= 8」。
+/// 返り値は 1 ブロックの warp 数 (= np / 32)。
+pub fn mix_dn5_warps(n_in: usize) -> Option<usize> {
+    if n_in == 0 || n_in % 64 != 0 {
+        return None;
+    }
+    let np = n_in / 64;
+    if np % 32 != 0 {
+        return None;
+    }
+    let warps = np / 32;
+    if warps == 0 || warps > MIX_DN5_MAX_WARPS {
+        return None;
+    }
+    Some(warps)
+}
+
+/// 新カーネルを 1 本積む (grid = n_out、block = 32 * warps)。
+fn launch_mix_dn5(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    x: CUdeviceptr,
+    o: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+    warps: usize,
+) -> Result<()> {
+    let k = mix_dn5_kernels().ok_or_else(|| anyhow::anyhow!("dn5 のカーネルが無い"))?;
+    let (mut pw, mut px, mut po) = (w, x, o);
+    let (mut ni, mut no, mut rb) = (n_in as c_int, n_out as c_int, row_bytes as c_int);
+    let mut args = [
+        &mut pw as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut po as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut no as *mut _ as *mut c_void,
+        &mut rb as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        ctx.launch_async(
+            k.f,
+            (n_out.max(1) as u32, 1, 1),
+            ((32 * warps) as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// task 418: dn5 の down を撃った回数 (診断。`[mix-qchain]` の `dn5=` に出る)。
+static MIX_DN5_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 418: dn5 の down を撃った回数。
+pub fn mix_dn5_hits() -> u64 {
+    MIX_DN5_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 418: 集計を 0 に戻す (リクエスト終端)。
+pub fn mix_dn5_reset() {
+    MIX_DN5_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ===========================================================================
@@ -33559,7 +33722,18 @@ pub fn maybe_gpu_mix_q_chain_into(
         } else {
             None
         };
+        // task 418: dn5 (1 ブロック 1 行) は Q8_0 の実形だけ。門番は
+        // `mix_dn5_warps` (np = n_in/64 が 32 の倍数、warp 数 <= 8) と PTX。
+        let dn5_warps = if want_down == MixGemv::Dn5
+            && down_ty == crate::kquant::GgmlType::Q8_0
+            && mix_dn5_kernels().is_some()
+        {
+            mix_dn5_warps(k1)
+        } else {
+            None
+        };
         let down_kind = match (want_down, kern, rd) {
+            (MixGemv::Dn5, _, _) if dn5_warps.is_some() => MixGemv::Dn5,
             (MixGemv::V5, _, _) if v5_down.is_some() => MixGemv::V5,
             (MixGemv::Blk, Some(k), Some(_)) if k.mix_rowblk.is_some() => MixGemv::Blk,
             (MixGemv::Seg, Some(k), Some(_)) if moe_batch_slot(down_ty).is_some() => MixGemv::Seg,
@@ -33721,6 +33895,12 @@ pub fn maybe_gpu_mix_q_chain_into(
             let rb_d = rd.expect("形は検査済み");
             unsafe {
                 match down_kind {
+                    MixGemv::Dn5 => {
+                        // task 418: 1 ブロック 1 行・1 レーン 1 対。重みは生ポインタ。
+                        let warps = dn5_warps.expect("検査済み");
+                        launch_mix_dn5(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps)?;
+                        MIX_DN5_HITS.fetch_add(1, AO::Relaxed);
+                    }
                     MixGemv::V5 => {
                         // task 286: v5 形 (68 B の対読み + 先読み)。重みは生ポインタ。
                         let plan = v5_down.as_ref().expect("検査済み");
@@ -44134,6 +44314,169 @@ mod tests {
         assert_eq!(mix_qk_from_value(Some("ups")), (MixGemv::Blk, MixGemv::Seg));
         // 未知の値は既定へ (切り戻しは 0)。
         assert_eq!(mix_qk_from_value(Some("nope")), (MixGemv::V5, MixGemv::V5));
+    }
+
+    /// task 418: `DENNO_MIX_QK=dn5` の解釈と形の門番。
+    /// 既定は v5 (dn5 は既定 off)、実形 k=10240 だけを dn5 に載せる。
+    #[test]
+    fn mix_dn5_gate_and_shape() {
+        // 未設定は v5 のまま (dn5 は既定 off)。
+        assert_eq!(mix_qk_from_value(None), (MixGemv::V5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some("DN5")), (MixGemv::Dn5, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some(" d5 ")), (MixGemv::Dn5, MixGemv::V5));
+        // 形: n_in = 10240 = 64 * 160 -> 5 warp (1 レーン 1 対)。
+        assert_eq!(mix_dn5_warps(10240), Some(5));
+        assert_eq!(mix_dn5_warps(64 * 32), Some(1));
+        assert_eq!(mix_dn5_warps(64 * 64), Some(2));
+        assert_eq!(mix_dn5_warps(64 * 256), Some(8));
+        // 対が 32 の倍数でない / warp が 8 を超える / 64 で割れない形は載せない。
+        assert_eq!(mix_dn5_warps(64 * 16), None, "16 対は 32 の倍数でない");
+        assert_eq!(mix_dn5_warps(64 * 288), None, "9 warp は共有メモリの上限");
+        assert_eq!(mix_dn5_warps(1024 + 32), None, "64 で割れない");
+        assert_eq!(mix_dn5_warps(0), None);
+        // 320 は (対 5 個) で 32 の倍数でない -> 従来の up 側は dn5 に載らない。
+        assert_eq!(mix_dn5_warps(320), None);
+    }
+
+    /// task 418: dn5 の合計順を CPU で写し、f64 の真値と v5 の順の両方に
+    /// 1e-4 + 1e-5*|ref| で一致すること (差は丸めだけ) を固定する。
+    #[test]
+    fn mix_dn5_cpu_mirror_matches_v5_and_reference() {
+        let n_in = 10240usize;
+        let n_out = 8usize; // 全行を回すと遅いので先頭 8 行だけ
+        // Q8_0 の行: 32 要素ごとに f16 の d (0x3800 = 0.5) + int8 の q。
+        let nb = n_in / 32;
+        let rb = nb * 34;
+        let mut w = vec![0u8; rb * n_out];
+        for r in 0..n_out {
+            for b in 0..nb {
+                let o = r * rb + b * 34;
+                w[o] = 0x00;
+                w[o + 1] = 0x38; // f16 0.5
+                for j in 0..32 {
+                    let q = ((b * 32 + j + 3 * r) % 255) as i32 - 127;
+                    w[o + 2 + j] = q as i8 as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..n_in).map(|i| ((i * 37 % 1009) as f32 - 500.0) / 997.0).collect();
+
+        // 1 対 (68 B = 64 要素) の積和。カーネルと同じ式・同じ 4 アキュムレータ。
+        let dot = |r: usize, pair: usize| -> f32 {
+            let base = r * rb + pair * 68;
+            let d0 = f16_bits_to_f32(u16::from_le_bytes([w[base], w[base + 1]]));
+            let d1 = f16_bits_to_f32(u16::from_le_bytes([w[base + 34], w[base + 35]]));
+            let mut acc = [0.0f32; 4];
+            for j in 0..32 {
+                let q = w[base + 2 + j] as i8 as f32;
+                let y = q * d0;
+                acc[j & 3] += y * x[pair * 64 + j];
+            }
+            for j in 0..32 {
+                let q = w[base + 34 + 2 + j] as i8 as f32;
+                let y = q * d1;
+                acc[j & 3] += y * x[pair * 64 + 32 + j];
+            }
+            (acc[0] + acc[1]) + (acc[2] + acc[3])
+        };
+        // dn5: 1 レーン 1 対 -> 32 レーンの木 -> 5 warp の逐次。
+        let dn5 = |r: usize| -> f32 {
+            let np = n_in / 64;
+            let warps = np / 32;
+            let mut part = [0.0f32; 8];
+            for wid in 0..warps {
+                let mut lane = [0.0f32; 32];
+                for l in 0..32 {
+                    lane[l] = dot(r, wid * 32 + l);
+                }
+                let mut off = 16;
+                while off > 0 {
+                    for l in 0..off {
+                        lane[l] += lane[l + off];
+                    }
+                    off >>= 1;
+                }
+                part[wid] = lane[0];
+            }
+            let mut s = part[0];
+            for w in part.iter().take(warps).skip(1) {
+                s += *w;
+            }
+            s
+        };
+        // v5: 1 レーンが 5 対を積んでから 32 レーンの木。
+        let v5 = |r: usize| -> f32 {
+            let np = n_in / 64;
+            let per = np / 32;
+            let mut lane = [0.0f32; 32];
+            for l in 0..32 {
+                let mut s = 0.0f32;
+                for p in 0..per {
+                    s += dot(r, l * per + p);
+                }
+                lane[l] = s;
+            }
+            let mut off = 16;
+            while off > 0 {
+                for l in 0..off {
+                    lane[l] += lane[l + off];
+                }
+                off >>= 1;
+            }
+            lane[0]
+        };
+        // f64 の真値。
+        let reference = |r: usize| -> f64 {
+            let mut s = 0.0f64;
+            for pair in 0..n_in / 64 {
+                let base = r * rb + pair * 68;
+                let d0 = f16_bits_to_f32(u16::from_le_bytes([w[base], w[base + 1]])) as f64;
+                let d1 = f16_bits_to_f32(u16::from_le_bytes([w[base + 34], w[base + 35]])) as f64;
+                for j in 0..32 {
+                    s += (w[base + 2 + j] as i8 as f64) * d0 * x[pair * 64 + j] as f64;
+                }
+                for j in 0..32 {
+                    s += (w[base + 34 + 2 + j] as i8 as f64) * d1 * x[pair * 64 + 32 + j] as f64;
+                }
+            }
+            s
+        };
+        for r in 0..n_out {
+            let a = dn5(r);
+            let b = v5(r);
+            let rf = reference(r);
+            let tol = 1e-4 + 1e-5 * rf.abs();
+            assert!(
+                (a as f64 - rf).abs() <= tol,
+                "dn5 が真値から外れた: row={r} dn5={a} ref={rf}"
+            );
+            assert!(
+                (b as f64 - rf).abs() <= tol,
+                "v5 が真値から外れた: row={r} v5={b} ref={rf}"
+            );
+            // dn5 と v5 の差は丸めだけ (同じ 10240 項の和)。
+            assert!(
+                (a - b).abs() <= 1e-3 + 1e-5 * b.abs(),
+                "dn5 と v5 の差が大きい: row={r} dn5={a} v5={b}"
+            );
+            // 決定的であること (同じ入力で 2 回)。
+            assert_eq!(a.to_bits(), dn5(r).to_bits(), "dn5 が決定的でない");
+        }
+    }
+
+    /// task 418: f16 のビット列を f32 にする (テストの参照用。正規化数だけ)。
+    fn f16_bits_to_f32(h: u16) -> f32 {
+        let sign = ((h & 0x8000u16) as u32) << 16;
+        let exp = (h >> 10) & 0x1f;
+        let man = (h & 0x3ff) as u32;
+        let bits = if exp == 0 {
+            sign
+        } else if exp == 31 {
+            sign | 0x7f80_0000
+        } else {
+            sign | (((exp as u32) + 112) << 23) | (man << 13)
+        };
+        f32::from_bits(bits)
     }
 
     /// task 382: `DENNO_MIX_UPQ8` の真理値表と形の門番。

@@ -6297,8 +6297,13 @@ pub fn mix_qchain_line() -> Option<String> {
     let rtr = crate::cuda::router_in_mix_qchain_hits();
     #[cfg(not(feature = "cuda"))]
     let rtr = 0u64;
+    // task 418: down を新カーネル (1 ブロック 1 行) で撃った回数。0 なら v5。
+    #[cfg(feature = "cuda")]
+    let dn5 = crate::cuda::mix_dn5_hits();
+    #[cfg(not(feature = "cuda"))]
+    let dn5 = 0u64;
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6310,6 +6315,9 @@ pub fn mix_qchain_reset() {
     // task 282: 高速 GEMV の計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::mix_qk_reset();
+    // task 418: dn5 の計数も同じ区切りで 0 に戻す。
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_dn5_reset();
     // task 364: ルータを鎖に積んだ回数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::router_in_mix_qchain_reset();
