@@ -13103,6 +13103,10 @@ fn task448_flashdec_tile_kernel_and_wiring() {
         "fn fdt_loaded_log() {",
         "fn fdt_gate_log(tile_on: bool) {",
         "let tile_on = attn_fdec_tile_on();",
+        // decode の実サーバ経路 (デバイス連鎖の attn_launch) にも同じ門を置く。
+        // ここを忘れると lab では v1 だけが走り、差が出ない (t448a-c の失敗)。
+        "let tile_k = if tile_on && fdt_shape_ok(dh, tile) {",
+        "(kt.f_t, fdt_smem_bytes(tile, dh) as u32)",
         "b\"dno_attn_flashdec_t\\0\"",
         "if tile_on {",
         "if !fdt_shape_ok(a.dh, tile) {",

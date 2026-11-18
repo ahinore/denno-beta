@@ -2791,7 +2791,27 @@ pub(crate) mod dec_full_dev {
         if attn_flashdec_enabled() && len >= attn_flashdec_min_ctx() {
             if let Some(k) = fdec_kernels() {
                 let (n_split, chunk) = q4_fdec_split(len, attn_flashdec_chunk());
-                fdec_log(len, n_split, chunk, kv_dim, dh, group);
+                // task 448: タイル版 (K/V を shared へ協調ロード) を先に試す。
+                // decode の実サーバ経路はここ (デバイス連鎖) なので、門もここで見る。
+                // 形か PTX が欠けたら v1 (`dno_attn_flashdec`) で回す。
+                let tile = attn_fdec_tile();
+                let tile_on = attn_fdec_tile_on();
+                fdt_gate_log(tile_on);
+                let tile_k = if tile_on && fdt_shape_ok(dh, tile) {
+                    fdt_kernels()
+                } else {
+                    None
+                };
+                let (f_dec, shmem) = match tile_k {
+                    Some(kt) => {
+                        fdt_log(len, n_split, chunk, dh, tile);
+                        (kt.f_t, fdt_smem_bytes(tile, dh) as u32)
+                    }
+                    None => {
+                        fdec_log(len, n_split, chunk, kv_dim, dh, group);
+                        (k.f_dec, 0u32)
+                    }
+                };
                 nsplit_c = n_split as c_int;
                 let nkv_c = n_kv as c_int;
                 let part_bytes = heads * n_split * (dh + ATTN_FDEC_PART_EXTRA) * 4;
@@ -2817,13 +2837,18 @@ pub(crate) mod dec_full_dev {
                         &mut scale_c as *mut _ as *mut c_void,
                         &mut nsplit_c as *mut _ as *mut c_void,
                     ];
+                    // task 448: タイル版だけ 11 本目 (tile 行数) を渡す。
+                    let mut tile_c = tile as c_int;
+                    if tile_k.is_some() {
+                        args.push(&mut tile_c as *mut _ as *mut c_void);
+                    }
                     let tl = q4attn_kprof::stamp();
                     unsafe {
                         ctx.launch_async(
-                            k.f_dec,
+                            f_dec,
                             (n_split as u32, n_kv as u32, 1),
                             ((32 * group) as u32, 1, 1),
-                            0,
+                            shmem,
                             &mut args,
                         )?;
                     }
@@ -2845,7 +2870,11 @@ pub(crate) mod dec_full_dev {
                     }
                     q4attn_kprof::note_launch(tl);
                     q4attn_kprof::note_call();
-                    q4attn_kprof::note_fdec_call();
+                    if tile_k.is_some() {
+                        q4attn_kprof::note_fdt_call();
+                    } else {
+                        q4attn_kprof::note_fdec_call();
+                    }
                     Ok(aptr)
                 });
             }
