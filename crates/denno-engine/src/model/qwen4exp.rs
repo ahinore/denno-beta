@@ -6432,8 +6432,13 @@ pub fn mix_qchain_line() -> Option<String> {
     let dn6 = crate::cuda::mix_dn6_hits();
     #[cfg(not(feature = "cuda"))]
     let dn6 = 0u64;
+    // task 427: dn6 を mix 以外 (full 層の qkv/wo = f6、head = h6) で撃った回数。
+    #[cfg(feature = "cuda")]
+    let (f6, h6) = crate::cuda::dn6_dec_hits();
+    #[cfg(not(feature = "cuda"))]
+    let (f6, h6) = (0u64, 0u64);
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} f6={f6} h6={h6}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6451,6 +6456,9 @@ pub fn mix_qchain_reset() {
     // task 422: dn6 の計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::mix_dn6_reset();
+    // task 427: full 層 / head の dn6 計数も同じ区切りで 0 に戻す。
+    #[cfg(feature = "cuda")]
+    crate::cuda::dn6_dec_reset();
     // task 364: ルータを鎖に積んだ回数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::router_in_mix_qchain_reset();

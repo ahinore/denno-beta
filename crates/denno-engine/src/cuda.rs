@@ -2192,6 +2192,35 @@ pub(crate) mod dec_full_dev {
         })
     }
 
+    /// task 427: qkv / 出力投影の GEMV を dn6 (1 ブロック rows 行 / 1 レーン 1 対) で
+    /// 回す行数 (純関数)。`DENNO_FULL_DEC_FAST` の**既存 env に値を足す**形にした
+    /// (lab の COND は新しい env 名を落とすことがある)。
+    ///
+    /// **既定 2 行** (lab t427b: full 段 1.52 -> 1.36 ms/token = -10.5%、gpu 0.99 ->
+    /// 0.84。短い decode 11.95 -> 11.7 ms/tok)。切り戻しは `DENNO_FULL_DEC_FAST=v5`
+    /// (または `1` / `on` / `0`)。
+    /// `dn6` / `dn6r2` = 2 行、`dn6r1` = 1、`dn6r4` = 4、`dn6r8` = 8。
+    /// それ以外 (未設定・`1`・`on` など) は 0 = これまでどおり v5。
+    pub(crate) fn full_dec_dn6_rows_from_value(raw: Option<&str>) -> usize {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("dn6") | Some("dn6r2") => 2,
+            Some("dn6r1") => 1,
+            Some("dn6r4") => 4,
+            Some("dn6r8") => 8,
+            Some("v5") | Some("dn5") | Some("1") | Some("on") | Some("true") | Some("0")
+            | Some("off") | Some("false") | Some("no") => 0,
+            _ => 2,
+        }
+    }
+
+    /// [`full_dec_dn6_rows_from_value`] をプロセスで 1 回だけ読む。
+    fn dn6_rows() -> usize {
+        static ROWS: OnceLock<usize> = OnceLock::new();
+        *ROWS.get_or_init(|| {
+            full_dec_dn6_rows_from_value(std::env::var("DENNO_FULL_DEC_FAST").ok().as_deref())
+        })
+    }
+
     /// qkv / 出力投影の GEMV 計画。fast では v5 → v4 の順に試す。
     fn dec_plan(
         ctx: &CudaCtx,
@@ -2352,6 +2381,28 @@ pub(crate) mod dec_full_dev {
         }
         for u in a.qkv_units {
             let w = weights_for_gguf(u.uid, u.ty, u.blocks, u.k, u.n)?;
+            // task 427: dn6 (`DENNO_FULL_DEC_FAST=dn6*`) は 1 ブロック rows 行 /
+            // 1 レーン 1 対 (`dno_mix_gemv_q8_0_dn6`)。形 (Q8_0 / n_in % 64 == 0 /
+            // warps <= 8) と PTX が揃えば v5 の代わりに撃つ (丸め順だけが変わる)。
+            let dn6 = dn6_gemv_plan(u.ty, u.k, u.n, dn6_rows());
+            if let (Some((warps, rows)), Some(rb)) = (dn6, gguf_row_bytes(u.ty, u.k)) {
+                if w.buf.bytes() != u.n * rb {
+                    bail!("qkv 重みのバイト数が合わない ({:?})", u.ty);
+                }
+                launch_dn6_gemv(
+                    ctx,
+                    w.buf.ptr(),
+                    x_ptr,
+                    qkv_ptr + (u.out_row * 4) as u64,
+                    u.k,
+                    u.n,
+                    rb,
+                    warps,
+                    rows,
+                )?;
+                note_dn6_full_hit();
+                continue;
+            }
             let Some(plan) = dec_plan(ctx, u.ty, u.k, u.n)? else {
                 bail!("qkv GEMV の plan が無い ({:?})", u.ty);
             };
@@ -2479,16 +2530,36 @@ pub(crate) mod dec_full_dev {
         //    同じ形 (k=6144 Q8_0 / n=2560) が 51.2 -> 25.7 us。形が合わない・
         //    PTX が無いときは従来 (v3) の plan へ。
         let w_wo = weights_for_gguf(a.wo_uid, a.wo_ty, a.wo_blocks, a.wo_k, a.wo_n)?;
-        let plan_wo = wo_plan(ctx, a)?;
-        let Some(plan_wo) = plan_wo else {
-            bail!("出力投影の plan が無い ({:?})", a.wo_ty);
-        };
-        if w_wo.buf.bytes() != a.wo_n * plan_wo.rb {
-            bail!("出力投影の重みのバイト数が合わない");
-        }
         Scratch::ensure(&mut st.out, a.wo_n * 4)?;
         let optr = st.out.as_ref().expect("ensure 済み").ptr();
-        launch_plan(ctx, &plan_wo, w_wo.buf.ptr(), aptr, optr, a.wo_k, a.wo_n)?;
+        // task 427: dn6 経路 (既定は v5)。形が合わなければ下の v5 / v4 へ落ちる。
+        let dn6_wo = dn6_gemv_plan(a.wo_ty, a.wo_k, a.wo_n, dn6_rows());
+        if let (Some((warps, rows)), Some(rb)) = (dn6_wo, gguf_row_bytes(a.wo_ty, a.wo_k)) {
+            if w_wo.buf.bytes() != a.wo_n * rb {
+                bail!("出力投影の重みのバイト数が合わない");
+            }
+            launch_dn6_gemv(
+                ctx,
+                w_wo.buf.ptr(),
+                aptr,
+                optr,
+                a.wo_k,
+                a.wo_n,
+                rb,
+                warps,
+                rows,
+            )?;
+            note_dn6_full_hit();
+        } else {
+            let plan_wo = wo_plan(ctx, a)?;
+            let Some(plan_wo) = plan_wo else {
+                bail!("出力投影の plan が無い ({:?})", a.wo_ty);
+            };
+            if w_wo.buf.bytes() != a.wo_n * plan_wo.rb {
+                bail!("出力投影の重みのバイト数が合わない");
+            }
+            launch_plan(ctx, &plan_wo, w_wo.buf.ptr(), aptr, optr, a.wo_k, a.wo_n)?;
+        }
         kp_mark!("fd_wo");
 
         // 7) D2H 2 本 + 1 回の同期
@@ -9624,6 +9695,90 @@ pub fn head_fast_enabled() -> bool {
     *ON.get_or_init(|| head_fast_from_value(std::env::var("DENNO_DEC_HEAD_FAST").ok().as_deref()))
 }
 
+/// task 427: head の語彙 GEMV を dn6 (1 ブロック rows 行 / 1 レーン 1 対) で回す
+/// 行数 (純関数)。`DENNO_DEC_HEAD_FAST` の**既存 env に値を足す**形にした
+/// (lab の COND は新しい env 名を落とすことがある)。
+///
+/// **既定 4 行** (lab t427b: head 段 0.73 -> 0.61 ms/token = -16.4%、gpu 0.70 ->
+/// 0.58。短い decode 11.95 -> 11.7 ms/tok)。切り戻しは `DENNO_DEC_HEAD_FAST=v5`。
+/// `dn6` / `dn6r4` = 4 行、`dn6r1` = 1、`dn6r2` = 2、`dn6r8` = 8。
+/// `v5` / `1` / `on` / 偽値は 0 = これまでどおり v5。
+pub fn head_dn6_rows_from_value(raw: Option<&str>) -> usize {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("dn6") | Some("dn6r4") => 4,
+        Some("dn6r1") => 1,
+        Some("dn6r2") => 2,
+        Some("dn6r8") => 8,
+        Some("v5") | Some("1") | Some("on") | Some("true") | Some("0") | Some("off")
+        | Some("false") | Some("no") => 0,
+        _ => 4,
+    }
+}
+
+/// [`head_dn6_rows_from_value`] をプロセスで 1 回だけ読む。
+fn head_dn6_rows() -> usize {
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        head_dn6_rows_from_value(std::env::var("DENNO_DEC_HEAD_FAST").ok().as_deref())
+    })
+}
+
+/// task 427: head の GEMV を dn6 で 1 回だけ回す (pinned 経由・同期 1 回)。
+///
+/// 引数・発行順は [`CudaCtx::moe_gemv_dev_with`] の async 経路と同じで、
+/// カーネルだけが `dno_mix_gemv_q8_0_dn6` に変わる (丸め順は v5 と違う)。
+/// `Ok(false)` は「撃てなかった」= 呼び出し側は v5 へ落ちる。
+fn head_gemv_dn6(
+    ctx: &CudaCtx,
+    w: &DevBuffer,
+    x: &[f32],
+    n_in: usize,
+    n_out: usize,
+    out: &mut [f32],
+    row_bytes: usize,
+    warps: usize,
+    rows: usize,
+) -> Result<bool> {
+    let lib = lib()?;
+    MOE_SCRATCH.with(|cell| -> Result<bool> {
+        let mut s = cell.borrow_mut();
+        MoeScratch::ensure_tagged(&mut s.x, n_in * 4, crate::mem_audit::TAG_GEMV)?;
+        MoeScratch::ensure_tagged(&mut s.o, n_out * 4, crate::mem_audit::TAG_GEMV)?;
+        MoeScratch::ensure_pin(&mut s.pin_x, n_in * 4)?;
+        MoeScratch::ensure_pin(&mut s.pin_o, n_out * 4)?;
+        {
+            let px = s.pin_x.as_mut().expect("pin_x は ensure 済み");
+            px.as_mut_slice::<f32>()[..n_in].copy_from_slice(x);
+        }
+        let (xp, op, ho) = {
+            let xb = s.x.as_ref().expect("x は ensure 済み").ptr;
+            let ob = s.o.as_ref().expect("o は ensure 済み").ptr;
+            let px = s.pin_x.as_ref().expect("pin_x は ensure 済み").ptr;
+            (xb, ob, px)
+        };
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(xp, ho as *const c_void, n_in * 4, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (head dn6)",
+            )?;
+        }
+        launch_dn6_gemv(ctx, w.ptr, xp, op, n_in, n_out, row_bytes, warps, rows)?;
+        {
+            let po = s.pin_o.as_mut().expect("pin_o は ensure 済み");
+            unsafe {
+                check(
+                    (lib.memcpy_dtoh_async)(po.ptr, op, n_out * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (head dn6)",
+                )?;
+            }
+        }
+        ctx.sync_decode()?;
+        let po = s.pin_o.as_ref().expect("pin_o は ensure 済み");
+        out.copy_from_slice(&po.as_slice::<f32>()[..n_out]);
+        Ok(true)
+    })
+}
+
 /// 語彙 GEMV (head) を v5 カーネルで回す。`false` = 従来経路へ。
 pub fn maybe_gpu_head_gemv_v5(
     uid: u64,
@@ -9657,6 +9812,20 @@ pub fn maybe_gpu_head_gemv_v5(
         Ok(w) => w,
         Err(_) => return false,
     };
+    // task 427: dn6 経路 (`DENNO_DEC_HEAD_FAST=dn6*`)。形 (Q8_0 / n_in % 64 == 0 /
+    // warps <= 8) と PTX が揃ったときだけ。撃てなければ下の v5 へ落ちる。
+    if let (Some((warps, rows)), Some(rb)) = (
+        dn6_gemv_plan(ty, k, n, head_dn6_rows()),
+        gguf_row_bytes(ty, k),
+    ) {
+        if w.buf.bytes() == n * rb {
+            if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows) {
+                note_dn6_head_hit();
+                set_last_linear_ran_on_gpu(true);
+                return true;
+            }
+        }
+    }
     match ctx.moe_gemv_dev_with(ty, &w.buf, x, k, n, out, GemvKernelMode::V5) {
         Ok(true) => {
             set_last_linear_ran_on_gpu(true);
@@ -33571,6 +33740,72 @@ fn launch_mix_dn6(
     unsafe { ctx.launch_async(k.f, (grid, 1, 1), (block, 1, 1), 0, &mut args) }
 }
 
+/// task 427: mix 以外の呼び出し点 (full 層の qkv/wo、head) から dn6 を撃つ門番。
+///
+/// カーネル・値は mix の down と同一 (`dno_mix_gemv_q8_0_dn6`。rows は行の割り当て
+/// だけを変えるので dn5 とビット一致)。Q8_0 で、形 (`mix_dn6_plan`) と PTX が
+/// 揃うときだけ `Some((warps, rows))`。`want_rows == 0` は「撃たない」。
+pub(crate) fn dn6_gemv_plan(
+    ty: crate::kquant::GgmlType,
+    n_in: usize,
+    n_out: usize,
+    want_rows: usize,
+) -> Option<(usize, usize)> {
+    if want_rows == 0 || ty != crate::kquant::GgmlType::Q8_0 {
+        return None;
+    }
+    if mix_dn6_kernels().is_none() {
+        return None;
+    }
+    mix_dn6_plan(n_in, n_out, want_rows)
+}
+
+/// task 427: [`dn6_gemv_plan`] の計画を 1 本積む (生ポインタの重み)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_dn6_gemv(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    x: CUdeviceptr,
+    o: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+    warps: usize,
+    rows: usize,
+) -> Result<()> {
+    launch_mix_dn6(ctx, w, x, o, n_in, n_out, row_bytes, warps, rows)
+}
+
+/// task 427: full 層の qkv/wo を dn6 で撃った回数 (1 プロセス通算)。
+static DN6_FULL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 427: head の GEMV を dn6 で撃った回数 (1 プロセス通算)。
+static DN6_HEAD_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 427: 発火の証拠 (`[mix-qchain]` の `f6=` / `h6=`)。
+pub fn dn6_dec_hits() -> (u64, u64) {
+    (
+        DN6_FULL_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        DN6_HEAD_HITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// task 427: 集計を 0 に戻す。
+pub fn dn6_dec_reset() {
+    DN6_FULL_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    DN6_HEAD_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 427: full 層の 1 本を撃ったことを数える (full_dec から)。
+pub(crate) fn note_dn6_full_hit() {
+    DN6_FULL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 427: head の 1 本を撃ったことを数える。
+pub(crate) fn note_dn6_head_hit() {
+    DN6_HEAD_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// task 422: dn6 を撃った回数 (診断。`[mix-qchain]` の `dn6=` に出る)。
 static MIX_DN6_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -44843,6 +45078,61 @@ mod tests {
         assert_eq!(mix_dn6_plan(10240, 2560, 6), Some((5, 6)), "GDN の qkv");
         assert_eq!(mix_dn6_plan(10240, 0, 4), None, "n_out = 0");
         assert_eq!(mix_dn6_plan(1024 + 32, 320, 4), None, "形が合わない");
+    }
+
+    /// task 427: 既存の dn6 を mix 以外 (full 層の qkv/wo、head) から撃つ門番。
+    ///
+    /// ゲートは既存 env の値 (`DENNO_FULL_DEC_FAST` / `DENNO_DEC_HEAD_FAST`)。
+    /// **既定は dn6** (lab t427b で段 -10.5% / -16.4%)。切り戻しは `v5`。
+    #[test]
+    fn task427_full_and_head_dn6_gates_and_shapes() {
+        // full 層のゲート: 未設定は 2 行 (既定)。明示的な v5 / 1 / on は 0。
+        assert_eq!(
+            crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(None),
+            2,
+            "既定が dn6 でない"
+        );
+        for raw in [Some("1"), Some("on"), Some("true"), Some("v5"), Some("dn5")] {
+            assert_eq!(
+                crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(raw),
+                0,
+                "raw={raw:?} は v5 へ戻す"
+            );
+        }
+        for (raw, want) in [
+            (Some("dn6"), 2usize),
+            (Some("dn6r2"), 2),
+            (Some("dn6r1"), 1),
+            (Some("DN6R4"), 4),
+            (Some(" dn6r8 "), 8),
+        ] {
+            assert_eq!(
+                crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(raw),
+                want,
+                "raw={raw:?}"
+            );
+        }
+        // head のゲート: 未設定は 4 行 (既定)。v5 / 1 / on は 0。
+        assert_eq!(head_dn6_rows_from_value(None), 4, "既定が dn6 でない");
+        for raw in [Some("1"), Some("on"), Some("v5")] {
+            assert_eq!(head_dn6_rows_from_value(raw), 0, "raw={raw:?}");
+        }
+        // 空文字は未設定と同じ扱い (既定のまま)。
+        assert_eq!(head_dn6_rows_from_value(Some("")), 4);
+        assert_eq!(
+            crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(Some("")),
+            2
+        );
+        assert_eq!(head_dn6_rows_from_value(Some("dn6")), 4);
+        assert_eq!(head_dn6_rows_from_value(Some("dn6r4")), 4);
+        assert_eq!(head_dn6_rows_from_value(Some("dn6r2")), 2);
+        assert_eq!(head_dn6_rows_from_value(Some("dn6r1")), 1);
+        assert_eq!(head_dn6_rows_from_value(Some("dn6r8")), 8);
+        // 形の門番: full 層の実形 (qkv k=2560 n=13312 / wo k=6144 n=2560)。
+        assert_eq!(mix_dn6_plan(2560, 13312, 2), Some((2, 2)), "qkv (対 40 -> 2 warp)");
+        assert_eq!(mix_dn6_plan(6144, 2560, 2), Some((3, 2)), "wo (対 96 -> 3 warp)");
+        // head の実形 (k=2560 / n=248320)。
+        assert_eq!(mix_dn6_plan(2560, 248_320, 4), Some((2, 4)));
     }
 
     /// task 422: dn6 (1 ブロック rows 行・x をレジスタで使い回す) の合計順を
