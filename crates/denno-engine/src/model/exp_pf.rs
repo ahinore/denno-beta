@@ -2111,6 +2111,10 @@ pub const PLE_THREADS_ENV: &str = "DENNO_PF_PLE_THREADS";
 pub const DEFAULT_PLE_THREADS: usize = 128;
 
 /// [`PLE_THREADS_ENV`] の解釈 (純関数)。1..=128 に丸める。未設定・解析不能は既定。
+///
+/// task 423: 上限を 512 に上げて 256 本を lab t423a で測ったが、`ple_par_parts`
+/// (ple.rs) 側にも 128 の丸めがあり、**ゲートを上げても 128 本のまま**だった
+/// (ple 段 239.8 -> 241.2 ms で差なし)。ここは 128 に戻す。
 pub fn ple_threads_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_PLE_THREADS;
@@ -2195,6 +2199,47 @@ pub fn embed_ovl_from_value(v: Option<&str>) -> bool {
 pub fn embed_ovl() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| embed_ovl_from_value(std::env::var(EMBED_OVL_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_PLE_LJOIN`: 背景に出す PLE の gather を **層ループの PLE 層まで
+/// 待たない** (task 423)。
+///
+/// 層優先 prefill は埋め込みの裏で gather を走らせる (`DENNO_PF_EMBED_OVL`) が、
+/// 層ループへ入る**前に join** していた。gather は 90 B の pread が IOPS 律速で
+/// 14k で約 380 ms / 3,826 で約 200 ms かかり、その待ちが丸ごと GPU の遊びになる。
+/// PLE 層は層 1 で、行を使うのはその層の入口だけなので、join をそこへ移すと
+/// 層 0 の 1 層ぶん (14k で約 140 ms / 3,826 で約 170 ms) が gather と重なる。
+/// 受け渡しは**チャンクごと** (背景スレッドがチャンク順に送り、PLE 層が 1 チャンク
+/// ずつ受ける) なので、層 1 の後半のチャンクは更に待たない。
+/// 読む行・綴じ方は変えない (値はビット一致)。
+///
+/// # 実測 (lab t423a / t423b / t423c、既定モデル、depth8k、全 COND `DROP_CACHE=1`)
+///
+/// `[pre-kprof]` の **ple 段 (gather の待ち)**: 14k 378.8 / 377.8 -> 239.8 / 241.2 ms
+/// (層の入口でまとめて待つ版、t423a/t423b)、**チャンクごとに受ける版 (t423c) で
+/// 380.4 / 375.1 -> 37.1 / 21.8 ms**、3,826 200.4 / 200.9 -> **0.0 / 0.0 ms**。
+/// 壁は 14k が t423c の交互の対で **7.20 / 6.97 -> 6.94 / 6.68 s (-3.6 / -4.2%)**、
+/// 3,826 は 8.37 / 8.37 -> 8.30 / 8.36 (-0.8 / -0.2%。expert の読みで詰まっており、
+/// gather を層ループへ移すとそのぶん層が伸びる)、decode 12.0-12.2 ms/tok 不変、
+/// md5 は全 COND・全 6 文脈で SAME、errors 0、text sane。**既定 on**。
+pub const PLE_LJOIN_ENV: &str = "DENNO_PF_PLE_LJOIN";
+
+/// [`PLE_LJOIN_ENV`] の既定値 (on)。
+pub const DEFAULT_PLE_LJOIN: bool = true;
+
+/// [`PLE_LJOIN_ENV`] の解釈 (純関数)。未設定・空・解析不能は既定 (on)、
+/// `0` 系の明示値だけ off。
+pub fn ple_ljoin_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PLE_LJOIN,
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+    }
+}
+
+/// PLE の gather を層ループの PLE 層まで待たないか (プロセスで 1 回だけ env を読む)。
+pub fn ple_ljoin() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ple_ljoin_from_value(std::env::var(PLE_LJOIN_ENV).ok().as_deref()))
 }
 
 /// パート番号ごとの読み口 (pread 経路だけが使う)。
@@ -3692,6 +3737,22 @@ mod tests {
         assert!(embed_ovl_from_value(Some(" TRUE ")));
         assert_eq!(EMBED_OVL_ENV, "DENNO_PF_EMBED_OVL");
         assert!(DEFAULT_EMBED_OVL);
+    }
+
+    /// task 423: `DENNO_PF_PLE_LJOIN` は既定 on (t423a/t423b で採用)、`0` 系だけが偽。
+    #[test]
+    fn task423_ple_ljoin_gate_truth_table() {
+        assert!(ple_ljoin_from_value(None), "未設定は既定 (on)");
+        assert!(ple_ljoin_from_value(Some("")), "空も既定 (on)");
+        assert!(ple_ljoin_from_value(Some("x")), "解析不能は既定 (on)");
+        assert!(!ple_ljoin_from_value(Some("0")));
+        assert!(!ple_ljoin_from_value(Some("off")));
+        assert!(!ple_ljoin_from_value(Some(" FALSE ")));
+        assert!(!ple_ljoin_from_value(Some("no")));
+        assert!(ple_ljoin_from_value(Some("1")));
+        assert!(ple_ljoin_from_value(Some("on")));
+        assert_eq!(PLE_LJOIN_ENV, "DENNO_PF_PLE_LJOIN");
+        assert!(DEFAULT_PLE_LJOIN, "lab t423a/t423b で採ったので既定 on");
     }
 
     /// task 349 / 353: `DENNO_PF_PLE_PIPE` は既定 on (t353a で採用)、`0` 系だけが偽。
