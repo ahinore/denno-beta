@@ -34078,6 +34078,9 @@ const MIX_UP4_KERNEL_F: &str = "dno_mix_upmix_q8_up4f";
 /// 同上で JC=12 (1 ブロック 960 スレッド)。
 const MIX_UP4_KERNEL_W: &str = "dno_mix_upmix_q8_up4w";
 
+/// 同上で JC=4 (1 ブロック 320 スレッド、grid 1.5 倍) + exp は SFU。
+const MIX_UP4_KERNEL_X: &str = "dno_mix_upmix_q8_up4x";
+
 /// 引数の数 (lo, w, xn, out, n_in, e, inv_hc, row_bytes)。
 const MIX_UP4_NARGS: usize = 8;
 
@@ -34093,12 +34096,19 @@ pub(crate) const MIX_UP4_JC_W: usize = 12;
 /// `.cu` の JC=12 のスレッド数。
 pub(crate) const MIX_UP4_THREADS_W: u32 = 960;
 
+/// `.cu` の JC=4 (1 ブロック 16 行 = 320 スレッド)。
+pub(crate) const MIX_UP4_JC_X: usize = 4;
+
+/// `.cu` の JC=4 のスレッド数。
+pub(crate) const MIX_UP4_THREADS_X: u32 = 320;
+
 struct MixUp4Kernels {
     #[allow(dead_code)]
     module: CUmodule,
     up4: CUfunction,
     up4f: CUfunction,
     up4w: CUfunction,
+    up4x: CUfunction,
 }
 
 unsafe impl Send for MixUp4Kernels {}
@@ -34125,7 +34135,12 @@ fn mix_up4_kernels() -> Option<&'static MixUp4Kernels> {
                 Err(_) => return None,
             };
             let text = String::from_utf8_lossy(&image).to_string();
-            for name in [MIX_UP4_KERNEL, MIX_UP4_KERNEL_F, MIX_UP4_KERNEL_W] {
+            for name in [
+                MIX_UP4_KERNEL,
+                MIX_UP4_KERNEL_F,
+                MIX_UP4_KERNEL_W,
+                MIX_UP4_KERNEL_X,
+            ] {
                 if ptx_entry_params(&text, name) != Some(MIX_UP4_NARGS) {
                     eprintln!(
                         "[mix-up4] PTX の {name} の引数が {MIX_UP4_NARGS} 本でない → 従来の融合版へ。\
@@ -34158,7 +34173,8 @@ fn mix_up4_kernels() -> Option<&'static MixUp4Kernels> {
                 let up4 = get(MIX_UP4_KERNEL)?;
                 let up4f = get(MIX_UP4_KERNEL_F)?;
                 let up4w = get(MIX_UP4_KERNEL_W)?;
-                Some(MixUp4Kernels { module, up4, up4f, up4w })
+                let up4x = get(MIX_UP4_KERNEL_X)?;
+                Some(MixUp4Kernels { module, up4, up4f, up4w, up4x })
             }
         })
         .as_ref()
@@ -34169,13 +34185,14 @@ pub fn mix_up4_loaded() -> bool {
     mix_up4_kernels().is_some()
 }
 
-/// `mix_upq8_on()` の 3/4/5 を (種類 0=u4 1=u4f 2=u4w, JC, threads) へ。
+/// `mix_upq8_on()` の 3/4/5/6 を (種類 0=u4 1=u4f 2=u4w 3=u4x, JC, threads) へ。
 /// 0/1/2 とその他は `None` (従来経路)。
 pub fn mix_up4_plan(v: u8) -> Option<(u8, usize, u32)> {
     match v {
         3 => Some((0, MIX_UP4_JC, MIX_UP4_THREADS)),
         4 => Some((1, MIX_UP4_JC, MIX_UP4_THREADS)),
         5 => Some((2, MIX_UP4_JC_W, MIX_UP4_THREADS_W)),
+        6 => Some((3, MIX_UP4_JC_X, MIX_UP4_THREADS_X)),
         _ => None,
     }
 }
@@ -34294,13 +34311,17 @@ pub fn mix_upq8_shape_ok(n_in: usize, e: usize, hc: usize) -> bool {
 }
 
 /// `DENNO_MIX_UPQ8` の解釈 (純関数)。0 = 従来経路 / 1 = 融合 / 2 = 比較 /
-/// 3 = 1 対 4 レーン (u4) / 4 = 同 (exp だけ SFU、比較用) / 5 = 同 (JC=12)。
+/// 3 = 1 対 4 レーン (u4) / 4 = 同 (exp だけ SFU、**既定**) / 5 = 同 (JC=12) /
+/// 6 = 同 (JC=4 + SFU)。
 ///
 /// lab t382b (2 ラウンド、base 16.2 / fused 15.8 = -2.5%、mix 段 4.38 -> 3.93 ms/tok
-/// = -10.3%、prefill 0.68 s で不変、errors 0、md5 は 6 コンテキスト全部 SAME、
-/// `=check` の max|diff| は 1.5e-5 / |ref| 132 = 相対 1e-7、閾値超え 0 本) で
-/// 採ったので **既定 on**。切り戻しは `DENNO_MIX_UPQ8=0`。
-const MIX_UPQ8_DEFAULT: u8 = 1;
+/// = -10.3%、prefill を変えず、errors 0、md5 6 コンテキスト SAME) で融合版を採り、
+/// task 437 の lab t437b (2 ラウンド x 6 COND、mix 段 3.02/3.09 -> **2.82/2.82
+/// ms/tok** = -6.6%、短い decode 11.6 -> 11.3-11.4、14k 後 13.4 -> 13.0、errors 0、
+/// md5 6 コンテキスト SAME) で **1 対 = 4 レーンの u4f を既定にした**。
+/// u4f は exp だけ `__expf` (SFU、f32 で 2 ULP 程度) なので、glibc 一致の exp で
+/// 回したいときは `DENNO_MIX_UPQ8=u4`、従来の融合版は `=1`、3 本経路は `=0`。
+const MIX_UPQ8_DEFAULT: u8 = 4;
 
 pub fn mix_upq8_from_value(v: Option<&str>) -> u8 {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
@@ -34310,6 +34331,7 @@ pub fn mix_upq8_from_value(v: Option<&str>) -> u8 {
         Some("3") | Some("u4") | Some("up4") => 3,
         Some("4") | Some("u4f") | Some("up4f") => 4,
         Some("5") | Some("u4w") | Some("up4w") => 5,
+        Some("6") | Some("u4x") | Some("up4x") => 6,
         Some("0") | Some("off") | Some("false") | Some("no") | Some("") => 0,
         _ => MIX_UPQ8_DEFAULT,
     }
@@ -35024,6 +35046,7 @@ pub fn maybe_gpu_mix_q_chain_into(
                 let f = match kind {
                     1 => k.up4f,
                     2 => k.up4w,
+                    3 => k.up4x,
                     _ => k.up4,
                 };
                 (f, (e.div_ceil(jc)).max(1) as u32, th)
@@ -45780,8 +45803,9 @@ mod tests {
     /// t382b で採ったので既定 on、明示的な偽値だけが従来経路。
     #[test]
     fn mix_upq8_gate_and_shape() {
-        assert_eq!(mix_upq8_from_value(None), 1, "未設定は融合 (既定 on)");
-        assert_eq!(mix_upq8_from_value(Some("nope")), 1, "未知も既定 on");
+        // task 437: 既定は 1 対 = 4 レーンの u4f (lab t437b)。
+        assert_eq!(mix_upq8_from_value(None), 4, "未設定は u4f (既定 on)");
+        assert_eq!(mix_upq8_from_value(Some("nope")), 4, "未知も既定 on");
         assert_eq!(mix_upq8_from_value(Some("")), 0, "空文字は切り戻し");
         assert_eq!(mix_upq8_from_value(Some("0")), 0);
         assert_eq!(mix_upq8_from_value(Some("off")), 0);
@@ -45828,7 +45852,8 @@ mod tests {
         assert_eq!(mix_up4_plan(3), Some((0, 6, 480)), "u4 = JC6 / 480 スレッド");
         assert_eq!(mix_up4_plan(4), Some((1, 6, 480)), "u4f も同じ形");
         assert_eq!(mix_up4_plan(5), Some((2, 12, 960)), "u4w は JC12");
-        for v in [0u8, 1, 2, 6, 7, 255] {
+        assert_eq!(mix_up4_plan(6), Some((3, 4, 320)), "u4x は JC4 / 320 スレッド");
+        for v in [0u8, 1, 2, 7, 8, 255] {
             assert_eq!(mix_up4_plan(v), None, "{v} は従来経路");
         }
         // ゲートは既存 env の新しい値。
@@ -45839,14 +45864,18 @@ mod tests {
         assert_eq!(mix_upq8_from_value(Some("4")), 4);
         assert_eq!(mix_upq8_from_value(Some("u4w")), 5);
         assert_eq!(mix_upq8_from_value(Some("5")), 5);
-        // 既定は従来の融合版 (採否は lab で決める)。
-        assert_eq!(mix_upq8_from_value(None), 1);
-        assert_eq!(mix_upq8_from_value(Some("nope")), 1);
+        assert_eq!(mix_upq8_from_value(Some("u4x")), 6);
+        assert_eq!(mix_upq8_from_value(Some("6")), 6);
+        // lab t437b で採ったので既定は u4f (mix 段 -6.6%)。
+        assert_eq!(mix_upq8_from_value(None), 4);
+        assert_eq!(mix_upq8_from_value(Some("nope")), 4);
         // 実形のブロック数と 1 行 20 スレッド (5 対 x 4 レーン)。
         assert_eq!(2560usize.div_ceil(MIX_UP4_JC), 427);
         assert_eq!(2560usize.div_ceil(MIX_UP4_JC_W), 214);
+        assert_eq!(2560usize.div_ceil(MIX_UP4_JC_X), 640);
         assert_eq!(MIX_UP4_JC * 4 * 5 * 4, MIX_UP4_THREADS as usize);
         assert_eq!(MIX_UP4_JC_W * 4 * 5 * 4, MIX_UP4_THREADS_W as usize);
+        assert_eq!(MIX_UP4_JC_X * 4 * 5 * 4, MIX_UP4_THREADS_X as usize);
         // 形の門番は従来の融合版と同じ。
         assert!(mix_upq8_shape_ok(320, 2560, 4));
         assert!(!mix_upq8_shape_ok(256, 2560, 4));

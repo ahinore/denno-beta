@@ -268,3 +268,14 @@ extern "C" __global__ void dno_mix_upmix_q8_up4w(
 {
     dno_up4_body<false, 12>(lo, w, xn, out, n_in, e, inv_hc, row_bytes);
 }
+
+// JC=4 (block = 320、grid は 1.5 倍) + SFU。ブロック数をもう一段増やした版。
+extern "C" __global__ void dno_mix_upmix_q8_up4x(
+    const float* __restrict__ lo,
+    const unsigned char* __restrict__ w,
+    const float* __restrict__ xn,
+    float* __restrict__ out,
+    int n_in, int e, float inv_hc, int row_bytes)
+{
+    dno_up4_body<true, 4>(lo, w, xn, out, n_in, e, inv_hc, row_bytes);
+}

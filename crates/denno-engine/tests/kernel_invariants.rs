@@ -12891,6 +12891,7 @@ fn task437_up4_four_lanes_per_pair_up_is_wired() {
         "dno_mix_upmix_q8_up4",
         "dno_mix_upmix_q8_up4f",
         "dno_mix_upmix_q8_up4w",
+        "dno_mix_upmix_q8_up4x",
     ] {
         assert!(
             cu.contains(&format!("extern \"C\" __global__ void {name}(")),
@@ -12907,6 +12908,7 @@ fn task437_up4_four_lanes_per_pair_up_is_wired() {
     assert!(cu.contains("dno_up4_body<false, 6>"), "u4 (JC=6) が無い");
     assert!(cu.contains("dno_up4_body<true, 6>"), "u4f (JC=6, SFU) が無い");
     assert!(cu.contains("dno_up4_body<false, 12>"), "u4w (JC=12) が無い");
+    assert!(cu.contains("dno_up4_body<true, 4>"), "u4x (JC=4, SFU) が無い");
     assert!(cu.contains("#define UP4_XSTRIDE 68"), "x の窓が 68 でない");
     assert!(
         cu.contains("#define UP4_LPR (UP4_PAIRS * 4)"),
@@ -12918,10 +12920,13 @@ fn task437_up4_four_lanes_per_pair_up_is_wired() {
     assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS: u32 = 480;"));
     assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC_W: usize = 12;"));
     assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS_W: u32 = 960;"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC_X: usize = 4;"));
+    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS_X: u32 = 320;"));
     assert!(CUDA_RS.contains("pub fn mix_up4_plan(v: u8) -> Option<(u8, usize, u32)> {"));
     assert!(CUDA_RS.contains("Some(\"3\") | Some(\"u4\") | Some(\"up4\") => 3,"));
     assert!(CUDA_RS.contains("Some(\"4\") | Some(\"u4f\") | Some(\"up4f\") => 4,"));
     assert!(CUDA_RS.contains("Some(\"5\") | Some(\"u4w\") | Some(\"up4w\") => 5,"));
+    assert!(CUDA_RS.contains("Some(\"6\") | Some(\"u4x\") | Some(\"up4x\") => 6,"));
     let f = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_q_chain_into(");
     assert!(
         f.contains("let up4_plan = if fu_pre.is_some() && mix_up4_kernels().is_some() {"),
@@ -12929,6 +12934,7 @@ fn task437_up4_four_lanes_per_pair_up_is_wired() {
     );
     assert!(f.contains("1 => k.up4f,"), "u4f の選択が無い");
     assert!(f.contains("2 => k.up4w,"), "u4w の選択が無い");
+    assert!(f.contains("3 => k.up4x,"), "u4x の選択が無い");
     assert!(
         f.contains("MIX_UP4_HITS.fetch_add(1, AO::Relaxed)"),
         "発火の計数が無い"
