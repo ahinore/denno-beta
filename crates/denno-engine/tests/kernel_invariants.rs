@@ -12405,9 +12405,12 @@ fn task415_embed_par_and_overlap_are_wired() {
         f.contains("crate::model::linear_gguf::embed_rows_into("),
         "並列の埋め込み引きを呼んでいない"
     );
+    // task 423: 背景の gather はチャネルで受ける (join 相当。off は層ループの前、
+    // on は層ループの PLE 層でチャンクごと)。
     assert!(
-        f.contains("std::thread::spawn") && f.contains("h.join()"),
-        "PLE の gather を背景へ出して join していない"
+        f.contains("std::thread::spawn")
+            && f.contains("rx.recv().map_err(|_| one(\"PLE の先読みスレッドが落ちた\"))??"),
+        "PLE の gather を背景へ出して受け取っていない"
     );
     assert!(
         f.contains("self.forward_embed(&ctx[..=i], &hp)?"),
