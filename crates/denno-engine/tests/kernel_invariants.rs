@@ -12343,24 +12343,24 @@ fn task415_embed_par_and_overlap_are_wired() {
         "EMBED_PAR の env 名が無い"
     );
     assert!(
-        EXP_PF_SRC.contains("pub const DEFAULT_EMBED_PAR: usize = 0;"),
-        "EMBED_PAR の既定が直列でない"
+        EXP_PF_SRC.contains("pub const DEFAULT_EMBED_PAR: usize = 16;"),
+        "EMBED_PAR の既定が 16 本でない (lab t415b で採った値)"
     );
     assert!(
         EXP_PF_SRC.contains("pub const EMBED_OVL_ENV: &str = \"DENNO_PF_EMBED_OVL\";"),
         "EMBED_OVL の env 名が無い"
     );
     assert!(
-        EXP_PF_SRC.contains("pub const DEFAULT_EMBED_OVL: bool = false;"),
-        "EMBED_OVL の既定が on になっている"
+        EXP_PF_SRC.contains("pub const DEFAULT_EMBED_OVL: bool = true;"),
+        "EMBED_OVL の既定が on でない (lab t415b で採った値)"
     );
     let p = fn_body(EXP_PF_SRC, "pub fn embed_par_from_value(");
     assert!(p.contains("Ok(0) => 0"), "0 を直列として扱っていない");
     assert!(p.contains(".min(64)"), "本数の上限が無い");
     let o = fn_body(EXP_PF_SRC, "pub fn embed_ovl_from_value(");
     assert!(
-        o.contains("\"1\" | \"on\" | \"true\" | \"yes\""),
-        "明示の真値だけ on になっていない"
+        o.contains("\"0\" | \"off\" | \"false\" | \"no\""),
+        "0 系だけを off にしていない (未設定は既定 on)"
     );
     // 2. 層優先の prefill が (a) ゲートを読み、(b) 並列の引き口を呼び、
     //    (c) 背景の gather を join し、(d) 直列の従来経路も残していること。
