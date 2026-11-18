@@ -33280,6 +33280,10 @@ pub enum MixGemv {
     /// 載せて rows 行で使い回す。行ごとの積和と縮約順は dn5 と同一なので、
     /// **値は dn5 と 1 ビットも変わらない**。
     Dn6,
+    /// task 431: 1 対 = 4 レーン (`kernels_mix_dn7.cu`)。1 レーン = 1 対では
+    /// スレッド数が n_out * n_pairs で頭打ちになり 9.4 warp/SM しか出ないため、
+    /// 16 要素ずつ 4 レーンに割って 4 倍のスレッドを出す (丸め順が変わる)。
+    Dn7,
 }
 
 /// [`MIX_QK_ENV`] の解釈 (純関数)。返り値は `(down, up)` の種別。
@@ -33307,6 +33311,8 @@ pub fn mix_qk_from_value(v: Option<&str>) -> (MixGemv, MixGemv) {
         Some("ups") => (MixGemv::Blk, MixGemv::Seg),
         // task 418: down だけ 1 ブロック 1 行・1 レーン 1 対の新カーネル。
         Some("dn5") | Some("d5") => (MixGemv::Dn5, MixGemv::V5),
+        // task 431: 1 対 = 4 レーンの dn7 (丸め順が変わる)。
+        Some("dn7") | Some("d7") => (MixGemv::Dn7, MixGemv::V5),
         // task 422: down を「1 ブロック rows 行」に一般化した dn6
         // (`mix_dn6_rows_from_value` が rows を決める。値は dn5 と同一)。
         Some("dn6") | Some("d6") | Some("dn6r1") | Some("dn6r2") | Some("dn6r4")
@@ -33880,6 +33886,171 @@ fn mix_dn6_rows() -> usize {
 }
 
 // ===========================================================================
+// task 431: mix の down を 1 対 = 4 レーンで回す (`DENNO_MIX_QK=dn7`)
+// ===========================================================================
+//
+// lab t431a の mix band (`[dec-kprof-avg]`、1 呼び出しあたり) は
+//   H2D@a 10.3 / down 14.0 / up 10.8 / router 6.9 / D2H@a 5.4 us
+// で、down は 3.48 MB を 245 GB/s。**同じ dn6 の PTX を GDN の qkv
+// (grid 1,280 x 192) で撃つと 962 GB/s** 出るので、差はカーネルの中身ではなく
+// 同時に走る warp 数 (mix down は 9.4 warp/SM)。1 レーン = 1 対のままだと
+// スレッド数が n_out * n_pairs で固定されるため、dn7 は 1 対を 4 レーンに割る
+// (`kernels_mix_dn7.cu`)。実形で 204,800 スレッド = 37.6 warp/SM。
+//
+// 値は丸め順だけが変わる (1 行の和を 16 要素ずつ 4 レーンに分けて足す)。
+// ゲートは既存 env の新しい値 `DENNO_MIX_QK=dn7`。形が合わなければ dn6 へ落ちる。
+
+/// 新カーネル名 (`kernels_mix_dn7.cu`)。
+const MIX_DN7_KERNEL_NAME: &str = "dno_mix_gemv_q8_0_dn7";
+/// 引数の数 (w, x, out, n_in, n_out, row_bytes, rows)。
+const MIX_DN7_NARGS: usize = 7;
+/// 1 ブロックのスレッド上限。
+const MIX_DN7_MAX_THREADS: usize = 1024;
+/// 1 レーンが担当する要素数 (`.cu` の `16 * sub`)。
+const MIX_DN7_LANES: usize = 4;
+
+struct MixDn7Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixDn7Kernels {}
+unsafe impl Sync for MixDn7Kernels {}
+
+static MIX_DN7_KERNELS: OnceLock<Option<MixDn7Kernels>> = OnceLock::new();
+
+fn mix_dn7_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_DN7_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_dn7.ptx"),
+    }
+}
+
+/// 新カーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_dn7_kernels() -> Option<&'static MixDn7Kernels> {
+    MIX_DN7_KERNELS
+        .get_or_init(|| {
+            let path = mix_dn7_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_DN7_KERNEL_NAME) != Some(MIX_DN7_NARGS) {
+                eprintln!(
+                    "[mix-dn7] PTX の引数が {MIX_DN7_NARGS} 本でない → dn6 / dn5 / v5 へ。\
+                     `bash build_ptx.sh mix_dn7` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_DN7_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-dn7] PTX に {MIX_DN7_KERNEL_NAME} が無い → dn6 / dn5 / v5 へ");
+                    return None;
+                }
+                Some(MixDn7Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 新カーネルが載っているか (テスト / 診断用)。
+pub fn mix_dn7_loaded() -> bool {
+    mix_dn7_kernels().is_some()
+}
+
+/// 起動形 (純関数)。`Some((rows, threads))` なら撃てる。
+///
+/// `.cu` の前提は「Q8_0 / n_in % 64 == 0 / 1 行あたり np*4 スレッド
+/// (np = n_in/64) が 32 の倍数 = np % 8 == 0 / np*4 <= 1024 / warp 数 <= 32」。
+/// 実形 (n_in = 10,240) は np = 160 で 1 行 640 スレッド・20 warp。
+pub fn mix_dn7_plan(n_in: usize, n_out: usize) -> Option<(usize, usize)> {
+    if n_in == 0 || n_out == 0 || n_in % 64 != 0 {
+        return None;
+    }
+    let np = n_in / 64;
+    if np == 0 || np % 8 != 0 {
+        return None;
+    }
+    let per_row = np * MIX_DN7_LANES;
+    if per_row > MIX_DN7_MAX_THREADS || per_row / 32 > 32 {
+        return None;
+    }
+    // 1 ブロックは 1 行 (rows=1)。2 行にすると per_row*2 が上限を超える実形がある。
+    let rows = 1;
+    if n_out.div_ceil(rows) > u32::MAX as usize {
+        return None;
+    }
+    Some((rows, per_row))
+}
+
+/// 新カーネルを 1 本積む (grid = ceil(n_out / rows)、block = rows * np * 4)。
+fn launch_mix_dn7(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    x: CUdeviceptr,
+    o: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+    rows: usize,
+    threads: usize,
+) -> Result<()> {
+    let k = mix_dn7_kernels().ok_or_else(|| anyhow::anyhow!("dn7 のカーネルが無い"))?;
+    let (mut pw, mut px, mut po) = (w, x, o);
+    let (mut ni, mut no, mut rb) = (n_in as c_int, n_out as c_int, row_bytes as c_int);
+    let mut rw = rows as c_int;
+    let mut args = [
+        &mut pw as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut po as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut no as *mut _ as *mut c_void,
+        &mut rb as *mut _ as *mut c_void,
+        &mut rw as *mut _ as *mut c_void,
+    ];
+    // block = rows (1) * threads。grid は行数。
+    unsafe {
+        ctx.launch_async(
+            k.f,
+            (n_out.div_ceil(rows) as u32, 1, 1),
+            (threads as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// dn7 を撃った回数 (診断。`[mix-qchain]` の `dn7=` に出る)。
+static MIX_DN7_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// dn7 を撃った回数。
+pub fn mix_dn7_hits() -> u64 {
+    MIX_DN7_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 集計を 0 に戻す。
+pub fn mix_dn7_reset() {
+    MIX_DN7_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ===========================================================================
 // task 382: mix の silu + up + hc_mixed を 1 本に畳む (`DENNO_MIX_UPQ8`)
 // ===========================================================================
 //
@@ -34399,7 +34570,17 @@ pub fn maybe_gpu_mix_q_chain_into(
         } else {
             None
         };
+        // task 431: dn7 (1 対 4 レーン) の起動形。門番は `mix_dn7_plan`。
+        let dn7_plan = if want_down == MixGemv::Dn7
+            && down_ty == crate::kquant::GgmlType::Q8_0
+            && mix_dn7_kernels().is_some()
+        {
+            mix_dn7_plan(k1, n1)
+        } else {
+            None
+        };
         let down_kind = match (want_down, kern, rd) {
+            (MixGemv::Dn7, _, _) if dn7_plan.is_some() => MixGemv::Dn7,
             (MixGemv::Dn6, _, _) if dn6_plan.is_some() => MixGemv::Dn6,
             (MixGemv::Dn5, _, _) if dn5_warps.is_some() => MixGemv::Dn5,
             (MixGemv::V5, _, _) if v5_down.is_some() => MixGemv::V5,
@@ -34599,6 +34780,12 @@ pub fn maybe_gpu_mix_q_chain_into(
                         let (warps, rows) = dn6_plan.expect("検査済み");
                         launch_mix_dn6(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps, rows)?;
                         MIX_DN6_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    MixGemv::Dn7 => {
+                        // task 431: 1 対 4 レーン (スレッド数 4 倍、丸め順が変わる)。
+                        let (rows, threads) = dn7_plan.expect("検査済み");
+                        launch_mix_dn7(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, rows, threads)?;
+                        MIX_DN7_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     MixGemv::V5 => {
                         // task 286: v5 形 (68 B の対読み + 先読み)。重みは生ポインタ。
@@ -45467,6 +45654,32 @@ mod tests {
         assert_eq!(mix_zc_from_value(Some("ON")), (true, true));
         // 未知の値は既定 (従来経路) へ倒す。
         assert_eq!(mix_zc_from_value(Some("nope")), (false, false));
+    }
+
+    /// task 431: dn7 (1 対 = 4 レーン) の起動形とゲート。
+    ///
+    /// 実形 (mix down: n_in = 10,240 / n_out = 320) は np = 160 で
+    /// 1 行 640 スレッド (20 warp)・320 ブロック = 204,800 スレッド。
+    /// 形が合わない (np が 8 の倍数でない / 1024 超) は None = dn6 へ落ちる。
+    #[test]
+    fn mix_dn7_plan_and_gate_match_the_ud_mix_down() {
+        assert_eq!(mix_dn7_plan(10240, 320), Some((1, 640)), "実形が撃てない");
+        // np = n_in/64 が 8 の倍数でない / 0 は落とす。
+        assert_eq!(mix_dn7_plan(320, 10240), None, "up の形 (np=5) は対象外");
+        assert_eq!(mix_dn7_plan(64 * 4, 8), None, "np=4 (per_row が 32 の倍数でない)");
+        assert_eq!(mix_dn7_plan(0, 8), None);
+        assert_eq!(mix_dn7_plan(10240, 0), None);
+        // 1 行 1024 スレッド超 (np = 264 -> 1056) は落とす。
+        assert_eq!(mix_dn7_plan(64 * 264, 8), None);
+        // 1 行 1024 スレッドちょうど (np = 256) は通る。
+        assert_eq!(mix_dn7_plan(64 * 256, 8), Some((1, 1024)));
+        // ゲートは既存 env の新しい値。up は v5 のまま。
+        assert_eq!(mix_qk_from_value(Some("dn7")), (MixGemv::Dn7, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(Some(" D7 ")), (MixGemv::Dn7, MixGemv::V5));
+        assert_eq!(mix_qk_from_value(None), (MixGemv::Dn6, MixGemv::V5), "既定は dn6");
+        // 発火の計数はリセットできる。
+        mix_dn7_reset();
+        assert_eq!(mix_dn7_hits(), 0);
     }
 
     /// task 431: `DENNO_MIX_ZC` の第 3 の指定 (H2D を別ストリームへ) の真理値表。

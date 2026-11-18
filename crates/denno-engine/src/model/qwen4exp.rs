@@ -6437,6 +6437,11 @@ pub fn mix_qchain_line() -> Option<String> {
     let (f6, h6) = crate::cuda::dn6_dec_hits();
     #[cfg(not(feature = "cuda"))]
     let (f6, h6) = (0u64, 0u64);
+    // task 431: down を 1 対 4 レーンの dn7 で撃った回数 (0 なら dn6/dn5/v5)。
+    #[cfg(feature = "cuda")]
+    let dn7 = crate::cuda::mix_dn7_hits();
+    #[cfg(not(feature = "cuda"))]
+    let dn7 = 0u64;
     // task 431: xn の H2D を別ストリームへ出した回数 (`DENNO_MIX_ZC=stream`)。
     // 0 なら従来の null ストリーム (発火の証拠)。
     #[cfg(feature = "cuda")]
@@ -6444,7 +6449,7 @@ pub fn mix_qchain_line() -> Option<String> {
     #[cfg(not(feature = "cuda"))]
     let h2s = 0u64;
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} f6={f6} h6={h6} h2s={h2s}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} dn7={dn7} f6={f6} h6={h6} h2s={h2s}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6471,6 +6476,9 @@ pub fn mix_qchain_reset() {
     // task 431: 別ストリーム H2D の計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::mix_h2s_reset();
+    // task 431: dn7 の計数も同じ区切りで 0 に戻す。
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_dn7_reset();
 }
 
 #[cfg(test)]

@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy gdn_pf_wy4 exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf exp_k_tc mix_inj3 mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5 gdn_pf_wy6 gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy gdn_pf_wy4 exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf exp_k_tc mix_inj3 mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5 gdn_pf_wy6 gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -198,6 +198,8 @@ spec() {
         # task 422: dn5 を「1 ブロック rows 行」に一般化した版 (mix の down と
         # GDN の qkv/out の両方で撃つ)。積和と縮約の順は dn5 と同じ。
         mix_dn6)      echo "kernels_mix_dn6.cu|nofmad" ;;
+        # task 431: mix down の 1 対 = 4 レーン版 (丸め順が変わるので nofmad)。
+        mix_dn7)      echo "kernels_mix_dn7.cu|nofmad" ;;
         # task 225: prefill の ssm beta/alpha 射影 (F32 重み 2,560 x 48) を
         # 48 行 x 64 トークンのタイルで回す GEMM。出力 1 要素 1 アキュムレータ・
         # k 昇順の明示 __fmaf_rn なので -fmad=false (演算列を読めるようにする)。
