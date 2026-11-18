@@ -26963,6 +26963,10 @@ struct MixGpuScratch {
     /// task 382: `DENNO_MIX_UPQ8=check` の比較用 (融合版の出力 / その受け皿)。
     chk: Option<DevBuffer>,
     hchk: Option<PinMem>,
+    /// task 431: `DENNO_MIX_ZC=stream` の H2D 専用ストリーム + 完了イベント。
+    /// 鎖のカーネルは null ストリームのまま (発行順も同期点も変えない)。
+    cstream: Option<CopyStream>,
+    cev: Option<CopyEvent>,
 }
 
 thread_local! {
@@ -26980,7 +26984,39 @@ thread_local! {
             omap: None,
             chk: None,
             hchk: None,
+            cstream: None,
+            cev: None,
         });
+}
+
+/// task 431: H2D 専用の非ブロッキングストリーム + 完了イベントを用意する
+/// (`DENNO_MIX_ZC=stream` のときだけ呼ばれる)。作れなければ `None` = 従来経路。
+fn mix_h2s_ensure(s: &mut MixGpuScratch) -> Option<(CUstream, CUevent)> {
+    if let (Some(st), Some(ev)) = (s.cstream.as_ref(), s.cev.as_ref()) {
+        return Some((st.0, ev.0));
+    }
+    const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+    const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+    let l = lib().ok()?;
+    let (Some(stream_create), Some(event_create)) = (l.stream_create, l.event_create) else {
+        return None;
+    };
+    let mut st: CUstream = std::ptr::null_mut();
+    if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+        return None;
+    }
+    let mut ev: CUevent = std::ptr::null_mut();
+    if unsafe { event_create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+        unsafe {
+            if let Some(f) = l.stream_destroy {
+                let _ = f(st);
+            }
+        }
+        return None;
+    }
+    s.cstream = Some(CopyStream(st));
+    s.cev = Some(CopyEvent(ev));
+    Some((st, ev))
 }
 
 /// task 121: mix GPU で並列リダクション版 (`dno_matvec_f32_r`) に切り替える
@@ -34054,13 +34090,43 @@ pub fn mix_upq8_check_line() -> Option<String> {
 /// - `x` / `in`: H2D だけ消す (`down` がホストの `xn` を PCIe 越しに読む)。
 /// - `out`: D2H だけ消す (`hc_mixed` がホストメモリへ直接書く)。
 /// - `1` / `on` / `both`: 両方。
+/// - task 431: `os` / `outstream` / `all` は「D2H を消す + H2D を別ストリームへ」
+///   (H2D は消さない。下の [`mix_zc_h2d_stream_from_value`] を見る)。
 pub fn mix_zc_from_value(v: Option<&str>) -> (bool, bool) {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("x") | Some("in") => (true, false),
         Some("out") => (false, true),
         Some("1") | Some("on") | Some("true") | Some("yes") | Some("both") => (true, true),
+        // task 431: 第 3 の指定 (`H2D を別ストリーム`) と組む値。
+        Some("os") | Some("outstream") | Some("all") => (false, true),
         _ => (false, false),
     }
+}
+
+/// task 431: `DENNO_MIX_ZC` の第 3 の指定 — **xn の H2D を専用の
+/// 非ブロッキングストリームへ出す** (純関数)。
+///
+/// なぜ要るか (lab t431a の `[dec-kprof-avg]` mix band、1 呼び出しあたり):
+///   H2D@a 10.3 us / down 14.0 / up 10.8 / router 6.9 / D2H@a 5.4
+/// で、**41 KB の H2D が 10.3 us** かかっている。中身は転送 (0.8 us) ではなく
+/// 「null ストリームの前の仕事 (attention) が終わるまでの待ち」なので、
+/// コピーだけ別ストリームへ出せば前の仕事と重なって消える。鎖のカーネルは
+/// null ストリームのままで、コピーの完了イベントを 1 本待たせるだけ。
+/// 値は 1 ビットも変わらない (同じバイトが同じ場所へ行く)。
+///
+/// 値: `stream` / `s` (H2D だけ別ストリーム) と、上の `os` / `outstream` / `all`
+/// (D2H も消す)。既定 off。
+pub fn mix_zc_h2d_stream_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("stream")
+            | Some("s")
+            | Some("os")
+            | Some("outstream")
+            | Some("all")
+            | Some("sx")
+            | Some("instream")
+    )
 }
 
 pub const MIX_ZC_ENV: &str = "DENNO_MIX_ZC";
@@ -34086,8 +34152,41 @@ pub(crate) fn mix_zc_set_for_test(v: Option<(bool, bool)>) {
     MIX_ZC_FORCE.with(|c| c.set(v));
 }
 
+/// task 431: H2D を別ストリームへ出すかの実値 (プロセスで 1 回だけ env を読む)。
+pub fn mix_zc_h2d_stream() -> bool {
+    #[cfg(test)]
+    if let Some(v) = MIX_ZC_H2S_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_zc_h2d_stream_from_value(std::env::var(MIX_ZC_ENV).ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIX_ZC_H2S_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト用: [`mix_zc_h2d_stream`] の強制 (`None` = env の解釈)。
+#[cfg(test)]
+pub(crate) fn mix_zc_h2d_stream_set_for_test(v: Option<bool>) {
+    MIX_ZC_H2S_FORCE.with(|c| c.set(v));
+}
+
 static MIX_ZC_X_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MIX_ZC_OUT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// task 431: xn の H2D を別ストリームへ出した回数 (発火の証拠)。
+static MIX_H2S_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 431: 別ストリームへ出した H2D の回数 (診断)。
+pub fn mix_h2s_hits() -> u64 {
+    MIX_H2S_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 431: 計数を 0 に戻す (リクエスト終端)。
+pub fn mix_h2s_reset() {
+    MIX_H2S_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// 実際に H2D を省いた回数 / D2H を省いた回数 (診断)。
 pub fn mix_zc_hits() -> (u64, u64) {
@@ -34233,6 +34332,13 @@ pub fn maybe_gpu_mix_q_chain_into(
             3,
         );
         let mut s = cell.borrow_mut();
+        // task 431: H2D を別ストリームへ出すか (既定 off)。ストリームと
+        // イベントは `&mut *s` を分解する前に取る。
+        let h2s = if mix_zc_h2d_stream() {
+            mix_h2s_ensure(&mut s)
+        } else {
+            None
+        };
         let MixGpuScratch {
             x: dx,
             lo: dlo,
@@ -34248,6 +34354,8 @@ pub fn maybe_gpu_mix_q_chain_into(
             hchk,
             ..
         } = &mut *s;
+        // この H2D を積むストリーム (`h2s` が無ければ null = 従来)。
+        let h2d_stream: CUstream = h2s.map(|(st, _)| st).unwrap_or(std::ptr::null_mut());
         // task 382: 鎖の両端の往復 (H2D xn / D2H mixed) を消すかの実値。
         // H2D を消せるのは down/up が両方 v5 のときだけ (stage の前置きを
         // 読むのは Blk / Seg のカーネルで、v5 は重みポインタを引数で受ける)。
@@ -34351,6 +34459,8 @@ pub fn maybe_gpu_mix_q_chain_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        // task 431: 実際に積んだ H2D の本数 (0 ならイベントを待たせない)。
+        let mut h2d_copies = 0usize;
         if need_stage && zc_x {
             // task 382: xn を device から見える pinned へ置くだけ (転送命令なし)。
             dec_kprof::step("mix_h2d_pack", || {
@@ -34385,12 +34495,13 @@ pub fn maybe_gpu_mix_q_chain_into(
                         st.ptr(),
                         hs.ptr as *const c_void,
                         MIX_QK_PROLOGUE + k1 * 4,
-                        std::ptr::null_mut(),
+                        h2d_stream,
                     ),
                     "cuMemcpyHtoDAsync (mix qk)",
                 )?;
             }
             dec_kprof::op_end(kp_cp);
+            h2d_copies += 1;
         } else {
             dec_kprof::step("mix_h2d_pack", || {
                 hx.as_mut_slice::<f32>()[..k1].copy_from_slice(xn)
@@ -34408,12 +34519,13 @@ pub fn maybe_gpu_mix_q_chain_into(
                         dx.ptr(),
                         hx.ptr as *const c_void,
                         k1 * 4,
-                        std::ptr::null_mut(),
+                        h2d_stream,
                     ),
                     "cuMemcpyHtoDAsync (mix q chain)",
                 )?;
             }
             dec_kprof::op_end(kp_cp);
+            h2d_copies += 1;
         }
         // down が旧 GEMV のときは xn を従来どおり dx にも送る (前置き側の xn は
         // 使わない。up だけ高速にする組合せのための 40 KB の二重送り)。
@@ -34434,12 +34546,33 @@ pub fn maybe_gpu_mix_q_chain_into(
                         dx.ptr(),
                         hx.ptr as *const c_void,
                         k1 * 4,
-                        std::ptr::null_mut(),
+                        h2d_stream,
                     ),
                     "cuMemcpyHtoDAsync (mix q chain)",
                 )?;
             }
             dec_kprof::op_end(kp_cp);
+            h2d_copies += 1;
+        }
+        // task 431: 別ストリームへ出した H2D を、鎖のカーネル (null ストリーム)
+        // の前に 1 本のイベントで待たせる。ここまではホスト側の仕事だけで、
+        // コピーは前の層の GPU 仕事と重なって走る。
+        if let Some((st_side, ev_side)) = h2s {
+            if h2d_copies > 0 {
+                let ok = match (lib.event_record, lib.stream_wait_event) {
+                    (Some(rec), Some(wev)) => unsafe {
+                        rec(ev_side, st_side) == CUDA_SUCCESS
+                            && wev(std::ptr::null_mut(), ev_side, 0) == CUDA_SUCCESS
+                    },
+                    _ => false,
+                };
+                if ok {
+                    MIX_H2S_HITS.fetch_add(1, AO::Relaxed);
+                } else {
+                    // 順序が取れない環境では安全側に倒す (ホストで待つ)。
+                    ctx.sync()?;
+                }
+            }
         }
         // デバイス側の xn の置き場所 (down が高速なら前置きバッファの末尾)。
         let xdev = if zc_x {
@@ -34535,10 +34668,20 @@ pub fn maybe_gpu_mix_q_chain_into(
             Scratch::ensure(dchk, e * 4)?;
             Scratch::ensure_pin(hchk, e * 4)?;
         }
+        // 4. hc_mixed (xn と gate から mixed) の行き先。
+        // task 382: zc_out のときはホストの pinned へ直接書く (D2H を消す)。
+        // task 431: 融合版 (`DENNO_MIX_UPQ8`) は **この mdev をそのまま受け取る**
+        // ようにした (それまでは融合版だけ `dm` へ書いていて、zc_out と併用すると
+        // D2H を省いた先が空のままだった = 併用できなかった)。
+        let mdev = if zc_out {
+            omap.as_ref().expect("確保済み").dev
+        } else {
+            dm.ptr()
+        };
         if fu {
             let f = mix_upq8_kernels().expect("直前に確認").f;
             let pout = if fu_use {
-                dm.ptr()
+                mdev
             } else {
                 dchk.as_ref().expect("確保済み").ptr()
             };
@@ -34653,13 +34796,7 @@ pub fn maybe_gpu_mix_q_chain_into(
                 return Err(anyhow::anyhow!("up の GEMV 計画が無い"));
             }
         }
-        // 4. hc_mixed (xn と gate から mixed)
-        // task 382: zc_out のときはホストの pinned へ直接書く (D2H を消す)。
-        let mdev = if zc_out {
-            omap.as_ref().expect("確保済み").dev
-        } else {
-            dm.ptr()
-        };
+        // 4. hc_mixed (xn と gate から mixed) — 行き先は上で決めた `mdev`。
         if !fu_use {
             unsafe {
                 let (mut px, mut pg, mut pm) = (xdev, dout.ptr(), mdev);
@@ -45330,6 +45467,34 @@ mod tests {
         assert_eq!(mix_zc_from_value(Some("ON")), (true, true));
         // 未知の値は既定 (従来経路) へ倒す。
         assert_eq!(mix_zc_from_value(Some("nope")), (false, false));
+    }
+
+    /// task 431: `DENNO_MIX_ZC` の第 3 の指定 (H2D を別ストリームへ) の真理値表。
+    /// 既定 off、`stream` / `s` で H2D だけ、`os` / `outstream` / `all` で
+    /// D2H も消す。既存の値 (`x` / `out` / `1`) はストリームを立てない。
+    #[test]
+    fn mix_zc_h2d_stream_gate_parses_explicitly() {
+        assert!(!mix_zc_h2d_stream_from_value(None), "未設定は従来経路");
+        assert!(!mix_zc_h2d_stream_from_value(Some("")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("0")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("off")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("x")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("out")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("1")));
+        assert!(!mix_zc_h2d_stream_from_value(Some("nope")));
+        assert!(mix_zc_h2d_stream_from_value(Some("stream")));
+        assert!(mix_zc_h2d_stream_from_value(Some(" S ")));
+        assert!(mix_zc_h2d_stream_from_value(Some("sx")));
+        assert!(mix_zc_h2d_stream_from_value(Some("instream")));
+        // `os` / `outstream` / `all` は D2H も消す (両方の表で真)。
+        for v in ["os", "outstream", "all"] {
+            assert!(mix_zc_h2d_stream_from_value(Some(v)), "{v}");
+            assert_eq!(mix_zc_from_value(Some(v)), (false, true), "{v}");
+        }
+        assert_eq!(mix_zc_from_value(Some("stream")), (false, false));
+        // 発火の計数はリセットできる。
+        mix_h2s_reset();
+        assert_eq!(mix_h2s_hits(), 0);
     }
 
     /// task 382: ZC のゲートを立てても、CUDA が無い環境では鎖そのものが

@@ -12711,3 +12711,72 @@ fn task419_iq_min_rows_is_wired_into_the_stream_split() {
         "CPU の flat 経路を呼んでいない"
     );
 }
+
+/// task 431: 既定モデル decode の mix 鎖 — (1) `mixed` の D2H を消す経路
+/// (task 382 の `DENNO_MIX_ZC=out`) を**融合版 (`DENNO_MIX_UPQ8`) と併用できる**
+/// ようにした / (2) `xn` の H2D を専用の非ブロッキングストリームへ出して前の
+/// 層の GPU 仕事と重ねる (`DENNO_MIX_ZC=stream`)。既定はどちらも従来経路。
+#[test]
+fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
+    // 新しい .cu / .ptx / target は要らない (ホスト側の配線だけ)。
+    assert!(
+        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5"),
+        "build_ptx.sh の targets_all を触っている (カーネルは増やしていない)"
+    );
+    // (1) 融合版の出力先が mdev (= zc_out のとき device から見える pinned)。
+    assert!(
+        CUDA_RS.contains("let mdev = if zc_out {"),
+        "mdev の決定が無い"
+    );
+    let f = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_q_chain_into(");
+    assert!(
+        f.contains("let pout = if fu_use {\n                mdev"),
+        "融合版 (upq8) が mdev を受け取っていない (zc_out と併用できない)"
+    );
+    assert!(
+        f.contains("let mdev = if zc_out {"),
+        "mdev が融合版の起動より後ろにある (pout に渡せない)"
+    );
+    // D2H は zc_out のときだけ省く (従来は同じ判定)。
+    assert!(
+        f.contains("if !zc_out {"),
+        "D2H の門番が消えている"
+    );
+    // (2) H2D 専用の非ブロッキングストリーム。
+    assert!(
+        CUDA_RS.contains("fn mix_h2s_ensure(s: &mut MixGpuScratch)"),
+        "mix_h2s_ensure が無い"
+    );
+    assert!(
+        CUDA_RS.contains("stream_create(&mut st, CU_STREAM_NON_BLOCKING)"),
+        "別ストリームを非ブロッキングで作っていない"
+    );
+    assert_eq!(
+        f.matches("h2d_stream,").count(),
+        3,
+        "H2D の 3 か所が別ストリームを使っていない"
+    );
+    // 鎖のカーネル (null ストリーム) は 1 本のイベントでコピーの完了を待つ。
+    assert!(
+        f.contains("wev(std::ptr::null_mut(), ev_side, 0)"),
+        "null ストリームがコピーを待っていない"
+    );
+    assert!(
+        f.contains("MIX_H2S_HITS.fetch_add(1, AO::Relaxed)"),
+        "発火の計数が無い"
+    );
+    // ゲートは既存 env の新しい値 (lab の COND は新しい env 名を落とす)。
+    assert!(
+        CUDA_RS.contains("pub fn mix_zc_h2d_stream_from_value(v: Option<&str>) -> bool {"),
+        "ゲートの純関数が無い"
+    );
+    assert!(
+        CUDA_RS.contains("std::env::var(MIX_ZC_ENV).ok().as_deref())"),
+        "既存 env (DENNO_MIX_ZC) を見ていない"
+    );
+    // 発火の証拠は既定 on の診断行に出す。
+    assert!(
+        QWEN4EXP_RS.contains("h2s={h2s}"),
+        "`[mix-qchain]` に h2s が無い"
+    );
+}
