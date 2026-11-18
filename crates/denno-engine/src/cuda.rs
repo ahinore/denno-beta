@@ -2196,6 +2196,9 @@ pub(crate) mod dec_full_dev {
     /// 回す行数 (純関数)。`DENNO_FULL_DEC_FAST` の**既存 env に値を足す**形にした
     /// (lab の COND は新しい env 名を落とすことがある)。
     ///
+    /// **既定 2 行** (lab t427b: full 段 1.52 -> 1.36 ms/token = -10.5%、gpu 0.99 ->
+    /// 0.84。短い decode 11.95 -> 11.7 ms/tok)。切り戻しは `DENNO_FULL_DEC_FAST=v5`
+    /// (または `1` / `on` / `0`)。
     /// `dn6` / `dn6r2` = 2 行、`dn6r1` = 1、`dn6r4` = 4、`dn6r8` = 8。
     /// それ以外 (未設定・`1`・`on` など) は 0 = これまでどおり v5。
     pub(crate) fn full_dec_dn6_rows_from_value(raw: Option<&str>) -> usize {
@@ -2204,7 +2207,9 @@ pub(crate) mod dec_full_dev {
             Some("dn6r1") => 1,
             Some("dn6r4") => 4,
             Some("dn6r8") => 8,
-            _ => 0,
+            Some("v5") | Some("dn5") | Some("1") | Some("on") | Some("true") | Some("0")
+            | Some("off") | Some("false") | Some("no") => 0,
+            _ => 2,
         }
     }
 
@@ -9694,16 +9699,19 @@ pub fn head_fast_enabled() -> bool {
 /// 行数 (純関数)。`DENNO_DEC_HEAD_FAST` の**既存 env に値を足す**形にした
 /// (lab の COND は新しい env 名を落とすことがある)。
 ///
+/// **既定 4 行** (lab t427b: head 段 0.73 -> 0.61 ms/token = -16.4%、gpu 0.70 ->
+/// 0.58。短い decode 11.95 -> 11.7 ms/tok)。切り戻しは `DENNO_DEC_HEAD_FAST=v5`。
 /// `dn6` / `dn6r4` = 4 行、`dn6r1` = 1、`dn6r2` = 2、`dn6r8` = 8。
-/// それ以外 (未設定・`1`・`on`) は 0 = これまでどおり v5
-/// (rows が大きいほど x の再読みが減り、n_out = 248,320 行ではブロック数も減る)。
+/// `v5` / `1` / `on` / 偽値は 0 = これまでどおり v5。
 pub fn head_dn6_rows_from_value(raw: Option<&str>) -> usize {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("dn6") | Some("dn6r4") => 4,
         Some("dn6r1") => 1,
         Some("dn6r2") => 2,
         Some("dn6r8") => 8,
-        _ => 0,
+        Some("v5") | Some("1") | Some("on") | Some("true") | Some("0") | Some("off")
+        | Some("false") | Some("no") => 0,
+        _ => 4,
     }
 }
 
@@ -45074,16 +45082,21 @@ mod tests {
 
     /// task 427: 既存の dn6 を mix 以外 (full 層の qkv/wo、head) から撃つ門番。
     ///
-    /// ゲートは既存 env の値 (`DENNO_FULL_DEC_FAST` / `DENNO_DEC_HEAD_FAST`)、
-    /// 既定は 0 = 従来の v5。形の門番は Q8_0 だけを通し、実形で起動形が決まる。
+    /// ゲートは既存 env の値 (`DENNO_FULL_DEC_FAST` / `DENNO_DEC_HEAD_FAST`)。
+    /// **既定は dn6** (lab t427b で段 -10.5% / -16.4%)。切り戻しは `v5`。
     #[test]
     fn task427_full_and_head_dn6_gates_and_shapes() {
-        // full 層のゲート: dn6 系の値だけ行数を返す (既定 0 = v5 のまま)。
-        for raw in [None, Some(""), Some("1"), Some("on"), Some("true"), Some("dn5")] {
+        // full 層のゲート: 未設定は 2 行 (既定)。明示的な v5 / 1 / on は 0。
+        assert_eq!(
+            crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(None),
+            2,
+            "既定が dn6 でない"
+        );
+        for raw in [Some("1"), Some("on"), Some("true"), Some("v5"), Some("dn5")] {
             assert_eq!(
                 crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(raw),
                 0,
-                "raw={raw:?} は dn6 にしない"
+                "raw={raw:?} は v5 へ戻す"
             );
         }
         for (raw, want) in [
@@ -45099,10 +45112,17 @@ mod tests {
                 "raw={raw:?}"
             );
         }
-        // head のゲート (既定 0 = v5、dn6 は 4 行)。
-        for raw in [None, Some(""), Some("1"), Some("on")] {
+        // head のゲート: 未設定は 4 行 (既定)。v5 / 1 / on は 0。
+        assert_eq!(head_dn6_rows_from_value(None), 4, "既定が dn6 でない");
+        for raw in [Some("1"), Some("on"), Some("v5")] {
             assert_eq!(head_dn6_rows_from_value(raw), 0, "raw={raw:?}");
         }
+        // 空文字は未設定と同じ扱い (既定のまま)。
+        assert_eq!(head_dn6_rows_from_value(Some("")), 4);
+        assert_eq!(
+            crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(Some("")),
+            2
+        );
         assert_eq!(head_dn6_rows_from_value(Some("dn6")), 4);
         assert_eq!(head_dn6_rows_from_value(Some("dn6r4")), 4);
         assert_eq!(head_dn6_rows_from_value(Some("dn6r2")), 2);
@@ -45113,12 +45133,6 @@ mod tests {
         assert_eq!(mix_dn6_plan(6144, 2560, 2), Some((3, 2)), "wo (対 96 -> 3 warp)");
         // head の実形 (k=2560 / n=248320)。
         assert_eq!(mix_dn6_plan(2560, 248_320, 4), Some((2, 4)));
-        // `want_rows = 0` (ゲート off) は `dn6_gemv_plan` の入口で弾く
-        // (ここは形の門番なので 1 行へ丸める = 呼ばれない前提)。
-        assert_eq!(
-            crate::cuda::dec_full_dev::full_dec_dn6_rows_from_value(None),
-            0
-        );
     }
 
     /// task 422: dn6 (1 ブロック rows 行・x をレジスタで使い回す) の合計順を

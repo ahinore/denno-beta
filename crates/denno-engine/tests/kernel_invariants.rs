@@ -12585,7 +12585,8 @@ fn task422_mix_dn6_kernel_is_wired() {
 ///
 /// ゲートは**既存 env に値を足す**形 (lab の COND は新しい env 名を落とす):
 /// `DENNO_FULL_DEC_FAST=dn6*` と `DENNO_DEC_HEAD_FAST=dn6*`。
-/// 既定はどちらも従来 (v5) のまま = 値 0。
+/// 既定はどちらも dn6 (lab t427b で full 段 -10.5% / head 段 -16.4%)、
+/// 切り戻しは `=v5`。
 #[test]
 fn task427_dn6_reused_for_full_and_head_is_wired() {
     // 新しい .cu / .ptx / target は要らない (task 422 のカーネルを再利用する)。
