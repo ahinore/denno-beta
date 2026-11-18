@@ -674,8 +674,23 @@ pub const SUB_RES_PARK: usize = 31;
 pub const SUB_INJ: usize = 32;
 /// task 318: MoE の mixed を置き場へ写す (`pf_lm_park_mixed`。D2D)。
 pub const SUB_LM_PARK: usize = 33;
+/// task 419: 層優先 prefill の層ループ入口のホスト仕事 (`pf_lm_ensure` の確保、
+/// 追い出し階段、作業域の予約)。
+pub const SUB_PF_SETUP: usize = 34;
+/// task 419: 層ループを出たあとの後片付け (`pf_lm_release` / `pf_scratch_drop` /
+/// `pf_release` / 借りた作業域の返却 / 追い出した expert の戻し)。
+pub const SUB_PF_TEARDOWN: usize = 35;
+/// task 419: 1 チャンクぶんの attention 入口の前後 (`pf_attn_dev_*` と
+/// `pf_gdn_last_chunk_*` の切り替え)。
+pub const SUB_PF_ATTPRE: usize = 36;
+/// task 419: mix の出口の分岐 (`pf_mix_keep_layer` / `pf_mixed_keep_dev`)。
+pub const SUB_PF_MIXKEEP: usize = 37;
+/// task 419: combine の呼び出し側 (置き場のポインタ取りと `pf_combine_at`)。
+pub const SUB_PF_COMB: usize = 38;
+/// task 419: 層ループの 1 回転のうち**どの区間にも入らない**ホスト時間。
+pub const SUB_PF_ITER: usize = 39;
 /// 副区間の数。
-pub const SUB_N: usize = 34;
+pub const SUB_N: usize = 40;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -712,6 +727,12 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "res_park",
     "inj",
     "lm_park",
+    "pf_setup",
+    "pf_teardown",
+    "attn_pre",
+    "mix_keep",
+    "comb_at",
+    "iter",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
@@ -836,6 +857,62 @@ impl Drop for SubScope {
 pub fn sub_ns(parent: usize, item: usize) -> u64 {
     SUBS[parent.min(N - 1)][item.min(SUB_N - 1)].load(Ordering::Relaxed)
 }
+
+// ---------------------------------------------------------------------------
+// task 419: 層ループの 1 回転の「どの区間にも入らない」時間
+// ---------------------------------------------------------------------------
+// 14k cold の `other` は「壁時計 − 名前付き区間の和」の残差で、中身が読めない。
+// 副区間を足しても取り切れないぶんが残るので、回転ごとに
+//   uncovered = 1 回転の経過 − (名前付き区間の和の増分)
+// を直接積む。**診断専用** (区間の入口で `Instant` を 1 本と、6 行の
+// atomic load を 2 回)。off は `None` で素通りする。
+
+/// 層ループの回転の総経過 (ns)。
+static ITER_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+/// 層ループの回転のうち名前付き区間に入らない時間 (ns)。
+static ITER_UNCOVERED_NS: AtomicU64 = AtomicU64::new(0);
+/// 数えた回転の数。
+static ITER_N: AtomicU64 = AtomicU64::new(0);
+
+/// 名前付き区間 (`mix` / `router` / `shared` / `full` / `ssm` / `experts`) の
+/// 壁時計の和 (ns)。
+pub fn named_wall_ns() -> u64 {
+    [MIX, ROUTER, SHARED, FULL, SSM, EXPERTS]
+        .iter()
+        .map(|&i| ROWS[i].wall_ns.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// 層ループの 1 回転の入口 (off では `None`)。
+#[inline]
+pub fn iter_begin() -> Option<(Instant, u64)> {
+    if enabled() {
+        Some((Instant::now(), named_wall_ns()))
+    } else {
+        None
+    }
+}
+
+/// 層ループの 1 回転の出口。経過と、その間に名前付き区間が積んだぶんの差を積む。
+#[inline]
+pub fn iter_end(t: Option<(Instant, u64)>) {
+    let Some((t, s0)) = t else { return };
+    let total = t.elapsed().as_nanos() as u64;
+    let covered = named_wall_ns().saturating_sub(s0);
+    ITER_TOTAL_NS.fetch_add(total, Ordering::Relaxed);
+    ITER_UNCOVERED_NS.fetch_add(total.saturating_sub(covered), Ordering::Relaxed);
+    ITER_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 回転あたりの (総経過, 名前付き区間に入らない時間, 回転数) を ms で返す。
+fn iter_sums_ms() -> (f64, f64, u64) {
+    (
+        ITER_TOTAL_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        ITER_UNCOVERED_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        ITER_N.load(Ordering::Relaxed),
+    )
+}
+
 
 /// 台帳を 1 つの文字列群にする (`tok` = その窓の decode トークン数、
 /// `wall_ns` = decode ループ全体の壁時計 = リクエストのループ入口から
@@ -1128,6 +1205,17 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
             parts.join(" ")
         ));
     }
+    // task 419: 層ループの 1 回転のうち、どの区間にも入らないホスト時間。
+    // `other` の残差のうち層ループの中ぶんがここに閉じる (回転数も出す)。
+    {
+        let (t_total, t_unc, n) = iter_sums_ms();
+        if n > 0 {
+            let per = t_unc * 1000.0 / n as f64;
+            out.push(format!(
+                "[q4ledger-pf] iter n={n} total={t_total:.1}ms uncovered={t_unc:.1}ms ({per:.1}us/iter)"
+            ));
+        }
+    }
     // task 167: ssm 層の中の 4 段 (qkv 投影 / beta/alpha 投影 / GDN コア / 出力投影)
     // ごとの壁時計と転送量。`sub` の行は名前だけなので、ここでは
     // 「どの段が何 MB 動かしたか」を独立の行で出す (段の和は ssm の wall 以下)。
@@ -1219,6 +1307,9 @@ pub fn reset() {
     }
     SYNC_MIN_NS.store(u64::MAX, Ordering::Relaxed);
     PREFILL_WALL_NS.store(0, Ordering::Relaxed);
+    ITER_TOTAL_NS.store(0, Ordering::Relaxed);
+    ITER_UNCOVERED_NS.store(0, Ordering::Relaxed);
+    ITER_N.store(0, Ordering::Relaxed);
     #[cfg(feature = "cuda")]
     crate::cuda::tline::reset();
     for row in SUBS.iter() {
@@ -1293,6 +1384,38 @@ mod tests {
         assert_eq!(row(MIX), Row::default());
         reset();
         set_for_test(false);
+    }
+
+    /// task 419: 回転の uncovered は「経過 − 名前付き区間の増分」で、1 回転ぶん積まれる。
+    #[test]
+    fn iter_uncovered_is_named_wall_complement() {
+        let _g = lock();
+        set_for_test(true);
+        reset();
+        assert_eq!(iter_sums_ms().2, 0, "最初から回転が数えられている");
+        let t = iter_begin();
+        {
+            let _s = enter(MIX);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        iter_end(t);
+        let (tot, unc, n) = iter_sums_ms();
+        let mix = row(MIX).wall_ns as f64 / 1e6;
+        assert_eq!(n, 1, "回転が数えられていない");
+        assert!(tot > 0.0 && mix > 0.0, "tot={tot} mix={mix}");
+        // covered = mix の壁時計なので、uncovered は経過から mix を引いた残り。
+        assert!(
+            (tot - unc - mix).abs() < 0.05,
+            "tot={tot} unc={unc} mix={mix}"
+        );
+        let lines = line_prefill(64);
+        assert!(
+            lines.iter().any(|l| l.contains("iter n=1")),
+            "iter の行が出ない: {lines:?}"
+        );
+        reset();
+        set_for_test(false);
+        assert_eq!(iter_sums_ms().2, 0, "reset で回転が 0 に戻らない");
     }
 
     /// 出力は 1 トークンあたりで、全 item の名前と列が揃う。
