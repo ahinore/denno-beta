@@ -1608,6 +1608,15 @@ impl LayerTensors {
 pub trait LayerAttn: Send {
     fn forward(&mut self, layer: usize, cur: &[f32]) -> Result<Vec<f32>>;
 
+    /// task 468: 層 `layer` の入力を**デバイスから**渡してよいか。
+    ///
+    /// `true` を返した層では、呼び出し側が attn の mix の鎖を defer して
+    /// `cur` を空で渡す (入力は鎖がデバイスに残した `mixed`)。既定は `false`
+    /// = 従来どおりホストの `cur` を渡す。
+    fn takes_dev_input(&self, _layer: usize) -> bool {
+        false
+    }
+
     /// チャンクぶんの入力をまとめて処理する (バッチ prefill 用)。
     ///
     /// 既定は [`Self::forward`] をトークン順に呼ぶだけなので、数値は逐次と
@@ -3627,17 +3636,50 @@ impl Qwen4Exp {
         // task 217: `attn` block を切った層は mix / attn / combine を丸ごと飛ばす。
         if !iv.block_off(il, IvBlock::Attn) {
             let t_mix = std::time::Instant::now();
+            // task 464: ssm 層の attn mix は出力をホストで読まない (GDN が
+            // デバイスの `dm` をそのまま読む) ので、鎖の D2H と待ちを省いて
+            // 直後の GDN submission の同期へまとめる (`DENNO_MIX_NOWAIT`)。
+            // 前提が崩れたら ssm 側が空入力を検出して要求を落とす。
+            #[cfg(feature = "cuda")]
+            let mix_defer = crate::cuda::mix_nowait_on()
+                && crate::cuda::gdn_x_mix_on()
+                && gdn_gpu_win::active()
+                && hook.is_none()
+                && match self.p.layer_kind(il) {
+                    // ssm 層: ba を GPU で作るモデルだけ defer できる
+                    // (ホスト ba は cur が要る)。
+                    Ok(LayerKind::Ssm) => {
+                        crate::cuda::gdn_gpu_scan_on() && crate::cuda::gdn_ba_gpu_on()
+                    }
+                    // task 468: full 層は attention の device 経路が鎖の `mixed` を
+                    // 直接読める回だけ (`DENNO_MIX_NOWAIT=full`)。
+                    Ok(LayerKind::FullAttn) => self.attn.takes_dev_input(il),
+                    _ => false,
+                };
+            #[cfg(not(feature = "cuda"))]
+            let mix_defer = false;
             let (cur, inject) = {
                 // task 138: 台帳の区間 (mix)。off では stamp を取らないだけ。
                 let _l = q4ledger::enter(q4ledger::MIX);
-                hc_mix_quant(
-                    res,
-                    &lw.hc_attn_norm,
-                    &lw.hc_attn_down,
-                    &lw.hc_attn_up,
-                    Some(&lw.hc_attn_inject),
-                    hp,
-                )?
+                if mix_defer {
+                    hc_mix_quant_defer(
+                        res,
+                        &lw.hc_attn_norm,
+                        &lw.hc_attn_down,
+                        &lw.hc_attn_up,
+                        Some(&lw.hc_attn_inject),
+                        hp,
+                    )?
+                } else {
+                    hc_mix_quant(
+                        res,
+                        &lw.hc_attn_norm,
+                        &lw.hc_attn_down,
+                        &lw.hc_attn_up,
+                        Some(&lw.hc_attn_inject),
+                        hp,
+                    )?
+                }
             };
             {
                 let _l = q4ledger::enter(q4ledger::QPROF);
@@ -7172,9 +7214,27 @@ fn hc_mix_quant(
     hp: &HyperParams,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     if mix_fast_enabled() {
-        return hc_mix_quant_fast(res, norm, down, up, inject, hp);
+        return hc_mix_quant_fast(res, norm, down, up, inject, hp, false);
     }
     hc_mix_quant_ref(res, norm, down, up, inject, hp)
+}
+
+/// task 464: [`hc_mix_quant`] の「出力をホストで読まない」版 (ssm 層の attn mix 用)。
+///
+/// `DENNO_MIX_NOWAIT` が on で mix 鎖が走ったとき、鎖は `mixed` をホストへ降ろさず
+/// (D2H 無し)、イベントも待たない。返る `mixed` は **空の `Vec`** で、入力は
+/// デバイス側の `dm` を直後の GDN submission がそのまま読む。鎖が走らない・
+/// ゲートが off のときは従来どおり値が返るので、呼び出し側は空かどうかだけ見れば
+/// よい。
+pub(crate) fn hc_mix_quant_defer(
+    res: &HyperStreams,
+    norm: &[f32],
+    down: &GgufLinear,
+    up: &GgufLinear,
+    inject: Option<&GgufLinear>,
+    hp: &HyperParams,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    hc_mix_quant_fast(res, norm, down, up, inject, hp, cfg!(feature = "cuda"))
 }
 
 /// [`hc_mix_quant`] の旧経路 (A/B と `DENNO_MIX_FAST=0` 用)。
@@ -7347,7 +7407,11 @@ fn hc_mix_quant_fast(
     up: &GgufLinear,
     inject: Option<&GgufLinear>,
     hp: &HyperParams,
+    // task 464: 量子型の鎖に「出力をホストへ降ろさず待ちも省く」を許すか。
+    defer: bool,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    #[cfg(not(feature = "cuda"))]
+    let _ = defer;
     #[cfg(test)]
     MIX_FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // task 266: 分岐の分母 (ゲート on のときだけ数える)。
@@ -7585,9 +7649,16 @@ fn hc_mix_quant_fast(
                 xn,
                 &mut m,
                 Some(&mut inj_hook),
+                defer,
             ) {
                 MIX_QCHAIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                chain2_mixed = Some(m);
+                // task 464: defer した回は `m` がホストへ降りていない (中身は
+                // 不定)。空の `Vec` を返して「入力はデバイス側だけ」を伝える。
+                chain2_mixed = Some(if crate::cuda::mix_take_deferred() {
+                    Vec::new()
+                } else {
+                    m
+                });
                 if inj_hidden.is_some() {
                     inj_early = inj_hidden;
                 }
@@ -7781,7 +7852,7 @@ fn hc_mix_quant_batch(
         }
     }
     if nt == 1 {
-        let (mixed, inj) = hc_mix_quant_fast(&ress[0], norm, down, up, inject, hp)?;
+        let (mixed, inj) = hc_mix_quant_fast(&ress[0], norm, down, up, inject, hp, false)?;
         return Ok((vec![mixed], inj));
     }
     // task 126: 短い prefill は 1 トークン経路のほうが速い (しきい値の根拠は
@@ -26661,14 +26732,14 @@ mod tests {
             // ウォームアップ (プール起動とページ立ち上げ)。積んだ数値は捨てる。
             for s in 0..8 {
                 let (down, up, inject) = &slots[s];
-                let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp).expect("warm");
+                let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp, false).expect("warm");
             }
             for (mats, slot_pick) in [("mats=32 (DRAM)", None), ("mats=1  (L3)", Some(0usize))] {
                 mix_kprof::reset();
                 for c in 0..calls {
                     let idx = slot_pick.unwrap_or(c % slots.len());
                     let (down, up, inject) = &slots[idx];
-                    let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp)
+                    let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp, false)
                         .expect("fast");
                 }
                 let line = mix_kprof::line().expect("強制 on なのに line() が None");
@@ -26747,7 +26818,7 @@ mod tests {
             // ウォームアップ (プール / ページ)。
             for s in 0..8 {
                 let (down, up, inject) = &slots[s];
-                let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp).expect("warm");
+                let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp, false).expect("warm");
             }
             for rep in 0..reps {
                 // 順序を rep ごとに回転する (固定順の系統バイアスを消す)。
@@ -26761,7 +26832,7 @@ mod tests {
                     for _ in 0..per {
                         let (down, up, inject) = &slots[seq % slots.len()];
                         seq += 1;
-                        let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp)
+                        let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp, false)
                             .expect("fast");
                     }
                     let ms = t.elapsed().as_secs_f64() * 1e3 / per as f64;
