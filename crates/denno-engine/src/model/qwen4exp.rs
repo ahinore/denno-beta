@@ -9038,7 +9038,7 @@ pub(crate) fn ple_hist_push_ring(hist_buf: &mut [f32], head: &mut usize, x: &[f3
 }
 
 /// リングの履歴を線形 (先頭が最古・末尾が最新) に戻す。head = 0 なら何もしない。
-fn ple_hist_to_linear(hist_buf: &mut [f32], head: usize, hc_dim: usize, tmp: &mut Vec<f32>) {
+pub(crate) fn ple_hist_to_linear(hist_buf: &mut [f32], head: usize, hc_dim: usize, tmp: &mut Vec<f32>) {
     let hist = hist_buf.len() / hc_dim;
     let head = head % hist.max(1);
     if hist == 0 || head == 0 {

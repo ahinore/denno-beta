@@ -155,8 +155,9 @@ extern "C" __global__ void dno_pf_ple_gate(
 ///   conv[t][s][d]  = silu(sum_k wt[k][s][d] * x[t - (kern-1-k)*dil])
 ///   res[t][s][d]  += gated + conv
 ///
-/// 履歴は CPU の ring (`ple_hist_push_ring`) と同じ並び: push t は slot
-/// (head + t) % hist、読むときは (head + hist + t - back) % hist。
+/// 履歴の**読み**は CPU の ring と同じ式 (slot = (head + hist + t - back) % hist、
+/// head は 0 = 線形)。**書き**は線形 (先頭が最古) で返す: CPU の
+/// `ple_inject_batch_*` も終端で `ple_hist_to_linear` を通すため。
 /// `want` のときは最終トークンの (gated + conv)^2 を列ごとに足し、ブロックの
 /// 和を `part[s * ntiles + blockIdx.x]` へ書く (ホストが s → tile の順に足す)。
 extern "C" __global__ void dno_pf_ple_conv(
@@ -229,14 +230,21 @@ extern "C" __global__ void dno_pf_ple_conv(
             contrib = __fmaf_rn(add, add, contrib);
         }
     }
+    // 履歴は **線形** (先頭が最古) で書き戻す。CPU の `ple_inject_batch_*` も
+    // チャンク終端で `ple_hist_to_linear` を通すので、ここを ring のままにすると
+    // 次のチャンク / decode が履歴を 1 段ずらして読む (lab 前の自己点検で発見)。
     if (hist > 0 && act) {
         for (int j = 0; j < hist; ++j) {
-            int dd = ((j - head) % hist + hist) % hist;
-            if (nt - 1 < dd) {
-                continue;
+            const int back_j = hist - 1 - j;
+            const int tj = nt - 1 - back_j;
+            float v;
+            if (tj >= 0) {
+                v = xr[tj % hist];
+            } else {
+                const int slot = (head + hist + ((tj % hist) + hist) % hist) % hist;
+                v = hist_in[(size_t)slot * hc_dim + off];
             }
-            const int t_last = dd + ((nt - 1 - dd) / hist) * hist;
-            hist_out[(size_t)j * hc_dim + off] = xr[t_last % hist];
+            hist_out[(size_t)j * hc_dim + off] = v;
         }
     }
     if (want) {

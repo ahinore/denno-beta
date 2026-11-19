@@ -30573,7 +30573,6 @@ pub fn pf_ple_dev_run(a: PfPleDevArgs<'_>) -> Result<Option<PfPleDevOut>, String
             )
             .map_err(|e| format!("dno_pf_ple_gate の起動: {e:#}"))?;
         }
-        pf_ple_note(nt, hc, e, a.kern, a.hist_len);
         // conv + silu + res 加算
         let mut p_gc = wgc.ptr();
         let mut p_wwt = wwt.ptr();
@@ -30638,6 +30637,11 @@ pub fn pf_ple_dev_run(a: PfPleDevArgs<'_>) -> Result<Option<PfPleDevOut>, String
             contrib_rms: contrib,
         }))
     });
+    // `PLE_DEV` の borrow を解いてから発火の証拠を出す (内側で呼ぶと
+    // 「RefCell already borrowed」で落ちる。lab t461b で踏んだ)。
+    if matches!(r, Ok(Some(_))) {
+        pf_ple_note(nt, hc, e, a.kern, a.hist_len);
+    }
     r
 }
 
@@ -64711,6 +64715,147 @@ mod pf_ple_dev_tests {
         assert_eq!(PF_PLE_MAX_HIST, 32, "カーネルの PLE_MAX_HIST");
     }
 
+    /// カーネル `dno_pf_ple_gate` の式をホストで書き下したもの。
+    ///
+    /// カーネル: ss1 = Σ key^2、ss2 = Σ res^2 → invk / invq =
+    /// 1/sqrt(ss/e + eps)、dot = Σ (key*invk*gk)*(res*invq*gq)、
+    /// sv = dot/sqrt(e)、gate = sigmoid(sign(sv)*sqrt(max(|sv|,1e-6)))、
+    /// invc = 1/sqrt(Σ(value*gate)^2/e + eps)。
+    #[allow(clippy::too_many_arguments)]
+    fn gate_mirror(
+        hc: usize,
+        e: usize,
+        kern_gate: &[f32],
+        res_row: &[f32],
+        value_row: &[f32],
+        gk: &[f32],
+        gq: &[f32],
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
+        let mut gate = vec![0.0f32; hc];
+        let mut invc = vec![0.0f32; hc];
+        for s in 0..hc {
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            for i in 0..e {
+                let kv = kern_gate[s * e + i];
+                let rv = res_row[s * e + i];
+                s1 += kv * kv;
+                s2 += rv * rv;
+            }
+            let invk = 1.0 / (s1 / e as f32 + eps).sqrt();
+            let invq = 1.0 / (s2 / e as f32 + eps).sqrt();
+            let mut dot = 0.0f32;
+            for i in 0..e {
+                let kn = kern_gate[s * e + i] * invk * gk[s * e + i];
+                let qn = res_row[s * e + i] * invq * gq[s * e + i];
+                dot += kn * qn;
+            }
+            let sv = dot * inv_sqrt_e;
+            let av = if sv < 0.0 { -sv } else { sv };
+            let mag = (if av < 1e-6 { 1e-6 } else { av }).sqrt();
+            let sgn = if sv > 0.0 {
+                1.0f32
+            } else if sv < 0.0 {
+                -1.0f32
+            } else {
+                0.0f32
+            };
+            gate[s] = 1.0 / (1.0 + mirror_exp(-(sgn * mag)));
+            let mut s3 = 0.0f32;
+            for i in 0..e {
+                let gv = value_row[i] * gate[s];
+                s3 += gv * gv;
+            }
+            invc[s] = 1.0 / (s3 / e as f32 + eps).sqrt();
+        }
+        (gate, invc)
+    }
+
+    fn mirror_exp(x: f32) -> f32 {
+        if x > 88.0 {
+            return f32::INFINITY;
+        }
+        if x < -103.0 {
+            return 0.0;
+        }
+        (x as f64).exp() as f32
+    }
+
+    /// task 461: gate / invc の式が CPU 参照 (`grouped_rms_norm_into` + 内積) と
+    /// 同じ値になること (縮約の木と `__expf` のぶんだけ違う)。
+    #[test]
+    fn pf_ple_gate_mirror_matches_cpu_reference() {
+        let (hc, e) = (4usize, 256usize);
+        let eps = 1e-6f32;
+        let mut st = 424242u64;
+        let mut rnd = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((st >> 33) as f32) / (u32::MAX >> 1) as f32 - 0.5) * 2.0
+                })
+                .collect()
+        };
+        let key = rnd(hc * e);
+        let res = rnd(hc * e);
+        let value = rnd(e);
+        let gk = rnd(hc * e);
+        let gq = rnd(hc * e);
+        let (g_mine, i_mine) = gate_mirror(hc, e, &key, &res, &value, &gk, &gq, eps);
+        // CPU 参照: grouped_rms_norm_into → 内積 → sigmoid → gated の RMS。
+        let hp = crate::model::hyper::HyperParams {
+            hc,
+            n_embd: e,
+            low_rank: 4,
+            eps,
+        };
+        let mut kn = vec![0.0f32; hc * e];
+        let mut qn = vec![0.0f32; hc * e];
+        crate::model::hyper::grouped_rms_norm_into(&key, &gk, &hp, &mut kn);
+        crate::model::hyper::grouped_rms_norm_into(&res, &gq, &hp, &mut qn);
+        let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
+        for s in 0..hc {
+            let mut acc = 0.0f32;
+            for i in 0..e {
+                acc += kn[s * e + i] * qn[s * e + i];
+            }
+            let sv = acc * inv_sqrt_e;
+            let mag = (if sv.abs() < 1e-6 { 1e-6 } else { sv.abs() }).sqrt();
+            let sgn = if sv > 0.0 {
+                1.0f32
+            } else if sv < 0.0 {
+                -1.0f32
+            } else {
+                0.0f32
+            };
+            let want = crate::model::hyper::sigmoid(sgn * mag);
+            let d = (g_mine[s] - want).abs() / want.max(1e-6);
+            assert!(d < 1e-5, "gate[{s}] = {} vs CPU {want} (相対 {d})", g_mine[s]);
+            // invc も CPU の rmsnorm (gated) と一致すること。
+            let mut gated = vec![0.0f32; e];
+            for i in 0..e {
+                gated[i] = value[i] * want;
+            }
+            let mut nx = vec![0.0f32; e];
+            crate::tensor::rmsnorm_into(&gated, &vec![1.0f32; e], e, eps, &mut nx);
+            // nx = gated * invc なので、invc は nx/gated から取れる (gated != 0)。
+            let mut checked = 0;
+            for i in 0..e {
+                if gated[i].abs() > 1e-3 {
+                    let inv_cpu = nx[i] / gated[i];
+                    let d = (i_mine[s] - inv_cpu).abs() / inv_cpu.abs().max(1e-6);
+                    assert!(d < 1e-4, "invc[{s}] = {} vs CPU {inv_cpu}", i_mine[s]);
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "invc の比較点が無い");
+        }
+    }
+
     /// カーネルの `dno_pf_ple_conv` の索引算術を 1 対 1 でホストへ写したもの
     /// (conv の値と res / 履歴だけを比べる。寄与の和は順序が違うので見ない)。
     #[allow(clippy::too_many_arguments)]
@@ -64766,13 +64911,19 @@ mod pf_ple_dev_tests {
                     res[t * hc_dim + off] += gated + conv;
                 }
                 if hist > 0 {
+                    // 書き戻しは線形 (先頭が最古)。カーネルと同じ式。
                     for j in 0..hist {
-                        let dd = ((j + hist - head % hist) % hist) % hist;
-                        if nt - 1 < dd {
-                            continue;
-                        }
-                        let t_last = dd + ((nt - 1 - dd) / hist) * hist;
-                        hist_out[j * hc_dim + off] = xr[t_last % hist];
+                        let back_j = hist - 1 - j;
+                        let tj = nt as i64 - 1 - back_j as i64;
+                        hist_out[j * hc_dim + off] = if tj >= 0 {
+                            xr[(tj as usize) % hist]
+                        } else {
+                            let slot = ((head as i64
+                                + hist as i64
+                                + (tj % hist as i64) % hist as i64)
+                                % hist as i64) as usize;
+                            hist_in[slot * hc_dim + off]
+                        };
                     }
                 }
             }
@@ -64858,6 +65009,11 @@ mod pf_ple_dev_tests {
                     res_cpu[t * hc_dim + i] += gated[i] + conv[i];
                 }
                 crate::model::qwen4exp::ple_hist_push_ring(&mut hist_cpu, &mut head, &x, hc_dim);
+            }
+            // CPU 経路はチャンク終端で履歴を線形へ戻す。
+            {
+                let mut tmp = Vec::new();
+                crate::model::qwen4exp::ple_hist_to_linear(&mut hist_cpu, head, hc_dim, &mut tmp);
             }
             // カーネルの鏡
             let mut res_gpu = res0.clone();
@@ -64946,6 +65102,10 @@ mod pf_ple_dev_tests {
                     }
                 }
                 crate::model::qwen4exp::ple_hist_push_ring(&mut hist_cpu, &mut h, &x, hc_dim);
+            }
+            {
+                let mut tmp = Vec::new();
+                crate::model::qwen4exp::ple_hist_to_linear(&mut hist_cpu, h, hc_dim, &mut tmp);
             }
             let mut res_gpu = res0.clone();
             let hist_out = conv_mirror(
