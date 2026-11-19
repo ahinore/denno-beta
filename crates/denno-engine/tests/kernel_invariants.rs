@@ -13240,17 +13240,21 @@ fn task457_pf_elem_kernel_and_wiring() {
     }
 }
 
-/// ゲート (`DENNO_PF_MIX_NORMP` / `DENNO_PF_MIX_FASTSIG`) の既定は **off**
-/// (lab の結果で決める)。
+/// ゲート (`DENNO_PF_MIX_NORMP` / `DENNO_PF_MIX_FASTSIG`) の既定は **on**
+/// (lab t457b で採択。切り戻しは明示的な 0)。
 #[test]
-fn task457_pf_elem_gates_default_off() {
+fn task457_pf_elem_gates_default_on() {
     for f in [
         "pub(crate) fn pf_mix_normp_from_value",
         "pub(crate) fn pf_mix_fastsig_from_value",
     ] {
         let i = CUDA_RS.find(f).unwrap_or_else(|| panic!("{f} が無い"));
-        let body: String = CUDA_RS[i..].chars().take(300).collect();
-        assert!(body.contains("None => false,"), "{f}(None) が off でない: {body}");
+        let body: String = CUDA_RS[i..].chars().take(340).collect();
+        assert!(body.contains("None => true,"), "{f}(None) が on でない: {body}");
+        assert!(
+            body.contains(r#""0" | "off" | "false" | "no" | """#),
+            "{f} が明示的な偽値で off にならない: {body}"
+        );
     }
 }
 

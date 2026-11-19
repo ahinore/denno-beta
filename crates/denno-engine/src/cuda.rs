@@ -29731,7 +29731,7 @@ fn pf_log_grid(tag: &str, grid: (u32, u32, u32), threads: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// task 457: prefill hc mix の要素カーネル第 2 版 (kernels_pf_elem.cu、既定 off)
+// task 457: prefill hc mix の要素カーネル第 2 版 (kernels_pf_elem.cu、既定 on / lab t457b)
 // ---------------------------------------------------------------------------
 //
 // 動機は kernels_pf_elem.cu の先頭。既存の `dno_pf_rmsgroup` / `dno_pf_mixed`
@@ -29864,18 +29864,20 @@ fn pf_elem_note(tag: &str, grid: (u32, u32, u32), threads: u32, detail: &str) {
     );
 }
 
-/// `DENNO_PF_MIX_NORMP` の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_MIX_NORMP` の解釈 (純関数)。**明示的な偽値だけ off** = 既定 on。
+///
+/// lab t457b で採択 (mix 段の GPU busy 242.6/243.4 -> 211.4/211.7 ms = -13%)。
 pub(crate) fn pf_mix_normp_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
-        Some(s) => matches!(
+        None => true,
+        Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
+            "0" | "off" | "false" | "no" | ""
         ),
     }
 }
 
-/// norm の二乗和分担版を使うか (既定 off。採否は lab で決める)。
+/// norm の二乗和分担版を使うか (既定 on。切り戻しは `DENNO_PF_MIX_NORMP=0`)。
 pub(crate) fn pf_mix_normp_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| pf_mix_normp_from_value(std::env::var("DENNO_PF_MIX_NORMP").ok().as_deref()))
@@ -29889,18 +29891,20 @@ pub(crate) fn pf_mix_normp_ok(e: usize) -> bool {
     e > 0 && e <= PF_ELEM_NORM_THREADS * PF_ELEM_MAX_PER
 }
 
-/// `DENNO_PF_MIX_FASTSIG` の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_MIX_FASTSIG` の解釈 (純関数)。**明示的な偽値だけ off** = 既定 on。
+///
+/// lab t457b で採択 (mix 段の GPU busy 242.6/243.4 -> 214.8/214.6 ms = -12%)。
 pub(crate) fn pf_mix_fastsig_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
-        Some(s) => matches!(
+        None => true,
+        Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
+            "0" | "off" | "false" | "no" | ""
         ),
     }
 }
 
-/// mixed の fast sigmoid 版を使うか (既定 off。採否は lab で決める)。
+/// mixed の fast sigmoid 版を使うか (既定 on。切り戻しは `DENNO_PF_MIX_FASTSIG=0`)。
 pub(crate) fn pf_mix_fastsig_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -29917,24 +29921,18 @@ pub(crate) fn pf_mix_fastsig_ok(e: usize, hc: usize, nt: usize) -> bool {
 mod pf_elem_tests {
     use super::*;
 
-    /// ゲートの真理値表 (明示的な真値だけ on・既定 off)。
+    /// ゲートの真理値表 (**明示的な偽値だけ off** = 既定 on。切り戻し用)。
     #[test]
     fn pf_elem_gate_truth_table() {
-        for v in [
-            None,
-            Some("0"),
-            Some("off"),
-            Some("false"),
-            Some("no"),
-            Some(""),
-            Some(" OFF "),
-            Some("2"),
-            Some("0 "),
-        ] {
+        assert!(
+            pf_mix_normp_from_value(None) && pf_mix_fastsig_from_value(None),
+            "未設定が既定 on でない"
+        );
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some(""), Some(" OFF "), Some("0 ")] {
             assert!(!pf_mix_normp_from_value(v), "normp {v:?} が on になった");
             assert!(!pf_mix_fastsig_from_value(v), "fastsig {v:?} が on になった");
         }
-        for v in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
+        for v in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON "), Some("2")] {
             assert!(pf_mix_normp_from_value(v), "normp {v:?} が on でない");
             assert!(pf_mix_fastsig_from_value(v), "fastsig {v:?} が on でない");
         }
@@ -30184,7 +30182,7 @@ pub fn pf_mix(
                 &mut hc_c as *mut _ as *mut c_void,
                 &mut eps_c as *mut _ as *mut c_void,
             ];
-            // task 457: 二乗和を block で分担する版 (`DENNO_PF_MIX_NORMP`、既定 off)。
+            // task 457: 二乗和を block で分担する版 (`DENNO_PF_MIX_NORMP`、既定 on)。
             // PTX が無い / e がレジスタ上限を超えるときは従来カーネルへ (同じ値)。
             let normp = if pf_mix_normp_on() && pf_mix_normp_ok(e) {
                 pf_elem_kernels()
@@ -30470,7 +30468,7 @@ pub fn pf_mix(
                 &mut hc_c as *mut _ as *mut c_void,
                 &mut inv_c as *mut _ as *mut c_void,
             ];
-            // task 457: sigmoid を f32 の速い経路にした版 (`DENNO_PF_MIX_FASTSIG`、既定 off)。
+            // task 457: sigmoid を f32 の速い経路にした版 (`DENNO_PF_MIX_FASTSIG`、既定 on)。
             // 値は 2 ULP 程度変わる (丸めの変更)。形が外れたら従来カーネルへ。
             let fastsig = if pf_mix_fastsig_on() && pf_mix_fastsig_ok(e, hc, nt) {
                 pf_elem_kernels()
