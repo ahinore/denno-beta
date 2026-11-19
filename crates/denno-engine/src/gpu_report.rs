@@ -78,6 +78,36 @@ pub fn gdn_x_mix_reset() {
     crate::cuda::gdn_x_mix_reset();
 }
 
+/// task 464: mix の鎖の待ちを後ろ倒しにした層数の行
+/// (`DENNO_MIX_NOWAIT=1` のときだけ 1 行 = 分岐が発火した証拠)。
+pub fn mix_nowait_line() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    return crate::cuda::mix_nowait_line();
+    #[cfg(not(feature = "cuda"))]
+    None
+}
+
+/// task 464: [`mix_nowait_line`] の積算を 0 に戻す。
+pub fn mix_nowait_reset() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_nowait_reset();
+}
+
+/// task 468: full 層の attn mix も defer した層数の行
+/// (`DENNO_MIX_NOWAIT=full` のときだけ 1 行 = 分岐が発火した証拠)。
+pub fn mix_nowait_full_line() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    return crate::cuda::mix_nowait_full_line();
+    #[cfg(not(feature = "cuda"))]
+    None
+}
+
+/// task 468: [`mix_nowait_full_line`] の積算を 0 に戻す。
+pub fn mix_nowait_full_reset() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_nowait_full_reset();
+}
+
 /// task 382: [`mix_zc_hits`] を 0 に戻す。
 pub fn mix_zc_reset() {
     #[cfg(feature = "cuda")]

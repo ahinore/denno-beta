@@ -2047,6 +2047,10 @@ pub(crate) mod dec_full_dev {
         pub n_embd: usize,
         /// 層の入力 (ホスト)
         pub cur: &'a [f32],
+        /// task 468: 層の入力を**デバイスから**読む (直前の mix の鎖が残した
+        /// `mixed` の f32 `qkv_k` 本)。`Some` のとき `cur` は空でよく、
+        /// pinned への写しも H2D も撃たない (値は同じバイト列)。
+        pub x_dev: Option<u64>,
     }
 
     /// 戻り (層の出力と、ホスト KV キャッシュへ push する行)。
@@ -2120,7 +2124,7 @@ pub(crate) mod dec_full_dev {
                 && self.k_norm.len() == self.dh
                 && self.qkv_n == 2 * self.heads * self.dh + 2 * self.kv_dim
                 && self.qkv_k > 0
-                && self.cur.len() == self.qkv_k
+                && (self.x_dev.is_some() || self.cur.len() == self.qkv_k)
                 && self.units_ok()
                 // カーネルの前提: [q(2dh/head)][k][v] の並び。
                 && self.q_off == 0
@@ -2262,6 +2266,76 @@ pub(crate) mod dec_full_dev {
         [const { std::sync::atomic::AtomicU64::new(0) }; 6];
     static FULL_DEC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// task 468: 入力の H2D を省いた層数 (mix の鎖がデバイスに残した `mixed` を
+    /// そのまま読んだ回。発火の証拠 = `[full-x-dev]`)。
+    static FULL_X_DEV_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// task 468: 1 層ぶん数える。
+    fn note_full_x_dev_hit() {
+        FULL_X_DEV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// task 468: 積算を 0 に戻す (リクエスト終端)。
+    pub(crate) fn x_dev_reset() {
+        FULL_X_DEV_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// task 468: 入力の H2D を省いた層数。
+    pub(crate) fn x_dev_hits() -> u64 {
+        FULL_X_DEV_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// task 468: ミラーが「この層の 1 行追記」を受けられる状態か (書かずに見るだけ)。
+    ///
+    /// [`mirror_append`] の前提検査と同じ条件を、書き込み無しで評価する。
+    /// defer の可否 (入力の H2D を省いてよいか) を mix の前に決めるために使う
+    /// (種の無いミラーで `forward` が `None` を返すと要求が落ちるため)。
+    pub(crate) fn mirror_ready(
+        cache_id: u64,
+        n_layer: usize,
+        kv_dim: usize,
+        layer: usize,
+        gen: u64,
+        len: usize,
+    ) -> bool {
+        if len == 0 || layer >= n_layer {
+            return false;
+        }
+        let Some(mirrors) = Q4_ATTN_MIRRORS.get() else {
+            return false;
+        };
+        let ms = match mirrors.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let Some((_, m, _)) = ms.iter().find(|(k, _, _)| *k == cache_id) else {
+            return false;
+        };
+        if m.kv_dim != kv_dim || m.state.len.len() != n_layer {
+            return false;
+        }
+        if m.k[layer].is_none() || m.v[layer].is_none() {
+            return false;
+        }
+        if len > m.state.cap || q4_mirror_cap(len, m.state.cap) > m.state.cap {
+            return false;
+        }
+        q4_mirror_have(&m.state, layer, len, gen) + 1 == len
+    }
+
+    /// task 468: 「この呼び出しはデバイス入力を読める形か」を**ホスト側だけで**
+    /// 判定する (mix の鎖の D2H と待ちを省いてよいかの事前検査)。
+    ///
+    /// `len` は push 後の KV 行数 (= pos + 1)。形の静的検査 (`ok_shape`) は
+    /// モデル固定なのでここでは見ない (崩れていたら `forward` が `None` を返し、
+    /// 呼び出し側が要求を落とす = 黙って別経路で計算しない)。
+    pub(crate) fn dev_input_ok(len: usize) -> bool {
+        on() && cuda_enabled() && gpu_attention_enabled() && q4_gpu_attn_enabled()
+            && len >= full_dec_attn_min()
+            && len <= 65535
+            && chain_ctx().is_some()
+    }
+
     /// 理由コードを 1 つ数え、256 回ごとに集計を出す。
     fn dbg_note(idx: usize) {
         if !dbg_on() {
@@ -2355,30 +2429,39 @@ pub(crate) mod dec_full_dev {
         }
 
         // 1) qkv GEMV: ホスト cur -> デバイス (D2H しない)
-        Scratch::ensure(&mut st.qkv_in, a.qkv_k * 4)?;
+        // task 468: 入力がデバイスにある回 (直前の mix の鎖が残した `mixed`) は
+        // pinned へ写さず H2D も撃たない (同じバイト列なので値は変わらない)。
         Scratch::ensure(&mut st.qkv, a.qkv_n * 4)?;
-        Scratch::ensure_pin(&mut st.pin_x, a.qkv_k * 4)?;
-        {
-            let px = st.pin_x.as_mut().expect("ensure 済み");
-            px.as_mut_slice::<f32>()[..a.qkv_k].copy_from_slice(a.cur);
-        }
-        let x_ptr = st.qkv_in.as_ref().expect("ensure 済み").ptr();
-        let qkv_ptr = st.qkv.as_ref().expect("ensure 済み").ptr();
-        {
-            let lib = lib()?;
-            let pin = st.pin_x.as_ref().expect("ensure 済み");
-            unsafe {
-                check(
-                    (lib.memcpy_htod_async)(
-                        x_ptr,
-                        pin.ptr as *const c_void,
-                        a.qkv_k * 4,
-                        std::ptr::null_mut(),
-                    ),
-                    "cuMemcpyHtoDAsync (full dec dev)",
-                )?;
+        let x_ptr = match a.x_dev {
+            Some(p) => {
+                note_full_x_dev_hit();
+                p
             }
-        }
+            None => {
+                Scratch::ensure(&mut st.qkv_in, a.qkv_k * 4)?;
+                Scratch::ensure_pin(&mut st.pin_x, a.qkv_k * 4)?;
+                {
+                    let px = st.pin_x.as_mut().expect("ensure 済み");
+                    px.as_mut_slice::<f32>()[..a.qkv_k].copy_from_slice(a.cur);
+                }
+                let xp = st.qkv_in.as_ref().expect("ensure 済み").ptr();
+                let lib = lib()?;
+                let pin = st.pin_x.as_ref().expect("ensure 済み");
+                unsafe {
+                    check(
+                        (lib.memcpy_htod_async)(
+                            xp,
+                            pin.ptr as *const c_void,
+                            a.qkv_k * 4,
+                            std::ptr::null_mut(),
+                        ),
+                        "cuMemcpyHtoDAsync (full dec dev)",
+                    )?;
+                }
+                xp
+            }
+        };
+        let qkv_ptr = st.qkv.as_ref().expect("ensure 済み").ptr();
         for u in a.qkv_units {
             let w = weights_for_gguf(u.uid, u.ty, u.blocks, u.k, u.n)?;
             // task 427: dn6 (`DENNO_FULL_DEC_FAST=dn6*`) は 1 ブロック rows 行 /
@@ -2498,14 +2581,15 @@ pub(crate) mod dec_full_dev {
         .ok_or_else(|| anyhow!("ミラーの 1 行追記ができない (全行シードが必要)"))?;
         kp_mark!("fd_mirror");
 
-        // 4) attention (デバイス入力・出力)
-        let aptr = attn_launch(
-            ctx, qout, mkptr, mvptr, a.len, kv_dim, a.heads, a.group, a.dh, a.scale,
+        // 4) attention (デバイス入力・出力)。task 460: 融合版 (combine + gate) を
+        //    選んだときは a_gated = true で返る (下の出力ゲートを飛ばす)。
+        let (aptr, a_gated) = attn_launch(
+            ctx, qout, mkptr, mvptr, a.len, kv_dim, a.heads, a.group, a.dh, a.scale, gout,
         )?;
         kp_mark!("fd_attn");
 
-        // 5) 出力ゲート (デバイス)
-        {
+        // 5) 出力ゲート (デバイス)。融合版が掛け済みなら飛ばす。
+        if !a_gated {
             let mut p_out = aptr;
             let mut p_gate = gout;
             let mut n_c = qd as c_int;
@@ -2777,7 +2861,9 @@ pub(crate) mod dec_full_dev {
         group: usize,
         dh: usize,
         scale: f32,
-    ) -> Result<CUdeviceptr> {
+        // task 460: combine + ゲートの融合を使うときのゲート (0 = 融合しない)。
+        gate: CUdeviceptr,
+    ) -> Result<(CUdeviceptr, bool)> {
         let n_kv = heads / group;
         let qd = heads * dh;
         let mut kv_dim_c = kv_dim as c_int;
@@ -2790,7 +2876,7 @@ pub(crate) mod dec_full_dev {
         // 既定 (t179a の log と同じ) は「1024 未満は split・以上は flashdec」。
         if attn_flashdec_enabled() && len >= attn_flashdec_min_ctx() {
             if let Some(k) = fdec_kernels() {
-                let (n_split, chunk) = q4_fdec_split(len, attn_flashdec_chunk());
+                let (n_split, chunk) = q4_fdec_split(len, attn_flashdec_chunk_for(len));
                 // task 448: タイル版 (K/V を shared へ協調ロード) を先に試す。
                 // decode の実サーバ経路はここ (デバイス連鎖) なので、門もここで見る。
                 // 形か PTX が欠けたら v1 (`dno_attn_flashdec`) で回す。
@@ -2812,10 +2898,20 @@ pub(crate) mod dec_full_dev {
                         (k.f_dec, 0u32)
                     }
                 };
+                // task 460: combine と出力ゲートの融合 (既定 on)。PTX か ABI が
+                // 欠ければ None になり、下の従来 2 起動へ落ちる。
+                let cbg_k = if gate != 0 && attn_fdec_cbg_on() {
+                    fcbg_gate_log(true);
+                    fcbg_kernels()
+                } else {
+                    fcbg_gate_log(gate != 0);
+                    None
+                };
                 nsplit_c = n_split as c_int;
                 let nkv_c = n_kv as c_int;
                 let part_bytes = heads * n_split * (dh + ATTN_FDEC_PART_EXTRA) * 4;
-                return Q4ATTN_SCRATCH.with(|cell| -> Result<CUdeviceptr> {
+                let gated = cbg_k.is_some();
+                return Q4ATTN_SCRATCH.with(|cell| -> Result<(CUdeviceptr, bool)> {
                     let mut s = cell.borrow_mut();
                     Scratch::ensure(&mut s.out, qd * 4)?;
                     Scratch::ensure(&mut s.part, part_bytes)?;
@@ -2852,21 +2948,44 @@ pub(crate) mod dec_full_dev {
                             &mut args,
                         )?;
                     }
-                    let mut args2: Vec<*mut c_void> = vec![
-                        &mut partptr as *mut _ as *mut c_void,
-                        &mut aptr_c as *mut _ as *mut c_void,
-                        &mut group_c as *mut _ as *mut c_void,
-                        &mut dh_c as *mut _ as *mut c_void,
-                        &mut nsplit_c as *mut _ as *mut c_void,
-                    ];
-                    unsafe {
-                        ctx.launch_async(
-                            k.f_cb,
-                            (group as u32, nkv_c as u32, 1),
-                            (dh as u32, 1, 1),
-                            0,
-                            &mut args2,
-                        )?;
+                    // task 460: 融合版 (combine + ゲート) があれば 1 起動で済ませる。
+                    if let Some(kc) = cbg_k {
+                        let mut gptr_c = gate;
+                        let mut args3: Vec<*mut c_void> = vec![
+                            &mut partptr as *mut _ as *mut c_void,
+                            &mut aptr_c as *mut _ as *mut c_void,
+                            &mut gptr_c as *mut _ as *mut c_void,
+                            &mut group_c as *mut _ as *mut c_void,
+                            &mut dh_c as *mut _ as *mut c_void,
+                            &mut nsplit_c as *mut _ as *mut c_void,
+                        ];
+                        unsafe {
+                            ctx.launch_async(
+                                kc.f_cbg,
+                                (group as u32, nkv_c as u32, 1),
+                                (dh as u32, 1, 1),
+                                0,
+                                &mut args3,
+                            )?;
+                        }
+                        q4attn_kprof::note_cbg_call();
+                    } else {
+                        let mut args2: Vec<*mut c_void> = vec![
+                            &mut partptr as *mut _ as *mut c_void,
+                            &mut aptr_c as *mut _ as *mut c_void,
+                            &mut group_c as *mut _ as *mut c_void,
+                            &mut dh_c as *mut _ as *mut c_void,
+                            &mut nsplit_c as *mut _ as *mut c_void,
+                        ];
+                        unsafe {
+                            ctx.launch_async(
+                                k.f_cb,
+                                (group as u32, nkv_c as u32, 1),
+                                (dh as u32, 1, 1),
+                                0,
+                                &mut args2,
+                            )?;
+                        }
                     }
                     q4attn_kprof::note_launch(tl);
                     q4attn_kprof::note_call();
@@ -2875,7 +2994,7 @@ pub(crate) mod dec_full_dev {
                     } else {
                         q4attn_kprof::note_fdec_call();
                     }
-                    Ok(aptr)
+                    Ok((aptr, gated))
                 });
             }
         }
@@ -2887,7 +3006,7 @@ pub(crate) mod dec_full_dev {
         let (n_split, _chunk) = q4_dec_split(len, q4_gpu_attn_split());
         nsplit_c = n_split as c_int;
         let shmem = (q4_dec_sh_f(dh) * 4) as u32;
-        Q4ATTN_SCRATCH.with(|cell| -> Result<CUdeviceptr> {
+        Q4ATTN_SCRATCH.with(|cell| -> Result<(CUdeviceptr, bool)> {
             let mut s = cell.borrow_mut();
             let part_bytes = heads * n_split * (dh + 2) * 4;
             Scratch::ensure(&mut s.out, qd * 4)?;
@@ -2932,7 +3051,7 @@ pub(crate) mod dec_full_dev {
             q4attn_kprof::note_launch(tl);
             q4attn_kprof::note_call();
             q4attn_kprof::note_split_call();
-            Ok(aptr)
+            Ok((aptr, false))
         })
     }
 
@@ -3063,6 +3182,7 @@ pub(crate) mod dec_full_dev {
                 wo_n: 2_560,
                 n_embd: 2_560,
                 cur,
+                x_dev: None,
             }
         }
 
@@ -35896,6 +36016,10 @@ pub fn maybe_gpu_mix_q_chain_into(
     // task 282: GPU の鎖を積んだあと・待つ前にホストで走らせる仕事
     // (hc_inject の GEMV。GPU が遊んでいる間に出せるので待ちに隠れる)。
     pre_wait: Option<&mut dyn FnMut() -> Result<()>>,
+    // task 464: 呼び出し側が「`mixed` をホストで読まない」と言っているか
+    // (`DENNO_MIX_NOWAIT`)。true なら D2H を撃たず、イベントも待たない
+    // (次の鎖 or 後続の GDN submission の同期にまとめる)。
+    defer: bool,
 ) -> bool {
     use std::sync::atomic::Ordering as AO;
     // task 364: ルータ GEMV をこの鎖に載せにいく回数 (テスト専用。GPU 無しでも
@@ -35977,6 +36101,13 @@ pub fn maybe_gpu_mix_q_chain_into(
     let mut pre_wait = pre_wait;
     // task 364: 鎖の末尾に積むルータ GEMV の重み (同期の後まで生かす)。
     let mut router_w: Option<GgufWRef> = None;
+    // task 464: 前回 defer した鎖がまだ流れていれば、scratch (`stage` / `hx`) を
+    // 上書きする前に待つ。実際には直後の GDN submission が同期しているので
+    // ここで待つことはほぼ無い (イベントは完了済み)。
+    if let Err(err) = mix_pending_drain() {
+        mix_gpu_broken_once(&format!("mix pending wait: {err:#}"));
+        return false;
+    }
     let r = MIX_GPU_SC.with(|cell| -> Result<()> {
         let _kp_win = dec_kprof::window(
             dec_kprof::MIX,
@@ -36518,7 +36649,10 @@ pub fn maybe_gpu_mix_q_chain_into(
         if enq != 0 {
             ROUTER_IN_QCHAIN_HITS.fetch_add(1, AO::Relaxed);
         }
-        if !zc_out {
+        // task 464: defer の回は `mixed` をホストへ降ろさない (GDN が `dm` を
+        // そのまま読む)。降ろさないので下のイベント待ちも要らない。
+        let mut d2h_done = false;
+        if !zc_out && !defer {
             let kp_cp = dec_kprof::op_begin(
                 || "D2H@a".to_string(),
                 (0, 0, 0),
@@ -36532,6 +36666,7 @@ pub fn maybe_gpu_mix_q_chain_into(
                     "cuMemcpyDtoHAsync (mix q chain)",
                 )?;
             }
+            d2h_done = true;
             dec_kprof::op_end(kp_cp);
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
@@ -36570,9 +36705,26 @@ pub fn maybe_gpu_mix_q_chain_into(
         // 上げ直し (非ブロッキングストリーム) まで待ってしまうので使わない
         // (task 278 の層一括経路と同じ理由)。イベントが張れない環境だけ
         // 従来どおり文脈同期へ落とす。
+        // task 464: defer の回はイベントを打つだけで待たない (後続の GDN
+        // submission が同じ null ストリームの最後で待つ)。イベントが張れない
+        // 環境だけは降ろし直してから文脈同期する (defer しない)。
+        let mut deferred = false;
         if seg_ev::record_raw(8) {
-            seg_ev::wait(8)?;
+            if defer {
+                deferred = true;
+                MIX_PENDING_EV.with(|c| c.set(true));
+            } else {
+                seg_ev::wait(8)?;
+            }
         } else {
+            if defer && !zc_out && !d2h_done {
+                unsafe {
+                    check(
+                        (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
+                        "cuMemcpyDtoHAsync (mix q chain defer 落ち)",
+                    )?;
+                }
+            }
             ctx.sync()?;
         }
         // task 392: この鎖が作った `mixed` (= 次の段の入力 cur) のデバイス
@@ -36583,15 +36735,22 @@ pub fn maybe_gpu_mix_q_chain_into(
         }
         // task 364: 鎖に積んだルータ GEMV の重み参照を手放す (同期の後)。
         drop(router_w);
-        dec_kprof::step("mix_pack", || {
-            if zc_out {
-                // task 382: hc_mixed がホストの pinned へ直接書いている。
-                let m = omap.as_ref().expect("確保済み");
-                out.copy_from_slice(&m.pin.as_slice::<f32>()[..e]);
-            } else {
-                out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
-            }
-        });
+        if deferred {
+            // task 464: ホスト値は作らない (呼び出し側は空の Vec を受け取る)。
+            MIX_DEFERRED.with(|c| c.set(true));
+            MIX_NOWAIT_HITS.fetch_add(1, AO::Relaxed);
+        } else {
+            MIX_DEFERRED.with(|c| c.set(false));
+            dec_kprof::step("mix_pack", || {
+                if zc_out {
+                    // task 382: hc_mixed がホストの pinned へ直接書いている。
+                    let m = omap.as_ref().expect("確保済み");
+                    out.copy_from_slice(&m.pin.as_slice::<f32>()[..e]);
+                } else {
+                    out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+                }
+            });
+        }
         // task 382: 比較モード (`DENNO_MIX_UPQ8=check`) — 従来の 3 本の出力
         // (`ho`) と融合版の出力 (`hchk`) を突き合わせる。値を変えないので
         // テキストと md5 は従来経路のまま。
@@ -40768,6 +40927,61 @@ fn parse_attn_flashdec_chunk(v: Option<&str>) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 460: 1 分割の key 数を文脈長で変える (`DENNO_ATTN_FLASHDEC_CHUNK=auto`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (task 456 の lab t456c、既定モデル、depth8k):
+//   chunk 128 にすると 14k の full 段が 1.77 -> 1.65 ms/token (-6.6%、n_split が
+//   220 -> 110 になり combine の読みが半減) だが、2k では 1.19 -> 1.38 (+16%)
+//   になる (block 数 2*n_split = 62 が SM 170 を割る)。よって固定値ではなく
+//   **block 数 2*n_split >= 220 を保つ範囲で 1 分割を大きくする**。
+//
+// 規則 (純関数): chunk = ceil(len / 110) を 64..=128 に clamp。
+//   - 14,018 -> 128 (t456c で測った最良と同じ n_split 110)
+//   - 3,965 / 2,000 -> 64 (現状と同じ。n_split 62 を 32 にしない)
+//   - 8,000 -> 73 (n_split 110)
+/// `auto` のときの目標分割数 (block 数 2*n_split が SM 170 を余裕で超える)。
+const ATTN_FLASHDEC_AUTO_SPLITS: usize = 110;
+/// `auto` のときの 1 分割の上限 key 数。
+const ATTN_FLASHDEC_AUTO_CHUNK_MAX: usize = 128;
+
+/// `DENNO_ATTN_FLASHDEC_CHUNK` が `auto` か (純関数。前後の空白と大小は無視)。
+pub(crate) fn parse_attn_flashdec_chunk_auto(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("auto")
+    )
+}
+
+/// `DENNO_ATTN_FLASHDEC_CHUNK` の値を「auto かどうか」に落とす (純関数)。
+///
+/// 未設定・空・`auto` は auto (**既定 = auto**)。数値は固定値のまま (切り戻し)、
+/// 未知の値も固定 64。lab t460a/t460b で 14k の full 段が -6 to -8% だったので
+/// 既定を auto にした。切り戻しは `DENNO_ATTN_FLASHDEC_CHUNK=64`。
+pub(crate) fn attn_fdec_chunk_is_auto(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                true
+            } else if t.parse::<usize>().is_ok() {
+                false
+            } else {
+                parse_attn_flashdec_chunk_auto(Some(t))
+            }
+        }
+    }
+}
+
+/// 文脈長から 1 分割の key 数を決める (`auto` のとき。純関数)。
+pub(crate) fn q4_fdec_chunk_auto(t_total: usize) -> usize {
+    t_total
+        .div_ceil(ATTN_FLASHDEC_AUTO_SPLITS)
+        .clamp(ATTN_FLASHDEC_CHUNK_DEFAULT, ATTN_FLASHDEC_AUTO_CHUNK_MAX)
+}
+
 /// テスト用: flash decoding のゲートを差し替える (`None` で env の解釈に戻す)。
 #[cfg(test)]
 #[doc(hidden)]
@@ -40837,6 +41051,29 @@ fn attn_flashdec_chunk() -> usize {
     *N.get_or_init(|| {
         parse_attn_flashdec_chunk(std::env::var("DENNO_ATTN_FLASHDEC_CHUNK").ok().as_deref())
     })
+}
+
+/// この文脈長で使う 1 分割の key 数 (task 460)。
+///
+//   既定 (未設定・空) と `auto` のときは文脈長で変える ([`q4_fdec_chunk_auto`])。
+/// 数値を書いたときだけ [`attn_flashdec_chunk`] の固定値 (切り戻し)。
+fn attn_flashdec_chunk_for(t_total: usize) -> usize {
+    #[cfg(test)]
+    {
+        let f = ATTN_FDEC_CHUNK_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f;
+        }
+    }
+    static AUTO: OnceLock<bool> = OnceLock::new();
+    let auto = *AUTO.get_or_init(|| {
+        attn_fdec_chunk_is_auto(std::env::var("DENNO_ATTN_FLASHDEC_CHUNK").ok().as_deref())
+    });
+    if auto {
+        q4_fdec_chunk_auto(t_total)
+    } else {
+        attn_flashdec_chunk()
+    }
 }
 
 /// 文脈長から分割数を決める (純関数)。カーネル側の
@@ -41211,6 +41448,147 @@ fn fdt_log(len: usize, n_split: usize, chunk: usize, dh: usize, tile: usize) {
             fdt_smem_bytes(tile, dh) / 1024
         );
     }
+}
+
+// ---- task 460: combine と出力ゲートの融合 (`kernels_attn_dec4.cu`) --------
+//
+// 動機 (task 456 の `[dec-kprof-avg]`、14k の 1 層あたり):
+//   `dno_attn_flashdec_combine` 16.2 us + `dno_dec_gate_mul` 3.8 us が別々に
+//   走っていた。間に同期もデータ依存も無い (combine の出力を gate が読むだけ)
+//   ので 1 起動にすると、3.8 us の本体と起動 1 本ぶんの隙間が消える。
+//   値はビット一致 (縮約順もゲートの演算列も変えない)。
+//   lab t460b: full 段 14k 後 1.76 -> 1.63 ms/token (-7.6%)、md5 SAME。
+
+/// 融合カーネルの引数の個数 (`.cu` と一致させる。kernel_invariants が見る)。
+pub(crate) const FCBG_NARGS: usize = 6;
+
+/// `DENNO_ATTN_FLASHDEC_CBG` の解釈 (純関数)。**既定 on**。
+///
+/// lab t460b (既定モデル、depth8k) で full 段が 14k 後 1.76 -> 1.63 ms/token
+/// (-7.6%、`dno_attn_flashdec_combine` 16.2 + `dno_dec_gate_mul` 3.8 us/層が
+/// 融合版 10.8 us/層になった)。明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+/// PTX が無い・ABI が違うときは combine 単体 + gate の従来 2 起動へ落ちる。
+pub(crate) fn parse_attn_fdec_cbg(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+static FD_CBG_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// テスト用: 融合ゲートを差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_fdec_cbg_for_test(on: Option<bool>) {
+    FD_CBG_FORCE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// combine + ゲートの融合を使うか (`DENNO_ATTN_FLASHDEC_CBG`、既定 on)。
+fn attn_fdec_cbg_on() -> bool {
+    #[cfg(test)]
+    {
+        let f = FD_CBG_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_attn_fdec_cbg(std::env::var("DENNO_ATTN_FLASHDEC_CBG").ok().as_deref())
+    })
+}
+
+/// 融合版の PTX (`kernels_attn_dec4.ptx`)。`DENNO_ATTN_FLASHDEC4_PTX` で差し替え可。
+fn fcbg_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_ATTN_FLASHDEC4_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_attn_dec4.ptx"),
+    }
+}
+
+/// 融合版のカーネル 1 本。読み込み失敗は `None` を焼き付ける (2 起動へ落ちる)。
+struct FcbgKernels {
+    /// モジュールはプロセス終了まで保持する (unload しない)。
+    _module: CUmodule,
+    f_cbg: CUfunction,
+}
+
+unsafe impl Send for FcbgKernels {}
+unsafe impl Sync for FcbgKernels {}
+
+fn fcbg_kernels() -> Option<&'static FcbgKernels> {
+    static K: OnceLock<Option<FcbgKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = fcbg_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[attn-fdec4] PTX が読めない ({}) : {e} → combine + gate の 2 起動へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let text = String::from_utf8_lossy(&image).into_owned();
+        if ptx_entry_params(&text, "dno_attn_flashdec_cbg") != Some(FCBG_NARGS) {
+            eprintln!(
+                "[attn-fdec4] PTX の dno_attn_flashdec_cbg が {FCBG_NARGS} 引数でない \
+                 (再生成が必要) → 2 起動へ"
+            );
+            return None;
+        }
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[attn-fdec4] cuModuleLoadData 失敗 → 2 起動へ");
+                return None;
+            }
+        }
+        let mut f_cbg: CUfunction = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_get_function)(
+                &mut f_cbg,
+                module,
+                b"dno_attn_flashdec_cbg\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[attn-fdec4] PTX に dno_attn_flashdec_cbg が無い → 2 起動へ");
+                return None;
+            }
+        }
+        let k = FcbgKernels { _module: module, f_cbg };
+        eprintln!("[attn-fdec4] PTX ok: dno_attn_flashdec_cbg nargs={FCBG_NARGS}");
+        Some(k)
+    })
+    .as_ref()
+}
+
+/// 融合の門を 1 回だけログる (既定 off の確認用。t456 と同じ流儀)。
+fn fcbg_gate_log(gate_ok: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[attn-fdec4] gate cbg_on={} gate_ok={gate_ok} (DENNO_ATTN_FLASHDEC_CBG)",
+            attn_fdec_cbg_on()
+        );
+    });
 }
 
 #[cfg(test)]
@@ -42231,7 +42609,7 @@ fn q4_attn_decode_fdec(a: &Q4AttnCall<'_>, imp: FdecImpl) -> Option<Vec<f32>> {
             )
         }
     };
-    let (n_split, chunk) = q4_fdec_split(a.len, attn_flashdec_chunk());
+    let (n_split, chunk) = q4_fdec_split(a.len, attn_flashdec_chunk_for(a.len));
     match imp {
         FdecImpl::V1 => fdec_log(a.len, n_split, chunk, a.kv_dim, a.dh, a.group),
         FdecImpl::Tile => fdt_log(a.len, n_split, chunk, a.dh, tile),
@@ -42742,6 +43120,17 @@ pub mod q4attn_kprof {
         }
     }
 
+    // ---- task 460: combine + ゲートの融合版を回した回数 ----------------------
+    /// `dno_attn_flashdec_cbg` を回した回数 (= layer x decode token)。
+    /// 0 のままなら融合版は選ばれていない (既定 off)。
+    pub static CBG_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_cbg_call() {
+        if on() {
+            CBG_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn note_pf_h2d(t: Option<std::time::Instant>, bytes: usize) {
         if !on() {
             return;
@@ -42819,7 +43208,7 @@ pub mod q4attn_kprof {
              pf calls={pf_calls} h2d={:.1}MB q={:.1}MB out={:.1}MB | \
              pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms | \
              split calls={} fallback={} | fdec calls={} fallback={} | \
-             fdt calls={} fallback={} tile={}",
+             fdt calls={} fallback={} tile={} | cbg calls={}",
             mb(SEED_BYTES.load(Ordering::Relaxed)),
             mb(ROW_BYTES.load(Ordering::Relaxed)),
             mb(Q_BYTES.load(Ordering::Relaxed)),
@@ -42849,6 +43238,7 @@ pub mod q4attn_kprof {
             FDT_CALLS.load(Ordering::Relaxed),
             FDT_FALLBACKS.load(Ordering::Relaxed),
             super::attn_fdec_tile(),
+            CBG_CALLS.load(Ordering::Relaxed),
         ))
     }
 
@@ -42869,6 +43259,9 @@ pub mod q4attn_kprof {
             &SPLIT_FALLBACKS,
             &FDEC_CALLS,
             &FDEC_FALLBACKS,
+            &FDT_CALLS,
+            &FDT_FALLBACKS,
+            &CBG_CALLS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -46803,6 +47196,88 @@ mod tests {
         }
     }
 
+    /// task 464: `DENNO_MIX_NOWAIT` は既定 on (lab t464b で採否)・明示的な偽値だけ off。
+    #[test]
+    fn task464_mix_nowait_gate_truth_table() {
+        assert!(mix_nowait_from_value(None), "未設定は既定 on (lab t464b で採否)");
+        for v in ["0", "off", "false", "no", " OFF ", " False ", ""] {
+            assert!(!mix_nowait_from_value(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", "yes", " YES ", "ssm", " SSM ", "2"] {
+            assert!(mix_nowait_from_value(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 468: `DENNO_MIX_NOWAIT` の full 層の解釈 (既存 env の値。新しい env 名は
+    /// 足さない)。**既定 on** (lab t468c で採否)。
+    ///
+    /// 切り戻しは `=ssm` (ssm の defer は残して full だけ止める) か `=0` / `=off`。
+    #[test]
+    fn task468_mix_nowait_full_gate_truth_table() {
+        assert!(mix_nowait_full_from_value(None), "未設定は既定 on (lab t468c で採否)");
+        for v in ["0", "off", "false", "no", "ssm", " SSM ", ""] {
+            assert!(!mix_nowait_full_from_value(Some(v)), "raw={v:?}");
+        }
+        for v in ["full", " FULL ", "all", " All ", "1", "on", "true", "yes", "2"] {
+            assert!(mix_nowait_full_from_value(Some(v)), "raw={v:?}");
+        }
+        // `full` / 真値は ssm の defer も on のまま (既存の解釈を壊さない)。
+        for v in ["full", "1", "on"] {
+            assert!(mix_nowait_from_value(Some(v)), "raw={v:?}");
+        }
+        // 偽値は ssm も full も落とす。
+        assert!(!mix_nowait_from_value(Some("0")) && !mix_nowait_full_from_value(Some("0")));
+        // `ssm` は ssm だけ on (full は off)。
+        assert!(mix_nowait_from_value(Some("ssm")) && !mix_nowait_full_from_value(Some("ssm")));
+    }
+
+    /// task 468: `[mix-nowait-full]` は 1 層も通らなければ出さない。
+    #[test]
+    fn task468_mix_nowait_full_line_counts_layers() {
+        assert_eq!(mix_nowait_full_line_with(true, 0), None, "0 層なら出さない");
+        assert_eq!(mix_nowait_full_line_with(false, 12), None, "ゲート off なら出さない");
+        let l = mix_nowait_full_line_with(true, 12).expect("defer した層があれば出す");
+        assert!(l.contains("layers=12"), "{l}");
+        assert!(l.starts_with("[mix-nowait-full]"), "{l}");
+    }
+
+    /// task 464: 発火の証拠の行 (1 層も通らなければ出さない)。
+    #[test]
+    fn task464_mix_nowait_line_counts_layers() {
+        assert_eq!(mix_nowait_line_with(0, 0), None, "0 層なら出さない");
+        let l = mix_nowait_line_with(36, 36).expect("defer した層があれば出す");
+        assert!(l.contains("deferred_layers=36"), "{l}");
+        assert!(l.contains("alias_layers=36"), "{l}");
+        // alias だけ立った回 (defer 0) でも出す = 「前提は揃ったが defer していない」
+        // ことが読める。
+        let a = mix_nowait_line_with(0, 5).expect("alias だけでも出す");
+        assert!(a.contains("deferred_layers=0"), "{a}");
+    }
+
+    /// task 464: defer の印は既定 false で、読むと消える。
+    #[test]
+    fn task464_mix_take_deferred_is_one_shot() {
+        crate::cuda::mix_nowait_reset();
+        assert!(!mix_take_deferred(), "既定で defer になっている");
+        MIX_DEFERRED.with(|c| c.set(true));
+        assert!(mix_take_deferred(), "印が読めない");
+        assert!(!mix_take_deferred(), "2 回目も true (消えていない)");
+    }
+
+    /// task 464: 控えの有無は消費せずに読める (ssm 側の前提検査に使う)。
+    #[test]
+    fn task464_gdn_x_in_mix_armed_does_not_consume() {
+        gdn_x_mix_reset();
+        assert!(!gdn_x_in_mix_armed(4608), "空なのに armed");
+        gdn_x_in_mix_arm(0x1234_5000, 4608);
+        assert!(gdn_x_in_mix_armed(4608), "控えがあるのに armed でない");
+        assert!(!gdn_x_in_mix_armed(2304), "要素数が違うのに armed");
+        // 読んでも消えない = そのあと GDN が取れる。
+        assert_eq!(gdn_x_in_mix_take(4608), Some(0x1234_5000), "控えが消えた");
+        assert!(!gdn_x_in_mix_armed(4608), "取った後も armed");
+        gdn_x_mix_reset();
+    }
+
     /// task 392: `DENNO_GDN_X_MIX` は既定 on (lab t392c で採否)・明示的な偽値だけ off。
     #[test]
     fn gdn_x_mix_gate_truth_table() {
@@ -46959,6 +47434,7 @@ mod tests {
             &xn,
             &mut out,
             None,
+            false,
         );
         assert!(!ran, "CUDA 無しで mix の鎖が走った");
         assert_eq!(
@@ -46989,6 +47465,7 @@ mod tests {
             &xn,
             &mut out,
             None,
+            false,
         );
         assert_eq!(router_in_qchain_arms(), 0, "ゲート off なのに数えた");
         router_in_mix_set_for_test(None);
@@ -62272,6 +62749,165 @@ pub fn gdn_x_mix_reset() {
     GDN_X_LEN.store(0, Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// task 464: ssm 層の attn mix で鎖の待ちを GDN の同期へ後ろ倒しにする
+// (`DENNO_MIX_NOWAIT`)
+// ---------------------------------------------------------------------------
+//
+// decode 1 トークンは mix の Q8_0 鎖 (`maybe_gpu_mix_q_chain_into`) を 97 回
+// 呼び、そのたびに `cuEventSynchronize` 1 本で待つ。ssm 層 (36 層) の **attn の
+// mix** に限れば、鎖の出力 `mixed` をホストで読む相手が居ない:
+//
+// - 直後の GDN submission は `DENNO_GDN_X_MIX` でデバイスの `dm` をそのまま読む
+//   (ホストの `cur` は使わない)。
+// - inject (`ij`) は鎖の外でホストが計算する (`pre_wait`)。
+// - router GEMV が鎖に載るのは ffn の mix だけで、その回は defer しない。
+//
+// よって (a) `mixed` の D2H を撃たず、(b) 鎖のイベントを待たずに GDN の
+// submission (同じ null ストリーム) の最後の D2H 待ちへまとめられる。値は同じ
+// バイト列 (ホストへ降ろさないだけ) なのでビット一致。
+//
+// 次に鎖を呼ぶときは scratch (`stage` / `hx`) を上書きする前に前回のイベントを
+// 待つ ([`mix_pending_drain`])。実際にはその前に GDN が同期しているので待ちは
+// ほぼ 0。イベントが張れない環境では従来どおり文脈同期して defer しない。
+//
+// **既定 on** (lab t464b で採否: mix 段 2.81/2.85/2.82 -> 2.68/2.62/2.62 ms/token、
+// step 11.37 -> 11.23、md5 全 SAME)。切り戻しは `DENNO_MIX_NOWAIT=0`。
+pub const MIX_NOWAIT_ENV: &str = "DENNO_MIX_NOWAIT";
+
+/// [`MIX_NOWAIT_ENV`] の解釈 (純関数)。**既定 on**、明示的な偽値だけ off。
+fn mix_nowait_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
+    )
+}
+
+/// `DENNO_MIX_NOWAIT` が有効か (プロセスで 1 回だけ env を読む)。
+pub(crate) fn mix_nowait_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_nowait_from_value(std::env::var(MIX_NOWAIT_ENV).ok().as_deref()))
+}
+
+// ---------------------------------------------------------------------------
+// task 468: full 層の attn mix も defer する (`DENNO_MIX_NOWAIT=full`)
+// ---------------------------------------------------------------------------
+//
+// full 層 (12 層/token) の attn の mix も、鎖の出力 `mixed` を**ホストで読まない**
+// 相手が居る: 直後の full attention の device 経路 (`dec_full_dev`) が qkv GEMV の
+// 入力に同じデバイスバッファ (`dm`) を使えるようにした (task 468)。よって ssm 層と
+// 同じく (a) D2H を撃たず (b) イベントも待たない。待ちは次の鎖 (同じ層の ffn mix)
+// の入口の drain へ移るが、その前に full attention の 5 起動と同期が入るので
+// 待ちはほぼ 0 になる。
+//
+// **既定 on** (lab t468c で採否: 14k 後の decode が 12.3 -> 12.0 ms/token、
+// 短い decode と prefill は不変、md5 全 SAME)。切り戻しは `DENNO_MIX_NOWAIT=ssm`
+// (ssm の defer は残して full だけ止める) か `=0` (両方止める)。
+// 既存の env に値を足す形にした (lab の COND は新しい env 名を落とすことがある)。
+fn mix_nowait_full_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref() {
+        None => true,
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("") | Some("ssm") => false,
+        _ => true,
+    }
+}
+
+/// `DENNO_MIX_NOWAIT=full` (full 層も defer) か。プロセスで 1 回だけ読む。
+pub(crate) fn mix_nowait_full_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_nowait_full_from_value(std::env::var(MIX_NOWAIT_ENV).ok().as_deref())
+    })
+}
+
+/// 直前の鎖が残した `mixed` (デバイス) を 1 回だけ取り出す。
+///
+/// full attention の device 経路が qkv GEMV の入力に使う (ssm の
+/// [`gdn_x_in_mix_take`] と同じ控え)。要素数が合わなければ `None`。
+pub(crate) fn full_x_in_mix_take(n: usize) -> Option<u64> {
+    gdn_x_in_mix_take(n)
+}
+
+/// full 層で H2D を省いた層数の行 (1 層も通らなければ `None`)。
+pub fn mix_nowait_full_line() -> Option<String> {
+    mix_nowait_full_line_with(
+        mix_nowait_full_on(),
+        crate::cuda::dec_full_dev::x_dev_hits(),
+    )
+}
+
+/// [`mix_nowait_full_line`] の本体 (テストで両側を踏めるように引数で受ける)。
+fn mix_nowait_full_line_with(on: bool, layers: u64) -> Option<String> {
+    if !on || layers == 0 {
+        return None;
+    }
+    Some(format!("[mix-nowait-full] layers={layers}"))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn mix_nowait_full_reset() {
+    crate::cuda::dec_full_dev::x_dev_reset();
+}
+
+thread_local! {
+    /// 前回 defer した鎖のイベントをまだ待っていない (= 次の鎖の入口で待つ)。
+    static MIX_PENDING_EV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 直前の鎖が defer したか (呼び出し側が読んで消す)。
+    static MIX_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// defer した層数 (発火の証拠 `[mix-nowait]`)。
+static MIX_NOWAIT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// 前回 defer した鎖の完了を待つ (scratch を上書きする前に呼ぶ)。
+fn mix_pending_drain() -> Result<()> {
+    if MIX_PENDING_EV.with(|c| c.replace(false)) {
+        seg_ev::wait(8)?;
+    }
+    Ok(())
+}
+
+/// 直前の鎖が defer したか (読むと消える)。
+///
+/// `true` のとき `out` (mixed) はホストへ降ろされていない = ホスト値は不定。
+pub(crate) fn mix_take_deferred() -> bool {
+    MIX_DEFERRED.with(|c| c.replace(false))
+}
+
+/// 控え (`mixed` のデバイスコピー) が要素数 `n` で置かれているか (消費しない)。
+///
+/// ssm 層が「入力はデバイス側にある」と判定するために使う。
+pub(crate) fn gdn_x_in_mix_armed(n: usize) -> bool {
+    GDN_X_LEN.load(Ordering::Relaxed) == n as u64 && GDN_X_PTR.load(Ordering::Relaxed) != 0
+}
+
+/// defer した層数の行 (ゲート on で 1 層も通らなければ `None`)。
+pub fn mix_nowait_line() -> Option<String> {
+    mix_nowait_line_with(
+        MIX_NOWAIT_HITS.load(Ordering::Relaxed),
+        GDN_X_MIX_HITS.load(Ordering::Relaxed),
+    )
+}
+
+/// [`mix_nowait_line`] の本体 (テストで両側を踏めるように引数で受ける)。
+fn mix_nowait_line_with(deferred: u64, alias_hits: u64) -> Option<String> {
+    if deferred == 0 && alias_hits == 0 {
+        return None;
+    }
+    Some(format!(
+        "[mix-nowait] deferred_layers={deferred} alias_layers={alias_hits}"
+    ))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+///
+/// `MIX_PENDING_EV` は残す (defer した鎖がまだ流れているかもしれないので、次の
+/// 鎖の入口で待たせる)。
+pub fn mix_nowait_reset() {
+    MIX_NOWAIT_HITS.store(0, Ordering::Relaxed);
+    MIX_DEFERRED.with(|c| c.set(false));
+}
+
 /// `gdn_decode_submit` のリクエスト。
 pub struct GdnDecodeReq<'a> {
     /// SsmLayer インスタンスの nonce (ストアの鍵)。
@@ -62875,7 +63511,11 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             gdn_note_once("寸法が確保済みエントリと違う (バグの疑い) → CPU 経路");
             return GdnDecodeRes::cpu();
         }
-        if req.cur.len() != req.n_embd
+        // task 464: `DENNO_MIX_NOWAIT` の defer 回は `cur` が空で来る (入力は mix の
+        // 鎖がデバイスに残した `dm`)。空は控えが armed のときだけ許し、控えが無ければ
+        // **CPU 経路へ落とさず**に要求を落とす (空の入力で黙って計算しない)。
+        let cur_empty = req.cur.is_empty();
+        if (req.cur.len() != req.n_embd && !cur_empty)
             || req.conv_host.len() != e.conv_len
             || req.ssm_host.len() != e.ssm_len
             || (req.ba_units.is_empty()
@@ -62883,6 +63523,17 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         {
             gdn_note_once("入力長が寸法と違う (バグの疑い) → CPU 経路");
             return GdnDecodeRes::cpu();
+        }
+        if cur_empty && !gdn_x_in_mix_armed(req.n_embd) {
+            // 呼び出し側の前提 (mix の鎖が `dm` を残す) が崩れている。CPU 経路へ
+            // 落とすと空の入力で計算してしまうので、poisoned で要求を落とす。
+            gdn_note_once("入力が空で mix の控えも無い → 要求を落とす");
+            return GdnDecodeRes {
+                out: None,
+                state_back: None,
+                poisoned: true,
+                state_dev: None,
+            };
         }
         // task 140: qkv GEMV の出力は `e.qkv` の行オフセットへ書く。合計が
         // qkv_total を越えるとデバイスバッファの外へ書いて CUDA error 700 になる
@@ -63018,6 +63669,15 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         } else {
             None
         };
+        // task 464: mix の鎖を defer した回は `req.cur` が空で来る。控えが無いまま
+        // 進むと 0 バイトを staging に積んで黙って壊れた値を出すので、ここで落とす。
+        if x_alias.is_none() && req.cur.len() < req.n_embd {
+            bail!(
+                "gdn decode: 入力 cur が {} 要素 (n_embd={}) で mix の控えも無い (DENNO_MIX_NOWAIT の前提が崩れた)",
+                req.cur.len(),
+                req.n_embd
+            );
+        }
         // task 140: cur / beta / alpha を 1 本の staging に詰めて **H2D 1 回**で
         // 上げる (以前は同期 H2D 3 回。値・並びは同一で、カーネルへ渡す
         // ポインタだけが xba の先頭/中間を指す)。
@@ -64971,6 +65631,93 @@ mod task448_tests {
         assert_eq!(attn_fdec_tile(), 64, "FORCE の丸めが効いていない");
         set_attn_fdec_tile_for_test(None);
         assert_eq!(attn_fdec_tile(), parse_attn_fdec_tile(std::env::var("DENNO_ATTN_FLASHDEC_TILE").ok().as_deref()));
+    }
+
+    // ---- task 460: chunk の長さ依存化 + combine/gate の融合 ----------------
+
+    /// `DENNO_ATTN_FLASHDEC_CHUNK=auto` の真理値表と、長さ -> chunk の規則。
+    ///
+    /// 規則の根拠 (lab t456c、既定モデル): 14k では chunk 128 が full 段 -6.6%、
+    /// 2k では +16%。境目は block 数 2*n_split が SM 170 を割るかどうか。
+    #[test]
+    fn task460_auto_chunk_rule() {
+        // `auto` だけが真。数値・空・未知は固定値のまま。
+        assert!(parse_attn_flashdec_chunk_auto(Some("auto")));
+        assert!(parse_attn_flashdec_chunk_auto(Some(" AUTO ")));
+        for v in ["64", "128", "", "  ", "on", "x"] {
+            assert!(
+                !parse_attn_flashdec_chunk_auto(Some(v)),
+                "{v:?} を auto と読んでいる"
+            );
+        }
+        assert!(!parse_attn_flashdec_chunk_auto(None));
+
+        // 実測点: 14,018 -> 128 (n_split 110)、3,965 と 2,000 -> 64 (現状と同じ)。
+        assert_eq!(q4_fdec_chunk_auto(14018), 128);
+        assert_eq!(q4_fdec_chunk_auto(3965), 64);
+        assert_eq!(q4_fdec_chunk_auto(2000), 64);
+        assert_eq!(q4_fdec_chunk_auto(0), 64);
+        // 境界: 110*64 = 7040 まで 64、7041 で 65。上限は 128。
+        assert_eq!(q4_fdec_chunk_auto(7040), 64);
+        assert_eq!(q4_fdec_chunk_auto(7041), 65);
+        assert_eq!(q4_fdec_chunk_auto(14080), 128);
+        assert_eq!(q4_fdec_chunk_auto(40000), 128, "上限 128 を超えた");
+        // どの長さでも 1 分割は 64..=128 に収まる。
+        for t in [1usize, 63, 64, 1023, 1024, 4096, 8192, 12000, 14018, 65536] {
+            let c = q4_fdec_chunk_auto(t);
+            assert!((64..=128).contains(&c), "len={t} で chunk={c}");
+        }
+        // 実測点で n_split が期待どおり (14k は t456c の 110 と同じ、2k は 32 のまま)。
+        assert_eq!(q4_fdec_split(14018, q4_fdec_chunk_auto(14018)), (110, 128));
+        assert_eq!(q4_fdec_split(2000, q4_fdec_chunk_auto(2000)), (32, 63));
+        // 固定値の解釈 (数値を書いたとき) は今までどおり 64。
+        assert_eq!(parse_attn_flashdec_chunk(None), 64);
+
+        // 既定は auto (未設定・空)、数値を書いたときだけ固定 (切り戻し)。
+        assert!(attn_fdec_chunk_is_auto(None), "未設定が auto でない (既定 auto)");
+        assert!(attn_fdec_chunk_is_auto(Some("")));
+        assert!(attn_fdec_chunk_is_auto(Some(" AUTO ")));
+        for v in ["64", "128", " 96 "] {
+            assert!(!attn_fdec_chunk_is_auto(Some(v)), "{v:?} が auto になっている");
+        }
+        assert!(!attn_fdec_chunk_is_auto(Some("x")), "未知の値が auto になっている");
+        // 既定のまま 14k では 128 (= n_split 110) になり、2k では 64 のまま。
+        assert_eq!(q4_fdec_split(14018, q4_fdec_chunk_auto(14018)), (110, 128));
+        assert_eq!(q4_fdec_split(2000, q4_fdec_chunk_auto(2000)), (32, 63));
+    }
+
+    /// 融合版 (combine + ゲート) の門は**既定 on**、明示的な偽値だけ off
+    /// (lab t460b で 14k の full 段 -7.6%、md5 SAME)。
+    #[test]
+    fn task460_cbg_gate_truth_table() {
+        for v in ["1", "on", "true", "yes", " ON ", "True", "", "  ", "auto", "x"] {
+            assert!(parse_attn_fdec_cbg(Some(v)), "{v:?} が on でない (既定 on)");
+        }
+        for v in ["0", "off", "false", "no", " OFF ", "No"] {
+            assert!(!parse_attn_fdec_cbg(Some(v)), "{v:?} が on になっている");
+        }
+        assert!(parse_attn_fdec_cbg(None), "未設定が on でない (既定 on)");
+        // env 未設定なら (テストの差し替えが無ければ) on = 既定 on。
+        assert!(
+            attn_fdec_cbg_on() || FD_CBG_FORCE.load(std::sync::atomic::Ordering::Relaxed) == 0
+        );
+        // 差し替えフックは env より優先する。
+        set_attn_fdec_cbg_for_test(Some(true));
+        assert!(attn_fdec_cbg_on());
+        set_attn_fdec_cbg_for_test(Some(false));
+        assert!(!attn_fdec_cbg_on());
+        set_attn_fdec_cbg_for_test(None);
+    }
+
+    /// 融合版の発火計数とログの口。GPU 無しでは 0 のまま。
+    #[test]
+    fn task460_cbg_counters_exist() {
+        let before = q4attn_kprof::CBG_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        q4attn_kprof::note_cbg_call();
+        let after = q4attn_kprof::CBG_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before, "計数が減った");
+        // ABI の約束 (`.cu` の引数 6 本)。
+        assert_eq!(FCBG_NARGS, 6, "融合カーネルの引数が 6 本でない");
     }
 
     /// 発火の計数 (FDT_CALLS) とログの口があること。GPU 無しでは 0 のまま。

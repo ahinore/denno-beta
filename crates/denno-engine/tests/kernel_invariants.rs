@@ -10763,7 +10763,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem pf_ple attn_pf4)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12290,7 +12290,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12407,7 +12407,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12602,7 +12602,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12696,7 +12696,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12869,8 +12869,9 @@ fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
         "mdev が融合版の起動より後ろにある (pout に渡せない)"
     );
     // D2H は zc_out のときだけ省く (従来は同じ判定)。
+    // task 464: defer (ssm 層の attn mix) の回も省くので、門番は `!zc_out && !defer`。
     assert!(
-        f.contains("if !zc_out {"),
+        f.contains("if !zc_out && !defer {"),
         "D2H の門番が消えている"
     );
     // (2) H2D 専用の非ブロッキングストリーム。
@@ -12989,7 +12990,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
@@ -13264,6 +13265,175 @@ fn task448_flashdec_tile_kernel_and_wiring() {
     }
 }
 
+/// task 460: decode の full attention で combine と出力ゲートを 1 起動にまとめた
+/// `kernels_attn_dec4.cu` の配線。
+///
+/// 見るもの: (1) entry と引数 6 本、(2) 縮約が `kernels_attn_dec.cu` の
+/// `dno_attn_flashdec_combine` と **同じ順** (値が動かない根拠)、(3) ゲートの
+/// 演算列が `kernels_dec_dev.cu` の `dno_dec_gate_mul` と同じ、(4) dno_expf の
+/// 写しが同一 (定数まで)、(5) ホスト側の門・起動・計数、(6) build_ptx.sh の target、
+/// (7) PTX があれば ABI が 6 引数であること。
+#[test]
+fn task460_flashdec_combine_gate_kernel_and_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let cu1 = std::fs::read_to_string(root.join("kernels_attn_dec.cu"))
+        .expect("kernels_attn_dec.cu が無い");
+    let cu4 = std::fs::read_to_string(root.join("kernels_attn_dec4.cu"))
+        .expect("kernels_attn_dec4.cu が無い");
+    let cud = std::fs::read_to_string(root.join("kernels_dec_dev.cu"))
+        .expect("kernels_dec_dev.cu が無い");
+
+    // 1. entry は 1 本だけ。既存の entry 名を上書きしていない。
+    assert!(
+        cu4.contains("extern \"C\" __global__ void dno_attn_flashdec_cbg("),
+        "融合版の entry が無い"
+    );
+    assert!(
+        !cu4.contains("dno_attn_flashdec(") && !cu4.contains("dno_attn_flashdec_combine("),
+        "既存の entry を上書きしている"
+    );
+    // 引数は part / att / gate / group / dh / n_split の 6 本。
+    assert!(
+        cu4.contains("int group, int dh, int n_split) {"),
+        "引数の並びが 6 本でない"
+    );
+    assert!(cu4.contains("const float *__restrict__ gate,"), "gate 引数が無い");
+    assert!(cu4.contains("if (gate != nullptr) {"), "gate の null 分岐が無い");
+
+    // 2. 縮約の順が combine と同じ (macro 名の違いだけを落として比べる)。
+    let n4 = cu4.replace("DNO_CBG_LOG2E", "DNO_FD_LOG2E");
+    for s in [
+        "for (int sp = 0; sp < n_split; ++sp) mg = fmaxf(mg, base[(size_t)sp * step]);",
+        "const float e = exp2f((pp[0] - mg) * DNO_FD_LOG2E);",
+        "denom = fmaf(pp[1], e, denom);",
+        "num = fmaf(pp[2 + d], e, num);",
+        "(denom > 0.0f) ? __fdiv_rn(num, denom) : 0.0f;",
+        "const size_t step = (size_t)group * stride;",
+        "const float *base = part + ((size_t)(kh * n_split) * group + hh) * stride;",
+    ] {
+        assert!(cu1.contains(s), "combine 側に {s} が無い");
+        assert!(n4.contains(s), "融合側に {s} が無い (縮約順が違う)");
+    }
+
+    // 3. ゲートの演算列が `dno_dec_gate_mul` と同じ。
+    //    dec_dev: e = dno_expf(-g); sg = 1/(1+e); out *= sg。
+    assert!(cud.contains("const float e = dno_expf(-g);"), "gate 側の expf が無い");
+    assert!(
+        cud.contains("const float sg = __fdiv_rn(1.0f, __fadd_rn(1.0f, e));"),
+        "gate 側の sigmoid が無い"
+    );
+    assert!(cud.contains("out[i] = __fmul_rn(out[i], sg);"), "gate 側の乗算が無い");
+    assert!(cu4.contains("const float eg = dno_cbg_expf(-g);"), "融合側の expf が無い");
+    assert!(
+        cu4.contains("const float sg = __fdiv_rn(1.0f, __fadd_rn(1.0f, eg));"),
+        "融合側の sigmoid が無い"
+    );
+    assert!(cu4.contains("val = __fmul_rn(val, sg);"), "融合側の乗算が無い");
+
+    // 4. dno_expf の写しが同一 (数値定数を全部突き合わせる)。
+    fn hex_tokens(s: &str) -> Vec<String> {
+        let c: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < c.len() {
+            if c[i] == '0' && (c[i + 1] == 'x' || c[i + 1] == 'X') {
+                let st = i;
+                i += 2;
+                while i < c.len() {
+                    let ch = c[i];
+                    let ok = ch.is_ascii_hexdigit()
+                        || ch == '.'
+                        || ch == 'p'
+                        || ch == 'P'
+                        || ch == '-'
+                        || ch == '+';
+                    if !ok {
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(c[st..i].iter().collect());
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+    fn expf_block(s: &str, tab: &str, end: &str) -> String {
+        let i = s.find(tab).expect("expf の表が無い");
+        let j = s[i..].find(end).expect("expf の終端が無い") + i;
+        s[i..j].to_string()
+    }
+    let d = expf_block(&cud, "DNO_EXP2_TAB[32] = {", "return (float)y;");
+    let f = expf_block(&cu4, "DNO_CBG_EXP2_TAB[32] = {", "return (float)y;");
+    let (td, tf) = (hex_tokens(&d), hex_tokens(&f));
+    assert!(td.len() >= 36, "dec_dev の定数が取れていない ({})", td.len());
+    assert_eq!(td, tf, "dno_expf の写しが dec_dev と違う (定数が動く)");
+
+    // 5. ホスト側の配線。
+    let host = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda.rs"),
+    )
+    .expect("cuda.rs が読めない");
+    for s in [
+        "pub(crate) const FCBG_NARGS: usize = 6;",
+        "pub(crate) fn parse_attn_fdec_cbg(v: Option<&str>) -> bool {",
+        "fn attn_fdec_cbg_on() -> bool {",
+        "\"DENNO_ATTN_FLASHDEC_CBG\"",
+        "\"DENNO_ATTN_FLASHDEC4_PTX\"",
+        "fn fcbg_ptx_path() -> std::path::PathBuf {",
+        "fn fcbg_kernels() -> Option<&'static FcbgKernels> {",
+        "b\"dno_attn_flashdec_cbg\\0\"",
+        "fn fcbg_gate_log(gate_ok: bool) {",
+        // 融合の判定は「ゲートのポインタがある」かつ「env が on」のときだけ。
+        "let cbg_k = if gate != 0 && attn_fdec_cbg_on() {",
+        // 融合したら呼び出し側はゲートの起動を飛ばす (二重掛けしない)。
+        "if !a_gated {",
+        "let (aptr, a_gated) = attn_launch(",
+        "Ok((aptr, gated))",
+        "Ok((aptr, false))",
+        "q4attn_kprof::note_cbg_call();",
+        "pub static CBG_CALLS: AtomicU64 = AtomicU64::new(0);",
+        "cbg calls={}",
+        // 長さ依存の分割 (task 460)。
+        "pub(crate) fn parse_attn_flashdec_chunk_auto(v: Option<&str>) -> bool {",
+        "pub(crate) fn q4_fdec_chunk_auto(t_total: usize) -> usize {",
+        "pub(crate) fn attn_fdec_chunk_is_auto(v: Option<&str>) -> bool {",
+        "fn attn_flashdec_chunk_for(t_total: usize) -> usize {",
+        "q4_fdec_split(len, attn_flashdec_chunk_for(len))",
+        "q4_fdec_split(a.len, attn_flashdec_chunk_for(a.len))",
+    ] {
+        assert!(host.contains(s), "cuda.rs に {s} が無い");
+    }
+    // 融合版の起動は combine と同じ grid / block であること。
+    assert!(
+        host.contains("(group as u32, nkv_c as u32, 1),\n                                (dh as u32, 1, 1),"),
+        "融合版の grid/block が combine と違う"
+    );
+
+    // 6. build_ptx.sh: spec と targets_all (末尾 = merge の衝突を避ける)。
+    assert!(
+        BUILD_PTX_SH.contains("attn_dec4)    echo \"kernels_attn_dec4.cu|nofmad\""),
+        "build_ptx.sh に attn_dec4 の spec が無い"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all=("))
+        .unwrap_or("");
+    // task 461 が末尾に `pf_ple` を足したので、末尾一致ではなく語の有無で見る。
+    assert!(targets.contains("attn_dec4"), "targets_all に attn_dec4 が無い");
+
+    // 7. PTX があれば ABI (6 引数) を数える。無ければ lab が生成する
+    //    (最初の lab 依頼は PTX=attn_dec4 で出す)。
+    let ptx = root.join("kernels_attn_dec4.ptx");
+    if let Ok(text) = std::fs::read_to_string(&ptx) {
+        let pat = ".entry dno_attn_flashdec_cbg(";
+        let i = text.find(pat).expect("PTX に entry が無い (再生成が必要)");
+        let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+        assert_eq!(text[i..j].matches(".param .").count(), 6, "PTX の引数が 6 本でない");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // task 457: prefill hc mix の要素カーネル第 2 版 (`kernels_pf_elem.cu`)
 // ---------------------------------------------------------------------------
@@ -13474,5 +13644,222 @@ fn task457_pf_elem_off_path_keeps_old_kernels() {
         "\"[pf-elem] {tag} grid={}x{}x{} threads={threads} {detail}\"",
     ] {
         assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 464: ssm 層の attn mix で鎖の待ちを GDN の同期へ後ろ倒しにする
+// (`DENNO_MIX_NOWAIT`)
+// ---------------------------------------------------------------------------
+//
+// 新しい `.cu` は無い (カーネルは 1 本も変えない)。固定するのは配線だけ:
+//   - 門は既定 off・明示的な真値だけ on
+//   - 鎖は defer の回に D2H を撃たず、イベントも待たない (待ちは次の鎖 or GDN)
+//   - 呼ぶのは ssm 層の attn mix だけ (ffn の mix は router が載るので defer しない)
+//   - 空の入力を渡された ssm 側は、控えが無ければ**要求を落とす** (黙って 0 で
+//     計算しない)
+#[test]
+fn task464_mix_nowait_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let host = std::fs::read_to_string(root.join("src/model/qwen4exp.rs"))
+        .expect("qwen4exp.rs が読めない");
+    let ssm = std::fs::read_to_string(root.join("src/model/qwen4exp_ssm.rs"))
+        .expect("qwen4exp_ssm.rs が読めない");
+
+    // 1. cuda.rs: 門・defer の実装・GDN 側の前提検査。
+    for s in [
+        "pub const MIX_NOWAIT_ENV: &str = \"DENNO_MIX_NOWAIT\";",
+        "fn mix_nowait_from_value(v: Option<&str>) -> bool {",
+        "pub(crate) fn mix_nowait_on() -> bool {",
+        "fn mix_pending_drain() -> Result<()> {",
+        "pub(crate) fn mix_take_deferred() -> bool {",
+        "pub(crate) fn gdn_x_in_mix_armed(n: usize) -> bool {",
+        "pub fn mix_nowait_line() -> Option<String> {",
+        // 鎖の入口: 前回の defer を scratch の上書き前に待つ。
+        "if let Err(err) = mix_pending_drain() {",
+        // 引数 (`defer`) と、D2H を撃たない条件。
+        "    defer: bool,\n) -> bool {",
+        "if !zc_out && !defer {",
+        // 待ちを省く分岐 (defer のときは record だけで wait しない)。
+        "if seg_ev::record_raw(8) {\n            if defer {",
+        "MIX_PENDING_EV.with(|c| c.set(true));",
+        // イベントが張れない環境では降ろし直して文脈同期する (defer しない)。
+        "\"cuMemcpyDtoHAsync (mix q chain defer 落ち)\"",
+        // ホスト値を作らない + 発火の計数。
+        "MIX_DEFERRED.with(|c| c.set(true));",
+        "MIX_NOWAIT_HITS.fetch_add(1, AO::Relaxed);",
+        // GDN: 空の cur で控えも無いときは落とす。
+        "で mix の控えも無い (DENNO_MIX_NOWAIT の前提が崩れた)",
+        // 早期の寸法検査は空の cur を許し、控えが無ければ poisoned で落とす
+        // (CPU 経路へ静かに落ちると空の入力で計算してしまう)。
+        "if (req.cur.len() != req.n_embd && !cur_empty)",
+        "if cur_empty && !gdn_x_in_mix_armed(req.n_embd) {",
+        "入力が空で mix の控えも無い → 要求を落とす",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+
+    // 2. 呼ぶのは ssm 層の attn mix だけ。defer の入口は 1 箇所 (定義 + 1 呼び出し)。
+    assert_eq!(
+        host.matches("hc_mix_quant_defer(").count(),
+        2,
+        "hc_mix_quant_defer の呼び出しが 1 箇所でない (ffn の mix に足していないか)"
+    );
+    for s in [
+        "pub(crate) fn hc_mix_quant_defer(",
+        "let mix_defer = crate::cuda::mix_nowait_on()",
+        "&& crate::cuda::gdn_x_mix_on()",
+        // task 468: ssm の前提 (scan / ba を GPU で) は層種別の腕の中へ移した。
+        "Ok(LayerKind::Ssm) => {",
+        "crate::cuda::gdn_gpu_scan_on() && crate::cuda::gdn_ba_gpu_on()",
+        "&& gdn_gpu_win::active()",
+        "&& hook.is_none()",
+        // task 468: full 層は attention の device 経路の判定を通す。
+        "Ok(LayerKind::FullAttn) => self.attn.takes_dev_input(il),",
+        "if mix_defer {\n                    hc_mix_quant_defer(",
+        // 鎖が defer したら空の Vec を返す (ホスト値は降りていない)。
+        "chain2_mixed = Some(if crate::cuda::mix_take_deferred() {",
+    ] {
+        assert!(host.contains(s), "qwen4exp.rs に {s} が無い");
+    }
+    // 既定経路 (ゲート off) は従来の `hc_mix_quant` のまま。
+    assert!(
+        host.contains("                } else {\n                    hc_mix_quant(\n                        res,"),
+        "off 側が従来の hc_mix_quant でない"
+    );
+
+    // 3. ssm: 空の入力を「控えがあるときだけ」許し、GPU 経路が decline したら落とす。
+    for s in [
+        "let deferred = cur.is_empty();",
+        "if deferred && !crate::cuda::gdn_x_in_mix_armed(self.p.n_embd) {",
+        "SsmLayer::forward_token: 入力が空で mix の控えも無い",
+        "SsmLayer::forward_token: defer したが入力をデバイスから読めなかった",
+        "SsmLayer::forward_token: 入力が空で ba をホスト計算できない",
+    ] {
+        assert!(ssm.contains(s), "qwen4exp_ssm.rs に {s} が無い");
+    }
+    // 空の入力は長さ検査を素通りするので、`!deferred` で従来の検査を残していること。
+    assert!(
+        ssm.contains("if !deferred && cur.len() != self.p.n_embd {"),
+        "従来の長さ検査が deferred で消えている"
+    );
+
+    // 4. 発火の証拠を serve_flash が出す。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::gpu_report::mix_nowait_line()"),
+        "serve_flash.rs が [mix-nowait] を出さない"
+    );
+    for s in [
+        "pub fn mix_nowait_line() -> Option<String> {",
+        "pub fn mix_nowait_reset() {",
+    ] {
+        let rep = std::fs::read_to_string(root.join("src/gpu_report.rs"))
+            .expect("gpu_report.rs が読めない");
+        assert!(rep.contains(s), "gpu_report.rs に {s} が無い");
+    }
+}
+
+/// task 468: full 層の attn mix も defer する (`DENNO_MIX_NOWAIT=full`) 配線。
+///
+/// 見るのは 5 点。(1) 門は既存の env の値で、新しい env 名を足していない。
+/// (2) `dec_full_dev` が入力の H2D を省ける (`x_dev`)。(3) full 層の defer は
+/// attention の device 経路の判定 (`takes_dev_input`) を通す。(4) 入力が空で
+/// 控えも無い/経路が走らないときは要求を落とす (黙って別経路で計算しない)。
+/// (5) 発火の証拠を serve_flash が出す。
+#[test]
+fn task468_full_mix_nowait_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let host = std::fs::read_to_string(root.join("src/model/qwen4exp.rs"))
+        .expect("qwen4exp.rs が読めない");
+    let attn = std::fs::read_to_string(root.join("src/model/qwen4exp_attn.rs"))
+        .expect("qwen4exp_attn.rs が読めない");
+    let ssm = std::fs::read_to_string(root.join("src/model/qwen4exp_ssm.rs"))
+        .expect("qwen4exp_ssm.rs が読めない");
+
+    // 1. cuda.rs: 門 (既存 env の値)・控えの取り出し・入力を上げない経路・証拠の行。
+    for s in [
+        "fn mix_nowait_full_from_value(v: Option<&str>) -> bool {",
+        "pub(crate) fn mix_nowait_full_on() -> bool {",
+        "pub(crate) fn full_x_in_mix_take(n: usize) -> Option<u64> {",
+        "pub fn mix_nowait_full_line() -> Option<String> {",
+        "fn mix_nowait_full_line_with(on: bool, layers: u64) -> Option<String> {",
+        "pub fn mix_nowait_full_reset() {",
+        // 入力はデバイスにある回は pinned へ写さず H2D も撃たない。
+        "let x_ptr = match a.x_dev {",
+        "note_full_x_dev_hit();",
+        "FULL_X_DEV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);",
+        // 事前検査 (ホストだけで判定できる範囲) と、形の検査は cur が空でも通す。
+        "pub(crate) fn mirror_ready(",
+        "q4_mirror_have(&m.state, layer, len, gen) + 1 == len",
+        "pub(crate) fn dev_input_ok(len: usize) -> bool {",
+        "&& len <= 65535",
+        "&& (self.x_dev.is_some() || self.cur.len() == self.qkv_k)",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+    assert!(
+        CUDA_RS.contains("\"full\"")
+            && CUDA_RS.contains("fn mix_nowait_full_from_value(v: Option<&str>) -> bool {"),
+        "full の門が既存 env の値でない"
+    );
+
+    // 2. 呼ぶのは run_layer の defer 判定 1 箇所。full 層は trait の判定を通す。
+    for s in [
+        "Ok(LayerKind::FullAttn) => self.attn.takes_dev_input(il),",
+        "fn takes_dev_input(&self, _layer: usize) -> bool {",
+    ] {
+        assert!(host.contains(s), "qwen4exp.rs に {s} が無い");
+    }
+    assert_eq!(
+        host.matches("hc_mix_quant_defer(").count(),
+        2,
+        "hc_mix_quant_defer の呼び出しが 1 箇所でない"
+    );
+
+    // 3. full attention 側: 空の入力を許し、デバイスから読み、駄目なら落とす。
+    for s in [
+        "fn takes_dev_input(&self, layer: usize) -> bool {",
+        "crate::cuda::dec_full_dev::dev_input_ok(len + 1)",
+        // 種の無いミラーでは device 経路が従来経路へ落ちるので defer しない。
+        "crate::cuda::dec_full_dev::mirror_ready(", 
+        "let x_dev = if cur.is_empty() {",
+        "match crate::cuda::full_x_in_mix_take(self.n_embd) {",
+        "入力が空で mix の控えも無い (DENNO_MIX_NOWAIT=full の前提が崩れた)",
+        "入力をデバイスから読む回で device 経路が走らなかった",
+        "if cur.len() != self.n_embd && !cur.is_empty() {",
+        // `FullAttn::forward` (anyhow 版) の入口の長さ検査も空を通す。
+        "if cur.len() != self.n_embd && !cur_dev {",
+        "FullAttn::forward: 入力が空の層で QSA は回せない",
+    ] {
+        assert!(attn.contains(s), "qwen4exp_attn.rs に {s} が無い");
+    }
+    // 空の入力を device 経路へ渡していること (`x_dev` を Call に詰める)。
+    assert!(
+        attn.contains("x_dev,") && attn.contains("cur,\n                        x_dev,"),
+        "Call に x_dev を渡していない"
+    );
+
+    // 4. ssm 側は従来どおり (ssm 層は full の判定を借りない)。
+    assert!(
+        ssm.contains("Some(None) => self.full.takes_dev_input(layer),"),
+        "SsmAttn が full 層の判定を委譲していない"
+    );
+    assert!(
+        ssm.contains("Some(Some(_)) => false,"),
+        "ssm 層が full の判定を借りている"
+    );
+
+    // 5. 発火の証拠 (1 リクエスト 1 行) を serve_flash が出す。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::gpu_report::mix_nowait_full_line()"),
+        "serve_flash.rs が [mix-nowait-full] を出さない"
+    );
+    let rep = std::fs::read_to_string(root.join("src/gpu_report.rs"))
+        .expect("gpu_report.rs が読めない");
+    for s in [
+        "pub fn mix_nowait_full_line() -> Option<String> {",
+        "pub fn mix_nowait_full_reset() {",
+    ] {
+        assert!(rep.contains(s), "gpu_report.rs に {s} が無い");
     }
 }

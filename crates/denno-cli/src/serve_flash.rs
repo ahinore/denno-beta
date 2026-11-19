@@ -776,6 +776,19 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     if let Some(line) = denno_engine::gpu_report::gdn_x_mix_line() {
         eprintln!("{line}");
     }
+    // task 464: mix の鎖の D2H と待ちを省いた (ssm 層) 数。控えを使った層数
+    // (`[gdn-x-mix]` と同じ数) も並べるので、`gdn_x_mix_reset` より**先**に出す。
+    // ゲート on で 1 層も通らなければ行は出ない (= 分岐が発火した証拠)。
+    if let Some(line) = denno_engine::gpu_report::mix_nowait_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::gpu_report::mix_nowait_reset();
+    // task 468: full 層の attn mix も defer した層数 (`DENNO_MIX_NOWAIT=full` の
+    // ときだけ 1 行 = 分岐が発火した証拠)。
+    if let Some(line) = denno_engine::gpu_report::mix_nowait_full_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::gpu_report::mix_nowait_full_reset();
     denno_engine::gpu_report::gdn_x_mix_reset();
     // task 368: decode の待ちを null ストリームのイベントへ狭めた回数
     // (`DENNO_DEC_SYNC_STREAM=1` のときだけ 1 行 = 分岐が発火した証拠)。

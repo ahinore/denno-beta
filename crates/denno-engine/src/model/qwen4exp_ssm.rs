@@ -223,12 +223,26 @@ impl SsmLayer {
 
     /// `cur: [n_embd]` → 出力 `[n_embd]`。state を 1 トークンぶん進める。
     pub fn forward_token(&mut self, cur: &[f32]) -> Result<Vec<f32>> {
-        if cur.len() != self.p.n_embd {
+        // task 464: `DENNO_MIX_NOWAIT` の defer 回は入力がデバイス側 (`dm`) にしか
+        // 無い。空の `cur` はその合図で、ここでは長さの検査だけ緩める。
+        let deferred = cur.is_empty();
+        if !deferred && cur.len() != self.p.n_embd {
             bail!(
                 "SsmLayer::forward_token: 入力長 {} が n_embd={} と違う",
                 cur.len(),
                 self.p.n_embd
             );
+        }
+        #[cfg(feature = "cuda")]
+        if deferred && !crate::cuda::gdn_x_in_mix_armed(self.p.n_embd) {
+            bail!(
+                "SsmLayer::forward_token: 入力が空で mix の控えも無い (層 {})",
+                self.il
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        if deferred {
+            bail!("SsmLayer::forward_token: 入力が空 (cuda feature 無しでは defer できない)");
         }
         let prof = crate::model::qwen4exp::q4prof::enabled();
 
@@ -243,6 +257,14 @@ impl SsmLayer {
             if let Some(out) = self.forward_token_gpu(cur, prof)? {
                 return Ok(out);
             }
+        }
+        // task 464: defer したのに GPU 経路が decline したら、ホストに入力が無い
+        // ので黙って 0 で計算しない (要求を落とす)。
+        if deferred {
+            bail!(
+                "SsmLayer::forward_token: defer したが入力をデバイスから読めなかった (層 {})",
+                self.il
+            );
         }
 
         // task 128: CPU 経路が state を読む前に、デバイスが正ならホストへ回復する
@@ -368,6 +390,14 @@ impl SsmLayer {
         } else {
             Vec::new()
         };
+        // task 464: defer された回は `cur` が空。ba をホストで計算するモデル
+        // (`ba_units` が空) は入力が要るので、0 バイトの GEMV を回す前に落とす。
+        if cur.is_empty() && ba_units.is_empty() {
+            bail!(
+                "SsmLayer::forward_token: 入力が空で ba をホスト計算できない (層 {})",
+                self.il
+            );
+        }
         if ba_units.is_empty() {
             self.beta_alpha.gemv_concat_into("ssm_beta", cur, &mut ba)?;
         }
@@ -1475,6 +1505,16 @@ impl LayerAttn for SsmAttn {
                 // anyhow の文脈を 1 行に畳む (`{:#}` は "外側: 内側" を連結する)
                 .map_err(|e| Qwen4ExpError(vec![format!("層 {layer}: {e:#}")])),
             Some(None) => self.full.forward(layer, cur),
+        }
+    }
+
+    /// task 468: full 層だけ委譲先 (`FullAttn`) の判定を使う。ssm 層は GDN 側の
+    /// 判定 (`run_layer` が見る) なので、ここでは常に `false`。
+    fn takes_dev_input(&self, layer: usize) -> bool {
+        match self.layers.get(layer) {
+            Some(Some(_)) => false,
+            Some(None) => self.full.takes_dev_input(layer),
+            None => false,
         }
     }
 
