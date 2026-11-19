@@ -5389,6 +5389,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             }
             let t_lay = prekprof::stamp();
             // ---- 1. 全チャンクの mix / attn / ssm ----
+            // task 461: 直前のチャンクの PLE をデバイスで回したか (履歴の上げ直しと
+            // 同期の回数を減らすため。層ごとにリセットする)。
+            let mut ple_dev_chain = false;
             for (ci, &(start, end)) in ranges.iter().enumerate() {
                 let nt = end - start;
                 // task 419: 1 回転のうち名前付き区間に入らない時間を測る (診断)。
@@ -5445,7 +5448,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                             for t in 0..nt {
                                 flat.extend_from_slice(ples[t].as_deref().expect("rows_ok"));
                             }
-                            let want = roles.is_some();
+                            // 寄与 RMS (役割テレメトリ) は層の最後のチャンクの値だけが
+                            // 残る (`r.ple` はチャンクごとに上書き) ので、そこでだけ取る。
+                            let last_chunk = ci + 1 == ranges.len();
+                            let want = roles.is_some() && last_chunk;
                             let hist = self.ple_conv_state[il]
                                 .as_mut()
                                 .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
@@ -5462,6 +5468,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                                 wt: &pw.conv1d_t[..],
                                 hist_host: hist.as_mut_slice(),
                                 hist_len,
+                                upload_hist: !ple_dev_chain,
+                                flush_hist: last_chunk,
                                 kern,
                                 dil,
                                 li: il,
@@ -5476,6 +5484,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                                         }
                                     }
                                     ple_dev_done = true;
+                                    ple_dev_chain = true;
                                 }
                                 Ok(None) => {}
                                 Err(e) => {

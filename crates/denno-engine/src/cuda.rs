@@ -30425,6 +30425,14 @@ pub struct PfPleDevArgs<'a> {
     /// 履歴 (`[hist][hc][e]`)。入力でもあり、更新後の値も返す。
     pub hist_host: &'a mut [f32],
     pub hist_len: usize,
+    /// ホストの履歴をデバイスへ上げるか。層の最初のチャンク (または直前の
+    /// チャンクがホスト経路だったとき) だけ true。上げ直さないと、デバイス側の
+    /// 履歴が正本のまま層を進める (同期と D2H を 1 層 1 回に減らすため)。
+    pub upload_hist: bool,
+    /// 履歴をホストへ戻すか。層の**最後のチャンク**だけ true。
+    /// D2H は同期を伴うので、途中のチャンクでは払わない (lab t461c で
+    /// 14k の `experts` が +89 ms 悪化した原因がこの同期だった)。
+    pub flush_hist: bool,
     pub kern: usize,
     pub dil: usize,
     /// 層番号 (履歴の置き場の鍵)。
@@ -30523,7 +30531,7 @@ pub fn pf_ple_dev_run(a: PfPleDevArgs<'_>) -> Result<Option<PfPleDevOut>, String
         wgq.copy_from(a.gq).map_err(|e| format!("gq H2D: {e:#}"))?;
         wgc.copy_from(a.gc).map_err(|e| format!("gc H2D: {e:#}"))?;
         wwt.copy_from(a.wt).map_err(|e| format!("wt H2D: {e:#}"))?;
-        if a.hist_len > 0 {
+        if a.hist_len > 0 && a.upload_hist {
             hist.copy_from(&a.hist_host[..])
                 .map_err(|e| format!("hist H2D: {e:#}"))?;
         }
@@ -30612,9 +30620,13 @@ pub fn pf_ple_dev_run(a: PfPleDevArgs<'_>) -> Result<Option<PfPleDevOut>, String
             )
             .map_err(|e| format!("dno_pf_ple_conv の起動: {e:#}"))?;
         }
-        // 履歴と寄与 (少量) を戻す。1 同期で両方待つ。
-        ctx.sync().map_err(|e| format!("PLE の同期: {e:#}"))?;
-        if a.hist_len > 0 {
+        // 履歴と寄与 (少量) を戻す。**どちらも要らないチャンクでは同期しない**
+        // (同期は expert の上げストリームまで待つので、層ごとに払うと高い)。
+        let need_hist = a.hist_len > 0 && a.flush_hist;
+        if need_hist || a.want {
+            ctx.sync().map_err(|e| format!("PLE の同期: {e:#}"))?;
+        }
+        if need_hist {
             hist.to_slice(&mut a.hist_host[..])
                 .map_err(|e| format!("hist D2H: {e:#}"))?;
         }
