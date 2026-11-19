@@ -5421,7 +5421,74 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         prekprof::mark(t_ple, prekprof::PLE);
                         ples_all.push(chunk_rows);
                     }
-                    // task 300: `DENNO_PF_PLE_REUSE` では res の往復バッファを使い回す。
+                    // task 461: PLE の注入をデバイスで閉じる (`DENNO_PF_PLE_DEV`)。
+                    //
+                    // 従来は res を D2H → ホストでトークンループ → H2D していた
+                    // (14k で 1 層チャンクあたり res 82 MB x 2 + key/value の D2H)。
+                    // res / key / value は元からデバイスにあるので、2 本の要素
+                    // カーネル (gate / conv+silu) で閉じる。形が外れたら従来経路。
+                    let mut ple_dev_done = false;
+                    if crate::cuda::pf_ple_dev_on() {
+                        let ples = &ples_all[ci];
+                        let kern = pw.kern;
+                        let dil = self.p.ple_ngram_size;
+                        let hist_len = kern.saturating_sub(1) * dil;
+                        let rows_ok = ples.len() >= nt
+                            && (0..nt).all(|t| {
+                                ples[t]
+                                    .as_deref()
+                                    .map(|r| r.len() == e)
+                                    .unwrap_or(false)
+                            });
+                        if rows_ok && crate::cuda::pf_ple_dev_ok(nt, hc, e, kern, dil, hist_len) {
+                            let mut flat = Vec::with_capacity(nt * e);
+                            for t in 0..nt {
+                                flat.extend_from_slice(ples[t].as_deref().expect("rows_ok"));
+                            }
+                            let want = roles.is_some();
+                            let hist = self.ple_conv_state[il]
+                                .as_mut()
+                                .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
+                            let args = crate::cuda::PfPleDevArgs {
+                                flat: &flat,
+                                nt,
+                                hc,
+                                e,
+                                key: Self::pf_lin(&pw.key),
+                                value: Self::pf_lin(&pw.value),
+                                gk: &pw.norm_key[..],
+                                gq: &pw.norm_query[..],
+                                gc: &pw.norm_conv[..],
+                                wt: &pw.conv1d_t[..],
+                                hist_host: hist.as_mut_slice(),
+                                hist_len,
+                                kern,
+                                dil,
+                                li: il,
+                                eps: hp.eps,
+                                want,
+                            };
+                            match crate::cuda::pf_ple_dev_run(args) {
+                                Ok(Some(out)) => {
+                                    if want {
+                                        if let Some(r) = roles.as_deref_mut() {
+                                            r.ple = out.contrib_rms;
+                                        }
+                                    }
+                                    ple_dev_done = true;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    return Err(one(format!(
+                                        "層 {il}: PLE のデバイス経路: {e}"
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    if ple_dev_done {
+                        // res はデバイスで更新済み (ホストの控えは触らない)。
+                    } else {
                     let (mut back, back_reused) = pf_ple_back_take(nt * hc_dim);
                     if !crate::cuda::pf_download_res(&mut back) {
                         Self::pf_bail("PLE 層の res の D2H に失敗")?;
@@ -5494,6 +5561,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     }
                     // task 300: 往復バッファを返す。
                     pf_ple_back_return(back, back_reused);
+                    }
                 }
                 // 1.2 attention 入口 (デバイス mix) → attn → combine
                 let t_mix = std::time::Instant::now();
@@ -8902,7 +8970,7 @@ fn ple_conv_silu(
 /// 演算は同じ (k 昇順に `out[c] += wt * src`、最後に silu) なので [`ple_conv_silu`]
 /// とビット一致する。重みの並びだけが違うので、内側のループが連続読みになり
 /// ベクトル化できる (実測 27 us/トークン → 数 us)。
-fn ple_conv_silu_t(
+pub(crate) fn ple_conv_silu_t(
     out: &mut [f32],
     x: &[f32],
     hist_buf: &[f32],
@@ -8959,7 +9027,7 @@ fn ple_hist_push_shift(hist_buf: &mut [f32], x: &[f32], hc_dim: usize) {
 /// 1 トークンあたり hc_dim 個のコピーだけで済む (線形版は hist*hc_dim 個ずつ
 /// ずらす)。チャンクの終端で [`ple_hist_to_linear`] により線形へ戻すので、
 /// 経路をまたいでも履歴の意味は変わらない。
-fn ple_hist_push_ring(hist_buf: &mut [f32], head: &mut usize, x: &[f32], hc_dim: usize) {
+pub(crate) fn ple_hist_push_ring(hist_buf: &mut [f32], head: &mut usize, x: &[f32], hc_dim: usize) {
     let hist = hist_buf.len() / hc_dim;
     if hist == 0 {
         return;
