@@ -30353,6 +30353,59 @@ fn f32_gemm_dev_out(
     }
 }
 
+/// PLE の射影 (key / value) を**デバイスの出力域へ**回す。
+///
+/// 量子型 (Q8_0 / Q5_1 / Q4_K / Q5_K) は従来のホスト経路 (`pf_ple_proj`) と
+/// **同じ** `pf2_gemm` を、出力だけデバイスにして撃つ (D2H をしない)。
+/// F32 / BF16 / F16 は [`f32_gemm_dev_out`]。
+fn pf_ple_proj_dev_out(
+    ctx: &CudaCtx,
+    key: PfLin<'_>,
+    value: PfLin<'_>,
+    dev_x: CUdeviceptr,
+    nt: usize,
+    e: usize,
+    dev_k: CUdeviceptr,
+    dev_v: CUdeviceptr,
+) -> bool {
+    use crate::kquant::GgmlType as T;
+    let quant = |t: T| matches!(t, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K);
+    if quant(key.ty) && quant(value.ty) {
+        let (Some((pk, pk_k)), Some((pv, pv_k))) =
+            (pf_weight(key, false), pf_weight(value, false))
+        else {
+            return false;
+        };
+        return pf2_gemm(ctx, pk, pk_k, dev_x, dev_k, nt, e, key.n).is_ok()
+            && pf2_gemm(ctx, pv, pv_k, dev_x, dev_v, nt, e, value.n).is_ok();
+    }
+    f32_gemm_dev_out(
+        key.uid,
+        key.blocks,
+        key.k,
+        key.n,
+        dev_x,
+        nt,
+        dev_k,
+        key.ty,
+    ) && f32_gemm_dev_out(
+        value.uid,
+        value.blocks,
+        value.k,
+        value.n,
+        dev_x,
+        nt,
+        dev_v,
+        value.ty,
+    )
+}
+
+/// 失敗の理由を 1 回だけ出す (lab のログで原因を 1 行で分けるため)。
+fn pf_ple_warn(why: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| eprintln!("[pf-ple] {why} → 従来のホスト経路へ"));
+}
+
 /// デバイス経路 1 回ぶんの入力。
 pub struct PfPleDevArgs<'a> {
     /// PLE の行を詰めた `[nt][e]` (gather 済み)。
@@ -30475,29 +30528,16 @@ pub fn pf_ple_dev_run(a: PfPleDevArgs<'_>) -> Result<Option<PfPleDevOut>, String
                 .map_err(|e| format!("hist H2D: {e:#}"))?;
         }
         // 射影 2 本 (デバイス出力。D2H をしない)。
-        if !f32_gemm_dev_out(
-            a.key.uid,
-            a.key.blocks,
-            a.key.k,
-            a.key.n,
-            flat.ptr(),
-            nt,
-            keyv.ptr(),
-            a.key.ty,
+        //
+        // 既定モデルの ple_key / ple_value は **Q8_0** (目録も Q8_0) で、
+        // 従来のホスト経路は `pf_ple_proj` の量子 GEMM (`pf2_gemm`) で回す。
+        // ここも**同じカーネル**を出力だけデバイスにして撃つ (値は同一)。
+        // F32 / BF16 / F16 の目録のときは f32 GEMM のデバイス出力版。
+        if !pf_ple_proj_dev_out(
+            ctx, a.key, a.value, flat.ptr(), nt, e, keyv.ptr(), valv.ptr(),
         ) {
-            return Err("PLE key の射影 (デバイス出力) に失敗".to_string());
-        }
-        if !f32_gemm_dev_out(
-            a.value.uid,
-            a.value.blocks,
-            a.value.k,
-            a.value.n,
-            flat.ptr(),
-            nt,
-            valv.ptr(),
-            a.value.ty,
-        ) {
-            return Err("PLE value の射影 (デバイス出力) に失敗".to_string());
+            pf_ple_warn("射影 (デバイス出力) に失敗");
+            return Err("PLE の射影 (デバイス出力) に失敗".to_string());
         }
         // gate / invc
         let mut p_key = keyv.ptr();
