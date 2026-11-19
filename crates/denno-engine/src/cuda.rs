@@ -29463,6 +29463,20 @@ pub fn pf_lm_release() {
     });
 }
 
+/// task 461: 残差のデバイス域 (`pf_upload_res` が使う `PF_DEV.res`) の先頭。
+///
+/// PLE のデバイス経路 (`pf_ple_dev_run`) が、ホストへ落とさずにその場で
+/// 加算するために読む。無ければ 0 (= 従来経路へ)。
+pub(crate) fn pf_res_dev_ptr() -> CUdeviceptr {
+    PF_DEV.with(|cell| -> CUdeviceptr {
+        let d = cell.borrow();
+        match d.res.as_ref() {
+            Some(b) => b.ptr(),
+            None => 0,
+        }
+    })
+}
+
 /// task 154: チャンクの残差 (`[nt][hc][e]`) をデバイスへ置く。
 pub fn pf_upload_res(res: &[f32]) -> bool {
     // task 318: `other` の中の残差の往復を分けて数える (バイト数も付く)。
@@ -30105,6 +30119,587 @@ mod pf_elem_tests {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// task 461: prefill の PLE 注入をデバイスで閉じる (`DENNO_PF_PLE_DEV`)
+// ---------------------------------------------------------------------------
+//
+// 動機は `kernels_pf_ple.cu` の先頭。lab t457c の `[q4ledger-pf]` (既定モデル、
+// depth8k、PROFILE=1) では PLE 層 (48 層中 2 層) が 1 チャンク層あたり
+// res 82 MB を D2H → ホストのトークンループ → 82 MB を H2D し、14k cold で
+// `sub other` の `ple` 212.9 ms + `res_up` 245.8 ms = prefill の 8% だった。
+// res / key / value はどれも元から VRAM にあるので、往復をやめて 2 本の
+// 要素カーネルで閉じる (gate: 1 ブロック = 1 トークン / conv: 1 ブロック = 列タイル)。
+//
+// 既定 **off**。PTX が読めない / entry が無い / 引数の数が違う / 形が門番の外、
+// のどれでも `Ok(None)` を返し、呼び出し側は従来のホスト経路をそのまま回す
+// (res は 1 バイトも触らない)。**起動を始めた後**の失敗は `Err` にする
+// (res を書き換えたかもしれないので黙って落とさない)。
+
+/// `DENNO_PF_PLE_DEV` の env 名。
+pub const PF_PLE_DEV_ENV: &str = "DENNO_PF_PLE_DEV";
+/// `DENNO_PF_PLE_PTX` (PTX の置き場所。未設定はクレートの `kernels/`)。
+pub const PF_PLE_PTX_ENV: &str = "DENNO_PF_PLE_PTX";
+
+/// gate カーネルの引数の数 (カーネルと一致しない PTX は読まない)。
+pub(crate) const PF_PLE_GATE_NARGS: usize = 11;
+/// conv カーネルの引数の数。
+pub(crate) const PF_PLE_CONV_NARGS: usize = 18;
+/// 1 ブロックのスレッド数 (カーネルの `PLE_THREADS`)。
+pub(crate) const PF_PLE_THREADS: usize = 256;
+/// hc の上限 (カーネルの `PLE_MAX_HC`)。
+pub(crate) const PF_PLE_MAX_HC: usize = 8;
+/// e の上限 (カーネルの `PLE_MAX_E`)。
+pub(crate) const PF_PLE_MAX_E: usize = 8192;
+/// conv のカーネル幅の上限 (カーネルの `PLE_MAX_KERN`)。
+pub(crate) const PF_PLE_MAX_KERN: usize = 8;
+/// 履歴の長さの上限 (カーネルの `PLE_MAX_HIST`)。
+pub(crate) const PF_PLE_MAX_HIST: usize = 32;
+/// これ未満のトークン数は従来経路 (起動と往復の固定費が勝つ)。
+pub(crate) const PF_PLE_DEV_MIN_TOK: usize = 64;
+
+/// `DENNO_PF_PLE_DEV` の解釈。**明示的な偽値だけ off** = 既定 on。
+///
+/// lab t461d で採った: 3,826 cold prefill が base2 2,211 / 2,216 ms に対し
+/// **2,143 / 2,106 ms (-3.2% / -4.7%、2 ラウンドとも)**、`other` 段は
+/// 190.5 -> 85.3 ms。14k は ±1% (other -83 / experts +87 で相殺)、decode は不変。
+pub(crate) fn pf_ple_dev_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | ""
+        ),
+    }
+}
+
+/// デバイス経路を使うか (プロセスで 1 回だけ env を読む。既定 on。
+/// 切り戻しは `DENNO_PF_PLE_DEV=0`)。
+pub(crate) fn pf_ple_dev_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_ple_dev_from_value(std::env::var(PF_PLE_DEV_ENV).ok().as_deref()))
+}
+
+/// 形の門番 (純関数)。**res を触る前に**全部見る。
+///
+/// 実形は nt=1,913/2,002、hc=4、e=2,560、kern=2..4、hist=2..8。
+pub(crate) fn pf_ple_dev_ok(
+    nt: usize,
+    hc: usize,
+    e: usize,
+    kern: usize,
+    dil: usize,
+    hist: usize,
+) -> bool {
+    nt >= PF_PLE_DEV_MIN_TOK
+        && hc >= 1
+        && hc <= PF_PLE_MAX_HC
+        && e > 0
+        && e <= PF_PLE_MAX_E
+        && kern >= 1
+        && kern <= PF_PLE_MAX_KERN
+        && dil >= 1
+        && hist == (kern - 1) * dil
+        && hist <= PF_PLE_MAX_HIST
+}
+
+struct PfPleKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    gate: CUfunction,
+    conv: CUfunction,
+}
+
+// 生ハンドル (PfElemKernels と同じ規約)。
+unsafe impl Send for PfPleKernels {}
+unsafe impl Sync for PfPleKernels {}
+
+/// PTX の置き場所。`DENNO_PF_PLE_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_pf_ple.ptx`。
+fn pf_ple_ptx_path() -> std::path::PathBuf {
+    match std::env::var(PF_PLE_PTX_ENV) {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_pf_ple.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+fn pf_ple_kernels() -> Option<&'static PfPleKernels> {
+    static K: OnceLock<Option<PfPleKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = pf_ple_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    "[pf-ple] PTX が読めない ({}) : {e} → 従来のホスト経路へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        // 引数の数はモジュールを載せる前に見る (ABI の取り違えを先に落とす)。
+        {
+            let text = String::from_utf8_lossy(&image).to_string();
+            for (name, want) in [
+                ("dno_pf_ple_gate", PF_PLE_GATE_NARGS),
+                ("dno_pf_ple_conv", PF_PLE_CONV_NARGS),
+            ] {
+                match ptx_entry_params(&text, name) {
+                    Some(n) if n == want => {}
+                    other => {
+                        tracing::info!(
+                            "[pf-ple] {name} の引数が {other:?} (期待 {want}) → 従来のホスト経路へ"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                tracing::info!("[pf-ple] cuModuleLoadData 失敗 → 従来のホスト経路へ");
+                return None;
+            }
+            let mut fns: [CUfunction; 2] = [std::ptr::null_mut(); 2];
+            let names: [&[u8]; 2] = [b"dno_pf_ple_gate\0", b"dno_pf_ple_conv\0"];
+            for (i, name) in names.iter().enumerate() {
+                if (lib.module_get_function)(&mut fns[i], module, name.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    tracing::info!(
+                        "[pf-ple] PTX に {} が無い → 従来のホスト経路へ",
+                        String::from_utf8_lossy(&name[..name.len() - 1])
+                    );
+                    return None;
+                }
+            }
+            log_kernel_attr(lib, fns[0], "dno_pf_ple_gate");
+            log_kernel_attr(lib, fns[1], "dno_pf_ple_conv");
+            Some(PfPleKernels {
+                module,
+                gate: fns[0],
+                conv: fns[1],
+            })
+        }
+    })
+    .as_ref()
+}
+
+/// デバイス経路の作業域 (grow-only)。スレッド局所。
+struct PfPleDev {
+    flat: Option<DevBuffer>,  // [nt][e]
+    key: Option<DevBuffer>,   // [nt][hc*e]
+    value: Option<DevBuffer>, // [nt][e]
+    gate: Option<DevBuffer>,  // [nt][hc]
+    invc: Option<DevBuffer>,  // [nt][hc]
+    part: Option<DevBuffer>,  // [hc][ntiles]
+    wgk: Option<DevBuffer>,   // [hc][e]
+    wgq: Option<DevBuffer>,   // [hc][e]
+    wgc: Option<DevBuffer>,   // [hc][e]
+    wwt: Option<DevBuffer>,   // [kern][hc][e]
+    hist: Vec<Option<DevBuffer>>, // 層ごとの [hist][hc][e]
+    /// 発火の証拠を 1 形につき 1 回だけ出すための記録。
+    noted: Vec<(usize, usize, usize)>,
+}
+
+thread_local! {
+    static PLE_DEV: std::cell::RefCell<PfPleDev> = const { std::cell::RefCell::new(PfPleDev {
+        flat: None,
+        key: None,
+        value: None,
+        gate: None,
+        invc: None,
+        part: None,
+        wgk: None,
+        wgq: None,
+        wgc: None,
+        wwt: None,
+        hist: Vec::new(),
+        noted: Vec::new(),
+    }) };
+}
+
+/// 発火の証拠 (`[pf-ple] dev ...` を 1 形につき 1 回)。
+fn pf_ple_note(nt: usize, hc: usize, e: usize, kern: usize, hist: usize) {
+    let fresh = PLE_DEV.with(|c| {
+        let mut d = c.borrow_mut();
+        let key = (nt, hc, e);
+        if d.noted.contains(&key) {
+            false
+        } else {
+            d.noted.push(key);
+            true
+        }
+    });
+    if fresh {
+        eprintln!(
+            "[pf-ple] dev nt={nt} hc={hc} e={e} kern={kern} hist={hist} \
+             gate=dno_pf_ple_gate conv=dno_pf_ple_conv"
+        );
+    }
+}
+
+/// `out = x @ W^T` (f32 重み) を**デバイスの出力域へ**書く (同期しない)。
+///
+/// [`maybe_gpu_f32_gemm_batch_into`] と同じカーネル・同じタイル
+/// (`GEMM_MT_ROWS` x `GEMM_MT_TOKS`) で、D2H だけをしない版。
+fn f32_gemm_dev_out(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    dev_x: CUdeviceptr,
+    nt: usize,
+    dev_out: CUdeviceptr,
+    src_ty: crate::kquant::GgmlType,
+) -> bool {
+    if dev_x == 0 || dev_out == 0 || k == 0 || n == 0 || nt < 2 {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return false;
+    }
+    let Some(f) = gemm_f32_mt_fn(ctx) else {
+        return false;
+    };
+    let w = match weights_for_gemm_f32(uid, bytes, k, n, src_ty) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    let wp = w.buf.ptr();
+    unsafe {
+        let (mut pw, mut px, mut po) = (wp, dev_x, dev_out);
+        let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k as c_int, n as c_int);
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut nt_c as *mut _ as *mut c_void,
+            &mut k_c as *mut _ as *mut c_void,
+            &mut n_c as *mut _ as *mut c_void,
+        ];
+        let grid = (
+            n.div_ceil(GEMM_MT_ROWS) as u32,
+            nt.div_ceil(GEMM_MT_TOKS) as u32,
+            1,
+        );
+        ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)
+            .is_ok()
+    }
+}
+
+/// PLE の射影 (key / value) を**デバイスの出力域へ**回す。
+///
+/// 量子型 (Q8_0 / Q5_1 / Q4_K / Q5_K) は従来のホスト経路 (`pf_ple_proj`) と
+/// **同じ** `pf2_gemm` を、出力だけデバイスにして撃つ (D2H をしない)。
+/// F32 / BF16 / F16 は [`f32_gemm_dev_out`]。
+fn pf_ple_proj_dev_out(
+    ctx: &CudaCtx,
+    key: PfLin<'_>,
+    value: PfLin<'_>,
+    dev_x: CUdeviceptr,
+    nt: usize,
+    e: usize,
+    dev_k: CUdeviceptr,
+    dev_v: CUdeviceptr,
+) -> bool {
+    use crate::kquant::GgmlType as T;
+    let quant = |t: T| matches!(t, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K);
+    if quant(key.ty) && quant(value.ty) {
+        let (Some((pk, pk_k)), Some((pv, pv_k))) =
+            (pf_weight(key, false), pf_weight(value, false))
+        else {
+            return false;
+        };
+        return pf2_gemm(ctx, pk, pk_k, dev_x, dev_k, nt, e, key.n).is_ok()
+            && pf2_gemm(ctx, pv, pv_k, dev_x, dev_v, nt, e, value.n).is_ok();
+    }
+    f32_gemm_dev_out(
+        key.uid,
+        key.blocks,
+        key.k,
+        key.n,
+        dev_x,
+        nt,
+        dev_k,
+        key.ty,
+    ) && f32_gemm_dev_out(
+        value.uid,
+        value.blocks,
+        value.k,
+        value.n,
+        dev_x,
+        nt,
+        dev_v,
+        value.ty,
+    )
+}
+
+/// 失敗の理由を 1 回だけ出す (lab のログで原因を 1 行で分けるため)。
+fn pf_ple_warn(why: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| eprintln!("[pf-ple] {why} → 従来のホスト経路へ"));
+}
+
+/// デバイス経路 1 回ぶんの入力。
+pub struct PfPleDevArgs<'a> {
+    /// PLE の行を詰めた `[nt][e]` (gather 済み)。
+    pub flat: &'a [f32],
+    pub nt: usize,
+    pub hc: usize,
+    pub e: usize,
+    /// key / value の射影の重み。
+    pub key: PfLin<'a>,
+    pub value: PfLin<'a>,
+    /// grouped RMS の重み (`[hc][e]`)。
+    pub gk: &'a [f32],
+    pub gq: &'a [f32],
+    pub gc: &'a [f32],
+    /// conv の重み (`[kern][hc][e]`、`conv1d_t` の並び)。
+    pub wt: &'a [f32],
+    /// 履歴 (`[hist][hc][e]`)。入力でもあり、更新後の値も返す。
+    pub hist_host: &'a mut [f32],
+    pub hist_len: usize,
+    /// ホストの履歴をデバイスへ上げるか。層の最初のチャンク (または直前の
+    /// チャンクがホスト経路だったとき) だけ true。上げ直さないと、デバイス側の
+    /// 履歴が正本のまま層を進める (同期と D2H を 1 層 1 回に減らすため)。
+    pub upload_hist: bool,
+    /// 履歴をホストへ戻すか。層の**最後のチャンク**だけ true。
+    /// D2H は同期を伴うので、途中のチャンクでは払わない (lab t461c で
+    /// 14k の `experts` が +89 ms 悪化した原因がこの同期だった)。
+    pub flush_hist: bool,
+    pub kern: usize,
+    pub dil: usize,
+    /// 層番号 (履歴の置き場の鍵)。
+    pub li: usize,
+    pub eps: f32,
+    /// 最終トークンの寄与 RMS が要るか (役割テレメトリ)。
+    pub want: bool,
+}
+
+/// デバイス経路の結果。
+pub struct PfPleDevOut {
+    /// `want` のときの (gated + conv) の RMS。
+    pub contrib_rms: f32,
+}
+
+/// PLE の注入 1 回 (gate → conv+silu → res 加算 → 履歴の更新) をデバイスで回す。
+///
+/// `Ok(None)` = 何もせず従来経路へ / `Ok(Some(_))` = 完了 /
+/// `Err` = 起動を始めた後に失敗 (res を書き換えたかもしれない)。
+pub fn pf_ple_dev_run(a: PfPleDevArgs<'_>) -> Result<Option<PfPleDevOut>, String> {
+    let (nt, hc, e) = (a.nt, a.hc, a.e);
+    if !pf_ple_dev_ok(nt, hc, e, a.kern, a.dil, a.hist_len) {
+        return Ok(None);
+    }
+    let hc_dim = hc * e;
+    if a.flat.len() != nt * e
+        || a.gk.len() != hc_dim
+        || a.gq.len() != hc_dim
+        || a.gc.len() != hc_dim
+        || a.wt.len() != a.kern * hc_dim
+        || a.hist_host.len() != a.hist_len * hc_dim
+        || a.key.k != e
+        || a.key.n != hc_dim
+        || a.value.k != e
+        || a.value.n != e
+    {
+        return Ok(None);
+    }
+    let Some(k) = pf_ple_kernels() else {
+        return Ok(None);
+    };
+    let Some(ctx) = shared_ctx() else {
+        return Ok(None);
+    };
+    if ctx.make_current().is_err() {
+        return Ok(None);
+    }
+    // 残差のデバイス域 (pf_mix / pf_upload_res と同じもの) が無ければ従来経路。
+    let res_ptr = pf_res_dev_ptr();
+    if res_ptr == 0 {
+        return Ok(None);
+    }
+    // ここから先は「始めたら最後まで」。失敗は Err。
+    let ntiles = e.div_ceil(PF_PLE_THREADS);
+    let mut parts = vec![0.0f32; hc * ntiles];
+    let r = PLE_DEV.with(|cell| -> Result<Option<PfPleDevOut>, String> {
+        let mut d = cell.borrow_mut();
+        let mut ensure = |cap: &mut Option<DevBuffer>, bytes: usize| -> Result<(), String> {
+            Scratch::ensure(cap, bytes).map_err(|e| format!("PLE 作業域の確保: {e:#}"))
+        };
+        ensure(&mut d.flat, nt * e * 4)?;
+        ensure(&mut d.key, nt * hc_dim * 4)?;
+        ensure(&mut d.value, nt * e * 4)?;
+        ensure(&mut d.gate, nt * hc * 4)?;
+        ensure(&mut d.invc, nt * hc * 4)?;
+        ensure(&mut d.part, hc * ntiles * 4)?;
+        ensure(&mut d.wgk, hc_dim * 4)?;
+        ensure(&mut d.wgq, hc_dim * 4)?;
+        ensure(&mut d.wgc, hc_dim * 4)?;
+        ensure(&mut d.wwt, a.kern * hc_dim * 4)?;
+        if d.hist.len() <= a.li {
+            d.hist.resize_with(a.li + 1, || None);
+        }
+        ensure(&mut d.hist[a.li], a.hist_len.max(1) * hc_dim * 4)?;
+        let (flat, keyv, valv) = (
+            d.flat.as_ref().expect("ensure 済み"),
+            d.key.as_ref().expect("ensure 済み"),
+            d.value.as_ref().expect("ensure 済み"),
+        );
+        let (gate, invc, part) = (
+            d.gate.as_ref().expect("ensure 済み"),
+            d.invc.as_ref().expect("ensure 済み"),
+            d.part.as_ref().expect("ensure 済み"),
+        );
+        let (wgk, wgq, wgc, wwt) = (
+            d.wgk.as_ref().expect("ensure 済み"),
+            d.wgq.as_ref().expect("ensure 済み"),
+            d.wgc.as_ref().expect("ensure 済み"),
+            d.wwt.as_ref().expect("ensure 済み"),
+        );
+        let hist = d.hist[a.li].as_ref().expect("ensure 済み");
+        // 入力の H2D (flat / 重み / 履歴)。ここまで落ちたら何も走っていない。
+        flat.copy_from(a.flat)
+            .map_err(|e| format!("flat H2D: {e:#}"))?;
+        wgk.copy_from(a.gk).map_err(|e| format!("gk H2D: {e:#}"))?;
+        wgq.copy_from(a.gq).map_err(|e| format!("gq H2D: {e:#}"))?;
+        wgc.copy_from(a.gc).map_err(|e| format!("gc H2D: {e:#}"))?;
+        wwt.copy_from(a.wt).map_err(|e| format!("wt H2D: {e:#}"))?;
+        if a.hist_len > 0 && a.upload_hist {
+            hist.copy_from(&a.hist_host[..])
+                .map_err(|e| format!("hist H2D: {e:#}"))?;
+        }
+        // 射影 2 本 (デバイス出力。D2H をしない)。
+        //
+        // 既定モデルの ple_key / ple_value は **Q8_0** (目録も Q8_0) で、
+        // 従来のホスト経路は `pf_ple_proj` の量子 GEMM (`pf2_gemm`) で回す。
+        // ここも**同じカーネル**を出力だけデバイスにして撃つ (値は同一)。
+        // F32 / BF16 / F16 の目録のときは f32 GEMM のデバイス出力版。
+        if !pf_ple_proj_dev_out(
+            ctx, a.key, a.value, flat.ptr(), nt, e, keyv.ptr(), valv.ptr(),
+        ) {
+            pf_ple_warn("射影 (デバイス出力) に失敗");
+            return Err("PLE の射影 (デバイス出力) に失敗".to_string());
+        }
+        // gate / invc
+        let mut p_key = keyv.ptr();
+        let mut p_res = res_ptr;
+        let mut p_val = valv.ptr();
+        let mut p_gk = wgk.ptr();
+        let mut p_gq = wgq.ptr();
+        let mut p_gate = gate.ptr();
+        let mut p_invc = invc.ptr();
+        let (mut e_c, mut hc_c) = (e as c_int, hc as c_int);
+        let mut eps_c = a.eps;
+        let mut invs_c = 1.0f32 / (e as f32).sqrt();
+        let mut args = [
+            &mut p_key as *mut _ as *mut c_void,
+            &mut p_res as *mut _ as *mut c_void,
+            &mut p_val as *mut _ as *mut c_void,
+            &mut p_gk as *mut _ as *mut c_void,
+            &mut p_gq as *mut _ as *mut c_void,
+            &mut p_gate as *mut _ as *mut c_void,
+            &mut p_invc as *mut _ as *mut c_void,
+            &mut e_c as *mut _ as *mut c_void,
+            &mut hc_c as *mut _ as *mut c_void,
+            &mut eps_c as *mut _ as *mut c_void,
+            &mut invs_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(
+                k.gate,
+                (nt as u32, 1, 1),
+                (PF_PLE_THREADS as u32, 1, 1),
+                0,
+                &mut args,
+            )
+            .map_err(|e| format!("dno_pf_ple_gate の起動: {e:#}"))?;
+        }
+        // conv + silu + res 加算
+        let mut p_gc = wgc.ptr();
+        let mut p_wwt = wwt.ptr();
+        let mut p_hist_in = hist.ptr();
+        let mut p_hist_out = hist.ptr();
+        let mut p_part = part.ptr();
+        let (mut nt_c, mut kern_c, mut dil_c) = (nt as c_int, a.kern as c_int, a.dil as c_int);
+        let (mut hist_c, mut head_c) = (a.hist_len as c_int, 0 as c_int);
+        let (mut want_c, mut ntiles_c) = (a.want as c_int, ntiles as c_int);
+        let mut args2 = [
+            &mut p_val as *mut _ as *mut c_void,
+            &mut p_gate as *mut _ as *mut c_void,
+            &mut p_invc as *mut _ as *mut c_void,
+            &mut p_gc as *mut _ as *mut c_void,
+            &mut p_wwt as *mut _ as *mut c_void,
+            &mut p_hist_in as *mut _ as *mut c_void,
+            &mut p_hist_out as *mut _ as *mut c_void,
+            &mut p_res as *mut _ as *mut c_void,
+            &mut p_part as *mut _ as *mut c_void,
+            &mut nt_c as *mut _ as *mut c_void,
+            &mut e_c as *mut _ as *mut c_void,
+            &mut hc_c as *mut _ as *mut c_void,
+            &mut kern_c as *mut _ as *mut c_void,
+            &mut dil_c as *mut _ as *mut c_void,
+            &mut hist_c as *mut _ as *mut c_void,
+            &mut head_c as *mut _ as *mut c_void,
+            &mut want_c as *mut _ as *mut c_void,
+            &mut ntiles_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(
+                k.conv,
+                (ntiles as u32, hc as u32, 1),
+                (PF_PLE_THREADS as u32, 1, 1),
+                0,
+                &mut args2,
+            )
+            .map_err(|e| format!("dno_pf_ple_conv の起動: {e:#}"))?;
+        }
+        // 履歴と寄与 (少量) を戻す。**どちらも要らないチャンクでは同期しない**
+        // (同期は expert の上げストリームまで待つので、層ごとに払うと高い)。
+        let need_hist = a.hist_len > 0 && a.flush_hist;
+        if need_hist || a.want {
+            ctx.sync().map_err(|e| format!("PLE の同期: {e:#}"))?;
+        }
+        if need_hist {
+            hist.to_slice(&mut a.hist_host[..])
+                .map_err(|e| format!("hist D2H: {e:#}"))?;
+        }
+        let mut contrib = 0.0f32;
+        if a.want {
+            part.to_slice(&mut parts)
+                .map_err(|e| format!("part D2H: {e:#}"))?;
+            // CPU 参照と同じ順 (s 昇順 → 列タイル昇順) に足す。
+            let mut sq = 0.0f32;
+            for i in 0..parts.len() {
+                sq += parts[i];
+            }
+            contrib = if hc_dim == 0 {
+                0.0
+            } else {
+                (sq / hc_dim as f32).sqrt()
+            };
+        }
+        Ok(Some(PfPleDevOut {
+            contrib_rms: contrib,
+        }))
+    });
+    // `PLE_DEV` の borrow を解いてから発火の証拠を出す (内側で呼ぶと
+    // 「RefCell already borrowed」で落ちる。lab t461b で踏んだ)。
+    if matches!(r, Ok(Some(_))) {
+        pf_ple_note(nt, hc, e, a.kern, a.hist_len);
+    }
+    r
+}
 
 /// task 154: hc mix の 1 段 (norm → down → lo → up → mixed → inject) をデバイスで回し、
 /// `mixed` (と inject 列) をデバイスに残す。
@@ -64654,5 +65249,479 @@ mod task448_tests {
         q4attn_kprof::note_fdt_fallback();
         let fb1 = q4attn_kprof::FDT_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(fb1 >= fb0, "fallback の計数が減った");
+    }
+}
+
+#[cfg(test)]
+mod pf_ple_dev_tests {
+    use super::*;
+
+    /// task 461: `DENNO_PF_PLE_DEV` の真理値表 (**既定 on** = lab t461d で採択。
+    /// 切り戻しは明示的な偽値)。
+    #[test]
+    fn pf_ple_dev_gate_truth_table() {
+        assert!(pf_ple_dev_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", " OFF ", "FALSE", ""] {
+            assert!(!pf_ple_dev_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", " ON ", "TRUE"] {
+            assert!(pf_ple_dev_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    /// task 461: 形の門番。実形 (nt=1,913/2,002、hc=4、e=2,560、kern=2..4、hist=2..8)
+    /// が通り、履歴の式と合わない組み合わせ・上限外が落ちること。
+    #[test]
+    fn pf_ple_dev_shape_gate() {
+        // 実形 (kern=2 / dil=1 -> hist=1、kern=4 / dil=2 -> hist=6)
+        assert!(pf_ple_dev_ok(1913, 4, 2560, 2, 1, 1));
+        assert!(pf_ple_dev_ok(2002, 4, 2560, 4, 2, 6));
+        assert!(pf_ple_dev_ok(2002, 4, 2560, 3, 2, 4));
+        assert!(pf_ple_dev_ok(PF_PLE_DEV_MIN_TOK, 1, 1, 1, 1, 0), "kern=1 は履歴 0");
+        // 落ちるもの
+        assert!(!pf_ple_dev_ok(63, 4, 2560, 4, 2, 6), "短い prefill");
+        assert!(!pf_ple_dev_ok(2002, 9, 2560, 4, 2, 6), "hc が上限外");
+        assert!(!pf_ple_dev_ok(2002, 0, 2560, 4, 2, 6));
+        assert!(!pf_ple_dev_ok(2002, 4, 0, 4, 2, 6));
+        assert!(!pf_ple_dev_ok(2002, 4, PF_PLE_MAX_E + 1, 4, 2, 6));
+        assert!(!pf_ple_dev_ok(2002, 4, 2560, 9, 1, 8), "kern が上限外");
+        assert!(!pf_ple_dev_ok(2002, 4, 2560, 0, 1, 0));
+        // hist は (kern-1)*dil でなければ落ちる
+        assert!(!pf_ple_dev_ok(2002, 4, 2560, 4, 2, 5));
+        assert!(!pf_ple_dev_ok(2002, 4, 2560, 4, 0, 0));
+        assert!(!pf_ple_dev_ok(2002, 4, 2560, 8, 8, 56), "hist が上限外");
+    }
+
+    /// task 461: 起動形 (gate = nt ブロック / conv = (ceil(e/256), hc))。
+    #[test]
+    fn pf_ple_dev_grid() {
+        let (nt, hc, e) = (1913usize, 4usize, 2560usize);
+        assert_eq!(e.div_ceil(PF_PLE_THREADS), 10, "conv の grid.x");
+        assert_eq!((nt * hc) as f64 / 1e6, 0.007652);
+        assert_eq!(PF_PLE_THREADS, 256, "カーネルの PLE_THREADS");
+        assert_eq!(PF_PLE_MAX_HC, 8, "カーネルの PLE_MAX_HC");
+        assert_eq!(PF_PLE_MAX_E, 8192, "カーネルの PLE_MAX_E");
+        assert_eq!(PF_PLE_MAX_KERN, 8, "カーネルの PLE_MAX_KERN");
+        assert_eq!(PF_PLE_MAX_HIST, 32, "カーネルの PLE_MAX_HIST");
+    }
+
+    /// カーネル `dno_pf_ple_gate` の式をホストで書き下したもの。
+    ///
+    /// カーネル: ss1 = Σ key^2、ss2 = Σ res^2 → invk / invq =
+    /// 1/sqrt(ss/e + eps)、dot = Σ (key*invk*gk)*(res*invq*gq)、
+    /// sv = dot/sqrt(e)、gate = sigmoid(sign(sv)*sqrt(max(|sv|,1e-6)))、
+    /// invc = 1/sqrt(Σ(value*gate)^2/e + eps)。
+    #[allow(clippy::too_many_arguments)]
+    fn gate_mirror(
+        hc: usize,
+        e: usize,
+        kern_gate: &[f32],
+        res_row: &[f32],
+        value_row: &[f32],
+        gk: &[f32],
+        gq: &[f32],
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
+        let mut gate = vec![0.0f32; hc];
+        let mut invc = vec![0.0f32; hc];
+        for s in 0..hc {
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            for i in 0..e {
+                let kv = kern_gate[s * e + i];
+                let rv = res_row[s * e + i];
+                s1 += kv * kv;
+                s2 += rv * rv;
+            }
+            let invk = 1.0 / (s1 / e as f32 + eps).sqrt();
+            let invq = 1.0 / (s2 / e as f32 + eps).sqrt();
+            let mut dot = 0.0f32;
+            for i in 0..e {
+                let kn = kern_gate[s * e + i] * invk * gk[s * e + i];
+                let qn = res_row[s * e + i] * invq * gq[s * e + i];
+                dot += kn * qn;
+            }
+            let sv = dot * inv_sqrt_e;
+            let av = if sv < 0.0 { -sv } else { sv };
+            let mag = (if av < 1e-6 { 1e-6 } else { av }).sqrt();
+            let sgn = if sv > 0.0 {
+                1.0f32
+            } else if sv < 0.0 {
+                -1.0f32
+            } else {
+                0.0f32
+            };
+            gate[s] = 1.0 / (1.0 + mirror_exp(-(sgn * mag)));
+            let mut s3 = 0.0f32;
+            for i in 0..e {
+                let gv = value_row[i] * gate[s];
+                s3 += gv * gv;
+            }
+            invc[s] = 1.0 / (s3 / e as f32 + eps).sqrt();
+        }
+        (gate, invc)
+    }
+
+    fn mirror_exp(x: f32) -> f32 {
+        if x > 88.0 {
+            return f32::INFINITY;
+        }
+        if x < -103.0 {
+            return 0.0;
+        }
+        (x as f64).exp() as f32
+    }
+
+    /// task 461: gate / invc の式が CPU 参照 (`grouped_rms_norm_into` + 内積) と
+    /// 同じ値になること (縮約の木と `__expf` のぶんだけ違う)。
+    #[test]
+    fn pf_ple_gate_mirror_matches_cpu_reference() {
+        let (hc, e) = (4usize, 256usize);
+        let eps = 1e-6f32;
+        let mut st = 424242u64;
+        let mut rnd = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((st >> 33) as f32) / (u32::MAX >> 1) as f32 - 0.5) * 2.0
+                })
+                .collect()
+        };
+        let key = rnd(hc * e);
+        let res = rnd(hc * e);
+        let value = rnd(e);
+        let gk = rnd(hc * e);
+        let gq = rnd(hc * e);
+        let (g_mine, i_mine) = gate_mirror(hc, e, &key, &res, &value, &gk, &gq, eps);
+        // CPU 参照: grouped_rms_norm_into → 内積 → sigmoid → gated の RMS。
+        let hp = crate::model::hyper::HyperParams {
+            hc,
+            n_embd: e,
+            low_rank: 4,
+            eps,
+        };
+        let mut kn = vec![0.0f32; hc * e];
+        let mut qn = vec![0.0f32; hc * e];
+        crate::model::hyper::grouped_rms_norm_into(&key, &gk, &hp, &mut kn);
+        crate::model::hyper::grouped_rms_norm_into(&res, &gq, &hp, &mut qn);
+        let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
+        for s in 0..hc {
+            let mut acc = 0.0f32;
+            for i in 0..e {
+                acc += kn[s * e + i] * qn[s * e + i];
+            }
+            let sv = acc * inv_sqrt_e;
+            let mag = (if sv.abs() < 1e-6 { 1e-6 } else { sv.abs() }).sqrt();
+            let sgn = if sv > 0.0 {
+                1.0f32
+            } else if sv < 0.0 {
+                -1.0f32
+            } else {
+                0.0f32
+            };
+            let want = crate::model::hyper::sigmoid(sgn * mag);
+            let d = (g_mine[s] - want).abs() / want.max(1e-6);
+            assert!(d < 1e-5, "gate[{s}] = {} vs CPU {want} (相対 {d})", g_mine[s]);
+            // invc も CPU の rmsnorm (gated) と一致すること。
+            let mut gated = vec![0.0f32; e];
+            for i in 0..e {
+                gated[i] = value[i] * want;
+            }
+            let mut nx = vec![0.0f32; e];
+            crate::tensor::rmsnorm_into(&gated, &vec![1.0f32; e], e, eps, &mut nx);
+            // nx = gated * invc なので、invc は nx/gated から取れる (gated != 0)。
+            let mut checked = 0;
+            for i in 0..e {
+                if gated[i].abs() > 1e-3 {
+                    let inv_cpu = nx[i] / gated[i];
+                    let d = (i_mine[s] - inv_cpu).abs() / inv_cpu.abs().max(1e-6);
+                    assert!(d < 1e-4, "invc[{s}] = {} vs CPU {inv_cpu}", i_mine[s]);
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "invc の比較点が無い");
+        }
+    }
+
+    /// カーネルの `dno_pf_ple_conv` の索引算術を 1 対 1 でホストへ写したもの
+    /// (conv の値と res / 履歴だけを比べる。寄与の和は順序が違うので見ない)。
+    #[allow(clippy::too_many_arguments)]
+    fn conv_mirror(
+        nt: usize,
+        hc: usize,
+        e: usize,
+        kern: usize,
+        dil: usize,
+        hist: usize,
+        head: usize,
+        value: &[f32],
+        gate: &[f32],
+        invc: &[f32],
+        gc: &[f32],
+        wt: &[f32],
+        hist_in: &[f32],
+        res: &mut [f32],
+    ) -> Vec<f32> {
+        let hc_dim = hc * e;
+        let mut hist_out = hist_in.to_vec();
+        for s in 0..hc {
+            for d in 0..e {
+                let off = s * e + d;
+                let mut xr = vec![0.0f32; hist.max(1)];
+                for t in 0..nt {
+                    let g = gate[t * hc + s];
+                    let iv = invc[t * hc + s];
+                    let gated = value[t * e + d] * g;
+                    let x = gated * iv * gc[off];
+                    let mut acc = 0.0f32;
+                    for k in 0..kern {
+                        let back = (kern - 1 - k) * dil;
+                        let src = if back == 0 {
+                            x
+                        } else if t >= back {
+                            xr[(t - back) % hist]
+                        } else {
+                            // カーネルは int の負の剰余 (C は被除数の符号)。
+                            // usize だと 0 - back が wrap するので i64 で写す。
+                            let tb = t as i64 - back as i64;
+                            let slot =
+                                ((head as i64 + hist as i64 + tb % hist as i64) % hist as i64)
+                                    as usize;
+                            hist_in[slot * hc_dim + off]
+                        };
+                        acc += wt[k * hc_dim + off] * src;
+                    }
+                    let conv = mirror_silu(acc);
+                    if hist > 0 {
+                        xr[t % hist] = x;
+                    }
+                    res[t * hc_dim + off] += gated + conv;
+                }
+                if hist > 0 {
+                    // 書き戻しは線形 (先頭が最古)。カーネルと同じ式。
+                    for j in 0..hist {
+                        let back_j = hist - 1 - j;
+                        let tj = nt as i64 - 1 - back_j as i64;
+                        hist_out[j * hc_dim + off] = if tj >= 0 {
+                            xr[(tj as usize) % hist]
+                        } else {
+                            let slot = ((head as i64
+                                + hist as i64
+                                + (tj % hist as i64) % hist as i64)
+                                % hist as i64) as usize;
+                            hist_in[slot * hc_dim + off]
+                        };
+                    }
+                }
+            }
+        }
+        hist_out
+    }
+
+    fn mirror_silu(x: f32) -> f32 {
+        x * (1.0 / (1.0 + exp_approx(-x)))
+    }
+
+    /// `__expf` の粗い鏡 (f64 の exp を f32 に丸める)。2 ULP 以内。
+    fn exp_approx(x: f32) -> f32 {
+        if x > 88.0 {
+            return f32::INFINITY;
+        }
+        if x < -103.0 {
+            return 0.0;
+        }
+        (x as f64).exp() as f32
+    }
+
+    /// task 461: conv の索引算術 (履歴の ring / back の向き / 書き出しの slot) が
+    /// CPU の `ple_conv_silu_t` + `ple_hist_push_ring` と同じ結果になること。
+    ///
+    /// 値は `__expf` vs `exp` のぶんだけ違いうるので相対 1e-5 で見る
+    /// (索引を間違えると order-1 の差になる)。
+    #[test]
+    fn pf_ple_conv_mirror_matches_cpu_ring() {
+        for (kern, dil) in [(2usize, 1usize), (3, 2), (4, 2), (4, 1)] {
+            let hist = (kern - 1) * dil;
+            let (nt, hc, e) = (37usize, 2usize, 24usize);
+            let hc_dim = hc * e;
+            let mut st = 12345u64;
+            let mut rnd = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let u = ((st >> 33) as f32) / (u32::MAX >> 1) as f32;
+                        (u - 0.5) * 2.0
+                    })
+                    .collect()
+            };
+            let value = rnd(nt * e);
+            let gate = rnd(nt * hc);
+            let gc = rnd(hc_dim);
+            let wt = rnd(kern * hc_dim);
+            let hist_in = rnd(hist.max(1) * hc_dim);
+            let res0 = rnd(nt * hc_dim);
+            // invc は CPU の逐次和で作り、両方に同じものを渡す (conv の索引だけを見る)。
+            let mut invc = vec![0.0f32; nt * hc];
+            for t in 0..nt {
+                for s in 0..hc {
+                    let mut ss = 0.0f32;
+                    for d in 0..e {
+                        let g = value[t * e + d] * gate[t * hc + s];
+                        ss += g * g;
+                    }
+                    invc[t * hc + s] = 1.0 / (ss / e as f32 + 1e-6).sqrt();
+                }
+            }
+            // CPU 参照
+            let mut res_cpu = res0.clone();
+            let mut hist_cpu = hist_in[..hist * hc_dim].to_vec();
+            let mut head = 0usize;
+            for t in 0..nt {
+                let mut gated = vec![0.0f32; hc_dim];
+                let mut x = vec![0.0f32; hc_dim];
+                for s in 0..hc {
+                    let g = gate[t * hc + s];
+                    let iv = invc[t * hc + s];
+                    for d in 0..e {
+                        let gv = value[t * e + d] * g;
+                        gated[s * e + d] = gv;
+                        x[s * e + d] = gv * iv * gc[s * e + d];
+                    }
+                }
+                let mut conv = vec![0.0f32; hc_dim];
+                crate::model::qwen4exp::ple_conv_silu_t(
+                    &mut conv, &x, &hist_cpu, head, &wt, kern, dil, hc_dim,
+                );
+                for i in 0..hc_dim {
+                    res_cpu[t * hc_dim + i] += gated[i] + conv[i];
+                }
+                crate::model::qwen4exp::ple_hist_push_ring(&mut hist_cpu, &mut head, &x, hc_dim);
+            }
+            // CPU 経路はチャンク終端で履歴を線形へ戻す。
+            {
+                let mut tmp = Vec::new();
+                crate::model::qwen4exp::ple_hist_to_linear(&mut hist_cpu, head, hc_dim, &mut tmp);
+            }
+            // カーネルの鏡
+            let mut res_gpu = res0.clone();
+            let hist_out = conv_mirror(
+                nt, hc, e, kern, dil, hist, 0, &value, &gate, &invc, &gc, &wt, &hist_in, &mut res_gpu,
+            );
+            let scale = res_cpu.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let mut maxd = 0.0f32;
+            for i in 0..res_cpu.len() {
+                maxd = maxd.max((res_cpu[i] - res_gpu[i]).abs());
+            }
+            assert!(
+                maxd / scale < 1e-5,
+                "kern={kern} dil={dil}: conv の res が違う (max|diff|/scale = {})",
+                maxd / scale
+            );
+            // 履歴も同じ並びで出ること。
+            let hscale = hist_cpu.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let mut hmax = 0.0f32;
+            for i in 0..hist_cpu.len() {
+                hmax = hmax.max((hist_cpu[i] - hist_out[i]).abs());
+            }
+            assert!(
+                hmax / hscale < 1e-5,
+                "kern={kern} dil={dil}: 履歴の並びが違う (max|diff|/scale = {})",
+                hmax / hscale
+            );
+        }
+    }
+
+    /// task 461: チャンクを跨いだ履歴 (head != 0) でも ring の対応が合うこと。
+    #[test]
+    fn pf_ple_conv_mirror_ring_head() {
+        let (kern, dil) = (4usize, 2usize);
+        let hist = (kern - 1) * dil; // 6
+        let (nt, hc, e) = (23usize, 2usize, 8usize);
+        let hc_dim = hc * e;
+        let mut st = 777u64;
+        let mut rnd = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (((st >> 33) as f32) / (u32::MAX >> 1) as f32 - 0.5) * 2.0
+                })
+                .collect()
+        };
+        let value = rnd(nt * e);
+        let gate = rnd(nt * hc);
+        let gc = rnd(hc_dim);
+        let wt = rnd(kern * hc_dim);
+        let hist_in = rnd(hist * hc_dim);
+        let res0 = rnd(nt * hc_dim);
+        let mut invc = vec![0.0f32; nt * hc];
+        for t in 0..nt {
+            for s in 0..hc {
+                let mut ss = 0.0f32;
+                for d in 0..e {
+                    let g = value[t * e + d] * gate[t * hc + s];
+                    ss += g * g;
+                }
+                invc[t * hc + s] = 1.0 / (ss / e as f32 + 1e-6).sqrt();
+            }
+        }
+        for head in 0..hist {
+            let mut res_cpu = res0.clone();
+            let mut hist_cpu = hist_in.clone();
+            let mut h = head;
+            for t in 0..nt {
+                let mut x = vec![0.0f32; hc_dim];
+                for s in 0..hc {
+                    let g = gate[t * hc + s];
+                    let iv = invc[t * hc + s];
+                    for d in 0..e {
+                        x[s * e + d] = value[t * e + d] * g * iv * gc[s * e + d];
+                    }
+                }
+                let mut conv = vec![0.0f32; hc_dim];
+                crate::model::qwen4exp::ple_conv_silu_t(
+                    &mut conv, &x, &hist_cpu, h, &wt, kern, dil, hc_dim,
+                );
+                for s in 0..hc {
+                    let g = gate[t * hc + s];
+                    for d in 0..e {
+                        let i = s * e + d;
+                        res_cpu[t * hc_dim + i] += value[t * e + d] * g + conv[i];
+                    }
+                }
+                crate::model::qwen4exp::ple_hist_push_ring(&mut hist_cpu, &mut h, &x, hc_dim);
+            }
+            {
+                let mut tmp = Vec::new();
+                crate::model::qwen4exp::ple_hist_to_linear(&mut hist_cpu, h, hc_dim, &mut tmp);
+            }
+            let mut res_gpu = res0.clone();
+            let hist_out = conv_mirror(
+                nt, hc, e, kern, dil, hist, head, &value, &gate, &invc, &gc, &wt, &hist_in,
+                &mut res_gpu,
+            );
+            let scale = res_cpu.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let mut maxd = 0.0f32;
+            for i in 0..res_cpu.len() {
+                maxd = maxd.max((res_cpu[i] - res_gpu[i]).abs());
+            }
+            assert!(
+                maxd / scale < 1e-5,
+                "head={head}: res が違う (max|diff|/scale = {})",
+                maxd / scale
+            );
+            let hscale = hist_cpu.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let mut hmax = 0.0f32;
+            for i in 0..hist_cpu.len() {
+                hmax = hmax.max((hist_cpu[i] - hist_out[i]).abs());
+            }
+            assert!(
+                hmax / hscale < 1e-5,
+                "head={head}: 履歴が違う (max|diff|/scale = {})",
+                hmax / hscale
+            );
+        }
     }
 }

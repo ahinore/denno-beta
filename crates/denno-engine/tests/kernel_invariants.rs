@@ -10650,7 +10650,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12177,7 +12177,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12294,7 +12294,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12489,7 +12489,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12583,7 +12583,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12877,7 +12877,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
@@ -13307,7 +13307,8 @@ fn task460_flashdec_combine_gate_kernel_and_wiring() {
         .lines()
         .find(|l| l.starts_with("targets_all=("))
         .unwrap_or("");
-    assert!(targets.contains("attn_dec4)"), "targets_all に attn_dec4 が無い");
+    // task 461 が末尾に `pf_ple` を足したので、末尾一致ではなく語の有無で見る。
+    assert!(targets.contains("attn_dec4"), "targets_all に attn_dec4 が無い");
 
     // 7. PTX があれば ABI (6 引数) を数える。無ければ lab が生成する
     //    (最初の lab 依頼は PTX=attn_dec4 で出す)。
@@ -13395,6 +13396,96 @@ fn task457_pf_elem_kernel_and_wiring() {
         .join("kernels_pf_elem.ptx");
     if let Ok(text) = std::fs::read_to_string(&ptx) {
         for (name, want) in [("dno_pf_rmsgroup_p", 7usize), ("dno_pf_mixed_fs", 6)] {
+            let pat = format!(".entry {name}(");
+            let i = text
+                .find(&pat)
+                .unwrap_or_else(|| panic!("PTX に {name} の entry が無い (再生成が必要)"));
+            let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+            assert_eq!(
+                text[i..j].matches(".param .").count(),
+                want,
+                "PTX の {name} の引数が {want} 本でない"
+            );
+        }
+    }
+}
+
+
+const PF_PLE_SRC: &str = include_str!("../kernels/kernels_pf_ple.cu");
+
+/// task 461: prefill の PLE デバイス経路 (`DENNO_PF_PLE_DEV`) の配線。
+/// カーネル名 / #define と cuda.rs のミラー / build_ptx.sh の target /
+/// PTX があれば引数の数 (11 と 18)。無ければ lab が `PTX=pf_ple` で作る。
+#[test]
+fn task461_pf_ple_kernel_and_wiring() {
+    for name in ["dno_pf_ple_gate", "dno_pf_ple_conv"] {
+        assert!(
+            PF_PLE_SRC.contains(name),
+            "kernels_pf_ple.cu に {name} が無い"
+        );
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+    }
+    // .cu の #define と cuda.rs のミラー (値の行にコメントを付けない)。
+    for line in [
+        "#define PLE_THREADS 256",
+        "#define PLE_MAX_HC 8",
+        "#define PLE_MAX_E 8192",
+        "#define PLE_MAX_KERN 8",
+        "#define PLE_MAX_HIST 32",
+    ] {
+        assert!(PF_PLE_SRC.contains(line), "{line} が無い");
+    }
+    for line in [
+        "pub(crate) const PF_PLE_THREADS: usize = 256;",
+        "pub(crate) const PF_PLE_MAX_HC: usize = 8;",
+        "pub(crate) const PF_PLE_MAX_E: usize = 8192;",
+        "pub(crate) const PF_PLE_MAX_KERN: usize = 8;",
+        "pub(crate) const PF_PLE_MAX_HIST: usize = 32;",
+        "pub(crate) const PF_PLE_GATE_NARGS: usize = 11;",
+        "pub(crate) const PF_PLE_CONV_NARGS: usize = 18;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+    // 1 演算 1 丸め (明示 __*_rn)。gate の縮約は warp の木 + warp 間の順次。
+    for s in [
+        "return __fdividef(1.0f, __fadd_rn(1.0f, __expf(-x)));",
+        "return __fmul_rn(x, __fdividef(1.0f, __fadd_rn(1.0f, __expf(-x))));",
+        "__shfl_down_sync(0xffffffffu, v, off)",
+        "a = __fmaf_rn(kv, kv, a);",
+        "d = __fmaf_rn(kn, qn, d);",
+        "gate[t * (size_t)hc + (size_t)s] = ple_sigmoid(__fmul_rn(sgn, mag));",
+        "res[o] = __fadd_rn(res[o], add);",
+    ] {
+        assert!(PF_PLE_SRC.contains(s), "kernels_pf_ple.cu に {s} が無い");
+    }
+    // CPU 参照と同じ履歴の式 (ring の slot) が両方に書かれていること。
+    assert!(
+        PF_PLE_SRC.contains("int slot = (head + hist + ((t - back) % hist)) % hist;"),
+        "conv の履歴 slot の式が無い"
+    );
+    // build_ptx.sh の target (targets_all の末尾 = merge の衝突を避ける)。
+    assert!(
+        BUILD_PTX_SH.contains("pf_ple)       echo \"kernels_pf_ple.cu|nofmad\""),
+        "build_ptx.sh に pf_ple の spec が無い"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("pf_ple"),
+        "targets_all に pf_ple が無い: {targets}"
+    );
+    // PTX があれば ABI を数える。無ければ lab が生成する
+    // (最初の lab 依頼は PTX=pf_ple で出す)。
+    let ptx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("kernels")
+        .join("kernels_pf_ple.ptx");
+    if let Ok(text) = std::fs::read_to_string(&ptx) {
+        for (name, want) in [("dno_pf_ple_gate", 11usize), ("dno_pf_ple_conv", 18)] {
             let pat = format!(".entry {name}(");
             let i = text
                 .find(&pat)
