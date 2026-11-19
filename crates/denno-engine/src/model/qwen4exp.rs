@@ -19114,8 +19114,9 @@ fn pf_early_route_prefetch(
         crate::model::exp_pf::early_route_kb(),
         nt_all - nt0,
     );
-    // expert 昇順 = MoE が読む順。上限まで投げたら止める (ディスクの遊びは
+    // expert 昇順 = MoE が読む順。上限まで集めたら止める (ディスクの遊びは
     // 残りチャンクの attention の時間ぶんしかない)。
+    let mut runs: Vec<(u32, u64, usize)> = Vec::new();
     let mut bytes = 0usize;
     let mut calls = 0usize;
     let mut nex = 0usize;
@@ -19125,19 +19126,19 @@ fn pf_early_route_prefetch(
         }
         let ei = key.expert as usize;
         let mut one = 0usize;
+        let mut add: Vec<(u32, u64, usize)> = Vec::with_capacity(3);
         for w in [&lw.gate_exps, &lw.up_exps, &lw.down_exps] {
             let Ok((off, len)) = w.slice_abs(ei) else {
                 continue;
             };
-            let n = crate::model::exp_pf::readahead_part(w.file as u32, off, len);
-            if n > 0 {
-                one += n;
-                calls += 1;
-            }
+            one += len;
+            add.push((w.file as u32, off, len));
         }
         if one == 0 {
             continue;
         }
+        calls += add.len();
+        runs.extend(add);
         bytes += one;
         nex += 1;
         if bytes >= budget {
@@ -19146,6 +19147,65 @@ fn pf_early_route_prefetch(
     }
     if nex == 0 {
         return None;
+    }
+    let mode = crate::model::exp_pf::early_route_mode();
+    if mode >= 2 {
+        // 背景スレッドで `pread` して捨てる (readahead(2) が効かない環境むけ)。
+        // 実行役は層ごとに 1 本。前の 1 本がまだ走っていたらこの層は飛ばす。
+        if !crate::model::exp_pf::early_route_worker_idle() {
+            crate::model::exp_pf::note_early_route_skip();
+            return None;
+        }
+        let t = std::time::Instant::now();
+        // 1 本の pread では帯域が出ない (queue が浅い) ので 4 本で割る。
+        let mut buckets: [Vec<(u32, u64, usize)>; 4] = Default::default();
+        for (i, r) in runs.iter().enumerate() {
+            buckets[i % 4].push(*r);
+        }
+        let h = std::thread::Builder::new()
+            .name("pf-er-pread".to_string())
+            .spawn(move || {
+                std::thread::scope(|s| {
+                    for b in buckets.iter_mut() {
+                        s.spawn(move || {
+                            let mut buf = vec![0u8; 4 << 20];
+                            for (part, off, len) in b.iter() {
+                                let mut done = 0usize;
+                                while done < *len {
+                                    let n = (*len - done).min(buf.len());
+                                    let ok = unsafe {
+                                        crate::model::exp_pf::read_part_ptr(
+                                            *part,
+                                            *off + done as u64,
+                                            buf.as_mut_ptr(),
+                                            n,
+                                        )
+                                    };
+                                    if !ok {
+                                        break;
+                                    }
+                                    done += n;
+                                }
+                            }
+                        });
+                    }
+                });
+                // 読み切るまでの時間を台帳へ (ディスクが回った証拠)。
+                crate::model::exp_pf::note_early_route_read_ns(t.elapsed().as_nanos() as u64);
+            });
+        match h {
+            Ok(h) => crate::model::exp_pf::early_route_worker_set(h),
+            Err(_) => return None,
+        }
+    } else {
+        // `readahead(2)` (待たない)。
+        let mut sent = 0usize;
+        for (part, off, len) in &runs {
+            sent += crate::model::exp_pf::readahead_part(*part, *off, *len);
+        }
+        if sent == 0 {
+            return None;
+        }
     }
     crate::model::exp_pf::note_early_route(nex, bytes, calls);
     Some((nex, bytes, calls))

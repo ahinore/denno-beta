@@ -10254,14 +10254,17 @@ fn t470_early_route_is_wired() {
         lm.contains("let _ = pf_early_route_prefetch("),
         "先読みの戻り値を使っている (値に触ってはいけない)"
     );
-    // 本体: 実 routing → 常駐を飛ばす → readahead。
+    // 本体: 実 routing → 常駐を飛ばす → readahead / pread。
     let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
     for k in [
         "crate::cuda::pf_lm_mixed_ptr(0, nt0, e)",
         "crate::cuda::pf_router_dev_topk(",
         "crate::model::expert_vram::peek_many(",
         "crate::model::exp_pf::readahead_part(",
+        "crate::model::exp_pf::read_part_ptr(",
         "crate::model::exp_pf::early_route_budget(",
+        "crate::model::exp_pf::early_route_mode(",
+        "crate::model::exp_pf::early_route_worker_idle(",
         "w.slice_abs(ei)",
         "note_early_route(",
     ] {

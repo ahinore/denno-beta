@@ -2997,23 +2997,43 @@ pub fn layer_pre_stats_reset() {
 
 /// `DENNO_PF_EARLY_ROUTE`: 1 チャンク目の routing で選ばれた expert を先読みする。
 /// **既定 off** (lab で採否を決める)。
+///
+/// - `0` / `off` — 従来 (先読みしない)
+/// - `1` / `on` — `readahead(2)` でページキャッシュへ投げるだけ (待たない)
+/// - `2` — 背景スレッドで `pread` して捨てる (確実にディスクを回す)
 pub const EARLY_ROUTE_ENV: &str = "DENNO_PF_EARLY_ROUTE";
 
 /// [`EARLY_ROUTE_ENV`] の既定 (測るまで off)。
 pub const DEFAULT_EARLY_ROUTE: bool = false;
 
-/// [`EARLY_ROUTE_ENV`] の解釈 (明示的な真値だけ on)。
+/// ゲートの解釈 (純関数)。`1` 系は readahead、`2` だけ pread。
+///
+/// lab t470b: `1` (readahead) は 3,826 で 1 リクエスト 2.4-4.6 GB 投げたのに
+/// `copy_s` が 0.05-0.09 s しか縮まなかった (投げたぶんの 1 割程度しか
+/// ページキャッシュに載っていない)。`readahead(2)` が効かない環境なので、
+/// `2` の pread 版を足した。
+pub fn early_route_mode_from_value(v: Option<&str>) -> u8 {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("2") | Some("pread") => 2,
+        Some("1") | Some("on") | Some("true") | Some("yes") => 1,
+        _ => 0,
+    }
+}
+
+/// ゲートの解釈 (真偽だけ)。明示的な真値で on。
 pub fn early_route_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    early_route_mode_from_value(v) != 0
+}
+
+/// 先読みのやり方 (プロセスで 1 回だけ env を読む)。0 = off。
+pub fn early_route_mode() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| early_route_mode_from_value(std::env::var(EARLY_ROUTE_ENV).ok().as_deref()))
 }
 
 /// 1 チャンク目の routing で先読みするか (プロセスで 1 回だけ env を読む)。
 pub fn early_route_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| early_route_from_value(std::env::var(EARLY_ROUTE_ENV).ok().as_deref()))
+    early_route_mode() != 0
 }
 
 /// `DENNO_PF_EARLY_ROUTE_MB`: 1 層で先読みする上限 (MiB)。**0 = 自動**
@@ -3087,6 +3107,58 @@ static ER_LAYERS: AtomicU64 = AtomicU64::new(0);
 static ER_EXPERTS: AtomicU64 = AtomicU64::new(0);
 static ER_BYTES: AtomicU64 = AtomicU64::new(0);
 static ER_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `2` (pread) のときの、背景スレッドが実際に読み終えるまでの時間。
+static ER_READ_NS: AtomicU64 = AtomicU64::new(0);
+/// 前の層の先読みがまだ走っていて飛ばした層の数。
+static ER_SKIP: AtomicU64 = AtomicU64::new(0);
+
+/// 先読みの実行役 (高々 1 本)。`2` (pread) のときだけ使う。
+static ER_WORKER: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// 前の先読みが終わっていれば回収して true。まだ走っていれば false。
+///
+/// ディスクが追いつかないときにスレッドが溜まらないよう、**層ごとに 1 本**に絞る
+/// (前の 1 本が残っていたらその層の先読みは飛ばす)。
+pub fn early_route_worker_idle() -> bool {
+    let Ok(mut g) = ER_WORKER.lock() else {
+        return false;
+    };
+    match g.take() {
+        None => true,
+        Some(h) => {
+            if h.is_finished() {
+                let _ = h.join();
+                true
+            } else {
+                *g = Some(h);
+                false
+            }
+        }
+    }
+}
+
+/// 先読みの実行役を登録する (次の層が `is_finished` で回収する)。
+pub fn early_route_worker_set(h: std::thread::JoinHandle<()>) {
+    if let Ok(mut g) = ER_WORKER.lock() {
+        // 置き換えるときは前の 1 本を回収する (取りこぼしても detached で終わる)。
+        if let Some(old) = g.replace(h) {
+            if old.is_finished() {
+                let _ = old.join();
+            }
+        }
+    }
+}
+
+/// `2` (pread) の背景スレッドが読み終えた時間を積む。
+pub fn note_early_route_read_ns(ns: u64) {
+    ER_READ_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// 実行役が埋まっていて飛ばした層を数える。
+pub fn note_early_route_skip() {
+    ER_SKIP.fetch_add(1, Ordering::Relaxed);
+}
 
 /// 1 層ぶんの先読みを積んだ (診断用)。
 pub fn note_early_route(experts: usize, bytes: usize, calls: usize) {
@@ -3099,12 +3171,14 @@ pub fn note_early_route(experts: usize, bytes: usize, calls: usize) {
 /// `[exp-pf-stream]` の末尾へ足す台帳 (発火していなければ空)。
 pub fn early_route_stats() -> String {
     let n = ER_LAYERS.load(Ordering::Relaxed);
-    if n == 0 {
+    let skip = ER_SKIP.load(Ordering::Relaxed);
+    if n == 0 && skip == 0 {
         return String::new();
     }
     let mb = ER_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+    let ms = ER_READ_NS.load(Ordering::Relaxed) as f64 / 1e6;
     format!(
-        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={}",
+        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={} er_ms={ms:.1} er_skip={skip}",
         ER_EXPERTS.load(Ordering::Relaxed),
         ER_CALLS.load(Ordering::Relaxed)
     )
@@ -3115,6 +3189,8 @@ pub fn early_route_stats_reset() {
     for c in [&ER_LAYERS, &ER_EXPERTS, &ER_BYTES, &ER_CALLS] {
         c.store(0, Ordering::Relaxed);
     }
+    ER_READ_NS.store(0, Ordering::Relaxed);
+    ER_SKIP.store(0, Ordering::Relaxed);
 }
 
 
@@ -3752,6 +3828,15 @@ mod tests {
         assert!(early_route_from_value(Some("on")));
         assert!(early_route_from_value(Some(" TRUE ")));
         assert!(early_route_from_value(Some("yes")));
+        // `2` は pread 版 (実 I/O)。readahead が効かない環境で使う。
+        assert_eq!(early_route_mode_from_value(None), 0);
+        assert_eq!(early_route_mode_from_value(Some("0")), 0);
+        assert_eq!(early_route_mode_from_value(Some("1")), 1);
+        assert_eq!(early_route_mode_from_value(Some("on")), 1);
+        assert_eq!(early_route_mode_from_value(Some("2")), 2);
+        assert_eq!(early_route_mode_from_value(Some(" PREAD ")), 2);
+        assert_eq!(early_route_mode_from_value(Some("x")), 0);
+        assert!(early_route_from_value(Some("2")), "pread も on");
         // 明示 MiB はそのまま (0 は自動)。
         assert_eq!(early_route_mb_from_value(None), 0);
         assert_eq!(early_route_mb_from_value(Some("0")), 0);
