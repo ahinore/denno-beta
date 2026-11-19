@@ -32915,7 +32915,8 @@ pub(crate) const ATTN_PF3_BQ: usize = 64;
 // 1 本持ち、f32 のミラーから新チャンクの行だけを落として v4 に渡す。読みは
 // ちょうど半分になり、**値は 1 ビットも変わらない** (md5 SAME が期待値)。
 //
-// ゲート: `DENNO_PF_ATTN_KVBF16`。**既定 off** (採否は lab の実測で決める)。
+// ゲート: `DENNO_PF_ATTN_KVBF16`。**既定 on** (lab t465a/t465b で採択)。
+// 切り戻しは `DENNO_PF_ATTN_KVBF16=0` (値は v3 と同じ)。
 
 /// v4 カーネルの静的共有メモリ (`kernels_attn_pf4.cu` の A4_SMEM_BYTES と一致)。
 pub(crate) const ATTN_PF4_SMEM_BYTES: usize = 89_600;
@@ -32928,12 +32929,19 @@ pub(crate) const ATTN_PF4_THREADS: usize = 256;
 /// bf16 へ落とすカーネルのスレッド数 (`A4_CONV_THREADS`)。
 pub(crate) const ATTN_PF4_CONV_THREADS: usize = 256;
 
-/// `DENNO_PF_ATTN_KVBF16` の解釈 (純関数)。**既定 off**。
+/// `DENNO_PF_ATTN_KVBF16` の解釈 (純関数)。**既定 on** (lab t465a/t465b で採択)。
+///
+/// 実測 (depth8k、14k cold、2 ラウンド): `full` 段の GPU が 638.3 / 639.5 ms に
+/// 対して **552.7 / 552.7 ms (-13.4% / -13.6%)**、同段の wall が 826.7 / 833.8 に
+/// 対して 766.4 / 770.3 ms (-7.3% / -7.6%)。3,826 は同段が小さく差なし
+/// (round 2 で 108.0 対 107.9 ms)、decode も全 COND 11.3 ms/tok で不変、
+/// md5 は全 COND・全コンテキスト SAME、errors 0、text sane。
+/// 切り戻しは `DENNO_PF_ATTN_KVBF16=0`。
 pub(crate) fn pf_attn_kvbf16_from_value(v: Option<&str>) -> bool {
-    // 明示的な真値だけ on (未設定・知らない値は off = v3 のまま)。
     match v.map(|s| s.trim().to_ascii_lowercase()) {
+        // 未設定は既定 on。明示的な真値だけ on、`0` などで v3 へ戻す。
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
@@ -46758,10 +46766,11 @@ mod tests {
         }
     }
 
-    /// task 465: `DENNO_PF_ATTN_KVBF16` は既定 off・明示的な真値だけ on。
+    /// task 465: `DENNO_PF_ATTN_KVBF16` は既定 on (lab t465a/t465b で採択)。
+    /// 切り戻しは明示的な `0` など。
     #[test]
     fn pf_attn_kvbf16_gate_truth_table() {
-        assert!(!pf_attn_kvbf16_from_value(None), "未設定は既定 off");
+        assert!(pf_attn_kvbf16_from_value(None), "未設定は既定 on");
         for v in ["", "0", "off", "false", "no", "2"] {
             assert!(!pf_attn_kvbf16_from_value(Some(v)), "raw={v:?}");
         }
