@@ -3126,62 +3126,13 @@ pub fn early_route_window_ok(nt0: usize, nt_all: usize) -> bool {
 }
 
 /// 先読みの台帳 (層数 / expert 本数 / バイト / 呼び出し回数)。
+///
+/// task 474: 実行役の join と読み終えるまでの時間は置き場の側
+/// ([`rc_join`] / [`note_rc_read_ns`]) が持つ。ここは「何層ぶん投げたか」だけ。
 static ER_LAYERS: AtomicU64 = AtomicU64::new(0);
 static ER_EXPERTS: AtomicU64 = AtomicU64::new(0);
 static ER_BYTES: AtomicU64 = AtomicU64::new(0);
 static ER_CALLS: AtomicU64 = AtomicU64::new(0);
-/// `2` (pread) のときの、背景スレッドが実際に読み終えるまでの時間。
-static ER_READ_NS: AtomicU64 = AtomicU64::new(0);
-/// 前の層の先読みがまだ走っていて飛ばした層の数。
-static ER_SKIP: AtomicU64 = AtomicU64::new(0);
-
-/// 先読みの実行役 (高々 1 本)。`2` (pread) のときだけ使う。
-static ER_WORKER: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(None);
-
-/// 前の先読みが終わっていれば回収して true。まだ走っていれば false。
-///
-/// ディスクが追いつかないときにスレッドが溜まらないよう、**層ごとに 1 本**に絞る
-/// (前の 1 本が残っていたらその層の先読みは飛ばす)。
-pub fn early_route_worker_idle() -> bool {
-    let Ok(mut g) = ER_WORKER.lock() else {
-        return false;
-    };
-    match g.take() {
-        None => true,
-        Some(h) => {
-            if h.is_finished() {
-                let _ = h.join();
-                true
-            } else {
-                *g = Some(h);
-                false
-            }
-        }
-    }
-}
-
-/// 先読みの実行役を登録する (次の層が `is_finished` で回収する)。
-pub fn early_route_worker_set(h: std::thread::JoinHandle<()>) {
-    if let Ok(mut g) = ER_WORKER.lock() {
-        // 置き換えるときは前の 1 本を回収する (取りこぼしても detached で終わる)。
-        if let Some(old) = g.replace(h) {
-            if old.is_finished() {
-                let _ = old.join();
-            }
-        }
-    }
-}
-
-/// `2` (pread) の背景スレッドが読み終えた時間を積む。
-pub fn note_early_route_read_ns(ns: u64) {
-    ER_READ_NS.fetch_add(ns, Ordering::Relaxed);
-}
-
-/// 実行役が埋まっていて飛ばした層を数える。
-pub fn note_early_route_skip() {
-    ER_SKIP.fetch_add(1, Ordering::Relaxed);
-}
 
 /// 1 層ぶんの先読みを積んだ (診断用)。
 pub fn note_early_route(experts: usize, bytes: usize, calls: usize) {
@@ -3194,14 +3145,12 @@ pub fn note_early_route(experts: usize, bytes: usize, calls: usize) {
 /// `[exp-pf-stream]` の末尾へ足す台帳 (発火していなければ空)。
 pub fn early_route_stats() -> String {
     let n = ER_LAYERS.load(Ordering::Relaxed);
-    let skip = ER_SKIP.load(Ordering::Relaxed);
-    if n == 0 && skip == 0 {
+    if n == 0 {
         return String::new();
     }
     let mb = ER_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
-    let ms = ER_READ_NS.load(Ordering::Relaxed) as f64 / 1e6;
     format!(
-        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={} er_ms={ms:.1} er_skip={skip}",
+        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={}",
         ER_EXPERTS.load(Ordering::Relaxed),
         ER_CALLS.load(Ordering::Relaxed)
     )
@@ -3212,8 +3161,6 @@ pub fn early_route_stats_reset() {
     for c in [&ER_LAYERS, &ER_EXPERTS, &ER_BYTES, &ER_CALLS] {
         c.store(0, Ordering::Relaxed);
     }
-    ER_READ_NS.store(0, Ordering::Relaxed);
-    ER_SKIP.store(0, Ordering::Relaxed);
 }
 
 
