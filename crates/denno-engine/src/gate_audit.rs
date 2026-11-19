@@ -51,6 +51,13 @@ pub struct GatePtx {
 #[cfg(feature = "cuda")]
 pub const DEFAULT_ON_GATES: &[GatePtx] = &[
     GatePtx {
+        env: "DENNO_PF_ATTN_KVBF16",
+        ptx: "kernels_attn_pf4.ptx",
+        entries: &["dno_attention_prefill4", "dno_kv_f32_to_bf16"],
+        path_env: "DENNO_PF_ATTN4_PTX",
+        on: || crate::cuda::pf_attn_kvbf16_on(),
+    },
+    GatePtx {
         env: "DENNO_FULL_DEC_DEV",
         ptx: "kernels_dec_dev.ptx",
         entries: &["dno_dec_qknorm_rope", "dno_dec_gate_mul"],

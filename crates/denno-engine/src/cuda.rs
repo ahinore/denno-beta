@@ -33019,6 +33019,277 @@ pub(crate) const ATTN_PF3_DH: usize = 256;
 pub(crate) const ATTN_PF3_BQ: usize = 64;
 
 // ---------------------------------------------------------------------------
+// task 465: prefill attention v4 (K/V を bf16 で読む, `DENNO_PF_ATTN_KVBF16`)
+// ---------------------------------------------------------------------------
+//
+// `full` 段の GPU は 14k で 637.7 ms (lab t461d)、うち約 100 ms が qkv / out の
+// GEMM なので attention 本体は約 540 ms。v3 の 1 ブロックは 64 クエリ行で K/V の
+// タイルを 32 キーずつ読み、1 クエリ行あたりプレフィックス全体を読む: 14k の
+// 1 層で 219 ブロック x 24 head x 平均 7,010 キー x 512 次元 x 4 B x 2 本 = 75 GB、
+// 12 層で約 900 GB。540 ms は **1.67 TB/s で HBM の帯域 (1.79 TB/s) に張り付いて**
+// いる。クエリ行を増やす手は無い (sm_120 の動的 smem 上限 99 KB に対し v3 が
+// 89.6 KB、q_sm だけで 33.8 KB)。
+//
+// 一方、v3 は K/V を f32 で読み、smem へ入れるときに `__floats2bfloat162_rn` で
+// bf16 に丸めている = **カーネルが使う値は元から bf16**。そこで bf16 のミラーを
+// 1 本持ち、f32 のミラーから新チャンクの行だけを落として v4 に渡す。読みは
+// ちょうど半分になり、**値は 1 ビットも変わらない** (md5 SAME が期待値)。
+//
+// ゲート: `DENNO_PF_ATTN_KVBF16`。**既定 on** (lab t465a/t465b で採択)。
+// 切り戻しは `DENNO_PF_ATTN_KVBF16=0` (値は v3 と同じ)。
+
+/// v4 カーネルの静的共有メモリ (`kernels_attn_pf4.cu` の A4_SMEM_BYTES と一致)。
+pub(crate) const ATTN_PF4_SMEM_BYTES: usize = 89_600;
+/// v4 カーネルが前提にする head 次元 (`kernels_attn_pf4.cu` のスレッド配置)。
+pub(crate) const ATTN_PF4_DH: usize = 256;
+/// v4 カーネルが 1 ブロックで扱うクエリ行数 (ホストの grid y の分母)。
+pub(crate) const ATTN_PF4_BQ: usize = 64;
+/// v4 カーネルのスレッド数 (`A4_THREADS`)。
+pub(crate) const ATTN_PF4_THREADS: usize = 256;
+/// bf16 へ落とすカーネルのスレッド数 (`A4_CONV_THREADS`)。
+pub(crate) const ATTN_PF4_CONV_THREADS: usize = 256;
+
+/// `DENNO_PF_ATTN_KVBF16` の解釈 (純関数)。**既定 on** (lab t465a/t465b で採択)。
+///
+/// 実測 (depth8k、14k cold、2 ラウンド): `full` 段の GPU が 638.3 / 639.5 ms に
+/// 対して **552.7 / 552.7 ms (-13.4% / -13.6%)**、同段の wall が 826.7 / 833.8 に
+/// 対して 766.4 / 770.3 ms (-7.3% / -7.6%)。3,826 は同段が小さく差なし
+/// (round 2 で 108.0 対 107.9 ms)、decode も全 COND 11.3 ms/tok で不変、
+/// md5 は全 COND・全コンテキスト SAME、errors 0、text sane。
+/// 切り戻しは `DENNO_PF_ATTN_KVBF16=0`。
+pub(crate) fn pf_attn_kvbf16_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        // 未設定は既定 on。明示的な真値だけ on、`0` などで v3 へ戻す。
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+static PF_ATTN_KVBF16_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// prefill の attention を bf16 の K/V で回すか (**既定 off**)。
+pub(crate) fn pf_attn_kvbf16_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_ATTN_KVBF16_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_attn_kvbf16_from_value(std::env::var("DENNO_PF_ATTN_KVBF16").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn set_pf_attn_kvbf16_for_test(v: Option<bool>) {
+    PF_ATTN_KVBF16_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn pf_attn_pf4_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_ATTN4_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_attn_pf4.ptx"),
+    }
+}
+
+/// v4 の 2 つの入口 (attention 本体 + f32 -> bf16 の変換)。
+struct PfAttnV4 {
+    attn: CUfunction,
+    conv: CUfunction,
+}
+
+unsafe impl Send for PfAttnV4 {}
+unsafe impl Sync for PfAttnV4 {}
+
+/// v4 カーネルのハンドル (ゲート off / PTX 無し / opt-in 失敗は `None`)。
+///
+/// `None` のとき呼び出し側は v3 へ落ちる (fail closed)。
+fn pf_attn_pf4_kernels() -> Option<&'static PfAttnV4> {
+    static K: OnceLock<Option<PfAttnV4>> = OnceLock::new();
+    K.get_or_init(|| {
+        if !pf_attn_kvbf16_on() {
+            return None;
+        }
+        let path = pf_attn_pf4_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[pf-attn4] PTX が無い ({}) : {e} → v3 へ", path.display());
+                return None;
+            }
+        };
+        image.push(0);
+        let ctx = shared_ctx()?;
+        let _ = ctx;
+        let l = lib().ok()?;
+        unsafe {
+            let mut module: CUmodule = std::ptr::null_mut();
+            if (l.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[pf-attn4] PTX を読めない → v3 へ");
+                return None;
+            }
+            let mut attn: CUfunction = std::ptr::null_mut();
+            let mut conv: CUfunction = std::ptr::null_mut();
+            if (l.module_get_function)(
+                &mut attn,
+                module,
+                b"dno_attention_prefill4\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[pf-attn4] 入口 dno_attention_prefill4 が無い → v3 へ");
+                return None;
+            }
+            if (l.module_get_function)(
+                &mut conv,
+                module,
+                b"dno_kv_f32_to_bf16\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[pf-attn4] 入口 dno_kv_f32_to_bf16 が無い → v3 へ");
+                return None;
+            }
+            let ok = match l.func_set_attribute {
+                Some(fn_attr) => {
+                    (fn_attr)(
+                        attn,
+                        CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        ATTN_PF4_SMEM_BYTES as c_int,
+                    ) == 0
+                }
+                None => false,
+            };
+            if !ok {
+                eprintln!("[pf-attn4] 動的 smem の opt-in に失敗 → v3 へ");
+                return None;
+            }
+            eprintln!(
+                "[pf-attn4] K/V を bf16 で読む prefill attention を使う (smem {} B)",
+                ATTN_PF4_SMEM_BYTES
+            );
+            Some(PfAttnV4 { attn, conv })
+        }
+    })
+    .as_ref()
+}
+
+/// v4 用の bf16 K/V ミラー (1 本を層ごとに使い回す)。
+struct PfAttnV4Kv {
+    k: Option<DevBuffer>,
+    v: Option<DevBuffer>,
+    /// 次に変換する行 (0 から層の中で積み上がる。`pos0 == 0` でリセット)。
+    next_row: usize,
+    kv_dim: usize,
+}
+
+thread_local! {
+    static PF_ATTN_V4_KV: std::cell::RefCell<PfAttnV4Kv> = const {
+        std::cell::RefCell::new(PfAttnV4Kv { k: None, v: None, next_row: 0, kv_dim: 0 })
+    };
+}
+
+/// f32 のミラーの行 `[pos0, pos0 + nt)` を bf16 へ落とし、bf16 のポインタを返す。
+///
+/// 層優先 prefill は 1 層のチャンクを続けて回すので、`pos0` が前回の続き
+/// (`next_row`) と一致する限り差分だけ落とせばよい。`pos0 == 0` は層の先頭。
+/// 食い違ったら `None` を返して v3 へ落とす (誤った行を読ませない)。
+fn pf_attn_v4_kv_prepare(
+    kptr: CUdeviceptr,
+    vptr: CUdeviceptr,
+    pos0: usize,
+    nt: usize,
+    t_total: usize,
+    kv_dim: usize,
+) -> Option<(CUdeviceptr, CUdeviceptr)> {
+    let ctx = shared_ctx()?;
+    let fns = pf_attn_pf4_kernels()?;
+    PF_ATTN_V4_KV.with(|cell| {
+        let mut g = cell.borrow_mut();
+        if g.kv_dim != kv_dim {
+            g.k = None;
+            g.v = None;
+            g.kv_dim = kv_dim;
+            g.next_row = 0;
+        }
+        let need = t_total
+            .checked_add(t_total / 4 + 8192)?
+            .checked_mul(kv_dim)?
+            .checked_mul(2)?;
+        if need == 0 {
+            return None;
+        }
+        if g.k.as_ref().map(|b| b.bytes()).unwrap_or(0) < need {
+            let k = DevBuffer::alloc_tagged(need, crate::mem_audit::TAG_GEMV).ok()?;
+            let v = DevBuffer::alloc_tagged(need, crate::mem_audit::TAG_GEMV).ok()?;
+            g.k = Some(k);
+            g.v = Some(v);
+            g.next_row = 0;
+        }
+        if nt == 0 {
+            return None;
+        }
+        // 行 [from, pos0 + nt) を落とす。層の先頭 (pos0 == 0) と、前回の続き
+        // (next_row == pos0) は差分だけ。想定外の順 (逐次 prefill・確保し直し) は
+        // 0 からやり直す (読み手は常に [0, pos0+nt) しか見ない)。
+        let from = if pos0 == 0 || g.next_row > pos0 {
+            0
+        } else if g.next_row == pos0 {
+            pos0
+        } else {
+            // next_row < pos0: 途中の行が落ちていないので 0 から。
+            0
+        };
+        let rows = pos0 + nt - from;
+        let kb = g.k.as_ref()?.ptr();
+        let vb = g.v.as_ref()?.ptr();
+        // 行 [from, pos0+nt) を落とし、行 `from` から `rows` 行ぶん変換する。
+        let elems4 = (rows * kv_dim / 4).max(1);
+        let blocks = elems4
+            .div_ceil(ATTN_PF4_CONV_THREADS)
+            .min(65535) as u32;
+        let (mut a, mut b) = (kptr, vptr);
+        let mut c = kb;
+        let mut d = vb;
+        let (mut r0, mut n_c, mut kvd) =
+            (from as c_int, rows as c_int, kv_dim as c_int);
+        let mut args: Vec<*mut c_void> = vec![
+            &mut a as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut c as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut r0 as *mut _ as *mut c_void,
+            &mut n_c as *mut _ as *mut c_void,
+            &mut kvd as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(
+                fns.conv,
+                (blocks, 1, 1),
+                (ATTN_PF4_CONV_THREADS as u32, 1, 1),
+                0,
+                &mut args,
+            )
+            .ok()?;
+        }
+        g.next_row = pos0 + nt;
+        Some((kb, vb))
+    })
+}
+
+
+// ---------------------------------------------------------------------------
 // task 369: full 層の K/V 書き戻しを非同期にする (`DENNO_PF_KV_ASYNC`)
 // ---------------------------------------------------------------------------
 //
@@ -33448,6 +33719,17 @@ pub fn pf_full_out(
                     && !ctx.f_attn_pf2.is_null();
                 let (mut qp, mut kp, mut vp, mut ap) =
                     (qb.ptr(), kptr, vptr, attb.ptr());
+                // task 465: K/V を bf16 にした v4 が撃てるなら最優先。撃てなければ
+                // v3 -> v2 -> 従来へ fail closed (値はどれも同じ丸め順)。
+                let v4kv = if dh == ATTN_PF4_DH && qd == heads * dh && nt >= ATTN_PF4_BQ {
+                    pf_attn_v4_kv_prepare(kptr, vptr, pos0, nt, t_total, kv_dim)
+                } else {
+                    None
+                };
+                if let Some((kb, vb)) = v4kv {
+                    kp = kb;
+                    vp = vb;
+                }
                 let (mut heads_c, mut n_c, mut pos0_c) =
                     (heads as c_int, nt as c_int, pos0 as c_int);
                 let (mut kvd_c, mut t_c, mut group_c, mut dh_c) = (
@@ -33471,7 +33753,18 @@ pub fn pf_full_out(
                     &mut dh_c as *mut _ as *mut c_void,
                     &mut scale_c as *mut _ as *mut c_void,
                 ];
-                if use_v3 {
+                let v4f = if v4kv.is_some() { pf_attn_pf4_kernels() } else { None };
+                if let Some(fns) = v4f {
+                    unsafe {
+                        ctx.launch_async(
+                            fns.attn,
+                            (heads as u32, nt.div_ceil(ATTN_PF4_BQ) as u32, 1),
+                            (ATTN_PF4_THREADS as u32, 1, 1),
+                            ATTN_PF4_SMEM_BYTES as u32,
+                            &mut args,
+                        )?;
+                    }
+                } else if use_v3 {
                     unsafe {
                         ctx.launch_async(
                             ctx.f_attn_pf3,
@@ -46863,6 +47156,19 @@ mod tests {
         }
         for v in ["", "1", "on", "true", " ON ", " TRUE ", "yes"] {
             assert!(parse_gguf_gemv_v5(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 465: `DENNO_PF_ATTN_KVBF16` は既定 on (lab t465a/t465b で採択)。
+    /// 切り戻しは明示的な `0` など。
+    #[test]
+    fn pf_attn_kvbf16_gate_truth_table() {
+        assert!(pf_attn_kvbf16_from_value(None), "未設定は既定 on");
+        for v in ["", "0", "off", "false", "no", "2"] {
+            assert!(!pf_attn_kvbf16_from_value(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", " TRUE ", "yes"] {
+            assert!(pf_attn_kvbf16_from_value(Some(v)), "raw={v:?}");
         }
     }
 
