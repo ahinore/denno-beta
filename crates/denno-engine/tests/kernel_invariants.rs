@@ -13710,6 +13710,9 @@ fn task468_full_mix_nowait_wiring() {
         "入力が空で mix の控えも無い (DENNO_MIX_NOWAIT=full の前提が崩れた)",
         "入力をデバイスから読む回で device 経路が走らなかった",
         "if cur.len() != self.n_embd && !cur.is_empty() {",
+        // `FullAttn::forward` (anyhow 版) の入口の長さ検査も空を通す。
+        "if cur.len() != self.n_embd && !cur_dev {",
+        "FullAttn::forward: 入力が空の層で QSA は回せない",
     ] {
         assert!(attn.contains(s), "qwen4exp_attn.rs に {s} が無い");
     }

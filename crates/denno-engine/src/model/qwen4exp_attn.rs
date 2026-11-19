@@ -2094,12 +2094,23 @@ impl FullAttn {
             crate::cuda::dec_kprof::cur_pos(),
             0,
         );
-        if cur.len() != self.n_embd {
+        // task 468: 空は「入力はデバイス側 (mix の鎖の `mixed`)」の合図。長さの
+        // 検査は `forward_token_impl` / `dev_forward` が行い、device 経路が
+        // 走らなければ要求を落とす (空のまま CPU 経路へ落ちない)。
+        let cur_dev = cur.is_empty();
+        if cur.len() != self.n_embd && !cur_dev {
             bail!(
                 "FullAttn::forward: 入力長 {} が n_embd = {} と違う",
                 cur.len(),
                 self.n_embd
             );
+        }
+        // QSA は生キーを `cur` から作るので、空の入力では回せない (fail loud)。
+        if cur_dev {
+            #[cfg(feature = "cuda")]
+            if self.qsa.as_ref().is_some_and(|q| q.is_qsa(layer)) {
+                bail!("FullAttn::forward: 入力が空の層で QSA は回せない");
+            }
         }
         let Some(slot) = self.layers.get(layer) else {
             bail!("FullAttn::forward: 層 {layer} は範囲外 (n_layer = {})", self.layers.len());
