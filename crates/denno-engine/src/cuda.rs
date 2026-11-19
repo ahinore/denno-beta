@@ -35044,6 +35044,10 @@ pub fn maybe_gpu_mix_q_chain_into(
     // task 282: GPU の鎖を積んだあと・待つ前にホストで走らせる仕事
     // (hc_inject の GEMV。GPU が遊んでいる間に出せるので待ちに隠れる)。
     pre_wait: Option<&mut dyn FnMut() -> Result<()>>,
+    // task 464: 呼び出し側が「`mixed` をホストで読まない」と言っているか
+    // (`DENNO_MIX_NOWAIT`)。true なら D2H を撃たず、イベントも待たない
+    // (次の鎖 or 後続の GDN submission の同期にまとめる)。
+    defer: bool,
 ) -> bool {
     use std::sync::atomic::Ordering as AO;
     // task 364: ルータ GEMV をこの鎖に載せにいく回数 (テスト専用。GPU 無しでも
@@ -35125,6 +35129,13 @@ pub fn maybe_gpu_mix_q_chain_into(
     let mut pre_wait = pre_wait;
     // task 364: 鎖の末尾に積むルータ GEMV の重み (同期の後まで生かす)。
     let mut router_w: Option<GgufWRef> = None;
+    // task 464: 前回 defer した鎖がまだ流れていれば、scratch (`stage` / `hx`) を
+    // 上書きする前に待つ。実際には直後の GDN submission が同期しているので
+    // ここで待つことはほぼ無い (イベントは完了済み)。
+    if let Err(err) = mix_pending_drain() {
+        mix_gpu_broken_once(&format!("mix pending wait: {err:#}"));
+        return false;
+    }
     let r = MIX_GPU_SC.with(|cell| -> Result<()> {
         let _kp_win = dec_kprof::window(
             dec_kprof::MIX,
@@ -35666,7 +35677,10 @@ pub fn maybe_gpu_mix_q_chain_into(
         if enq != 0 {
             ROUTER_IN_QCHAIN_HITS.fetch_add(1, AO::Relaxed);
         }
-        if !zc_out {
+        // task 464: defer の回は `mixed` をホストへ降ろさない (GDN が `dm` を
+        // そのまま読む)。降ろさないので下のイベント待ちも要らない。
+        let mut d2h_done = false;
+        if !zc_out && !defer {
             let kp_cp = dec_kprof::op_begin(
                 || "D2H@a".to_string(),
                 (0, 0, 0),
@@ -35680,6 +35694,7 @@ pub fn maybe_gpu_mix_q_chain_into(
                     "cuMemcpyDtoHAsync (mix q chain)",
                 )?;
             }
+            d2h_done = true;
             dec_kprof::op_end(kp_cp);
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
@@ -35718,9 +35733,26 @@ pub fn maybe_gpu_mix_q_chain_into(
         // 上げ直し (非ブロッキングストリーム) まで待ってしまうので使わない
         // (task 278 の層一括経路と同じ理由)。イベントが張れない環境だけ
         // 従来どおり文脈同期へ落とす。
+        // task 464: defer の回はイベントを打つだけで待たない (後続の GDN
+        // submission が同じ null ストリームの最後で待つ)。イベントが張れない
+        // 環境だけは降ろし直してから文脈同期する (defer しない)。
+        let mut deferred = false;
         if seg_ev::record_raw(8) {
-            seg_ev::wait(8)?;
+            if defer {
+                deferred = true;
+                MIX_PENDING_EV.with(|c| c.set(true));
+            } else {
+                seg_ev::wait(8)?;
+            }
         } else {
+            if defer && !zc_out && !d2h_done {
+                unsafe {
+                    check(
+                        (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
+                        "cuMemcpyDtoHAsync (mix q chain defer 落ち)",
+                    )?;
+                }
+            }
             ctx.sync()?;
         }
         // task 392: この鎖が作った `mixed` (= 次の段の入力 cur) のデバイス
@@ -35731,15 +35763,22 @@ pub fn maybe_gpu_mix_q_chain_into(
         }
         // task 364: 鎖に積んだルータ GEMV の重み参照を手放す (同期の後)。
         drop(router_w);
-        dec_kprof::step("mix_pack", || {
-            if zc_out {
-                // task 382: hc_mixed がホストの pinned へ直接書いている。
-                let m = omap.as_ref().expect("確保済み");
-                out.copy_from_slice(&m.pin.as_slice::<f32>()[..e]);
-            } else {
-                out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
-            }
-        });
+        if deferred {
+            // task 464: ホスト値は作らない (呼び出し側は空の Vec を受け取る)。
+            MIX_DEFERRED.with(|c| c.set(true));
+            MIX_NOWAIT_HITS.fetch_add(1, AO::Relaxed);
+        } else {
+            MIX_DEFERRED.with(|c| c.set(false));
+            dec_kprof::step("mix_pack", || {
+                if zc_out {
+                    // task 382: hc_mixed がホストの pinned へ直接書いている。
+                    let m = omap.as_ref().expect("確保済み");
+                    out.copy_from_slice(&m.pin.as_slice::<f32>()[..e]);
+                } else {
+                    out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+                }
+            });
+        }
         // task 382: 比較モード (`DENNO_MIX_UPQ8=check`) — 従来の 3 本の出力
         // (`ho`) と融合版の出力 (`hchk`) を突き合わせる。値を変えないので
         // テキストと md5 は従来経路のまま。
@@ -46172,6 +46211,55 @@ mod tests {
         }
     }
 
+    /// task 464: `DENNO_MIX_NOWAIT` は既定 off・明示的な真値だけ on。
+    #[test]
+    fn task464_mix_nowait_gate_truth_table() {
+        assert!(!mix_nowait_from_value(None), "未設定は既定 off (lab で採否)");
+        for v in ["", "0", "off", "false", "no", "2", " on?", "all"] {
+            assert!(!mix_nowait_from_value(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", "yes", " YES ", "ssm", " SSM "] {
+            assert!(mix_nowait_from_value(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// task 464: 発火の証拠の行 (1 層も通らなければ出さない)。
+    #[test]
+    fn task464_mix_nowait_line_counts_layers() {
+        assert_eq!(mix_nowait_line_with(0, 0), None, "0 層なら出さない");
+        let l = mix_nowait_line_with(36, 36).expect("defer した層があれば出す");
+        assert!(l.contains("deferred_layers=36"), "{l}");
+        assert!(l.contains("alias_layers=36"), "{l}");
+        // alias だけ立った回 (defer 0) でも出す = 「前提は揃ったが defer していない」
+        // ことが読める。
+        let a = mix_nowait_line_with(0, 5).expect("alias だけでも出す");
+        assert!(a.contains("deferred_layers=0"), "{a}");
+    }
+
+    /// task 464: defer の印は既定 false で、読むと消える。
+    #[test]
+    fn task464_mix_take_deferred_is_one_shot() {
+        crate::cuda::mix_nowait_reset();
+        assert!(!mix_take_deferred(), "既定で defer になっている");
+        MIX_DEFERRED.with(|c| c.set(true));
+        assert!(mix_take_deferred(), "印が読めない");
+        assert!(!mix_take_deferred(), "2 回目も true (消えていない)");
+    }
+
+    /// task 464: 控えの有無は消費せずに読める (ssm 側の前提検査に使う)。
+    #[test]
+    fn task464_gdn_x_in_mix_armed_does_not_consume() {
+        gdn_x_mix_reset();
+        assert!(!gdn_x_in_mix_armed(4608), "空なのに armed");
+        gdn_x_in_mix_arm(0x1234_5000, 4608);
+        assert!(gdn_x_in_mix_armed(4608), "控えがあるのに armed でない");
+        assert!(!gdn_x_in_mix_armed(2304), "要素数が違うのに armed");
+        // 読んでも消えない = そのあと GDN が取れる。
+        assert_eq!(gdn_x_in_mix_take(4608), Some(0x1234_5000), "控えが消えた");
+        assert!(!gdn_x_in_mix_armed(4608), "取った後も armed");
+        gdn_x_mix_reset();
+    }
+
     /// task 392: `DENNO_GDN_X_MIX` は既定 on (lab t392c で採否)・明示的な偽値だけ off。
     #[test]
     fn gdn_x_mix_gate_truth_table() {
@@ -46328,6 +46416,7 @@ mod tests {
             &xn,
             &mut out,
             None,
+            false,
         );
         assert!(!ran, "CUDA 無しで mix の鎖が走った");
         assert_eq!(
@@ -46358,6 +46447,7 @@ mod tests {
             &xn,
             &mut out,
             None,
+            false,
         );
         assert_eq!(router_in_qchain_arms(), 0, "ゲート off なのに数えた");
         router_in_mix_set_for_test(None);
@@ -61641,6 +61731,104 @@ pub fn gdn_x_mix_reset() {
     GDN_X_LEN.store(0, Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// task 464: ssm 層の attn mix で鎖の待ちを GDN の同期へ後ろ倒しにする
+// (`DENNO_MIX_NOWAIT`)
+// ---------------------------------------------------------------------------
+//
+// decode 1 トークンは mix の Q8_0 鎖 (`maybe_gpu_mix_q_chain_into`) を 97 回
+// 呼び、そのたびに `cuEventSynchronize` 1 本で待つ。ssm 層 (36 層) の **attn の
+// mix** に限れば、鎖の出力 `mixed` をホストで読む相手が居ない:
+//
+// - 直後の GDN submission は `DENNO_GDN_X_MIX` でデバイスの `dm` をそのまま読む
+//   (ホストの `cur` は使わない)。
+// - inject (`ij`) は鎖の外でホストが計算する (`pre_wait`)。
+// - router GEMV が鎖に載るのは ffn の mix だけで、その回は defer しない。
+//
+// よって (a) `mixed` の D2H を撃たず、(b) 鎖のイベントを待たずに GDN の
+// submission (同じ null ストリーム) の最後の D2H 待ちへまとめられる。値は同じ
+// バイト列 (ホストへ降ろさないだけ) なのでビット一致。
+//
+// 次に鎖を呼ぶときは scratch (`stage` / `hx`) を上書きする前に前回のイベントを
+// 待つ ([`mix_pending_drain`])。実際にはその前に GDN が同期しているので待ちは
+// ほぼ 0。イベントが張れない環境では従来どおり文脈同期して defer しない。
+//
+// **既定 off** (lab で採否を決める)。`1` / `on` / `ssm` で on。
+pub const MIX_NOWAIT_ENV: &str = "DENNO_MIX_NOWAIT";
+
+/// [`MIX_NOWAIT_ENV`] の解釈 (純関数)。
+fn mix_nowait_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes") | Some("ssm")
+    )
+}
+
+/// `DENNO_MIX_NOWAIT` が有効か (プロセスで 1 回だけ env を読む)。
+pub(crate) fn mix_nowait_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_nowait_from_value(std::env::var(MIX_NOWAIT_ENV).ok().as_deref()))
+}
+
+thread_local! {
+    /// 前回 defer した鎖のイベントをまだ待っていない (= 次の鎖の入口で待つ)。
+    static MIX_PENDING_EV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 直前の鎖が defer したか (呼び出し側が読んで消す)。
+    static MIX_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// defer した層数 (発火の証拠 `[mix-nowait]`)。
+static MIX_NOWAIT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// 前回 defer した鎖の完了を待つ (scratch を上書きする前に呼ぶ)。
+fn mix_pending_drain() -> Result<()> {
+    if MIX_PENDING_EV.with(|c| c.replace(false)) {
+        seg_ev::wait(8)?;
+    }
+    Ok(())
+}
+
+/// 直前の鎖が defer したか (読むと消える)。
+///
+/// `true` のとき `out` (mixed) はホストへ降ろされていない = ホスト値は不定。
+pub(crate) fn mix_take_deferred() -> bool {
+    MIX_DEFERRED.with(|c| c.replace(false))
+}
+
+/// 控え (`mixed` のデバイスコピー) が要素数 `n` で置かれているか (消費しない)。
+///
+/// ssm 層が「入力はデバイス側にある」と判定するために使う。
+pub(crate) fn gdn_x_in_mix_armed(n: usize) -> bool {
+    GDN_X_LEN.load(Ordering::Relaxed) == n as u64 && GDN_X_PTR.load(Ordering::Relaxed) != 0
+}
+
+/// defer した層数の行 (ゲート on で 1 層も通らなければ `None`)。
+pub fn mix_nowait_line() -> Option<String> {
+    mix_nowait_line_with(
+        MIX_NOWAIT_HITS.load(Ordering::Relaxed),
+        GDN_X_MIX_HITS.load(Ordering::Relaxed),
+    )
+}
+
+/// [`mix_nowait_line`] の本体 (テストで両側を踏めるように引数で受ける)。
+fn mix_nowait_line_with(deferred: u64, alias_hits: u64) -> Option<String> {
+    if deferred == 0 && alias_hits == 0 {
+        return None;
+    }
+    Some(format!(
+        "[mix-nowait] deferred_layers={deferred} alias_layers={alias_hits}"
+    ))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+///
+/// `MIX_PENDING_EV` は残す (defer した鎖がまだ流れているかもしれないので、次の
+/// 鎖の入口で待たせる)。
+pub fn mix_nowait_reset() {
+    MIX_NOWAIT_HITS.store(0, Ordering::Relaxed);
+    MIX_DEFERRED.with(|c| c.set(false));
+}
+
 /// `gdn_decode_submit` のリクエスト。
 pub struct GdnDecodeReq<'a> {
     /// SsmLayer インスタンスの nonce (ストアの鍵)。
@@ -62387,6 +62575,15 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         } else {
             None
         };
+        // task 464: mix の鎖を defer した回は `req.cur` が空で来る。控えが無いまま
+        // 進むと 0 バイトを staging に積んで黙って壊れた値を出すので、ここで落とす。
+        if x_alias.is_none() && req.cur.len() < req.n_embd {
+            bail!(
+                "gdn decode: 入力 cur が {} 要素 (n_embd={}) で mix の控えも無い (DENNO_MIX_NOWAIT の前提が崩れた)",
+                req.cur.len(),
+                req.n_embd
+            );
+        }
         // task 140: cur / beta / alpha を 1 本の staging に詰めて **H2D 1 回**で
         // 上げる (以前は同期 H2D 3 回。値・並びは同一で、カーネルへ渡す
         // ポインタだけが xba の先頭/中間を指す)。

@@ -12756,8 +12756,9 @@ fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
         "mdev が融合版の起動より後ろにある (pout に渡せない)"
     );
     // D2H は zc_out のときだけ省く (従来は同じ判定)。
+    // task 464: defer (ssm 層の attn mix) の回も省くので、門番は `!zc_out && !defer`。
     assert!(
-        f.contains("if !zc_out {"),
+        f.contains("if !zc_out && !defer {"),
         "D2H の門番が消えている"
     );
     // (2) H2D 専用の非ブロッキングストリーム。
@@ -13439,5 +13440,110 @@ fn task457_pf_elem_off_path_keeps_old_kernels() {
         "\"[pf-elem] {tag} grid={}x{}x{} threads={threads} {detail}\"",
     ] {
         assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 464: ssm 層の attn mix で鎖の待ちを GDN の同期へ後ろ倒しにする
+// (`DENNO_MIX_NOWAIT`)
+// ---------------------------------------------------------------------------
+//
+// 新しい `.cu` は無い (カーネルは 1 本も変えない)。固定するのは配線だけ:
+//   - 門は既定 off・明示的な真値だけ on
+//   - 鎖は defer の回に D2H を撃たず、イベントも待たない (待ちは次の鎖 or GDN)
+//   - 呼ぶのは ssm 層の attn mix だけ (ffn の mix は router が載るので defer しない)
+//   - 空の入力を渡された ssm 側は、控えが無ければ**要求を落とす** (黙って 0 で
+//     計算しない)
+#[test]
+fn task464_mix_nowait_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let host = std::fs::read_to_string(root.join("src/model/qwen4exp.rs"))
+        .expect("qwen4exp.rs が読めない");
+    let ssm = std::fs::read_to_string(root.join("src/model/qwen4exp_ssm.rs"))
+        .expect("qwen4exp_ssm.rs が読めない");
+
+    // 1. cuda.rs: 門・defer の実装・GDN 側の前提検査。
+    for s in [
+        "pub const MIX_NOWAIT_ENV: &str = \"DENNO_MIX_NOWAIT\";",
+        "fn mix_nowait_from_value(v: Option<&str>) -> bool {",
+        "pub(crate) fn mix_nowait_on() -> bool {",
+        "fn mix_pending_drain() -> Result<()> {",
+        "pub(crate) fn mix_take_deferred() -> bool {",
+        "pub(crate) fn gdn_x_in_mix_armed(n: usize) -> bool {",
+        "pub fn mix_nowait_line() -> Option<String> {",
+        // 鎖の入口: 前回の defer を scratch の上書き前に待つ。
+        "if let Err(err) = mix_pending_drain() {",
+        // 引数 (`defer`) と、D2H を撃たない条件。
+        "    defer: bool,\n) -> bool {",
+        "if !zc_out && !defer {",
+        // 待ちを省く分岐 (defer のときは record だけで wait しない)。
+        "if seg_ev::record_raw(8) {\n            if defer {",
+        "MIX_PENDING_EV.with(|c| c.set(true));",
+        // イベントが張れない環境では降ろし直して文脈同期する (defer しない)。
+        "\"cuMemcpyDtoHAsync (mix q chain defer 落ち)\"",
+        // ホスト値を作らない + 発火の計数。
+        "MIX_DEFERRED.with(|c| c.set(true));",
+        "MIX_NOWAIT_HITS.fetch_add(1, AO::Relaxed);",
+        // GDN: 空の cur で控えも無いときは落とす。
+        "で mix の控えも無い (DENNO_MIX_NOWAIT の前提が崩れた)",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+
+    // 2. 呼ぶのは ssm 層の attn mix だけ。defer の入口は 1 箇所 (定義 + 1 呼び出し)。
+    assert_eq!(
+        host.matches("hc_mix_quant_defer(").count(),
+        2,
+        "hc_mix_quant_defer の呼び出しが 1 箇所でない (ffn の mix に足していないか)"
+    );
+    for s in [
+        "pub(crate) fn hc_mix_quant_defer(",
+        "let mix_defer = crate::cuda::mix_nowait_on()",
+        "&& crate::cuda::gdn_x_mix_on()",
+        "&& crate::cuda::gdn_gpu_scan_on()",
+        "&& crate::cuda::gdn_ba_gpu_on()",
+        "&& gdn_gpu_win::active()",
+        "&& matches!(self.p.layer_kind(il), Ok(LayerKind::Ssm))",
+        "&& hook.is_none();",
+        "if mix_defer {\n                    hc_mix_quant_defer(",
+        // 鎖が defer したら空の Vec を返す (ホスト値は降りていない)。
+        "chain2_mixed = Some(if crate::cuda::mix_take_deferred() {",
+    ] {
+        assert!(host.contains(s), "qwen4exp.rs に {s} が無い");
+    }
+    // 既定経路 (ゲート off) は従来の `hc_mix_quant` のまま。
+    assert!(
+        host.contains("                } else {\n                    hc_mix_quant(\n                        res,"),
+        "off 側が従来の hc_mix_quant でない"
+    );
+
+    // 3. ssm: 空の入力を「控えがあるときだけ」許し、GPU 経路が decline したら落とす。
+    for s in [
+        "let deferred = cur.is_empty();",
+        "if deferred && !crate::cuda::gdn_x_in_mix_armed(self.p.n_embd) {",
+        "SsmLayer::forward_token: 入力が空で mix の控えも無い",
+        "SsmLayer::forward_token: defer したが入力をデバイスから読めなかった",
+        "SsmLayer::forward_token: 入力が空で ba をホスト計算できない",
+    ] {
+        assert!(ssm.contains(s), "qwen4exp_ssm.rs に {s} が無い");
+    }
+    // 空の入力は長さ検査を素通りするので、`!deferred` で従来の検査を残していること。
+    assert!(
+        ssm.contains("if !deferred && cur.len() != self.p.n_embd {"),
+        "従来の長さ検査が deferred で消えている"
+    );
+
+    // 4. 発火の証拠を serve_flash が出す。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::gpu_report::mix_nowait_line()"),
+        "serve_flash.rs が [mix-nowait] を出さない"
+    );
+    for s in [
+        "pub fn mix_nowait_line() -> Option<String> {",
+        "pub fn mix_nowait_reset() {",
+    ] {
+        let rep = std::fs::read_to_string(root.join("src/gpu_report.rs"))
+            .expect("gpu_report.rs が読めない");
+        assert!(rep.contains(s), "gpu_report.rs に {s} が無い");
     }
 }
