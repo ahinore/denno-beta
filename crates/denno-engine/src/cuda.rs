@@ -46902,22 +46902,27 @@ mod tests {
         }
     }
 
-    /// task 468: `DENNO_MIX_NOWAIT=full` の解釈 (既存 env の値。新しい env 名は足さない)。
+    /// task 468: `DENNO_MIX_NOWAIT` の full 層の解釈 (既存 env の値。新しい env 名は
+    /// 足さない)。**既定 on** (lab t468c で採否)。
     ///
-    /// 既定 (未設定 / `1` / 真値) では ssm 層だけを defer する (`false`)。
+    /// 切り戻しは `=ssm` (ssm の defer は残して full だけ止める) か `=0` / `=off`。
     #[test]
     fn task468_mix_nowait_full_gate_truth_table() {
-        assert!(!mix_nowait_full_from_value(None), "未設定は full を defer しない");
-        for v in ["0", "off", "false", "no", "1", "on", "true", "yes", "ssm", ""] {
+        assert!(mix_nowait_full_from_value(None), "未設定は既定 on (lab t468c で採否)");
+        for v in ["0", "off", "false", "no", "ssm", " SSM ", ""] {
             assert!(!mix_nowait_full_from_value(Some(v)), "raw={v:?}");
         }
-        for v in ["full", " FULL ", "all", " All "] {
+        for v in ["full", " FULL ", "all", " All ", "1", "on", "true", "yes", "2"] {
             assert!(mix_nowait_full_from_value(Some(v)), "raw={v:?}");
         }
-        // `full` は ssm の defer も on のまま (既存の解釈を壊さない)。
-        assert!(mix_nowait_from_value(Some("full")));
+        // `full` / 真値は ssm の defer も on のまま (既存の解釈を壊さない)。
+        for v in ["full", "1", "on"] {
+            assert!(mix_nowait_from_value(Some(v)), "raw={v:?}");
+        }
         // 偽値は ssm も full も落とす。
         assert!(!mix_nowait_from_value(Some("0")) && !mix_nowait_full_from_value(Some("0")));
+        // `ssm` は ssm だけ on (full は off)。
+        assert!(mix_nowait_from_value(Some("ssm")) && !mix_nowait_full_from_value(Some("ssm")));
     }
 
     /// task 468: `[mix-nowait-full]` は 1 層も通らなければ出さない。
@@ -62489,13 +62494,16 @@ pub(crate) fn mix_nowait_on() -> bool {
 // の入口の drain へ移るが、その前に full attention の 5 起動と同期が入るので
 // 待ちはほぼ 0 になる。
 //
-// **既定 off** (`DENNO_MIX_NOWAIT=full` で on。ssm の defer も同時に on)。
+// **既定 on** (lab t468c で採否: 14k 後の decode が 12.3 -> 12.0 ms/token、
+// 短い decode と prefill は不変、md5 全 SAME)。切り戻しは `DENNO_MIX_NOWAIT=ssm`
+// (ssm の defer は残して full だけ止める) か `=0` (両方止める)。
 // 既存の env に値を足す形にした (lab の COND は新しい env 名を落とすことがある)。
 fn mix_nowait_full_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("full") | Some("all")
-    )
+    match v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref() {
+        None => true,
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("") | Some("ssm") => false,
+        _ => true,
+    }
 }
 
 /// `DENNO_MIX_NOWAIT=full` (full 層も defer) か。プロセスで 1 回だけ読む。
