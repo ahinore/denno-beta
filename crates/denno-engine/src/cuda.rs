@@ -2285,6 +2285,44 @@ pub(crate) mod dec_full_dev {
         FULL_X_DEV_HITS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// task 468: ミラーが「この層の 1 行追記」を受けられる状態か (書かずに見るだけ)。
+    ///
+    /// [`mirror_append`] の前提検査と同じ条件を、書き込み無しで評価する。
+    /// defer の可否 (入力の H2D を省いてよいか) を mix の前に決めるために使う
+    /// (種の無いミラーで `forward` が `None` を返すと要求が落ちるため)。
+    pub(crate) fn mirror_ready(
+        cache_id: u64,
+        n_layer: usize,
+        kv_dim: usize,
+        layer: usize,
+        gen: u64,
+        len: usize,
+    ) -> bool {
+        if len == 0 || layer >= n_layer {
+            return false;
+        }
+        let Some(mirrors) = Q4_ATTN_MIRRORS.get() else {
+            return false;
+        };
+        let ms = match mirrors.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let Some((_, m, _)) = ms.iter().find(|(k, _, _)| *k == cache_id) else {
+            return false;
+        };
+        if m.kv_dim != kv_dim || m.state.len.len() != n_layer {
+            return false;
+        }
+        if m.k[layer].is_none() || m.v[layer].is_none() {
+            return false;
+        }
+        if len > m.state.cap || q4_mirror_cap(len, m.state.cap) > m.state.cap {
+            return false;
+        }
+        q4_mirror_have(&m.state, layer, len, gen) + 1 == len
+    }
+
     /// task 468: 「この呼び出しはデバイス入力を読める形か」を**ホスト側だけで**
     /// 判定する (mix の鎖の D2H と待ちを省いてよいかの事前検査)。
     ///

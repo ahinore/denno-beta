@@ -2640,7 +2640,20 @@ impl LayerAttn for FullAttn {
             let Ok(len) = self.cache.len(layer) else {
                 return false;
             };
+            let Ok(gen) = self.cache.gen(layer) else {
+                return false;
+            };
             crate::cuda::dec_full_dev::dev_input_ok(len + 1)
+                // 種の無いミラー (新しい文脈の最初の層) では device 経路が
+                // 従来経路へ落ちるので defer しない (その回はホストの cur が要る)。
+                && crate::cuda::dec_full_dev::mirror_ready(
+                    self.cache.id(),
+                    self.cache.n_layer(),
+                    self.cache.n_head_kv() * self.cache.head_dim(),
+                    layer,
+                    gen,
+                    len + 1,
+                )
         }
         #[cfg(not(feature = "cuda"))]
         {

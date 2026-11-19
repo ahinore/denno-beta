@@ -13676,6 +13676,8 @@ fn task468_full_mix_nowait_wiring() {
         "note_full_x_dev_hit();",
         "FULL_X_DEV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);",
         // 事前検査 (ホストだけで判定できる範囲) と、形の検査は cur が空でも通す。
+        "pub(crate) fn mirror_ready(",
+        "q4_mirror_have(&m.state, layer, len, gen) + 1 == len",
         "pub(crate) fn dev_input_ok(len: usize) -> bool {",
         "&& len <= 65535",
         "&& (self.x_dev.is_some() || self.cur.len() == self.qkv_k)",
@@ -13705,6 +13707,8 @@ fn task468_full_mix_nowait_wiring() {
     for s in [
         "fn takes_dev_input(&self, layer: usize) -> bool {",
         "crate::cuda::dec_full_dev::dev_input_ok(len + 1)",
+        // 種の無いミラーでは device 経路が従来経路へ落ちるので defer しない。
+        "crate::cuda::dec_full_dev::mirror_ready(", 
         "let x_dev = if cur.is_empty() {",
         "match crate::cuda::full_x_in_mix_take(self.n_embd) {",
         "入力が空で mix の控えも無い (DENNO_MIX_NOWAIT=full の前提が崩れた)",
