@@ -10342,7 +10342,7 @@ fn t470_early_route_is_wired() {
     // ゲートと純関数が exp_pf にある。
     for k in [
         "pub const EARLY_ROUTE_ENV: &str = \"DENNO_PF_EARLY_ROUTE\"",
-        "pub const DEFAULT_EARLY_ROUTE: bool = false",
+        "pub const DEFAULT_EARLY_ROUTE: bool = true",
         "pub fn early_route_on(",
         "pub fn early_route_budget(",
         "pub fn early_route_mb(",
@@ -10382,7 +10382,8 @@ fn t470_early_route_is_wired() {
         "crate::model::exp_pf::rc_stopped()",
         "crate::model::exp_pf::read_part_ptr(",
         "crate::model::exp_pf::early_route_budget(",
-        "crate::model::exp_pf::early_route_mode(",
+        "ram_peek(lw, ei)",
+        "crate::model::exp_pf::pread_on()",
         "w.slice_abs(ei)",
         "note_early_route(",
     ] {

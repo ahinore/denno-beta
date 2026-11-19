@@ -2998,28 +2998,31 @@ pub fn layer_pre_stats_reset() {
 // 値は 1 バイトも変えない (router の結果は先読みにしか使わず、MoE は従来どおり
 // 全トークンで routing を解き直す)。ゲート off では分岐 1 回だけ。
 
-/// `DENNO_PF_EARLY_ROUTE`: 1 チャンク目の routing で選ばれた expert を先読みする。
-/// **既定 off** (lab で採否を決める)。
+/// `DENNO_PF_EARLY_ROUTE`: 1 チャンク目の routing で選ばれた expert を先読みし、
+/// **RAM の置き場**へ置く (MoE の写しがそこから memcpy する)。**既定 on**
+/// (task 474 の lab t474b で採用)。
 ///
 /// - `0` / `off` — 従来 (先読みしない)
-/// - `1` / `on` — `readahead(2)` でページキャッシュへ投げるだけ (待たない)
-/// - `2` — 背景スレッドで `pread` して捨てる (確実にディスクを回す)
+/// - `1` / `on` — 置き場へ読む (残りの窓が 4 チャンク以上ある層だけ)
+/// - `2` / `pread` — `1` と同じ (task 470 の pread 版の名前。互換のため残す)
+///
+/// task 470 の `readahead(2)` / 「pread して捨てる」はページキャッシュに残らず
+/// `copy_s` が投げたぶんの 11-28% しか縮まなかったので、task 474 で置き場を
+/// プロセスが持つ形に変えた (lab t474b: 14k cold で -25%、3,826 はゲート on でも
+/// 1 命令も変わらない = 残り 1 チャンクの窓には収まらないので先読みしない)。
 pub const EARLY_ROUTE_ENV: &str = "DENNO_PF_EARLY_ROUTE";
 
-/// [`EARLY_ROUTE_ENV`] の既定 (測るまで off)。
-pub const DEFAULT_EARLY_ROUTE: bool = false;
+/// [`EARLY_ROUTE_ENV`] の既定 (task 474 で on)。
+pub const DEFAULT_EARLY_ROUTE: bool = true;
 
-/// ゲートの解釈 (純関数)。`1` 系は readahead、`2` だけ pread。
-///
-/// lab t470b: `1` (readahead) は 3,826 で 1 リクエスト 2.4-4.6 GB 投げたのに
-/// `copy_s` が 0.05-0.09 s しか縮まなかった (投げたぶんの 1 割程度しか
-/// ページキャッシュに載っていない)。`readahead(2)` が効かない環境なので、
-/// `2` の pread 版を足した。
+/// ゲートの解釈 (純関数)。未設定は既定 (on)、`0` 系だけが偽。
 pub fn early_route_mode_from_value(v: Option<&str>) -> u8 {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("2") | Some("pread") => 2,
         Some("1") | Some("on") | Some("true") | Some("yes") => 1,
-        _ => 0,
+        Some("0") | Some("off") | Some("false") | Some("no") => 0,
+        // 未設定 / 空 / 解析不能は既定。
+        _ => u8::from(DEFAULT_EARLY_ROUTE),
     }
 }
 
@@ -4192,29 +4195,31 @@ mod tests {
         assert_eq!(layer_pre_stats(), "");
     }
 
-    /// task 470: 1 チャンク目の routing による先読みのゲートは既定 off、
-    /// 明示の真値だけ on。上限は「明示 MiB > 自動 (残りトークン × KiB)」で、
+    /// task 470 / 474: 1 チャンク目の routing による先読みのゲートは**既定 on**、
+    /// `0` 系だけが偽。上限は「明示 MiB > 自動 (残りトークン × KiB)」で、
     /// 自動は下限 / 上限に丸める。
     #[test]
     fn early_route_gate_and_budget() {
-        assert!(!DEFAULT_EARLY_ROUTE, "既定が on になっている");
-        assert!(!early_route_from_value(None), "未設定は既定 (off)");
-        assert!(!early_route_from_value(Some("")), "空も既定 (off)");
+        assert!(DEFAULT_EARLY_ROUTE, "task 474 で既定 on にした");
+        assert!(early_route_from_value(None), "未設定は既定 (on)");
+        assert!(early_route_from_value(Some("")), "空も既定 (on)");
         assert!(!early_route_from_value(Some("0")));
         assert!(!early_route_from_value(Some("off")));
         assert!(!early_route_from_value(Some("no")));
+        assert!(!early_route_from_value(Some("false")));
         assert!(early_route_from_value(Some("1")));
         assert!(early_route_from_value(Some("on")));
         assert!(early_route_from_value(Some(" TRUE ")));
         assert!(early_route_from_value(Some("yes")));
-        // `2` は pread 版 (実 I/O)。readahead が効かない環境で使う。
-        assert_eq!(early_route_mode_from_value(None), 0);
+        // `2` は task 470 の pread 版の名前 (置き場を使うので 1 と同じ)。
+        assert_eq!(early_route_mode_from_value(None), 1);
+        assert_eq!(early_route_mode_from_value(Some("")), 1);
         assert_eq!(early_route_mode_from_value(Some("0")), 0);
         assert_eq!(early_route_mode_from_value(Some("1")), 1);
         assert_eq!(early_route_mode_from_value(Some("on")), 1);
         assert_eq!(early_route_mode_from_value(Some("2")), 2);
         assert_eq!(early_route_mode_from_value(Some(" PREAD ")), 2);
-        assert_eq!(early_route_mode_from_value(Some("x")), 0);
+        assert_eq!(early_route_mode_from_value(Some("x")), 1, "解析不能は既定");
         assert!(early_route_from_value(Some("2")), "pread も on");
         // 明示 MiB はそのまま (0 は自動)。
         assert_eq!(early_route_mb_from_value(None), 0);

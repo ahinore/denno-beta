@@ -19030,6 +19030,11 @@ fn pf_early_route_prefetch(
     if iv.expert_mask(lw.il).is_some() {
         return None;
     }
+    // task 474: `DENNO_PF_PREAD=0` では MoE の写しが mmap からの memcpy になり
+    // (`src: None`)、置き場を 1 バイトも使わない。先読みしない。
+    if !crate::model::exp_pf::pread_on() {
+        return None;
+    }
     let expert_gpu = if pf_lm_k_dev_on() {
         pf_expert_mode(lw)
     } else {
@@ -19152,6 +19157,13 @@ fn pf_early_route_prefetch(
         if one == 0 {
             continue;
         }
+        // task 474: RAM tier に載っている expert は MoE が mmap から写す
+        // (`src: None` = `pread` を使わない) ので、先読みしても 1 バイトも
+        // 使われない。t474c の既定モデル (IQ3_XXS) は全 expert が tier から
+        // 来ていて、先読み 14.2 GB が全部無駄になった (`ra_pct=0`)。
+        if ram_peek(lw, ei).is_some() {
+            continue;
+        }
         calls += add.len();
         runs.extend(add);
         bytes += one;
@@ -19161,10 +19173,6 @@ fn pf_early_route_prefetch(
         }
     }
     if nex == 0 {
-        return None;
-    }
-    let mode = crate::model::exp_pf::early_route_mode();
-    if mode == 0 {
         return None;
     }
     // task 474: 読んだバイトは**捨てずに** RAM の置き場へ置く。MoE の写し
