@@ -19157,37 +19157,33 @@ fn pf_early_route_prefetch(
             return None;
         }
         let t = std::time::Instant::now();
-        // 1 本の pread では帯域が出ない (queue が浅い) ので 4 本で割る。
-        let mut buckets: [Vec<(u32, u64, usize)>; 4] = Default::default();
-        for (i, r) in runs.iter().enumerate() {
-            buckets[i % 4].push(*r);
-        }
+        // 1 本の pread では帯域が出ない (queue が浅い) ので rayon で割る。
+        // 実測 (t470c): 4 本 + 4 MiB で 2.7-2.9 GB/s (= コピーの 6 GB/s の半分)。
+        // 窓の中で読み切れないと残りがコピーと帯域を奪い合うだけになるので、
+        // 並列度を上げて窓の中で読み切る。
         let h = std::thread::Builder::new()
             .name("pf-er-pread".to_string())
             .spawn(move || {
-                std::thread::scope(|s| {
-                    for b in buckets.iter_mut() {
-                        s.spawn(move || {
-                            let mut buf = vec![0u8; 4 << 20];
-                            for (part, off, len) in b.iter() {
-                                let mut done = 0usize;
-                                while done < *len {
-                                    let n = (*len - done).min(buf.len());
-                                    let ok = unsafe {
-                                        crate::model::exp_pf::read_part_ptr(
-                                            *part,
-                                            *off + done as u64,
-                                            buf.as_mut_ptr(),
-                                            n,
-                                        )
-                                    };
-                                    if !ok {
-                                        break;
-                                    }
-                                    done += n;
-                                }
+                use rayon::prelude::*;
+                runs.par_chunks(4).for_each(|chunk| {
+                    let mut buf = vec![0u8; 2 << 20];
+                    for (part, off, len) in chunk {
+                        let mut done = 0usize;
+                        while done < *len {
+                            let n = (*len - done).min(buf.len());
+                            let ok = unsafe {
+                                crate::model::exp_pf::read_part_ptr(
+                                    *part,
+                                    *off + done as u64,
+                                    buf.as_mut_ptr(),
+                                    n,
+                                )
+                            };
+                            if !ok {
+                                break;
                             }
-                        });
+                            done += n;
+                        }
                     }
                 });
                 // 読み切るまでの時間を台帳へ (ディスクが回った証拠)。
