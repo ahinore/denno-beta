@@ -2047,6 +2047,10 @@ pub(crate) mod dec_full_dev {
         pub n_embd: usize,
         /// 層の入力 (ホスト)
         pub cur: &'a [f32],
+        /// task 468: 層の入力を**デバイスから**読む (直前の mix の鎖が残した
+        /// `mixed` の f32 `qkv_k` 本)。`Some` のとき `cur` は空でよく、
+        /// pinned への写しも H2D も撃たない (値は同じバイト列)。
+        pub x_dev: Option<u64>,
     }
 
     /// 戻り (層の出力と、ホスト KV キャッシュへ push する行)。
@@ -2120,7 +2124,7 @@ pub(crate) mod dec_full_dev {
                 && self.k_norm.len() == self.dh
                 && self.qkv_n == 2 * self.heads * self.dh + 2 * self.kv_dim
                 && self.qkv_k > 0
-                && self.cur.len() == self.qkv_k
+                && (self.x_dev.is_some() || self.cur.len() == self.qkv_k)
                 && self.units_ok()
                 // カーネルの前提: [q(2dh/head)][k][v] の並び。
                 && self.q_off == 0
@@ -2262,6 +2266,38 @@ pub(crate) mod dec_full_dev {
         [const { std::sync::atomic::AtomicU64::new(0) }; 6];
     static FULL_DEC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// task 468: 入力の H2D を省いた層数 (mix の鎖がデバイスに残した `mixed` を
+    /// そのまま読んだ回。発火の証拠 = `[full-x-dev]`)。
+    static FULL_X_DEV_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// task 468: 1 層ぶん数える。
+    fn note_full_x_dev_hit() {
+        FULL_X_DEV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// task 468: 積算を 0 に戻す (リクエスト終端)。
+    pub(crate) fn x_dev_reset() {
+        FULL_X_DEV_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// task 468: 入力の H2D を省いた層数。
+    pub(crate) fn x_dev_hits() -> u64 {
+        FULL_X_DEV_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// task 468: 「この呼び出しはデバイス入力を読める形か」を**ホスト側だけで**
+    /// 判定する (mix の鎖の D2H と待ちを省いてよいかの事前検査)。
+    ///
+    /// `len` は push 後の KV 行数 (= pos + 1)。形の静的検査 (`ok_shape`) は
+    /// モデル固定なのでここでは見ない (崩れていたら `forward` が `None` を返し、
+    /// 呼び出し側が要求を落とす = 黙って別経路で計算しない)。
+    pub(crate) fn dev_input_ok(len: usize) -> bool {
+        on() && cuda_enabled() && gpu_attention_enabled() && q4_gpu_attn_enabled()
+            && len >= full_dec_attn_min()
+            && len <= 65535
+            && chain_ctx().is_some()
+    }
+
     /// 理由コードを 1 つ数え、256 回ごとに集計を出す。
     fn dbg_note(idx: usize) {
         if !dbg_on() {
@@ -2355,30 +2391,39 @@ pub(crate) mod dec_full_dev {
         }
 
         // 1) qkv GEMV: ホスト cur -> デバイス (D2H しない)
-        Scratch::ensure(&mut st.qkv_in, a.qkv_k * 4)?;
+        // task 468: 入力がデバイスにある回 (直前の mix の鎖が残した `mixed`) は
+        // pinned へ写さず H2D も撃たない (同じバイト列なので値は変わらない)。
         Scratch::ensure(&mut st.qkv, a.qkv_n * 4)?;
-        Scratch::ensure_pin(&mut st.pin_x, a.qkv_k * 4)?;
-        {
-            let px = st.pin_x.as_mut().expect("ensure 済み");
-            px.as_mut_slice::<f32>()[..a.qkv_k].copy_from_slice(a.cur);
-        }
-        let x_ptr = st.qkv_in.as_ref().expect("ensure 済み").ptr();
-        let qkv_ptr = st.qkv.as_ref().expect("ensure 済み").ptr();
-        {
-            let lib = lib()?;
-            let pin = st.pin_x.as_ref().expect("ensure 済み");
-            unsafe {
-                check(
-                    (lib.memcpy_htod_async)(
-                        x_ptr,
-                        pin.ptr as *const c_void,
-                        a.qkv_k * 4,
-                        std::ptr::null_mut(),
-                    ),
-                    "cuMemcpyHtoDAsync (full dec dev)",
-                )?;
+        let x_ptr = match a.x_dev {
+            Some(p) => {
+                note_full_x_dev_hit();
+                p
             }
-        }
+            None => {
+                Scratch::ensure(&mut st.qkv_in, a.qkv_k * 4)?;
+                Scratch::ensure_pin(&mut st.pin_x, a.qkv_k * 4)?;
+                {
+                    let px = st.pin_x.as_mut().expect("ensure 済み");
+                    px.as_mut_slice::<f32>()[..a.qkv_k].copy_from_slice(a.cur);
+                }
+                let xp = st.qkv_in.as_ref().expect("ensure 済み").ptr();
+                let lib = lib()?;
+                let pin = st.pin_x.as_ref().expect("ensure 済み");
+                unsafe {
+                    check(
+                        (lib.memcpy_htod_async)(
+                            xp,
+                            pin.ptr as *const c_void,
+                            a.qkv_k * 4,
+                            std::ptr::null_mut(),
+                        ),
+                        "cuMemcpyHtoDAsync (full dec dev)",
+                    )?;
+                }
+                xp
+            }
+        };
+        let qkv_ptr = st.qkv.as_ref().expect("ensure 済み").ptr();
         for u in a.qkv_units {
             let w = weights_for_gguf(u.uid, u.ty, u.blocks, u.k, u.n)?;
             // task 427: dn6 (`DENNO_FULL_DEC_FAST=dn6*`) は 1 ブロック rows 行 /
@@ -3099,6 +3144,7 @@ pub(crate) mod dec_full_dev {
                 wo_n: 2_560,
                 n_embd: 2_560,
                 cur,
+                x_dev: None,
             }
         }
 
@@ -46818,6 +46864,34 @@ mod tests {
         }
     }
 
+    /// task 468: `DENNO_MIX_NOWAIT=full` の解釈 (既存 env の値。新しい env 名は足さない)。
+    ///
+    /// 既定 (未設定 / `1` / 真値) では ssm 層だけを defer する (`false`)。
+    #[test]
+    fn task468_mix_nowait_full_gate_truth_table() {
+        assert!(!mix_nowait_full_from_value(None), "未設定は full を defer しない");
+        for v in ["0", "off", "false", "no", "1", "on", "true", "yes", "ssm", ""] {
+            assert!(!mix_nowait_full_from_value(Some(v)), "raw={v:?}");
+        }
+        for v in ["full", " FULL ", "all", " All "] {
+            assert!(mix_nowait_full_from_value(Some(v)), "raw={v:?}");
+        }
+        // `full` は ssm の defer も on のまま (既存の解釈を壊さない)。
+        assert!(mix_nowait_from_value(Some("full")));
+        // 偽値は ssm も full も落とす。
+        assert!(!mix_nowait_from_value(Some("0")) && !mix_nowait_full_from_value(Some("0")));
+    }
+
+    /// task 468: `[mix-nowait-full]` は 1 層も通らなければ出さない。
+    #[test]
+    fn task468_mix_nowait_full_line_counts_layers() {
+        assert_eq!(mix_nowait_full_line_with(true, 0), None, "0 層なら出さない");
+        assert_eq!(mix_nowait_full_line_with(false, 12), None, "ゲート off なら出さない");
+        let l = mix_nowait_full_line_with(true, 12).expect("defer した層があれば出す");
+        assert!(l.contains("layers=12"), "{l}");
+        assert!(l.starts_with("[mix-nowait-full]"), "{l}");
+    }
+
     /// task 464: 発火の証拠の行 (1 層も通らなければ出さない)。
     #[test]
     fn task464_mix_nowait_line_counts_layers() {
@@ -62364,6 +62438,63 @@ fn mix_nowait_from_value(v: Option<&str>) -> bool {
 pub(crate) fn mix_nowait_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| mix_nowait_from_value(std::env::var(MIX_NOWAIT_ENV).ok().as_deref()))
+}
+
+// ---------------------------------------------------------------------------
+// task 468: full 層の attn mix も defer する (`DENNO_MIX_NOWAIT=full`)
+// ---------------------------------------------------------------------------
+//
+// full 層 (12 層/token) の attn の mix も、鎖の出力 `mixed` を**ホストで読まない**
+// 相手が居る: 直後の full attention の device 経路 (`dec_full_dev`) が qkv GEMV の
+// 入力に同じデバイスバッファ (`dm`) を使えるようにした (task 468)。よって ssm 層と
+// 同じく (a) D2H を撃たず (b) イベントも待たない。待ちは次の鎖 (同じ層の ffn mix)
+// の入口の drain へ移るが、その前に full attention の 5 起動と同期が入るので
+// 待ちはほぼ 0 になる。
+//
+// **既定 off** (`DENNO_MIX_NOWAIT=full` で on。ssm の defer も同時に on)。
+// 既存の env に値を足す形にした (lab の COND は新しい env 名を落とすことがある)。
+fn mix_nowait_full_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("full") | Some("all")
+    )
+}
+
+/// `DENNO_MIX_NOWAIT=full` (full 層も defer) か。プロセスで 1 回だけ読む。
+pub(crate) fn mix_nowait_full_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_nowait_full_from_value(std::env::var(MIX_NOWAIT_ENV).ok().as_deref())
+    })
+}
+
+/// 直前の鎖が残した `mixed` (デバイス) を 1 回だけ取り出す。
+///
+/// full attention の device 経路が qkv GEMV の入力に使う (ssm の
+/// [`gdn_x_in_mix_take`] と同じ控え)。要素数が合わなければ `None`。
+pub(crate) fn full_x_in_mix_take(n: usize) -> Option<u64> {
+    gdn_x_in_mix_take(n)
+}
+
+/// full 層で H2D を省いた層数の行 (1 層も通らなければ `None`)。
+pub fn mix_nowait_full_line() -> Option<String> {
+    mix_nowait_full_line_with(
+        mix_nowait_full_on(),
+        crate::cuda::dec_full_dev::x_dev_hits(),
+    )
+}
+
+/// [`mix_nowait_full_line`] の本体 (テストで両側を踏めるように引数で受ける)。
+fn mix_nowait_full_line_with(on: bool, layers: u64) -> Option<String> {
+    if !on || layers == 0 {
+        return None;
+    }
+    Some(format!("[mix-nowait-full] layers={layers}"))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn mix_nowait_full_reset() {
+    crate::cuda::dec_full_dev::x_dev_reset();
 }
 
 thread_local! {

@@ -1508,6 +1508,16 @@ impl LayerAttn for SsmAttn {
         }
     }
 
+    /// task 468: full 層だけ委譲先 (`FullAttn`) の判定を使う。ssm 層は GDN 側の
+    /// 判定 (`run_layer` が見る) なので、ここでは常に `false`。
+    fn takes_dev_input(&self, layer: usize) -> bool {
+        match self.layers.get(layer) {
+            Some(Some(_)) => false,
+            Some(None) => self.full.takes_dev_input(layer),
+            None => false,
+        }
+    }
+
     /// ssm 層は投影をチャンクでまとめる。full 層は `self.full` の
     /// [`LayerAttn::forward_batch`] に委譲する (バッチ prefill で `FullAttn` が
     /// 入っているときは KV を 1 回走査するバッチ版が走る。既定の実装 =

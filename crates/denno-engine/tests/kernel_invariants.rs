@@ -13596,11 +13596,13 @@ fn task464_mix_nowait_wiring() {
         "pub(crate) fn hc_mix_quant_defer(",
         "let mix_defer = crate::cuda::mix_nowait_on()",
         "&& crate::cuda::gdn_x_mix_on()",
-        "&& crate::cuda::gdn_gpu_scan_on()",
-        "&& crate::cuda::gdn_ba_gpu_on()",
+        // task 468: ssm の前提 (scan / ba を GPU で) は層種別の腕の中へ移した。
+        "Ok(LayerKind::Ssm) => {",
+        "crate::cuda::gdn_gpu_scan_on() && crate::cuda::gdn_ba_gpu_on()",
         "&& gdn_gpu_win::active()",
-        "&& matches!(self.p.layer_kind(il), Ok(LayerKind::Ssm))",
-        "&& hook.is_none();",
+        "&& hook.is_none()",
+        // task 468: full 層は attention の device 経路の判定を通す。
+        "Ok(LayerKind::FullAttn) => self.attn.takes_dev_input(il),",
         "if mix_defer {\n                    hc_mix_quant_defer(",
         // 鎖が defer したら空の Vec を返す (ホスト値は降りていない)。
         "chain2_mixed = Some(if crate::cuda::mix_take_deferred() {",
@@ -13640,6 +13642,104 @@ fn task464_mix_nowait_wiring() {
     ] {
         let rep = std::fs::read_to_string(root.join("src/gpu_report.rs"))
             .expect("gpu_report.rs が読めない");
+        assert!(rep.contains(s), "gpu_report.rs に {s} が無い");
+    }
+}
+
+/// task 468: full 層の attn mix も defer する (`DENNO_MIX_NOWAIT=full`) 配線。
+///
+/// 見るのは 5 点。(1) 門は既存の env の値で、新しい env 名を足していない。
+/// (2) `dec_full_dev` が入力の H2D を省ける (`x_dev`)。(3) full 層の defer は
+/// attention の device 経路の判定 (`takes_dev_input`) を通す。(4) 入力が空で
+/// 控えも無い/経路が走らないときは要求を落とす (黙って別経路で計算しない)。
+/// (5) 発火の証拠を serve_flash が出す。
+#[test]
+fn task468_full_mix_nowait_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let host = std::fs::read_to_string(root.join("src/model/qwen4exp.rs"))
+        .expect("qwen4exp.rs が読めない");
+    let attn = std::fs::read_to_string(root.join("src/model/qwen4exp_attn.rs"))
+        .expect("qwen4exp_attn.rs が読めない");
+    let ssm = std::fs::read_to_string(root.join("src/model/qwen4exp_ssm.rs"))
+        .expect("qwen4exp_ssm.rs が読めない");
+
+    // 1. cuda.rs: 門 (既存 env の値)・控えの取り出し・入力を上げない経路・証拠の行。
+    for s in [
+        "fn mix_nowait_full_from_value(v: Option<&str>) -> bool {",
+        "pub(crate) fn mix_nowait_full_on() -> bool {",
+        "pub(crate) fn full_x_in_mix_take(n: usize) -> Option<u64> {",
+        "pub fn mix_nowait_full_line() -> Option<String> {",
+        "fn mix_nowait_full_line_with(on: bool, layers: u64) -> Option<String> {",
+        "pub fn mix_nowait_full_reset() {",
+        // 入力はデバイスにある回は pinned へ写さず H2D も撃たない。
+        "let x_ptr = match a.x_dev {",
+        "note_full_x_dev_hit();",
+        "FULL_X_DEV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);",
+        // 事前検査 (ホストだけで判定できる範囲) と、形の検査は cur が空でも通す。
+        "pub(crate) fn dev_input_ok(len: usize) -> bool {",
+        "&& len <= 65535",
+        "&& (self.x_dev.is_some() || self.cur.len() == self.qkv_k)",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+    assert!(
+        CUDA_RS.contains("\"full\"")
+            && CUDA_RS.contains("fn mix_nowait_full_from_value(v: Option<&str>) -> bool {"),
+        "full の門が既存 env の値でない"
+    );
+
+    // 2. 呼ぶのは run_layer の defer 判定 1 箇所。full 層は trait の判定を通す。
+    for s in [
+        "Ok(LayerKind::FullAttn) => self.attn.takes_dev_input(il),",
+        "fn takes_dev_input(&self, _layer: usize) -> bool {",
+    ] {
+        assert!(host.contains(s), "qwen4exp.rs に {s} が無い");
+    }
+    assert_eq!(
+        host.matches("hc_mix_quant_defer(").count(),
+        2,
+        "hc_mix_quant_defer の呼び出しが 1 箇所でない"
+    );
+
+    // 3. full attention 側: 空の入力を許し、デバイスから読み、駄目なら落とす。
+    for s in [
+        "fn takes_dev_input(&self, layer: usize) -> bool {",
+        "crate::cuda::dec_full_dev::dev_input_ok(len + 1)",
+        "let x_dev = if cur.is_empty() {",
+        "match crate::cuda::full_x_in_mix_take(self.n_embd) {",
+        "入力が空で mix の控えも無い (DENNO_MIX_NOWAIT=full の前提が崩れた)",
+        "入力をデバイスから読む回で device 経路が走らなかった",
+        "if cur.len() != self.n_embd && !cur.is_empty() {",
+    ] {
+        assert!(attn.contains(s), "qwen4exp_attn.rs に {s} が無い");
+    }
+    // 空の入力を device 経路へ渡していること (`x_dev` を Call に詰める)。
+    assert!(
+        attn.contains("x_dev,") && attn.contains("cur,\n                        x_dev,"),
+        "Call に x_dev を渡していない"
+    );
+
+    // 4. ssm 側は従来どおり (ssm 層は full の判定を借りない)。
+    assert!(
+        ssm.contains("Some(None) => self.full.takes_dev_input(layer),"),
+        "SsmAttn が full 層の判定を委譲していない"
+    );
+    assert!(
+        ssm.contains("Some(Some(_)) => false,"),
+        "ssm 層が full の判定を借りている"
+    );
+
+    // 5. 発火の証拠 (1 リクエスト 1 行) を serve_flash が出す。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::gpu_report::mix_nowait_full_line()"),
+        "serve_flash.rs が [mix-nowait-full] を出さない"
+    );
+    let rep = std::fs::read_to_string(root.join("src/gpu_report.rs"))
+        .expect("gpu_report.rs が読めない");
+    for s in [
+        "pub fn mix_nowait_full_line() -> Option<String> {",
+        "pub fn mix_nowait_full_reset() {",
+    ] {
         assert!(rep.contains(s), "gpu_report.rs に {s} が無い");
     }
 }

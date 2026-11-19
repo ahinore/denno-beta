@@ -1765,6 +1765,19 @@ impl AttnLayer {
     ) -> Result<Option<Vec<f32>>> {
         #[cfg(feature = "cuda")]
         {
+            // task 468: `cur` が空 = 直前の mix の鎖が defer した回 (入力は鎖が
+            // デバイスに残した `mixed`)。控えが無ければ**黙って別経路で計算せずに**
+            // 要求を落とす (空の入力で層を回さない)。
+            let x_dev = if cur.is_empty() {
+                match crate::cuda::full_x_in_mix_take(self.n_embd) {
+                    Some(p) => Some(p),
+                    None => bail!(
+                        "full attn: 入力が空で mix の控えも無い (DENNO_MIX_NOWAIT=full の前提が崩れた)"
+                    ),
+                }
+            } else {
+                None
+            };
             if cells.is_none() && crate::cuda::dec_full_dev::on() {
                 // 連結できた層は 1 本、できない層 (q/k/v で型が違う) は 3 本。
                 // どちらも同じ入力 cur を取り、`qkv` バッファの行範囲へ書く。
@@ -1813,12 +1826,18 @@ impl AttnLayer {
                         wo_n: self.wo.n(),
                         n_embd: self.n_embd,
                         cur,
+                        x_dev,
                     };
                     if let Some(o) = crate::cuda::dec_full_dev::forward(&call) {
                         cache.push(layer, &o.k, &o.v)?;
                         return Ok(Some(o.out));
                     }
                 }
+            }
+            if x_dev.is_some() {
+                // defer した層で device 経路が走らなかった = ホストの `cur` は無い。
+                // 空の入力で CPU 経路へ落ちない (fail loud)。
+                bail!("full attn: 入力をデバイスから読む回で device 経路が走らなかった");
             }
         }
         let _ = (cur, cache, layer, pos, cells);
@@ -1840,7 +1859,8 @@ impl AttnLayer {
         // stamp していたので、merge で二重に取らないようここ 1 箇所に寄せた
         // (A_FULL への加算も末尾の 1 回だけ)。
         let t_all = q4prof::stamp();
-        if cur.len() != self.n_embd {
+        // task 468: 空は「入力はデバイス側 (mix の鎖の `mixed`)」の合図。
+        if cur.len() != self.n_embd && !cur.is_empty() {
             bail!(
                 "AttnLayer::forward_token: 入力長 {} が n_embd = {} と違う",
                 cur.len(),
@@ -2593,6 +2613,29 @@ impl LayerAttn for FullAttn {
     ) -> std::result::Result<Vec<f32>, Qwen4ExpError> {
         self.forward_token(layer, cur)
             .map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
+    }
+
+    /// task 468: full attention の device 経路が、mix の鎖がデバイスに残した
+    /// `mixed` を qkv GEMV の入力にそのまま使えるか。
+    ///
+    /// 形の静的検査はモデル固定なのでここでは見ない (崩れていたら
+    /// `dev_forward` が要求を落とす = 黙って別経路で計算しない)。
+    fn takes_dev_input(&self, layer: usize) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            if !crate::cuda::mix_nowait_full_on() || !crate::cuda::gdn_x_mix_on() {
+                return false;
+            }
+            let Ok(len) = self.cache.len(layer) else {
+                return false;
+            };
+            crate::cuda::dec_full_dev::dev_input_ok(len + 1)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = layer;
+            false
+        }
     }
 
     /// チャンクぶんの full attention を KV 1 回走査で回す

@@ -1608,6 +1608,15 @@ impl LayerTensors {
 pub trait LayerAttn: Send {
     fn forward(&mut self, layer: usize, cur: &[f32]) -> Result<Vec<f32>>;
 
+    /// task 468: 層 `layer` の入力を**デバイスから**渡してよいか。
+    ///
+    /// `true` を返した層では、呼び出し側が attn の mix の鎖を defer して
+    /// `cur` を空で渡す (入力は鎖がデバイスに残した `mixed`)。既定は `false`
+    /// = 従来どおりホストの `cur` を渡す。
+    fn takes_dev_input(&self, _layer: usize) -> bool {
+        false
+    }
+
     /// チャンクぶんの入力をまとめて処理する (バッチ prefill 用)。
     ///
     /// 既定は [`Self::forward`] をトークン順に呼ぶだけなので、数値は逐次と
@@ -3634,12 +3643,19 @@ impl Qwen4Exp {
             #[cfg(feature = "cuda")]
             let mix_defer = crate::cuda::mix_nowait_on()
                 && crate::cuda::gdn_x_mix_on()
-                && crate::cuda::gdn_gpu_scan_on()
-                // ba を GPU で作るモデルだけ defer できる (ホスト ba は cur が要る)。
-                && crate::cuda::gdn_ba_gpu_on()
                 && gdn_gpu_win::active()
-                && matches!(self.p.layer_kind(il), Ok(LayerKind::Ssm))
-                && hook.is_none();
+                && hook.is_none()
+                && match self.p.layer_kind(il) {
+                    // ssm 層: ba を GPU で作るモデルだけ defer できる
+                    // (ホスト ba は cur が要る)。
+                    Ok(LayerKind::Ssm) => {
+                        crate::cuda::gdn_gpu_scan_on() && crate::cuda::gdn_ba_gpu_on()
+                    }
+                    // task 468: full 層は attention の device 経路が鎖の `mixed` を
+                    // 直接読める回だけ (`DENNO_MIX_NOWAIT=full`)。
+                    Ok(LayerKind::FullAttn) => self.attn.takes_dev_input(il),
+                    _ => false,
+                };
             #[cfg(not(feature = "cuda"))]
             let mix_defer = false;
             let (cur, inject) = {
