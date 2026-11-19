@@ -5758,6 +5758,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
                 q4ledger::iter_end(t_iter);
             }
+            // task 474: ここから先はディスクが主役なので、先読みの実行役は止める
+            // (窓 = 残りチャンクの attention は終わった)。
+            crate::model::exp_pf::rc_stop();
             // ---- 2. 層で 1 回の MoE (expert 重みはここでしか運ばれない) ----
             let t_moe = std::time::Instant::now();
             // task 233: 入力も出力もデバイスの置き場のまま回す。ホストへ戻るのは
@@ -19149,59 +19152,50 @@ fn pf_early_route_prefetch(
         return None;
     }
     let mode = crate::model::exp_pf::early_route_mode();
-    if mode >= 2 {
-        // 背景スレッドで `pread` して捨てる (readahead(2) が効かない環境むけ)。
-        // 実行役は層ごとに 1 本。前の 1 本がまだ走っていたらこの層は飛ばす。
-        if !crate::model::exp_pf::early_route_worker_idle() {
-            crate::model::exp_pf::note_early_route_skip();
-            return None;
-        }
-        let t = std::time::Instant::now();
-        // 1 本の pread では帯域が出ない (queue が浅い) ので rayon で割る。
-        // 実測 (t470c): 4 本 + 4 MiB で 2.7-2.9 GB/s (= コピーの 6 GB/s の半分)。
-        // 窓の中で読み切れないと残りがコピーと帯域を奪い合うだけになるので、
-        // 並列度を上げて窓の中で読み切る。
-        let h = std::thread::Builder::new()
-            .name("pf-er-pread".to_string())
-            .spawn(move || {
-                use rayon::prelude::*;
-                runs.par_chunks(4).for_each(|chunk| {
-                    let mut buf = vec![0u8; 2 << 20];
-                    for (part, off, len) in chunk {
-                        let mut done = 0usize;
-                        while done < *len {
-                            let n = (*len - done).min(buf.len());
-                            let ok = unsafe {
-                                crate::model::exp_pf::read_part_ptr(
-                                    *part,
-                                    *off + done as u64,
-                                    buf.as_mut_ptr(),
-                                    n,
-                                )
-                            };
-                            if !ok {
-                                break;
-                            }
-                            done += n;
-                        }
+    if mode == 0 {
+        return None;
+    }
+    // task 474: 読んだバイトは**捨てずに** RAM の置き場へ置く。MoE の写し
+    // (`pf_copy_into_pin`) は同じ (パート, 絶対オフセット, 長さ) が置き場に
+    // あればディスクを読まずにそこから memcpy する (値はバイト単位で同じ)。
+    //
+    // task 470 は同じ窓を `readahead(2)` と「pread して捨てる」で埋めようとして
+    // 負けた: 投げたバイトの 11-28% しか `copy_s` が縮まなかった (ページキャッシュ
+    // に残らない)。置き場をプロセスが持てばその取りこぼしが無い。
+    let Some((buf, jobs)) = crate::model::exp_pf::rc_plan(&runs) else {
+        return None;
+    };
+    let h = std::thread::Builder::new()
+        .name("pf-er-ram".to_string())
+        .spawn(move || {
+            use rayon::prelude::*;
+            let t = std::time::Instant::now();
+            let nt = crate::model::exp_pf::rc_threads();
+            let run = || {
+                jobs.par_iter().with_max_len(1).for_each(|&(dst, file, off, len)| {
+                    // 窓が終わったら (MoE が始まったら) そこで止める。
+                    if crate::model::exp_pf::rc_stopped() {
+                        return;
+                    }
+                    // SAFETY: `dst` は `rc_layout` が割り当てた互いに重ならない
+                    // 範囲で、置き場はプロセスの終わりまで有効。
+                    let p = unsafe { buf.ptr().add(dst as usize) };
+                    if unsafe {
+                        crate::model::exp_pf::read_part_ptr(file, off, p, len as usize)
+                    } {
+                        crate::model::exp_pf::rc_commit_one(file, off, len as usize, dst);
                     }
                 });
-                // 読み切るまでの時間を台帳へ (ディスクが回った証拠)。
-                crate::model::exp_pf::note_early_route_read_ns(t.elapsed().as_nanos() as u64);
-            });
-        match h {
-            Ok(h) => crate::model::exp_pf::early_route_worker_set(h),
-            Err(_) => return None,
-        }
-    } else {
-        // `readahead(2)` (待たない)。
-        let mut sent = 0usize;
-        for (part, off, len) in &runs {
-            sent += crate::model::exp_pf::readahead_part(*part, *off, *len);
-        }
-        if sent == 0 {
-            return None;
-        }
+            };
+            match crate::model::exp_pf::rc_pool(nt) {
+                Some(pool) => pool.install(run),
+                None => run(),
+            }
+            crate::model::exp_pf::note_rc_read_ns(t.elapsed().as_nanos() as u64);
+        });
+    match h {
+        Ok(h) => crate::model::exp_pf::rc_worker_set(h),
+        Err(_) => return None,
     }
     crate::model::exp_pf::note_early_route(nex, bytes, calls);
     Some((nex, bytes, calls))
