@@ -10650,7 +10650,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 attn_dec4)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12177,7 +12177,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 attn_dec4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12294,7 +12294,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 attn_dec4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12489,7 +12489,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 attn_dec4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12583,7 +12583,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 attn_dec4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12876,7 +12876,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 attn_dec4)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
@@ -13148,5 +13148,172 @@ fn task448_flashdec_tile_kernel_and_wiring() {
             11,
             "PTX の引数が 11 本でない"
         );
+    }
+}
+
+/// task 460: decode の full attention で combine と出力ゲートを 1 起動にまとめた
+/// `kernels_attn_dec4.cu` の配線。
+///
+/// 見るもの: (1) entry と引数 6 本、(2) 縮約が `kernels_attn_dec.cu` の
+/// `dno_attn_flashdec_combine` と **同じ順** (値が動かない根拠)、(3) ゲートの
+/// 演算列が `kernels_dec_dev.cu` の `dno_dec_gate_mul` と同じ、(4) dno_expf の
+/// 写しが同一 (定数まで)、(5) ホスト側の門・起動・計数、(6) build_ptx.sh の target、
+/// (7) PTX があれば ABI が 6 引数であること。
+#[test]
+fn task460_flashdec_combine_gate_kernel_and_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let cu1 = std::fs::read_to_string(root.join("kernels_attn_dec.cu"))
+        .expect("kernels_attn_dec.cu が無い");
+    let cu4 = std::fs::read_to_string(root.join("kernels_attn_dec4.cu"))
+        .expect("kernels_attn_dec4.cu が無い");
+    let cud = std::fs::read_to_string(root.join("kernels_dec_dev.cu"))
+        .expect("kernels_dec_dev.cu が無い");
+
+    // 1. entry は 1 本だけ。既存の entry 名を上書きしていない。
+    assert!(
+        cu4.contains("extern \"C\" __global__ void dno_attn_flashdec_cbg("),
+        "融合版の entry が無い"
+    );
+    assert!(
+        !cu4.contains("dno_attn_flashdec(") && !cu4.contains("dno_attn_flashdec_combine("),
+        "既存の entry を上書きしている"
+    );
+    // 引数は part / att / gate / group / dh / n_split の 6 本。
+    assert!(
+        cu4.contains("int group, int dh, int n_split) {"),
+        "引数の並びが 6 本でない"
+    );
+    assert!(cu4.contains("const float *__restrict__ gate,"), "gate 引数が無い");
+    assert!(cu4.contains("if (gate != nullptr) {"), "gate の null 分岐が無い");
+
+    // 2. 縮約の順が combine と同じ (macro 名の違いだけを落として比べる)。
+    let n4 = cu4.replace("DNO_CBG_LOG2E", "DNO_FD_LOG2E");
+    for s in [
+        "for (int sp = 0; sp < n_split; ++sp) mg = fmaxf(mg, base[(size_t)sp * step]);",
+        "const float e = exp2f((pp[0] - mg) * DNO_FD_LOG2E);",
+        "denom = fmaf(pp[1], e, denom);",
+        "num = fmaf(pp[2 + d], e, num);",
+        "(denom > 0.0f) ? __fdiv_rn(num, denom) : 0.0f;",
+        "const size_t step = (size_t)group * stride;",
+        "const float *base = part + ((size_t)(kh * n_split) * group + hh) * stride;",
+    ] {
+        assert!(cu1.contains(s), "combine 側に {s} が無い");
+        assert!(n4.contains(s), "融合側に {s} が無い (縮約順が違う)");
+    }
+
+    // 3. ゲートの演算列が `dno_dec_gate_mul` と同じ。
+    //    dec_dev: e = dno_expf(-g); sg = 1/(1+e); out *= sg。
+    assert!(cud.contains("const float e = dno_expf(-g);"), "gate 側の expf が無い");
+    assert!(
+        cud.contains("const float sg = __fdiv_rn(1.0f, __fadd_rn(1.0f, e));"),
+        "gate 側の sigmoid が無い"
+    );
+    assert!(cud.contains("out[i] = __fmul_rn(out[i], sg);"), "gate 側の乗算が無い");
+    assert!(cu4.contains("const float eg = dno_cbg_expf(-g);"), "融合側の expf が無い");
+    assert!(
+        cu4.contains("const float sg = __fdiv_rn(1.0f, __fadd_rn(1.0f, eg));"),
+        "融合側の sigmoid が無い"
+    );
+    assert!(cu4.contains("val = __fmul_rn(val, sg);"), "融合側の乗算が無い");
+
+    // 4. dno_expf の写しが同一 (数値定数を全部突き合わせる)。
+    fn hex_tokens(s: &str) -> Vec<String> {
+        let c: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < c.len() {
+            if c[i] == '0' && (c[i + 1] == 'x' || c[i + 1] == 'X') {
+                let st = i;
+                i += 2;
+                while i < c.len() {
+                    let ch = c[i];
+                    let ok = ch.is_ascii_hexdigit()
+                        || ch == '.'
+                        || ch == 'p'
+                        || ch == 'P'
+                        || ch == '-'
+                        || ch == '+';
+                    if !ok {
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(c[st..i].iter().collect());
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+    fn expf_block(s: &str, tab: &str, end: &str) -> String {
+        let i = s.find(tab).expect("expf の表が無い");
+        let j = s[i..].find(end).expect("expf の終端が無い") + i;
+        s[i..j].to_string()
+    }
+    let d = expf_block(&cud, "DNO_EXP2_TAB[32] = {", "return (float)y;");
+    let f = expf_block(&cu4, "DNO_CBG_EXP2_TAB[32] = {", "return (float)y;");
+    let (td, tf) = (hex_tokens(&d), hex_tokens(&f));
+    assert!(td.len() >= 36, "dec_dev の定数が取れていない ({})", td.len());
+    assert_eq!(td, tf, "dno_expf の写しが dec_dev と違う (定数が動く)");
+
+    // 5. ホスト側の配線。
+    let host = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda.rs"),
+    )
+    .expect("cuda.rs が読めない");
+    for s in [
+        "pub(crate) const FCBG_NARGS: usize = 6;",
+        "pub(crate) fn parse_attn_fdec_cbg(v: Option<&str>) -> bool {",
+        "fn attn_fdec_cbg_on() -> bool {",
+        "\"DENNO_ATTN_FLASHDEC_CBG\"",
+        "\"DENNO_ATTN_FLASHDEC4_PTX\"",
+        "fn fcbg_ptx_path() -> std::path::PathBuf {",
+        "fn fcbg_kernels() -> Option<&'static FcbgKernels> {",
+        "b\"dno_attn_flashdec_cbg\\0\"",
+        "fn fcbg_gate_log(gate_ok: bool) {",
+        // 融合の判定は「ゲートのポインタがある」かつ「env が on」のときだけ。
+        "let cbg_k = if gate != 0 && attn_fdec_cbg_on() {",
+        // 融合したら呼び出し側はゲートの起動を飛ばす (二重掛けしない)。
+        "if !a_gated {",
+        "let (aptr, a_gated) = attn_launch(",
+        "Ok((aptr, gated))",
+        "Ok((aptr, false))",
+        "q4attn_kprof::note_cbg_call();",
+        "pub static CBG_CALLS: AtomicU64 = AtomicU64::new(0);",
+        "cbg calls={}",
+        // 長さ依存の分割 (task 460)。
+        "pub(crate) fn parse_attn_flashdec_chunk_auto(v: Option<&str>) -> bool {",
+        "pub(crate) fn q4_fdec_chunk_auto(t_total: usize) -> usize {",
+        "fn attn_flashdec_chunk_for(t_total: usize) -> usize {",
+        "q4_fdec_split(len, attn_flashdec_chunk_for(len))",
+        "q4_fdec_split(a.len, attn_flashdec_chunk_for(a.len))",
+    ] {
+        assert!(host.contains(s), "cuda.rs に {s} が無い");
+    }
+    // 融合版の起動は combine と同じ grid / block であること。
+    assert!(
+        host.contains("(group as u32, nkv_c as u32, 1),\n                                (dh as u32, 1, 1),"),
+        "融合版の grid/block が combine と違う"
+    );
+
+    // 6. build_ptx.sh: spec と targets_all (末尾 = merge の衝突を避ける)。
+    assert!(
+        BUILD_PTX_SH.contains("attn_dec4)    echo \"kernels_attn_dec4.cu|nofmad\""),
+        "build_ptx.sh に attn_dec4 の spec が無い"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all=("))
+        .unwrap_or("");
+    assert!(targets.contains("attn_dec4)"), "targets_all に attn_dec4 が無い");
+
+    // 7. PTX があれば ABI (6 引数) を数える。無ければ lab が生成する
+    //    (最初の lab 依頼は PTX=attn_dec4 で出す)。
+    let ptx = root.join("kernels_attn_dec4.ptx");
+    if let Ok(text) = std::fs::read_to_string(&ptx) {
+        let pat = ".entry dno_attn_flashdec_cbg(";
+        let i = text.find(pat).expect("PTX に entry が無い (再生成が必要)");
+        let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+        assert_eq!(text[i..j].matches(".param .").count(), 6, "PTX の引数が 6 本でない");
     }
 }

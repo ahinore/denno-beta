@@ -2498,14 +2498,15 @@ pub(crate) mod dec_full_dev {
         .ok_or_else(|| anyhow!("ミラーの 1 行追記ができない (全行シードが必要)"))?;
         kp_mark!("fd_mirror");
 
-        // 4) attention (デバイス入力・出力)
-        let aptr = attn_launch(
-            ctx, qout, mkptr, mvptr, a.len, kv_dim, a.heads, a.group, a.dh, a.scale,
+        // 4) attention (デバイス入力・出力)。task 460: 融合版 (combine + gate) を
+        //    選んだときは a_gated = true で返る (下の出力ゲートを飛ばす)。
+        let (aptr, a_gated) = attn_launch(
+            ctx, qout, mkptr, mvptr, a.len, kv_dim, a.heads, a.group, a.dh, a.scale, gout,
         )?;
         kp_mark!("fd_attn");
 
-        // 5) 出力ゲート (デバイス)
-        {
+        // 5) 出力ゲート (デバイス)。融合版が掛け済みなら飛ばす。
+        if !a_gated {
             let mut p_out = aptr;
             let mut p_gate = gout;
             let mut n_c = qd as c_int;
@@ -2777,7 +2778,9 @@ pub(crate) mod dec_full_dev {
         group: usize,
         dh: usize,
         scale: f32,
-    ) -> Result<CUdeviceptr> {
+        // task 460: combine + ゲートの融合を使うときのゲート (0 = 融合しない)。
+        gate: CUdeviceptr,
+    ) -> Result<(CUdeviceptr, bool)> {
         let n_kv = heads / group;
         let qd = heads * dh;
         let mut kv_dim_c = kv_dim as c_int;
@@ -2790,7 +2793,7 @@ pub(crate) mod dec_full_dev {
         // 既定 (t179a の log と同じ) は「1024 未満は split・以上は flashdec」。
         if attn_flashdec_enabled() && len >= attn_flashdec_min_ctx() {
             if let Some(k) = fdec_kernels() {
-                let (n_split, chunk) = q4_fdec_split(len, attn_flashdec_chunk());
+                let (n_split, chunk) = q4_fdec_split(len, attn_flashdec_chunk_for(len));
                 // task 448: タイル版 (K/V を shared へ協調ロード) を先に試す。
                 // decode の実サーバ経路はここ (デバイス連鎖) なので、門もここで見る。
                 // 形か PTX が欠けたら v1 (`dno_attn_flashdec`) で回す。
@@ -2812,10 +2815,20 @@ pub(crate) mod dec_full_dev {
                         (k.f_dec, 0u32)
                     }
                 };
+                // task 460: combine と出力ゲートの融合 (既定 off)。PTX か ABI が
+                // 欠ければ None になり、下の従来 2 起動へ落ちる。
+                let cbg_k = if gate != 0 && attn_fdec_cbg_on() {
+                    fcbg_gate_log(true);
+                    fcbg_kernels()
+                } else {
+                    fcbg_gate_log(gate != 0);
+                    None
+                };
                 nsplit_c = n_split as c_int;
                 let nkv_c = n_kv as c_int;
                 let part_bytes = heads * n_split * (dh + ATTN_FDEC_PART_EXTRA) * 4;
-                return Q4ATTN_SCRATCH.with(|cell| -> Result<CUdeviceptr> {
+                let gated = cbg_k.is_some();
+                return Q4ATTN_SCRATCH.with(|cell| -> Result<(CUdeviceptr, bool)> {
                     let mut s = cell.borrow_mut();
                     Scratch::ensure(&mut s.out, qd * 4)?;
                     Scratch::ensure(&mut s.part, part_bytes)?;
@@ -2852,21 +2865,44 @@ pub(crate) mod dec_full_dev {
                             &mut args,
                         )?;
                     }
-                    let mut args2: Vec<*mut c_void> = vec![
-                        &mut partptr as *mut _ as *mut c_void,
-                        &mut aptr_c as *mut _ as *mut c_void,
-                        &mut group_c as *mut _ as *mut c_void,
-                        &mut dh_c as *mut _ as *mut c_void,
-                        &mut nsplit_c as *mut _ as *mut c_void,
-                    ];
-                    unsafe {
-                        ctx.launch_async(
-                            k.f_cb,
-                            (group as u32, nkv_c as u32, 1),
-                            (dh as u32, 1, 1),
-                            0,
-                            &mut args2,
-                        )?;
+                    // task 460: 融合版 (combine + ゲート) があれば 1 起動で済ませる。
+                    if let Some(kc) = cbg_k {
+                        let mut gptr_c = gate;
+                        let mut args3: Vec<*mut c_void> = vec![
+                            &mut partptr as *mut _ as *mut c_void,
+                            &mut aptr_c as *mut _ as *mut c_void,
+                            &mut gptr_c as *mut _ as *mut c_void,
+                            &mut group_c as *mut _ as *mut c_void,
+                            &mut dh_c as *mut _ as *mut c_void,
+                            &mut nsplit_c as *mut _ as *mut c_void,
+                        ];
+                        unsafe {
+                            ctx.launch_async(
+                                kc.f_cbg,
+                                (group as u32, nkv_c as u32, 1),
+                                (dh as u32, 1, 1),
+                                0,
+                                &mut args3,
+                            )?;
+                        }
+                        q4attn_kprof::note_cbg_call();
+                    } else {
+                        let mut args2: Vec<*mut c_void> = vec![
+                            &mut partptr as *mut _ as *mut c_void,
+                            &mut aptr_c as *mut _ as *mut c_void,
+                            &mut group_c as *mut _ as *mut c_void,
+                            &mut dh_c as *mut _ as *mut c_void,
+                            &mut nsplit_c as *mut _ as *mut c_void,
+                        ];
+                        unsafe {
+                            ctx.launch_async(
+                                k.f_cb,
+                                (group as u32, nkv_c as u32, 1),
+                                (dh as u32, 1, 1),
+                                0,
+                                &mut args2,
+                            )?;
+                        }
                     }
                     q4attn_kprof::note_launch(tl);
                     q4attn_kprof::note_call();
@@ -2875,7 +2911,7 @@ pub(crate) mod dec_full_dev {
                     } else {
                         q4attn_kprof::note_fdec_call();
                     }
-                    Ok(aptr)
+                    Ok((aptr, gated))
                 });
             }
         }
@@ -2887,7 +2923,7 @@ pub(crate) mod dec_full_dev {
         let (n_split, _chunk) = q4_dec_split(len, q4_gpu_attn_split());
         nsplit_c = n_split as c_int;
         let shmem = (q4_dec_sh_f(dh) * 4) as u32;
-        Q4ATTN_SCRATCH.with(|cell| -> Result<CUdeviceptr> {
+        Q4ATTN_SCRATCH.with(|cell| -> Result<(CUdeviceptr, bool)> {
             let mut s = cell.borrow_mut();
             let part_bytes = heads * n_split * (dh + 2) * 4;
             Scratch::ensure(&mut s.out, qd * 4)?;
@@ -2932,7 +2968,7 @@ pub(crate) mod dec_full_dev {
             q4attn_kprof::note_launch(tl);
             q4attn_kprof::note_call();
             q4attn_kprof::note_split_call();
-            Ok(aptr)
+            Ok((aptr, false))
         })
     }
 
@@ -39489,6 +39525,40 @@ fn parse_attn_flashdec_chunk(v: Option<&str>) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 460: 1 分割の key 数を文脈長で変える (`DENNO_ATTN_FLASHDEC_CHUNK=auto`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (task 456 の lab t456c、既定モデル、depth8k):
+//   chunk 128 にすると 14k の full 段が 1.77 -> 1.65 ms/token (-6.6%、n_split が
+//   220 -> 110 になり combine の読みが半減) だが、2k では 1.19 -> 1.38 (+16%)
+//   になる (block 数 2*n_split = 62 が SM 170 を割る)。よって固定値ではなく
+//   **block 数 2*n_split >= 220 を保つ範囲で 1 分割を大きくする**。
+//
+// 規則 (純関数): chunk = ceil(len / 110) を 64..=128 に clamp。
+//   - 14,018 -> 128 (t456c で測った最良と同じ n_split 110)
+//   - 3,965 / 2,000 -> 64 (現状と同じ。n_split 62 を 32 にしない)
+//   - 8,000 -> 73 (n_split 110)
+/// `auto` のときの目標分割数 (block 数 2*n_split が SM 170 を余裕で超える)。
+const ATTN_FLASHDEC_AUTO_SPLITS: usize = 110;
+/// `auto` のときの 1 分割の上限 key 数。
+const ATTN_FLASHDEC_AUTO_CHUNK_MAX: usize = 128;
+
+/// `DENNO_ATTN_FLASHDEC_CHUNK` が `auto` か (純関数。前後の空白と大小は無視)。
+pub(crate) fn parse_attn_flashdec_chunk_auto(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("auto")
+    )
+}
+
+/// 文脈長から 1 分割の key 数を決める (`auto` のとき。純関数)。
+pub(crate) fn q4_fdec_chunk_auto(t_total: usize) -> usize {
+    t_total
+        .div_ceil(ATTN_FLASHDEC_AUTO_SPLITS)
+        .clamp(ATTN_FLASHDEC_CHUNK_DEFAULT, ATTN_FLASHDEC_AUTO_CHUNK_MAX)
+}
+
 /// テスト用: flash decoding のゲートを差し替える (`None` で env の解釈に戻す)。
 #[cfg(test)]
 #[doc(hidden)]
@@ -39558,6 +39628,29 @@ fn attn_flashdec_chunk() -> usize {
     *N.get_or_init(|| {
         parse_attn_flashdec_chunk(std::env::var("DENNO_ATTN_FLASHDEC_CHUNK").ok().as_deref())
     })
+}
+
+/// この文脈長で使う 1 分割の key 数 (task 460)。
+///
+/// `DENNO_ATTN_FLASHDEC_CHUNK=auto` のときだけ文脈長で変える ([`q4_fdec_chunk_auto`])。
+/// それ以外は [`attn_flashdec_chunk`] の固定値 (現行と同じ)。
+fn attn_flashdec_chunk_for(t_total: usize) -> usize {
+    #[cfg(test)]
+    {
+        let f = ATTN_FDEC_CHUNK_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f;
+        }
+    }
+    static AUTO: OnceLock<bool> = OnceLock::new();
+    let auto = *AUTO.get_or_init(|| {
+        parse_attn_flashdec_chunk_auto(std::env::var("DENNO_ATTN_FLASHDEC_CHUNK").ok().as_deref())
+    });
+    if auto {
+        q4_fdec_chunk_auto(t_total)
+    } else {
+        attn_flashdec_chunk()
+    }
 }
 
 /// 文脈長から分割数を決める (純関数)。カーネル側の
@@ -39932,6 +40025,141 @@ fn fdt_log(len: usize, n_split: usize, chunk: usize, dh: usize, tile: usize) {
             fdt_smem_bytes(tile, dh) / 1024
         );
     }
+}
+
+// ---- task 460: combine と出力ゲートの融合 (`kernels_attn_dec4.cu`) --------
+//
+// 動機 (task 456 の `[dec-kprof-avg]`、14k の 1 層あたり):
+//   `dno_attn_flashdec_combine` 16.2 us + `dno_dec_gate_mul` 3.8 us が別々に
+//   走っていた。間に同期もデータ依存も無い (combine の出力を gate が読むだけ)
+//   ので 1 起動にすると、3.8 us の本体と起動 1 本ぶんの隙間が消える。
+//   値はビット一致 (縮約順もゲートの演算列も変えない)。
+
+/// 融合カーネルの引数の個数 (`.cu` と一致させる。kernel_invariants が見る)。
+pub(crate) const FCBG_NARGS: usize = 6;
+
+/// `DENNO_ATTN_FLASHDEC_CBG` の解釈 (純関数)。**既定 off**。
+///
+/// 真値 (`1` / `on` / `true` / `yes`) のときだけ融合版を使う。PTX が無い・ABI が
+/// 違うときは combine 単体 + gate の従来 2 起動へ落ちる (fail-closed)。
+pub(crate) fn parse_attn_fdec_cbg(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+#[cfg(test)]
+static FD_CBG_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// テスト用: 融合ゲートを差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_fdec_cbg_for_test(on: Option<bool>) {
+    FD_CBG_FORCE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// combine + ゲートの融合を使うか (`DENNO_ATTN_FLASHDEC_CBG`、既定 off)。
+fn attn_fdec_cbg_on() -> bool {
+    #[cfg(test)]
+    {
+        let f = FD_CBG_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_attn_fdec_cbg(std::env::var("DENNO_ATTN_FLASHDEC_CBG").ok().as_deref())
+    })
+}
+
+/// 融合版の PTX (`kernels_attn_dec4.ptx`)。`DENNO_ATTN_FLASHDEC4_PTX` で差し替え可。
+fn fcbg_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_ATTN_FLASHDEC4_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_attn_dec4.ptx"),
+    }
+}
+
+/// 融合版のカーネル 1 本。読み込み失敗は `None` を焼き付ける (2 起動へ落ちる)。
+struct FcbgKernels {
+    /// モジュールはプロセス終了まで保持する (unload しない)。
+    _module: CUmodule,
+    f_cbg: CUfunction,
+}
+
+unsafe impl Send for FcbgKernels {}
+unsafe impl Sync for FcbgKernels {}
+
+fn fcbg_kernels() -> Option<&'static FcbgKernels> {
+    static K: OnceLock<Option<FcbgKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = fcbg_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[attn-fdec4] PTX が読めない ({}) : {e} → combine + gate の 2 起動へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let text = String::from_utf8_lossy(&image).into_owned();
+        if ptx_entry_params(&text, "dno_attn_flashdec_cbg") != Some(FCBG_NARGS) {
+            eprintln!(
+                "[attn-fdec4] PTX の dno_attn_flashdec_cbg が {FCBG_NARGS} 引数でない \
+                 (再生成が必要) → 2 起動へ"
+            );
+            return None;
+        }
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[attn-fdec4] cuModuleLoadData 失敗 → 2 起動へ");
+                return None;
+            }
+        }
+        let mut f_cbg: CUfunction = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_get_function)(
+                &mut f_cbg,
+                module,
+                b"dno_attn_flashdec_cbg\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[attn-fdec4] PTX に dno_attn_flashdec_cbg が無い → 2 起動へ");
+                return None;
+            }
+        }
+        let k = FcbgKernels { _module: module, f_cbg };
+        eprintln!("[attn-fdec4] PTX ok: dno_attn_flashdec_cbg nargs={FCBG_NARGS}");
+        Some(k)
+    })
+    .as_ref()
+}
+
+/// 融合の門を 1 回だけログる (既定 off の確認用。t456 と同じ流儀)。
+fn fcbg_gate_log(gate_ok: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[attn-fdec4] gate cbg_on={} gate_ok={gate_ok} (DENNO_ATTN_FLASHDEC_CBG)",
+            attn_fdec_cbg_on()
+        );
+    });
 }
 
 #[cfg(test)]
@@ -40952,7 +41180,7 @@ fn q4_attn_decode_fdec(a: &Q4AttnCall<'_>, imp: FdecImpl) -> Option<Vec<f32>> {
             )
         }
     };
-    let (n_split, chunk) = q4_fdec_split(a.len, attn_flashdec_chunk());
+    let (n_split, chunk) = q4_fdec_split(a.len, attn_flashdec_chunk_for(a.len));
     match imp {
         FdecImpl::V1 => fdec_log(a.len, n_split, chunk, a.kv_dim, a.dh, a.group),
         FdecImpl::Tile => fdt_log(a.len, n_split, chunk, a.dh, tile),
@@ -41463,6 +41691,17 @@ pub mod q4attn_kprof {
         }
     }
 
+    // ---- task 460: combine + ゲートの融合版を回した回数 ----------------------
+    /// `dno_attn_flashdec_cbg` を回した回数 (= layer x decode token)。
+    /// 0 のままなら融合版は選ばれていない (既定 off)。
+    pub static CBG_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_cbg_call() {
+        if on() {
+            CBG_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn note_pf_h2d(t: Option<std::time::Instant>, bytes: usize) {
         if !on() {
             return;
@@ -41540,7 +41779,7 @@ pub mod q4attn_kprof {
              pf calls={pf_calls} h2d={:.1}MB q={:.1}MB out={:.1}MB | \
              pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms | \
              split calls={} fallback={} | fdec calls={} fallback={} | \
-             fdt calls={} fallback={} tile={}",
+             fdt calls={} fallback={} tile={} | cbg calls={}",
             mb(SEED_BYTES.load(Ordering::Relaxed)),
             mb(ROW_BYTES.load(Ordering::Relaxed)),
             mb(Q_BYTES.load(Ordering::Relaxed)),
@@ -41570,6 +41809,7 @@ pub mod q4attn_kprof {
             FDT_CALLS.load(Ordering::Relaxed),
             FDT_FALLBACKS.load(Ordering::Relaxed),
             super::attn_fdec_tile(),
+            CBG_CALLS.load(Ordering::Relaxed),
         ))
     }
 
@@ -41590,6 +41830,9 @@ pub mod q4attn_kprof {
             &SPLIT_FALLBACKS,
             &FDEC_CALLS,
             &FDEC_FALLBACKS,
+            &FDT_CALLS,
+            &FDT_FALLBACKS,
+            &CBG_CALLS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -63679,6 +63922,78 @@ mod task448_tests {
         assert_eq!(attn_fdec_tile(), 64, "FORCE の丸めが効いていない");
         set_attn_fdec_tile_for_test(None);
         assert_eq!(attn_fdec_tile(), parse_attn_fdec_tile(std::env::var("DENNO_ATTN_FLASHDEC_TILE").ok().as_deref()));
+    }
+
+    // ---- task 460: chunk の長さ依存化 + combine/gate の融合 ----------------
+
+    /// `DENNO_ATTN_FLASHDEC_CHUNK=auto` の真理値表と、長さ -> chunk の規則。
+    ///
+    /// 規則の根拠 (lab t456c、既定モデル): 14k では chunk 128 が full 段 -6.6%、
+    /// 2k では +16%。境目は block 数 2*n_split が SM 170 を割るかどうか。
+    #[test]
+    fn task460_auto_chunk_rule() {
+        // `auto` だけが真。数値・空・未知は固定値のまま。
+        assert!(parse_attn_flashdec_chunk_auto(Some("auto")));
+        assert!(parse_attn_flashdec_chunk_auto(Some(" AUTO ")));
+        for v in ["64", "128", "", "  ", "on", "x"] {
+            assert!(
+                !parse_attn_flashdec_chunk_auto(Some(v)),
+                "{v:?} を auto と読んでいる"
+            );
+        }
+        assert!(!parse_attn_flashdec_chunk_auto(None));
+
+        // 実測点: 14,018 -> 128 (n_split 110)、3,965 と 2,000 -> 64 (現状と同じ)。
+        assert_eq!(q4_fdec_chunk_auto(14018), 128);
+        assert_eq!(q4_fdec_chunk_auto(3965), 64);
+        assert_eq!(q4_fdec_chunk_auto(2000), 64);
+        assert_eq!(q4_fdec_chunk_auto(0), 64);
+        // 境界: 110*64 = 7040 まで 64、7041 で 65。上限は 128。
+        assert_eq!(q4_fdec_chunk_auto(7040), 64);
+        assert_eq!(q4_fdec_chunk_auto(7041), 65);
+        assert_eq!(q4_fdec_chunk_auto(14080), 128);
+        assert_eq!(q4_fdec_chunk_auto(40000), 128, "上限 128 を超えた");
+        // どの長さでも 1 分割は 64..=128 に収まる。
+        for t in [1usize, 63, 64, 1023, 1024, 4096, 8192, 12000, 14018, 65536] {
+            let c = q4_fdec_chunk_auto(t);
+            assert!((64..=128).contains(&c), "len={t} で chunk={c}");
+        }
+        // 実測点で n_split が期待どおり (14k は t456c の 110 と同じ、2k は 32 のまま)。
+        assert_eq!(q4_fdec_split(14018, q4_fdec_chunk_auto(14018)), (110, 128));
+        assert_eq!(q4_fdec_split(2000, q4_fdec_chunk_auto(2000)), (32, 63));
+        // 固定値 (auto でない) の既定は今までどおり 64。
+        assert_eq!(parse_attn_flashdec_chunk(None), 64);
+    }
+
+    /// 融合版 (combine + ゲート) の門は**既定 off**、真値のときだけ on。
+    #[test]
+    fn task460_cbg_gate_truth_table() {
+        for v in ["1", "on", "true", "yes", " ON ", "True"] {
+            assert!(parse_attn_fdec_cbg(Some(v)), "{v:?} が on でない");
+        }
+        for v in ["0", "off", "false", "no", "", "  ", "auto", "x"] {
+            assert!(!parse_attn_fdec_cbg(Some(v)), "{v:?} が on になっている");
+        }
+        assert!(!parse_attn_fdec_cbg(None), "未設定で on になっている (既定 off)");
+        // env 未設定なら (テストの差し替えが無ければ) off。
+        assert!(!attn_fdec_cbg_on() || FD_CBG_FORCE.load(std::sync::atomic::Ordering::Relaxed) == 1);
+        // 差し替えフックは env より優先する。
+        set_attn_fdec_cbg_for_test(Some(true));
+        assert!(attn_fdec_cbg_on());
+        set_attn_fdec_cbg_for_test(Some(false));
+        assert!(!attn_fdec_cbg_on());
+        set_attn_fdec_cbg_for_test(None);
+    }
+
+    /// 融合版の発火計数とログの口。GPU 無しでは 0 のまま。
+    #[test]
+    fn task460_cbg_counters_exist() {
+        let before = q4attn_kprof::CBG_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        q4attn_kprof::note_cbg_call();
+        let after = q4attn_kprof::CBG_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before, "計数が減った");
+        // ABI の約束 (`.cu` の引数 6 本)。
+        assert_eq!(FCBG_NARGS, 6, "融合カーネルの引数が 6 本でない");
     }
 
     /// 発火の計数 (FDT_CALLS) とログの口があること。GPU 無しでは 0 のまま。
