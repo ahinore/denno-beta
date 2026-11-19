@@ -46211,14 +46211,14 @@ mod tests {
         }
     }
 
-    /// task 464: `DENNO_MIX_NOWAIT` は既定 off・明示的な真値だけ on。
+    /// task 464: `DENNO_MIX_NOWAIT` は既定 on (lab t464b で採否)・明示的な偽値だけ off。
     #[test]
     fn task464_mix_nowait_gate_truth_table() {
-        assert!(!mix_nowait_from_value(None), "未設定は既定 off (lab で採否)");
-        for v in ["", "0", "off", "false", "no", "2", " on?", "all"] {
+        assert!(mix_nowait_from_value(None), "未設定は既定 on (lab t464b で採否)");
+        for v in ["0", "off", "false", "no", " OFF ", " False ", ""] {
             assert!(!mix_nowait_from_value(Some(v)), "raw={v:?}");
         }
-        for v in ["1", "on", "true", " ON ", "yes", " YES ", "ssm", " SSM "] {
+        for v in ["1", "on", "true", " ON ", "yes", " YES ", "ssm", " SSM ", "2"] {
             assert!(mix_nowait_from_value(Some(v)), "raw={v:?}");
         }
     }
@@ -61753,14 +61753,15 @@ pub fn gdn_x_mix_reset() {
 // 待つ ([`mix_pending_drain`])。実際にはその前に GDN が同期しているので待ちは
 // ほぼ 0。イベントが張れない環境では従来どおり文脈同期して defer しない。
 //
-// **既定 off** (lab で採否を決める)。`1` / `on` / `ssm` で on。
+// **既定 on** (lab t464b で採否: mix 段 2.81/2.85/2.82 -> 2.68/2.62/2.62 ms/token、
+// step 11.37 -> 11.23、md5 全 SAME)。切り戻しは `DENNO_MIX_NOWAIT=0`。
 pub const MIX_NOWAIT_ENV: &str = "DENNO_MIX_NOWAIT";
 
-/// [`MIX_NOWAIT_ENV`] の解釈 (純関数)。
+/// [`MIX_NOWAIT_ENV`] の解釈 (純関数)。**既定 on**、明示的な偽値だけ off。
 fn mix_nowait_from_value(v: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes") | Some("ssm")
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
     )
 }
 
