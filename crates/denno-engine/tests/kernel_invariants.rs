@@ -13150,3 +13150,122 @@ fn task448_flashdec_tile_kernel_and_wiring() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// task 457: prefill hc mix の要素カーネル第 2 版 (`kernels_pf_elem.cu`)
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「.cu の #define と cuda.rs のミラーが一致する」
+// 「build_ptx.sh が target を持つ」「PTX があれば ABI (引数 7 / 6 本) が合う」を
+// 固定する。値の一致 (丸めの木 / __expf) は cuda.rs の pf_elem_tests と lab が担当。
+const PF_ELEM_SRC: &str = include_str!("../kernels/kernels_pf_elem.cu");
+
+#[test]
+fn task457_pf_elem_kernel_and_wiring() {
+    // 1. カーネル名と、cuda.rs が同じ名前を読んでいること。
+    for name in ["dno_pf_rmsgroup_p", "dno_pf_mixed_fs"] {
+        assert!(
+            PF_ELEM_SRC.contains(name),
+            "kernels_pf_elem.cu に {name} が無い"
+        );
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+    }
+    // 2. .cu の #define と cuda.rs のミラー (値の行にコメントを付けない)。
+    for line in [
+        "#define PFE_THREADS 256",
+        "#define PFE_MAX_PER 16",
+        "#define PFE_MIXED_THREADS 256",
+    ] {
+        assert!(PF_ELEM_SRC.contains(line), "{line} が無い");
+    }
+    for line in [
+        "pub(crate) const PF_ELEM_NORM_THREADS: usize = 256;",
+        "pub(crate) const PF_ELEM_MAX_PER: usize = 16;",
+        "pub(crate) const PF_ELEM_MIXED_THREADS: usize = 256;",
+        "pub(crate) const PF_MIX_FASTSIG_MIN_TOK: usize = 32;",
+        "pub(crate) const PF_MIX_FASTSIG_MAX_HC: usize = 8;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+    // 3. norm は 1 演算 1 丸め (__fadd_rn / __fmul_rn) のまま、縮約だけ木にする。
+    for s in [
+        "ss = __fadd_rn(ss, __fmul_rn(x0, x0));",
+        "__shfl_down_sync(0xffffffffu, ss, off)",
+        "s_inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(t, eps)));",
+        "dst[i] = __fmul_rn(__fmul_rn(v[k], inv), g[i]);",
+    ] {
+        assert!(PF_ELEM_SRC.contains(s), "kernels_pf_elem.cu に {s} が無い");
+    }
+    // 4. mixed の式は従来と同じで、exp だけ __expf / 除算だけ __fdividef。
+    for s in [
+        "__fmul_rn(xn[base], __fdividef(1.0f, __fadd_rn(1.0f, __expf(-gate[base]))))",
+        "out[t * (size_t)e + (size_t)d] = __fmul_rn(acc, inv_hc);",
+    ] {
+        assert!(PF_ELEM_SRC.contains(s), "kernels_pf_elem.cu に {s} が無い");
+    }
+    // 5. build_ptx.sh の target (targets_all の末尾 = merge の衝突を避ける)。
+    assert!(
+        BUILD_PTX_SH.contains("pf_elem)      echo \"kernels_pf_elem.cu|fmad\""),
+        "build_ptx.sh に pf_elem の spec が無い"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("pf_elem"),
+        "targets_all に pf_elem が無い: {targets}"
+    );
+    // 6. PTX があれば ABI を数える。無ければ lab が生成する
+    //    (最初の lab 依頼は PTX=pf_elem で出す)。
+    let ptx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("kernels")
+        .join("kernels_pf_elem.ptx");
+    if let Ok(text) = std::fs::read_to_string(&ptx) {
+        for (name, want) in [("dno_pf_rmsgroup_p", 7usize), ("dno_pf_mixed_fs", 6)] {
+            let pat = format!(".entry {name}(");
+            let i = text
+                .find(&pat)
+                .unwrap_or_else(|| panic!("PTX に {name} の entry が無い (再生成が必要)"));
+            let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+            assert_eq!(
+                text[i..j].matches(".param .").count(),
+                want,
+                "PTX の {name} の引数が {want} 本でない"
+            );
+        }
+    }
+}
+
+/// ゲート (`DENNO_PF_MIX_NORMP` / `DENNO_PF_MIX_FASTSIG`) の既定は **off**
+/// (lab の結果で決める)。
+#[test]
+fn task457_pf_elem_gates_default_off() {
+    for f in [
+        "pub(crate) fn pf_mix_normp_from_value",
+        "pub(crate) fn pf_mix_fastsig_from_value",
+    ] {
+        let i = CUDA_RS.find(f).unwrap_or_else(|| panic!("{f} が無い"));
+        let body: String = CUDA_RS[i..].chars().take(300).collect();
+        assert!(body.contains("None => false,"), "{f}(None) が off でない: {body}");
+    }
+}
+
+/// 既定経路 (ゲート off) では新しいカーネルを 1 本も撃たない: 起動サイトが
+/// ゲートで分岐し、off 側が従来カーネル (`k.rmsgroup` / `k.mixed`) であること。
+#[test]
+fn task457_pf_elem_off_path_keeps_old_kernels() {
+    for s in [
+        "ctx.launch_async(k.rmsgroup, (rows as u32, 1, 1), (128, 1, 1), 0, &mut args)",
+        "ctx.launch_async(k.mixed, grid, (256, 1, 1), 0, &mut args)",
+        "let normp = if pf_mix_normp_on() && pf_mix_normp_ok(e) {",
+        "let fastsig = if pf_mix_fastsig_on() && pf_mix_fastsig_ok(e, hc, nt) {",
+        // 発火の証拠 (COND ごとに 1 行出る)。
+        "\"[pf-elem] {tag} grid={}x{}x{} threads={threads} {detail}\"",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+}

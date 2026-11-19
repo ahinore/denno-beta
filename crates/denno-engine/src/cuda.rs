@@ -29730,6 +29730,348 @@ fn pf_log_grid(tag: &str, grid: (u32, u32, u32), threads: u32) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// task 457: prefill hc mix の要素カーネル第 2 版 (kernels_pf_elem.cu、既定 off)
+// ---------------------------------------------------------------------------
+//
+// 動機は kernels_pf_elem.cu の先頭。既存の `dno_pf_rmsgroup` / `dno_pf_mixed`
+// (kernels_pf.ptx、include_bytes で固定) は**触らず**、新しい PTX を実行時に読む。
+// 読めない / entry が無い / 引数の数が違う / 形が外れる、のどれでも従来カーネルへ
+// fail closed (ゲート on でも既定と同じ経路・同じ値)。
+
+/// norm 版のスレッド数 (カーネルの `PFE_THREADS`)。
+pub(crate) const PF_ELEM_NORM_THREADS: usize = 256;
+/// 1 スレッドがレジスタに持てる要素数 (カーネルの `PFE_MAX_PER`)。
+pub(crate) const PF_ELEM_MAX_PER: usize = 16;
+/// mixed 版のスレッド数 (カーネルの `PFE_MIXED_THREADS`、既存と同じ 256)。
+pub(crate) const PF_ELEM_MIXED_THREADS: usize = 256;
+/// これ未満のトークン数は従来カーネル (起動のほうが高い)。
+pub(crate) const PF_MIX_FASTSIG_MIN_TOK: usize = 32;
+/// fast sigmoid 版を使ってよい hc の上限 (inject と同じ 8)。
+pub(crate) const PF_MIX_FASTSIG_MAX_HC: usize = 8;
+
+struct PfElemKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    rmsgroup_p: CUfunction,
+    mixed_fs: CUfunction,
+}
+
+// 生ハンドル (PfKernels / MixInjKernels と同じ規約)。
+unsafe impl Send for PfElemKernels {}
+unsafe impl Sync for PfElemKernels {}
+
+/// PTX の置き場所。`DENNO_PF_ELEM_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_pf_elem.ptx`。
+fn pf_elem_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_ELEM_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_pf_elem.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+fn pf_elem_kernels() -> Option<&'static PfElemKernels> {
+    static K: OnceLock<Option<PfElemKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = pf_elem_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    "[pf-elem] PTX が読めない ({}) : {e} → 従来の要素カーネルへ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        // 引数の数はモジュールを載せる前に見る (ABI の取り違えを先に落とす)。
+        {
+            let text = String::from_utf8_lossy(&image).to_string();
+            for (name, want) in [("dno_pf_rmsgroup_p", 7usize), ("dno_pf_mixed_fs", 6)] {
+                match ptx_entry_params(&text, name) {
+                    Some(n) if n == want => {}
+                    other => {
+                        tracing::info!(
+                            "[pf-elem] {name} の引数が {other:?} (期待 {want}) → 従来の要素カーネルへ"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                tracing::info!("[pf-elem] cuModuleLoadData 失敗 → 従来の要素カーネルへ");
+                return None;
+            }
+            let mut fns: [CUfunction; 2] = [std::ptr::null_mut(); 2];
+            let names: [&[u8]; 2] = [b"dno_pf_rmsgroup_p\0", b"dno_pf_mixed_fs\0"];
+            for (i, name) in names.iter().enumerate() {
+                if (lib.module_get_function)(&mut fns[i], module, name.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    tracing::info!(
+                        "[pf-elem] PTX に {} が無い → 従来の要素カーネルへ",
+                        String::from_utf8_lossy(&name[..name.len() - 1])
+                    );
+                    return None;
+                }
+            }
+            log_kernel_attr(lib, fns[0], "dno_pf_rmsgroup_p");
+            log_kernel_attr(lib, fns[1], "dno_pf_mixed_fs");
+            Some(PfElemKernels {
+                module,
+                rmsgroup_p: fns[0],
+                mixed_fs: fns[1],
+            })
+        }
+    })
+    .as_ref()
+}
+
+/// 発火の証拠を 1 形につき 1 回だけ出す (`PROFILE` の有無に依らない)。
+///
+/// lab の COND でゲートが届いたか・新カーネルが走ったかを 1 見で分けるため。
+/// `[pf-mix-grid]` と違い `DENNO_PF_MIX_KPROF` を要求しない (本番の既定 on でも
+/// プロセスあたり数行しか出ない)。
+fn pf_elem_note(tag: &str, grid: (u32, u32, u32), threads: u32, detail: &str) {
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<(String, u32, u32, u32, u32)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (tag.to_string(), grid.0, grid.1, grid.2, threads);
+    let fresh = SEEN.with(|c| {
+        let mut v = c.borrow_mut();
+        if v.contains(&key) {
+            false
+        } else {
+            v.push(key.clone());
+            true
+        }
+    });
+    if !fresh {
+        return;
+    }
+    eprintln!(
+        "[pf-elem] {tag} grid={}x{}x{} threads={threads} {detail}",
+        grid.0, grid.1, grid.2
+    );
+}
+
+/// `DENNO_PF_MIX_NORMP` の解釈 (純関数)。明示的な真値だけ on。
+pub(crate) fn pf_mix_normp_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// norm の二乗和分担版を使うか (既定 off。採否は lab で決める)。
+pub(crate) fn pf_mix_normp_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_mix_normp_from_value(std::env::var("DENNO_PF_MIX_NORMP").ok().as_deref()))
+}
+
+/// その e を分担版で回してよいか (純関数)。
+///
+/// 1 スレッドのレジスタ上限 (`PF_ELEM_NORM_THREADS` x [`PF_ELEM_MAX_PER`]) に収まる
+/// ことだけが条件。実形は e=2,560 (10 要素/スレッド)。
+pub(crate) fn pf_mix_normp_ok(e: usize) -> bool {
+    e > 0 && e <= PF_ELEM_NORM_THREADS * PF_ELEM_MAX_PER
+}
+
+/// `DENNO_PF_MIX_FASTSIG` の解釈 (純関数)。明示的な真値だけ on。
+pub(crate) fn pf_mix_fastsig_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// mixed の fast sigmoid 版を使うか (既定 off。採否は lab で決める)。
+pub(crate) fn pf_mix_fastsig_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_mix_fastsig_from_value(std::env::var("DENNO_PF_MIX_FASTSIG").ok().as_deref())
+    })
+}
+
+/// その形を fast sigmoid 版で回してよいか (純関数)。
+pub(crate) fn pf_mix_fastsig_ok(e: usize, hc: usize, nt: usize) -> bool {
+    e > 0 && hc >= 1 && hc <= PF_MIX_FASTSIG_MAX_HC && nt >= PF_MIX_FASTSIG_MIN_TOK
+}
+
+#[cfg(test)]
+mod pf_elem_tests {
+    use super::*;
+
+    /// ゲートの真理値表 (明示的な真値だけ on・既定 off)。
+    #[test]
+    fn pf_elem_gate_truth_table() {
+        for v in [
+            None,
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("no"),
+            Some(""),
+            Some(" OFF "),
+            Some("2"),
+            Some("0 "),
+        ] {
+            assert!(!pf_mix_normp_from_value(v), "normp {v:?} が on になった");
+            assert!(!pf_mix_fastsig_from_value(v), "fastsig {v:?} が on になった");
+        }
+        for v in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
+            assert!(pf_mix_normp_from_value(v), "normp {v:?} が on でない");
+            assert!(pf_mix_fastsig_from_value(v), "fastsig {v:?} が on でない");
+        }
+    }
+
+    /// norm 分担版の形の門番: レジスタ上限まで、それ以上は従来へ。
+    #[test]
+    fn pf_elem_normp_ok_bounds() {
+        assert!(pf_mix_normp_ok(2560), "実形 e=2,560 が落ちている");
+        assert!(pf_mix_normp_ok(1));
+        assert!(pf_mix_normp_ok(PF_ELEM_NORM_THREADS * PF_ELEM_MAX_PER));
+        assert!(!pf_mix_normp_ok(0));
+        assert!(!pf_mix_normp_ok(PF_ELEM_NORM_THREADS * PF_ELEM_MAX_PER + 1));
+    }
+
+    /// fast sigmoid 版の形の門番。
+    #[test]
+    fn pf_elem_fastsig_ok_bounds() {
+        assert!(pf_mix_fastsig_ok(2560, 4, 1913), "実形が落ちている");
+        assert!(pf_mix_fastsig_ok(2560, 1, 32));
+        assert!(!pf_mix_fastsig_ok(2560, 4, 19), "短い prefill は従来");
+        assert!(!pf_mix_fastsig_ok(2560, 0, 512));
+        assert!(!pf_mix_fastsig_ok(2560, 9, 512), "hc>8 は従来");
+        assert!(!pf_mix_fastsig_ok(0, 4, 512));
+    }
+
+    /// 実形の grid が 1 ブロック 1 行 / e を 256 で割った形になること。
+    #[test]
+    fn pf_elem_real_shape_grid() {
+        let (nt, hc, e) = (1913usize, 4usize, 2560usize);
+        assert_eq!((nt * hc) as u32, 7652, "norm の grid が実測と違う");
+        assert_eq!(e.div_ceil(PF_ELEM_MIXED_THREADS) as u32, 10, "mixed の grid.x が違う");
+        // 1 スレッドあたりの要素数 = ceil(e/256) = 10 <= PF_ELEM_MAX_PER
+        assert_eq!(e.div_ceil(PF_ELEM_NORM_THREADS), 10);
+        assert!(e.div_ceil(PF_ELEM_NORM_THREADS) <= PF_ELEM_MAX_PER);
+    }
+
+    /// 分担版の二乗和 (スレッド内 10 要素 + 32 本の木 + 8 warp) をホストで再現し、
+    /// 従来の逐次和と f64 真値の両方に 1e-6 相対で合うこと (= 木の順序の取り違え
+    /// が無いこと) を確かめる。
+    #[test]
+    fn pf_elem_norm_tree_matches_reference() {
+        let e = 2560usize;
+        let nt = PF_ELEM_NORM_THREADS;
+        let x: Vec<f32> = (0..e)
+            .map(|i| ((i as f32) * 0.001).sin() + 0.5)
+            .collect();
+        // (a) 従来 (1 スレッドが i 昇順)
+        let mut serial = 0.0f32;
+        for v in x.iter() {
+            serial = fadd(serial, fmul(*v, *v));
+        }
+        // (b) 分担版
+        let nper = e.div_ceil(nt);
+        let mut part = vec![0.0f32; nt];
+        for (t, p) in part.iter_mut().enumerate() {
+            let mut ss = 0.0f32;
+            for k in 0..nper {
+                let i = t + k * nt;
+                if i < e {
+                    ss = fadd(ss, fmul(x[i], x[i]));
+                }
+            }
+            *p = ss;
+        }
+        // warp 内の木 (__shfl_down_sync の off=16..1)。
+        // 注意: shfl は**その時点のレーンの値**を読むので、ホストの鏡も
+        // step ごとに別バッファへ書く (in-place で足すと木が壊れる)。
+        for w in 0..(nt / 32) {
+            let base = w * 32;
+            let mut cur: Vec<f32> = part[base..base + 32].to_vec();
+            for off in [16usize, 8, 4, 2, 1] {
+                let mut next = cur.clone();
+                for l in 0..32 {
+                    if l + off < 32 {
+                        next[l] = fadd(cur[l], cur[l + off]);
+                    }
+                }
+                cur = next;
+            }
+            part[base] = cur[0];
+        }
+        let mut tree = part[0];
+        for w in 1..(nt / 32) {
+            tree = fadd(tree, part[w * 32]);
+        }
+        // f64 真値
+        let truth: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let rel = |a: f32, b: f64| ((a as f64) - b).abs() / b.abs();
+        assert!(rel(tree, truth) < 1e-6, "tree {tree} vs truth {truth}");
+        assert!(rel(serial, truth) < 1e-6, "serial {serial} vs truth {truth}");
+        // 分担版は従来と厳密一致はしない (丸め順が違う) が、差は 1e-7 相対以内。
+        let d = ((tree as f64) - (serial as f64)).abs() / (serial as f64).abs();
+        assert!(d < 1e-6, "tree {tree} / serial {serial} の相対差 {d}");
+    }
+
+    /// fast sigmoid の値が従来 (f64 expf 相当の f32 参照) と 3e-7 相対以内で、
+    /// 端点 (0 / 1) で壊れないこと。
+    #[test]
+    fn pf_elem_fastsig_values() {
+        for g in [-40.0f32, -8.0, -1.0, 0.0, 1.0, 8.0, 40.0] {
+            let fast = fdiv(1.0, fadd(1.0, expf_f32(-g)));
+            let slow = 1.0f32 / (1.0f32 + (-g as f64).exp() as f32);
+            let d = (fast - slow).abs() / slow.max(1e-30);
+            assert!(d < 3e-7, "g={g}: fast {fast} slow {slow} 相対差 {d}");
+        }
+        // 飽和: 大きな負の gate で sigmoid -> 0、正で 1。
+        assert_eq!(fdiv(1.0, fadd(1.0, expf_f32(1000.0))), 0.0);
+        let s = fdiv(1.0, fadd(1.0, expf_f32(-1000.0)));
+        assert!((s - 1.0).abs() < 1e-7, "{s}");
+    }
+
+    // --- ホスト側の鏡 (カーネルの 1 演算 1 丸めと同じ) ---
+    fn fadd(a: f32, b: f32) -> f32 {
+        a + b
+    }
+    fn fmul(a: f32, b: f32) -> f32 {
+        a * b
+    }
+    fn fdiv(a: f32, b: f32) -> f32 {
+        a / b
+    }
+    /// `__expf` の近似 (2^-x を f32 で)。値の比較用の粗い鏡。
+    fn expf_f32(x: f32) -> f32 {
+        if x > 88.0 {
+            return f32::INFINITY;
+        }
+        if x < -103.0 {
+            return 0.0;
+        }
+        // 2^(x/ln2) を exp2 の分解で (f32 の丸めのみ)。
+        let t = (x as f64) * std::f64::consts::LOG2_E;
+        (2.0f64).powf(t) as f32
+    }
+}
+
+
 /// task 154: hc mix の 1 段 (norm → down → lo → up → mixed → inject) をデバイスで回し、
 /// `mixed` (と inject 列) をデバイスに残す。
 ///
@@ -29842,11 +30184,37 @@ pub fn pf_mix(
                 &mut hc_c as *mut _ as *mut c_void,
                 &mut eps_c as *mut _ as *mut c_void,
             ];
-            unsafe {
-                ctx.launch_async(k.rmsgroup, (rows as u32, 1, 1), (128, 1, 1), 0, &mut args)
-                    .map_err(|e| format!("rmsgroup launch: {e:#}"))?;
+            // task 457: 二乗和を block で分担する版 (`DENNO_PF_MIX_NORMP`、既定 off)。
+            // PTX が無い / e がレジスタ上限を超えるときは従来カーネルへ (同じ値)。
+            let normp = if pf_mix_normp_on() && pf_mix_normp_ok(e) {
+                pf_elem_kernels()
+            } else {
+                None
+            };
+            match normp {
+                Some(fns) => {
+                    let threads = PF_ELEM_NORM_THREADS as u32;
+                    let grid = (rows as u32, 1, 1);
+                    pf_elem_note(
+                        "normp",
+                        grid,
+                        threads,
+                        &format!("e={e} rows={rows} hc={hc} inv=tree"),
+                    );
+                    unsafe {
+                        ctx.launch_async(fns.rmsgroup_p, grid, (threads, 1, 1), 0, &mut args)
+                            .map_err(|e| format!("rmsgroup_p launch: {e:#}"))?;
+                    }
+                    pf_log_grid("normp", grid, threads);
+                }
+                None => {
+                    unsafe {
+                        ctx.launch_async(k.rmsgroup, (rows as u32, 1, 1), (128, 1, 1), 0, &mut args)
+                            .map_err(|e| format!("rmsgroup launch: {e:#}"))?;
+                    }
+                    pf_log_grid("norm", (rows as u32, 1, 1), 128);
+                }
             }
-            pf_log_grid("norm", (rows as u32, 1, 1), 128);
         }
         pf_mix_kprof::end(pf_mix_kprof::NORM);
         // 2. down GEMM (xn → lo)
@@ -30102,11 +30470,36 @@ pub fn pf_mix(
                 &mut hc_c as *mut _ as *mut c_void,
                 &mut inv_c as *mut _ as *mut c_void,
             ];
-            unsafe {
-                ctx.launch_async(k.mixed, grid, (256, 1, 1), 0, &mut args)
-                    .map_err(|e| format!("mixed launch: {e:#}"))?;
+            // task 457: sigmoid を f32 の速い経路にした版 (`DENNO_PF_MIX_FASTSIG`、既定 off)。
+            // 値は 2 ULP 程度変わる (丸めの変更)。形が外れたら従来カーネルへ。
+            let fastsig = if pf_mix_fastsig_on() && pf_mix_fastsig_ok(e, hc, nt) {
+                pf_elem_kernels()
+            } else {
+                None
+            };
+            match fastsig {
+                Some(fns) => {
+                    let threads = PF_ELEM_MIXED_THREADS as u32;
+                    pf_elem_note(
+                        "mixed_fs",
+                        grid,
+                        threads,
+                        &format!("e={e} hc={hc} nt={nt} sigmoid=__expf"),
+                    );
+                    unsafe {
+                        ctx.launch_async(fns.mixed_fs, grid, (threads, 1, 1), 0, &mut args)
+                            .map_err(|e| format!("mixed_fs launch: {e:#}"))?;
+                    }
+                    pf_log_grid("mixed_fs", grid, threads);
+                }
+                None => {
+                    unsafe {
+                        ctx.launch_async(k.mixed, grid, (256, 1, 1), 0, &mut args)
+                            .map_err(|e| format!("mixed launch: {e:#}"))?;
+                    }
+                    pf_log_grid("mixed", grid, 256);
+                }
             }
-            pf_log_grid("mixed", grid, 256);
         }
         pf_mix_kprof::end(pf_mix_kprof::MIXED);
         // 6. inject GEMM (xn → inj) + 1/hc
