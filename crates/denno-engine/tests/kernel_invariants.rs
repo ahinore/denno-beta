@@ -13486,6 +13486,11 @@ fn task464_mix_nowait_wiring() {
         "MIX_NOWAIT_HITS.fetch_add(1, AO::Relaxed);",
         // GDN: 空の cur で控えも無いときは落とす。
         "で mix の控えも無い (DENNO_MIX_NOWAIT の前提が崩れた)",
+        // 早期の寸法検査は空の cur を許し、控えが無ければ poisoned で落とす
+        // (CPU 経路へ静かに落ちると空の入力で計算してしまう)。
+        "if (req.cur.len() != req.n_embd && !cur_empty)",
+        "if cur_empty && !gdn_x_in_mix_armed(req.n_embd) {",
+        "入力が空で mix の控えも無い → 要求を落とす",
     ] {
         assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
     }

@@ -62432,7 +62432,11 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             gdn_note_once("寸法が確保済みエントリと違う (バグの疑い) → CPU 経路");
             return GdnDecodeRes::cpu();
         }
-        if req.cur.len() != req.n_embd
+        // task 464: `DENNO_MIX_NOWAIT` の defer 回は `cur` が空で来る (入力は mix の
+        // 鎖がデバイスに残した `dm`)。空は控えが armed のときだけ許し、控えが無ければ
+        // **CPU 経路へ落とさず**に要求を落とす (空の入力で黙って計算しない)。
+        let cur_empty = req.cur.is_empty();
+        if (req.cur.len() != req.n_embd && !cur_empty)
             || req.conv_host.len() != e.conv_len
             || req.ssm_host.len() != e.ssm_len
             || (req.ba_units.is_empty()
@@ -62440,6 +62444,17 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         {
             gdn_note_once("入力長が寸法と違う (バグの疑い) → CPU 経路");
             return GdnDecodeRes::cpu();
+        }
+        if cur_empty && !gdn_x_in_mix_armed(req.n_embd) {
+            // 呼び出し側の前提 (mix の鎖が `dm` を残す) が崩れている。CPU 経路へ
+            // 落とすと空の入力で計算してしまうので、poisoned で要求を落とす。
+            gdn_note_once("入力が空で mix の控えも無い → 要求を落とす");
+            return GdnDecodeRes {
+                out: None,
+                state_back: None,
+                poisoned: true,
+                state_dev: None,
+            };
         }
         // task 140: qkv GEMV の出力は `e.qkv` の行オフセットへ書く。合計が
         // qkv_total を越えるとデバイスバッファの外へ書いて CUDA error 700 になる
