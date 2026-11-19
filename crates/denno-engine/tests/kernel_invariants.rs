@@ -7771,6 +7771,119 @@ fn pf230_attn_pf3_tile_matches_host() {
     assert_eq!(nargs, 11, "引数の数が v2 (12 個) と違う");
 }
 
+// ---------------------------------------------------------------------------
+// task 465: prefill attention v4 (`kernels_attn_pf4.cu` = K/V を bf16 で読む v3)
+// ---------------------------------------------------------------------------
+
+const ATTN_PF4_SRC: &str = include_str!("../kernels/kernels_attn_pf4.cu");
+
+/// v4 が v3 と同じタイル・同じ smem で、K/V だけ bf16 になっていること。
+#[test]
+fn task465_pf_attn_v4_is_v3_with_bf16_kv() {
+    let d = defines(ATTN_PF4_SRC);
+    let bq = eval_define("A4_BQ", &d);
+    let bk = eval_define("A4_BK", &d);
+    let qd = eval_define("A4_QD", &d);
+    let pd = eval_define("A4_PD", &d);
+    let thr = eval_define("A4_THREADS", &d);
+    let smem = eval_define("A4_SMEM_BYTES", &d);
+    // タイルは v3 と同一 (sm_120 の動的 smem 上限 99 KB に収めるため広げない)。
+    assert_eq!(bq, 64, "A4_BQ が v3 と違う");
+    assert_eq!(bk, 32, "A4_BK が v3 と違う");
+    assert_eq!(thr, 256, "A4_THREADS が v3 と違う");
+    assert_eq!(qd, 264, "A4_QD が 264 でない (256 + 8 の詰め物)");
+    assert_eq!(pd, 40, "A4_PD が 40 でない (32 + 8 の詰め物)");
+    let expect = bq * qd * 2
+        + bk * qd * 2
+        + bk * qd * 2
+        + bq * pd * 2
+        + bq * bk * 4
+        + 2 * bq * 4
+        + 8 * 16 * 16 * 4;
+    assert_eq!(expect, smem, "A4_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect < 99 * 1024,
+        "動的 smem {expect} B が実機の opt-in 上限 (99KB) を超える"
+    );
+    // ホスト側のミラー。
+    assert_eq!(rust_const("ATTN_PF4_SMEM_BYTES"), smem, "cuda.rs と不一致");
+    assert_eq!(rust_const("ATTN_PF4_BQ"), bq, "cuda.rs の ATTN_PF4_BQ が不一致");
+    assert_eq!(rust_const("ATTN_PF4_THREADS"), thr, "cuda.rs の ATTN_PF4_THREADS が不一致");
+    assert_eq!(rust_const("ATTN_PF4_DH"), 256, "ATTN_PF4_DH が 256 でない");
+    // K/V が bf16 で読まれ、smem へは 8 バイトのコピーで入ること
+    // (f32 のままなら v3 と同じで、読む量が減らない)。
+    assert!(
+        ATTN_PF4_SRC.contains("const __nv_bfloat16 *__restrict__ kc,")
+            && ATTN_PF4_SRC.contains("const __nv_bfloat16 *__restrict__ vc,"),
+        "K/V の引数が bf16 でない"
+    );
+    assert!(
+        ATTN_PF4_SRC.contains("const __nv_bfloat16 *ksrc = kc + (size_t)j * kv_dim + kh_off + dd;")
+            && ATTN_PF4_SRC.contains("*reinterpret_cast<const uint2 *>(ksrc + 4 * blk);"),
+        "K のタイル読みが 8 バイトのコピーでない (f32 経路が残っている)"
+    );
+    assert!(
+        !ATTN_PF4_SRC.contains("const float *ksrc"),
+        "K を f32 で読む経路が残っている (読みが半分にならない)"
+    );
+    // 変換カーネルも同じ丸め (`__floats2bfloat162_rn`) を使うこと。
+    assert!(
+        ATTN_PF4_SRC.contains("extern \"C\" __global__ void dno_kv_f32_to_bf16(")
+            && ATTN_PF4_SRC.contains("__floats2bfloat162_rn"),
+        "f32 -> bf16 の変換カーネルが無い/丸めが違う"
+    );
+    // スコアと PV の mma は v3 と同じ形であること (丸め順を変えない)。
+    assert!(
+        ATTN_PF4_SRC.contains(
+            "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;"
+        ) && ATTN_PF4_SRC.contains("wmma::mma_sync(acc[t], af, bf, acc[t]);"),
+        "v3 と同じ mma の形でない"
+    );
+    assert!(
+        ATTN_PF4_SRC.contains("exp2f((s_sm[idx] - m0_sm[r]) * A4_LOG2E)")
+            && ATTN_PF4_SRC.contains("m0_sm[tid] = (mx > -INFINITY) ? mx : 0.0f;"),
+        "行最大と exp2 の扱いが v3 と違う"
+    );
+    // build_ptx.sh: compute_90 で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("attn_pf4)     echo \"kernels_attn_pf4.cu|nofmad|compute_90\""),
+        "build_ptx.sh の attn_pf4 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("attn_pf4"),
+        "build_ptx.sh の targets_all に attn_pf4 が無い: {targets}"
+    );
+    // PTX の入口名と引数 (12 個) の一致。
+    assert!(
+        CUDA_RS.contains("b\"dno_attention_prefill4\\0\""),
+        "cuda.rs が dno_attention_prefill4 を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("b\"dno_kv_f32_to_bf16\\0\""),
+        "cuda.rs が dno_kv_f32_to_bf16 を読んでいない"
+    );
+    for (entry, want) in [("dno_attention_prefill4", 11), ("dno_kv_f32_to_bf16", 6)] {
+        let sig = ATTN_PF4_SRC
+            .find(&format!("extern \"C\" __global__ void {entry}("))
+            .unwrap_or_else(|| panic!("入口 {entry} が無い"));
+        let head = &ATTN_PF4_SRC[sig..];
+        let head = &head[..head.find(')').expect("引数リストが閉じない")];
+        let code: String = head
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(code.matches(',').count(), want, "{entry} の引数の数が違う");
+    }
+}
+
 /// task 230: v3 の attention (PV の bf16 mma と「最初のタイルの行最大 m0」) の
 /// 数値を CPU で模擬し、誤差の上限を固定する。
 ///
@@ -10715,7 +10828,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12242,7 +12355,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12359,7 +12472,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12554,7 +12667,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12648,7 +12761,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12942,7 +13055,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
