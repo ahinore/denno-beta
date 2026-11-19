@@ -30122,15 +30122,23 @@ pub(crate) const PF_PLE_MAX_HIST: usize = 32;
 /// これ未満のトークン数は従来経路 (起動と往復の固定費が勝つ)。
 pub(crate) const PF_PLE_DEV_MIN_TOK: usize = 64;
 
-/// `DENNO_PF_PLE_DEV` の解釈 (明示的な真値だけ on)。
+/// `DENNO_PF_PLE_DEV` の解釈。**明示的な偽値だけ off** = 既定 on。
+///
+/// lab t461d で採った: 3,826 cold prefill が base2 2,211 / 2,216 ms に対し
+/// **2,143 / 2,106 ms (-3.2% / -4.7%、2 ラウンドとも)**、`other` 段は
+/// 190.5 -> 85.3 ms。14k は ±1% (other -83 / experts +87 で相殺)、decode は不変。
 pub(crate) fn pf_ple_dev_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim),
-        Some("1" | "on" | "true" | "yes" | "ON" | "TRUE" | "YES")
-    )
+    match v {
+        None => true,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | ""
+        ),
+    }
 }
 
-/// デバイス経路を使うか (プロセスで 1 回だけ env を読む。既定 off)。
+/// デバイス経路を使うか (プロセスで 1 回だけ env を読む。既定 on。
+/// 切り戻しは `DENNO_PF_PLE_DEV=0`)。
 pub(crate) fn pf_ple_dev_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| pf_ple_dev_from_value(std::env::var(PF_PLE_DEV_ENV).ok().as_deref()))
@@ -64678,12 +64686,12 @@ mod task448_tests {
 mod pf_ple_dev_tests {
     use super::*;
 
-    /// task 461: `DENNO_PF_PLE_DEV` の真理値表 (既定 off。明示的な真値だけ on)。
+    /// task 461: `DENNO_PF_PLE_DEV` の真理値表 (**既定 on** = lab t461d で採択。
+    /// 切り戻しは明示的な偽値)。
     #[test]
     fn pf_ple_dev_gate_truth_table() {
-        assert!(!pf_ple_dev_from_value(None), "未設定は既定 off");
-        assert!(!pf_ple_dev_from_value(Some("")));
-        for v in ["0", "off", "false", "no", " off ", "FALSE", "2"] {
+        assert!(pf_ple_dev_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", " OFF ", "FALSE", ""] {
             assert!(!pf_ple_dev_from_value(Some(v)), "{v:?} が on になった");
         }
         for v in ["1", "on", "true", "yes", " ON ", "TRUE"] {
