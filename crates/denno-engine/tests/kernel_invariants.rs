@@ -10375,6 +10375,7 @@ fn t470_early_route_is_wired() {
         "crate::model::expert_vram::peek_many(",
         // task 474: 捨てずに置き場 (RAM) へ置く。ページキャッシュ頼みの
         // `readahead(2)` / 「pread して捨てる」は t470 で負けたので消した。
+        "crate::model::exp_pf::early_route_window_ok(nt0, nt_all)",
         "crate::model::exp_pf::rc_plan(&runs)",
         "crate::model::exp_pf::rc_pool(nt)",
         "crate::model::exp_pf::rc_commit_one(",

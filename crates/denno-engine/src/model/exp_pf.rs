@@ -3105,6 +3105,23 @@ pub fn early_route_budget(mb: usize, kb: usize, rest_tok: usize) -> usize {
     want.clamp(EARLY_ROUTE_MIN_BYTES, EARLY_ROUTE_MAX_BYTES)
 }
 
+/// 先読みの窓として要る「残りチャンク数」の下限。
+///
+/// lab t474a: 3,826 (残り 1 チャンク) では 1 層 42 MB の先読みが窓 (9.5 ms) に
+/// 収まらず (11.3 ms)、壁は ±0 だった。14k (残り 6 チャンク) は収まって -13.6%。
+pub const EARLY_ROUTE_MIN_REST_CHUNKS: usize = 4;
+
+/// 先読みの窓が十分か (純関数)。
+///
+/// 「残りのチャンクが [`EARLY_ROUTE_MIN_REST_CHUNKS`] 本以上」= 窓が
+/// `4 × nt0` トークン以上あること。1 チャンクで終わる層 (窓なし) も false。
+pub fn early_route_window_ok(nt0: usize, nt_all: usize) -> bool {
+    if nt0 == 0 || nt_all <= nt0 {
+        return false;
+    }
+    nt_all - nt0 >= nt0.saturating_mul(EARLY_ROUTE_MIN_REST_CHUNKS)
+}
+
 /// 先読みの台帳 (層数 / expert 本数 / バイト / 呼び出し回数)。
 static ER_LAYERS: AtomicU64 = AtomicU64::new(0);
 static ER_EXPERTS: AtomicU64 = AtomicU64::new(0);
@@ -4310,6 +4327,20 @@ mod tests {
         assert_eq!(rc_threads_from_value(Some("4")), 4);
         assert_eq!(rc_threads_from_value(Some("999")), 32, "上限 32");
         assert_eq!(rc_threads_from_value(Some("x")), DEFAULT_RC_THREADS);
+    }
+
+    /// task 474: 窓の下限 (残りチャンク 4 本)。
+    ///
+    /// 3,826 (1,913 トークンのチャンク 2 本 = 残り 1 本) は窓が短すぎて
+    /// 先読みがはみ出す (t474a で ±0)。14k (2,003 × 7) は残り 6 本で収まる。
+    #[test]
+    fn early_route_window_gate() {
+        assert!(!early_route_window_ok(1_913, 3_826), "3,826 は残り 1 チャンク");
+        assert!(early_route_window_ok(2_003, 14_018), "14k は残り 6 チャンク");
+        assert!(!early_route_window_ok(0, 14_018), "チャンク 0 は窓なし");
+        assert!(!early_route_window_ok(2_048, 2_048), "1 チャンクは窓なし");
+        assert!(early_route_window_ok(2_048, 10_240), "残り 4 本ちょうどは可");
+        assert!(!early_route_window_ok(2_048, 10_239), "残り 4 本未満は不可");
     }
 
     /// task 325: `DENNO_PF_RA_GROUPS` の真理値表 (未設定は off)。

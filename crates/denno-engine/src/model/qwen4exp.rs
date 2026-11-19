@@ -19119,6 +19119,18 @@ fn pf_early_route_prefetch(
     );
     // expert 昇順 = MoE が読む順。上限まで集めたら止める (ディスクの遊びは
     // 残りチャンクの attention の時間ぶんしかない)。
+    // 1.1 窓が短すぎる層は何もしない。
+    //
+    // lab t474a の実測: 3,826 (1 チャンク = 1,913 トークンの窓) では 1 層 42 MB の
+    // 先読みに 11.3 ms かかり、窓の 9.5 ms に収まらない。はみ出した分は写しと
+    // 帯域を奪い合うだけで、壁は b 9.34/9.30 s 対 rc 8.96/10.04 s = **±0**
+    // (ディスクの揺れの内側) だった。14k (残り 6 チャンク = 62 ms の窓) では
+    // 1 層 287 MB が 51 ms で収まり、壁は b 15.20 / b2 13.88 s 対 rc 12.56 s。
+    // したがって「残りの窓が 4 チャンク以上」のときだけ先読みする
+    // (`nt0` = 1 チャンクのトークン数)。
+    if !crate::model::exp_pf::early_route_window_ok(nt0, nt_all) {
+        return None;
+    }
     let mut runs: Vec<(u32, u64, usize)> = Vec::new();
     let mut bytes = 0usize;
     let mut calls = 0usize;
