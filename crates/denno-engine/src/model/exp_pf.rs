@@ -2974,6 +2974,150 @@ pub fn layer_pre_stats_reset() {
     }
 }
 
+// ===========================================================================
+// task 470: 1 チャンク目の routing を解いてから先読みする (`DENNO_PF_EARLY_ROUTE`)
+// ===========================================================================
+//
+// task 394 の `DENNO_PF_LAYER_PRE` は「その層の expert は全部要る」という前提で
+// 1 層先を `readahead(2)` したが、実測は層に **512 本** あるのに routing は
+// **296 本 (58%)** しか使わず、77 GB を投げて 44.4 GB を読む 1.73 倍の無駄読みに
+// なって負けた (t394b)。無駄読みはディスクの遊びをそのまま食うので、58% では
+// 差が出ない。
+//
+// ここでは予測ではなく**事実**を使う。層優先 prefill は 1 チャンク目の
+// attention が終わった時点で、そのチャンクのトークンの MoE 入力がデバイスに
+// 確定しているので、**そのチャンクの routing を実際に解いて**選ばれた expert
+// だけを先に読む。チャンク 0 の expert 集合は層全体の集合の**部分集合**なので
+// (トークンが増えて減ることはない)、無駄読みは 0。残りのチャンクの attention が
+// 走っているあいだディスクが遊ぶぶん (3,826 で 1 層 9.5 ms / 14k で 46 ms) を
+// そのまま取り返す。
+//
+// 値は 1 バイトも変えない (router の結果は先読みにしか使わず、MoE は従来どおり
+// 全トークンで routing を解き直す)。ゲート off では分岐 1 回だけ。
+
+/// `DENNO_PF_EARLY_ROUTE`: 1 チャンク目の routing で選ばれた expert を先読みする。
+/// **既定 off** (lab で採否を決める)。
+pub const EARLY_ROUTE_ENV: &str = "DENNO_PF_EARLY_ROUTE";
+
+/// [`EARLY_ROUTE_ENV`] の既定 (測るまで off)。
+pub const DEFAULT_EARLY_ROUTE: bool = false;
+
+/// [`EARLY_ROUTE_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn early_route_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// 1 チャンク目の routing で先読みするか (プロセスで 1 回だけ env を読む)。
+pub fn early_route_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| early_route_from_value(std::env::var(EARLY_ROUTE_ENV).ok().as_deref()))
+}
+
+/// `DENNO_PF_EARLY_ROUTE_MB`: 1 層で先読みする上限 (MiB)。**0 = 自動**
+/// ([`early_route_budget`])。
+pub const EARLY_ROUTE_MB_ENV: &str = "DENNO_PF_EARLY_ROUTE_MB";
+
+/// `DENNO_PF_EARLY_ROUTE_KB`: 自動のときの「残りのトークン 1 個あたり何 KiB 投げるか」。
+///
+/// 実測の比 (UD-Q4_K_XL、t470a の b1): attention は 3,826 で 0.240 ms/tok、
+/// 14,018 で 0.254 ms/tok でほぼ同じ、ディスクは 5.9 GB/s。1 チャンク目を除いた
+/// 残りトークンが遊ぶディスクは 0.25 ms × 5.9 GB/s = 1.45 MB/tok ではなく、
+/// **残りチャンクの GPU 時間**ぶんなので、14k (残り 12,000 tok、1 層 46 ms) で
+/// 271 MB = 23 KiB/tok、3,826 (残り 1,913 tok、1 層 9.5 ms) で 45 MB = 24 KiB/tok。
+/// 既定はその中央の 24 KiB。
+pub const EARLY_ROUTE_KB_ENV: &str = "DENNO_PF_EARLY_ROUTE_KB";
+
+/// [`EARLY_ROUTE_KB_ENV`] の既定 (KiB/token)。
+pub const DEFAULT_EARLY_ROUTE_KB: usize = 24;
+
+/// 自動の上限の下限 / 上限 (バイト)。1 本の expert は約 3 MB なので、
+/// 下限でも 1 本は投げられる。
+pub const EARLY_ROUTE_MIN_BYTES: usize = 8 << 20;
+/// 自動の上限の上限 (バイト)。ページキャッシュを 1 層ぶん以上汚さない。
+pub const EARLY_ROUTE_MAX_BYTES: usize = 768 << 20;
+
+/// [`EARLY_ROUTE_MB_ENV`] の解釈 (純関数)。数値だけを受け付け、0 は自動。
+pub fn early_route_mb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s.parse::<usize>().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// 1 層で先読みする上限 (MiB、0 = 自動)。
+pub fn early_route_mb() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| early_route_mb_from_value(std::env::var(EARLY_ROUTE_MB_ENV).ok().as_deref()))
+}
+
+/// [`EARLY_ROUTE_KB_ENV`] の解釈 (純関数)。数値だけ、0 も許す。
+pub fn early_route_kb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s.parse::<usize>().unwrap_or(DEFAULT_EARLY_ROUTE_KB),
+        None => DEFAULT_EARLY_ROUTE_KB,
+    }
+}
+
+/// 自動のときの KiB/token。
+pub fn early_route_kb() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        early_route_kb_from_value(std::env::var(EARLY_ROUTE_KB_ENV).ok().as_deref())
+    })
+}
+
+/// 1 層ぶんの先読み上限 (バイト) を決める (純関数)。
+///
+/// - `mb > 0` ならその MiB (env の明示指定が最優先)。
+/// - `mb == 0` なら `残りトークン数 × kb KiB` を
+///   [`EARLY_ROUTE_MIN_BYTES`]..=[`EARLY_ROUTE_MAX_BYTES`] に丸める。
+pub fn early_route_budget(mb: usize, kb: usize, rest_tok: usize) -> usize {
+    if mb > 0 {
+        return mb.saturating_mul(1 << 20);
+    }
+    let want = rest_tok.saturating_mul(kb).saturating_mul(1 << 10);
+    want.clamp(EARLY_ROUTE_MIN_BYTES, EARLY_ROUTE_MAX_BYTES)
+}
+
+/// 先読みの台帳 (層数 / expert 本数 / バイト / 呼び出し回数)。
+static ER_LAYERS: AtomicU64 = AtomicU64::new(0);
+static ER_EXPERTS: AtomicU64 = AtomicU64::new(0);
+static ER_BYTES: AtomicU64 = AtomicU64::new(0);
+static ER_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// 1 層ぶんの先読みを積んだ (診断用)。
+pub fn note_early_route(experts: usize, bytes: usize, calls: usize) {
+    ER_LAYERS.fetch_add(1, Ordering::Relaxed);
+    ER_EXPERTS.fetch_add(experts as u64, Ordering::Relaxed);
+    ER_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    ER_CALLS.fetch_add(calls as u64, Ordering::Relaxed);
+}
+
+/// `[exp-pf-stream]` の末尾へ足す台帳 (発火していなければ空)。
+pub fn early_route_stats() -> String {
+    let n = ER_LAYERS.load(Ordering::Relaxed);
+    if n == 0 {
+        return String::new();
+    }
+    let mb = ER_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+    format!(
+        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={}",
+        ER_EXPERTS.load(Ordering::Relaxed),
+        ER_CALLS.load(Ordering::Relaxed)
+    )
+}
+
+/// 先読みの台帳を 0 に戻す。
+pub fn early_route_stats_reset() {
+    for c in [&ER_LAYERS, &ER_EXPERTS, &ER_BYTES, &ER_CALLS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+
 /// `part` の `off..off+len` をページキャッシュへ先に読む (Linux の `readahead(2)`)。
 ///
 /// - ユーザー側のバッファを持たない (カーネルがページキャッシュを埋めるだけ)。
@@ -3391,6 +3535,8 @@ pub fn stats_line() -> Option<String> {
         out.push_str(&ra_stats());
         // task 394: 次の層の先読みが発火したかの台帳。
         out.push_str(&layer_pre_stats());
+        // task 470: 1 チャンク目の routing による先読みの台帳。
+        out.push_str(&early_route_stats());
     }
     Some(out)
 }
@@ -3434,6 +3580,8 @@ pub fn stats_reset() {
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    // task 470: 1 チャンク目の routing による先読みの台帳も戻す。
+    early_route_stats_reset();
     CHECK_LAYERS.store(0, Ordering::Relaxed);
     if let Ok(mut g) = CHECK.lock() {
         *g = None;
@@ -3589,11 +3737,73 @@ mod tests {
         assert_eq!(layer_pre_stats(), "");
     }
 
+    /// task 470: 1 チャンク目の routing による先読みのゲートは既定 off、
+    /// 明示の真値だけ on。上限は「明示 MiB > 自動 (残りトークン × KiB)」で、
+    /// 自動は下限 / 上限に丸める。
+    #[test]
+    fn early_route_gate_and_budget() {
+        assert!(!DEFAULT_EARLY_ROUTE, "既定が on になっている");
+        assert!(!early_route_from_value(None), "未設定は既定 (off)");
+        assert!(!early_route_from_value(Some("")), "空も既定 (off)");
+        assert!(!early_route_from_value(Some("0")));
+        assert!(!early_route_from_value(Some("off")));
+        assert!(!early_route_from_value(Some("no")));
+        assert!(early_route_from_value(Some("1")));
+        assert!(early_route_from_value(Some("on")));
+        assert!(early_route_from_value(Some(" TRUE ")));
+        assert!(early_route_from_value(Some("yes")));
+        // 明示 MiB はそのまま (0 は自動)。
+        assert_eq!(early_route_mb_from_value(None), 0);
+        assert_eq!(early_route_mb_from_value(Some("0")), 0);
+        assert_eq!(early_route_mb_from_value(Some("128")), 128);
+        assert_eq!(early_route_mb_from_value(Some("x")), 0);
+        // KiB/token は数値だけ (解析不能は既定)。
+        assert_eq!(early_route_kb_from_value(None), DEFAULT_EARLY_ROUTE_KB);
+        assert_eq!(early_route_kb_from_value(Some("0")), 0);
+        assert_eq!(early_route_kb_from_value(Some(" 48 ")), 48);
+        assert_eq!(early_route_kb_from_value(Some("x")), DEFAULT_EARLY_ROUTE_KB);
+        // 自動の上限: 3,826 の 1 チャンク (残り 1,913 tok) と 14k の 6 チャンク。
+        assert_eq!(
+            early_route_budget(0, 24, 1_913),
+            1_913 * 24 * 1024,
+            "3,826 の残り 1 チャンク"
+        );
+        assert_eq!(
+            early_route_budget(0, 24, 12_000),
+            294_912_000,
+            "14k の残り 6 チャンク (288 MiB)"
+        );
+        assert_eq!(
+            early_route_budget(0, 24, 64_000),
+            EARLY_ROUTE_MAX_BYTES,
+            "長すぎるときは上限 (768 MiB) に当たる"
+        );
+        assert_eq!(
+            early_route_budget(0, 24, 1),
+            EARLY_ROUTE_MIN_BYTES,
+            "小さすぎるときは下限"
+        );
+        // 明示 MiB は自動より優先。
+        assert_eq!(early_route_budget(200, 24, 1_913), 200 << 20);
+        assert_eq!(early_route_budget(0, 0, 12_000), EARLY_ROUTE_MIN_BYTES);
+        // 台帳は積んだぶんだけ出て、0 に戻せる。
+        early_route_stats_reset();
+        assert_eq!(early_route_stats(), "", "発火していないのに台帳が出る");
+        note_early_route(40, 128 << 20, 120);
+        note_early_route(40, 128 << 20, 120);
+        let s = early_route_stats();
+        assert!(s.contains("er_layers=2"), "{s}");
+        assert!(s.contains("er_experts=80"), "{s}");
+        assert!(s.contains("er_calls=240"), "{s}");
+        assert!(s.contains("er_MB=268.4"), "{s}");
+        early_route_stats_reset();
+        assert_eq!(early_route_stats(), "");
+    }
+
     /// task 325: `DENNO_PF_RA_GROUPS` の真理値表 (未設定は off)。
     #[test]
     fn ra_groups_gate_truth_table() {
         assert_eq!(ra_groups_from_value(None), 0);
-        assert_eq!(ra_groups_from_value(Some("")), 0);
         assert_eq!(ra_groups_from_value(Some("0")), 0);
         assert_eq!(ra_groups_from_value(Some("1")), 1);
         assert_eq!(ra_groups_from_value(Some(" 3 ")), 3);

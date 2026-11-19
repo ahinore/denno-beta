@@ -10216,6 +10216,68 @@ fn t394_restore_mt_is_wired() {
     );
 }
 
+/// task 470: 1 チャンク目の routing による先読み (`DENNO_PF_EARLY_ROUTE`) の配線。
+///
+/// - ゲートは exp_pf にあり、既定 off。
+/// - 呼び出しは**層優先のチャンクループの 1 チャンク目だけ**で、
+///   `pf_lm_park_mixed` (MoE 入力を置き場へ写す) の**あと**。
+/// - 先読みの本体は「実際の routing を解く」「VRAM 常駐は飛ばす」「readahead を
+///   投げる」の 3 つを通り、戻り値は捨てる (値に触らない)。
+/// - 台帳が `[exp-pf-stream]` に出る。
+#[test]
+fn t470_early_route_is_wired() {
+    // ゲートと純関数が exp_pf にある。
+    for k in [
+        "pub const EARLY_ROUTE_ENV: &str = \"DENNO_PF_EARLY_ROUTE\"",
+        "pub const DEFAULT_EARLY_ROUTE: bool = false",
+        "pub fn early_route_on(",
+        "pub fn early_route_budget(",
+        "pub fn early_route_mb(",
+        "pub fn early_route_kb(",
+        "pub fn note_early_route(",
+        "pub fn early_route_stats(",
+        "out.push_str(&early_route_stats())",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 層優先のループ: 1 チャンク目だけ、MoE 入力の確定 (park_mixed) のあと。
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let park = lm
+        .find("pf_lm_park_mixed(start, nt, e)")
+        .expect("層優先のループに pf_lm_park_mixed が無い");
+    let call = lm
+        .find("pf_early_route_prefetch(")
+        .expect("層優先のループに pf_early_route_prefetch が無い");
+    assert!(park < call, "先読みが MoE 入力の確定より前にある");
+    assert!(lm.contains("if ci == 0 {"), "先読みが 1 チャンク目に限られていない");
+    assert!(
+        lm.contains("let _ = pf_early_route_prefetch("),
+        "先読みの戻り値を使っている (値に触ってはいけない)"
+    );
+    // 本体: 実 routing → 常駐を飛ばす → readahead。
+    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    for k in [
+        "crate::cuda::pf_lm_mixed_ptr(0, nt0, e)",
+        "crate::cuda::pf_router_dev_topk(",
+        "crate::model::expert_vram::peek_many(",
+        "crate::model::exp_pf::readahead_part(",
+        "crate::model::exp_pf::early_route_budget(",
+        "w.slice_abs(ei)",
+        "note_early_route(",
+    ] {
+        assert!(f.contains(k), "先読みの本体に {k} が無い");
+    }
+    // 1 チャンクで終わる層では何もしない (窓が無い)。
+    assert!(
+        f.contains("nt0 >= nt_all"),
+        "1 チャンクの層を弾いていない (窓が無いのに readahead を投げる)"
+    );
+    // ゲート off では router も読まない (先頭で戻る)。
+    let gate = f.find("exp_pf::early_route_on()").expect("ゲートを読んでいない");
+    let router = f.find("pf_router_dev_topk(").expect("router が無い");
+    assert!(gate < router, "ゲートの判定が router より後ろにある");
+}
+
 // ---------------------------------------------------------------------------
 // task 233: 層優先 prefill のデバイス MoE (活性をホストへ戻さない)
 // ---------------------------------------------------------------------------
