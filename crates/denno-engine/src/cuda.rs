@@ -2815,7 +2815,7 @@ pub(crate) mod dec_full_dev {
                         (k.f_dec, 0u32)
                     }
                 };
-                // task 460: combine と出力ゲートの融合 (既定 off)。PTX か ABI が
+                // task 460: combine と出力ゲートの融合 (既定 on)。PTX か ABI が
                 // 欠ければ None になり、下の従来 2 起動へ落ちる。
                 let cbg_k = if gate != 0 && attn_fdec_cbg_on() {
                     fcbg_gate_log(true);
@@ -39552,6 +39552,27 @@ pub(crate) fn parse_attn_flashdec_chunk_auto(v: Option<&str>) -> bool {
     )
 }
 
+/// `DENNO_ATTN_FLASHDEC_CHUNK` の値を「auto かどうか」に落とす (純関数)。
+///
+/// 未設定・空・`auto` は auto (**既定 = auto**)。数値は固定値のまま (切り戻し)、
+/// 未知の値も固定 64。lab t460a/t460b で 14k の full 段が -6 to -8% だったので
+/// 既定を auto にした。切り戻しは `DENNO_ATTN_FLASHDEC_CHUNK=64`。
+pub(crate) fn attn_fdec_chunk_is_auto(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                true
+            } else if t.parse::<usize>().is_ok() {
+                false
+            } else {
+                parse_attn_flashdec_chunk_auto(Some(t))
+            }
+        }
+    }
+}
+
 /// 文脈長から 1 分割の key 数を決める (`auto` のとき。純関数)。
 pub(crate) fn q4_fdec_chunk_auto(t_total: usize) -> usize {
     t_total
@@ -39632,8 +39653,8 @@ fn attn_flashdec_chunk() -> usize {
 
 /// この文脈長で使う 1 分割の key 数 (task 460)。
 ///
-/// `DENNO_ATTN_FLASHDEC_CHUNK=auto` のときだけ文脈長で変える ([`q4_fdec_chunk_auto`])。
-/// それ以外は [`attn_flashdec_chunk`] の固定値 (現行と同じ)。
+//   既定 (未設定・空) と `auto` のときは文脈長で変える ([`q4_fdec_chunk_auto`])。
+/// 数値を書いたときだけ [`attn_flashdec_chunk`] の固定値 (切り戻し)。
 fn attn_flashdec_chunk_for(t_total: usize) -> usize {
     #[cfg(test)]
     {
@@ -39644,7 +39665,7 @@ fn attn_flashdec_chunk_for(t_total: usize) -> usize {
     }
     static AUTO: OnceLock<bool> = OnceLock::new();
     let auto = *AUTO.get_or_init(|| {
-        parse_attn_flashdec_chunk_auto(std::env::var("DENNO_ATTN_FLASHDEC_CHUNK").ok().as_deref())
+        attn_fdec_chunk_is_auto(std::env::var("DENNO_ATTN_FLASHDEC_CHUNK").ok().as_deref())
     });
     if auto {
         q4_fdec_chunk_auto(t_total)
@@ -40034,19 +40055,25 @@ fn fdt_log(len: usize, n_split: usize, chunk: usize, dh: usize, tile: usize) {
 //   走っていた。間に同期もデータ依存も無い (combine の出力を gate が読むだけ)
 //   ので 1 起動にすると、3.8 us の本体と起動 1 本ぶんの隙間が消える。
 //   値はビット一致 (縮約順もゲートの演算列も変えない)。
+//   lab t460b: full 段 14k 後 1.76 -> 1.63 ms/token (-7.6%)、md5 SAME。
 
 /// 融合カーネルの引数の個数 (`.cu` と一致させる。kernel_invariants が見る)。
 pub(crate) const FCBG_NARGS: usize = 6;
 
-/// `DENNO_ATTN_FLASHDEC_CBG` の解釈 (純関数)。**既定 off**。
+/// `DENNO_ATTN_FLASHDEC_CBG` の解釈 (純関数)。**既定 on**。
 ///
-/// 真値 (`1` / `on` / `true` / `yes`) のときだけ融合版を使う。PTX が無い・ABI が
-/// 違うときは combine 単体 + gate の従来 2 起動へ落ちる (fail-closed)。
+/// lab t460b (既定モデル、depth8k) で full 段が 14k 後 1.76 -> 1.63 ms/token
+/// (-7.6%、`dno_attn_flashdec_combine` 16.2 + `dno_dec_gate_mul` 3.8 us/層が
+/// 融合版 10.8 us/層になった)。明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+/// PTX が無い・ABI が違うときは combine 単体 + gate の従来 2 起動へ落ちる。
 pub(crate) fn parse_attn_fdec_cbg(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -40066,7 +40093,7 @@ pub fn set_attn_fdec_cbg_for_test(on: Option<bool>) {
     );
 }
 
-/// combine + ゲートの融合を使うか (`DENNO_ATTN_FLASHDEC_CBG`、既定 off)。
+/// combine + ゲートの融合を使うか (`DENNO_ATTN_FLASHDEC_CBG`、既定 on)。
 fn attn_fdec_cbg_on() -> bool {
     #[cfg(test)]
     {
@@ -63961,22 +63988,37 @@ mod task448_tests {
         // 実測点で n_split が期待どおり (14k は t456c の 110 と同じ、2k は 32 のまま)。
         assert_eq!(q4_fdec_split(14018, q4_fdec_chunk_auto(14018)), (110, 128));
         assert_eq!(q4_fdec_split(2000, q4_fdec_chunk_auto(2000)), (32, 63));
-        // 固定値 (auto でない) の既定は今までどおり 64。
+        // 固定値の解釈 (数値を書いたとき) は今までどおり 64。
         assert_eq!(parse_attn_flashdec_chunk(None), 64);
+
+        // 既定は auto (未設定・空)、数値を書いたときだけ固定 (切り戻し)。
+        assert!(attn_fdec_chunk_is_auto(None), "未設定が auto でない (既定 auto)");
+        assert!(attn_fdec_chunk_is_auto(Some("")));
+        assert!(attn_fdec_chunk_is_auto(Some(" AUTO ")));
+        for v in ["64", "128", " 96 "] {
+            assert!(!attn_fdec_chunk_is_auto(Some(v)), "{v:?} が auto になっている");
+        }
+        assert!(!attn_fdec_chunk_is_auto(Some("x")), "未知の値が auto になっている");
+        // 既定のまま 14k では 128 (= n_split 110) になり、2k では 64 のまま。
+        assert_eq!(q4_fdec_split(14018, q4_fdec_chunk_auto(14018)), (110, 128));
+        assert_eq!(q4_fdec_split(2000, q4_fdec_chunk_auto(2000)), (32, 63));
     }
 
-    /// 融合版 (combine + ゲート) の門は**既定 off**、真値のときだけ on。
+    /// 融合版 (combine + ゲート) の門は**既定 on**、明示的な偽値だけ off
+    /// (lab t460b で 14k の full 段 -7.6%、md5 SAME)。
     #[test]
     fn task460_cbg_gate_truth_table() {
-        for v in ["1", "on", "true", "yes", " ON ", "True"] {
-            assert!(parse_attn_fdec_cbg(Some(v)), "{v:?} が on でない");
+        for v in ["1", "on", "true", "yes", " ON ", "True", "", "  ", "auto", "x"] {
+            assert!(parse_attn_fdec_cbg(Some(v)), "{v:?} が on でない (既定 on)");
         }
-        for v in ["0", "off", "false", "no", "", "  ", "auto", "x"] {
+        for v in ["0", "off", "false", "no", " OFF ", "No"] {
             assert!(!parse_attn_fdec_cbg(Some(v)), "{v:?} が on になっている");
         }
-        assert!(!parse_attn_fdec_cbg(None), "未設定で on になっている (既定 off)");
-        // env 未設定なら (テストの差し替えが無ければ) off。
-        assert!(!attn_fdec_cbg_on() || FD_CBG_FORCE.load(std::sync::atomic::Ordering::Relaxed) == 1);
+        assert!(parse_attn_fdec_cbg(None), "未設定が on でない (既定 on)");
+        // env 未設定なら (テストの差し替えが無ければ) on = 既定 on。
+        assert!(
+            attn_fdec_cbg_on() || FD_CBG_FORCE.load(std::sync::atomic::Ordering::Relaxed) == 0
+        );
         // 差し替えフックは env より優先する。
         set_attn_fdec_cbg_for_test(Some(true));
         assert!(attn_fdec_cbg_on());

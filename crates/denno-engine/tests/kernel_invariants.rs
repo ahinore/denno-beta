@@ -13284,6 +13284,7 @@ fn task460_flashdec_combine_gate_kernel_and_wiring() {
         // 長さ依存の分割 (task 460)。
         "pub(crate) fn parse_attn_flashdec_chunk_auto(v: Option<&str>) -> bool {",
         "pub(crate) fn q4_fdec_chunk_auto(t_total: usize) -> usize {",
+        "pub(crate) fn attn_fdec_chunk_is_auto(v: Option<&str>) -> bool {",
         "fn attn_flashdec_chunk_for(t_total: usize) -> usize {",
         "q4_fdec_split(len, attn_flashdec_chunk_for(len))",
         "q4_fdec_split(a.len, attn_flashdec_chunk_for(a.len))",
