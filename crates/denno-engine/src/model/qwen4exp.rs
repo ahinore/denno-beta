@@ -18108,6 +18108,21 @@ fn iq_pf_stream_layer(
         crate::cuda::pf_stream_why_set("entries");
         return Ok(None);
     }
+    // task 510: この層で「選択した expert 全体」と「VRAM 常駐から回せたぶん」を
+    // 積む。`up_MB` はステージングへ上げたぶんしか数えないので、常駐が実際に
+    // 効いているかはこの台帳でしか読めない。
+    {
+        let per = (|| -> Option<usize> {
+            let rg = crate::model::exp_pf::row_bytes(lw.gate_exps.ty, e)?;
+            let ru = crate::model::exp_pf::row_bytes(lw.up_exps.ty, e)?;
+            let rd = crate::model::exp_pf::row_bytes(lw.down_exps.ty, ff)?;
+            Some(rg * ff + ru * ff + rd * e)
+        })();
+        let n_all = entries.len();
+        let n_res = entries.iter().filter(|en| en.dev.is_some()).count();
+        let per = per.unwrap_or(0);
+        crate::model::exp_pf::note_stream_residency(n_res, n_res * per, n_all, n_all * per);
+    }
     let plan = crate::model::exp_pf::build_plan(by_expert, &pick);
     if plan.total_rows == 0 || plan.nseg() != entries.len() {
         crate::cuda::pf_stream_why_set("plan");

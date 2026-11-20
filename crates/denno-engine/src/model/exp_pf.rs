@@ -3892,6 +3892,15 @@ static QUANT_PF_NS: AtomicU64 = AtomicU64::new(0);
 static STREAM_EXPERTS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ上げたバイト数。
 static STREAM_BYTES: AtomicU64 = AtomicU64::new(0);
+/// task 510: 層の選択 expert のうち **VRAM 常駐から回せた** 本数とバイト数。
+///
+/// `experts` / `up_MB` はステージングへ上げたぶんだけを数えるので、常駐が
+/// 実際に効いているかはこの 2 本と並べないと読めない (`req_MB` は層の
+/// 選択 expert 全体のバイト数 = 常駐 + ミス)。
+static STREAM_RES_EXPERTS: AtomicU64 = AtomicU64::new(0);
+static STREAM_RES_BYTES: AtomicU64 = AtomicU64::new(0);
+static STREAM_ALL_EXPERTS: AtomicU64 = AtomicU64::new(0);
+static STREAM_ALL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// task 162: H2D の完了待ちで止まった時間 (重なりの指標)。
 static STREAM_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ホストのバウンスバッファへの写しの所要。
@@ -3975,6 +3984,28 @@ pub fn note_skip_layer() {
 pub fn note_upload_ns(ns: u64) {
     UPLOADS.fetch_add(1, Ordering::Relaxed);
     UPLOAD_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// task 510: 1 層ぶんの「選択 expert 全体」と「VRAM 常駐から回せたぶん」を積む。
+///
+/// ステージングへ上げた量 (`note_stream_group`) だけでは、常駐が効いて
+/// **読まなかった** バイトが分からない。ここに全体を並べて置くことで、
+/// `req_MB - res_MB` が層でディスク/置き場から読んだ量になる。
+pub fn note_stream_residency(res_experts: usize, res_bytes: usize, all_experts: usize, all_bytes: usize) {
+    STREAM_RES_EXPERTS.fetch_add(res_experts as u64, Ordering::Relaxed);
+    STREAM_RES_BYTES.fetch_add(res_bytes as u64, Ordering::Relaxed);
+    STREAM_ALL_EXPERTS.fetch_add(all_experts as u64, Ordering::Relaxed);
+    STREAM_ALL_BYTES.fetch_add(all_bytes as u64, Ordering::Relaxed);
+}
+
+/// task 510: `[exp-pf-stream]` の `res_*` / `req_*` の生値 (本数, バイト, 本数, バイト)。
+pub fn stream_residency() -> (u64, u64, u64, u64) {
+    (
+        STREAM_RES_EXPERTS.load(Ordering::Relaxed),
+        STREAM_RES_BYTES.load(Ordering::Relaxed),
+        STREAM_ALL_EXPERTS.load(Ordering::Relaxed),
+        STREAM_ALL_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 /// task 162: ステージングへ 1 グループ上げた。
@@ -4233,6 +4264,14 @@ pub fn stats_line() -> Option<String> {
                 out.push_str(&format!(" tab_async_calls={calls} tab_async_ok={oks}"));
             }
         }
+        // task 510: 常駐 (VRAM) から回せたぶんと、層の選択 expert 全体。
+        out.push_str(&format!(
+            " res_exp={} res_MB={:.1} req_exp={} req_MB={:.1}",
+            STREAM_RES_EXPERTS.load(Ordering::Relaxed),
+            STREAM_RES_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+            STREAM_ALL_EXPERTS.load(Ordering::Relaxed),
+            STREAM_ALL_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+        ));
         // task 325: 1 回目の読みの経路 (pread / 先読み) が発火したかの台帳。
         out.push_str(&pread_stats());
         out.push_str(&rc_stats());
@@ -4264,6 +4303,10 @@ pub fn stats_reset() {
         &GDN_WB_SKIPS,
         &STREAM_EXPERTS,
         &STREAM_BYTES,
+        &STREAM_RES_EXPERTS,
+        &STREAM_RES_BYTES,
+        &STREAM_ALL_EXPERTS,
+        &STREAM_ALL_BYTES,
         &STREAM_WAIT_NS,
         &STREAM_COPY_NS,
         &STREAM_ENQ_NS,
@@ -5845,5 +5888,18 @@ mod tests {
         assert_eq!(c.max_abs, 5.0e-6);
         assert_eq!(c.max_rel, 2.0e-6);
         assert!(take_check().is_none(), "取り出したら空になる");
+    }
+
+    /// task 510: 常駐で回せたぶんと層の選択全体を別々に積む
+    /// (どちらも `stats_reset` で 0 に戻る)。
+    #[test]
+    fn stream_residency_counts_resident_and_all_separately() {
+        stats_reset();
+        assert_eq!(stream_residency(), (0, 0, 0, 0), "戻した直後は 0");
+        note_stream_residency(2, 100, 5, 250);
+        note_stream_residency(0, 0, 3, 150);
+        assert_eq!(stream_residency(), (2, 100, 8, 400));
+        stats_reset();
+        assert_eq!(stream_residency(), (0, 0, 0, 0), "リクエスト終端で戻る");
     }
 }
