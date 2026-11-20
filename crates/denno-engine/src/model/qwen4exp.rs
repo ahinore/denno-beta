@@ -19262,9 +19262,25 @@ fn pf_early_route_prefetch(
     // 返して何もしない)。以前はその判定が後ろにあり、3,826 (2 チャンク) でも
     // 48 層ぶん払っていた (lab t482a: `sub other pf_er=72.6/90.1 ms`)。
     // `DENNO_PF_ER_EARLY_EXIT=0` で task 474 と同じ順序へ戻せる。
-    if crate::model::exp_pf::er_early_exit_on()
-        && !crate::model::exp_pf::early_route_window_ok(nt0, nt_all)
-    {
+    //
+    // task 486: 窓の判定を 2 本に分ける。
+    // - `wide` = task 474 の規則 (残り 4 チャンク以上)。14k の経路は不変。
+    // - `narrow` = 残り 1〜3 チャンク。`DENNO_PF_ER_SMALL` のときだけ、しかも
+    //   ストリームの実測が「ディスクから読んでいる」層だけ通す
+    //   (既定モデルのように page cache / RAM tier から来る層では、先読みは
+    //   1 バイトも得をせず router の同期だけ増える)。
+    // どちらも安い判定なので、ここ (router の前) で決める。
+    let wide = crate::model::exp_pf::early_route_window_ok(nt0, nt_all);
+    let (rate_bytes, rate_ns) = crate::model::exp_pf::stream_copy_rate();
+    let narrow = crate::model::exp_pf::er_small_pass(
+        wide,
+        crate::model::exp_pf::er_small_on(),
+        nt0,
+        nt_all,
+        rate_bytes,
+        rate_ns,
+    );
+    if crate::model::exp_pf::er_early_exit_on() && !(wide || narrow) {
         return None;
     }
     // 窓が無い (1 チャンクで終わる) / 形が合わない層は何もしない。
@@ -19378,7 +19394,9 @@ fn pf_early_route_prefetch(
     // 1 層 287 MB が 51 ms で収まり、壁は b 15.20 / b2 13.88 s 対 rc 12.56 s。
     // したがって「残りの窓が 4 チャンク以上」のときだけ先読みする
     // (`nt0` = 1 チャンクのトークン数)。
-    if !crate::model::exp_pf::early_route_window_ok(nt0, nt_all) {
+    // task 474 の窓の下限 (残り 4 チャンク)。task 486 は狭い窓 (`narrow`) も
+    // 同じ判断で通すので、ここでは「どちらでもない」ときだけ降りる。
+    if !(wide || narrow) {
         return None;
     }
     let mut runs: Vec<(u32, u64, usize)> = Vec::new();

@@ -3231,6 +3231,123 @@ pub fn er_early_exit_on() -> bool {
     })
 }
 
+// ---- task 486: 2〜3 チャンクの層にも先読みの窓を使う -------------------------
+//
+// task 474 は「残りの窓が 4 チャンク以上」のときだけ先読みした (3,826 の
+// 残り 1 チャンク = 窓 9.5 ms に 42 MB の先読みが収まらず **±0** だった)。
+// そのときの先読みは **8 本**で読んでおり、42 MB に 11.3 ms かかっていた
+// (3.7 GB/s)。
+//
+// task 486 の lab (t486a、UD-Q4_K_XL、depth8k、PROFILE=1) は 2x2 で測った:
+//
+// | COND | 先読みの門 | スレッド | 3,826 copy_s r1/r2 | 3,826 壁 r1/r2 |
+// | --- | --- | --- | --- | --- |
+// | b / b2 | off | 8 | 8.50 / 6.98 | 10.07 / 8.11 |
+// | t | off | 24 | 7.33 / 6.89 | 8.49 / 8.05 |
+// | s8 | **on** | 8 | **6.93 / 6.61** | 8.09 / **7.77** |
+// | s | on | 24 | 7.40 / 7.37 | 9.76 / 8.70 |
+//
+// 門は 3,826 で **発火した** (`er_layers=47 er_experts=740 er_MB=2313`)。
+// 窓 (8.4 ms/層) に収まる範囲だけ読み、`copy_s` が 2 ラウンドとも最小、
+// 壁は round 2 で -4.2%。**24 本にすると悪化した** (先読みが窓を越えて
+// MoE の写しと帯域を奪い合う) ので、スレッドは 8 のまま (既定を触らない)。
+//
+// ただし窓の小さい層では router の同期 (GPU の router GEMV + D2H。3,826 で
+// 48 層 62-70 ms、D2H 205 MB) が窓を食うので、**ディスクから読んでいる層だけ**
+// 通す。既定モデルは expert が page cache / RAM tier から来るので、先読みは
+// 1 バイトも得をしない (捨てる計算を増やすだけ)。判定はストリームの実測
+// (`STREAM_BYTES / STREAM_COPY_NS`) をそのまま使う。
+
+/// task 486: 窓の小さい層でも先読みする (`DENNO_PF_ER_SMALL`)。**既定 on**。
+pub const ER_SMALL_ENV: &str = "DENNO_PF_ER_SMALL";
+
+/// [`ER_SMALL_ENV`] の解釈 (純関数)。既定 on、明示的な偽値だけ off。
+pub fn er_small_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
+    )
+}
+
+/// [`ER_SMALL_ENV`] をプロセスで 1 回だけ読む。
+pub fn er_small_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| er_small_from_value(std::env::var(ER_SMALL_ENV).ok().as_deref()))
+}
+
+/// 窓の小さい経路が要る「残りチャンク数」の下限 (task 486)。
+///
+/// 1 = 先読みするトークンの後ろに 1 チャンクでも attention があれば試す。
+pub const EARLY_ROUTE_SMALL_MIN_REST_CHUNKS: usize = 1;
+
+/// 窓の小さい経路の判定 (純関数)。
+///
+/// [`early_route_window_ok`] の下限を 1 チャンクへ緩めただけ。1 チャンクで
+/// 終わる層 (窓なし) と `nt0 == 0` は false のまま。
+pub fn early_route_small_ok(nt0: usize, nt_all: usize) -> bool {
+    if nt0 == 0 || nt_all <= nt0 {
+        return false;
+    }
+    nt_all - nt0 >= nt0.saturating_mul(EARLY_ROUTE_SMALL_MIN_REST_CHUNKS)
+}
+
+/// ディスク判定に要る最小の実測バイト数 (これ未満は「まだ分からない」= false)。
+pub const ER_SMALL_MIN_BYTES: usize = 256 << 20;
+
+/// ディスク判定の上限 (GB/s)。これより速い = page cache / RAM tier から来ている。
+///
+/// 実測 (lab t482b、UD-Q4_K_XL): 3,826 cold 43.5 GB / 7.32 s = **5.9 GB/s**、
+/// 14k cold 52.3 GB / 7.37 s = **7.1 GB/s**。既定モデル (UD-IQ3_XXS) は
+/// 3,826 の prefill が 2.1 s で、同じ 40 GB 前後を page cache から引くので
+/// 20 GB/s 前後になる。12 GB/s はその間に置いた。
+pub const ER_SMALL_MAX_GBS: f64 = 12.0;
+
+/// 先読みを「ディスクから読んでいる層」に限る判定 (純関数)。
+///
+/// `bytes` / `copy_ns` はストリームが積んだ実測 ([`stream_copy_rate`])。
+/// bytes/ns はそのまま GB/s。実測がまだ薄い (`ER_SMALL_MIN_BYTES` 未満) か
+/// `copy_ns == 0` なら false (先読みしない)。
+pub fn er_small_disk_bound(bytes: u64, copy_ns: u64) -> bool {
+    if copy_ns == 0 || bytes < ER_SMALL_MIN_BYTES as u64 {
+        return false;
+    }
+    let gbs = bytes as f64 / copy_ns as f64;
+    gbs <= ER_SMALL_MAX_GBS
+}
+
+/// このリクエストでストリームが積んだ (バイト, 写しの ns)。
+///
+/// 窓の小さい経路のディスク判定に使う (読み取り専用。数値経路には触れない)。
+pub fn stream_copy_rate() -> (u64, u64) {
+    (
+        STREAM_BYTES.load(Ordering::Relaxed),
+        STREAM_COPY_NS.load(Ordering::Relaxed),
+    )
+}
+
+/// 窓の小さい経路を通すか (純関数)。分岐の条件は全部ここに集める。
+///
+/// - `wide` = task 474 の規則 (残り 4 チャンク以上)。広い窓が立っていれば
+///   狭い窓の判定は要らない (二重に先読みしない)。
+/// - `small_on` = `DENNO_PF_ER_SMALL`。
+/// - `nt0` / `nt_all` / `bytes` / `copy_ns` は [`early_route_small_ok`] と
+///   [`er_small_disk_bound`] へそのまま渡す。
+///
+/// lab t486a で勝ったので `small_on` の既定は on (`DENNO_PF_ER_SMALL=0` で切る)。
+pub fn er_small_pass(
+    wide: bool,
+    small_on: bool,
+    nt0: usize,
+    nt_all: usize,
+    bytes: u64,
+    copy_ns: u64,
+) -> bool {
+    !wide
+        && small_on
+        && early_route_small_ok(nt0, nt_all)
+        && er_small_disk_bound(bytes, copy_ns)
+}
+
 /// 先読みの台帳 (層数 / expert 本数 / バイト / 呼び出し回数)。
 ///
 /// task 474: 実行役の join と読み終えるまでの時間は置き場の側
@@ -3341,7 +3458,11 @@ pub const DEFAULT_RC_CACHE_MB: usize = 512;
 /// 窓は短いので上げすぎても立ち上げで損をする (t470d の実測: 14 本で 3.2-5.5 GB/s)。
 pub const RC_THREADS_ENV: &str = "DENNO_PF_RA_THREADS";
 
-/// [`RC_THREADS_ENV`] の既定。
+/// [`RC_THREADS_ENV`] の既定 (task 486 でも 8 のまま)。
+///
+/// task 486 は「窓の中の先読みを 24 本にすると 2〜3 チャンクの窓にも収まる」
+/// という仮説を lab の A/B で測る (`DENNO_PF_RA_THREADS=24`)。勝ったときだけ
+/// ここを 24 へ上げる。既定は task 474 のまま (8)。
 pub const DEFAULT_RC_THREADS: usize = 8;
 
 /// [`RC_CACHE_MB_ENV`] の解釈 (純関数)。0 は「置き場なし」、それ以外は

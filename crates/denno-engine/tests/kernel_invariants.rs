@@ -14058,13 +14058,115 @@ fn t482_early_route_window_exit_is_wired() {
         assert!(exit < at, "早期終了が {later} より後ろにある");
     }
     // 早期終了は窓の判定そのものを使う (別の規則を作らない)。
+    // task 486: 判定は `wide` (task 474 の規則) と `narrow` (狭い窓) の 2 本に
+    // 分かれたが、どちらも router より前 = 早期終了より前に決まる。
     let win = f
         .find("exp_pf::early_route_window_ok(nt0, nt_all)")
         .expect("窓の判定が無い");
-    assert!(exit < win, "早期終了が窓の判定より後ろにある");
-    // 既存の規則 (ゲート -> 早期終了 -> router) の順。
+    let small = f
+        .find("exp_pf::er_small_pass(")
+        .expect("狭い窓の判定が無い");
+    assert!(win < exit, "窓の判定が早期終了より後ろにある");
+    assert!(small < exit, "狭い窓の判定が早期終了より後ろにある");
+    // 既存の規則 (ゲート -> 窓の判定 -> 早期終了 -> router) の順。
     let gate = f.find("exp_pf::early_route_on()").expect("ゲートが無い");
+    assert!(gate < win, "窓の判定がゲートより前にある");
     assert!(gate < exit, "早期終了がゲートより前にある");
+}
+
+/// task 486: 窓の小さい層 (残り 1〜3 チャンク) の先読みの門。
+///
+/// task 474 は 3,826 (残り 1 チャンク = 窓 8.4-9.5 ms) を測って ±0 とし、
+/// 4 チャンク未満を閉じた。そのときの先読みは 8 本で 42 MB に 11.3 ms
+/// (3.7 GB/s) かかっていた。ここでは (1) 門が既定 on であること、
+/// (2) 4 条件 (広い窓でない / ゲート / 窓の形 / ディスク実測) の真理値表、
+/// (3) 判定が router より前にあることを固定する。
+#[test]
+fn t486_early_route_small_window_is_wired() {
+    for k in [
+        "pub const ER_SMALL_ENV: &str = \"DENNO_PF_ER_SMALL\"",
+        "pub fn er_small_from_value(",
+        "pub fn er_small_on(",
+        "pub fn early_route_small_ok(",
+        "pub fn er_small_disk_bound(",
+        "pub fn er_small_pass(",
+        "pub fn stream_copy_rate(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 既定 on (未設定で true)。env を汚したまま回さない。
+    assert!(
+        std::env::var("DENNO_PF_ER_SMALL").is_err(),
+        "このテストは env 未設定で回すこと"
+    );
+    assert!(
+        denno_engine::model::exp_pf::er_small_from_value(None),
+        "未設定が既定 on になっていない"
+    );
+    for v in ["0", "off", "false", "no", ""] {
+        assert!(
+            !denno_engine::model::exp_pf::er_small_from_value(Some(v)),
+            "{v:?} を on と読んだ"
+        );
+    }
+    for v in ["1", "on", "true", "yes"] {
+        assert!(
+            denno_engine::model::exp_pf::er_small_from_value(Some(v)),
+            "{v:?} を off と読んだ"
+        );
+    }
+    // 窓の形: 残り 1 チャンク以上。1 チャンクで終わる層は false のまま。
+    assert!(!denno_engine::model::exp_pf::early_route_small_ok(0, 100));
+    assert!(!denno_engine::model::exp_pf::early_route_small_ok(1913, 1913));
+    assert!(denno_engine::model::exp_pf::early_route_small_ok(1913, 3826));
+    assert!(denno_engine::model::exp_pf::early_route_small_ok(2002, 14018));
+    // ディスク実測: 256 MiB 未満・0 ns は「まだ分からない」= false。
+    const GB: u64 = 1 << 30;
+    assert!(!denno_engine::model::exp_pf::er_small_disk_bound(0, 0));
+    assert!(!denno_engine::model::exp_pf::er_small_disk_bound(100 << 20, 20_000_000));
+    assert!(!denno_engine::model::exp_pf::er_small_disk_bound(43 * GB, 0));
+    // lab t482b の実測: 3,826 は 43.5 GB / 7.32 s = 5.9 GB/s (ディスク)。
+    assert!(denno_engine::model::exp_pf::er_small_disk_bound(
+        43 * GB,
+        7_320_000_000
+    ));
+    // 14k は 52.3 GB / 7.37 s = 7.1 GB/s (ディスク)。
+    assert!(denno_engine::model::exp_pf::er_small_disk_bound(
+        52 * GB,
+        7_370_000_000
+    ));
+    // 既定モデル (UD-IQ3_XXS) の 3,826 は約 40 GB / 2.1 s = 19 GB/s (page cache)。
+    assert!(!denno_engine::model::exp_pf::er_small_disk_bound(
+        40 * GB,
+        2_100_000_000
+    ));
+    // 4 条件の真理値表 (`er_small_pass`)。1 つでも欠けたら通さない。
+    let ok = |wide, small_on, nt0, nt_all, bytes, ns| {
+        denno_engine::model::exp_pf::er_small_pass(wide, small_on, nt0, nt_all, bytes, ns)
+    };
+    assert!(ok(false, true, 1913, 3826, 43 * GB, 7_320_000_000));
+    assert!(!ok(false, false, 1913, 3826, 43 * GB, 7_320_000_000)); // ゲート off
+    assert!(!ok(true, true, 1913, 3826, 43 * GB, 7_320_000_000)); // 広い窓が立った
+    assert!(!ok(false, true, 1913, 1913, 43 * GB, 7_320_000_000)); // 窓なし
+    assert!(!ok(false, true, 1913, 3826, 40 * GB, 2_100_000_000)); // page cache
+
+    // 本体: 門の判定が router / VRAM 参照 / 置き場の計画より前にある。
+    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    let small = f.find("exp_pf::er_small_pass(").expect("門が無い");
+    for later in [
+        "pf_router_dev_topk(",
+        "pf_lm_mixed_ptr(0, nt0, e)",
+        "peek_many(",
+        "rc_plan(&runs)",
+    ] {
+        let at = f.find(later).expect(later);
+        assert!(small < at, "門が {later} より後ろにある");
+    }
+    // 門が通した層だけが先読みへ進む (最後の窓の判定も 2 本を見る)。
+    let last = f
+        .rfind("if !(wide || narrow)")
+        .expect("最後の窓の判定が wide/narrow を見ていない");
+    assert!(small < last, "門が最後の窓の判定より後ろにある");
 }
 
 /// task 481: 上げスレッドの分割 DMA の配線 (既定 on) を字面で固定する。
