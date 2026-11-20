@@ -8365,6 +8365,130 @@ fn put_f32s(dst: &mut [u8], src: &[f32]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 498: seg 層の和 (e*4 B) の D2H を小さな pinned バウンス経由にする
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t498b の `[seg-prof]`、UD-Q4_K_XL、decode 定常):
+// `d2h=13.3-14.8 us/層` が 1 層 1 本 (= e*4 = 10 KB) の **pageable な同期 D2H** で、
+// 48 層/token で 0.64-0.71 ms/token = decode 13.4 ms の 5%。pageable の D2H は
+// driver が内部ステージングを取ってから写すため 0.7 GB/s しか出ない。
+// task 356 の専用ストリーム版 (捨てた) でも `us/copy=6.9` だったので、pinned へ
+// 直接 DMA させれば同じ 10 KB がその半分程度になる見込み。
+//
+// `DENNO_PF_PIN_STAGE` の共有バウンスは prefill 用の門 (1 MiB 床 + 窓 + 育つ 1 本) を
+// 持ち、P358/P369 が prefill で採らなかったもの。ここは decode の seg 和だけを見る
+// **別のゲート** (`DENNO_SEG_SUM_PIN`、既定 off) にして、専用の 64 KiB pinned を
+// 1 本だけ持つ (cuMemHostAlloc は device を同期させるので、確保は初回の 1 回だけ)。
+// 失敗 (確保できない / CUDA 無し) は false を返し、呼び出し側は従来の pageable
+// `to_slice` へ落ちる。値は同じバイト列。
+
+/// `DENNO_SEG_SUM_PIN` の解釈 (純関数)。**既定 off**、明示的な真値だけ on。
+pub fn seg_sum_pin_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// seg 和の D2H を pinned バウンス経由にするか (プロセスで 1 回だけ env を読む)。
+fn seg_sum_pin_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| seg_sum_pin_from_value(std::env::var("DENNO_SEG_SUM_PIN").ok().as_deref()))
+}
+
+/// 起動ログ用: ゲートの状態 (COND の env が届いたかを確かめる)。
+pub fn seg_sum_pin_boot_line() -> String {
+    format!(
+        "[flash] seg sum pin: {} (DENNO_SEG_SUM_PIN)",
+        if seg_sum_pin_on() { "on" } else { "off" }
+    )
+}
+
+/// リクエスト終端の診断行 (ゲート on のときだけ)。`calls` が 0 なら**分岐が
+/// 発火していない**ので、そのときは採否の判断をしない (fail closed の証拠)。
+pub fn seg_sum_pin_report() -> Option<String> {
+    if !seg_sum_pin_on() {
+        return None;
+    }
+    let (calls, fallbacks) = seg_pin_counts();
+    Some(format!(
+        "[seg-pin] calls={calls} fallbacks={fallbacks} bytes={SEG_PIN_BYTES} (DENNO_SEG_SUM_PIN)"
+    ))
+}
+
+/// 小さな D2H のバウンス 1 本ぶんの大きさ (e*4 = 10 KB に十分な余裕)。
+const SEG_PIN_BYTES: usize = 64 << 10;
+
+/// 専用バウンスの状態 (`calls` = 発火、`fallbacks` = 従来経路へ落ちた回数)。
+struct SegPin {
+    buf: Option<PinMem>,
+    calls: u64,
+    fallbacks: u64,
+}
+
+static SEG_PIN: OnceLock<std::sync::Mutex<SegPin>> = OnceLock::new();
+
+fn seg_pin_state() -> &'static std::sync::Mutex<SegPin> {
+    SEG_PIN.get_or_init(|| {
+        std::sync::Mutex::new(SegPin {
+            buf: None,
+            calls: 0,
+            fallbacks: 0,
+        })
+    })
+}
+
+/// 発火 / 落ちた回数 (テストと起動ログ用)。
+pub fn seg_pin_counts() -> (u64, u64) {
+    let g = match seg_pin_state().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    (g.calls, g.fallbacks)
+}
+
+/// `src` (デバイス) から `dst` (ホストの `u8`) へ pinned バウンス経由で写す。
+///
+/// 成功で true。pinned が取れない / 転送が失敗したら false (呼び出し側が pageable
+/// 経路でやり直す)。`dst` は `SEG_PIN_BYTES` 以下であること。
+fn seg_pin_copy_d2h(src: CUdeviceptr, dst: &mut [u8]) -> bool {
+    let bytes = dst.len();
+    if bytes == 0 || bytes > SEG_PIN_BYTES {
+        return false;
+    }
+    let state = seg_pin_state();
+    let mut g = match state.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if g.buf.is_none() {
+        match PinMem::alloc(SEG_PIN_BYTES) {
+            Ok(p) => g.buf = Some(p),
+            Err(_) => {
+                g.fallbacks += 1;
+                return false;
+            }
+        }
+    }
+    let pin = g.buf.as_ref().expect("確保済み").ptr;
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(_) => {
+            g.fallbacks += 1;
+            return false;
+        }
+    };
+    let r = unsafe { check((lib.memcpy_dtoh)(pin, src, bytes), "cuMemcpyDtoH (seg pin)") };
+    if r.is_err() {
+        g.fallbacks += 1;
+        return false;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(pin as *const u8, dst.as_mut_ptr(), bytes) };
+    g.calls += 1;
+    true
+}
+
 /// K 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層を **5 起動 / 1 待ち**で回す (task 278)。
 ///
 /// - `pg` / `pu` / `pd`: segment ごとの重み先頭 (デバイスアドレス)
@@ -8700,8 +8824,23 @@ where
         // e=2,560 (10 KB) で 11 us/層かかっていた (lab の `[seg-prof] d2h=`)。
         // `to_slice` は 1 本の作業域へ直接戻し、`DENNO_PF_PIN_STAGE` の窓に入って
         // いれば pinned バウンス経由 (同じバイト列) になる。
+        //
+        // task 498: `DENNO_SEG_SUM_PIN` (既定 off) のときは、この 10 KB の D2H を
+        // **専用の小さな pinned バウンス**へ DMA してからホストへ写す。pageable の
+        // 同期 D2H は driver が内部ステージングを取るので 13-15 us かかる
+        // (lab t498b の `[seg-prof] d2h=13.3-14.8/層`)。失敗したら従来経路へ
+        // 丸ごと落ちる (値は同じバイト列)。
         let _t_d2h = crate::model::seg_prof::stamp();
-        outb.to_slice(&mut out[..e])?;
+        let mut d2h_done = false;
+        if seg_sum_pin_on() && e * 4 <= SEG_PIN_BYTES {
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(out[..e].as_mut_ptr() as *mut u8, e * 4)
+            };
+            d2h_done = seg_pin_copy_d2h(outb.ptr, dst);
+        }
+        if !d2h_done {
+            outb.to_slice(&mut out[..e])?;
+        }
         dbg_d2h(e * 4);
         crate::model::seg_prof::add(crate::model::seg_prof::PH_D2H, _t_d2h);
 
@@ -65396,6 +65535,55 @@ mod task204_tests {
             Some(MIX_UP_NARGS),
             "upw の PTX 引数数が {MIX_UP_NARGS} でない"
         );
+    }
+}
+
+#[cfg(test)]
+mod task498_tests {
+    use super::*;
+
+    /// `DENNO_SEG_SUM_PIN` の真理値表。**既定は off** (明示した真値だけ on)。
+    #[test]
+    fn seg_sum_pin_truth_table() {
+        assert!(!seg_sum_pin_from_value(None), "未設定は既定 off");
+        assert!(!seg_sum_pin_from_value(Some("")));
+        assert!(!seg_sum_pin_from_value(Some("0")));
+        assert!(!seg_sum_pin_from_value(Some("off")));
+        assert!(!seg_sum_pin_from_value(Some(" no ")));
+        assert!(!seg_sum_pin_from_value(Some("FALSE")));
+        assert!(seg_sum_pin_from_value(Some("1")));
+        assert!(seg_sum_pin_from_value(Some("on")));
+        assert!(seg_sum_pin_from_value(Some(" true ")));
+        assert!(seg_sum_pin_from_value(Some("YES")));
+    }
+
+    /// バウンスに収まらない長さは「やらない」を返す (呼び出し側は pageable へ落ちる)。
+    ///
+    /// 0 バイトと上限超えは CUDA を触る前に false を返すので、GPU の無い
+    /// コンテナでも判定できる。共有カウンタは読まない (並列テストで競合しない)。
+    #[test]
+    fn seg_pin_copy_rejects_out_of_range() {
+        let mut none: [u8; 0] = [];
+        assert!(!seg_pin_copy_d2h(0, &mut none), "0 バイトは false");
+        let mut big = vec![0u8; SEG_PIN_BYTES + 1];
+        assert!(!seg_pin_copy_d2h(0, &mut big), "上限超えは false");
+    }
+
+    /// GPU の無い環境では pinned が取れず **false (= 従来経路) に落ちる**。
+    /// 落ちた回数 (fallbacks) が増えるので、起動ログの `[seg-pin]` で判別できる。
+    /// 共有カウンタは他テストと競合し得るので「増えた」だけを見る。
+    #[test]
+    fn seg_pin_copy_falls_back_without_cuda() {
+        let (_, before) = seg_pin_counts();
+        let mut dst = vec![0u8; 64];
+        let ok = seg_pin_copy_d2h(0, &mut dst);
+        let (_, after) = seg_pin_counts();
+        if ok {
+            // GPU のある環境でだけ通り得る (コンテナでは起きない)。
+            assert_eq!(dst, vec![0u8; 64], "0 番地からの写しは 0 のまま");
+        } else {
+            assert!(after > before, "落ちた回数が増える");
+        }
     }
 }
 
