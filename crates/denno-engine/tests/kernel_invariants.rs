@@ -10329,6 +10329,140 @@ fn t394_restore_mt_is_wired() {
     );
 }
 
+/// task 470: 1 チャンク目の routing による先読み (`DENNO_PF_EARLY_ROUTE`) の配線。
+///
+/// - ゲートは exp_pf にあり、既定 off。
+/// - 呼び出しは**層優先のチャンクループの 1 チャンク目だけ**で、
+///   `pf_lm_park_mixed` (MoE 入力を置き場へ写す) の**あと**。
+/// - 先読みの本体は「実際の routing を解く」「VRAM 常駐は飛ばす」「readahead を
+///   投げる」の 3 つを通り、戻り値は捨てる (値に触らない)。
+/// - 台帳が `[exp-pf-stream]` に出る。
+#[test]
+fn t470_early_route_is_wired() {
+    // ゲートと純関数が exp_pf にある。
+    for k in [
+        "pub const EARLY_ROUTE_ENV: &str = \"DENNO_PF_EARLY_ROUTE\"",
+        "pub const DEFAULT_EARLY_ROUTE: bool = true",
+        "pub fn early_route_on(",
+        "pub fn early_route_budget(",
+        "pub fn early_route_mb(",
+        "pub fn early_route_kb(",
+        "pub fn note_early_route(",
+        "pub fn early_route_stats(",
+        "out.push_str(&early_route_stats())",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 層優先のループ: 1 チャンク目だけ、MoE 入力の確定 (park_mixed) のあと。
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let park = lm
+        .find("pf_lm_park_mixed(start, nt, e)")
+        .expect("層優先のループに pf_lm_park_mixed が無い");
+    let call = lm
+        .find("pf_early_route_prefetch(")
+        .expect("層優先のループに pf_early_route_prefetch が無い");
+    assert!(park < call, "先読みが MoE 入力の確定より前にある");
+    assert!(lm.contains("if ci == 0 {"), "先読みが 1 チャンク目に限られていない");
+    assert!(
+        lm.contains("let _ = pf_early_route_prefetch("),
+        "先読みの戻り値を使っている (値に触ってはいけない)"
+    );
+    // 本体: 実 routing → 常駐を飛ばす → RAM の置き場へ読む (task 474)。
+    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    for k in [
+        "crate::cuda::pf_lm_mixed_ptr(0, nt0, e)",
+        "crate::cuda::pf_router_dev_topk(",
+        "crate::model::expert_vram::peek_many(",
+        // task 474: 捨てずに置き場 (RAM) へ置く。ページキャッシュ頼みの
+        // `readahead(2)` / 「pread して捨てる」は t470 で負けたので消した。
+        "crate::model::exp_pf::early_route_window_ok(nt0, nt_all)",
+        "crate::model::exp_pf::rc_plan(&runs)",
+        "crate::model::exp_pf::rc_pool(nt)",
+        "crate::model::exp_pf::rc_commit_one(",
+        "crate::model::exp_pf::rc_stopped()",
+        "crate::model::exp_pf::read_part_ptr(",
+        "crate::model::exp_pf::early_route_budget(",
+        "ram_peek(lw, ei)",
+        "crate::model::exp_pf::pread_on()",
+        "w.slice_abs(ei)",
+        "note_early_route(",
+    ] {
+        assert!(f.contains(k), "先読みの本体に {k} が無い");
+    }
+    // ページキャッシュ頼みの 2 経路が戻っていないこと (t470 の負け)。
+    for k in ["readahead_part(", "early_route_worker_idle("] {
+        assert!(!f.contains(k), "t470 で負けた経路が戻っている: {k}");
+    }
+    // 1 チャンクで終わる層では何もしない (窓が無い)。
+    assert!(
+        f.contains("nt0 >= nt_all"),
+        "1 チャンクの層を弾いていない (窓が無いのに先読みする)"
+    );
+    // ゲート off では router も読まない (先頭で戻る)。
+    let gate = f.find("exp_pf::early_route_on()").expect("ゲートを読んでいない");
+    let router = f.find("pf_router_dev_topk(").expect("router が無い");
+    assert!(gate < router, "ゲートの判定が router より後ろにある");
+}
+
+/// task 474: 先読みした RAM の置き場を MoE の写しが使う配線。
+///
+/// - 窓の終わり (`rc_stop`) は**層の MoE の直前**で、先読みの呼び出しより後ろ。
+/// - 写し (`pf_copy_into_pin`) は置き場に当たれば `rc_copy_into` で memcpy し、
+///   外れたら従来どおり `read_part_ptr`。
+/// - 置き場の索引は (パート, 絶対オフセット, 長さ) の**完全一致**だけで当たる
+///   (`rc_has`) = バイト列は必ず同じ (値が変わらない)。
+/// - 台帳が `[exp-pf-stream]` に出る。
+#[test]
+fn t474_ram_readahead_cache_is_wired() {
+    for k in [
+        "pub const RC_CACHE_MB_ENV: &str = \"DENNO_PF_RA_CACHE_MB\"",
+        "pub const RC_THREADS_ENV: &str = \"DENNO_PF_RA_THREADS\"",
+        "pub fn rc_layout(",
+        "pub fn rc_plan(",
+        "pub fn rc_commit_one(",
+        "pub fn rc_has(",
+        "pub unsafe fn rc_copy_into(",
+        "pub fn rc_stop(",
+        "pub fn rc_join(",
+        "out.push_str(&rc_stats())",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 索引の一致は完全一致 (部分一致で当てると別のバイト列を持ってくる)。
+    let has = fn_body(EXP_PF_SRC, "pub fn rc_has(");
+    for k in ["e.file == file", "e.off == off", "e.len as usize == len"] {
+        assert!(has.contains(k), "rc_has が {k} を見ていない");
+    }
+    let cp = fn_body(EXP_PF_SRC, "pub unsafe fn rc_copy_into(");
+    for k in ["copy_nonoverlapping", "RC_N.load", "RA_MISS"] {
+        assert!(
+            cp.contains(k) || cp.contains(&k.replace("RA_MISS", "RC_MISS")),
+            "rc_copy_into に {k} が無い"
+        );
+    }
+    // 写しの側: 当たれば置き場から、外れればディスク。
+    let pin = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
+    let hit = pin.find("exp_pf::rc_copy_into(").expect("置き場を使っていない");
+    let rd = pin.find("exp_pf::read_part_ptr(").expect("ディスクの読みが無い");
+    assert!(hit < rd, "置き場の判定がディスクの読みより後ろにある");
+    assert!(
+        pin.contains("exp_pf::rc_has("),
+        "区間まるごとの判定 (rc_has) が無い"
+    );
+    // 窓の終わりは層の MoE の直前 (先読みの呼び出しより後ろ)。
+    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let call = lm
+        .find("pf_early_route_prefetch(")
+        .expect("先読みの呼び出しが無い");
+    let stop = lm
+        .find("crate::model::exp_pf::rc_stop()")
+        .expect("窓の終わり (rc_stop) が無い");
+    let moe = lm
+        .find("// ---- 2. 層で 1 回の MoE")
+        .expect("MoE の区切りが無い");
+    assert!(call < stop && stop < moe, "rc_stop が MoE の直前でない");
+}
+
 // ---------------------------------------------------------------------------
 // task 233: 層優先 prefill のデバイス MoE (活性をホストへ戻さない)
 // ---------------------------------------------------------------------------

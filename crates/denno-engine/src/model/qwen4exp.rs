@@ -5739,8 +5739,28 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 if !crate::cuda::pf_res_park_save(ci, nt, hc, e) {
                     Self::pf_bail("res の退避に失敗")?;
                 }
+                // task 470: 1 チャンク目の routing をここで解き、残りのチャンクの
+                // attention が走るあいだに expert の重みを先へ読む
+                // (`DENNO_PF_EARLY_ROUTE`、既定 off)。この時点で `mixed` の
+                // 先頭 `nt` 行は MoE 入力として確定している (pf_lm_park_mixed)。
+                #[cfg(feature = "cuda")]
+                if ci == 0 {
+                    let _ = pf_early_route_prefetch(
+                        lw,
+                        nt,
+                        nt_all,
+                        e,
+                        self.p.n_expert_used,
+                        self.p.n_ff_exp,
+                        self.p.n_expert,
+                        iv,
+                    );
+                }
                 q4ledger::iter_end(t_iter);
             }
+            // task 474: ここから先はディスクが主役なので、先読みの実行役は止める
+            // (窓 = 残りチャンクの attention は終わった)。
+            crate::model::exp_pf::rc_stop();
             // ---- 2. 層で 1 回の MoE (expert 重みはここでしか運ばれない) ----
             let t_moe = std::time::Instant::now();
             // task 233: 入力も出力もデバイスの置き場のまま回す。ホストへ戻るのは
@@ -18957,6 +18977,260 @@ fn pf_layer_prefetch(lw: &LayerW) -> usize {
         crate::model::exp_pf::note_layer_pre(total, calls);
     }
     total
+}
+
+/// task 470: 1 チャンク目の routing を**実際に解いて**、選ばれた expert の重みを
+/// ページキャッシュへ先読みする (`DENNO_PF_EARLY_ROUTE`)。
+///
+/// # なぜ要るか
+///
+/// 層優先 prefill は「全チャンクの attention → 層で 1 回の MoE」の順なので、
+/// routing が決まるまでディスクが遊んでいる (t470a の b1: 3,826 で 1 層 9.5 ms /
+/// 14k で 46 ms、48 層で 0.46 s / 2.2 s)。1 チャンク目の attention が終わった
+/// 時点でそのチャンクの MoE 入力はデバイスに確定しているので、そこで routing を
+/// 解けば **残りのチャンクの attention が走っているあいだ**に expert の読みを
+/// 始められる。
+///
+/// task 394 の `DENNO_PF_LAYER_PRE` は「層の expert は全部要る」前提で全数
+/// (512 本) を投げ、実際は 296 本 (58%) しか使わないので 1.73 倍を読んで負けた。
+/// ここは**そのチャンクの実際の routing** なので、集合は層全体の部分集合 =
+/// 無駄読み 0。
+///
+/// # どこへ読むか (task 474)
+///
+/// 読んだバイトは**捨てずに** RAM の置き場 ([`crate::model::exp_pf::rc_plan`]) へ
+/// 置く。層の MoE の写し (`pf_copy_into_pin`) は同じ (パート, 絶対オフセット,
+/// 長さ) が置き場にあればディスクを読まずに memcpy する。task 470 の
+/// `readahead(2)` / 「pread して捨てる」はページキャッシュに残らず、投げた
+/// バイトの 11-28% しか `copy_s` が縮まなかった (lab t470b-d)。
+///
+/// # 何をしないか
+///
+/// - VRAM に載っている expert は飛ばす (MoE も上げ直さない)。
+/// - RAM tier に載っている expert (`ram_peek`) は飛ばす (MoE は mmap から写す
+///   ので置き場を使わない。lab t474c で 14.2 GB が全部無駄になった)。
+/// - MoE がデバイス経路に乗らない層 (mask 付き / 形が合わない / stream の床未満)
+///   は何もしない。
+/// - **残りの窓が 4 チャンク未満の層は何もしない** ([`crate::model::exp_pf::early_route_window_ok`]。
+///   3,826 の窓 9.5 ms に 42 MB の先読みが収まらず ±0 だった)。
+/// - 値は 1 バイトも変えない。router の結果は先読みにしか使わず、MoE は従来どおり
+///   全トークンで routing を解き直す。
+///
+/// 戻り値は (先読みした expert 本数, 投げたバイト数, 呼び出し回数)。
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn pf_early_route_prefetch(
+    lw: &LayerW,
+    nt0: usize,
+    nt_all: usize,
+    e: usize,
+    k: usize,
+    ff: usize,
+    ne: usize,
+    iv: IvView<'_>,
+) -> Option<(usize, usize, usize)> {
+    use crate::model::expert_cache::ExpertKey;
+    use crate::model::expert_vram::ExpertShape;
+    if !crate::model::exp_pf::early_route_on() {
+        return None;
+    }
+    // 窓が無い (1 チャンクで終わる) / 形が合わない層は何もしない。
+    if nt0 == 0 || nt0 >= nt_all || k == 0 || ne == 0 || lw.gate_inp.k() != e {
+        return None;
+    }
+    // mask 付きの層はデバイス router に乗らない (MoE 側も同じ条件で落ちる)。
+    if iv.expert_mask(lw.il).is_some() {
+        return None;
+    }
+    // task 474: `DENNO_PF_PREAD=0` では MoE の写しが mmap からの memcpy になり
+    // (`src: None`)、置き場を 1 バイトも使わない。先読みしない。
+    if !crate::model::exp_pf::pread_on() {
+        return None;
+    }
+    let expert_gpu = if pf_lm_k_dev_on() {
+        pf_expert_mode(lw)
+    } else {
+        iq_expert_mode(lw)
+    };
+    if !lm_dev_moe_ok(
+        nt_all,
+        crate::model::exp_pf::pf_enabled(),
+        expert_gpu,
+        crate::model::exp_pf::stream_enabled(),
+        crate::model::exp_pf::stream_min_tok(),
+        pf_router_gpu_on(),
+        true,
+    ) {
+        return None;
+    }
+    // 1 チャンク目の MoE 入力 (attention のあとの残差) はデバイスにある。
+    let xs0 = crate::cuda::pf_lm_mixed_ptr(0, nt0, e)?;
+    if !crate::cuda::pf_router_dev_ok(nt0, ne, k) {
+        return None;
+    }
+    let mut sel32 = vec![0u32; nt0 * k];
+    let mut wts = vec![0.0f32; nt0 * k];
+    let mut rowsum = vec![0.0f32; nt0];
+    if !crate::cuda::pf_router_dev_topk(
+        lw.gate_inp.uid(),
+        lw.gate_inp.blocks().as_slice(),
+        lw.gate_inp.k(),
+        lw.gate_inp.n(),
+        Some(xs0),
+        None,
+        nt0,
+        k,
+        &mut sel32,
+        &mut wts,
+        &mut rowsum,
+        GgmlType::F32,
+    ) {
+        return None;
+    }
+    let mut seen = vec![false; ne];
+    let mut nex_pick = 0usize;
+    for &s in &sel32 {
+        let ei = s as usize;
+        if ei < ne && !seen[ei] {
+            seen[ei] = true;
+            nex_pick += 1;
+        }
+    }
+    if nex_pick == 0 {
+        return None;
+    }
+    let keys: Vec<ExpertKey> = (0..ne)
+        .filter(|&ei| seen[ei])
+        .map(|ei| ExpertKey {
+            layer: lw.il as u16,
+            expert: ei as u16,
+        })
+        .collect();
+    let shapes = [
+        ExpertShape {
+            ty: lw.gate_exps.ty,
+            k: e,
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.up_exps.ty,
+            k: e,
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.down_exps.ty,
+            k: ff,
+            n: e,
+        },
+    ];
+    // VRAM に載っている expert は飛ばす (読んでも MoE は上げ直さない)。
+    // 参照だけ (LRU を塗り替えない)。失敗したら全部先読みする側へ倒す。
+    let resident: Vec<bool> = match crate::model::expert_vram::peek_many(&keys, shapes) {
+        Ok(v) => v.iter().map(|g| g.is_some()).collect(),
+        Err(_) => vec![false; keys.len()],
+    };
+    let budget = crate::model::exp_pf::early_route_budget(
+        crate::model::exp_pf::early_route_mb(),
+        crate::model::exp_pf::early_route_kb(),
+        nt_all - nt0,
+    );
+    // expert 昇順 = MoE が読む順。上限まで集めたら止める (ディスクの遊びは
+    // 残りチャンクの attention の時間ぶんしかない)。
+    // 1.1 窓が短すぎる層は何もしない。
+    //
+    // lab t474a の実測: 3,826 (1 チャンク = 1,913 トークンの窓) では 1 層 42 MB の
+    // 先読みに 11.3 ms かかり、窓の 9.5 ms に収まらない。はみ出した分は写しと
+    // 帯域を奪い合うだけで、壁は b 9.34/9.30 s 対 rc 8.96/10.04 s = **±0**
+    // (ディスクの揺れの内側) だった。14k (残り 6 チャンク = 62 ms の窓) では
+    // 1 層 287 MB が 51 ms で収まり、壁は b 15.20 / b2 13.88 s 対 rc 12.56 s。
+    // したがって「残りの窓が 4 チャンク以上」のときだけ先読みする
+    // (`nt0` = 1 チャンクのトークン数)。
+    if !crate::model::exp_pf::early_route_window_ok(nt0, nt_all) {
+        return None;
+    }
+    let mut runs: Vec<(u32, u64, usize)> = Vec::new();
+    let mut bytes = 0usize;
+    let mut calls = 0usize;
+    let mut nex = 0usize;
+    for (i, key) in keys.iter().enumerate() {
+        if resident[i] {
+            continue;
+        }
+        let ei = key.expert as usize;
+        let mut one = 0usize;
+        let mut add: Vec<(u32, u64, usize)> = Vec::with_capacity(3);
+        for w in [&lw.gate_exps, &lw.up_exps, &lw.down_exps] {
+            let Ok((off, len)) = w.slice_abs(ei) else {
+                continue;
+            };
+            one += len;
+            add.push((w.file as u32, off, len));
+        }
+        if one == 0 {
+            continue;
+        }
+        // task 474: RAM tier に載っている expert は MoE が mmap から写す
+        // (`src: None` = `pread` を使わない) ので、先読みしても 1 バイトも
+        // 使われない。t474c の既定モデル (IQ3_XXS) は全 expert が tier から
+        // 来ていて、先読み 14.2 GB が全部無駄になった (`ra_pct=0`)。
+        if ram_peek(lw, ei).is_some() {
+            continue;
+        }
+        calls += add.len();
+        runs.extend(add);
+        bytes += one;
+        nex += 1;
+        if bytes >= budget {
+            break;
+        }
+    }
+    if nex == 0 {
+        return None;
+    }
+    // task 474: 読んだバイトは**捨てずに** RAM の置き場へ置く。MoE の写し
+    // (`pf_copy_into_pin`) は同じ (パート, 絶対オフセット, 長さ) が置き場に
+    // あればディスクを読まずにそこから memcpy する (値はバイト単位で同じ)。
+    //
+    // task 470 は同じ窓を `readahead(2)` と「pread して捨てる」で埋めようとして
+    // 負けた: 投げたバイトの 11-28% しか `copy_s` が縮まなかった (ページキャッシュ
+    // に残らない)。置き場をプロセスが持てばその取りこぼしが無い。
+    let Some((buf, jobs)) = crate::model::exp_pf::rc_plan(&runs) else {
+        return None;
+    };
+    let h = std::thread::Builder::new()
+        .name("pf-er-ram".to_string())
+        .spawn(move || {
+            use rayon::prelude::*;
+            let t = std::time::Instant::now();
+            let nt = crate::model::exp_pf::rc_threads();
+            let run = || {
+                jobs.par_iter().with_max_len(1).for_each(|&(dst, file, off, len)| {
+                    // 窓が終わったら (MoE が始まったら) そこで止める。
+                    if crate::model::exp_pf::rc_stopped() {
+                        return;
+                    }
+                    // SAFETY: `dst` は `rc_layout` が割り当てた互いに重ならない
+                    // 範囲で、置き場はプロセスの終わりまで有効。
+                    let p = unsafe { buf.ptr().add(dst as usize) };
+                    if unsafe {
+                        crate::model::exp_pf::read_part_ptr(file, off, p, len as usize)
+                    } {
+                        crate::model::exp_pf::rc_commit_one(file, off, len as usize, dst);
+                    }
+                });
+            };
+            match crate::model::exp_pf::rc_pool(nt) {
+                Some(pool) => pool.install(run),
+                None => run(),
+            }
+            crate::model::exp_pf::note_rc_read_ns(t.elapsed().as_nanos() as u64);
+        });
+    match h {
+        Ok(h) => crate::model::exp_pf::rc_worker_set(h),
+        Err(_) => return None,
+    }
+    crate::model::exp_pf::note_early_route(nex, bytes, calls);
+    Some((nex, bytes, calls))
 }
 
 /// task 394: 戻しの 1 本ぶん。`deferred` なら転送を LRU のロックの外で行う

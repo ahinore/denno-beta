@@ -2347,30 +2347,33 @@ pub fn pread_stats_reset() {
 
 /// 先読みの台帳 (グループ数 / madvise したバイト / その時間)。
 static RA_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RA_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RA_GROUP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RA_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 先読み 1 グループぶんを積む (診断用)。
 pub fn note_ra_job(bytes: usize, ns: u64) {
     RA_JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    RA_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    RA_GROUP_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
     RA_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `[exp-pf-stream]` の末尾へ足す先読みの台帳 (発火していなければ空)。
-pub fn ra_stats() -> String {
+///
+/// task 325 の `DENNO_PF_RA_GROUPS` (ページキャッシュへ投げるだけ) 用。
+/// task 474 の RAM の置き場は [`rc_stats`] が別に出す。
+pub fn ra_head_stats() -> String {
     let jobs = RA_JOBS.load(std::sync::atomic::Ordering::Relaxed);
     if jobs == 0 {
         return String::new();
     }
-    let mb = RA_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+    let mb = RA_GROUP_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
     let s = RA_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
     format!(" ra_groups={jobs} ra_MB={mb:.1} ra_s={s:.2}")
 }
 
 /// 先読みの台帳を 0 に戻す。
-pub fn ra_stats_reset() {
-    for c in [&RA_JOBS, &RA_BYTES, &RA_NS] {
+pub fn ra_head_stats_reset() {
+    for c in [&RA_JOBS, &RA_GROUP_BYTES, &RA_NS] {
         c.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -2974,6 +2977,193 @@ pub fn layer_pre_stats_reset() {
     }
 }
 
+// ===========================================================================
+// task 470: 1 チャンク目の routing を解いてから先読みする (`DENNO_PF_EARLY_ROUTE`)
+// ===========================================================================
+//
+// task 394 の `DENNO_PF_LAYER_PRE` は「その層の expert は全部要る」という前提で
+// 1 層先を `readahead(2)` したが、実測は層に **512 本** あるのに routing は
+// **296 本 (58%)** しか使わず、77 GB を投げて 44.4 GB を読む 1.73 倍の無駄読みに
+// なって負けた (t394b)。無駄読みはディスクの遊びをそのまま食うので、58% では
+// 差が出ない。
+//
+// ここでは予測ではなく**事実**を使う。層優先 prefill は 1 チャンク目の
+// attention が終わった時点で、そのチャンクのトークンの MoE 入力がデバイスに
+// 確定しているので、**そのチャンクの routing を実際に解いて**選ばれた expert
+// だけを先に読む。チャンク 0 の expert 集合は層全体の集合の**部分集合**なので
+// (トークンが増えて減ることはない)、無駄読みは 0。残りのチャンクの attention が
+// 走っているあいだディスクが遊ぶぶん (3,826 で 1 層 9.5 ms / 14k で 46 ms) を
+// そのまま取り返す。
+//
+// 値は 1 バイトも変えない (router の結果は先読みにしか使わず、MoE は従来どおり
+// 全トークンで routing を解き直す)。ゲート off では分岐 1 回だけ。
+
+/// `DENNO_PF_EARLY_ROUTE`: 1 チャンク目の routing で選ばれた expert を先読みし、
+/// **RAM の置き場**へ置く (MoE の写しがそこから memcpy する)。**既定 on**
+/// (task 474 の lab t474b で採用)。
+///
+/// - `0` / `off` — 従来 (先読みしない)
+/// - `1` / `on` — 置き場へ読む (残りの窓が 4 チャンク以上ある層だけ)
+/// - `2` / `pread` — `1` と同じ (task 470 の pread 版の名前。互換のため残す)
+///
+/// task 470 の `readahead(2)` / 「pread して捨てる」はページキャッシュに残らず
+/// `copy_s` が投げたぶんの 11-28% しか縮まなかったので、task 474 で置き場を
+/// プロセスが持つ形に変えた (lab t474b: 14k cold で -25%、3,826 はゲート on でも
+/// 1 命令も変わらない = 残り 1 チャンクの窓には収まらないので先読みしない)。
+pub const EARLY_ROUTE_ENV: &str = "DENNO_PF_EARLY_ROUTE";
+
+/// [`EARLY_ROUTE_ENV`] の既定 (task 474 で on)。
+pub const DEFAULT_EARLY_ROUTE: bool = true;
+
+/// ゲートの解釈 (純関数)。未設定は既定 (on)、`0` 系だけが偽。
+pub fn early_route_mode_from_value(v: Option<&str>) -> u8 {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("2") | Some("pread") => 2,
+        Some("1") | Some("on") | Some("true") | Some("yes") => 1,
+        Some("0") | Some("off") | Some("false") | Some("no") => 0,
+        // 未設定 / 空 / 解析不能は既定。
+        _ => u8::from(DEFAULT_EARLY_ROUTE),
+    }
+}
+
+/// ゲートの解釈 (真偽だけ)。明示的な真値で on。
+pub fn early_route_from_value(v: Option<&str>) -> bool {
+    early_route_mode_from_value(v) != 0
+}
+
+/// 先読みのやり方 (プロセスで 1 回だけ env を読む)。0 = off。
+pub fn early_route_mode() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| early_route_mode_from_value(std::env::var(EARLY_ROUTE_ENV).ok().as_deref()))
+}
+
+/// 1 チャンク目の routing で先読みするか (プロセスで 1 回だけ env を読む)。
+pub fn early_route_on() -> bool {
+    early_route_mode() != 0
+}
+
+/// `DENNO_PF_EARLY_ROUTE_MB`: 1 層で先読みする上限 (MiB)。**0 = 自動**
+/// ([`early_route_budget`])。
+pub const EARLY_ROUTE_MB_ENV: &str = "DENNO_PF_EARLY_ROUTE_MB";
+
+/// `DENNO_PF_EARLY_ROUTE_KB`: 自動のときの「残りのトークン 1 個あたり何 KiB 投げるか」。
+///
+/// 実測の比 (UD-Q4_K_XL、t470a の b1): attention は 3,826 で 0.240 ms/tok、
+/// 14,018 で 0.254 ms/tok でほぼ同じ、ディスクは 5.9 GB/s。1 チャンク目を除いた
+/// 残りトークンが遊ぶディスクは 0.25 ms × 5.9 GB/s = 1.45 MB/tok ではなく、
+/// **残りチャンクの GPU 時間**ぶんなので、14k (残り 12,000 tok、1 層 46 ms) で
+/// 271 MB = 23 KiB/tok、3,826 (残り 1,913 tok、1 層 9.5 ms) で 45 MB = 24 KiB/tok。
+/// 既定はその中央の 24 KiB。
+pub const EARLY_ROUTE_KB_ENV: &str = "DENNO_PF_EARLY_ROUTE_KB";
+
+/// [`EARLY_ROUTE_KB_ENV`] の既定 (KiB/token)。
+pub const DEFAULT_EARLY_ROUTE_KB: usize = 24;
+
+/// 自動の上限の下限 / 上限 (バイト)。1 本の expert は約 3 MB なので、
+/// 下限でも 1 本は投げられる。
+pub const EARLY_ROUTE_MIN_BYTES: usize = 8 << 20;
+/// 自動の上限の上限 (バイト)。ページキャッシュを 1 層ぶん以上汚さない。
+pub const EARLY_ROUTE_MAX_BYTES: usize = 768 << 20;
+
+/// [`EARLY_ROUTE_MB_ENV`] の解釈 (純関数)。数値だけを受け付け、0 は自動。
+pub fn early_route_mb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s.parse::<usize>().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// 1 層で先読みする上限 (MiB、0 = 自動)。
+pub fn early_route_mb() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| early_route_mb_from_value(std::env::var(EARLY_ROUTE_MB_ENV).ok().as_deref()))
+}
+
+/// [`EARLY_ROUTE_KB_ENV`] の解釈 (純関数)。数値だけ、0 も許す。
+pub fn early_route_kb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s.parse::<usize>().unwrap_or(DEFAULT_EARLY_ROUTE_KB),
+        None => DEFAULT_EARLY_ROUTE_KB,
+    }
+}
+
+/// 自動のときの KiB/token。
+pub fn early_route_kb() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        early_route_kb_from_value(std::env::var(EARLY_ROUTE_KB_ENV).ok().as_deref())
+    })
+}
+
+/// 1 層ぶんの先読み上限 (バイト) を決める (純関数)。
+///
+/// - `mb > 0` ならその MiB (env の明示指定が最優先)。
+/// - `mb == 0` なら `残りトークン数 × kb KiB` を
+///   [`EARLY_ROUTE_MIN_BYTES`]..=[`EARLY_ROUTE_MAX_BYTES`] に丸める。
+pub fn early_route_budget(mb: usize, kb: usize, rest_tok: usize) -> usize {
+    if mb > 0 {
+        return mb.saturating_mul(1 << 20);
+    }
+    let want = rest_tok.saturating_mul(kb).saturating_mul(1 << 10);
+    want.clamp(EARLY_ROUTE_MIN_BYTES, EARLY_ROUTE_MAX_BYTES)
+}
+
+/// 先読みの窓として要る「残りチャンク数」の下限。
+///
+/// lab t474a: 3,826 (残り 1 チャンク) では 1 層 42 MB の先読みが窓 (9.5 ms) に
+/// 収まらず (11.3 ms)、壁は ±0 だった。14k (残り 6 チャンク) は収まって -13.6%。
+pub const EARLY_ROUTE_MIN_REST_CHUNKS: usize = 4;
+
+/// 先読みの窓が十分か (純関数)。
+///
+/// 「残りのチャンクが [`EARLY_ROUTE_MIN_REST_CHUNKS`] 本以上」= 窓が
+/// `4 × nt0` トークン以上あること。1 チャンクで終わる層 (窓なし) も false。
+pub fn early_route_window_ok(nt0: usize, nt_all: usize) -> bool {
+    if nt0 == 0 || nt_all <= nt0 {
+        return false;
+    }
+    nt_all - nt0 >= nt0.saturating_mul(EARLY_ROUTE_MIN_REST_CHUNKS)
+}
+
+/// 先読みの台帳 (層数 / expert 本数 / バイト / 呼び出し回数)。
+///
+/// task 474: 実行役の join と読み終えるまでの時間は置き場の側
+/// ([`rc_join`] / [`note_rc_read_ns`]) が持つ。ここは「何層ぶん投げたか」だけ。
+static ER_LAYERS: AtomicU64 = AtomicU64::new(0);
+static ER_EXPERTS: AtomicU64 = AtomicU64::new(0);
+static ER_BYTES: AtomicU64 = AtomicU64::new(0);
+static ER_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// 1 層ぶんの先読みを積んだ (診断用)。
+pub fn note_early_route(experts: usize, bytes: usize, calls: usize) {
+    ER_LAYERS.fetch_add(1, Ordering::Relaxed);
+    ER_EXPERTS.fetch_add(experts as u64, Ordering::Relaxed);
+    ER_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    ER_CALLS.fetch_add(calls as u64, Ordering::Relaxed);
+}
+
+/// `[exp-pf-stream]` の末尾へ足す台帳 (発火していなければ空)。
+pub fn early_route_stats() -> String {
+    let n = ER_LAYERS.load(Ordering::Relaxed);
+    if n == 0 {
+        return String::new();
+    }
+    let mb = ER_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+    format!(
+        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={}",
+        ER_EXPERTS.load(Ordering::Relaxed),
+        ER_CALLS.load(Ordering::Relaxed)
+    )
+}
+
+/// 先読みの台帳を 0 に戻す。
+pub fn early_route_stats_reset() {
+    for c in [&ER_LAYERS, &ER_EXPERTS, &ER_BYTES, &ER_CALLS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+
 /// `part` の `off..off+len` をページキャッシュへ先に読む (Linux の `readahead(2)`)。
 ///
 /// - ユーザー側のバッファを持たない (カーネルがページキャッシュを埋めるだけ)。
@@ -3011,6 +3201,363 @@ pub fn readahead_part(part: u32, off: u64, len: usize) -> usize {
         let _ = (f, off);
         0
     }
+}
+
+// ---------------------------------------------------------------------------
+// task 474: 先読みを「捨てる」のをやめて RAM に置き、MoE の写しがそこから取る
+// ---------------------------------------------------------------------------
+//
+// task 470 の実測: 1 チャンク目の routing を解いて **残りチャンクの attention の
+// あいだ** に expert を読む窓は実在する (3,826 で 1 層 9.5 ms、14k で 62 ms) が、
+// (a) `readahead(2)` はほぼ無効、(b) 背景 pread で捨ててもページキャッシュに
+// 残らず、`copy_s` が縮んだのは投げたバイトの 11-28% だけだった。
+//
+// そこで **読んだバイトをプロセスの RAM に置く**。MoE の写し
+// (`pf_copy_into_pin`) は、同じ (パート, 絶対オフセット, 長さ) が置き場にあれば
+// ディスクを読まずに memcpy する。値はバイト単位で同じなので**数値は 1 bit も
+// 変わらない** (読む場所が変わるだけ)。
+//
+// 置き場は 1 層ぶんを使い回す。1 本の expert は約 3 MB、窓の中で読める量は
+// `DENNO_PF_EARLY_ROUTE` の予算 (既定: 残りトークン × 24 KiB) で決まる。
+
+/// `DENNO_PF_RA_CACHE_MB`: 先読みの置き場 (MiB)。**既定 512**。
+///
+/// 1 層ぶんしか使わない。14k の予算は 287 MB (24 KiB × 11,970 tok) なので
+/// 512 MiB あれば足りる。0 にすると置き場を作らない (先読みもしない)。
+pub const RC_CACHE_MB_ENV: &str = "DENNO_PF_RA_CACHE_MB";
+
+/// [`RC_CACHE_MB_ENV`] の既定 (MiB)。
+pub const DEFAULT_RC_CACHE_MB: usize = 512;
+
+/// `DENNO_PF_RA_THREADS`: 先読みの並列度。**既定 8**。
+///
+/// 窓のあいだディスクを回す本数。コピー側は 32 本 (`DENNO_PF_PREAD_THREADS`) だが、
+/// 窓は短いので上げすぎても立ち上げで損をする (t470d の実測: 14 本で 3.2-5.5 GB/s)。
+pub const RC_THREADS_ENV: &str = "DENNO_PF_RA_THREADS";
+
+/// [`RC_THREADS_ENV`] の既定。
+pub const DEFAULT_RC_THREADS: usize = 8;
+
+/// [`RC_CACHE_MB_ENV`] の解釈 (純関数)。0 は「置き場なし」、それ以外は
+/// 32..=2048 MiB に丸める。
+pub fn rc_cache_mb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some("") | None => DEFAULT_RC_CACHE_MB,
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => 0,
+            Ok(n) => n.clamp(32, 2048),
+            Err(_) => DEFAULT_RC_CACHE_MB,
+        },
+    }
+}
+
+/// 置き場のバイト数 (プロセスで 1 回だけ env を読む)。
+pub fn rc_cache_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        rc_cache_mb_from_value(std::env::var(RC_CACHE_MB_ENV).ok().as_deref()) << 20
+    })
+}
+
+/// [`RC_THREADS_ENV`] の解釈 (純関数)。1..=32。
+pub fn rc_threads_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some("") | None => DEFAULT_RC_THREADS,
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => DEFAULT_RC_THREADS,
+            Ok(n) => n.clamp(1, 32),
+            Err(_) => DEFAULT_RC_THREADS,
+        },
+    }
+}
+
+/// 先読みの並列度。
+pub fn rc_threads() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| rc_threads_from_value(std::env::var(RC_THREADS_ENV).ok().as_deref()))
+}
+
+/// 置き場の 1 エントリ。`base` は [`RcBuf`] の先頭からのオフセット。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RcEnt {
+    pub file: u32,
+    pub off: u64,
+    pub len: u32,
+    pub base: u32,
+}
+
+/// `(file, off, len)` = ディスク上の範囲を、置き場のどの位置へ読むか。
+///
+/// [`rc_layout`] の戻り値の 1 本。`base` は置き場の先頭からのバイト。
+pub type RcJob = (u32, u32, u64, u32);
+
+/// 先読みの範囲を置き場のオフセットへ割り当てる (純関数)。
+///
+/// `runs` は **(パート, 絶対オフセット, 長さ)** を MoE が読む順に並べたもの。
+/// 先頭から `cap` バイトに収まる手前までを割り当てる (expert 昇順の先頭 =
+/// MoE が最初に読むぶん)。戻り値は (割り当て, 合計バイト)。1 本も入らなければ
+/// `None`。
+pub fn rc_layout(runs: &[(u32, u64, usize)], cap: usize) -> Option<(Vec<RcJob>, usize)> {
+    let mut jobs: Vec<RcJob> = Vec::with_capacity(runs.len());
+    let mut at = 0usize;
+    for &(file, off, len) in runs {
+        if len == 0 {
+            continue;
+        }
+        if at.saturating_add(len) > cap {
+            break;
+        }
+        jobs.push((at as u32, file, off, len as u32));
+        at += len;
+    }
+    if jobs.is_empty() {
+        return None;
+    }
+    Some((jobs, at))
+}
+
+/// 置き場そのもの (プロセスで 1 回だけ確保し、層ごとに使い回す)。
+///
+/// 中身は先読みスレッドが**互いに重ならない範囲**へ書き、書き終えた範囲だけを
+/// 索引へ入れる (読みかけのバイトを MoE が掴まない)。
+pub struct RcBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: 確保した領域は解放しない (プロセスの終わりまで有効)。書き込みは
+// `rc_layout` が割り当てた重ならない範囲だけで、索引への登録は `rc_commit_one`
+// (Mutex) を通す。読み出しは登録済みの範囲だけ。
+unsafe impl Send for RcBuf {}
+unsafe impl Sync for RcBuf {}
+
+impl RcBuf {
+    /// 置き場の先頭。
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+    /// 置き場のバイト数。
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    /// 空か。
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+static RC_BUF: std::sync::OnceLock<Option<std::sync::Arc<RcBuf>>> = std::sync::OnceLock::new();
+
+/// 置き場を用意する (初回だけ確保する)。0 バイト設定なら `None`。
+fn rc_buf() -> Option<std::sync::Arc<RcBuf>> {
+    RC_BUF
+        .get_or_init(|| {
+            let n = rc_cache_bytes();
+            if n == 0 {
+                return None;
+            }
+            let mut v = vec![0u8; n].into_boxed_slice();
+            let ptr = v.as_mut_ptr();
+            std::mem::forget(v);
+            Some(std::sync::Arc::new(RcBuf { ptr, len: n }))
+        })
+        .clone()
+}
+
+struct RcIdx {
+    ents: Vec<RcEnt>,
+}
+
+static RC_IDX: std::sync::Mutex<RcIdx> = std::sync::Mutex::new(RcIdx { ents: Vec::new() });
+
+/// 先読みを止めるか (MoE が始まったら窓は終わり)。
+static RC_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 先読みの実行役 (高々 1 本)。
+static RC_WORKER: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// 置き場に載ったバイト / MoE が置き場から取ったバイト / その本数 / 外れた本数。
+static RC_BYTES: AtomicU64 = AtomicU64::new(0);
+static RC_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static RC_HIT_CALLS: AtomicU64 = AtomicU64::new(0);
+static RC_MISS_CALLS: AtomicU64 = AtomicU64::new(0);
+/// 先読みが読み終えるまでの時間 (層ごとの最大を積む)。
+static RC_READ_NS: AtomicU64 = AtomicU64::new(0);
+
+/// 前の層の実行役を回収する (まだ走っていれば止めてから待つ)。
+pub fn rc_join() {
+    RC_STOP.store(true, Ordering::Relaxed);
+    let Ok(mut g) = RC_WORKER.lock() else {
+        return;
+    };
+    if let Some(h) = g.take() {
+        let _ = h.join();
+    }
+}
+
+/// 窓の終わりを知らせる (実行役は次の範囲の手前で止まる)。
+pub fn rc_stop() {
+    RC_STOP.store(true, Ordering::Relaxed);
+}
+
+/// 先読みが止められたか (実行役が範囲ごとに見る)。
+pub fn rc_stopped() -> bool {
+    RC_STOP.load(Ordering::Relaxed)
+}
+
+/// 索引の本数 (ロックを取らずに「載っていない」を判定するため)。
+static RC_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 索引を空にする (置き場のバイトは消さない)。
+pub fn rc_clear() {
+    if let Ok(mut g) = RC_IDX.lock() {
+        g.ents.clear();
+    }
+    RC_N.store(0, Ordering::Relaxed);
+}
+
+/// 1 層ぶんの先読みを始める。
+///
+/// 前の層の実行役を回収し、索引を空にし、`runs` を置き場へ割り当てて返す
+/// (読み込みは呼び出し側が別スレッドで行い、[`rc_commit_one`] で索引へ入れる)。
+pub fn rc_plan(runs: &[(u32, u64, usize)]) -> Option<(std::sync::Arc<RcBuf>, Vec<RcJob>)> {
+    rc_join();
+    rc_clear();
+    let buf = rc_buf()?;
+    let (jobs, _total) = rc_layout(runs, buf.len())?;
+    RC_STOP.store(false, Ordering::Relaxed);
+    Some((buf, jobs))
+}
+
+/// 実行役を登録する (次の層の [`rc_plan`] が回収する)。
+pub fn rc_worker_set(h: std::thread::JoinHandle<()>) {
+    if let Ok(mut g) = RC_WORKER.lock() {
+        if let Some(old) = g.replace(h) {
+            let _ = old.join();
+        }
+    }
+}
+
+/// 1 範囲を読み終えたので索引へ入れる (読みかけを見せない)。
+pub fn rc_commit_one(file: u32, off: u64, len: usize, base: u32) {
+    if len == 0 || len > u32::MAX as usize {
+        return;
+    }
+    if let Ok(mut g) = RC_IDX.lock() {
+        g.ents.push(RcEnt {
+            file,
+            off,
+            len: len as u32,
+            base,
+        });
+        RC_N.store(g.ents.len(), Ordering::Relaxed);
+        RC_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    }
+}
+
+/// 置き場に `(file, off, len)` がちょうど載っているか。
+pub fn rc_has(file: u32, off: u64, len: usize) -> bool {
+    if RC_N.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let Ok(g) = RC_IDX.lock() else {
+        return false;
+    };
+    g.ents
+        .iter()
+        .any(|e| e.file == file && e.off == off && e.len as usize == len)
+}
+
+/// 置き場から `dst` へ写す。載っていなければ false (呼び出し側がディスクへ落ちる)。
+///
+/// # Safety
+///
+/// `dst` は `len` バイト以上書ける領域を指すこと。
+pub unsafe fn rc_copy_into(file: u32, off: u64, len: usize, dst: *mut u8) -> bool {
+    if len == 0 || dst.is_null() {
+        return false;
+    }
+    if RC_N.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let Ok(g) = RC_IDX.lock() else {
+        return false;
+    };
+    let Some(e) = g
+        .ents
+        .iter()
+        .find(|e| e.file == file && e.off == off && e.len as usize == len)
+    else {
+        RC_MISS_CALLS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let src = unsafe { rc_buf_ptr().add(e.base as usize) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+    }
+    RC_HIT_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    RC_HIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// 置き場の先頭 (索引が空でないときだけ呼ばれる)。
+fn rc_buf_ptr() -> *const u8 {
+    match RC_BUF.get().and_then(|b| b.as_ref()) {
+        Some(b) => b.ptr as *const u8,
+        None => std::ptr::null(),
+    }
+}
+
+/// 先読み専用の rayon プール (プロセスで 1 個)。
+///
+/// 層ループの rayon を奪わないよう、置き場を埋めるスレッドは専用にする。
+pub fn rc_pool(nt: usize) -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(nt.max(1))
+            .thread_name(|i| format!("pf-ra-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// 先読みが 1 層ぶん読み終えるまでの時間を積む (診断)。
+pub fn note_rc_read_ns(ns: u64) {
+    RC_READ_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// 置き場の台帳 (`[exp-pf-stream]` の末尾へ足す。載っていなければ空)。
+pub fn rc_stats() -> String {
+    let bytes = RC_BYTES.load(Ordering::Relaxed);
+    let hit = RC_HIT_BYTES.load(Ordering::Relaxed);
+    let miss = RC_MISS_CALLS.load(Ordering::Relaxed);
+    if bytes == 0 && hit == 0 && miss == 0 {
+        return String::new();
+    }
+    let ms = RC_READ_NS.load(Ordering::Relaxed) as f64 / 1e6;
+    let hit_mb = hit as f64 / 1e6;
+    let put_mb = bytes as f64 / 1e6;
+    let pct = if bytes > 0 {
+        hit as f64 * 100.0 / bytes as f64
+    } else {
+        0.0
+    };
+    format!(
+        " ra_MB={put_mb:.1} ra_hit_MB={hit_mb:.1} ra_hit={} ra_miss={miss} ra_ms={ms:.1} ra_pct={pct:.0}",
+        RC_HIT_CALLS.load(Ordering::Relaxed)
+    )
+}
+
+/// 置き場の台帳を 0 に戻す。
+pub fn rc_stats_reset() {
+    for c in [&RC_BYTES, &RC_HIT_BYTES, &RC_HIT_CALLS, &RC_MISS_CALLS] {
+        c.store(0, Ordering::Relaxed);
+    }
+    RC_READ_NS.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -3388,9 +3935,11 @@ pub fn stats_line() -> Option<String> {
         }
         // task 325: 1 回目の読みの経路 (pread / 先読み) が発火したかの台帳。
         out.push_str(&pread_stats());
-        out.push_str(&ra_stats());
+        out.push_str(&rc_stats());
         // task 394: 次の層の先読みが発火したかの台帳。
         out.push_str(&layer_pre_stats());
+        // task 470: 1 チャンク目の routing による先読みの台帳。
+        out.push_str(&early_route_stats());
     }
     Some(out)
 }
@@ -3434,6 +3983,10 @@ pub fn stats_reset() {
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    // task 470: 1 チャンク目の routing による先読みの台帳も戻す。
+    early_route_stats_reset();
+    // task 474: 先読みの置き場 (RAM) の台帳も戻す。
+    rc_stats_reset();
     CHECK_LAYERS.store(0, Ordering::Relaxed);
     if let Ok(mut g) = CHECK.lock() {
         *g = None;
@@ -3443,7 +3996,7 @@ pub fn stats_reset() {
     crate::cuda::pf_tab_counts_reset();
     // task 325: 1 回目の読みの台帳もリクエスト単位にする。
     pread_stats_reset();
-    ra_stats_reset();
+    rc_stats_reset();
     // task 394: 次の層の先読みの台帳もリクエスト単位にする。
     layer_pre_stats_reset();
 }
@@ -3589,11 +4142,163 @@ mod tests {
         assert_eq!(layer_pre_stats(), "");
     }
 
+    /// task 470 / 474: 1 チャンク目の routing による先読みのゲートは**既定 on**、
+    /// `0` 系だけが偽。上限は「明示 MiB > 自動 (残りトークン × KiB)」で、
+    /// 自動は下限 / 上限に丸める。
+    #[test]
+    fn early_route_gate_and_budget() {
+        assert!(DEFAULT_EARLY_ROUTE, "task 474 で既定 on にした");
+        assert!(early_route_from_value(None), "未設定は既定 (on)");
+        assert!(early_route_from_value(Some("")), "空も既定 (on)");
+        assert!(!early_route_from_value(Some("0")));
+        assert!(!early_route_from_value(Some("off")));
+        assert!(!early_route_from_value(Some("no")));
+        assert!(!early_route_from_value(Some("false")));
+        assert!(early_route_from_value(Some("1")));
+        assert!(early_route_from_value(Some("on")));
+        assert!(early_route_from_value(Some(" TRUE ")));
+        assert!(early_route_from_value(Some("yes")));
+        // `2` は task 470 の pread 版の名前 (置き場を使うので 1 と同じ)。
+        assert_eq!(early_route_mode_from_value(None), 1);
+        assert_eq!(early_route_mode_from_value(Some("")), 1);
+        assert_eq!(early_route_mode_from_value(Some("0")), 0);
+        assert_eq!(early_route_mode_from_value(Some("1")), 1);
+        assert_eq!(early_route_mode_from_value(Some("on")), 1);
+        assert_eq!(early_route_mode_from_value(Some("2")), 2);
+        assert_eq!(early_route_mode_from_value(Some(" PREAD ")), 2);
+        assert_eq!(early_route_mode_from_value(Some("x")), 1, "解析不能は既定");
+        assert!(early_route_from_value(Some("2")), "pread も on");
+        // 明示 MiB はそのまま (0 は自動)。
+        assert_eq!(early_route_mb_from_value(None), 0);
+        assert_eq!(early_route_mb_from_value(Some("0")), 0);
+        assert_eq!(early_route_mb_from_value(Some("128")), 128);
+        assert_eq!(early_route_mb_from_value(Some("x")), 0);
+        // KiB/token は数値だけ (解析不能は既定)。
+        assert_eq!(early_route_kb_from_value(None), DEFAULT_EARLY_ROUTE_KB);
+        assert_eq!(early_route_kb_from_value(Some("0")), 0);
+        assert_eq!(early_route_kb_from_value(Some(" 48 ")), 48);
+        assert_eq!(early_route_kb_from_value(Some("x")), DEFAULT_EARLY_ROUTE_KB);
+        // 自動の上限: 3,826 の 1 チャンク (残り 1,913 tok) と 14k の 6 チャンク。
+        assert_eq!(
+            early_route_budget(0, 24, 1_913),
+            1_913 * 24 * 1024,
+            "3,826 の残り 1 チャンク"
+        );
+        assert_eq!(
+            early_route_budget(0, 24, 12_000),
+            294_912_000,
+            "14k の残り 6 チャンク (288 MiB)"
+        );
+        assert_eq!(
+            early_route_budget(0, 24, 64_000),
+            EARLY_ROUTE_MAX_BYTES,
+            "長すぎるときは上限 (768 MiB) に当たる"
+        );
+        assert_eq!(
+            early_route_budget(0, 24, 1),
+            EARLY_ROUTE_MIN_BYTES,
+            "小さすぎるときは下限"
+        );
+        // 明示 MiB は自動より優先。
+        assert_eq!(early_route_budget(200, 24, 1_913), 200 << 20);
+        assert_eq!(early_route_budget(0, 0, 12_000), EARLY_ROUTE_MIN_BYTES);
+        // 台帳は積んだぶんだけ出て、0 に戻せる。
+        early_route_stats_reset();
+        assert_eq!(early_route_stats(), "", "発火していないのに台帳が出る");
+        note_early_route(40, 128 << 20, 120);
+        note_early_route(40, 128 << 20, 120);
+        let s = early_route_stats();
+        assert!(s.contains("er_layers=2"), "{s}");
+        assert!(s.contains("er_experts=80"), "{s}");
+        assert!(s.contains("er_calls=240"), "{s}");
+        assert!(s.contains("er_MB=268.4"), "{s}");
+        early_route_stats_reset();
+        assert_eq!(early_route_stats(), "");
+    }
+
+    /// task 474: 先読みの置き場 (RAM) の割り当てと索引。
+    ///
+    /// `rc_layout` は「MoE が読む順の先頭から、置き場に収まる手前まで」を
+    /// 割り当てる (expert 昇順の先頭 = 一番早く要るぶん)。索引は
+    /// **(パート, 絶対オフセット, 長さ) の完全一致**だけで当たる
+    /// (1 バイトでも違えばディスクへ落ちる = 値は絶対に変わらない)。
+    #[test]
+    fn ra_cache_layout_and_index() {
+        // 1 本 100 バイト × 3 本。200 バイトの置き場には 2 本しか入らない。
+        let runs = [(0u32, 1_000u64, 100usize), (0, 2_000, 100), (1, 3_000, 100)];
+        let (jobs, total) = rc_layout(&runs, 200).expect("2 本は入る");
+        assert_eq!(total, 200);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0], (0u32, 0u32, 1_000u64, 100u32), "先頭は置き場の 0");
+        assert_eq!(jobs[1], (100, 0, 2_000, 100), "次は前の直後");
+        // ぴったり 300 バイトなら 3 本。
+        assert_eq!(rc_layout(&runs, 300).map(|(j, t)| (j.len(), t)), Some((3, 300)));
+        // 1 本も入らない / 空。
+        assert!(rc_layout(&runs, 99).is_none());
+        assert!(rc_layout(&runs, 0).is_none());
+        assert!(rc_layout(&[], 1 << 20).is_none());
+        // 長さ 0 の範囲は飛ばす (置き場を無駄にしない)。
+        let z = [(0u32, 10u64, 0usize), (0, 20, 8)];
+        let (j, t) = rc_layout(&z, 64).expect("1 本");
+        assert_eq!((j.len(), t), (1, 8));
+        assert_eq!(j[0].0, 0, "長さ 0 は場所を食わない");
+
+        // 索引: 完全一致だけが当たる。
+        rc_clear();
+        assert!(!rc_has(0, 1_000, 100), "空なら当たらない");
+        rc_commit_one(0, 1_000, 100, 0);
+        rc_commit_one(1, 3_000, 100, 100);
+        assert!(rc_has(0, 1_000, 100));
+        assert!(rc_has(1, 3_000, 100));
+        assert!(!rc_has(0, 1_000, 99), "長さが違えば当たらない");
+        assert!(!rc_has(0, 1_001, 100), "位置が違えば当たらない");
+        assert!(!rc_has(2, 1_000, 100), "パートが違えば当たらない");
+        // 台帳 (載ったバイト) が積まれる。
+        let s = rc_stats();
+        assert!(s.contains("ra_MB=0.0"), "{s}");
+        assert!(s.contains("ra_hit=0"), "{s}");
+        rc_stats_reset();
+        rc_clear();
+        assert_eq!(rc_stats(), "", "空に戻したら台帳も空");
+        assert!(!rc_has(0, 1_000, 100), "clear で消える");
+    }
+
+    /// task 474: 置き場の大きさと並列度の env 解釈。
+    #[test]
+    fn ra_cache_env_truth_table() {
+        assert_eq!(rc_cache_mb_from_value(None), DEFAULT_RC_CACHE_MB);
+        assert_eq!(rc_cache_mb_from_value(Some("")), DEFAULT_RC_CACHE_MB);
+        assert_eq!(rc_cache_mb_from_value(Some("0")), 0, "0 は置き場なし");
+        assert_eq!(rc_cache_mb_from_value(Some("256")), 256);
+        assert_eq!(rc_cache_mb_from_value(Some(" 64 ")), 64);
+        assert_eq!(rc_cache_mb_from_value(Some("1")), 32, "下限 32 MiB");
+        assert_eq!(rc_cache_mb_from_value(Some("99999")), 2048, "上限 2048 MiB");
+        assert_eq!(rc_cache_mb_from_value(Some("x")), DEFAULT_RC_CACHE_MB);
+        assert_eq!(rc_threads_from_value(None), DEFAULT_RC_THREADS);
+        assert_eq!(rc_threads_from_value(Some("0")), DEFAULT_RC_THREADS);
+        assert_eq!(rc_threads_from_value(Some("4")), 4);
+        assert_eq!(rc_threads_from_value(Some("999")), 32, "上限 32");
+        assert_eq!(rc_threads_from_value(Some("x")), DEFAULT_RC_THREADS);
+    }
+
+    /// task 474: 窓の下限 (残りチャンク 4 本)。
+    ///
+    /// 3,826 (1,913 トークンのチャンク 2 本 = 残り 1 本) は窓が短すぎて
+    /// 先読みがはみ出す (t474a で ±0)。14k (2,003 × 7) は残り 6 本で収まる。
+    #[test]
+    fn early_route_window_gate() {
+        assert!(!early_route_window_ok(1_913, 3_826), "3,826 は残り 1 チャンク");
+        assert!(early_route_window_ok(2_003, 14_018), "14k は残り 6 チャンク");
+        assert!(!early_route_window_ok(0, 14_018), "チャンク 0 は窓なし");
+        assert!(!early_route_window_ok(2_048, 2_048), "1 チャンクは窓なし");
+        assert!(early_route_window_ok(2_048, 10_240), "残り 4 本ちょうどは可");
+        assert!(!early_route_window_ok(2_048, 10_239), "残り 4 本未満は不可");
+    }
+
     /// task 325: `DENNO_PF_RA_GROUPS` の真理値表 (未設定は off)。
     #[test]
     fn ra_groups_gate_truth_table() {
         assert_eq!(ra_groups_from_value(None), 0);
-        assert_eq!(ra_groups_from_value(Some("")), 0);
         assert_eq!(ra_groups_from_value(Some("0")), 0);
         assert_eq!(ra_groups_from_value(Some("1")), 1);
         assert_eq!(ra_groups_from_value(Some(" 3 ")), 3);

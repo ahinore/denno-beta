@@ -11723,6 +11723,9 @@ thread_local! {
 /// task 165: 上げ専用スレッドを**先に**止めて join する (ステージングや pinned を
 /// 指したままにしない)。
 pub fn pf_stream_release() {
+    // task 474: 先読みの実行役を先に止めて join する (置き場を指したままにしない)。
+    crate::model::exp_pf::rc_join();
+    crate::model::exp_pf::rc_clear();
     let _ = PF_UP.try_with(|cell| {
         if let Ok(mut slot) = cell.try_borrow_mut() {
             *slot = None;
@@ -11850,7 +11853,9 @@ impl PfHostRange {
 fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool) {
     // task 325: pread のときは「塊」を単位に仕事を作る (1 つの区間を
     // `DENNO_PF_PREAD_KB` ずつに切り、並列度を上げる)。
-    let mut tasks: Vec<(usize, Option<(u32, u64)>, usize, usize)> = Vec::new();
+    // task 474: 区間**丸ごと**が先読みの置き場 (`DENNO_PF_EARLY_ROUTE` の RAM) に
+    // 載っていれば、その区間は 1 本の memcpy にする (ディスクを読まない)。
+    let mut tasks: Vec<(usize, Option<(u32, u64)>, usize, usize, bool)> = Vec::new();
     if pread {
         let blk = exp_pf::pread_bytes().max(1);
         for &(off, r) in parts {
@@ -11859,23 +11864,36 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             }
             match r.src {
                 Some(s) => {
-                    // task 325: 1 区間を `DENNO_PF_PREAD_KB` ずつに切る。
-                    for (at, n) in exp_pf::pread_blocks(r.len, blk) {
-                        tasks.push((off + at, Some((s.0, s.1 + at as u64)), r.ptr + at, n));
+                    if exp_pf::rc_has(s.0, s.1, r.len) {
+                        tasks.push((off, Some(s), r.ptr, r.len, true));
+                    } else {
+                        // task 325: 1 区間を `DENNO_PF_PREAD_KB` ずつに切る。
+                        for (at, n) in exp_pf::pread_blocks(r.len, blk) {
+                            tasks.push((
+                                off + at,
+                                Some((s.0, s.1 + at as u64)),
+                                r.ptr + at,
+                                n,
+                                false,
+                            ));
+                        }
                     }
                 }
-                None => tasks.push((off, None, r.ptr, r.len)),
+                None => tasks.push((off, None, r.ptr, r.len, false)),
             }
         }
     } else {
         for &(off, r) in parts {
-            tasks.push((off, None, r.ptr, r.len));
+            tasks.push((off, None, r.ptr, r.len, false));
         }
     }
-    let work = |&(off, src, ptr, len): &(usize, Option<(u32, u64)>, usize, usize)| {
+    let work = |&(off, src, ptr, len, cached): &(usize, Option<(u32, u64)>, usize, usize, bool)| {
         let dst = (pin_base + off) as *mut u8;
         if let Some((part, at)) = src {
             // SAFETY: 区間は互いに重ならず、`pin_base` は `need` バイト以上ある。
+            if cached && unsafe { exp_pf::rc_copy_into(part, at, len, dst) } {
+                return;
+            }
             if unsafe { exp_pf::read_part_ptr(part, at, dst, len) } {
                 return;
             }
