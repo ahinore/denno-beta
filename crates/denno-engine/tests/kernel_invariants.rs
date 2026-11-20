@@ -10897,7 +10897,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12424,7 +12424,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12541,7 +12541,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12736,7 +12736,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12830,13 +12830,87 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_mix_dn6.ptx");
     if let Ok(text) = std::fs::read_to_string(&path) {
         let pat = ".entry dno_mix_gemv_q8_0_dn6(";
+        let i = text
+            .find(pat)
+            .unwrap_or_else(|| panic!("PTX に entry が無い (再生成が必要)"));
+        let j = text[i..].find(')').map(|k| i + k).expect("引数リストが閉じない");
+        let got = text[i..j].matches(".param .").count();
+        assert_eq!(got, 7, "PTX の引数が {got} 個 (ホスト側は 7 個)");
+    }
+}
+
+/// task 496: dn8 (`dno_mix_gemv_q8_0_dn8`) が「1 ブロック = rows * np 個の
+/// (行, 対)」でレーンを詰め、ホスト側の起動形・ゲート・build_ptx.sh と揃って
+/// いること (np が 32 の倍数の形は dn6 のまま = 受け皿を消していない)。
+#[test]
+fn task496_mix_dn8_lane_packed_gemv_is_wired() {
+    let src = include_str!("../kernels/kernels_mix_dn8.cu");
+    assert!(src.contains("dno_mix_gemv_q8_0_dn8"), "カーネル名が無い");
+    assert_eq!(cu_kernel_nargs(src, "dno_mix_gemv_q8_0_dn8"), 7, "引数の数が違う");
+    for line in [
+        "const int np = n_in >> 6;",
+        "const int items = np * rows;",
+        "xs[(i >> 6) * 65 + (i & 63)] = x[i];",
+        "const int r = tid / np;",
+        "const int pair = tid - r * np;",
+        "dno_dn8_load17(cur, rowp + (size_t)pair * 68u);",
+        "part[tid] = v;",
+        "for (int i = 1; i < np; ++i) s = __fadd_rn(s, p[i]);",
+    ] {
+        assert!(src.contains(line), "`.cu` に {line} が無い");
+    }
+    // 1 対の積和は dn6 と同一 (同じ 4 アキュムレータ・同じ f16 復元)。
+    assert!(src.contains("float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;"));
+    assert!(src.contains("__shared__") == false || src.contains("extern __shared__ float smem[];"));
+    // ホスト側: 名前 / 引数 / plan / launch (shmem を渡す)。
+    assert!(CUDA_RS.contains("const MIX_DN8_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn8\";"));
+    assert!(CUDA_RS.contains("const MIX_DN8_NARGS: usize = 7;"));
+    assert!(CUDA_RS.contains("pub fn mix_dn8_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<MixDn8Plan> {"));
+    assert!(CUDA_RS.contains("plan.shmem as u32,"), "shared を渡していない");
+    assert_eq!(
+        CUDA_RS.matches(".join(\"kernels_mix_dn8.ptx\")").count(),
+        1,
+        "PTX のパスが違う"
+    );
+    // ゲート: `DENNO_GDN_DEC_GEMV=dn8` (既存 env の新しい値) と、dn6 の受け皿。
+    assert!(CUDA_RS.contains("Some(\"dn8\") | Some(\"d8\")"), "dn8 のゲートが無い");
+    assert!(CUDA_RS.contains("fn dn6_alive_for(c: GdnDecGemv) -> bool {"));
+    assert!(CUDA_RS.contains("matches!(c, GdnDecGemv::Dn6 | GdnDecGemv::Dn8)"));
+    // 起動点: GDN の qkv が dn8 を先に試し、形が合わなければ dn6 へ落ちる。
+    assert!(CUDA_RS.contains("let dn8 = gdn_dn8_plan(u.ty, u.k, u.n, gdn_dn8_rows());"));
+    assert!(CUDA_RS.contains("fn gdn_dn8_plan("));
+    assert!(CUDA_RS.contains("want_rows: usize,\n) -> Option<MixDn8Plan> {"));
+    // out 側 (`dn8a`) の起動点と、np 32 倍数を許す口。
+    assert!(CUDA_RS.contains("let dn8_out = gdn_dn8_plan(\n            req.out_unit.ty,"));
+    assert!(CUDA_RS.contains("mix_dn8_plan_with(k, n, want_rows, gdn_dn8_all())"));
+    // レジスタ上限 (t496b の error 701) で block を 640 に抑えていること。
+    assert!(CUDA_RS.contains("const MIX_DN8_MAX_BLOCK: usize = 640;"));
+    assert!(CUDA_RS.contains("const GDN_DN8_OUT_ROWS: usize = 4;"));
+    // 発火の証拠 (`[mix-qchain]` の `dn8=`) と計数の reset。
+    assert!(CUDA_RS.contains("pub fn mix_dn8_hits() -> u64 {"));
+    assert!(CUDA_RS.contains("pub fn mix_dn8_reset() {"));
+    assert!(QWEN4EXP_RS.contains("dn8={dn8}"), "[mix-qchain] に dn8= が無い");
+    assert!(QWEN4EXP_RS.contains("crate::cuda::mix_dn8_reset();"));
+    // build_ptx.sh: target と targets_all の末尾。
+    assert!(
+        BUILD_PTX_SH.contains("mix_dn8)      echo \"kernels_mix_dn8.cu|nofmad\" ;;"),
+        "build_ptx.sh に target が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        "targets_all の末尾に足していない"
+    );
+    // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_mix_dn8.ptx");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let pat = ".entry dno_mix_gemv_q8_0_dn8(";
         let i = text
             .find(pat)
             .unwrap_or_else(|| panic!("PTX に entry が無い (再生成が必要)"));
@@ -13124,7 +13198,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(

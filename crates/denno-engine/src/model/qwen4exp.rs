@@ -6717,6 +6717,11 @@ pub fn mix_qchain_line() -> Option<String> {
     let (f6, h6) = crate::cuda::dn6_dec_hits();
     #[cfg(not(feature = "cuda"))]
     let (f6, h6) = (0u64, 0u64);
+    // task 496: GDN の qkv をレーン詰めの dn8 で撃った回数 (0 なら dn6/v5)。
+    #[cfg(feature = "cuda")]
+    let dn8 = crate::cuda::mix_dn8_hits();
+    #[cfg(not(feature = "cuda"))]
+    let dn8 = 0u64;
     // task 431: down を 1 対 4 レーンの dn7 で撃った回数 (0 なら dn6/dn5/v5)。
     #[cfg(feature = "cuda")]
     let dn7 = crate::cuda::mix_dn7_hits();
@@ -6732,7 +6737,7 @@ pub fn mix_qchain_line() -> Option<String> {
     // (`DENNO_MIX_INJ_R4`)。0 なら従来の 1 行ずつの逐次和。
     let inj4 = mix_inj_r4_hits();
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} dn7={dn7} f6={f6} h6={h6} h2s={h2s} inj4={inj4}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} dn7={dn7} dn8={dn8} f6={f6} h6={h6} h2s={h2s} inj4={inj4}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6750,6 +6755,9 @@ pub fn mix_qchain_reset() {
     // task 422: dn6 の計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::mix_dn6_reset();
+    // task 496: dn8 の計数も同じ区切りで 0 に戻す。
+    #[cfg(feature = "cuda")]
+    crate::cuda::mix_dn8_reset();
     // task 427: full 層 / head の dn6 計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::dn6_dec_reset();
