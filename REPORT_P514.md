@@ -130,12 +130,18 @@ expert 範囲へ `posix_fadvise(DONTNEED)`)。
   リクエストがディスクから読み直している**。`[q4prof]` の `experts` も b 1,867 ms
   対 c 3,283 ms。
 - `[exp-ram-probe]` の常駐 (リクエスト終端): b は expert 49.1-51.6 GB (67-70%) /
-  file 53.6-56.1 GB、c は drop 直後に expert 30.7-37.2 GB まで下がり、次の大きな
-  リクエストで 51-53 GB まで戻る。**落ちるのは 13-19 GB で、残りは unmapped でない**
-  (§2 の表と一致)。
+  file 53.6-56.1 GB。c の drop は**prefill 終端でよく効き、decode 終端ではほぼ効かない**:
+  `[exp-pc-end]` の実測 (t514b c_1) は prefill 終端で
+  `expert_resident=50,210MiB->15,465MiB` / `file_resident=54,864MiB->20,119MiB`
+  (**−34.0 GB が落ちる**)、同じリクエストの decode 終端では
+  `32,887MiB->31,623MiB` (−1.2 GB)。pread の読み残しは prefill の staging で出るので
+  そこで落ち、decode のページは mmap でフォールト済みで落ちない (§2 の表と一致)。
+  落としたぶんは次のリクエストが読み直す (3,826 で +11 GB のディスク読み)。
 - `VERDICT b vs x0 OK decode +0.0% prefill +0.0% md5 DIFF` (t514b)、
   `VERDICT c vs x0 OK decode +19.0% prefill +10.2% md5 DIFF`。x0 は捨て COND の
   あとの温かい状態なので b と同等 = **baseline は計器を足しても変わっていない**。
+- **分岐が発火した証拠**: `[exp-pc-end]` の行は c のログにだけ出る
+  (t514b c_1 で 16 行、b_1 で 0 行)。`[exp-ram-probe]` は全 COND に出る。
 
 ### 3.2 t514c (既定モデル UD-IQ3_XXS)
 
