@@ -179,7 +179,11 @@ CARGO_TARGET_DIR=/tmp/t496 cargo test --release -p denno-engine --features cuda 
 同 --test kernel_invariants
   -> 144 passed; 0 failed
 (関門の外) CARGO_TARGET_DIR=/tmp/t496nocuda cargo build --workspace --release -> ok
-(関門の外) CARGO_TARGET_DIR=/tmp/t496 cargo test --workspace -- --test-threads=1 -> 結果は REPORT 末尾
+(関門の外) CARGO_TARGET_DIR=/tmp/t496 cargo test --workspace -- --test-threads=1
+  -> EXIT=0、63 本の test result すべて ok、FAILED 0
+     (最初の回だけ denno-server の `slot_leak::dropped_stream_receivers_do_not_leak_kv_slots`
+      が QueueFull で 1 回落ちたが、int-auto (e0746f327) の worktree でも同じ負荷で
+      再現しない**flaky**。単体 3 回 + 全体 2 回は緑)
 ```
 
 足したテスト:
