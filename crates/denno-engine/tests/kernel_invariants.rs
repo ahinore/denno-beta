@@ -10763,7 +10763,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 exp_iq_ds)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12290,7 +12290,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 exp_iq_ds)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12407,7 +12407,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 exp_iq_ds)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12602,7 +12602,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 exp_iq_ds)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12696,7 +12696,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 exp_iq_ds)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12990,7 +12990,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 exp_iq_ds)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
@@ -13862,156 +13862,4 @@ fn task468_full_mix_nowait_wiring() {
     ] {
         assert!(rep.contains(s), "gpu_report.rs に {s} が無い");
     }
-}
-
-/// task 480: expert の down GEMV + 重み付き和の融合 (`DENNO_DEC_EXPDOWN`).
-///
-/// 見るのは 4 点。(1) カーネルは 6 型ぶんあり、1 行の内積が v2 と同じ
-/// アキュムレータ (`a[j & 3] += p * xv[j]`) で、和は t 昇順の 1 本
-/// (`__fmul_rn` / `__fadd_rn` を明示 = `dno_dec_exp_sum` と同じ 2 演算)。
-/// (2) 起動形は blockDim = 32*rows / grid.x = ceil(e/rows) / 9 引数で、
-/// PTX の引数の数を先に検査する (合わない PTX を撃つと黙って壊れる)。
-/// (3) 形が合わない層は従来の 2 起動へ落ち、落ちた数を数える。
-/// (4) 発火の証拠を serve_flash が出す。
-#[test]
-fn task480_exp_down_sum_fusion_kernel_and_wiring() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let cu = std::fs::read_to_string(root.join("kernels/kernels_exp_iq_ds.cu"))
-        .expect("kernels_exp_iq_ds.cu が読めない");
-
-    // 1. カーネルの中身 (v2 と同じ式・同じ順であること)。
-    for s in [
-        "#define DS_NS 10",
-        // 6 型ぶんのエントリ。
-        "DS_DEFINE(dno_exp_gemv_ds_iq2s, DsIq2s)",
-        "DS_DEFINE(dno_exp_gemv_ds_iq3xxs, DsIq3xxs)",
-        "DS_DEFINE(dno_exp_gemv_ds_iq3s, DsIq3s)",
-        "DS_DEFINE(dno_exp_gemv_ds_iq4xs, DsIq4xs)",
-        "DS_DEFINE(dno_exp_gemv_ds_iq4nl, DsIq4nl)",
-        "DS_DEFINE(dno_exp_gemv_ds_q2_0, DsQ20)",
-        // 1 起動の引数は 9 本 (wptrs / xbase / w / obase / seg / nseg / n_in / n_out / row_bytes)。
-        "const float* __restrict__ w,",
-        // 畳めない形は撃たない (fail closed)。
-        "if (nseg != DS_NS) return;",
-        // 起動形はカーネル側も blockDim から決める。
-        "const int rows = (int)(blockDim.x >> 5);",
-        "const int row = (int)blockIdx.x * rows + (int)(threadIdx.x >> 5);",
-        // 1 行の内積: v2 と同じ 4 本のアキュムレータへ j 昇順。
-        "a[j & 3] += p * xv[j];",
-        "a[j & 1] += p * xv[j];",
-        "a[2 + (j & 1)] += p * xv[4 + j];",
-        // 和: t 昇順・1 本のアキュムレータ・積と和は別の丸め。
-        "acc = __fadd_rn(acc, __fmul_rn(w[t], one));",
-        "ds_reduce(ds_fold4(a[t][0], a[t][1], a[t][2], a[t][3]))",
-        // 縮約は v2 と同じ木。
-        "__shfl_down_sync(0xffffffffu, acc, 16)",
-        "__shfl_down_sync(0xffffffffu, acc, 1)",
-    ] {
-        assert!(cu.contains(s), "kernels_exp_iq_ds.cu に {s} が無い");
-    }
-    // v2 の down カーネルを書き換えていないこと (既定経路が変わらない)。
-    let v2 = std::fs::read_to_string(root.join("kernels/kernels_exp_iq_v2.cu"))
-        .expect("kernels_exp_iq_v2.cu が読めない");
-    assert!(
-        !v2.contains("ds_body"),
-        "v2 の .cu に融合版の本体が混ざっている"
-    );
-
-    // 2. ホスト側: ABI 検査 (9 引数) と融合の発行。
-    for s in [
-        "const EXP_DS_NARGS: usize = 9;",
-        "fn exp_ds_entry_params(ptx: &str, name: &str) -> Option<usize> {",
-        "fn exp_ds_kernels() -> Option<&'static ExpDsKernels> {",
-        "Some(EXP_DS_NARGS) => {}",
-        "→ 従来の 2 起動へ",
-        // 融合の発行 (9 引数) と起動形。
-        "let mut pwv = w_addr as *mut c_void;",
-        "let tiles = e.div_ceil(ds_rows).max(1) as u32;",
-        "((32 * ds_rows) as u32, 1, 1),",
-        // 形の判定 (nseg == EXP_DS_NS と量子ブロックの割り切り)。
-        "&& nseg == crate::model::exp_iq::EXP_DS_NS",
-        ".is_some_and(|ch| ch > 0 && ff.is_multiple_of(ch));",
-        // 落ちた数を数える + 発火を数える。
-        "crate::model::exp_iq::note_ds_fallback();",
-        "crate::model::exp_iq::note_ds_layer();",
-        // 和は融合した層では撃たない (src_ptr が融合の出力を指す)。
-        "let src_ptr = if let Some(p) = ds_src {",
-    ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
-    }
-    // off 側 (従来の 2 起動) が残っていること。
-    for s in [
-        "if ds_src.is_none() {",
-        "let (df, dblk) = match exp_w4_fn(slot_d) {",
-    ] {
-        assert!(CUDA_RS.contains(s), "従来の down 起動が消えている ({s})");
-    }
-
-    // 3. 発火の証拠を serve_flash が出す。
-    assert!(
-        SERVE_FLASH_SRC.contains("denno_engine::model::exp_iq::exp_down_line()"),
-        "serve_flash.rs が [exp-ds] を出さない"
-    );
-}
-
-/// task 480: expert GEMV の 1 行 4 warp 版 (`DENNO_DEC_EXPW4`).
-///
-/// 見るのは 3 点。(1) 1 行を 4 warp が分担し、warp 内の木は v2 と同じで、
-/// block 内は warp 番号の昇順に 1 本のアキュムレータで足す (丸め順だけが変わる)。
-/// (2) 起動形は 512 スレッド (4 行 x 4 warp) で、引数は v2 と同じ 8 本。
-/// (3) ゲートは既存 env の値でも張れ、撃った数を数えて serve_flash が出す。
-#[test]
-fn task480_exp_w4_row_parallel_kernel_and_wiring() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let cu = std::fs::read_to_string(root.join("kernels/kernels_exp_iq_ds.cu"))
-        .expect("kernels_exp_iq_ds.cu が読めない");
-    for s in [
-        "#define W4_WPR 4",
-        "W4_DEFINE(dno_exp_gemv_w4_iq2s, DsIq2s)",
-        "W4_DEFINE(dno_exp_gemv_w4_iq3xxs, DsIq3xxs)",
-        "W4_DEFINE(dno_exp_gemv_w4_iq3s, DsIq3s)",
-        "W4_DEFINE(dno_exp_gemv_w4_iq4xs, DsIq4xs)",
-        "W4_DEFINE(dno_exp_gemv_w4_iq4nl, DsIq4nl)",
-        "W4_DEFINE(dno_exp_gemv_w4_q2_0, DsQ20)",
-        // 行は block 内の warp から決める (1 行 = 4 warp)。
-        "const int sw = warp % W4_WPR;",
-        "const int row = (int)blockIdx.x * rows + warp / W4_WPR;",
-        // 行の内積は warp ごとに v2 と同じ木で縮約し、block 内は昇順に足す。
-        "const float part = ds_reduce(ds_fold4(a[0], a[1], a[2], a[3]));",
-        "s = __fadd_rn(s, sp[warp + k]);",
-        // 起動形 (引数は v2 と同じ 8 本)。
-        "int n_in, int n_out, int row_bytes)                      \\",
-    ] {
-        assert!(cu.contains(s), "kernels_exp_iq_ds.cu に {s} が無い");
-    }
-
-    // ホスト側: 8 引数の ABI 検査 / ゲート / 起動形 / 3 箇所 (gate+up 融合・
-    // 非融合の gate/up・down) の差し替え。
-    let eq = std::fs::read_to_string(root.join("src/model/exp_iq.rs"))
-        .expect("exp_iq.rs が読めない");
-    for s in [
-        "pub fn exp_w4_from_value(v: Option<&str>) -> bool {",
-        "pub fn exp_w4_pick(w4: Option<&str>, gu: Option<&str>) -> bool {",
-        "pub const EXP_W4_THREADS: usize = 32 * EXP_W4_WPR * 4;",
-    ] {
-        assert!(eq.contains(s), "exp_iq.rs に {s} が無い");
-    }
-    for s in [
-        "fn exp_w4_fn(slot: usize) -> Option<CUfunction> {",
-        "if exp_ds_entry_params(&text, wname) != Some(8) {",
-        "(f, (crate::model::exp_iq::EXP_W4_THREADS as u32, 1, 1))",
-        "(w, (crate::model::exp_iq::EXP_W4_THREADS as u32, 1, 1))",
-        "crate::model::exp_iq::note_w4_launch();",
-    ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
-    }
-    assert_eq!(
-        CUDA_RS.matches("crate::model::exp_iq::note_w4_launch();").count(),
-        3,
-        "w4 を撃つ箇所が 3 つ (gate+up 融合 / gate・up / down) でない"
-    );
-    assert!(
-        SERVE_FLASH_SRC.contains("denno_engine::model::exp_iq::exp_w4_line()"),
-        "serve_flash.rs が [exp-w4] を出さない"
-    );
 }
