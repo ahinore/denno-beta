@@ -3158,7 +3158,7 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     );
     // task 498: seg 層の和 (10 KB) の D2H を pinned バウンス経由にするゲート
     // (`DENNO_SEG_SUM_PIN`、既定 off)。COND の env が届いたかを確かめる。
-    eprintln!("{}", denno_engine::cuda::seg_sum_pin_boot_line());
+    eprintln!("{}", denno_engine::model::seg_prof::seg_sum_pin_boot_line());
     // task 213: 既定 on のゲートが必要とする PTX を起動時に監査する。
     // PTX が無いとその機能は**静かに**従来経路へ落ちる (REPORT_P204 の fold/upw)。
     // 起動は止めず、summary 1 行 + 欠落ごとに 1 行を出す。
@@ -3459,7 +3459,7 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
                 // task 498: seg 和の D2H の pinned バウンスが発火した回数 (ゲート on の
                 // ときだけ)。0 なら分岐が通っていないので採否に使わない。
-                if let Some(line) = denno_engine::cuda::seg_sum_pin_report() {
+                if let Some(line) = denno_engine::model::seg_prof::seg_sum_pin_report() {
                     eprintln!("{line}");
                 }
                 // task 149: リクエスト境界。prefill の一時領域 (arena) を返し、

@@ -272,12 +272,117 @@ pub fn flush() -> Option<String> {
     Some(format_line(&s, tok))
 }
 
+// ---------------------------------------------------------------------------
+// task 498: seg 層の和 (e*4 B) の D2H を小さな pinned バウンス経由にする
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t498b の `[seg-prof]`、UD-Q4_K_XL、decode 定常):
+// `d2h=13.3-14.8 us/層` が 1 層 1 本 (= e*4 = 10 KB) の **pageable な同期 D2H** で、
+// 48 層/token で 0.64-0.71 ms/token = decode 13.4 ms の 5%。pageable の D2H は
+// driver が内部ステージングを取ってから写すため 0.7 GB/s しか出ない。
+// 転送の実体は cuda 側 (`cuda::seg_pin_copy_d2h`) に置き、**ゲートとカウンタはここ**
+// に置く (CUDA 無しのビルドでも起動ログとリクエスト終端の行が出せる)。
+
+/// ゲート env。**既定 off** (明示的な真値だけ on)。
+pub const SEG_PIN_ENV: &str = "DENNO_SEG_SUM_PIN";
+
+/// [`SEG_PIN_ENV`] の解釈 (純関数)。
+pub fn seg_sum_pin_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// seg 和の D2H を pinned バウンス経由にするか (プロセスで 1 回だけ env を読む)。
+pub fn seg_sum_pin_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| seg_sum_pin_from_value(std::env::var(SEG_PIN_ENV).ok().as_deref()))
+}
+
+/// 発火した回数 (pinned 経由で写せた) と、従来の pageable へ落ちた回数。
+static SEG_PIN_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_PIN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 発火を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_pin_call() {
+    SEG_PIN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 従来経路へ落ちたことを 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_pin_fallback() {
+    SEG_PIN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// (発火, 落ちた) の回数。
+pub fn seg_pin_counts() -> (u64, u64) {
+    (
+        SEG_PIN_CALLS.load(Ordering::Relaxed),
+        SEG_PIN_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// テスト用: 積算を 0 に戻す。
+#[cfg(test)]
+pub fn seg_pin_reset() {
+    SEG_PIN_CALLS.store(0, Ordering::Relaxed);
+    SEG_PIN_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+/// 起動ログ用: ゲートの状態 (COND の env が届いたかを確かめる)。
+pub fn seg_sum_pin_boot_line() -> String {
+    format!(
+        "[flash] seg sum pin: {} ({SEG_PIN_ENV})",
+        if seg_sum_pin_on() { "on" } else { "off" }
+    )
+}
+
+/// リクエスト終端の診断行 (ゲート on のときだけ)。`calls` が 0 なら**分岐が
+/// 発火していない**ので、そのときは採否の判断をしない (fail closed の証拠)。
+pub fn seg_sum_pin_report() -> Option<String> {
+    if !seg_sum_pin_on() {
+        return None;
+    }
+    let (calls, fallbacks) = seg_pin_counts();
+    Some(format!(
+        "[seg-pin] calls={calls} fallbacks={fallbacks} ({SEG_PIN_ENV})"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// グローバルの積算を使うのでテストは直列化する。
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// task 498: `DENNO_SEG_SUM_PIN` の真理値表。**既定は off**。
+    #[test]
+    fn t498_seg_sum_pin_truth_table() {
+        assert!(!seg_sum_pin_from_value(None), "未設定は既定 off");
+        assert!(!seg_sum_pin_from_value(Some("")));
+        assert!(!seg_sum_pin_from_value(Some("0")));
+        assert!(!seg_sum_pin_from_value(Some("off")));
+        assert!(!seg_sum_pin_from_value(Some(" no ")));
+        assert!(!seg_sum_pin_from_value(Some("FALSE")));
+        assert!(seg_sum_pin_from_value(Some("1")));
+        assert!(seg_sum_pin_from_value(Some("on")));
+        assert!(seg_sum_pin_from_value(Some(" true ")));
+        assert!(seg_sum_pin_from_value(Some("YES")));
+    }
+
+    /// task 498: 発火 / 落ちた回数が別々に積まれる。
+    #[test]
+    fn t498_seg_pin_counts_accumulate() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seg_pin_reset();
+        note_seg_pin_call();
+        note_seg_pin_call();
+        note_seg_pin_fallback();
+        assert_eq!(seg_pin_counts(), (2, 1));
+        seg_pin_reset();
+        assert_eq!(seg_pin_counts(), (0, 0));
+    }
 
     /// off のときは何も積まない (既定の経路にカウンタが乗らない)。
     #[test]
