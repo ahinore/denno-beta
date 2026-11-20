@@ -3183,6 +3183,77 @@ pub fn early_route_budget(mb: usize, kb: usize, rest_tok: usize) -> usize {
     want.clamp(EARLY_ROUTE_MIN_BYTES, EARLY_ROUTE_MAX_BYTES)
 }
 
+// ---- task 490: 窓の広い層 (14k) の予算を別に持つ --------------------------
+//
+// task 474 の予算は「残りトークン × 24 KiB」1 本で、窓の判定 (4 チャンク以上
+// = `wide`、1〜3 チャンク = `narrow`) が違っても同じ値を使っていた。
+// 14k の窓は**残り 6 チャンクの attention** (1 層 69 ms) で、lab t490a の
+// 実測は 1 層 288 MB の予算に対し、置き場へ入ったのは 259 MB (87%) だった
+// (`er_MB=14166.6` 対 `ra_MB=12378.4`)。つまり予算の側が先に尽きていて、
+// 窓はまだ余っている。3,826 (`narrow`) は窓が 8.4 ms しかなく、予算を増やすと
+// 窓を越えて MoE の写しと帯域を奪い合う (task 486 の 24 本がその実例) ので、
+// **広い窓のときだけ**別の値を使えるようにする。
+
+/// `DENNO_PF_ER_KB_WIDE`: 窓の広い層 (`wide` = 残り 4 チャンク以上) の
+/// 先読み予算 (残りトークン 1 個あたり KiB)。**0 / 未設定 = 従来と同じ**
+/// ([`EARLY_ROUTE_KB_ENV`] の値 = 24)。
+///
+/// lab t490b (UD-Q4_K_XL、depth8k、14k cold、1 ラウンド) は 24 / 32 / 40 を
+/// 同じ run で並べた:
+///
+/// | COND | `er_MB` | 置き場へ入った `ra_MB` | experts 段 (ms) | 壁 (s) |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | b (24) | 14,166.6 | 12,700.8 | 16,529.6 | 20.00 |
+/// | **k32** | **18,880.6** | **14,026.8** | **15,887.7** | **19.33** |
+/// | k40 | 23,590.6 | 14,099.0 | 16,035.1 | 19.51 |
+/// | b2 (24) | 14,166.6 | 13,004.9 | 16,111.4 | 19.46 |
+///
+/// 予算を増やすと**計画**は増えるが、置き場へ入るのは窓 (残り 6 チャンクの
+/// attention、1 層 69 ms) が許す 14.0 GB で頭打ちになる。experts 段は
+/// baseline 2 本の中央値 16,320.5 に対し k32 が -2.6%、壁は -2.0%。
+/// 40 KiB は 32 より計画が多いだけで置き場へ入る量は同じなので、**32 を既定**
+/// にする (`DENNO_PF_ER_KB_WIDE=0` で task 474/486 の 24 に戻る)。
+/// 既定モデル (t490c) は 14k の壁 5.10 対 baseline 5.21/5.01 = ±0.2%、
+/// md5 は全 COND SAME で、効かない側に費用が出ないことを確認した。
+pub const ER_KB_WIDE_ENV: &str = "DENNO_PF_ER_KB_WIDE";
+
+/// [`ER_KB_WIDE_ENV`] の既定 (0 = 従来どおり [`DEFAULT_EARLY_ROUTE_KB`])。
+/// lab t490b の A/B で 32 が勝ったので 32。0 で切り戻せる。
+pub const DEFAULT_ER_KB_WIDE: usize = 32;
+
+/// 予算の KiB/token の上限 (置き場 512 MiB ÷ 12,000 トークン ≈ 43 KiB。
+/// 明示指定の暴走だけを止める)。
+pub const ER_KB_WIDE_MAX: usize = 64;
+
+/// [`ER_KB_WIDE_ENV`] の解釈 (純関数)。数値だけ、0 は「未指定」。
+pub fn er_kb_wide_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .map(|n| n.min(ER_KB_WIDE_MAX))
+            .unwrap_or(DEFAULT_ER_KB_WIDE),
+        None => DEFAULT_ER_KB_WIDE,
+    }
+}
+
+/// 窓の広い層の予算の KiB/token (プロセスで 1 回だけ env を読む)。0 = 未指定。
+pub fn er_kb_wide() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| er_kb_wide_from_value(std::env::var(ER_KB_WIDE_ENV).ok().as_deref()))
+}
+
+/// 層に使う予算の KiB/token を選ぶ (純関数)。
+///
+/// `wide` のときだけ [`er_kb_wide`] を見る。0 なら従来の `base`。
+/// `narrow` (1〜3 チャンク) は常に `base` (窓が短いので増やすと損)。
+pub fn er_route_kb(wide: bool, base: usize, wide_kb: usize) -> usize {
+    if wide && wide_kb > 0 {
+        wide_kb
+    } else {
+        base
+    }
+}
+
 /// 先読みの窓として要る「残りチャンク数」の下限。
 ///
 /// lab t474a: 3,826 (残り 1 チャンク) では 1 層 42 MB の先読みが窓 (9.5 ms) に

@@ -14216,3 +14216,72 @@ fn task481_up_split_dma_wiring() {
         assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
     }
 }
+
+/// task 490: 窓の広い層 (14k) の先読み予算を別に持つ口 (`DENNO_PF_ER_KB_WIDE`)。
+///
+/// 1. 未設定は既定 32 KiB/token (lab t490b の A/B で勝った値)、`0` は
+///    従来と同じ値へ戻す口 ([`er_route_kb`] が `base` を使う)。
+/// 2. 窓の狭い層 (`narrow` = 1〜3 チャンク) は、広い窓の値が入っていても
+///    従来の値を使う (3,826 の窓は 8.4 ms しかなく、増やすと MoE の写しと
+///    帯域を奪い合う。task 486 の 24 本がその実例)。
+/// 3. 予算 = 残りトークン × KiB で、14k (12,000 残) は 24 KiB = 288,000 KiB、
+///    32 KiB = 384,000 KiB (= 393,216,000 B、置き場 512 MiB に収まる)。
+/// 4. 配線: `pf_early_route_prefetch` が `wide` を見て `er_route_kb` を通し、
+///    その結果を `early_route_budget` へ渡している。
+#[test]
+fn t490_wide_window_budget_is_wired() {
+    for k in [
+        "pub const ER_KB_WIDE_ENV: &str = \"DENNO_PF_ER_KB_WIDE\";",
+        "pub const DEFAULT_ER_KB_WIDE: usize = 32;",
+        "pub const ER_KB_WIDE_MAX: usize = 64;",
+        "pub fn er_kb_wide_from_value(",
+        "pub fn er_kb_wide(",
+        "pub fn er_route_kb(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // env を汚したまま回さない (既定 = 未指定 = 32)。
+    assert!(
+        std::env::var("DENNO_PF_ER_KB_WIDE").is_err(),
+        "このテストは env 未設定で回すこと"
+    );
+    use denno_engine::model::exp_pf::{
+        early_route_budget, er_kb_wide, er_kb_wide_from_value, er_route_kb, DEFAULT_ER_KB_WIDE,
+    };
+    assert_eq!(er_kb_wide(), DEFAULT_ER_KB_WIDE, "未設定が既定になっていない");
+    assert_eq!(er_kb_wide(), 32);
+    assert_eq!(er_kb_wide_from_value(None), 32);
+    assert_eq!(er_kb_wide_from_value(Some("")), 32);
+    // 0 は「未指定 = 従来へ戻す」口 (ここが 32 に化けると切り戻せない)。
+    assert_eq!(er_kb_wide_from_value(Some("0")), 0);
+    assert_eq!(er_kb_wide_from_value(Some(" 40 ")), 40);
+    assert_eq!(er_kb_wide_from_value(Some("x")), 32);
+    assert_eq!(er_kb_wide_from_value(Some("9999")), 64);
+
+    // 予算の選択: 広い窓だけ別値、狭い窓は常に base、0 は base。
+    assert_eq!(er_route_kb(true, 24, 0), 24);
+    assert_eq!(er_route_kb(true, 24, 32), 32);
+    assert_eq!(er_route_kb(false, 24, 32), 24);
+    assert_eq!(er_route_kb(false, 24, 0), 24);
+
+    // 14k の予算 (残りトークン 12,000)。32 KiB = 384,000 KiB = 393,216,000 B
+    // (置き場 512 MiB に収まる)。24 KiB は従来の値。
+    assert_eq!(early_route_budget(0, 32, 12_000), 393_216_000);
+    assert_eq!(early_route_budget(0, 24, 12_000), 294_912_000);
+    // 明示 MB が最優先 (従来の意味を変えない)。
+    assert_eq!(early_route_budget(300, 40, 12_000), 300 << 20);
+    // 3,826 の狭い窓 (残り 1,913) は 40 KiB でも予算の側では 78 MB。
+    assert_eq!(early_route_budget(0, 40, 1_913), 78_356_480);
+    assert_eq!(early_route_budget(0, 24, 1_913), 47_013_888);
+
+    // 配線: `wide` を見て選び、その値を予算へ渡す。
+    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    let pick = f.find("exp_pf::er_route_kb(").expect("予算の選択が無い");
+    assert!(f[pick..].contains("wide,"), "er_route_kb に wide を渡していない");
+    let bud = f.find("exp_pf::early_route_budget(").expect("予算の計算が無い");
+    assert!(pick < bud, "予算の選択が計算より後ろにある");
+    assert!(
+        f[bud..].contains("kb,"),
+        "選んだ KiB を early_route_budget に渡していない"
+    );
+}

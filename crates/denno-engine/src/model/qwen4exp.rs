@@ -19378,9 +19378,17 @@ fn pf_early_route_prefetch(
         Ok(v) => v.iter().map(|g| g.is_some()).collect(),
         Err(_) => vec![false; keys.len()],
     };
+    // task 490: 窓の広い層は別の予算を使える (`DENNO_PF_ER_KB_WIDE`)。
+    // 未設定 (0) なら従来どおり `DENNO_PF_EARLY_ROUTE_KB`。狭い窓 (`narrow`)
+    // は常に従来の値 (3,826 の窓は 8.4 ms で、増やすと写しと帯域を奪い合う)。
+    let kb = crate::model::exp_pf::er_route_kb(
+        wide,
+        crate::model::exp_pf::early_route_kb(),
+        crate::model::exp_pf::er_kb_wide(),
+    );
     let budget = crate::model::exp_pf::early_route_budget(
         crate::model::exp_pf::early_route_mb(),
-        crate::model::exp_pf::early_route_kb(),
+        kb,
         nt_all - nt0,
     );
     // expert 昇順 = MoE が読む順。上限まで集めたら止める (ディスクの遊びは
