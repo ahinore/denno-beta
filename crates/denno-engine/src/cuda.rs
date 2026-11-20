@@ -8608,6 +8608,98 @@ fn seg_pin_copy_d2h(src: CUdeviceptr, dst: &mut [u8]) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// task 502: seg 和の D2H を非同期にしてミスの CPU 計算の裏で流す
+// ---------------------------------------------------------------------------
+//
+// ゲートとカウンタは `crate::model::seg_prof` 側 (`DENNO_SEG_SUM_ASYNC`、既定 off)。
+// 動機は `seg_prof::SEG_ASYNC_ENV` のコメント。ここは転送の実体だけを持つ。
+//
+// - バンスは**スレッドごと**に 1 本 (`cuMemHostAlloc` はデバイスを止めるので初回だけ)。
+//   プロセス共有にするとミス計算の間ずっとロックを握ることになるため。
+// - コピーは null ストリーム (和カーネルの後ろ) に出し、**コピーの後にイベントを打って**
+//   その完了だけを待つ。`cuMemcpyDtoH` (同期) はこの文脈の仕事を待つので、
+//   ミス計算の後ろに直列で挟まっていた。
+
+/// 非同期コピーの完了を押さえるイベントのスロット (`seg_ev` の 0..=6 と重ねない)。
+const SEG_ASYNC_EV: usize = 7;
+
+thread_local! {
+    /// 非同期 D2H の行き先 (このスレッド専用)。
+    static SEG_ASYNC_PIN: std::cell::RefCell<Option<PinMem>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 和の D2H を非同期で pinned へ出す。`true` = 出した (完了待ちは
+/// [`seg_async_d2h_collect`])。`false` = 従来の同期経路へ丸ごと落ちる。
+fn seg_async_d2h_issue(src: CUdeviceptr, bytes: usize) -> bool {
+    use crate::model::seg_prof as sp;
+    if bytes == 0 || bytes > SEG_PIN_BYTES {
+        sp::note_seg_async_fallback();
+        return false;
+    }
+    let Ok(l) = lib() else {
+        sp::note_seg_async_fallback();
+        return false;
+    };
+    let ptr = SEG_ASYNC_PIN.with(|c| -> Option<*mut c_void> {
+        let mut g = c.borrow_mut();
+        if g.is_none() {
+            match PinMem::alloc(SEG_PIN_BYTES) {
+                Ok(p) => *g = Some(p),
+                Err(_) => return None,
+            }
+        }
+        g.as_ref().map(|p| p.ptr)
+    });
+    let Some(ptr) = ptr else {
+        sp::note_seg_async_fallback();
+        return false;
+    };
+    let r = unsafe {
+        check(
+            (l.memcpy_dtoh_async)(ptr, src, bytes, std::ptr::null_mut()),
+            "cuMemcpyDtoHAsync (seg sum)",
+        )
+    };
+    if r.is_err() {
+        sp::note_seg_async_fallback();
+        return false;
+    }
+    // ここまで来たらコピーは stream に積まれている。完了をイベントで押さえる
+    // (イベントが張れない環境では従来経路へ。余分なコピーは無害)。
+    if !seg_ev::record_raw(SEG_ASYNC_EV) {
+        sp::note_seg_async_fallback();
+        return false;
+    }
+    sp::note_seg_async_call();
+    true
+}
+
+/// 非同期コピーの完了を待って `dst` へ写す。`false` = 取れなかった。
+fn seg_async_d2h_collect(dst: &mut [u8]) -> bool {
+    let bytes = dst.len();
+    if bytes == 0 || bytes > SEG_PIN_BYTES {
+        return false;
+    }
+    if seg_ev::wait(SEG_ASYNC_EV).is_err() {
+        crate::model::seg_prof::note_seg_async_fallback();
+        return false;
+    }
+    SEG_ASYNC_PIN.with(|c| {
+        let g = c.borrow();
+        match g.as_ref() {
+            Some(p) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(p.ptr as *const u8, dst.as_mut_ptr(), bytes)
+                };
+                true
+            }
+            None => false,
+        }
+    })
+}
+
 /// K 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層を **5 起動 / 1 待ち**で回す (task 278)。
 ///
 /// - `pg` / `pu` / `pd`: segment ごとの重み先頭 (デバイスアドレス)
@@ -8917,6 +9009,15 @@ where
         // 和の後 (ここを待てば 5 起動ぶんが終わる)
         let timed = seg_ev::record(5);
 
+        // task 502: `DENNO_SEG_SUM_ASYNC` のときは、和の直後に D2H を**非同期**で
+        // pinned バウンスへ出す。完了待ちは下の 8. で 1 回だけ行うので、コピーは
+        // 6. のミス CPU 計算 (1 層 ~100 us) の裏に完全に隠れる。同期の
+        // `cuMemcpyDtoH` はこの文脈の仕事を待つため 12-17 us/層 かかり、
+        // task 498 の pinned 同期版でも縮まなかった (t498c)。
+        let async_ok = crate::model::seg_prof::seg_sum_async_on()
+            && e * 4 <= SEG_PIN_BYTES
+            && seg_async_d2h_issue(outb.ptr, e * 4);
+
         // 6. GPU を待つ間にミスの CPU 計算を走らせる (重ね打ち)。
         let _t_miss = crate::model::seg_prof::stamp();
         let miss_r = cpu_miss();
@@ -8951,7 +9052,15 @@ where
         // 丸ごと落ちる (値は同じバイト列)。
         let _t_d2h = crate::model::seg_prof::stamp();
         let mut d2h_done = false;
-        if crate::model::seg_prof::seg_sum_pin_on() && e * 4 <= SEG_PIN_BYTES {
+        // task 502: 非同期で出したコピーの完了を待って pinned から写す
+        // (コピーはミス計算の裏で終わっている)。失敗したら下の同期経路へ。
+        if async_ok {
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(out[..e].as_mut_ptr() as *mut u8, e * 4)
+            };
+            d2h_done = seg_async_d2h_collect(dst);
+        }
+        if !d2h_done && crate::model::seg_prof::seg_sum_pin_on() && e * 4 <= SEG_PIN_BYTES {
             let dst = unsafe {
                 std::slice::from_raw_parts_mut(out[..e].as_mut_ptr() as *mut u8, e * 4)
             };
@@ -65974,6 +66083,39 @@ mod task498_tests {
         } else {
             assert!(after > before, "落ちた回数が増える");
         }
+    }
+}
+
+#[cfg(test)]
+mod task502_tests {
+    use super::*;
+
+    /// バウンスに収まらない長さは CUDA を触る前に「やらない」を返す。
+    #[test]
+    fn seg_async_issue_rejects_out_of_range() {
+        assert!(!seg_async_d2h_issue(0, 0), "0 バイトは false");
+        assert!(!seg_async_d2h_issue(0, SEG_PIN_BYTES + 1), "上限超えは false");
+    }
+
+    /// collect も範囲外は false (呼び出し側は同期経路へ落ちる)。
+    #[test]
+    fn seg_async_collect_rejects_out_of_range() {
+        let mut none: [u8; 0] = [];
+        assert!(!seg_async_d2h_collect(&mut none), "0 バイトは false");
+        let mut big = vec![0u8; SEG_PIN_BYTES + 1];
+        assert!(!seg_async_d2h_collect(&mut big), "上限超えは false");
+    }
+
+    /// GPU の無い環境では非同期コピーを出せず **false (= 従来経路) に落ちる**。
+    /// 落ちた回数が増えるので、リクエスト終端の `[seg-async] fallbacks=` で判別できる。
+    /// 共有カウンタは他テストと競合し得るので「増えた」だけを見る。
+    #[test]
+    fn seg_async_issue_falls_back_without_cuda() {
+        let (_, before) = crate::model::seg_prof::seg_async_counts();
+        let ok = seg_async_d2h_issue(0, 64);
+        let (_, after) = crate::model::seg_prof::seg_async_counts();
+        assert!(!ok, "コンテナ (GPU 無し) では出せない");
+        assert!(after > before, "落ちた回数が増える");
     }
 }
 
