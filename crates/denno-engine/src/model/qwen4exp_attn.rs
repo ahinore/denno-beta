@@ -619,7 +619,9 @@ const KV_PUSH_PAR_MIN: usize = 1 << 18;
 /// task 505: ゼロ埋めせずに `dst_off` から `n * row` 要素を積む。
 ///
 /// `kv.len()` は常に `row` の倍数 (積むのは full 層の行だけ)。既にある範囲は
-/// その場で書き、足りない末尾だけ `extend_from_slice` で伸ばす。
+/// その場で書き、足りない末尾は `reserve` してから空き領域へ直接書く
+/// (新しいページのフォルトを `par` 本に分ける。`extend_from_slice` は 1 本なので
+/// 14k の初回 = 689 MB のフォルトが直列になっていた)。
 fn kv_push_noresize(dst: &mut Vec<f32>, src: &[f32], dst_off: usize, row: usize, n: usize, par: usize) {
     let need = dst_off + n * row;
     let have = dst.len().min(need);
@@ -627,8 +629,34 @@ fn kv_push_noresize(dst: &mut Vec<f32>, src: &[f32], dst_off: usize, row: usize,
     if m > 0 {
         kv_push_rows(&mut dst[dst_off..have], &src[..m], par);
     }
-    if dst.len() < need {
-        dst.extend_from_slice(&src[m..n * row]);
+    let add = need.saturating_sub(dst.len());
+    if add == 0 {
+        return;
+    }
+    let s = &src[m..n * row];
+    debug_assert_eq!(s.len(), add);
+    dst.reserve(add);
+    // SAFETY: `reserve(add)` で `len + add` 以上ある。`add` 要素を全部書いてから
+    // `set_len` する。`f32` は Copy で、書いた範囲だけを長さに含める。
+    unsafe {
+        let spare = dst.spare_capacity_mut();
+        if par > 1 && add >= KV_PUSH_PAR_MIN {
+            use rayon::prelude::*;
+            let per = add.div_ceil(par).max(1);
+            spare[..add]
+                .par_chunks_mut(per)
+                .enumerate()
+                .for_each(|(i, d)| {
+                    std::ptr::copy_nonoverlapping(
+                        s.as_ptr().add(i * per),
+                        d.as_mut_ptr() as *mut f32,
+                        d.len(),
+                    );
+                });
+        } else {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), spare.as_mut_ptr() as *mut f32, add);
+        }
+        dst.set_len(need);
     }
 }
 
@@ -787,6 +815,25 @@ mod attn_cache_tests {
         let over = vec![0.0f32; 64 * row];
         assert!(nr.push_many_opts(0, &over, &over, 64, true, 1).is_err());
         assert!(npr.push_many_opts(0, &k[..row - 1], &v[..row], 1, true, 4).is_err());
+    }
+
+    /// task 505: 伸ばす経路も `par` で分けたとき (1 MB 以上の写し) に同じ結果に
+    /// なること。分割の境目が要素数だけで決まることを固定する。
+    #[test]
+    fn task505_push_many_parallel_growth_matches_serial() {
+        let row = 2048; // n_head_kv = 8, head_dim = 256
+        let mut a = AttnCache::new(1, 8, 256, 256).expect("cache");
+        let mut b = AttnCache::new(1, 8, 256, 256).expect("cache");
+        for (i, n) in [128usize, 128].into_iter().enumerate() {
+            assert!(n * row >= super::KV_PUSH_PAR_MIN, "並列の枝に入らない");
+            let k: Vec<f32> = (0..n * row).map(|j| (j as f32) * 1e-3 + i as f32).collect();
+            let v: Vec<f32> = (0..n * row).map(|j| 7.0 - (j as f32) * 1e-3).collect();
+            a.push_many_opts(0, &k, &v, n, true, 1).expect("serial");
+            b.push_many_opts(0, &k, &v, n, true, 4).expect("par");
+        }
+        assert_eq!(a.len(0).unwrap(), b.len(0).unwrap(), "長さが違う");
+        assert_eq!(a.k(0).unwrap(), b.k(0).unwrap(), "k が違う");
+        assert_eq!(a.v(0).unwrap(), b.v(0).unwrap(), "v が違う");
     }
 
     /// task 505: 2 つのゲートの真理値表 (明示的な真値だけ on、未設定は既定 off)。
