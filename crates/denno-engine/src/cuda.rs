@@ -8274,6 +8274,9 @@ struct SegKKernels {
     mix_r8: Option<CUfunction>,
     /// task 282: mix の down 用 (1 行 = 1 ブロック 256 スレッド)。Q8_0 専用。
     mix_rowblk: Option<CUfunction>,
+    /// task 412 / 526: gate + up + silu を 1 起動で回す版 ([`SEG_K_GU_NAMES`] の順)。
+    /// 古い PTX には無いので `None` (そのときは従来の 3 起動へ落ちる)。
+    gu: [Option<CUfunction>; 4],
 }
 
 // 生ハンドル (context / module / function)。CudaCtx と同じ規約。
@@ -8289,6 +8292,45 @@ const SEG_K_NAMES: [&[u8]; 4] = [
     b"dno_seg_gemv_k_q4k\0",
     b"dno_seg_gemv_k_q5k\0",
 ];
+
+/// task 412 / 526: gate + up + silu を 1 起動で回す版の名前 ([`moe_batch_slot`] の順)。
+const SEG_K_GU_NAMES: [&[u8]; 4] = [
+    b"dno_seg_gemv_gu_q8_0\0",
+    b"dno_seg_gemv_gu_q5_1\0",
+    b"dno_seg_gemv_gu_q4k\0",
+    b"dno_seg_gemv_gu_q5k\0",
+];
+
+/// task 412 / 526: `DENNO_SEG_GU_FUSE` — seg 経路 (K 型モデルの decode) の
+/// gate / up / silu を **1 起動**に畳む (`kernels_seg_k.ptx` の
+/// `dno_seg_gemv_gu_*`)。**既定 off** (lab で採否を決める)。
+///
+/// gate と up は入力 `x` が同じで行数も同じなので、(1) 起動が 3 -> 1、
+/// (2) 1 ブロックあたりの `x` の読みが 1 回、(3) `g` / `u` の作業域
+/// (`nseg x ff`) を書かない。**行ごとの計算順序は `dno_seg_gemv_k_*` と同じ**
+/// (ブロック昇順のアキュムレータ 1 本 + 同じ warp 木) なので、1 行の値は
+/// 従来とビット一致する。
+pub const SEG_GU_FUSE_ENV: &str = "DENNO_SEG_GU_FUSE";
+
+/// [`SEG_GU_FUSE_ENV`] の解釈 (純関数)。`1` / `on` / `true` / `yes` だけが真。
+pub fn seg_gu_fuse_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`SEG_GU_FUSE_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+pub fn seg_gu_fuse_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| seg_gu_fuse_from_value(std::env::var(SEG_GU_FUSE_ENV).ok().as_deref()))
+}
+
+/// task 412 / 526: 融合カーネルの起動形。`kernels/kernels_seg_k.cu` の
+/// `SK_GU_ROWS` と一致させること (テスト `seg_fuse_shape_matches_cu` が突き合わせる)。
+pub(crate) const SEG_WARPS: u32 = 4;
+/// 1 warp が受け持つ gate/up の行数 (`SK_GU_ROWS`)。
+pub(crate) const SEG_GU_ROWS: u32 = 2;
 
 /// task 278: 高速版 GEMV (`kernels_seg_k.ptx`) を使うか。
 ///
@@ -8366,11 +8408,17 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
             // task 282: mix 用の 2 本は任意 (無ければ旧 GEMV へ落ちる)。
             let mix_r8 = get(b"dno_mix_gemv_q8_0_r8\0");
             let mix_rowblk = get(b"dno_mix_gemv_q8_0_rowblk\0");
+            // task 412 / 526: 融合 (gu) の 4 型は任意 (古い PTX でも動く)。
+            let mut gu = [None; 4];
+            for (i, name) in SEG_K_GU_NAMES.iter().enumerate() {
+                gu[i] = get(name);
+            }
             Some(SegKKernels {
                 module,
                 fns,
                 mix_r8,
                 mix_rowblk,
+                gu,
             })
         })
         .as_ref()
@@ -8820,6 +8868,21 @@ where
     };
     ctx.make_current()?;
 
+    // task 412 / 526: 融合版 (gate+up+silu 1 起動) の選択。
+    // `kernels_seg_k.ptx` の新しいカーネルが要る (古い PTX では None)。
+    // 高速版 (`seg_k`) の経路でだけ使う: 遅い方の PTX には無い。
+    let fuse_gu: Option<CUfunction> = match fast {
+        // gate と up は型も行長も同じときだけ畳める (x を共有する前提)。
+        Some(k) if seg_gu_fuse_enabled() && ty_g == ty_u && rb_g == rb_u => k.gu[slot_g],
+        _ => None,
+    };
+    // 融合カーネルの起動形 (blockDim = 128 = 4 warp)。
+    let gu_grid = (
+        (ff as u32).div_ceil(SEG_WARPS * SEG_GU_ROWS),
+        nseg as u32,
+        1u32,
+    );
+
     let lay = eb::seg_stage_layout(nseg, n_in);
     let ng = nseg * ff;
     let nh = nseg * e;
@@ -8864,6 +8927,39 @@ where
         // 2. 5 起動を同じストリームに積む (待たない)。
         let base = stage.ptr;
         let _ = seg_ev::record(0); // gate の前
+        // task 412 / 526: 融合版があれば gate / up / silu を 1 起動で済ませる。
+        if let Some(fg) = fuse_gu {
+            let mut pgw = base + lay.pg as u64;
+            let mut puw = base + lay.pu as u64;
+            let mut pxf = base + lay.x as u64;
+            let mut paf = act.ptr;
+            let mut psf = base + lay.sgu as u64;
+            let mut nsf = nseg as c_int;
+            let mut nif = n_in as c_int;
+            let mut nof = ff as c_int;
+            let mut rbf = rb_g as c_int;
+            let _t_launch = crate::model::seg_prof::stamp();
+            unsafe {
+                let mut args = [
+                    &mut pgw as *mut _ as *mut c_void,
+                    &mut puw as *mut _ as *mut c_void,
+                    &mut pxf as *mut _ as *mut c_void,
+                    &mut paf as *mut _ as *mut c_void,
+                    &mut psf as *mut _ as *mut c_void,
+                    &mut nsf as *mut _ as *mut c_void,
+                    &mut nif as *mut _ as *mut c_void,
+                    &mut nof as *mut _ as *mut c_void,
+                    &mut rbf as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(fg, gu_grid, block, 0, &mut args)?;
+            }
+            crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+            // prof: up / silu の区間は 0 になる (行の形は従来と同じ)。
+            let _ = seg_ev::record(1);
+            let _ = seg_ev::record(2);
+            let _ = seg_ev::record(3);
+        }
+        if fuse_gu.is_none() {
         let mut pw = base + lay.pg as u64;
         let mut px = base + lay.x as u64;
         let mut po = g.ptr;
@@ -8945,6 +9041,7 @@ where
         }
         crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
         let _ = seg_ev::record(3); // silu の後
+        } // fuse_gu.is_none()
         // 4. down
         let mut pw = base + lay.pd as u64;
         let mut px = act.ptr;
@@ -48464,6 +48561,64 @@ mod tests {
         assert!(!seg_k_from_value(Some("off")));
         assert!(!seg_k_from_value(Some("false")));
         assert!(!seg_k_from_value(Some("NO")));
+    }
+
+    /// task 526: seg の gate+up+silu 融合 (`DENNO_SEG_GU_FUSE`) のゲートは
+    /// **既定 off**。明示的な真値だけが on (lab の A/B で `=1` を立てる)。
+    #[test]
+    fn seg_fuse_gate_default_off() {
+        assert!(!seg_gu_fuse_from_value(None), "未設定は off (既定)");
+        assert!(!seg_gu_fuse_from_value(Some("")));
+        assert!(!seg_gu_fuse_from_value(Some("0")));
+        assert!(!seg_gu_fuse_from_value(Some("off")));
+        assert!(!seg_gu_fuse_from_value(Some("no")));
+        for v in ["1", "on", "true", "yes", " TRUE "] {
+            assert!(seg_gu_fuse_from_value(Some(v)), "gu: {v}");
+        }
+    }
+
+    /// task 526: ホストの起動形 (1 warp が受け持つ行数) と `kernels_seg_k.cu` の
+    /// `#define` が一致していること。片方だけ変えると行の取り違えになる
+    /// (GPU 無しで検出できるのはここまで。値の一致は lab の A/B で見る)。
+    #[test]
+    fn seg_fuse_shape_matches_cu() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_seg_k.cu");
+        let src = std::fs::read_to_string(&p).expect("kernels_seg_k.cu が読めない");
+        let pick = |name: &str| -> u32 {
+            let key = format!("#define {name} ");
+            let line = src
+                .lines()
+                .find(|l| l.starts_with(&key))
+                .unwrap_or_else(|| panic!("{name} の #define が無い"));
+            line[key.len()..].trim().parse().expect("#define の値が数値でない")
+        };
+        assert_eq!(pick("SK_GU_ROWS"), SEG_GU_ROWS, "gu の行数");
+        // ブロックは 128 = 4 warp 固定 (カーネルは blockDim.x >> 5 を使う)。
+        assert_eq!(SEG_WARPS, 4);
+    }
+
+    /// task 526: コミット済みの `kernels_seg_k.ptx` に融合 (gu) の 4 エントリが
+    /// 居ること。**PTX の再生成を忘れると、ゲートを on にしても静かに従来の
+    /// 3 起動へ落ちる** (起動数でしか気づけない) ので、ここで固定する。
+    #[test]
+    fn seg_fuse_ptx_has_new_entries() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_seg_k.ptx");
+        let ptx = std::fs::read_to_string(&p).expect("kernels_seg_k.ptx が読めない");
+        for n in SEG_K_GU_NAMES.iter() {
+            let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
+            let key = format!(".visible .entry {name}(");
+            assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
+        }
+        // 従来の 4 本も残っていること (差し替えではなく追加)。
+        for n in SEG_K_NAMES.iter() {
+            let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
+            let key = format!(".visible .entry {name}(");
+            assert!(ptx.contains(&key), "{name} が消えた");
+        }
     }
     /// task 282: mix の GEMV 種別 (`DENNO_MIX_QK`) の既定は `(Blk, R8)`。
     /// `0` で旧 GEMV に戻り、`down` / `up` / `seg` で向きごとに選べる。
