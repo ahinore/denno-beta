@@ -13593,8 +13593,8 @@ fn pf_up_run(
     }
     // 2. 写しと積み込み。
     //
-    // task 481: `DENNO_PF_UP_SPLIT_KB` があれば、**キャッシュあり**の小さな
-    // バウンス 2 枚を交互に使い、写し(i+1) を DMA(i) と重ねる。DMA が読む行は
+    // task 481: `DENNO_PF_UP_SPLIT_KB` (既定 8 MiB) があれば、**キャッシュあり**の
+    // 小さなバウンス 2 枚を交互に使い、写し(i+1) を DMA(i) と重ねる。DMA が読む行は
     // まだ L3 にあるので、DRAM の読み直し (page cache とバウンスで 2 本) が
     // 1 本になる見込み (**推定**)。デバイスへ渡るバイト列は 1 回写しと同一。
     let split_bytes = exp_pf::up_split_bytes();

@@ -1956,7 +1956,7 @@ pub fn pread_blocks(len: usize, blk: usize) -> Vec<(usize, usize)> {
 }
 
 /// `DENNO_PF_UP_SPLIT_KB`: 上げスレッドの写しと DMA を何 KiB ずつ重ねるか
-/// (task 481、既定 0 = 従来の「全部写してから 1 回 DMA」)。
+/// (**既定 8192 = 8 MiB**。`0` で従来の「全部写してから 1 回 DMA」)。
 ///
 /// # なぜ要るか (task 481 の台帳)
 ///
@@ -1970,24 +1970,42 @@ pub fn pread_blocks(len: usize, blk: usize) -> Vec<(usize, usize)> {
 /// 小さなバウンス 2 枚を交互に使い、写し(i+1) を DMA(i) と重ねると、DMA が
 /// 読むのは**ついさっき書いた行**になる。キャッシュコヒーレントな PCIe では
 /// その行がまだ L3 (9800X3D は 96 MB) にあれば DRAM を読み直さない。
-/// DRAM の往復が 3 → 2 になり、写しが 1.5 倍前後になる見込み (**推定**)。
+///
+/// # 実測 (lab t481b、`model=flash-next-UD-IQ3_XXS`、depth8k)
+///
+/// | | base2 (従来) | sp8 (8 MiB) | sp16 (16 MiB) |
+/// | --- | --- | --- | --- |
+/// | 3,826 cold | 2.12 s (copy 1.09) | **1.96 s** (copy 0.80) | 1.96 s |
+/// | 14k cold | 5.18 s (copy 1.32) | **5.03 s** (copy 0.94) | 5.09 s |
+/// | decode | 11.1 ms/tok | 11.2 | 11.2 |
+///
+/// copy_s が -27% / -29%、壁が -7.5% / -2.9%。md5 は全コンテキスト SAME。
 ///
 /// 値は 1 バイトも変えない (デバイスへ渡るバイト列は 1 回写しと同一。
 /// `pf_stream_tests` の分割一致テストが同じ契約を固定している)。
 pub const UP_SPLIT_KB_ENV: &str = "DENNO_PF_UP_SPLIT_KB";
 
-/// [`UP_SPLIT_KB_ENV`] の既定値 (0 = 分割しない)。
-pub const DEFAULT_UP_SPLIT_KB: usize = 0;
+/// [`UP_SPLIT_KB_ENV`] の既定値 (8 MiB)。
+///
+/// lab t481b (3,826 / 14k cold、`model=flash-next-UD-IQ3_XXS`): 8 MiB と 16 MiB は
+/// 同じだけ効いた (3,826 2.12 -> 1.96 / 1.96、14k 5.18 -> 5.03 / 5.09) ので、
+/// L3 (96 MB) に余裕のある 8 MiB を既定にした。`DENNO_PF_UP_SPLIT_KB=0` で
+/// 従来の「全部写してから 1 回 DMA」へ戻せる。
+pub const DEFAULT_UP_SPLIT_KB: usize = 8192;
 
-/// [`UP_SPLIT_KB_ENV`] の解釈 (純関数)。0 / 未設定 / 解析不能は 0 (従来)、
-/// 正の値は 64..=65536 KiB に丸める。
+/// [`UP_SPLIT_KB_ENV`] の解釈 (純関数)。未設定 / 空 / 解析不能は既定 (8 MiB)、
+/// 明示的な `0` / `off` は分割しない、正の値は 64..=65536 KiB に丸める。
 pub fn up_split_kb_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_UP_SPLIT_KB;
     };
     match s.parse::<usize>() {
-        Ok(n) if n > 0 => n.clamp(64, 65536),
-        _ => DEFAULT_UP_SPLIT_KB,
+        Ok(0) => 0,
+        Ok(n) => n.clamp(64, 65536),
+        Err(_) => match s.to_ascii_lowercase().as_str() {
+            "off" | "false" | "no" => 0,
+            _ => DEFAULT_UP_SPLIT_KB,
+        },
     }
 }
 
@@ -5429,11 +5447,13 @@ mod tests {
         assert_eq!(stream_split_from_value(Some("x")), 1, "解析不能は既定へ");
         assert_eq!(stream_split_from_value(Some("4")), 4);
         assert_eq!(stream_split_from_value(Some("64")), 16, "上限 16");
-        // task 481: 上げスレッドの分割 DMA は既定 0 (従来の 1 回写し + 1 回 DMA)。
-        assert_eq!(up_split_kb_from_value(None), 0);
-        assert_eq!(up_split_kb_from_value(Some("")), 0);
-        assert_eq!(up_split_kb_from_value(Some("0")), 0);
-        assert_eq!(up_split_kb_from_value(Some("x")), 0, "解析不能は従来");
+        // task 481: 上げスレッドの分割 DMA は既定 8 MiB (lab t481b で採用)。
+        assert_eq!(up_split_kb_from_value(None), 8192, "未設定は既定 (on)");
+        assert_eq!(up_split_kb_from_value(Some("")), 8192);
+        assert_eq!(up_split_kb_from_value(Some("0")), 0, "明示的な 0 は従来");
+        assert_eq!(up_split_kb_from_value(Some("off")), 0);
+        assert_eq!(up_split_kb_from_value(Some("false")), 0);
+        assert_eq!(up_split_kb_from_value(Some("x")), 8192, "解析不能は既定へ");
         assert_eq!(up_split_kb_from_value(Some("16")), 64, "下限 64 KiB");
         assert_eq!(up_split_kb_from_value(Some("4096")), 4096);
         assert_eq!(up_split_kb_from_value(Some(" 8192 ")), 8192, "空白は無視");
