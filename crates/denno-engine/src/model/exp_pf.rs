@@ -3183,6 +3183,58 @@ pub fn early_route_budget(mb: usize, kb: usize, rest_tok: usize) -> usize {
     want.clamp(EARLY_ROUTE_MIN_BYTES, EARLY_ROUTE_MAX_BYTES)
 }
 
+// ---- task 490: 窓の広い層 (14k) の予算を別に持つ --------------------------
+//
+// task 474 の予算は「残りトークン × 24 KiB」1 本で、窓の判定 (4 チャンク以上
+// = `wide`、1〜3 チャンク = `narrow`) が違っても同じ値を使っていた。
+// 14k の窓は**残り 6 チャンクの attention** (1 層 69 ms) で、lab t490a の
+// 実測は 1 層 288 MB の予算に対し、置き場へ入ったのは 259 MB (87%) だった
+// (`er_MB=14166.6` 対 `ra_MB=12378.4`)。つまり予算の側が先に尽きていて、
+// 窓はまだ余っている。3,826 (`narrow`) は窓が 8.4 ms しかなく、予算を増やすと
+// 窓を越えて MoE の写しと帯域を奪い合う (task 486 の 24 本がその実例) ので、
+// **広い窓のときだけ**別の値を使えるようにする。
+
+/// `DENNO_PF_ER_KB_WIDE`: 窓の広い層 (`wide` = 残り 4 チャンク以上) の
+/// 先読み予算 (残りトークン 1 個あたり KiB)。**0 / 未設定 = 従来と同じ**
+/// ([`EARLY_ROUTE_KB_ENV`] の値)。
+pub const ER_KB_WIDE_ENV: &str = "DENNO_PF_ER_KB_WIDE";
+
+/// [`ER_KB_WIDE_ENV`] の既定 (0 = 従来どおり [`DEFAULT_EARLY_ROUTE_KB`])。
+pub const DEFAULT_ER_KB_WIDE: usize = 0;
+
+/// 予算の KiB/token の上限 (置き場 512 MiB ÷ 12,000 トークン ≈ 43 KiB。
+/// 明示指定の暴走だけを止める)。
+pub const ER_KB_WIDE_MAX: usize = 64;
+
+/// [`ER_KB_WIDE_ENV`] の解釈 (純関数)。数値だけ、0 は「未指定」。
+pub fn er_kb_wide_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .map(|n| n.min(ER_KB_WIDE_MAX))
+            .unwrap_or(DEFAULT_ER_KB_WIDE),
+        None => DEFAULT_ER_KB_WIDE,
+    }
+}
+
+/// 窓の広い層の予算の KiB/token (プロセスで 1 回だけ env を読む)。0 = 未指定。
+pub fn er_kb_wide() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| er_kb_wide_from_value(std::env::var(ER_KB_WIDE_ENV).ok().as_deref()))
+}
+
+/// 層に使う予算の KiB/token を選ぶ (純関数)。
+///
+/// `wide` のときだけ [`er_kb_wide`] を見る。0 なら従来の `base`。
+/// `narrow` (1〜3 チャンク) は常に `base` (窓が短いので増やすと損)。
+pub fn er_route_kb(wide: bool, base: usize, wide_kb: usize) -> usize {
+    if wide && wide_kb > 0 {
+        wide_kb
+    } else {
+        base
+    }
+}
+
 /// 先読みの窓として要る「残りチャンク数」の下限。
 ///
 /// lab t474a: 3,826 (残り 1 チャンク) では 1 層 42 MB の先読みが窓 (9.5 ms) に
