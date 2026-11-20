@@ -8948,8 +8948,10 @@ const EXP_DS_NARGS: usize = 9;
 struct ExpDsKernels {
     #[allow(dead_code)]
     module: CUmodule,
-    /// 型ごとの融合 GEMV ([`crate::model::exp_iq::slot`] の順)
+    /// 型ごとの融合 GEMV ([`crate::model::exp_iq::slot`] の順)。9 引数。
     fns: [CUfunction; crate::model::exp_iq::SLOTS],
+    /// task 480: 1 行 4 warp の GEMV (v2 と同じ 8 引数)。
+    w4: [CUfunction; crate::model::exp_iq::SLOTS],
 }
 
 unsafe impl Send for ExpDsKernels {}
@@ -9007,6 +9009,14 @@ fn exp_ds_kernels() -> Option<&'static ExpDsKernels> {
                         return None;
                     }
                 }
+                // task 480: 1 行 4 warp 版は v2 と同じ 8 引数。
+                let wname = crate::model::exp_iq::w4_kernel_name(i)?;
+                if exp_ds_entry_params(&text, wname) != Some(8) {
+                    eprintln!(
+                        "[exp-w4] PTX の {wname} の引数が 8 本でない → 従来のカーネルへ"
+                    );
+                    return None;
+                }
             }
             let mut image = text.into_bytes();
             image.push(0);
@@ -9022,22 +9032,55 @@ fn exp_ds_kernels() -> Option<&'static ExpDsKernels> {
             }
             let mut fns: [CUfunction; crate::model::exp_iq::SLOTS] =
                 [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
-            for (i, f) in fns.iter_mut().enumerate() {
+            let mut w4: [CUfunction; crate::model::exp_iq::SLOTS] =
+                [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
+            for i in 0..crate::model::exp_iq::SLOTS {
                 let name = crate::model::exp_iq::ds_kernel_name(i)?;
                 let mut cname = name.as_bytes().to_vec();
                 cname.push(0);
                 unsafe {
-                    if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
+                    if (lib.module_get_function)(&mut fns[i], module, cname.as_ptr() as *const c_char)
                         != CUDA_SUCCESS
                     {
                         eprintln!("[exp-ds] PTX に {name} が無い → 従来の 2 起動へ");
                         return None;
                     }
                 }
+                let wname = crate::model::exp_iq::w4_kernel_name(i)?;
+                let mut wcname = wname.as_bytes().to_vec();
+                wcname.push(0);
+                unsafe {
+                    if (lib.module_get_function)(
+                        &mut w4[i],
+                        module,
+                        wcname.as_ptr() as *const c_char,
+                    ) != CUDA_SUCCESS
+                    {
+                        eprintln!("[exp-w4] PTX に {wname} が無い → 従来のカーネルへ");
+                        return None;
+                    }
+                }
             }
-            Some(ExpDsKernels { module, fns })
+            Some(ExpDsKernels { module, fns, w4 })
         })
         .as_ref()
+}
+
+/// task 480: 1 行 4 warp 版 (`DENNO_DEC_EXPW4=w4`) の関数を引く。
+///
+/// ゲート off / PTX に無いときは `None` (= 従来のカーネル)。
+/// 撃つときの blockDim は [`crate::model::exp_iq::EXP_W4_THREADS`] 固定。
+fn exp_w4_fn(slot: usize) -> Option<CUfunction> {
+    if !crate::model::exp_iq::exp_w4_enabled() {
+        return None;
+    }
+    let k = exp_ds_kernels()?;
+    let f = k.w4.get(slot).copied().unwrap_or(std::ptr::null_mut());
+    if f.is_null() {
+        None
+    } else {
+        Some(f)
+    }
 }
 
 /// decode の層一括 GEMV に使うカーネル一式。
@@ -9563,10 +9606,19 @@ where
                         &mut no as *mut _ as *mut c_void,
                         &mut rb as *mut _ as *mut c_void,
                     ];
+                    // task 480: 1 行 4 warp 版 (`DENNO_DEC_EXPW4`) があればそれで撃つ。
+                    // 値は丸め順だけが変わる (ゲート off は従来のカーネル)。
+                    let (gf, gblk) = match exp_w4_fn(slot_g) {
+                        Some(f) => {
+                            crate::model::exp_iq::note_w4_launch();
+                            (f, (crate::model::exp_iq::EXP_W4_THREADS as u32, 1, 1))
+                        }
+                        None => (kernels.fns[slot_g], plan_g.block),
+                    };
                     ctx.launch_async(
-                        kernels.fns[slot_g],
+                        gf,
                         (plan_g.grid.0, (2 * nseg) as u32, 1),
-                        plan_g.block,
+                        gblk,
                         0,
                         &mut args,
                     )?;
@@ -9577,9 +9629,9 @@ where
                 EXP_GU_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 let mut gu = 0usize;
-                for (f, ptrs, buf, rb) in [
-                    (kernels.fns[slot_g], pg_addr, g, rb_g),
-                    (kernels.fns[slot_u], pu_addr, u, rb_u),
+                for (f0, slot, ptrs, buf, rb) in [
+                    (kernels.fns[slot_g], slot_g, pg_addr, g, rb_g),
+                    (kernels.fns[slot_u], slot_u, pu_addr, u, rb_u),
                 ] {
                     let mut pw = ptrs as *mut c_void;
                     let mut px = x_addr as *mut c_void;
@@ -9601,7 +9653,15 @@ where
                         &mut no as *mut _ as *mut c_void,
                         &mut rb as *mut _ as *mut c_void,
                     ];
-                    ctx.launch_async(f, plan_g.grid, plan_g.block, 0, &mut args)?;
+                    // task 480: 1 行 4 warp 版 (`DENNO_DEC_EXPW4`)。
+                    let (f, blk) = match exp_w4_fn(slot) {
+                        Some(w) => {
+                            crate::model::exp_iq::note_w4_launch();
+                            (w, (crate::model::exp_iq::EXP_W4_THREADS as u32, 1, 1))
+                        }
+                        None => (f0, plan_g.block),
+                    };
+                    ctx.launch_async(f, plan_g.grid, blk, 0, &mut args)?;
                     // 1 本目 = gate、2 本目 = up。
                     dec_exp_kprof::mark(if gu == 0 {
                         dec_exp_kprof::GATE
@@ -9715,13 +9775,15 @@ where
                     &mut no as *mut _ as *mut c_void,
                     &mut rb as *mut _ as *mut c_void,
                 ];
-                ctx.launch_async(
-                    kernels.fns[slot_d],
-                    plan_d.grid,
-                    plan_d.block,
-                    0,
-                    &mut args,
-                )?;
+                // task 480: 1 行 4 warp 版 (`DENNO_DEC_EXPW4`)。
+                let (df, dblk) = match exp_w4_fn(slot_d) {
+                    Some(w) => {
+                        crate::model::exp_iq::note_w4_launch();
+                        (w, (crate::model::exp_iq::EXP_W4_THREADS as u32, 1, 1))
+                    }
+                    None => (kernels.fns[slot_d], plan_d.block),
+                };
+                ctx.launch_async(df, plan_d.grid, dblk, 0, &mut args)?;
                 dec_exp_kprof::mark(dec_exp_kprof::DOWN);
             }
             // 3.5 task 187: ヒットの寄与をデバイスで重み付き和にする

@@ -503,6 +503,95 @@ pub fn exp_down_reset() {
 }
 
 // ---------------------------------------------------------------------------
+// task 480: 1 行を 4 warp で分担する expert GEMV (`DENNO_DEC_EXPW4`)
+// ---------------------------------------------------------------------------
+//
+// v2 は 1 行 = 1 warp で、1 warp が同時に持つロードが 1-2 本しかない。
+// lab t480a の実測は gate+up 22.0 us/層 / down 16.7 us/層で 490-523 GB/s
+// (ピークの 3 割)。同じモデルの mix / ssm の GEMV は 1 ブロック 1 行で
+// 700-900 GB/s 出ている = 行あたりの並列度が違う。ここでは 1 行を 4 warp が
+// 分担し、行ごとの未完了ロードを 4 倍にする (`kernels_exp_iq_ds.cu` の w4 群)。
+//
+// 値は v2 と**ビット一致しない** (行の内積を 4 本に割って足す順が変わる)。
+// 丸め方の変更だけ。ゲート off (既定) は従来のカーネルなので md5 は変わらない。
+
+/// `DENNO_DEC_EXPW4`: 1 行 4 warp の expert GEMV。既定 off。
+pub const EXP_W4_ENV: &str = "DENNO_DEC_EXPW4";
+
+/// 1 行を分担する warp 数 (`kernels_exp_iq_ds.cu` の `W4_WPR`)。
+pub const EXP_W4_WPR: usize = 4;
+
+/// 1 ブロックのスレッド数 (4 行 x 4 warp)。
+pub const EXP_W4_THREADS: usize = 32 * EXP_W4_WPR * 4;
+
+/// [`EXP_W4_ENV`] の解釈 (純関数)。`w4` も真として受ける。
+pub fn exp_w4_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes" | "w4")
+    )
+}
+
+/// 2 つの env から決める (新しい名前が真なら on、無ければ既存名の `w4`)。
+pub fn exp_w4_pick(w4: Option<&str>, gu: Option<&str>) -> bool {
+    exp_w4_from_value(w4) || exp_w4_from_value(gu)
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。既定 off。
+pub fn exp_w4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        exp_w4_pick(
+            std::env::var(EXP_W4_ENV).ok().as_deref(),
+            std::env::var("DENNO_DEC_EXPGU").ok().as_deref(),
+        )
+    })
+}
+
+/// 1 行 4 warp 版のカーネル名。
+pub fn w4_kernel_name(slot: usize) -> Option<&'static str> {
+    Some(match slot {
+        0 => "dno_exp_gemv_w4_iq2s",
+        1 => "dno_exp_gemv_w4_iq3xxs",
+        2 => "dno_exp_gemv_w4_iq3s",
+        3 => "dno_exp_gemv_w4_iq4xs",
+        4 => "dno_exp_gemv_w4_iq4nl",
+        5 => "dno_exp_gemv_w4_q2_0",
+        _ => return None,
+    })
+}
+
+/// 1 行 4 warp 版を撃った起動数 (**分岐が発火した証拠**)。
+static W4_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+/// 1 行 4 warp 版を撃った起動を 1 つ数える。
+pub fn note_w4_launch() {
+    W4_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 リクエストぶんの 1 行 (ゲート on でも 0 なら `None`)。
+pub fn exp_w4_line() -> Option<String> {
+    exp_w4_line_with(exp_w4_enabled())
+}
+
+/// [`exp_w4_line`] の本体。
+fn exp_w4_line_with(on: bool) -> Option<String> {
+    if !on {
+        return None;
+    }
+    let n = W4_LAUNCHES.load(Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    Some(format!("[exp-w4] w4_launches={n} wpr={EXP_W4_WPR}"))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn exp_w4_reset() {
+    W4_LAUNCHES.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
 // task 388: ミスの CPU 計算を GPU の起動と重ねる (`DENNO_DEC_MISS_SPAWN`)
 // ---------------------------------------------------------------------------
 //
@@ -1307,6 +1396,36 @@ mod tests {
             exp_down_line_with(ExpDown::Ds8).is_none(),
             "0 に戻したら行を出さない"
         );
+    }
+
+    /// task 480: `DENNO_DEC_EXPW4` の真理値表と行。
+    #[test]
+    fn task480_exp_w4_gate_and_line() {
+        assert!(!exp_w4_from_value(None), "未設定は off");
+        for v in ["", "0", "off", "false", "no", "ds", "w8"] {
+            assert!(!exp_w4_from_value(Some(v)), "{v:?} は off");
+        }
+        for v in ["1", "on", "true", "yes", "w4", " W4 "] {
+            assert!(exp_w4_from_value(Some(v)), "{v:?} は on");
+        }
+        // 既存 env の値でも張れる (lab の COND が新しい env 名を落とすことがある)。
+        assert!(exp_w4_pick(None, Some("w4")));
+        assert!(exp_w4_pick(Some("1"), None));
+        assert!(!exp_w4_pick(None, Some("gu4")), "gu4 は w4 ではない");
+        assert_eq!(EXP_W4_WPR, 4);
+        assert_eq!(EXP_W4_THREADS, 512, "4 行 x 4 warp");
+        // 行はゲート on かつ 1 回以上撃ったときだけ。
+        exp_w4_reset();
+        assert!(exp_w4_line_with(false).is_none());
+        assert!(exp_w4_line_with(true).is_none(), "0 回なら出さない");
+        note_w4_launch();
+        note_w4_launch();
+        note_w4_launch();
+        let line = exp_w4_line_with(true).expect("撃ったら出る");
+        assert!(line.contains("w4_launches=3"), "{line}");
+        assert!(line.contains("wpr=4"), "{line}");
+        exp_w4_reset();
+        assert!(exp_w4_line_with(true).is_none(), "0 に戻したら出さない");
     }
 
     /// task 480: 融合カーネルの名前が .cu に在り、スロットの対応が v2 と揃う。

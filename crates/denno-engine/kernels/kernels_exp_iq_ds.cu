@@ -493,3 +493,85 @@ DS_DEFINE(dno_exp_gemv_ds_iq3s, DsIq3s)
 DS_DEFINE(dno_exp_gemv_ds_iq4xs, DsIq4xs)
 DS_DEFINE(dno_exp_gemv_ds_iq4nl, DsIq4nl)
 DS_DEFINE(dno_exp_gemv_ds_q2_0, DsQ20)
+
+// ---------------------------------------------------------------------------
+// task 480: 1 行を 4 warp で分担する版 (`DENNO_DEC_EXPW4=1` / `DENNO_DEC_EXPGU=w4`)
+// ---------------------------------------------------------------------------
+//
+// v2 の層一括 GEMV は **1 行 = 1 warp** で、1 warp が同時に持つロードが 1-2 本
+// しかない。lab t480a の [dec-exp-kprof] は gate+up 22.0 us/層 / down 16.7 us/層で、
+// どちらも 490-523 GB/s (ピークの 3 割) に留まる。同じモデルの mix / ssm の GEMV は
+// 1 ブロック 1 行 (128-256 スレッド) で 700-900 GB/s 出ている = **行あたりの
+// 並列度**が違う。ここでは 1 行を 4 warp (WPR) が分担し、行ごとの未完了ロードを
+// 4 倍にする。1 ブロック = 4 行 x 4 warp = 512 スレッド。
+//
+// 数値の契約: **v2 とはビット一致しない** (行の内積を 4 本に割って足す順が変わる)。
+// 丸め方の変更だけなので、値の差は f32 の和の順による最下位ビット程度。
+// ゲート off (既定) では従来のカーネルを撃つので md5 は変わらない。
+
+#define W4_WPR 4
+
+template <class TP>
+__device__ __forceinline__ void w4_body(const unsigned char* const* __restrict__ wptrs,
+                                        const float* __restrict__ xbase,
+                                        float* __restrict__ obase,
+                                        const unsigned int* __restrict__ seg,
+                                        const int nseg, const int n_in,
+                                        const int n_out, const int row_bytes,
+                                        const typename TP::Sh* sh)
+{
+    const int si = (int)blockIdx.y;
+    if (si >= nseg) return;
+    const int warp = (int)(threadIdx.x >> 5);
+    const int lane = (int)(threadIdx.x & 31u);
+    const int rows = (int)(blockDim.x >> 5) / W4_WPR;
+    const int sw = warp % W4_WPR;      // 行の中で何本目の warp か
+    const int row = (int)blockIdx.x * rows + warp / W4_WPR;
+    const bool act = row < n_out;
+
+    const unsigned int* sg = seg + (size_t)si * 4u;
+    float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (act && (int)sg[1] == 1) {
+        const unsigned char* rowp = wptrs[si] + (size_t)row * (size_t)row_bytes;
+        const float* xp = xbase + (size_t)sg[2];
+        const int nblk = n_in / (int)TP::CH;
+        const int xoff_lane = lane * (int)TP::XE;
+        for (int b = sw; b < nblk; b += W4_WPR) {
+            const TP cur = TP::load(rowp + (size_t)b * (size_t)TP::BYTES, lane, sh);
+            float xv[TP::XE];
+            DsLoad<TP::XE>::run(xp + (size_t)b * (size_t)TP::CH + (size_t)xoff_lane, xv);
+            TP::acc(cur, xv, a, sh);
+        }
+    }
+    // 縮約: warp 内 (v2 と同じ木) -> block 内 (warp 番号の昇順に 1 本の和)。
+    const float part = ds_reduce(ds_fold4(a[0], a[1], a[2], a[3]));
+    __shared__ float sp[32];
+    if (lane == 0) sp[warp] = part;
+    __syncthreads();
+    if (act && sw == 0 && lane == 0) {
+        float s = sp[warp];
+#pragma unroll
+        for (int k = 1; k < W4_WPR; ++k) s = __fadd_rn(s, sp[warp + k]);
+        obase[row] = s;
+    }
+}
+
+#define W4_DEFINE(NAME, TP)                                                                  \
+    extern "C" __global__ void NAME(const unsigned char* const* __restrict__ wptrs,          \
+                                    const float* __restrict__ xbase,                         \
+                                    float* __restrict__ obase,                               \
+                                    const unsigned int* __restrict__ seg, int nseg,          \
+                                    int n_in, int n_out, int row_bytes)                      \
+    {                                                                                        \
+        __shared__ TP::Sh sh;                                                                \
+        TP::init_sh(&sh, (int)threadIdx.x, (int)blockDim.x);                                 \
+        __syncthreads();                                                                     \
+        w4_body<TP>(wptrs, xbase, obase, seg, nseg, n_in, n_out, row_bytes, &sh);             \
+    }
+
+W4_DEFINE(dno_exp_gemv_w4_iq2s, DsIq2s)
+W4_DEFINE(dno_exp_gemv_w4_iq3xxs, DsIq3xxs)
+W4_DEFINE(dno_exp_gemv_w4_iq3s, DsIq3s)
+W4_DEFINE(dno_exp_gemv_w4_iq4xs, DsIq4xs)
+W4_DEFINE(dno_exp_gemv_w4_iq4nl, DsIq4nl)
+W4_DEFINE(dno_exp_gemv_w4_q2_0, DsQ20)

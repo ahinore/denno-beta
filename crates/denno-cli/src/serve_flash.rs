@@ -766,6 +766,12 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_iq::exp_down_reset();
+    // task 480: 1 行 4 warp の expert GEMV を撃った起動数
+    // (`DENNO_DEC_EXPW4=1` のときだけ 1 行 = 分岐が発火した証拠)。
+    if let Some(line) = denno_engine::model::exp_iq::exp_w4_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_iq::exp_w4_reset();
     // task 388: ミスの CPU 計算を GPU の起動と重ねた層数 (ゲート on のときだけ 1 行)。
     if let Some(line) = denno_engine::model::exp_iq::miss_spawn_line() {
         eprintln!("{line}");

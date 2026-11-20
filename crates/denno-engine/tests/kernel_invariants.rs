@@ -13940,14 +13940,78 @@ fn task480_exp_down_sum_fusion_kernel_and_wiring() {
         assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
     }
     // off 側 (従来の 2 起動) が残っていること。
-    assert!(
-        CUDA_RS.contains("                ctx.launch_async(\n                    kernels.fns[slot_d],\n                    plan_d.grid,\n                    plan_d.block,"),
-        "従来の down 起動が消えている"
-    );
+    for s in [
+        "if ds_src.is_none() {",
+        "let (df, dblk) = match exp_w4_fn(slot_d) {",
+    ] {
+        assert!(CUDA_RS.contains(s), "従来の down 起動が消えている ({s})");
+    }
 
     // 3. 発火の証拠を serve_flash が出す。
     assert!(
         SERVE_FLASH_SRC.contains("denno_engine::model::exp_iq::exp_down_line()"),
         "serve_flash.rs が [exp-ds] を出さない"
+    );
+}
+
+/// task 480: expert GEMV の 1 行 4 warp 版 (`DENNO_DEC_EXPW4`).
+///
+/// 見るのは 3 点。(1) 1 行を 4 warp が分担し、warp 内の木は v2 と同じで、
+/// block 内は warp 番号の昇順に 1 本のアキュムレータで足す (丸め順だけが変わる)。
+/// (2) 起動形は 512 スレッド (4 行 x 4 warp) で、引数は v2 と同じ 8 本。
+/// (3) ゲートは既存 env の値でも張れ、撃った数を数えて serve_flash が出す。
+#[test]
+fn task480_exp_w4_row_parallel_kernel_and_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cu = std::fs::read_to_string(root.join("kernels/kernels_exp_iq_ds.cu"))
+        .expect("kernels_exp_iq_ds.cu が読めない");
+    for s in [
+        "#define W4_WPR 4",
+        "W4_DEFINE(dno_exp_gemv_w4_iq2s, DsIq2s)",
+        "W4_DEFINE(dno_exp_gemv_w4_iq3xxs, DsIq3xxs)",
+        "W4_DEFINE(dno_exp_gemv_w4_iq3s, DsIq3s)",
+        "W4_DEFINE(dno_exp_gemv_w4_iq4xs, DsIq4xs)",
+        "W4_DEFINE(dno_exp_gemv_w4_iq4nl, DsIq4nl)",
+        "W4_DEFINE(dno_exp_gemv_w4_q2_0, DsQ20)",
+        // 行は block 内の warp から決める (1 行 = 4 warp)。
+        "const int sw = warp % W4_WPR;",
+        "const int row = (int)blockIdx.x * rows + warp / W4_WPR;",
+        // 行の内積は warp ごとに v2 と同じ木で縮約し、block 内は昇順に足す。
+        "const float part = ds_reduce(ds_fold4(a[0], a[1], a[2], a[3]));",
+        "s = __fadd_rn(s, sp[warp + k]);",
+        // 起動形 (引数は v2 と同じ 8 本)。
+        "int n_in, int n_out, int row_bytes)                      \\",
+    ] {
+        assert!(cu.contains(s), "kernels_exp_iq_ds.cu に {s} が無い");
+    }
+
+    // ホスト側: 8 引数の ABI 検査 / ゲート / 起動形 / 3 箇所 (gate+up 融合・
+    // 非融合の gate/up・down) の差し替え。
+    let eq = std::fs::read_to_string(root.join("src/model/exp_iq.rs"))
+        .expect("exp_iq.rs が読めない");
+    for s in [
+        "pub fn exp_w4_from_value(v: Option<&str>) -> bool {",
+        "pub fn exp_w4_pick(w4: Option<&str>, gu: Option<&str>) -> bool {",
+        "pub const EXP_W4_THREADS: usize = 32 * EXP_W4_WPR * 4;",
+    ] {
+        assert!(eq.contains(s), "exp_iq.rs に {s} が無い");
+    }
+    for s in [
+        "fn exp_w4_fn(slot: usize) -> Option<CUfunction> {",
+        "if exp_ds_entry_params(&text, wname) != Some(8) {",
+        "(f, (crate::model::exp_iq::EXP_W4_THREADS as u32, 1, 1))",
+        "(w, (crate::model::exp_iq::EXP_W4_THREADS as u32, 1, 1))",
+        "crate::model::exp_iq::note_w4_launch();",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+    assert_eq!(
+        CUDA_RS.matches("crate::model::exp_iq::note_w4_launch();").count(),
+        3,
+        "w4 を撃つ箇所が 3 つ (gate+up 融合 / gate・up / down) でない"
+    );
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::exp_iq::exp_w4_line()"),
+        "serve_flash.rs が [exp-w4] を出さない"
     );
 }
