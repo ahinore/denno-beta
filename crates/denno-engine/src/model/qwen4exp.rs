@@ -6565,26 +6565,34 @@ pub fn mix_qchain_gate_on() -> bool {
 // (`gemv inj ... ty=-` は F32 = id 0。`[mix-kprof]` の `inj 137 ms / 9506 回`)。
 // 従来は 1 行ずつの逐次和 (`gemv_scalar_body`) で、dev の実測でも 16.7 us。
 //
-// 4 行を同時に回して x の 1 ブロックを全行で共有する FMA 版は 0.98 us で、
-// 差は 2.3e-6 (|ref| 1.0) = 丸めだけ。`DENNO_MIX_INJ_R4` で切り替える
-// (**既定 off**。採否は lab t484b で決める)。
+// 4 行を同時に回して x の 1 ブロックを全行で共有する FMA 版は 1.00 us で、
+// 差は 2.3e-6 (|ref| 1.0) = 丸めだけ。lab t484b (base vs inj4、2 ラウンド交互) は
+// 短い decode 11.1 -> 10.8 (-2.7%)、c2000_cold 13.4 -> 13.0 (-3.0%)、
+// c2000_turn2 12.2 -> 11.8 (-3.3%)、c8000_cold 13.0 -> 13.1 (+0.8%、ノイズ幅)、
+// prefill 0.58 -> 0.57、md5 全 SAME、errors 0 だったので **既定 on** にした。
+// 切り戻しは `DENNO_MIX_INJ_R4=0`。
 //
 // lab の COND が新しい env 名を落とす回があるので、既存の `DENNO_MIX_QK` の値に
 // `inj4` が含まれていても on にする (逃げ道。値の解釈は dn7 などのまま)。
 
-/// [`MIX_INJ_R4_ENV`] の解釈 (純関数)。`qk` は `DENNO_MIX_QK` の生値。
+/// [`MIX_INJ_R4_ENV`] の解釈 (純関数)。**既定 on** (task 484 で採否 yes)。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけが off。
+/// `qk` は `DENNO_MIX_QK` の生値で、値に `inj4` が入っていれば on
+/// (lab の COND が新しい env 名を落とす回の逃げ道。明示 off より強い)。
 pub fn mix_inj_r4_from_value(v: Option<&str>, qk: Option<&str>) -> bool {
-    let on = matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes") | Some("r4")
-    );
-    let via_qk = qk
+    if qk
         .map(|s| s.to_ascii_lowercase().contains("inj4"))
-        .unwrap_or(false);
-    on || via_qk
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
 }
 
-/// task 484: hc inject を 4 行同時の F32 FMA GEMV で回すか (既定 off)。
+/// task 484: hc inject を 4 行同時の F32 FMA GEMV で回すか (**既定 on**)。
 pub fn mix_inj_r4_on() -> bool {
     #[cfg(test)]
     if let Some(v) = MIX_INJ_R4_FORCE.with(|c| c.get()) {
@@ -6752,21 +6760,23 @@ pub fn mix_qchain_reset() {
 mod mix_qchain_tests {
     use super::*;
 
-    /// task 484: `DENNO_MIX_INJ_R4` の真理値表。新しい env 名が lab の COND で
-    /// 落ちる回の逃げ道 (`DENNO_MIX_QK` の値に `inj4`) も固定する。
+    /// task 484: `DENNO_MIX_INJ_R4` の真理値表。**既定 on** (lab t484b で採否 yes) で、
+    /// 明示的な偽値だけ off。新しい env 名が lab の COND で落ちる回の逃げ道
+    /// (`DENNO_MIX_QK` の値に `inj4`) も固定する。
     #[test]
     fn mix_inj_r4_gate_truth_table() {
-        assert!(!mix_inj_r4_from_value(None, None), "未設定は既定 off");
-        assert!(!mix_inj_r4_from_value(Some(""), None), "空は off");
+        assert!(mix_inj_r4_from_value(None, None), "未設定は既定 on");
+        assert!(mix_inj_r4_from_value(Some(""), None), "空は既定 on");
         assert!(!mix_inj_r4_from_value(Some("0"), None));
-        assert!(!mix_inj_r4_from_value(Some("off"), None));
+        assert!(!mix_inj_r4_from_value(Some(" off "), None));
+        assert!(!mix_inj_r4_from_value(Some("false"), None));
         assert!(mix_inj_r4_from_value(Some("1"), None));
-        assert!(mix_inj_r4_from_value(Some(" on "), None));
+        assert!(mix_inj_r4_from_value(Some("on"), None));
         assert!(mix_inj_r4_from_value(Some("R4"), None));
         // 逃げ道: 既存 env の値に inj4 (値の解釈は dn7 などのまま)。
         assert!(mix_inj_r4_from_value(None, Some("dn7,inj4")));
         assert!(mix_inj_r4_from_value(None, Some("INJ4")));
-        assert!(!mix_inj_r4_from_value(None, Some("dn7")));
+        assert!(mix_inj_r4_from_value(None, Some("dn7")), "既定 on なので dn7 でも on");
         assert!(mix_inj_r4_from_value(Some("0"), Some("dn7,inj4")), "逃げ道は明示 off でも効く");
     }
 
