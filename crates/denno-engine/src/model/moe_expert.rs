@@ -4544,6 +4544,59 @@ pub(crate) fn gemv_f32_router(blocks: &[u8], n_in: usize, out: &mut [f32], x: &[
     false
 }
 
+/// task 484: 行数の少ない F32 GEMV (hc inject の実形 = hc 行 x hc_dim) の入口。
+///
+/// 既存の [`gemv_f32_rows_fma_avx2`] を `n_out` 行ぶん一度に回す。1 行ずつ
+/// 逐次和する従来経路 (`gemv_scalar_body`) は、hc inject の実形
+/// (k = 10,240 / n = 4 / 160 KB) で **1 回 16.7 us** かかっていた
+/// (dev 実測 `examples/inj_gemv_bench.rs`。lab t484a の `[dec-kprof-avg]`
+/// `mix_inj` = 16.1 us と一致)。この形は x の 1 ブロックを全行で共有し、
+/// 行ごとに独立な FMA チェーンを立てるので **0.98 us** になる
+/// (同じベンチ。重み 160 KB は L2 に載るので帯域ではなく演算で決まる)。
+///
+/// 値は FMA と 8 レーン縮約のぶんだけ classic の逐次和と丸め順が違う
+/// (実測の差は 2.3e-6、|ref| ≈ 1.0 で、既定の許容 1e-4 + 1e-5 の内側)。
+///
+/// 累積器は **1 行 1 本 (A = 1)**。A = 2 (k を 2 分割) にすると内側ループの
+/// `acc[g][a]` が動的添字になってスタックへ落ち、3.18 us だった (A = 1 は
+/// 1.00 us。行ごとの独立チェーンだけで FMA レイテンシは隠れる)。
+///
+/// `true` = `out` を書いた / `false` = この形が使えない (呼び出し側の従来経路へ)。
+pub fn expert_gemv_f32_rows_small(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    if n_out == 0 || n_out > 4 || n_in == 0 || x.len() != n_in || out.len() != n_out {
+        return false;
+    }
+    if blocks.len() < n_out.saturating_mul(n_in).saturating_mul(4) {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !q4k_fused_supported() || f32_exact_enabled() {
+            return false;
+        }
+        let bp = blocks.as_ptr();
+        // SAFETY: 上の検査で blocks / x / out の長さを確認済みで、
+        // q4k_fused_supported() が AVX2 + FMA を実行時に確認している。
+        unsafe {
+            match n_out {
+                4 => gemv_f32_rows_fma_avx2::<4, 1>(bp, n_in, 4, x, out),
+                3 => gemv_f32_rows_fma_avx2::<3, 1>(bp, n_in, 3, x, out),
+                2 => gemv_f32_rows_fma_avx2::<2, 1>(bp, n_in, 2, x, out),
+                _ => gemv_f32_rows_fma_avx2::<1, 1>(bp, n_in, 1, x, out),
+            }
+        }
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
 /// expert テンソルの量子型で GEMV を振り分ける (P-MOE-G1 で追加)。
 ///
 /// mmap 経路 ([`crate::model::qwen4exp`] の `ExpertW::gemv`) とキャッシュ経路
