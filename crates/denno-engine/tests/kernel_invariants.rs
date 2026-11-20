@@ -14066,3 +14066,51 @@ fn t482_early_route_window_exit_is_wired() {
     let gate = f.find("exp_pf::early_route_on()").expect("ゲートが無い");
     assert!(gate < exit, "早期終了がゲートより前にある");
 }
+
+/// task 481: 上げスレッドの分割 DMA の配線 (既定 on) を字面で固定する。
+///
+/// 1. `pf_up_run` が `exp_pf::up_split_bytes()` を見て分割経路へ分岐し、
+///    分割しなかったときは従来どおり「全部写して 1 回 DMA」へ落ちること。
+/// 2. 分割経路が (a) 依頼をまたいで `used` でバウンスの再利用を待つ、
+///    (b) 各サブ塊を写してすぐ DMA を積む、(c) 最後に `job.up_ev` を記録する。
+/// 3. 既定が 8 MiB で、`0` で切れる (切り戻しの口がある)。
+/// 4. 発火を数える計器 (`usplit=`) が台帳に載っている。
+#[test]
+fn task481_up_split_dma_wiring() {
+    let pf = include_str!("../src/model/exp_pf.rs");
+    for s in [
+        "pub const UP_SPLIT_KB_ENV: &str = \"DENNO_PF_UP_SPLIT_KB\";",
+        "pub const DEFAULT_UP_SPLIT_KB: usize = 8192;",
+        "pub fn up_split_kb_from_value(v: Option<&str>) -> usize {",
+        "pub fn up_split_bytes() -> usize {",
+        "pub fn note_up_split() {",
+        "usplit={} usplit_kb={}",
+    ] {
+        assert!(pf.contains(s), "exp_pf.rs に {s} が無い");
+    }
+    assert!(
+        pf.contains("        Ok(0) => 0,"),
+        "明示的な 0 が「既定へ」に化けると切り戻せない"
+    );
+
+    // 分岐と分割経路の本体 (cuda.rs)。
+    for s in [
+        "let split_bytes = exp_pf::up_split_bytes();",
+        "if split_bytes > 0 && job.need > 0 && job.pin != 0 {",
+        "pf_up_run_split(job, copy_ns, enq_ns)?;",
+        "fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result<()> {",
+        "fn pf_copy_into_pin_at(",
+        // 依頼をまたいだ再利用待ち (ここを依頼内の番号にすると重みが壊れる)。
+        "if s.used[b] {",
+        "s.used[b] = true;",
+        "used: [bool; 2],",
+        // 写し -> DMA を 1 塊ずつ。
+        "pf_copy_into_pin_at(ptr, &job.parts, off, n, job.pread);",
+        "\"cuMemcpyHtoDAsync (分割 DMA)\",",
+        "exp_pf::note_up_split();",
+        // 従来経路は残っている (既定で切ったときの戻り先)。
+        "pf_copy_into_pin(job.pin, &job.parts, job.pread);",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+}
