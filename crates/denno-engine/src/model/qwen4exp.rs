@@ -2374,7 +2374,11 @@ fn expert_ram_prepare(f: &GgufFile, layers: &[LayerW]) -> Result<()> {
         .collect();
     crate::model::exp_pf::install_parts(parts);
     // 診断用の範囲 (probe の mincore / page cache の drop)。tier の有無に依らず覚える。
-    if expert_ram::probe_enabled() || expert_ram::drop_enabled() {
+    // task 514: `DENNO_PF_FADV_END` でも範囲が要る (終端の drop が使う)。
+    if expert_ram::probe_enabled()
+        || expert_ram::drop_enabled()
+        || expert_ram::fadv_end_enabled()
+    {
         let mut ranges: Vec<(usize, u64, u64)> = Vec::new();
         let mut mmap: Vec<(usize, usize)> = Vec::new();
         for l in layers {
@@ -2391,6 +2395,14 @@ fn expert_ram_prepare(f: &GgufFile, layers: &[LayerW]) -> Result<()> {
             .filter_map(|i| f.path_at(i).map(|p| p.to_path_buf()))
             .collect();
         expert_ram::install_ranges(parts, ranges, mmap);
+        // task 514: モデル全体 (dense / PLE を含む) の常駐量を測るための mmap。
+        let mut pmap: Vec<(usize, usize)> = Vec::with_capacity(f.part_count());
+        for i in 0..f.part_count() {
+            if let Some(m) = f.mmap_handle_at(i) {
+                pmap.push((m.as_ptr() as usize, m.len()));
+            }
+        }
+        expert_ram::install_part_map(pmap);
     }
     Ok(())
 }
