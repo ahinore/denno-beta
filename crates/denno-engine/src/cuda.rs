@@ -13717,6 +13717,13 @@ struct PfUpSplit {
     stage: [Option<PinMem>; 2],
     /// 各バウンスを前回読んだ DMA の完了イベント (作った時点で非 null)。
     ev: [CUevent; 2],
+    /// そのバウンスを**一度でも** DMA の転送元に使ったか。
+    ///
+    /// バウンスは依頼 (グループ) をまたいで使い回すので、「この依頼の中で
+    /// 2 個前か」ではなく「過去に使ったか」で待つ。ここを依頼内の番号で
+    /// 判定すると、前の依頼の最後の DMA がまだ読んでいるバウンスを次の依頼が
+    /// 上書きして**重みが壊れる** (lab t481a で実際に壊れた)。
+    used: [bool; 2],
     /// 1 枚の大きさ (バイト)。
     chunk: usize,
 }
@@ -13819,6 +13826,7 @@ fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result
             *slot = Some(Box::new(PfUpSplit {
                 stage: [Some(a), Some(b)],
                 ev,
+                used: [false; 2],
                 chunk,
             }));
         }
@@ -13829,8 +13837,9 @@ fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result
         while off < job.need {
             let n = chunk.min(job.need - off);
             let b = i % 2;
-            // このバウンスを前回読んだ DMA が終わるまで上書きしない。
-            if i >= 2 {
+            // このバウンスを前回読んだ DMA が終わるまで上書きしない
+            // (依頼をまたいでも待つ。`used` はグループで戻さない)。
+            if s.used[b] {
                 unsafe {
                     check(
                         esync(s.ev[b]),
@@ -13859,6 +13868,7 @@ fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result
                 )?;
             }
             *enq_ns = enq_ns.saturating_add(t_enq.elapsed().as_nanos() as u64);
+            s.used[b] = true;
             exp_pf::note_up_split();
             off += n;
             i += 1;
