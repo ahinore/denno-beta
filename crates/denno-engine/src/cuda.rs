@@ -8934,6 +8934,112 @@ fn exp_iq_kernels_v3() -> Option<&'static ExpIqKernels> {
         .as_ref()
 }
 
+// ---------------------------------------------------------------------------
+// task 480: down GEMV + 重み付き和の融合カーネル (`kernels_exp_iq_ds.ptx`)
+// ---------------------------------------------------------------------------
+//
+// `DENNO_DEC_EXPDOWN=ds|ds8` のとき、1 層ぶんの down と和を 1 起動で回す
+// (`kernels_exp_iq_ds.cu`)。値は v2 の down + `dno_dec_exp_sum` とビット一致。
+// PTX が無い / 引数の数が違う / 形が合わない層は従来の 2 起動へ落ちる。
+
+/// 融合カーネルの引数の数 (ABI 検査)。
+const EXP_DS_NARGS: usize = 9;
+
+struct ExpDsKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// 型ごとの融合 GEMV ([`crate::model::exp_iq::slot`] の順)
+    fns: [CUfunction; crate::model::exp_iq::SLOTS],
+}
+
+unsafe impl Send for ExpDsKernels {}
+unsafe impl Sync for ExpDsKernels {}
+
+static EXP_DS_KERNELS: OnceLock<Option<ExpDsKernels>> = OnceLock::new();
+
+/// 融合 PTX の置き場所 (`DENNO_EXP_IQ_DS_PTX` で差し替え可)。
+fn exp_ds_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_IQ_DS_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_ds.ptx"),
+    }
+}
+
+/// `.visible .entry NAME(` の次の `)` までに `.param` が何本あるか。
+///
+/// task 68 の `ptx_entry_params` と同じ規約 (nvcc は引数名を `NAME_param_N` に
+/// するので source の名前は残らない)。融合カーネルは 9 引数で、down 用の 8 引数
+/// カーネルとは別 ABI。数が合わない PTX を撃つと**黙って壊れる**ので先に弾く。
+fn exp_ds_entry_params(ptx: &str, name: &str) -> Option<usize> {
+    let head = format!(".visible .entry {name}(");
+    let i = ptx.find(&head)?;
+    let rest = &ptx[i + head.len()..];
+    let end = rest.find(')').unwrap_or(rest.len());
+    Some(rest[..end].matches(".param").count())
+}
+
+/// 融合カーネル一式 (初回だけ PTX を読む。失敗は None を焼き付ける)。
+fn exp_ds_kernels() -> Option<&'static ExpDsKernels> {
+    EXP_DS_KERNELS
+        .get_or_init(|| {
+            let path = exp_ds_ptx_path();
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "[exp-ds] PTX が読めない ({}) : {e} → 従来の 2 起動へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            for i in 0..crate::model::exp_iq::SLOTS {
+                let name = crate::model::exp_iq::ds_kernel_name(i)?;
+                match exp_ds_entry_params(&text, name) {
+                    Some(EXP_DS_NARGS) => {}
+                    other => {
+                        eprintln!(
+                            "[exp-ds] PTX の {name} の引数が {other:?} 本 (期待 {EXP_DS_NARGS})\
+                             → 従来の 2 起動へ"
+                        );
+                        return None;
+                    }
+                }
+            }
+            let mut image = text.into_bytes();
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[exp-ds] cuModuleLoadData 失敗 → 従来の 2 起動へ");
+                    return None;
+                }
+            }
+            let mut fns: [CUfunction; crate::model::exp_iq::SLOTS] =
+                [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
+            for (i, f) in fns.iter_mut().enumerate() {
+                let name = crate::model::exp_iq::ds_kernel_name(i)?;
+                let mut cname = name.as_bytes().to_vec();
+                cname.push(0);
+                unsafe {
+                    if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[exp-ds] PTX に {name} が無い → 従来の 2 起動へ");
+                        return None;
+                    }
+                }
+            }
+            Some(ExpDsKernels { module, fns })
+        })
+        .as_ref()
+}
+
 /// decode の層一括 GEMV に使うカーネル一式。
 ///
 /// `DENNO_EXP_IQ_V2=1` かつ v2 の PTX が読めたときだけ v2。それ以外は v1
@@ -9530,7 +9636,65 @@ where
                 dec_exp_kprof::mark(dec_exp_kprof::SILU);
             }
             // 3. down (expert ごとの act を読む)
-            {
+            //
+            // task 480: `DENNO_DEC_EXPDOWN=ds|ds8` かつ形が合う層 (nseg == 10、
+            // 量子型のブロックが ff を割り切る) は **和まで 1 起動に畳む**。
+            // 出力は和と同じ先 (zc の pinned / VRAM の作業域) へ書くので、
+            // 下の D2H の経路は従来のまま。形が合わない層は 2 起動へ落とす。
+            let ds_rows = crate::model::exp_iq::exp_down_rows();
+            let ds_ready = ds_rows > 0
+                && sum_mode
+                && nseg == crate::model::exp_iq::EXP_DS_NS
+                && crate::model::exp_iq::ds_block_elems(slot_d)
+                    .is_some_and(|ch| ch > 0 && ff.is_multiple_of(ch));
+            let mut ds_src: Option<u64> = None;
+            if ds_ready {
+                if let Some(f) = exp_ds_kernels().map(|k| k.fns[slot_d]) {
+                    let out_ptr = if zc {
+                        sc.psum_zc.as_ref().expect("確保済み").ptr as u64
+                    } else {
+                        sc.psum.as_ref().expect("確保済み").ptr
+                    };
+                    let mut pw = pd_addr as *mut c_void;
+                    let mut px = act.ptr;
+                    let mut pwv = w_addr as *mut c_void;
+                    let mut po = out_ptr;
+                    let mut ps = sgd_addr as *mut c_void;
+                    let (mut ns, mut ni, mut no, mut rb) = (
+                        nseg as c_int,
+                        ff as c_int,
+                        e as c_int,
+                        crate::model::exp_iq::row_bytes(ty_d, ff).unwrap_or(0) as c_int,
+                    );
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut pwv as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ps as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void,
+                        &mut ni as *mut _ as *mut c_void,
+                        &mut no as *mut _ as *mut c_void,
+                        &mut rb as *mut _ as *mut c_void,
+                    ];
+                    let tiles = e.div_ceil(ds_rows).max(1) as u32;
+                    ctx.launch_async(
+                        f,
+                        (tiles, 1, 1),
+                        ((32 * ds_rows) as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                    dec_exp_kprof::mark(dec_exp_kprof::DOWN);
+                    dec_exp_kprof::mark(dec_exp_kprof::SUM);
+                    crate::model::exp_iq::note_ds_layer();
+                    ds_src = Some(out_ptr);
+                } else {
+                    // PTX が無い / ABI が違う (1 行は読み込み時に出る)。
+                    crate::model::exp_iq::note_ds_fallback();
+                }
+            }
+            if ds_src.is_none() {
                 let mut pw = pd_addr as *mut c_void;
                 let mut px = act.ptr;
                 let mut po = h.ptr;
@@ -9563,7 +9727,10 @@ where
             // 3.5 task 187: ヒットの寄与をデバイスで重み付き和にする
             //     (`out[j] = sum_t w[t] * h[t*e+j]`)。t 昇順の 1 アキュムレータ
             //     なので、ミスの無い層ではホストの足し込みとビット一致する。
-            let src_ptr = if let Some(sk) = sumk {
+            //     task 480: 融合した層はすでに和まで書けている (起動しない)。
+            let src_ptr = if let Some(p) = ds_src {
+                p
+            } else if let Some(sk) = sumk {
                 // task 356 (`DENNO_DEC_EXP_SUM_ZC`): 和の出力を pinned のホストへ
                 // 直接書かせる (UVA なのでホストのアドレスがそのままデバイスの
                 // アドレス)。これで 10 KB の D2H とその完了待ちが丸ごと消える。
@@ -66204,6 +66371,43 @@ mod pf_ple_dev_tests {
                 hmax / hscale < 1e-5,
                 "head={head}: 履歴が違う (max|diff|/scale = {})",
                 hmax / hscale
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod exp_ds_tests {
+    use super::*;
+
+    /// task 480: PTX の `.param` 数え上げ (ABI 検査) の書式。
+    ///
+    /// nvcc の実出力と同じ形 (合成文字列) と、収録済み PTX があればそれ。
+    #[test]
+    fn task480_ds_ptx_abi_parse() {
+        let synth = ".visible .entry dno_exp_gemv_ds_iq4nl(\n\t.param .u64 dno_exp_gemv_ds_iq4nl_param_0,\n\t.param .u64 dno_exp_gemv_ds_iq4nl_param_1,\n\t.param .u64 dno_exp_gemv_ds_iq4nl_param_2,\n\t.param .u64 dno_exp_gemv_ds_iq4nl_param_3,\n\t.param .u64 dno_exp_gemv_ds_iq4nl_param_4,\n\t.param .u32 dno_exp_gemv_ds_iq4nl_param_5,\n\t.param .u32 dno_exp_gemv_ds_iq4nl_param_6,\n\t.param .u32 dno_exp_gemv_ds_iq4nl_param_7,\n\t.param .u32 dno_exp_gemv_ds_iq4nl_param_8\n)\n{\n";
+        assert_eq!(
+            exp_ds_entry_params(synth, "dno_exp_gemv_ds_iq4nl"),
+            Some(EXP_DS_NARGS)
+        );
+        assert_eq!(exp_ds_entry_params(synth, "dno_exp_gemv_ds_iq2s"), None);
+        // 8 引数 (v2 の ABI) は弾く。
+        let short = synth.replace("\t.param .u32 dno_exp_gemv_ds_iq4nl_param_8\n", "");
+        assert_eq!(
+            exp_ds_entry_params(&short, "dno_exp_gemv_ds_iq4nl"),
+            Some(EXP_DS_NARGS - 1)
+        );
+        // 収録済みの PTX があれば、6 本とも 9 引数であること。
+        let path = exp_ds_ptx_path();
+        let Ok(ptx) = std::fs::read_to_string(&path) else {
+            return; // まだ生成していない (lab の前) はここまで。
+        };
+        for i in 0..crate::model::exp_iq::SLOTS {
+            let name = crate::model::exp_iq::ds_kernel_name(i).expect("slot");
+            assert_eq!(
+                exp_ds_entry_params(&ptx, name),
+                Some(EXP_DS_NARGS),
+                "{name} の引数の数が .cu と違う"
             );
         }
     }

@@ -360,6 +360,149 @@ pub fn sum_zc_reset() {
 }
 
 // ---------------------------------------------------------------------------
+// task 480: expert の down GEMV と重み付き和を 1 起動に畳む (`DENNO_DEC_EXPDOWN`)
+// ---------------------------------------------------------------------------
+//
+// lab t476a の `[dec-exp-kprof]` は 1 層あたり down 16.6 us + sum 4.2 us
+// (48 層/token)。sum は 2,560 要素の和に 4.2 us = 起動律速で、down は短い GEMV
+// なので 1 warp が同時に持つロードが 1 本しかない。
+//
+// `kernels_exp_iq_ds.cu` の `dno_exp_gemv_ds_<type>` は **1 出力行を nseg 個ぶん
+// まとめて**計算し、t 昇順の重み付き和を `D2H` 無しで直接書く (`DENNO_DEC_EXP_SUM_ZC`
+// と同じ pinned のホスト / または VRAM の作業域)。値は v2 の down と
+// `dno_dec_exp_sum` の合成とビット一致 (同じレーン割り・同じアキュムレータ 4 本・
+// 同じ和の順)。
+//
+// ゲートは**既存 env の値でも張れる** (`DENNO_DEC_EXPGU=ds` / `ds8`)。lab の COND が
+// 新しい env 名を落とすことがあるため (t294b)、両方を受ける。
+
+/// `DENNO_DEC_EXPDOWN`: `ds` = 4 行/ブロック、`ds8` = 8 行/ブロック。既定 off。
+pub const EXP_DOWN_ENV: &str = "DENNO_DEC_EXPDOWN";
+
+/// 畳む segment 数 (`kernels_exp_iq_ds.cu` の `DS_NS` と一致させる)。
+pub const EXP_DS_NS: usize = 10;
+
+/// [`EXP_DOWN_ENV`] の解釈。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpDown {
+    /// 従来の 2 起動 (down + sum)。
+    Off,
+    /// 融合カーネル、1 ブロック = 4 warp。
+    Ds4,
+    /// 融合カーネル、1 ブロック = 8 warp (同じ act を覆う行数が増える)。
+    Ds8,
+}
+
+/// `DENNO_DEC_EXPDOWN` の値の解釈 (純関数)。
+///
+/// `ds` / `4` / `ds4` が 4 行、`ds8` / `8` が 8 行。それ以外は off。
+pub fn exp_down_from_value(v: Option<&str>) -> ExpDown {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("ds" | "ds4" | "4") => ExpDown::Ds4,
+        Some("ds8" | "8") => ExpDown::Ds8,
+        _ => ExpDown::Off,
+    }
+}
+
+/// 2 つの env から決める (新しい名前を優先し、無ければ既存名の値で張れる)。
+pub fn exp_down_pick(down: Option<&str>, gu: Option<&str>) -> ExpDown {
+    match exp_down_from_value(down) {
+        ExpDown::Off => exp_down_from_value(gu),
+        v => v,
+    }
+}
+
+/// ゲートが有効か (プロセスで 1 回だけ env を読む)。
+pub fn exp_down_enabled() -> ExpDown {
+    static MODE: std::sync::OnceLock<ExpDown> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        exp_down_pick(
+            std::env::var(EXP_DOWN_ENV).ok().as_deref(),
+            std::env::var("DENNO_DEC_EXPGU").ok().as_deref(),
+        )
+    })
+}
+
+/// 1 ブロックあたりの行数 (0 = 融合しない)。
+pub fn exp_down_rows() -> usize {
+    match exp_down_enabled() {
+        ExpDown::Off => 0,
+        ExpDown::Ds4 => 4,
+        ExpDown::Ds8 => 8,
+    }
+}
+
+/// 融合カーネルの名前 (量子型のスロット -> `kernels_exp_iq_ds.cu` のエントリ)。
+pub fn ds_kernel_name(slot: usize) -> Option<&'static str> {
+    Some(match slot {
+        0 => "dno_exp_gemv_ds_iq2s",
+        1 => "dno_exp_gemv_ds_iq3xxs",
+        2 => "dno_exp_gemv_ds_iq3s",
+        3 => "dno_exp_gemv_ds_iq4xs",
+        4 => "dno_exp_gemv_ds_iq4nl",
+        5 => "dno_exp_gemv_ds_q2_0",
+        _ => return None,
+    })
+}
+
+/// 1 ブロック (量子ブロック) が覆う要素数 = カーネルが k を割り切れるかの判定。
+pub fn ds_block_elems(slot: usize) -> Option<usize> {
+    Some(match slot {
+        0..=3 => 256,
+        4 => 32,
+        5 => 64,
+        _ => return None,
+    })
+}
+
+/// 融合カーネルを撃った層の数 (**分岐が発火した証拠**)。
+static DS_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// ゲートは on だが形が合わず従来の 2 起動へ落ちた層の数。
+static DS_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 融合カーネルを撃った層を 1 つ数える。
+pub fn note_ds_layer() {
+    DS_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 形が合わず従来経路へ落ちた層を 1 つ数える。
+pub fn note_ds_fallback() {
+    DS_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 リクエストぶんの 1 行 (ゲート on でも 0 層なら `None`)。
+pub fn exp_down_line() -> Option<String> {
+    exp_down_line_with(exp_down_enabled())
+}
+
+/// [`exp_down_line`] の本体 (ゲートの値と行数を引数で受ける = テストで踏める)。
+fn exp_down_line_with(mode: ExpDown) -> Option<String> {
+    if !matches!(mode, ExpDown::Ds4 | ExpDown::Ds8) {
+        return None;
+    }
+    let layers = DS_LAYERS.load(Ordering::Relaxed);
+    let fb = DS_FALLBACKS.load(Ordering::Relaxed);
+    if layers == 0 && fb == 0 {
+        return None;
+    }
+    let rows = match mode {
+        ExpDown::Off => 0,
+        ExpDown::Ds4 => 4,
+        ExpDown::Ds8 => 8,
+    };
+    Some(format!(
+        "[exp-ds] ds_layers={layers} rows={rows} fallback={fb}"
+    ))
+}
+
+/// 積算を 0 に戻す (リクエスト終端)。
+pub fn exp_down_reset() {
+    for c in [&DS_LAYERS, &DS_FALLBACKS] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // task 388: ミスの CPU 計算を GPU の起動と重ねる (`DENNO_DEC_MISS_SPAWN`)
 // ---------------------------------------------------------------------------
 //
@@ -1110,6 +1253,91 @@ mod tests {
         }
         for v in ["", "1", "on", "true", "yes", "2", "abc"] {
             assert!(sum_zc_from_value(Some(v)), "{v:?} は on (偽値だけ切る)");
+        }
+    }
+
+    /// task 480: `DENNO_DEC_EXPDOWN` の真理値表 (純関数)。
+    ///
+    /// 値は `ds` (4 行) / `ds8` (8 行) だけで、未設定と偽値は off。
+    /// 新しい env 名が lab の COND から落ちても、既存の `DENNO_DEC_EXPGU` の値で
+    /// 張れること (t294b の回避) も固定する。
+    #[test]
+    fn task480_exp_down_gate_truth_table() {
+        assert_eq!(exp_down_from_value(None), ExpDown::Off);
+        for v in ["", "0", "off", "false", "no", "1", "on", "ds3", " gu "] {
+            assert_eq!(exp_down_from_value(Some(v)), ExpDown::Off, "{v:?} は off");
+        }
+        for v in ["ds", "ds4", "4", " DS "] {
+            assert_eq!(exp_down_from_value(Some(v)), ExpDown::Ds4, "{v:?}");
+        }
+        for v in ["ds8", "8"] {
+            assert_eq!(exp_down_from_value(Some(v)), ExpDown::Ds8, "{v:?}");
+        }
+        // 2 つの env の合成: 新しい名前が優先、無ければ既存名の値。
+        assert_eq!(exp_down_pick(None, None), ExpDown::Off);
+        assert_eq!(exp_down_pick(None, Some("ds")), ExpDown::Ds4);
+        assert_eq!(exp_down_pick(Some("ds8"), Some("ds")), ExpDown::Ds8);
+        assert_eq!(exp_down_pick(Some("0"), Some("ds8")), ExpDown::Ds8);
+        assert_eq!(exp_down_pick(Some("ds"), Some("gu4")), ExpDown::Ds4);
+        // 行数と env 名。
+        assert_eq!(EXP_DOWN_ENV, "DENNO_DEC_EXPDOWN");
+        assert_eq!(EXP_DS_NS, 10, "kernels_exp_iq_ds.cu の DS_NS");
+    }
+
+    /// task 480: 積算の行 (ゲート off / 0 層なら出さない)。
+    #[test]
+    fn task480_exp_down_line_counts_layers() {
+        exp_down_reset();
+        assert!(exp_down_line_with(ExpDown::Off).is_none(), "off は行を出さない");
+        assert!(
+            exp_down_line_with(ExpDown::Ds4).is_none(),
+            "0 層なら行を出さない"
+        );
+        note_ds_layer();
+        note_ds_layer();
+        let line = exp_down_line_with(ExpDown::Ds4).expect("ゲート on なら行が出る");
+        assert!(line.contains("ds_layers=2"), "{line}");
+        assert!(line.contains("rows=4"), "{line}");
+        note_ds_fallback();
+        let line = exp_down_line_with(ExpDown::Ds8).expect("行が出る");
+        assert!(line.contains("rows=8"), "{line}");
+        assert!(line.contains("fallback=1"), "{line}");
+        exp_down_reset();
+        assert!(
+            exp_down_line_with(ExpDown::Ds8).is_none(),
+            "0 に戻したら行を出さない"
+        );
+    }
+
+    /// task 480: 融合カーネルの名前が .cu に在り、スロットの対応が v2 と揃う。
+    #[test]
+    fn task480_ds_kernel_names_match_cu() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let cu =
+            std::fs::read_to_string(dir.join("kernels_exp_iq_ds.cu")).expect(".cu が読めない");
+        // .cu の `#define DS_NS` と Rust の定数が一致する。
+        assert!(
+            cu.contains(&format!("#define DS_NS {EXP_DS_NS}")),
+            "DS_NS が Rust と違う"
+        );
+        for i in 0..SLOTS {
+            let name = ds_kernel_name(i).expect("slot");
+            assert!(
+                cu.contains(&format!("DS_DEFINE({name}, ")) || cu.contains(&format!(
+                    "__global__ void {name}("
+                )),
+                "{name} が .cu に無い"
+            );
+            // v2 の名前との取り違え防止 (融合版は必ず `_ds_` を含む)。
+            assert!(name.contains("_ds_"), "{name} に _ds_ が無い");
+            let ch = ds_block_elems(i).expect("block elems");
+            assert!(ch.is_power_of_two(), "slot {i} の CH={ch}");
+        }
+        assert_eq!(ds_kernel_name(SLOTS), None);
+        assert_eq!(ds_block_elems(SLOTS), None);
+        // 6 型ぶんのブロック幅が v2 のカーネルと一致する (取り違えると k の割り切りが狂う)。
+        for (i, ch) in [(0usize, 256usize), (1, 256), (2, 256), (3, 256), (4, 32), (5, 64)] {
+            assert_eq!(ds_block_elems(i), Some(ch), "slot {i}");
         }
     }
 
