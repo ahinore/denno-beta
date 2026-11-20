@@ -3196,11 +3196,30 @@ pub fn early_route_budget(mb: usize, kb: usize, rest_tok: usize) -> usize {
 
 /// `DENNO_PF_ER_KB_WIDE`: 窓の広い層 (`wide` = 残り 4 チャンク以上) の
 /// 先読み予算 (残りトークン 1 個あたり KiB)。**0 / 未設定 = 従来と同じ**
-/// ([`EARLY_ROUTE_KB_ENV`] の値)。
+/// ([`EARLY_ROUTE_KB_ENV`] の値 = 24)。
+///
+/// lab t490b (UD-Q4_K_XL、depth8k、14k cold、1 ラウンド) は 24 / 32 / 40 を
+/// 同じ run で並べた:
+///
+/// | COND | `er_MB` | 置き場へ入った `ra_MB` | experts 段 (ms) | 壁 (s) |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | b (24) | 14,166.6 | 12,700.8 | 16,529.6 | 20.00 |
+/// | **k32** | **18,880.6** | **14,026.8** | **15,887.7** | **19.33** |
+/// | k40 | 23,590.6 | 14,099.0 | 16,035.1 | 19.51 |
+/// | b2 (24) | 14,166.6 | 13,004.9 | 16,111.4 | 19.46 |
+///
+/// 予算を増やすと**計画**は増えるが、置き場へ入るのは窓 (残り 6 チャンクの
+/// attention、1 層 69 ms) が許す 14.0 GB で頭打ちになる。experts 段は
+/// baseline 2 本の中央値 16,320.5 に対し k32 が -2.6%、壁は -2.0%。
+/// 40 KiB は 32 より計画が多いだけで置き場へ入る量は同じなので、**32 を既定**
+/// にする (`DENNO_PF_ER_KB_WIDE=0` で task 474/486 の 24 に戻る)。
+/// 既定モデル (t490c) は 14k の壁 5.10 対 baseline 5.21/5.01 = ±0.2%、
+/// md5 は全 COND SAME で、効かない側に費用が出ないことを確認した。
 pub const ER_KB_WIDE_ENV: &str = "DENNO_PF_ER_KB_WIDE";
 
 /// [`ER_KB_WIDE_ENV`] の既定 (0 = 従来どおり [`DEFAULT_EARLY_ROUTE_KB`])。
-pub const DEFAULT_ER_KB_WIDE: usize = 0;
+/// lab t490b の A/B で 32 が勝ったので 32。0 で切り戻せる。
+pub const DEFAULT_ER_KB_WIDE: usize = 32;
 
 /// 予算の KiB/token の上限 (置き場 512 MiB ÷ 12,000 トークン ≈ 43 KiB。
 /// 明示指定の暴走だけを止める)。
