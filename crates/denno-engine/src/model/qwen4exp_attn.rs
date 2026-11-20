@@ -561,15 +561,28 @@ pub(crate) fn pf_kv_bulk_on() -> bool {
 /// task 505: `DENNO_PF_KV_NORESIZE` の env 名。
 pub const PF_KV_NORESIZE_ENV: &str = "DENNO_PF_KV_NORESIZE";
 
-/// 未設定のときの既定 (**測って採るまで off**)。切り戻しは `=0`。
-pub const DEFAULT_PF_KV_NORESIZE: bool = false;
+/// 未設定のときの既定 (**lab で採ったので on**)。切り戻しは `=0` / `off`。
+///
+/// 実測 (GPU ラボ、`MODEL=flash-next-UD-IQ3_XXS`、depth8k、PROFILE=1):
+///
+/// | 段 | run / COND | 3,826 cold | 14k cold |
+/// | --- | --- | --- | --- |
+/// | `full` 段の壁 | t505b b / nz | 109.9 / **105.0** ms | 868.0 / **780.9** ms |
+/// | `full` 段の壁 | t505c b / np / b2 | 108.5 / **95.5** / 108.9 ms | 840.3 / **782.8** / 831.6 ms |
+/// | `kv_push` | t505c b / np / b2 | 29.6 / **16.6** / 30.0 ms | 305.0 / **241.0** / 284.7 ms |
+///
+/// 3,826 は 2 ラウンドとも同じ向き (108.3-108.9 -> 95.5-95.6)、14k も
+/// (-6.9% / -6.7%)。壁時計は動かない (3,826 は 1.88 s で全 COND 同じ、
+/// 14k は 5.02-5.07 s が COND の位置で動く) — 段の勝ちだけを採った。
+/// デバイスへ渡るバイト列・ホストのキャッシュの中身は従来と同一 (md5 全 SAME)。
+pub const DEFAULT_PF_KV_NORESIZE: bool = true;
 
-/// [`PF_KV_NORESIZE_ENV`] の解釈 (明示的な真値だけ on)。
+/// [`PF_KV_NORESIZE_ENV`] の解釈 (未設定・空は既定、明示的な偽値だけ off)。
 pub fn pf_kv_noresize_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PF_KV_NORESIZE,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
 }
 
 /// ゼロ埋めせずに積むか (プロセスで 1 回だけ env を読む)。
@@ -836,17 +849,19 @@ mod attn_cache_tests {
         assert_eq!(a.v(0).unwrap(), b.v(0).unwrap(), "v が違う");
     }
 
-    /// task 505: 2 つのゲートの真理値表 (明示的な真値だけ on、未設定は既定 off)。
+    /// task 505: 2 つのゲートの真理値表。`DENNO_PF_KV_NORESIZE` は lab で採った
+    /// ので未設定・空は on (明示的な偽値だけ off)。`DENNO_PF_KV_PUSH_PAR` は off。
     #[test]
     fn task505_kv_push_gates_truth_table() {
-        for raw in [None, Some(""), Some("0"), Some("off"), Some("no")] {
+        assert!(
+            super::pf_kv_noresize_from_value(None),
+            "noresize: 未設定が off になった (lab で採ったので既定 on)"
+        );
+        assert!(super::pf_kv_noresize_from_value(Some("")));
+        for raw in [Some("0"), Some("off"), Some("no"), Some("false")] {
             assert!(
                 !super::pf_kv_noresize_from_value(raw),
                 "noresize が on になった: {raw:?}"
-            );
-            assert!(
-                !super::pf_kv_push_par_from_value(raw),
-                "push_par が on になった: {raw:?}"
             );
         }
         for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
@@ -854,6 +869,14 @@ mod attn_cache_tests {
                 super::pf_kv_noresize_from_value(raw),
                 "noresize が off のまま: {raw:?}"
             );
+        }
+        for raw in [None, Some(""), Some("0"), Some("off"), Some("no")] {
+            assert!(
+                !super::pf_kv_push_par_from_value(raw),
+                "push_par が on になった: {raw:?}"
+            );
+        }
+        for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
             assert!(
                 super::pf_kv_push_par_from_value(raw),
                 "push_par が off のまま: {raw:?}"
