@@ -12884,11 +12884,15 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
     assert!(CUDA_RS.contains("fn dn6_alive_for(c: GdnDecGemv) -> bool {"));
     assert!(CUDA_RS.contains("matches!(c, GdnDecGemv::Dn6 | GdnDecGemv::Dn8)"));
     // 起動点: GDN の qkv が dn8 を先に試し、形が合わなければ dn6 へ落ちる。
-    assert!(CUDA_RS.contains("let dn8 = gdn_dn8_plan(u.ty, u.k, u.n);"));
-    assert!(CUDA_RS.contains("fn gdn_dn8_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<MixDn8Plan> {"));
+    assert!(CUDA_RS.contains("let dn8 = gdn_dn8_plan(u.ty, u.k, u.n, gdn_dn8_rows());"));
+    assert!(CUDA_RS.contains("fn gdn_dn8_plan("));
+    assert!(CUDA_RS.contains("want_rows: usize,\n) -> Option<MixDn8Plan> {"));
     // out 側 (`dn8a`) の起動点と、np 32 倍数を許す口。
-    assert!(CUDA_RS.contains("let dn8_out = gdn_dn8_plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n);"));
-    assert!(CUDA_RS.contains("mix_dn8_plan_with(k, n, gdn_dn8_rows(), gdn_dn8_all())"));
+    assert!(CUDA_RS.contains("let dn8_out = gdn_dn8_plan(\n            req.out_unit.ty,"));
+    assert!(CUDA_RS.contains("mix_dn8_plan_with(k, n, want_rows, gdn_dn8_all())"));
+    // レジスタ上限 (t496b の error 701) で block を 640 に抑えていること。
+    assert!(CUDA_RS.contains("const MIX_DN8_MAX_BLOCK: usize = 640;"));
+    assert!(CUDA_RS.contains("const GDN_DN8_OUT_ROWS: usize = 4;"));
     // 発火の証拠 (`[mix-qchain]` の `dn8=`) と計数の reset。
     assert!(CUDA_RS.contains("pub fn mix_dn8_hits() -> u64 {"));
     assert!(CUDA_RS.contains("pub fn mix_dn8_reset() {"));

@@ -1695,11 +1695,15 @@ pub(crate) mod dec_kprof {
             // np が 32 の倍数の形 (out = 6,144 -> np 96) は既定では dn6 のまま。
             assert_eq!(mix_dn8_plan(6144, 2560, 4), None);
             // `dn8a` (allow_full) なら out の形も dn8 (x を rows 本で使い回す)。
-            let po = mix_dn8_plan_with(6144, 2560, 8, true).expect("out の dn8a 計画");
-            assert_eq!((po.np, po.rows, po.block, po.grid), (96, 8, 768, 320));
-            assert_eq!(po.shmem, (96 * 65 + 768) * 4);
-            // allow_full でも items > 1024 は受けない。
-            assert_eq!(mix_dn8_plan_with(6144, 2560, 16, true), None);
+            let po = mix_dn8_plan_with(6144, 2560, 4, true).expect("out の dn8a 計画");
+            assert_eq!((po.np, po.rows, po.block, po.grid), (96, 4, 384, 640));
+            assert_eq!(po.shmem, (96 * 65 + 384) * 4);
+            // allow_full でも items > 1024 / block > 640 は受けない
+            // (t496b の d8a8 は block 768 で error 701 = LAUNCH_OUT_OF_RESOURCES)。
+            assert_eq!(mix_dn8_plan_with(6144, 2560, 16, true), None, "items 1536");
+            assert_eq!(mix_dn8_plan_with(6144, 2560, 8, true), None, "block 768");
+            // block の上限だけに当たる形 (np 168 = 10,752 / 100、shmem は 46 KB で収まる)。
+            assert_eq!(mix_dn8_plan(10752, 100, 4), None, "block 672");
             // 門番: n_in % 64 != 0 / n_out 0 / items > 1024 / shared > 48 KiB。
             assert_eq!(mix_dn8_plan(2592, 16384, 4), None);
             assert_eq!(mix_dn8_plan(2560, 0, 4), None);
@@ -6898,15 +6902,28 @@ fn gdn_dn8_all() -> bool {
 ///
 /// Q8_0 で、ゲートが dn8 のときだけ。np が 32 の倍数の形 (out = np 96 など) は
 /// `mix_dn8_plan` が `None` を返すので dn6 のまま。
-fn gdn_dn8_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<MixDn8Plan> {
+fn gdn_dn8_plan(
+    ty: crate::kquant::GgmlType,
+    k: usize,
+    n: usize,
+    want_rows: usize,
+) -> Option<MixDn8Plan> {
     if ty != crate::kquant::GgmlType::Q8_0
         || !gdn_dec_gemv_dn8_on()
         || mix_dn8_kernels().is_none()
     {
         return None;
     }
-    mix_dn8_plan_with(k, n, gdn_dn8_rows(), gdn_dn8_all())
+    mix_dn8_plan_with(k, n, want_rows, gdn_dn8_all())
 }
+
+/// out 投影を dn8 で撃つときの rows (4 固定)。
+///
+/// out は np = 96 で dn6 でもレーンは 100% なので、狙いは x (y ベクトル
+/// 6,144 本 = 24 KB) を 1 ブロック 1 回にすること。rows=4 で
+/// 1,280 -> 640 ブロック = x のグローバル読みが 31 MB -> 15.5 MB。block は
+/// 384 (レジスタ上限 640 の内側)。
+const GDN_DN8_OUT_ROWS: usize = 4;
 
 /// task 422: GDN の qkv/out 用の rows (純関数。既定 6 = block 960)。
 pub fn gdn_dn6_rows_from_value(v: Option<&str>) -> usize {
@@ -35808,6 +35825,15 @@ const MIX_DN8_MAX_THREADS: usize = 1024;
 /// t496a で rows 2 -> 4 -> 8 が単調に良かったので 16 まで試せるようにする)。
 const MIX_DN8_MAX_ROWS: usize = 16;
 
+/// 1 ブロックのスレッド数上限 (レジスタの都合)。
+///
+/// `.cu` は 1 レーンが x の 64 要素をレジスタに持つので ~100 レジスタ/スレッド
+/// 使う。t496b の `d8a8` (out を block 768 で撃った回) は
+/// `cuLaunchKernel が失敗: error 701` = LAUNCH_OUT_OF_RESOURCES で落ちた
+/// (768 x 100 > 65,536)。640 は t496b の `d8a16` (qkv を block 640 で撃った回)
+/// で通っているので、それを上限にする。
+const MIX_DN8_MAX_BLOCK: usize = 640;
+
 /// shared の上限 (x の詰め物込み。48 KiB を超える形は dn6 へ)。
 const MIX_DN8_MAX_SHMEM: usize = 48 * 1024;
 
@@ -35939,6 +35965,9 @@ pub fn mix_dn8_plan_with(
         return None;
     }
     let block = 32 * items.div_ceil(32);
+    if block > MIX_DN8_MAX_BLOCK {
+        return None;
+    }
     if lane_gain {
         // dn6 の埋まり (32 * ceil(np / 32) レーン) より 5 ポイント以上良いときだけ。
         let dn6_lanes = 32 * np.div_ceil(32);
@@ -64422,7 +64451,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         }
         for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
             // task 496: 先に dn8 (レーン詰め版)。np が 32 の倍数の形は None で dn6 へ。
-            let dn8 = gdn_dn8_plan(u.ty, u.k, u.n);
+            let dn8 = gdn_dn8_plan(u.ty, u.k, u.n, gdn_dn8_rows());
             if let (Some(dp), Some(rb)) = (dn8, gguf_row_bytes(u.ty, u.k)) {
                 launch_mix_dn8(
                     ctx,
@@ -64532,7 +64561,12 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         stage_sync!("scan");
         // task 496: out 投影も `dn8a` のときは dn8 (np が 32 の倍数でも x を
         // shared へ 1 回だけ置く形が効くかを見る)。np 96 の形は dn8a でのみ。
-        let dn8_out = gdn_dn8_plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n);
+        let dn8_out = gdn_dn8_plan(
+            req.out_unit.ty,
+            req.out_unit.k,
+            req.out_unit.n,
+            GDN_DN8_OUT_ROWS,
+        );
         if let (Some(dp), Some(rb)) = (dn8_out, gguf_row_bytes(req.out_unit.ty, req.out_unit.k))
         {
             launch_mix_dn8(
