@@ -3839,7 +3839,20 @@ impl DevBuffer {
         // (47MB で数 ms)。未初期化領域へ直接 D2H し、コピー完了後に set_len する
         // (cuMemcpyDtoH は同期コピーなので戻った時点で全要素が埋まっている)。
         let mut out: Vec<T> = Vec::with_capacity(len);
-        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        // task 518: 小さな往復 (`DENNO_DEC_PIN_SMALL`) と大きな転送
+        // (`DENNO_PF_PIN_STAGE`) は pinned バウンス経由。ゲート off / 確保失敗 /
+        // 転送エラーは下の pageable 経路で丸ごとやり直す (値は同じ)。
+        if let Ok(Some(())) = with_pf_pin(bytes, |pin| unsafe {
+            check(
+                (lib()?.memcpy_dtoh)(pin, self.ptr, bytes),
+                "cuMemcpyDtoH (pin stage)",
+            )?;
+            std::ptr::copy_nonoverlapping(pin as *const u8, out.as_mut_ptr() as *mut u8, bytes);
+            Ok(())
+        }) {
+            unsafe { out.set_len(len) };
+            return Ok(out);
+        }
         let kp = dec_kprof::op_begin(|| "D2H".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
         let res = unsafe {
             check(
@@ -17382,6 +17395,50 @@ const PF_PIN_MAX_BYTES: usize = 256 << 20;
 /// ようにしておく。
 pub const PF_PIN_MIN_KB_ENV: &str = "DENNO_PF_PIN_MIN_KB";
 
+/// task 518: decode の**小さな往復** (層ごとの 4 KiB .. 1 MiB) を pinned バウンスへ。
+///
+/// # なぜ要るか (2026-11-21)
+///
+/// UD-Q4_K_XL の warm 短 decode (12.5 ms/tok) は 4 段すべてが GPU の帯域律速
+/// (experts 470 / ssm 420 / mix 300-390 GB/s) で、ホスト側に残っているのは
+/// **層ごとの小さな同期コピー**だけだった。1 トークンあたりの回数は
+/// seg experts の prologue H2D (10.8 KB) と結果 D2H (10 KB)、GDN の xba H2D
+/// (10.3 KB) と out D2H (10 KB)、full attention の KV ミラー H2D (65 KB) で、
+/// 48 層ぶん並ぶと 200 回前後になる。pageable の 10 KB コピーは 11 us/回
+/// (task 358 の実測) なので、1 トークンで 1-2 ms になりうる。
+///
+/// task 318 の 1 MiB の床は「pinned の確保そのものが高い」時代のもの。task 358 で
+/// 共有 1 本 (grow-only) になったので、床を外したときの損得は測り直す価値がある。
+/// ここでは **1 MiB 未満だけ**を対象にする (prefill の大きな転送は
+/// `DENNO_PF_PIN_STAGE` の判定のまま = 既存の数字を動かさない)。
+pub const DEC_PIN_SMALL_ENV: &str = "DENNO_DEC_PIN_SMALL";
+
+/// [`DEC_PIN_SMALL_ENV`] の解釈 (純関数)。**既定 off**、明示的な真値だけ on。
+pub fn dec_pin_small_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => false,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+    }
+}
+
+/// [`DEC_PIN_SMALL_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+fn dec_pin_small_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dec_pin_small_from_value(std::env::var(DEC_PIN_SMALL_ENV).ok().as_deref()))
+}
+
+/// task 518: 小さな往復の窓の下限 (4 KiB 未満は写しの固定費が勝つ)。上限は
+/// 既存の 1 MiB の床 (= それ以上は `DENNO_PF_PIN_STAGE` の担当)。
+const PF_PIN_SMALL_MIN_BYTES: usize = 4 << 10;
+
+/// task 518: `bytes` が「小さな往復」の窓に入るか (純関数)。
+fn pf_pin_small_window_from(small_on: bool, bytes: usize) -> bool {
+    small_on && (PF_PIN_SMALL_MIN_BYTES..PF_PIN_MIN_BYTES).contains(&bytes)
+}
+
 /// [`PF_PIN_MIN_KB_ENV`] の解釈 (純関数)。1..=262144 KiB に丸める。未設定は既定。
 fn pf_pin_min_kb_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -17520,7 +17577,13 @@ fn with_pf_pin<T>(
     bytes: usize,
     f: impl FnOnce(*mut c_void) -> Result<T>,
 ) -> Result<Option<T>> {
-    if bytes == 0 || !pf_pin_stage_on() || !pf_pin_window_ok(bytes) {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    // task 518: decode の小さな往復は専用の窓 (`DENNO_DEC_PIN_SMALL`)。
+    // prefill の大きな転送は従来どおり `DENNO_PF_PIN_STAGE` + 床 1 MiB の判定。
+    let big = pf_pin_stage_on() && pf_pin_window_ok(bytes);
+    if !big && !pf_pin_small_window_from(dec_pin_small_on(), bytes) {
         return Ok(None);
     }
     let m = pf_pin_shared();
@@ -66005,6 +66068,34 @@ mod task318_tests {
         assert_eq!(pf_pin_min_kb_from_value(Some("4")), 4);
         assert_eq!(pf_pin_min_kb_from_value(Some(" 64 ")), 64);
         assert_eq!(pf_pin_min_kb_from_value(Some("99999999")), 262_144);
+    }
+
+    /// task 518: 「小さな往復」の窓 (既定 off、4 KiB .. 1 MiB 未満) とゲートの解釈。
+    ///
+    /// ここが固定されていないと、ゲートを on にしても 1 発も pinned を通らない
+    /// (逆に prefill の大きな転送を巻き込んで既存の数字を動かす) という壊れ方をする。
+    #[test]
+    fn dec_pin_small_window_and_gate_truth_table() {
+        // ゲート off ならどんなサイズも窓の外。
+        assert!(!pf_pin_small_window_from(false, 10 << 10));
+        assert!(!pf_pin_small_window_from(false, 0));
+        // 窓の内側: 4 KiB / 10 KB / 65 KB。
+        assert!(pf_pin_small_window_from(true, 4 << 10));
+        assert!(pf_pin_small_window_from(true, 10 << 10));
+        assert!(pf_pin_small_window_from(true, 65 << 10));
+        // 下限の外 (4 KiB 未満) と上限の外 (1 MiB 以上 = 従来の担当)。
+        assert!(!pf_pin_small_window_from(true, (4 << 10) - 1));
+        assert!(!pf_pin_small_window_from(true, PF_PIN_MIN_BYTES));
+        assert!(!pf_pin_small_window_from(true, 0));
+        // env の解釈: 未設定・空・偽値は off、明示的な真値だけ on。
+        assert!(!dec_pin_small_from_value(None));
+        assert!(!dec_pin_small_from_value(Some("")));
+        assert!(!dec_pin_small_from_value(Some("0")));
+        assert!(!dec_pin_small_from_value(Some("off")));
+        assert!(!dec_pin_small_from_value(Some("yes please")));
+        assert!(dec_pin_small_from_value(Some("1")));
+        assert!(dec_pin_small_from_value(Some(" on ")));
+        assert!(dec_pin_small_from_value(Some("TRUE")));
     }
 
     /// task 358: 育つ判断は grow-only + 2 の冪切り上げ (確保の回数を数回に抑える)。
