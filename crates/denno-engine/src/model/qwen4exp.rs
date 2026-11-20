@@ -5488,7 +5488,24 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                                     .unwrap_or(false)
                             });
                         if rows_ok && crate::cuda::pf_ple_dev_ok(nt, hc, e, kern, dil, hist_len) {
-                            let mut flat = Vec::with_capacity(nt * e);
+                            // task 505: 平坦化バッファを使い回す (`DENNO_PF_PLE_FLAT_REUSE`)。
+                            // 従来は層チャンクごとに `Vec::with_capacity` で新しい
+                            // (nt * e * 4 B = 14k で 21 MB) を確保していたので、
+                            // 初回タッチのフォルトと munmap を層チャンクの数だけ払った。
+                            let reuse = pf_ple_flat_reuse_on();
+                            let mut flat = if reuse {
+                                PF_PLE_FLAT.with(|c| {
+                                    let mut v = c.borrow_mut();
+                                    let mut b = std::mem::take(&mut *v);
+                                    b.clear();
+                                    if b.capacity() < nt * e {
+                                        b.reserve(nt * e - b.capacity());
+                                    }
+                                    b
+                                })
+                            } else {
+                                Vec::with_capacity(nt * e)
+                            };
                             for t in 0..nt {
                                 flat.extend_from_slice(ples[t].as_deref().expect("rows_ok"));
                             }
@@ -5536,6 +5553,15 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                                         "層 {il}: PLE のデバイス経路: {e}"
                                     )))
                                 }
+                            }
+                            // task 505: バッファを返す (次の層チャンクが同じ容量を使い回す)。
+                            if reuse {
+                                PF_PLE_FLAT.with(|c| {
+                                    let mut v = c.borrow_mut();
+                                    if v.capacity() < flat.capacity() {
+                                        *v = flat;
+                                    }
+                                });
                             }
                         }
                     }
@@ -8454,6 +8480,34 @@ pub(crate) fn pf_ple_reuse_on() -> bool {
     *ON.get_or_init(|| pf_ple_reuse_from_value(std::env::var(PLE_REUSE_ENV).ok().as_deref()))
 }
 
+/// task 505: `DENNO_PF_PLE_FLAT_REUSE` — PLE のデバイス経路が作る `flat`
+/// (チャンクの全トークンの行を詰めた `nt × e`、14k で 21 MB) を使い回す。
+///
+/// 従来は層チャンクごとに `Vec::with_capacity` で新しく確保していたので、
+/// 初回タッチのフォルトと開放を 14k で 14 回 (PLE 層は 48 層中 2 層 x 7 チャンク)
+/// 払っていた。`DENNO_PF_PLE_REUSE` と同じ「全要素を書き直す」形なので、
+/// 使い回してもデバイスへ渡るバイト列は同じ。既定は測って採るまで **off**。
+pub const PLE_FLAT_REUSE_ENV: &str = "DENNO_PF_PLE_FLAT_REUSE";
+
+/// [`PLE_FLAT_REUSE_ENV`] の既定 (**off**)。切り戻しは `=0`。
+pub const DEFAULT_PLE_FLAT_REUSE: bool = false;
+
+/// [`PLE_FLAT_REUSE_ENV`] の解釈 (明示的な真値だけ on)。
+pub(crate) fn pf_ple_flat_reuse_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// `flat` を使い回すか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_ple_flat_reuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_ple_flat_reuse_from_value(std::env::var(PLE_FLAT_REUSE_ENV).ok().as_deref())
+    })
+}
+
 /// task 393: `DENNO_PF_PLE_PIN` — PLE 層の res 往復バッファを pinned にする。
 ///
 /// prefill は PLE 層 (このモデルは 48 層中 2 層) で残差を **ホストへ降ろして
@@ -8530,6 +8584,10 @@ thread_local! {
     /// task 300: PLE の射影バッファ (`key` / `value`)。grow-only。
     static PLE_KV_BUF: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    /// task 505: PLE の `flat` (チャンクの全トークンの行を詰めた `nt × e`)。
+    /// `DENNO_PF_PLE_FLAT_REUSE` のとき grow-only で使い回す。
+    static PF_PLE_FLAT: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// task 393: PLE の res 往復バッファ (スライスとして長さ `len` ちょうど).
@@ -26672,6 +26730,20 @@ mod tests {
             assert!(pf_ple_reuse_from_value(Some("1")));
             assert!(pf_ple_reuse_from_value(Some(" on ")));
             assert!(pf_ple_reuse_from_value(Some("TRUE")));
+
+            // task 505: `DENNO_PF_PLE_FLAT_REUSE` は測って採るまで既定 off。
+            for v in [None, Some(""), Some("0"), Some("off"), Some("no")] {
+                assert!(
+                    !pf_ple_flat_reuse_from_value(v),
+                    "flat_reuse が on になった: {v:?}"
+                );
+            }
+            for v in [Some("1"), Some("on"), Some(" on "), Some("TRUE")] {
+                assert!(
+                    pf_ple_flat_reuse_from_value(v),
+                    "flat_reuse が off のまま: {v:?}"
+                );
+            }
 
             // task 393: `DENNO_PF_PLE_PIN` は lab で採ったので既定 on
             // (明示的な偽値だけ off)。

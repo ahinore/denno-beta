@@ -698,8 +698,14 @@ pub const SUB_PF_ITTOP: usize = 40;
 pub const SUB_PF_ITAPRE: usize = 41;
 /// task 482: 早期 routing の先読み (`pf_early_route_prefetch`。層 1 回)。
 pub const SUB_PF_ER: usize = 42;
+/// task 505: full 層 KV のミラー書き戻しの**待ち** (`pf_kv_wb_copy_into` /
+/// `pf_kv_wb_with` の中の `cuEventSynchronize`)。14k の `full` 段の cpu 列が
+/// 502 ms あり、その中身が「待ち」か「写し」かで次の手が変わるので割る。
+pub const SUB_PF_KVWAIT: usize = 43;
+/// task 505: full 層 KV をホストのキャッシュへ積む写し (`AttnCache::push_many`)。
+pub const SUB_PF_KVPUSH: usize = 44;
 /// 副区間の数。
-pub const SUB_N: usize = 43;
+pub const SUB_N: usize = 45;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -745,6 +751,8 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "iter_top",
     "iter_apre",
     "pf_er",
+    "kv_wait",
+    "kv_push",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
@@ -1341,6 +1349,22 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task 505: full 層 KV 書き戻しの 2 つの副区間。
+    ///
+    /// 14k の `full` 段の cpu 列 (502 ms) を「待ち」と「写し」に割るための id。
+    /// 名前と添字が 1 対 1 で、既存の添字を動かしていないことを固定する。
+    #[test]
+    fn task505_kv_wb_sub_names_are_wired() {
+        let _g = lock();
+        assert_eq!(SUB_NAMES[SUB_PF_KVWAIT], "kv_wait");
+        assert_eq!(SUB_NAMES[SUB_PF_KVPUSH], "kv_push");
+        assert_eq!(SUB_PF_KVWAIT, 43);
+        assert_eq!(SUB_PF_KVPUSH, 44);
+        assert_eq!(SUB_N, SUB_PF_KVPUSH + 1);
+        assert_eq!(SUB_NAMES[SUB_PF_ER], "pf_er", "既存の添字が動いた");
+        assert_eq!(SUB_NAMES.len(), SUB_N, "名前の本数が SUB_N と違う");
+    }
 
     /// task 482: `other` の残差 (14k で 672 ms) を割る 3 つの副区間。
     ///
