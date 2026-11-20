@@ -1665,6 +1665,16 @@ pub(crate) mod dec_kprof {
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8r2")), 2);
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8r6")), 6);
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8r8")), 8);
+            assert_eq!(gdn_dn8_rows_from_value(Some("dn8r12")), 12);
+            assert_eq!(gdn_dn8_rows_from_value(Some("dn8r16")), 16);
+            assert_eq!(gdn_dn8_rows_from_value(Some("dn8ar8")), 8);
+            // `dn8a*` だけ「np が 32 の倍数の形にも dn8」。
+            assert!(!gdn_dn8_all_from_value(None));
+            assert!(!gdn_dn8_all_from_value(Some("dn8")));
+            assert!(!gdn_dn8_all_from_value(Some("dn8r8")));
+            assert!(gdn_dn8_all_from_value(Some("dn8a")));
+            assert!(gdn_dn8_all_from_value(Some("dn8ar8")));
+            assert!(gdn_dn8_all_from_value(Some(" D8A ")));
             // dn8 のときも dn6 は受け皿として生きている (np が 32 の倍数の単位)。
             assert!(dn6_alive_for(GdnDecGemv::Dn8));
             assert!(dn6_alive_for(GdnDecGemv::Dn6));
@@ -1678,8 +1688,18 @@ pub(crate) mod dec_kprof {
             assert_eq!(p.shmem, (40 * 65 + 160) * 4);
             // 同じ形でも rows=1 は dn6 と同じ埋まりなので受けない。
             assert_eq!(mix_dn8_plan(2560, 16384, 1), None);
-            // np が 32 の倍数の形 (out = 6,144 -> np 96) は dn6 のまま。
+            // rows=16 まで許す (items = 640 <= 1024、block 640、grid 1,024)。
+            let p16 = mix_dn8_plan(2560, 16384, 16).expect("rows=16 の計画");
+            assert_eq!((p16.rows, p16.block, p16.grid), (16, 640, 1024));
+            assert_eq!(p16.shmem, (40 * 65 + 640) * 4);
+            // np が 32 の倍数の形 (out = 6,144 -> np 96) は既定では dn6 のまま。
             assert_eq!(mix_dn8_plan(6144, 2560, 4), None);
+            // `dn8a` (allow_full) なら out の形も dn8 (x を rows 本で使い回す)。
+            let po = mix_dn8_plan_with(6144, 2560, 8, true).expect("out の dn8a 計画");
+            assert_eq!((po.np, po.rows, po.block, po.grid), (96, 8, 768, 320));
+            assert_eq!(po.shmem, (96 * 65 + 768) * 4);
+            // allow_full でも items > 1024 は受けない。
+            assert_eq!(mix_dn8_plan_with(6144, 2560, 16, true), None);
             // 門番: n_in % 64 != 0 / n_out 0 / items > 1024 / shared > 48 KiB。
             assert_eq!(mix_dn8_plan(2592, 16384, 4), None);
             assert_eq!(mix_dn8_plan(2560, 0, 4), None);
@@ -6747,7 +6767,11 @@ fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
         }
         // task 496: dn8 (レーン詰め版)。rows は `gdn_dn8_rows_from_value`。
         Some("dn8") | Some("d8") | Some("dn8r2") | Some("dn8r4") | Some("dn8r6")
-        | Some("dn8r8") | Some("d8r2") | Some("d8r4") | Some("d8r6") | Some("d8r8") => {
+        | Some("dn8r8") | Some("d8r2") | Some("d8r4") | Some("d8r6") | Some("d8r8")
+        | Some("dn8r12") | Some("dn8r16") | Some("d8r12") | Some("d8r16") | Some("dn8a")
+        | Some("d8a") | Some("dn8ar2") | Some("dn8ar4") | Some("dn8ar6") | Some("dn8ar8")
+        | Some("dn8ar12") | Some("dn8ar16") | Some("d8ar2") | Some("d8ar4")
+        | Some("d8ar6") | Some("d8ar8") | Some("d8ar12") | Some("d8ar16") => {
             GdnDecGemv::Dn8
         }
         // 明示 off は「v5 以前の既定」= v4 (task 179 の既定)。
@@ -6834,10 +6858,23 @@ fn dn8_on_for(c: GdnDecGemv) -> bool {
 /// `dn8r2` / `dn8r6` / `dn8r8` で行数を変える (A/B 用)。
 pub fn gdn_dn8_rows_from_value(v: Option<&str>) -> usize {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("dn8r2") | Some("d8r2") => 2,
-        Some("dn8r6") | Some("d8r6") => 6,
-        Some("dn8r8") | Some("d8r8") => 8,
+        Some("dn8r2") | Some("d8r2") | Some("dn8ar2") | Some("d8ar2") => 2,
+        Some("dn8r6") | Some("d8r6") | Some("dn8ar6") | Some("d8ar6") => 6,
+        Some("dn8r8") | Some("d8r8") | Some("dn8ar8") | Some("d8ar8") => 8,
+        Some("dn8r12") | Some("d8r12") | Some("dn8ar12") | Some("d8ar12") => 12,
+        Some("dn8r16") | Some("d8r16") | Some("dn8ar16") | Some("d8ar16") => 16,
         _ => 4,
+    }
+}
+
+/// `dn8a*` (= np が 32 の倍数の形にも dn8 を使う) か (純関数)。
+pub fn gdn_dn8_all_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("dn8a") | Some("d8a") => true,
+        Some(s) => {
+            s.starts_with("dn8a") || s.starts_with("d8a")
+        }
+        None => false,
     }
 }
 
@@ -6846,6 +6883,14 @@ fn gdn_dn8_rows() -> usize {
     static R: OnceLock<usize> = OnceLock::new();
     *R.get_or_init(|| {
         gdn_dn8_rows_from_value(std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref())
+    })
+}
+
+/// np が 32 の倍数の形にも dn8 を使うか (env から 1 回だけ読む)。
+fn gdn_dn8_all() -> bool {
+    static A: OnceLock<bool> = OnceLock::new();
+    *A.get_or_init(|| {
+        gdn_dn8_all_from_value(std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref())
     })
 }
 
@@ -6860,7 +6905,7 @@ fn gdn_dn8_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<MixDn
     {
         return None;
     }
-    mix_dn8_plan(k, n, gdn_dn8_rows())
+    mix_dn8_plan_with(k, n, gdn_dn8_rows(), gdn_dn8_all())
 }
 
 /// task 422: GDN の qkv/out 用の rows (純関数。既定 6 = block 960)。
@@ -35759,6 +35804,10 @@ const MIX_DN8_NARGS: usize = 7;
 /// 1 ブロックのスレッド上限 (items = rows * np)。
 const MIX_DN8_MAX_THREADS: usize = 1024;
 
+/// 1 ブロックが持つ行数の上限 (`.cu` は rows を引数で受けるだけなので自由。
+/// t496a で rows 2 -> 4 -> 8 が単調に良かったので 16 まで試せるようにする)。
+const MIX_DN8_MAX_ROWS: usize = 16;
+
 /// shared の上限 (x の詰め物込み。48 KiB を超える形は dn6 へ)。
 const MIX_DN8_MAX_SHMEM: usize = 48 * 1024;
 
@@ -35856,24 +35905,46 @@ fn dn8_fill(np: usize, lanes: usize) -> f64 {
 /// 前提: `np = n_in / 64` が 1 以上 / `np % 32 != 0` (32 の倍数なら dn6 で十分) /
 /// `items = rows * np <= 1024` / `shared = (np * 65 + items) * 4 <= 48 KiB`。
 pub fn mix_dn8_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<MixDn8Plan> {
+    mix_dn8_plan_with(n_in, n_out, want_rows, false)
+}
+
+/// [`mix_dn8_plan`] の本体。`allow_full` は「np が 32 の倍数の形 (dn6 で既に
+/// レーンが 100% 埋まる形) でも dn8 を使う」か。
+///
+/// その形でも dn8 は **x を shared に 1 回だけ置いて rows 本で使い回す**ので、
+/// x のグローバル読み (1 ブロックあたり n_in 本) が 1/rows になる
+/// (GDN の out は n_in = 6,144 で、rows=2 の dn6 は 1,280 ブロック x 24 KB を
+/// 読む)。レーンの詰まりは dn6 と同じなので、埋まりの比較は課さない。
+pub fn mix_dn8_plan_with(
+    n_in: usize,
+    n_out: usize,
+    want_rows: usize,
+    allow_full: bool,
+) -> Option<MixDn8Plan> {
     if n_in == 0 || n_in % 64 != 0 || n_out == 0 {
         return None;
     }
     let np = n_in / 64;
-    if np == 0 || np % 32 == 0 {
+    if np == 0 {
+        return None;
+    }
+    let lane_gain = np % 32 != 0;
+    if !lane_gain && !allow_full {
         // dn6 が既に 100% 埋まる (qkv の out 側や mix down はこちら)。
         return None;
     }
-    let rows = want_rows.clamp(1, 8);
+    let rows = want_rows.clamp(1, MIX_DN8_MAX_ROWS);
     let items = np.checked_mul(rows)?;
     if items == 0 || items > MIX_DN8_MAX_THREADS {
         return None;
     }
     let block = 32 * items.div_ceil(32);
-    // dn6 の埋まり (32 * ceil(np / 32) レーン) より 5 ポイント以上良いときだけ。
-    let dn6_lanes = 32 * np.div_ceil(32);
-    if dn8_fill(items, block) <= dn8_fill(np, dn6_lanes) + 0.05 {
-        return None;
+    if lane_gain {
+        // dn6 の埋まり (32 * ceil(np / 32) レーン) より 5 ポイント以上良いときだけ。
+        let dn6_lanes = 32 * np.div_ceil(32);
+        if dn8_fill(items, block) <= dn8_fill(np, dn6_lanes) + 0.05 {
+            return None;
+        }
     }
     let shmem = (np * 65 + items).checked_mul(4)?;
     if shmem > MIX_DN8_MAX_SHMEM {
@@ -64459,6 +64530,24 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         }
         scan_launched.set(true);
         stage_sync!("scan");
+        // task 496: out 投影も `dn8a` のときは dn8 (np が 32 の倍数でも x を
+        // shared へ 1 回だけ置く形が効くかを見る)。np 96 の形は dn8a でのみ。
+        let dn8_out = gdn_dn8_plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n);
+        if let (Some(dp), Some(rb)) = (dn8_out, gguf_row_bytes(req.out_unit.ty, req.out_unit.k))
+        {
+            launch_mix_dn8(
+                ctx,
+                &dp,
+                ow.buf.ptr(),
+                e.y.ptr(),
+                e.out.ptr(),
+                req.out_unit.k,
+                req.out_unit.n,
+                rb,
+            )?;
+            MIX_DN8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stage_sync!("out_gemv");
+        } else {
         // task 422: out 投影も Q8_0 で形が合えば dn6。
         match gdn_dn6_plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n) {
             Some((warps, rows)) => {
@@ -64484,6 +64573,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
                 req.nv * req.dv,
                 req.n_embd,
             )?,
+        }
         }
         stage_sync!("out_gemv");
         let out = e.out.to_vec::<f32>(req.n_embd)?;

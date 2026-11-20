@@ -12886,6 +12886,9 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
     // 起動点: GDN の qkv が dn8 を先に試し、形が合わなければ dn6 へ落ちる。
     assert!(CUDA_RS.contains("let dn8 = gdn_dn8_plan(u.ty, u.k, u.n);"));
     assert!(CUDA_RS.contains("fn gdn_dn8_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<MixDn8Plan> {"));
+    // out 側 (`dn8a`) の起動点と、np 32 倍数を許す口。
+    assert!(CUDA_RS.contains("let dn8_out = gdn_dn8_plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n);"));
+    assert!(CUDA_RS.contains("mix_dn8_plan_with(k, n, gdn_dn8_rows(), gdn_dn8_all())"));
     // 発火の証拠 (`[mix-qchain]` の `dn8=`) と計数の reset。
     assert!(CUDA_RS.contains("pub fn mix_dn8_hits() -> u64 {"));
     assert!(CUDA_RS.contains("pub fn mix_dn8_reset() {"));
