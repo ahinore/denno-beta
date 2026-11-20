@@ -1613,18 +1613,18 @@ pub(crate) mod dec_kprof {
         /// 合わない単位は v4 へ落ちるので、既定は「v5 を試す」でよい。
         #[test]
         fn gdn_dec_gemv_parse_truth_table() {
-            // task 422: 未設定・空・未知の値は既定 (dn6。rows は 2)。
+            // task 496: 未設定・空・未知の値は既定 (dn8。rows は 8)。
             for raw in [None, Some(""), Some("  "), Some("x")] {
-                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Dn6, "raw={raw:?}");
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Dn8, "raw={raw:?}");
             }
             assert_eq!(gdn_dn6_rows_from_value(None), 2, "既定は 2 行");
             assert_eq!(gdn_dn6_rows_from_value(Some("dn6r4")), 4);
             assert_eq!(gdn_dn6_rows_from_value(Some("dn6r6")), 6);
-            // dn6 の値は全部 Dn6 へ (rows だけが変わる)。
+            // dn6 の値は全部 Dn6 へ (rows だけが変わる) = dn8 の切り戻し。
             for raw in ["dn6", "d6", "dn6r1", "dn6r2", "dn6r4", "dn6r6"] {
                 assert_eq!(parse_gdn_dec_gemv(Some(raw)), GdnDecGemv::Dn6, "raw={raw:?}");
             }
-            // dn6 のときも v5 の計画は生かす (形が合わない単位の受け皿)。
+            // dn6 / dn8 のときも v5 の計画は生かす (形が合わない単位の受け皿)。
             assert!(gdn_dec_gemv_v5_on());
             // 明示 off は v5 以前の既定 = v4。
             for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
@@ -1660,8 +1660,8 @@ pub(crate) mod dec_kprof {
             ] {
                 assert_eq!(parse_gdn_dec_gemv(Some(raw)), GdnDecGemv::Dn8, "raw={raw:?}");
             }
-            assert_eq!(gdn_dn8_rows_from_value(None), 4, "既定は 4 行");
-            assert_eq!(gdn_dn8_rows_from_value(Some("dn8")), 4);
+            assert_eq!(gdn_dn8_rows_from_value(None), 8, "既定は 8 行");
+            assert_eq!(gdn_dn8_rows_from_value(Some("dn8")), 8);
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8r2")), 2);
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8r6")), 6);
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8r8")), 8);
@@ -1669,7 +1669,7 @@ pub(crate) mod dec_kprof {
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8r16")), 16);
             assert_eq!(gdn_dn8_rows_from_value(Some("dn8ar8")), 8);
             // `dn8a*` だけ「np が 32 の倍数の形にも dn8」。
-            assert!(!gdn_dn8_all_from_value(None));
+            assert!(gdn_dn8_all_from_value(None), "既定は out も dn8");
             assert!(!gdn_dn8_all_from_value(Some("dn8")));
             assert!(!gdn_dn8_all_from_value(Some("dn8r8")));
             assert!(gdn_dn8_all_from_value(Some("dn8a")));
@@ -6745,6 +6745,15 @@ enum GdnDecGemv {
 /// その層は v4 のまま (53.6 us で不変)。戻すのは `DENNO_GDN_DEC_GEMV=v4`。
 const GDN_DEC_GEMV5_DEFAULT: bool = true;
 
+/// task 496: GDN の qkv/out の既定を dn8 (レーン詰め + x を shared) にする。
+///
+/// lab t496c (c042a09f6、depth8k、既定モデル、2 ラウンド) の同じ run の対で、
+/// base ssm 3.07/3.08 -> `dn8ar8` 2.94/2.95 (-4.2%、t496a/t496b の
+/// rows=8 = -3.4% と合わせて 3 run 連続)、短い decode 10.8 -> 10.6 (-1.4〜-1.9%)、
+/// md5 は全 6 文脈 SAME、errors 0。14k 後と prefill は不変 (±1% 以内)。
+/// 切り戻しは `DENNO_GDN_DEC_GEMV=dn6` (dn8 をやめる) / `=dn8` (out は dn6)。
+const GDN_DEC_GEMV_DN8_DEFAULT: bool = true;
+
 /// task 422: GDN の qkv/out の既定を dn6 (1 ブロック 2 行 / 1 レーン 1 対) にする。
 ///
 /// lab t422c (8aed5bd7b、depth8k、既定モデル) の同じ run の対で、`DENNO_MIX_QK`
@@ -6781,7 +6790,13 @@ fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
         // 明示 off は「v5 以前の既定」= v4 (task 179 の既定)。
         Some("0") | Some("off") | Some("false") | Some("no") => GdnDecGemv::V4,
         _ => {
-            if GDN_DEC_GEMV_DN6_DEFAULT {
+            // task 496: 既定は dn8 (lab t496c: ssm 3.07 -> 2.94 (-4.2%)、短い
+            // decode 10.8 -> 10.6、md5 SAME、errors 0。np が 32 の倍数の形や
+            // 形が合わない単位は dn6 / v5 が受け皿)。切り戻しは
+            // `DENNO_GDN_DEC_GEMV=dn6` (dn8 をやめる) / `=dn8` (out は dn6)。
+            if GDN_DEC_GEMV_DN8_DEFAULT {
+                GdnDecGemv::Dn8
+            } else if GDN_DEC_GEMV_DN6_DEFAULT {
                 GdnDecGemv::Dn6
             } else if GDN_DEC_GEMV5_DEFAULT {
                 GdnDecGemv::V5
@@ -6867,7 +6882,8 @@ pub fn gdn_dn8_rows_from_value(v: Option<&str>) -> usize {
         Some("dn8r8") | Some("d8r8") | Some("dn8ar8") | Some("d8ar8") => 8,
         Some("dn8r12") | Some("d8r12") | Some("dn8ar12") | Some("d8ar12") => 12,
         Some("dn8r16") | Some("d8r16") | Some("dn8ar16") | Some("d8ar16") => 16,
-        _ => 4,
+        // lab t496c (既定モデル、depth8k) で rows=8 が最良 (ssm 3.07 -> 2.97)。
+        _ => 8,
     }
 }
 
@@ -6875,10 +6891,10 @@ pub fn gdn_dn8_rows_from_value(v: Option<&str>) -> usize {
 pub fn gdn_dn8_all_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("dn8a") | Some("d8a") => true,
-        Some(s) => {
-            s.starts_with("dn8a") || s.starts_with("d8a")
-        }
-        None => false,
+        Some(s) => s.starts_with("dn8a") || s.starts_with("d8a"),
+        // lab t496c の `d8ar8` (out も dn8、rows=4) が ssm 2.94 = 既定より -4.2%。
+        // 未設定 (既定) は out も dn8。`DENNO_GDN_DEC_GEMV=dn8` で out は dn6 へ。
+        None => true,
     }
 }
 
