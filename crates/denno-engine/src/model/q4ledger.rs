@@ -689,8 +689,17 @@ pub const SUB_PF_MIXKEEP: usize = 37;
 pub const SUB_PF_COMB: usize = 38;
 /// task 419: 層ループの 1 回転のうち**どの区間にも入らない**ホスト時間。
 pub const SUB_PF_ITER: usize = 39;
+/// task 482: 1 回転の入口 (残差の復帰 / steer / PLE の待ち) の壁時計。
+///
+/// `other` (14k で 924 ms = 壁の 8%) の残差は「どの副区間にも入らない」ぶんが
+/// 672 ms あり、中身が読めなかった。回転の中の名前の無い区間を 3 つに割る。
+pub const SUB_PF_ITTOP: usize = 40;
+/// task 482: attention 入口の下ごしらえ (`curs` の組み立て / `pf_attn_dev_*`)。
+pub const SUB_PF_ITAPRE: usize = 41;
+/// task 482: 早期 routing の先読み (`pf_early_route_prefetch`。層 1 回)。
+pub const SUB_PF_ER: usize = 42;
 /// 副区間の数。
-pub const SUB_N: usize = 40;
+pub const SUB_N: usize = 43;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -733,6 +742,9 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "mix_keep",
     "comb_at",
     "iter",
+    "iter_top",
+    "iter_apre",
+    "pf_er",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
@@ -1329,6 +1341,40 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task 482: `other` の残差 (14k で 672 ms) を割る 3 つの副区間。
+    ///
+    /// 名前と添字が 1 対 1 であること、`sub` が実際に親 `other` へ積まれること
+    /// (名前付き区間の外でも `CUR` は `OTHER` なので、そこの `sub` は
+    /// `other` の行に出る) を固定する。
+    #[test]
+    fn task482_iter_residual_sub_names_are_wired() {
+        let _g = lock();
+        assert_eq!(SUB_NAMES[SUB_PF_ITTOP], "iter_top");
+        assert_eq!(SUB_NAMES[SUB_PF_ITAPRE], "iter_apre");
+        assert_eq!(SUB_NAMES[SUB_PF_ER], "pf_er");
+        assert!(SUB_PF_ITTOP < SUB_N && SUB_PF_ITAPRE < SUB_N && SUB_PF_ER < SUB_N);
+        // 既存の添字を動かしていないこと (lab の台帳と読み比べるため)。
+        assert_eq!(SUB_NAMES[SUB_PF_ITER], "iter");
+        assert_eq!(SUB_NAMES[SUB_RES_PARK], "res_park");
+    }
+
+    /// task 482: 名前付き区間の外で開いた `sub` は `other` に積まれる。
+    #[test]
+    fn task482_sub_outside_named_region_lands_on_other() {
+        let _g = lock();
+        set_for_test(true);
+        reset();
+        {
+            let _s = sub(SUB_PF_ER);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let got = sub_ns(OTHER, SUB_PF_ER);
+        assert!(got > 0, "other/pf_er が積まれていない");
+        assert_eq!(sub_ns(SSM, SUB_PF_ER), 0, "親が混ざっている");
+        reset();
+        set_for_test(false);
+    }
 
     /// 積算はプロセス共通なので 1 本ずつ回す (moe と同じロック)。
     fn lock() -> std::sync::MutexGuard<'static, ()> {
