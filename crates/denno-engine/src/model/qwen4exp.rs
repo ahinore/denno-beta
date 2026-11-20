@@ -19044,6 +19044,16 @@ fn pf_early_route_prefetch(
     if !crate::model::exp_pf::early_route_on() {
         return None;
     }
+    // task 482: 窓が足りない層は、この先の routing (GPU の router GEMV + D2H) も
+    // VRAM 参照も置き場の計画も**まるごと**要らない (この関数は最後に `None` を
+    // 返して何もしない)。以前はその判定が後ろにあり、3,826 (2 チャンク) でも
+    // 48 層ぶん払っていた (lab t482a: `sub other pf_er=72.6/90.1 ms`)。
+    // `DENNO_PF_ER_EARLY_EXIT=0` で task 474 と同じ順序へ戻せる。
+    if crate::model::exp_pf::er_early_exit_on()
+        && !crate::model::exp_pf::early_route_window_ok(nt0, nt_all)
+    {
+        return None;
+    }
     // 窓が無い (1 チャンクで終わる) / 形が合わない層は何もしない。
     if nt0 == 0 || nt0 >= nt_all || k == 0 || ne == 0 || lw.gate_inp.k() != e {
         return None;

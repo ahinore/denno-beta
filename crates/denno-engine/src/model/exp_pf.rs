@@ -3118,11 +3118,42 @@ pub const EARLY_ROUTE_MIN_REST_CHUNKS: usize = 4;
 ///
 /// 「残りのチャンクが [`EARLY_ROUTE_MIN_REST_CHUNKS`] 本以上」= 窓が
 /// `4 × nt0` トークン以上あること。1 チャンクで終わる層 (窓なし) も false。
+///
+/// task 482: この判定は [`crate::model::qwen4exp`] の
+/// `pf_early_route_prefetch` の**先頭**でも使う ([`er_early_exit_on`])。
+/// 以前は routing (GPU の router GEMV + D2H) と VRAM 参照の後ろにあり、
+/// 窓が足りない 3,826 でも 48 層ぶんそれを払っていた (lab t482a の
+/// `sub other pf_er=72.6/90.1 ms`)。
 pub fn early_route_window_ok(nt0: usize, nt_all: usize) -> bool {
     if nt0 == 0 || nt_all <= nt0 {
         return false;
     }
     nt_all - nt0 >= nt0.saturating_mul(EARLY_ROUTE_MIN_REST_CHUNKS)
+}
+
+/// task 482: 窓の判定を `pf_early_route_prefetch` の**先頭**へ移すか
+/// (`DENNO_PF_ER_EARLY_EXIT`)。**既定 on**、明示的な偽値だけ切る。
+///
+/// on では、窓が足りない層 (3,826 の 2 チャンクなど) で router GEMV + D2H +
+/// VRAM 参照 + 置き場の計画を**まるごと飛ばす**。窓が足りない層はこの先の
+/// 経路が `None` を返して何もしないので、**値も読みも 1 バイトも変わらない**
+/// (捨てる計算を先に捨てるだけ)。off は task 474 と同じ順序。
+pub const ER_EARLY_EXIT_ENV: &str = "DENNO_PF_ER_EARLY_EXIT";
+
+/// [`ER_EARLY_EXIT_ENV`] の解釈 (純関数)。既定 on、明示的な偽値だけ off。
+pub fn er_early_exit_from_value(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
+    )
+}
+
+/// [`ER_EARLY_EXIT_ENV`] をプロセスで 1 回だけ読む。
+pub fn er_early_exit_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        er_early_exit_from_value(std::env::var(ER_EARLY_EXIT_ENV).ok().as_deref())
+    })
 }
 
 /// 先読みの台帳 (層数 / expert 本数 / バイト / 呼び出し回数)。
