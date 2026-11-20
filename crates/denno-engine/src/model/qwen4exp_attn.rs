@@ -391,6 +391,28 @@ impl AttnCache {
     /// **1 回の `copy_from_slice`** で `n * row` 要素を写す (値も順序も同じ)。
     /// `k` / `v` は先頭 `n * row` 要素だけ読む。
     pub fn push_many(&mut self, layer: usize, k: &[f32], v: &[f32], n: usize) -> Result<()> {
+        let par = if pf_kv_push_par_on() {
+            rayon::current_num_threads().clamp(1, 16)
+        } else {
+            1
+        };
+        self.push_many_opts(layer, k, v, n, pf_kv_noresize_on(), par)
+    }
+
+    /// task 505: [`Self::push_many`] の中身。ゲートを引数で受ける
+    /// (テストが両方の値を渡して同じバイト列になることを確かめる)。
+    ///
+    /// `noresize` のときは伸ばすときにゼロ埋めをしない (`extend_from_slice`)。
+    /// `par > 1` のときは写しを rayon で分ける。どちらも入るバイト列は同じ。
+    fn push_many_opts(
+        &mut self,
+        layer: usize,
+        k: &[f32],
+        v: &[f32],
+        n: usize,
+        noresize: bool,
+        par: usize,
+    ) -> Result<()> {
         let row = self.row();
         let cur = self.len(layer)?;
         if n == 0 {
@@ -411,12 +433,21 @@ impl AttnCache {
             );
         }
         let need = (cur + n) * row;
-        if self.k[layer].len() < need {
-            self.k[layer].resize(need, 0.0);
-            self.v[layer].resize(need, 0.0);
+        {
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_KVPUSH);
+            if noresize {
+                kv_push_noresize(&mut self.k[layer], &k[..src], cur * row, row, n, par);
+                kv_push_noresize(&mut self.v[layer], &v[..src], cur * row, row, n, par);
+            } else {
+                if self.k[layer].len() < need {
+                    self.k[layer].resize(need, 0.0);
+                    self.v[layer].resize(need, 0.0);
+                }
+                let (k0, v0) = (cur * row, cur * row);
+                kv_push_rows(&mut self.k[layer][k0..need], &k[..src], par);
+                kv_push_rows(&mut self.v[layer][v0..need], &v[..src], par);
+            }
         }
-        self.k[layer][cur * row..need].copy_from_slice(&k[..src]);
-        self.v[layer][cur * row..need].copy_from_slice(&v[..src]);
         self.len[layer] = cur + n;
         Ok(())
     }
@@ -512,6 +543,93 @@ pub(crate) fn pf_kv_bulk_from_value(v: Option<&str>) -> bool {
 pub(crate) fn pf_kv_bulk_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| pf_kv_bulk_from_value(std::env::var(PF_KV_BULK_ENV).ok().as_deref()))
+}
+
+// ---------------------------------------------------------------------------
+// task 505: ミラーへの積み方 (ゼロ埋めをやめる / 写しを分ける)
+// ---------------------------------------------------------------------------
+//
+// 14k cold prefill の `[q4ledger-pf]` は `full` 段の cpu 列が 502 ms
+// (壁 5.71 s の 8.8%) で、その大半が `AttnCache::push_many` の写しだった
+// (P369 の注記: 689 MB を 2.3 GB/s)。`push_many` は伸ばすときに
+// `resize(need, 0.0)` で新しい領域をゼロ埋めしてから `copy_from_slice` で
+// 上書きするので、**同じページを 2 回**書いていた (新しいページはフォルトの
+// コストも 2 倍)。`DENNO_PF_KV_NORESIZE` ではインプレースで書ける範囲を
+// `copy_from_slice`、足りない末尾だけ `extend_from_slice` にする
+// (キャッシュに入るバイト列は同じ。値も順序も変わらない)。
+
+/// task 505: `DENNO_PF_KV_NORESIZE` の env 名。
+pub const PF_KV_NORESIZE_ENV: &str = "DENNO_PF_KV_NORESIZE";
+
+/// 未設定のときの既定 (**測って採るまで off**)。切り戻しは `=0`。
+pub const DEFAULT_PF_KV_NORESIZE: bool = false;
+
+/// [`PF_KV_NORESIZE_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn pf_kv_noresize_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// ゼロ埋めせずに積むか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_kv_noresize_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_kv_noresize_from_value(std::env::var(PF_KV_NORESIZE_ENV).ok().as_deref()))
+}
+
+/// task 505: `DENNO_PF_KV_PUSH_PAR` の env 名。ミラーへの写しを rayon で分ける。
+pub const PF_KV_PUSH_PAR_ENV: &str = "DENNO_PF_KV_PUSH_PAR";
+
+/// 未設定のときの既定 (**測って採るまで off**)。
+pub const DEFAULT_PF_KV_PUSH_PAR: bool = false;
+
+/// [`PF_KV_PUSH_PAR_ENV`] の解釈 (明示的な真値だけ on)。
+pub fn pf_kv_push_par_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// 写しを分けるか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_kv_push_par_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_kv_push_par_from_value(std::env::var(PF_KV_PUSH_PAR_ENV).ok().as_deref()))
+}
+
+/// task 505: 1 本の写しを `par` 本に割る (分割の境目は要素数だけで決まる)。
+fn kv_push_rows(dst: &mut [f32], src: &[f32], par: usize) {
+    debug_assert!(dst.len() <= src.len());
+    if par > 1 && dst.len() >= KV_PUSH_PAR_MIN {
+        let per = dst.len().div_ceil(par).max(1);
+        use rayon::prelude::*;
+        dst.par_chunks_mut(per).enumerate().for_each(|(i, d)| {
+            let o = i * per;
+            d.copy_from_slice(&src[o..o + d.len()]);
+        });
+    } else {
+        dst.copy_from_slice(&src[..dst.len()]);
+    }
+}
+
+/// この要素数未満は 1 本で写す (rayon の分割コストが見合わない)。
+const KV_PUSH_PAR_MIN: usize = 1 << 18;
+
+/// task 505: ゼロ埋めせずに `dst_off` から `n * row` 要素を積む。
+///
+/// `kv.len()` は常に `row` の倍数 (積むのは full 層の行だけ)。既にある範囲は
+/// その場で書き、足りない末尾だけ `extend_from_slice` で伸ばす。
+fn kv_push_noresize(dst: &mut Vec<f32>, src: &[f32], dst_off: usize, row: usize, n: usize, par: usize) {
+    let need = dst_off + n * row;
+    let have = dst.len().min(need);
+    let m = have.saturating_sub(dst_off);
+    if m > 0 {
+        kv_push_rows(&mut dst[dst_off..have], &src[..m], par);
+    }
+    if dst.len() < need {
+        dst.extend_from_slice(&src[m..n * row]);
+    }
 }
 
 thread_local! {
@@ -626,6 +744,74 @@ mod attn_cache_tests {
             b.push_many(0, &k[..row - 1], &v[..row], 1).is_err(),
             "短い k が通った"
         );
+    }
+
+    /// task 505: ゼロ埋めしない積み方と、写しを分ける積み方が、従来の
+    /// `resize` + `copy_from_slice` と同じバイト列・同じ長さになること。
+    #[test]
+    fn task505_push_many_noresize_and_par_match_resize() {
+        let row = 2 * 8; // n_head_kv = 2, head_dim = 8
+        let mut base = AttnCache::new(1, 2, 8, 64).expect("cache");
+        let mut nr = AttnCache::new(1, 2, 8, 64).expect("cache");
+        let mut npr = AttnCache::new(1, 2, 8, 64).expect("cache");
+        // 3 回に分けて積む (1 回目だけが「伸ばす」経路、2 回目以降は書き込み先が
+        // 既にある = インプレース。ここが本番の 2 チャンク目以降に対応する)。
+        for (i, n) in [3usize, 5, 7].into_iter().enumerate() {
+            let k: Vec<f32> = (0..n * row)
+                .map(|j| (j as f32) * 0.5 + i as f32 * 100.0 - 3.0)
+                .collect();
+            let v: Vec<f32> = (0..n * row)
+                .map(|j| -(j as f32) * 0.25 + i as f32 * 7.0 + 1.0)
+                .collect();
+            base.push_many_opts(0, &k, &v, n, false, 1).expect("base");
+            nr.push_many_opts(0, &k, &v, n, true, 1).expect("noresize");
+            npr.push_many_opts(0, &k, &v, n, true, 4).expect("noresize+par");
+        }
+        for (name, c) in [("noresize", &nr), ("noresize+par", &npr)] {
+            assert_eq!(base.len(0).unwrap(), c.len(0).unwrap(), "{name}: 長さが違う");
+            assert_eq!(base.k(0).unwrap(), c.k(0).unwrap(), "{name}: k が違う");
+            assert_eq!(base.v(0).unwrap(), c.v(0).unwrap(), "{name}: v が違う");
+        }
+        // 巻き戻して短く積み直す (clear 後) と同じ長さで積む経路も一致する。
+        for c in [&mut base, &mut nr, &mut npr] {
+            c.clear(0).expect("clear");
+        }
+        let k: Vec<f32> = (0..2 * row).map(|j| (j as f32) * 1.5 - 9.0).collect();
+        let v: Vec<f32> = (0..2 * row).map(|j| 4.0 - (j as f32)).collect();
+        base.push_many_opts(0, &k, &v, 2, false, 1).expect("base2");
+        nr.push_many_opts(0, &k, &v, 2, true, 1).expect("nr2");
+        npr.push_many_opts(0, &k, &v, 2, true, 4).expect("npr2");
+        assert_eq!(base.k(0).unwrap(), nr.k(0).unwrap(), "clear 後の k が違う");
+        assert_eq!(base.v(0).unwrap(), npr.v(0).unwrap(), "clear 後の v が違う");
+        // 容量超過と短い入力はどの経路でもエラー (黙って伸ばさない)。
+        let over = vec![0.0f32; 64 * row];
+        assert!(nr.push_many_opts(0, &over, &over, 64, true, 1).is_err());
+        assert!(npr.push_many_opts(0, &k[..row - 1], &v[..row], 1, true, 4).is_err());
+    }
+
+    /// task 505: 2 つのゲートの真理値表 (明示的な真値だけ on、未設定は既定 off)。
+    #[test]
+    fn task505_kv_push_gates_truth_table() {
+        for raw in [None, Some(""), Some("0"), Some("off"), Some("no")] {
+            assert!(
+                !super::pf_kv_noresize_from_value(raw),
+                "noresize が on になった: {raw:?}"
+            );
+            assert!(
+                !super::pf_kv_push_par_from_value(raw),
+                "push_par が on になった: {raw:?}"
+            );
+        }
+        for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
+            assert!(
+                super::pf_kv_noresize_from_value(raw),
+                "noresize が off のまま: {raw:?}"
+            );
+            assert!(
+                super::pf_kv_push_par_from_value(raw),
+                "push_par が off のまま: {raw:?}"
+            );
+        }
     }
 
     /// task 393: ゲートの真理値表 (未設定・空は既定、明示的な偽値だけ off)。
