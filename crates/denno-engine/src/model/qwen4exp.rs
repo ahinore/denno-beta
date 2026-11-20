@@ -5438,6 +5438,8 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 let nt = end - start;
                 // task 419: 1 回転のうち名前付き区間に入らない時間を測る (診断)。
                 let t_iter = q4ledger::iter_begin();
+                // task 482: `other` の残差 (14k で 672 ms が名前の無い区間) を割る。
+                let _s_itop = q4ledger::sub(q4ledger::SUB_PF_ITTOP);
                 // 残差をデバイスへ (層 0 はホストの初期値、それ以降は退避域から)。
                 if il == 0 {
                     if !crate::cuda::pf_upload_res(&res_all[start * hc_dim..end * hc_dim]) {
@@ -5615,6 +5617,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     }
                 }
                 // 1.2 attention 入口 (デバイス mix) → attn → combine
+                drop(_s_itop);
                 let t_mix = std::time::Instant::now();
                 let flat_attn = pf_attn_flat_on();
                 {
@@ -5649,11 +5652,15 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 // task 419: attn 入口の切り替え (誰の区間でもない) を分けて数える。
                 let sub_attnpre = q4ledger::sub(q4ledger::SUB_PF_ATTPRE);
                 let attn_dev = flat_attn && pf_attn_devres_on() && roles.is_none();
+                // task 482: `curs` の組み立て (トークンごとの `Vec` 確保) は
+                // 平坦化していないときだけ走る。`other` の残差の候補。
+                let _s_apre = q4ledger::sub(q4ledger::SUB_PF_ITAPRE);
                 let curs: Vec<Vec<f32>> = if flat_attn {
                     Vec::new()
                 } else {
                     mixed_attn.chunks_exact(e).map(|c| c.to_vec()).collect()
                 };
+                drop(_s_apre);
                 let t_attn = std::time::Instant::now();
                 crate::cuda::pf_attn_dev_clear();
                 crate::cuda::pf_attn_dev_request(attn_dev);
@@ -5745,6 +5752,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 // 先頭 `nt` 行は MoE 入力として確定している (pf_lm_park_mixed)。
                 #[cfg(feature = "cuda")]
                 if ci == 0 {
+                    // task 482: 早期 routing の先読みは名前付き区間の外で走る
+                    // (14k で層 1 回 = 48 回)。`other` の残差の最有力候補。
+                    let _s_er = q4ledger::sub(q4ledger::SUB_PF_ER);
                     let _ = pf_early_route_prefetch(
                         lw,
                         nt,
@@ -19245,6 +19255,16 @@ fn pf_early_route_prefetch(
     use crate::model::expert_cache::ExpertKey;
     use crate::model::expert_vram::ExpertShape;
     if !crate::model::exp_pf::early_route_on() {
+        return None;
+    }
+    // task 482: 窓が足りない層は、この先の routing (GPU の router GEMV + D2H) も
+    // VRAM 参照も置き場の計画も**まるごと**要らない (この関数は最後に `None` を
+    // 返して何もしない)。以前はその判定が後ろにあり、3,826 (2 チャンク) でも
+    // 48 層ぶん払っていた (lab t482a: `sub other pf_er=72.6/90.1 ms`)。
+    // `DENNO_PF_ER_EARLY_EXIT=0` で task 474 と同じ順序へ戻せる。
+    if crate::model::exp_pf::er_early_exit_on()
+        && !crate::model::exp_pf::early_route_window_ok(nt0, nt_all)
+    {
         return None;
     }
     // 窓が無い (1 チャンクで終わる) / 形が合わない層は何もしない。

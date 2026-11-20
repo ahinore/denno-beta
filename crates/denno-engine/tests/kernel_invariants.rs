@@ -13997,3 +13997,72 @@ fn task468_full_mix_nowait_wiring() {
         assert!(rep.contains(s), "gpu_report.rs に {s} が無い");
     }
 }
+
+/// task 482: 先読みの窓の判定が routing より**前**にある配線。
+///
+/// lab t482a の 14k の分解 (`sub other`) で `iter_top=392` / `pf_er=217` /
+/// `pf_teardown=121` / `res_up=92` が読めた。そのうち `pf_er` は 3,826
+/// (2 チャンク = 窓が足りない) でも 72.6 / 90.1 ms 出ていた: 窓の判定が
+/// router GEMV + D2H + VRAM 参照 + 置き場の計画の**後ろ**にあったため。
+/// ここでは (1) 判定が先頭にあること、(2) 既定 on のゲートで切れること、
+/// (3) その判定より前に値へ触る処理が無いことを固定する。
+#[test]
+fn t482_early_route_window_exit_is_wired() {
+    // ゲートと純関数。
+    for k in [
+        "pub const ER_EARLY_EXIT_ENV: &str = \"DENNO_PF_ER_EARLY_EXIT\"",
+        "pub fn er_early_exit_from_value(",
+        "pub fn er_early_exit_on(",
+        "pub fn early_route_window_ok(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 既定 on (未設定で true) であること。
+    assert!(
+        std::env::var("DENNO_PF_ER_EARLY_EXIT").is_err(),
+        "このテストは env 未設定で回すこと"
+    );
+    assert!(
+        denno_engine::model::exp_pf::er_early_exit_from_value(None),
+        "未設定が既定 on でない"
+    );
+    for v in ["0", "off", "false", "no", ""] {
+        assert!(
+            !denno_engine::model::exp_pf::er_early_exit_from_value(Some(v)),
+            "{v:?} を on と読んだ"
+        );
+    }
+    for v in ["1", "on", "true", "yes"] {
+        assert!(
+            denno_engine::model::exp_pf::er_early_exit_from_value(Some(v)),
+            "{v:?} を off と読んだ"
+        );
+    }
+    // 窓の判定の意味は変えていない。
+    assert!(!denno_engine::model::exp_pf::early_route_window_ok(0, 100));
+    assert!(!denno_engine::model::exp_pf::early_route_window_ok(2002, 3826));
+    assert!(denno_engine::model::exp_pf::early_route_window_ok(2002, 14018));
+
+    // 本体: 早期終了が router / VRAM 参照 / 置き場の計画より前にある。
+    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    let exit = f
+        .find("exp_pf::er_early_exit_on()")
+        .expect("早期終了のゲートが無い");
+    for later in [
+        "pf_router_dev_topk(",
+        "pf_lm_mixed_ptr(0, nt0, e)",
+        "peek_many(",
+        "rc_plan(&runs)",
+    ] {
+        let at = f.find(later).expect(later);
+        assert!(exit < at, "早期終了が {later} より後ろにある");
+    }
+    // 早期終了は窓の判定そのものを使う (別の規則を作らない)。
+    let win = f
+        .find("exp_pf::early_route_window_ok(nt0, nt_all)")
+        .expect("窓の判定が無い");
+    assert!(exit < win, "早期終了が窓の判定より後ろにある");
+    // 既存の規則 (ゲート -> 早期終了 -> router) の順。
+    let gate = f.find("exp_pf::early_route_on()").expect("ゲートが無い");
+    assert!(gate < exit, "早期終了がゲートより前にある");
+}
