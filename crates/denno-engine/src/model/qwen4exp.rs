@@ -6554,6 +6554,112 @@ pub fn mix_qchain_gate_on() -> bool {
     mix_qchain_enabled()
 }
 
+// ===========================================================================
+// task 484: hc inject の GEMV を「行数 4 の F32 FMA カーネル」にする
+// ===========================================================================
+//
+// lab t484a (現 int-auto、既定モデル、`[dec-kprof-avg]` の mix band) で、
+// mix のホスト仕事は **mix_inj 16.1 us/回** が最大だった (`mix_norm` 3.3、
+// `mix_h2d_pack` 0.8)。97 呼び出し/token なので 1.56 ms/token = decode 11.1 の
+// 14%。中身は `hc_inject` の GEMV で、実形は **F32 の 4 行 x 10,240**
+// (`gemv inj ... ty=-` は F32 = id 0。`[mix-kprof]` の `inj 137 ms / 9506 回`)。
+// 従来は 1 行ずつの逐次和 (`gemv_scalar_body`) で、dev の実測でも 16.7 us。
+//
+// 4 行を同時に回して x の 1 ブロックを全行で共有する FMA 版は 1.00 us で、
+// 差は 2.3e-6 (|ref| 1.0) = 丸めだけ。lab t484b (base vs inj4、2 ラウンド交互) は
+// 短い decode 11.1 -> 10.8 (-2.7%)、c2000_cold 13.4 -> 13.0 (-3.0%)、
+// c2000_turn2 12.2 -> 11.8 (-3.3%)、c8000_cold 13.0 -> 13.1 (+0.8%、ノイズ幅)、
+// prefill 0.58 -> 0.57、md5 全 SAME、errors 0 だったので **既定 on** にした。
+// 切り戻しは `DENNO_MIX_INJ_R4=0`。
+//
+// lab の COND が新しい env 名を落とす回があるので、既存の `DENNO_MIX_QK` の値に
+// `inj4` が含まれていても on にする (逃げ道。値の解釈は dn7 などのまま)。
+
+/// [`MIX_INJ_R4_ENV`] の解釈 (純関数)。**既定 on** (task 484 で採否 yes)。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) だけが off。
+/// `qk` は `DENNO_MIX_QK` の生値で、値に `inj4` が入っていれば on
+/// (lab の COND が新しい env 名を落とす回の逃げ道。明示 off より強い)。
+pub fn mix_inj_r4_from_value(v: Option<&str>, qk: Option<&str>) -> bool {
+    if qk
+        .map(|s| s.to_ascii_lowercase().contains("inj4"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// task 484: hc inject を 4 行同時の F32 FMA GEMV で回すか (**既定 on**)。
+pub fn mix_inj_r4_on() -> bool {
+    #[cfg(test)]
+    if let Some(v) = MIX_INJ_R4_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_inj_r4_from_value(
+            std::env::var(MIX_INJ_R4_ENV).ok().as_deref(),
+            std::env::var("DENNO_MIX_QK").ok().as_deref(),
+        )
+    })
+}
+
+/// task 484: ゲートの env 名。
+pub const MIX_INJ_R4_ENV: &str = "DENNO_MIX_INJ_R4";
+
+#[cfg(test)]
+thread_local! {
+    static MIX_INJ_R4_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト用: ゲートの強制 (`None` = env の解釈)。
+#[cfg(test)]
+pub(crate) fn mix_inj_r4_set_for_test(v: Option<bool>) {
+    MIX_INJ_R4_FORCE.with(|c| c.set(v));
+}
+
+/// task 484: 4 行 FMA 経路で inject を計算した回数 (発火の証拠)。
+static MIX_INJ_R4_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`MIX_INJ_R4_HITS`] を読む (`[mix-qchain]` の `inj4=` に出る)。
+pub fn mix_inj_r4_hits() -> u64 {
+    MIX_INJ_R4_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 計数を 0 に戻す (リクエスト終端)。
+pub fn mix_inj_r4_reset() {
+    MIX_INJ_R4_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 484: inject の GEMV 1 発。4 行同時の F32 FMA 経路が使えればそこへ書き、
+/// `true` を返す。使えなければ**何も書かずに** `false` (呼び出し側が従来経路)。
+///
+/// 対象は `hc_inject` の実形 (F32・hc 行 x hc_dim、hc <= 4・hc_dim は 8 の倍数) だけ。
+/// 発火は [`MIX_INJ_R4_HITS`] で数える (`[mix-qchain]` の `inj4=`)。
+fn inject_gemv_r4(w: &GgufLinear, x: &[f32], out: &mut [f32]) -> bool {
+    if !mix_inj_r4_on() || w.ty() != crate::kquant::GgmlType::F32 {
+        return false;
+    }
+    let ok = crate::model::moe_expert::expert_gemv_f32_rows_small(
+        w.blocks().as_slice(),
+        w.k(),
+        w.n(),
+        x,
+        out,
+    );
+    if ok {
+        MIX_INJ_R4_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 台帳 (`[mix-kprof]` の gpu=) が直前の GEMV のフラグを引き継がないように。
+        #[cfg(feature = "cuda")]
+        crate::cuda::set_last_linear_ran_on_gpu(false);
+    }
+    ok
+}
+
+
 /// task 266: mix が呼ばれた回数 (ゲート on のときだけ数える。1 プロセス通算)。
 pub(crate) static MIX_QCHAIN_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -6612,8 +6718,11 @@ pub fn mix_qchain_line() -> Option<String> {
     let h2s = crate::cuda::mix_h2s_hits();
     #[cfg(not(feature = "cuda"))]
     let h2s = 0u64;
+    // task 484: inject を 4 行同時の F32 FMA GEMV で計算した回数
+    // (`DENNO_MIX_INJ_R4`)。0 なら従来の 1 行ずつの逐次和。
+    let inj4 = mix_inj_r4_hits();
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} dn7={dn7} f6={f6} h6={h6} h2s={h2s}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} dn7={dn7} f6={f6} h6={h6} h2s={h2s} inj4={inj4}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
@@ -6643,11 +6752,109 @@ pub fn mix_qchain_reset() {
     // task 431: dn7 の計数も同じ区切りで 0 に戻す。
     #[cfg(feature = "cuda")]
     crate::cuda::mix_dn7_reset();
+    // task 484: inject の 4 行 FMA 経路の計数も同じ区切りで 0 に戻す。
+    mix_inj_r4_reset();
 }
 
 #[cfg(test)]
 mod mix_qchain_tests {
     use super::*;
+
+    /// task 484: `DENNO_MIX_INJ_R4` の真理値表。**既定 on** (lab t484b で採否 yes) で、
+    /// 明示的な偽値だけ off。新しい env 名が lab の COND で落ちる回の逃げ道
+    /// (`DENNO_MIX_QK` の値に `inj4`) も固定する。
+    #[test]
+    fn mix_inj_r4_gate_truth_table() {
+        assert!(mix_inj_r4_from_value(None, None), "未設定は既定 on");
+        assert!(mix_inj_r4_from_value(Some(""), None), "空は既定 on");
+        assert!(!mix_inj_r4_from_value(Some("0"), None));
+        assert!(!mix_inj_r4_from_value(Some(" off "), None));
+        assert!(!mix_inj_r4_from_value(Some("false"), None));
+        assert!(mix_inj_r4_from_value(Some("1"), None));
+        assert!(mix_inj_r4_from_value(Some("on"), None));
+        assert!(mix_inj_r4_from_value(Some("R4"), None));
+        // 逃げ道: 既存 env の値に inj4 (値の解釈は dn7 などのまま)。
+        assert!(mix_inj_r4_from_value(None, Some("dn7,inj4")));
+        assert!(mix_inj_r4_from_value(None, Some("INJ4")));
+        assert!(mix_inj_r4_from_value(None, Some("dn7")), "既定 on なので dn7 でも on");
+        assert!(mix_inj_r4_from_value(Some("0"), Some("dn7,inj4")), "逃げ道は明示 off でも効く");
+    }
+
+    /// task 484: ゲート on で 4 行 FMA 経路が**実際に発火**し、値は従来の
+    /// 逐次和と同じ (差は丸めだけ) ことを固定する。hc inject の実形に近い
+    /// 形 (k = 10,240 は重いので k = 1,024 / hc = 4) で見る。
+    #[test]
+    fn mix_inj_r4_fires_and_matches_classic() {
+        if !crate::model::moe_expert::q4k_fused_supported() {
+            eprintln!("skip mix_inj_r4_fires_and_matches_classic: AVX2/FMA が無い");
+            return;
+        }
+        let k = 1024usize;
+        for n in [1usize, 2, 3, 4] {
+            let mut blocks = Vec::with_capacity(k * n * 4);
+            for r in 0..n {
+                for i in 0..k {
+                    let v = (((i * 31 + r * 7) % 251) as f32 - 125.0) * 0.001;
+                    blocks.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            let w = GgufLinear::new(
+                crate::kquant::GgmlType::F32,
+                k,
+                n,
+                crate::quant::WeightBlocks::from_vec(blocks),
+            )
+            .expect("GgufLinear");
+            let x: Vec<f32> = (0..k)
+                .map(|i| (((i * 37) % 89) as f32 - 44.0) * 0.013)
+                .collect();
+            let mut classic = vec![0.0f32; n];
+            w.gemv(&x, &mut classic).expect("classic");
+
+            let before = mix_inj_r4_hits();
+            let mut fast = vec![0.0f32; n];
+            mix_inj_r4_set_for_test(Some(true));
+            let fired = inject_gemv_r4(&w, &x, &mut fast);
+            mix_inj_r4_set_for_test(None);
+            assert!(fired, "n={n}: 行 FMA 経路が使われていない (発火の証拠が無い)");
+            assert!(
+                mix_inj_r4_hits() > before,
+                "n={n}: 計数が増えていない (発火の証拠が無い)"
+            );
+            for i in 0..n {
+                let d = (classic[i] as f64 - fast[i] as f64).abs();
+                let tol = 1e-4 + 1e-5 * classic[i].abs() as f64;
+                assert!(
+                    d <= tol,
+                    "n={n} 行 {i}: classic {} vs FMA {} (差 {d:.3e} > {tol:.3e})",
+                    classic[i],
+                    fast[i]
+                );
+            }
+            // ゲート off なら何も書かない (従来経路がそのまま走る)。
+            let mut off = vec![7.0f32; n];
+            mix_inj_r4_set_for_test(Some(false));
+            assert!(!inject_gemv_r4(&w, &x, &mut off), "ゲート off で発火した");
+            mix_inj_r4_set_for_test(None);
+            assert_eq!(off, vec![7.0f32; n], "ゲート off なのに書いた");
+        }
+        // 形が合わない (n > 4) は何も書かずに false = 従来経路。
+        let (k5, n5) = (1024usize, 5usize);
+        let blocks5 = vec![0u8; k5 * n5 * 4];
+        let w5 = GgufLinear::new(
+            crate::kquant::GgmlType::F32,
+            k5,
+            n5,
+            crate::quant::WeightBlocks::from_vec(blocks5),
+        )
+        .expect("GgufLinear");
+        let x5 = vec![0.5f32; k5];
+        let mut o5 = vec![7.0f32; n5];
+        mix_inj_r4_set_for_test(Some(true));
+        assert!(!inject_gemv_r4(&w5, &x5, &mut o5), "n=5 で発火した");
+        mix_inj_r4_set_for_test(None);
+        assert_eq!(o5, vec![7.0f32; n5], "n=5 なのに書いた");
+    }
 
     /// task 282: ゲートは既定 on。明示的な偽値だけ off (task 266 では既定 off だった)。
     #[test]
@@ -7568,8 +7775,14 @@ fn hc_mix_quant_fast(
         let do_inj = |w: &GgufLinear| -> Result<Vec<f32>> {
             let mut v = vec![0.0f32; w.n()];
             let t = mix_kprof::stamp();
-            kp_step!("mix_inj", w.gemv_label("hc_inject", xn, &mut v))
-                .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+            // task 484: inject の実形 (hc 行 x hc_dim の F32) は 1 行ずつの逐次和で
+            // 16.7 us/回かかっていた (lab t484a の `[dec-kprof-avg]` mix_inj 16.1 us、
+            // 97 呼び出し/token で 1.56 ms/token)。行を同時に回して x を共有する
+            // FMA 版は 0.98 us (`DENNO_MIX_INJ_R4`、既定 off)。
+            if !inject_gemv_r4(w, xn, &mut v) {
+                kp_step!("mix_inj", w.gemv_label("hc_inject", xn, &mut v))
+                    .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+            }
             // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
             mix_kprof::gemv::note_inj(t, w.ty());
             mix_kprof::mark(t, mix_kprof::INJ);
