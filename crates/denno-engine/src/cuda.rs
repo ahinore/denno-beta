@@ -13591,54 +13591,88 @@ fn pf_up_run(
         }
         *slot_ns = t.elapsed().as_nanos() as u64;
     }
-    // 2. pinned へ写す (計算スレッドと同じ並列写し)。
-    let t_copy = std::time::Instant::now();
-    pf_copy_into_pin(job.pin, &job.parts, job.pread);
-    *copy_ns = t_copy.elapsed().as_nanos() as u64;
-    // 2.5 task 320 (分離モード): VRAM のステージングを前回読んだカーネルの
-    //     完了を上げストリームの待ちとして入れる (ホストは止めない)。
-    if decouple && job.wait_ev != 0 && job.need > 0 {
-        let Some(sw) = l.stream_wait_event else {
-            bail!("cuStreamWaitEvent が無い");
+    // 2. 写しと積み込み。
+    //
+    // task 481: `DENNO_PF_UP_SPLIT_KB` があれば、**キャッシュあり**の小さな
+    // バウンス 2 枚を交互に使い、写し(i+1) を DMA(i) と重ねる。DMA が読む行は
+    // まだ L3 にあるので、DRAM の読み直し (page cache とバウンスで 2 本) が
+    // 1 本になる見込み (**推定**)。デバイスへ渡るバイト列は 1 回写しと同一。
+    let split_bytes = exp_pf::up_split_bytes();
+    if split_bytes > 0 && job.need > 0 && job.pin != 0 {
+        // 2.5 と同じ待ち (VRAM のステージングの再利用) を先に積む。
+        if decouple && job.wait_ev != 0 {
+            let Some(sw) = l.stream_wait_event else {
+                bail!("cuStreamWaitEvent が無い");
+            };
+            unsafe {
+                check(
+                    sw(job.stream as CUstream, job.wait_ev as CUevent, 0),
+                    "cuStreamWaitEvent (stage reuse/上げスレッド/分割)",
+                )?;
+            }
+        }
+        pf_up_run_split(job, copy_ns, enq_ns)?;
+        let Some(record) = l.event_record else {
+            bail!("cuEventRecord が無い");
+        };
+        let t_enq2 = std::time::Instant::now();
+        unsafe {
+            check(
+                record(job.up_ev as CUevent, job.stream as CUstream),
+                "cuEventRecord (stage up/上げスレッド/分割)",
+            )?;
+        }
+        *enq_ns = enq_ns.saturating_add(t_enq2.elapsed().as_nanos() as u64);
+    } else {
+        // 2. pinned へ写す (計算スレッドと同じ並列写し)。
+        let t_copy = std::time::Instant::now();
+        pf_copy_into_pin(job.pin, &job.parts, job.pread);
+        *copy_ns = t_copy.elapsed().as_nanos() as u64;
+        // 2.5 task 320 (分離モード): VRAM のステージングを前回読んだカーネルの
+        //     完了を上げストリームの待ちとして入れる (ホストは止めない)。
+        if decouple && job.wait_ev != 0 && job.need > 0 {
+            let Some(sw) = l.stream_wait_event else {
+                bail!("cuStreamWaitEvent が無い");
+            };
+            unsafe {
+                check(
+                    sw(
+                        job.stream as CUstream,
+                        job.wait_ev as CUevent,
+                        0,
+                    ),
+                    "cuStreamWaitEvent (stage reuse/上げスレッド)",
+                )?;
+            }
+        }
+        // 3. 非同期 H2D を積み、完了イベントを記録する。
+        let t_enq = std::time::Instant::now();
+        if job.need > 0 {
+            // 台帳 (q4ledger) はスレッドローカルの区間を持つので、ここでは素の
+            // 関数を呼ぶ (バイト数は [exp-pf-stream] が数える)。
+            let real = REAL_HTOD_ASYNC.load(Ordering::Relaxed);
+            if real.is_null() {
+                bail!("cuMemcpyHtoDAsync の実体が無い");
+            }
+            let f: FnCuMemcpyHtoDAsyncV2 = unsafe { std::mem::transmute(real) };
+            unsafe {
+                check(
+                    f(job.dst, job.pin as *const c_void, job.need, job.stream as CUstream),
+                    "cuMemcpyHtoDAsync (stage/上げスレッド)",
+                )?;
+            }
+        }
+        let Some(record) = l.event_record else {
+            bail!("cuEventRecord が無い");
         };
         unsafe {
             check(
-                sw(
-                    job.stream as CUstream,
-                    job.wait_ev as CUevent,
-                    0,
-                ),
-                "cuStreamWaitEvent (stage reuse/上げスレッド)",
+                record(job.up_ev as CUevent, job.stream as CUstream),
+                "cuEventRecord (stage up/上げスレッド)",
             )?;
         }
+        *enq_ns = t_enq.elapsed().as_nanos() as u64;
     }
-    // 3. 非同期 H2D を積み、完了イベントを記録する。
-    let t_enq = std::time::Instant::now();
-    if job.need > 0 {
-        // 台帳 (q4ledger) はスレッドローカルの区間を持つので、ここでは素の
-        // 関数を呼ぶ (バイト数は [exp-pf-stream] が数える)。
-        let real = REAL_HTOD_ASYNC.load(Ordering::Relaxed);
-        if real.is_null() {
-            bail!("cuMemcpyHtoDAsync の実体が無い");
-        }
-        let f: FnCuMemcpyHtoDAsyncV2 = unsafe { std::mem::transmute(real) };
-        unsafe {
-            check(
-                f(job.dst, job.pin as *const c_void, job.need, job.stream as CUstream),
-                "cuMemcpyHtoDAsync (stage/上げスレッド)",
-            )?;
-        }
-    }
-    let Some(record) = l.event_record else {
-        bail!("cuEventRecord が無い");
-    };
-    unsafe {
-        check(
-            record(job.up_ev as CUevent, job.stream as CUstream),
-            "cuEventRecord (stage up/上げスレッド)",
-        )?;
-    }
-    *enq_ns = t_enq.elapsed().as_nanos() as u64;
     // 4. 最初の 1 グループだけ、同期して実 H2D を測る。
     if job.probe {
         let Some(es) = l.event_sync else {
@@ -13654,6 +13688,183 @@ fn pf_up_run(
         *probe = Some((job.need, t.elapsed().as_nanos() as u64));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// task 481: 上げスレッドの「写し + DMA」を小さなバウンス 2 枚で重ねる
+// ---------------------------------------------------------------------------
+//
+// 3,826 cold の `[exp-pf-stream]` は up_MB=22,455 に対して copy_s=1.09 s で、
+// 壁 2,119 ms の 51%。内訳は 3 往復 (page cache を読む 22.4 GB / バウンスへ
+// 書く 22.4 GB / DMA がバウンスを読み直す 22.4 GB) で、DRAM の**読み**が
+// 2 本ある。DMA が読むのは直前に書いた行なので、まだ L3 (96 MB) にあれば
+// 読み直しは DRAM に降りない。キャッシュありの pinned を 2 枚交互に使い、
+// 写し(i+1) を DMA(i) と重ねる形にして、読みを 1 本に落とす。
+//
+// デバイスへ渡るバイト列は 1 回写しと同一 (値は 1 ビットも変わらない)。
+// 外れたとき (DMA が L3 を見ない等) は従来と同じ 3 往復に戻るだけで、
+// 悪化は「小さい DMA の起動が増える」ぶんに留まる (**推定**)。
+
+thread_local! {
+    /// task 481: 分割 DMA の状態 (上げスレッド専用)。
+    static PF_UP_SPLIT: std::cell::RefCell<Option<Box<PfUpSplit>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// task 481: 分割 DMA の 2 枚のバウンスと、それぞれを前回読んだ DMA の完了。
+struct PfUpSplit {
+    /// 2 枚の pinned (write-combined にしない = L3 に載る)。
+    stage: [Option<PinMem>; 2],
+    /// 各バウンスを前回読んだ DMA の完了イベント (作った時点で非 null)。
+    ev: [CUevent; 2],
+    /// 1 枚の大きさ (バイト)。
+    chunk: usize,
+}
+
+impl Drop for PfUpSplit {
+    fn drop(&mut self) {
+        if let Ok(l) = lib() {
+            if let Some(f) = l.event_destroy {
+                for e in self.ev {
+                    if !e.is_null() {
+                        unsafe {
+                            let _ = f(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// task 481: `parts` の `[start, start+len)` だけを `dst` の先頭へ写す。
+///
+/// [`pf_copy_into_pin_range`] は**絶対**オフセットへ書く (大きなバウンス用)。
+/// こちらは小さなバウンスの先頭へ詰める (オフセットを `start` だけ引く)。
+fn pf_copy_into_pin_at(
+    dst: usize,
+    parts: &[(usize, PfHostRange)],
+    start: usize,
+    len: usize,
+    pread: bool,
+) {
+    let end = start.saturating_add(len);
+    let mut sub: Vec<(usize, PfHostRange)> = Vec::with_capacity(parts.len());
+    for &(off, r) in parts {
+        let r_end = off.saturating_add(r.len);
+        let s = off.max(start);
+        let e = r_end.min(end);
+        if e <= s {
+            continue;
+        }
+        sub.push((
+            s - start,
+            PfHostRange {
+                ptr: r.ptr + (s - off),
+                len: e - s,
+                src: r.src.map(|(part, at)| (part, at + (s - off) as u64)),
+            },
+        ));
+    }
+    if !sub.is_empty() {
+        pf_copy_into_pin(dst, &sub, pread);
+    }
+}
+
+/// task 481: 依頼 1 本を小さいバウンスで分割して積む (写しと DMA を重ねる)。
+///
+/// 呼び出し側が VRAM ステージングの再利用待ち (`cuStreamWaitEvent`) を
+/// 先に積んであること。完了イベント (`job.up_ev`) は呼び出し側が記録する。
+fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result<()> {
+    let l = lib()?;
+    let (Some(create), Some(record), Some(esync)) =
+        (l.event_create, l.event_record, l.event_sync)
+    else {
+        bail!("event_create / event_record / event_sync が無い (分割 DMA)");
+    };
+    let chunk = exp_pf::up_split_bytes();
+    if chunk == 0 {
+        bail!("分割の大きさが 0 (分割 DMA)");
+    }
+    let real = REAL_HTOD_ASYNC.load(Ordering::Relaxed);
+    if real.is_null() {
+        bail!("cuMemcpyHtoDAsync の実体が無い (分割 DMA)");
+    }
+    let f: FnCuMemcpyHtoDAsyncV2 = unsafe { std::mem::transmute(real) };
+    PF_UP_SPLIT.with(|cell| -> Result<()> {
+        let mut slot = cell.borrow_mut();
+        let need_new = match slot.as_ref() {
+            Some(s) => {
+                s.chunk != chunk
+                    || s.stage[0]
+                        .as_ref()
+                        .map(|b| b.bytes < chunk)
+                        .unwrap_or(true)
+            }
+            None => true,
+        };
+        if need_new {
+            // 古い 2 枚を先に落としてから作り直す (イベントは Drop が壊す)。
+            *slot = None;
+            let a = PinMem::alloc_flags(chunk, false)?;
+            let b = PinMem::alloc_flags(chunk, false)?;
+            let mut ev: [CUevent; 2] = [std::ptr::null_mut(); 2];
+            for e in ev.iter_mut() {
+                let mut x: CUevent = std::ptr::null_mut();
+                if unsafe { create(&mut x, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                    bail!("cuEventCreate (分割 DMA)");
+                }
+                *e = x;
+            }
+            *slot = Some(Box::new(PfUpSplit {
+                stage: [Some(a), Some(b)],
+                ev,
+                chunk,
+            }));
+        }
+        let s = slot.as_mut().expect("直前に作った");
+        s.chunk = chunk;
+        let mut off = 0usize;
+        let mut i = 0usize;
+        while off < job.need {
+            let n = chunk.min(job.need - off);
+            let b = i % 2;
+            // このバウンスを前回読んだ DMA が終わるまで上書きしない。
+            if i >= 2 {
+                unsafe {
+                    check(
+                        esync(s.ev[b]),
+                        "cuEventSynchronize (分割 DMA の再利用)",
+                    )?;
+                }
+            }
+            let ptr = s.stage[b].as_ref().expect("確保済み").ptr as usize;
+            let t_copy = std::time::Instant::now();
+            pf_copy_into_pin_at(ptr, &job.parts, off, n, job.pread);
+            *copy_ns = copy_ns.saturating_add(t_copy.elapsed().as_nanos() as u64);
+            let t_enq = std::time::Instant::now();
+            unsafe {
+                check(
+                    f(
+                        job.dst + off as u64,
+                        ptr as *const c_void,
+                        n,
+                        job.stream as CUstream,
+                    ),
+                    "cuMemcpyHtoDAsync (分割 DMA)",
+                )?;
+                check(
+                    record(s.ev[b], job.stream as CUstream),
+                    "cuEventRecord (分割 DMA)",
+                )?;
+            }
+            *enq_ns = enq_ns.saturating_add(t_enq.elapsed().as_nanos() as u64);
+            exp_pf::note_up_split();
+            off += n;
+            i += 1;
+        }
+        Ok(())
+    })
 }
 
 /// 1 グループぶんの m 行カーネルを起動する (gate, up, silu, down)。
@@ -16175,6 +16386,80 @@ mod pf_stream_tests {
         assert_eq!(&split[0..16], &src[0..16]);
         assert_eq!(&split[32..52], &src[16..36]);
         assert_eq!(&split[64..76], &src[36..48]);
+    }
+
+    /// task 481: 小さなバウンスへ**詰めて**写しても、1 回写しと中身が同じ。
+    ///
+    /// `pf_copy_into_pin_at` は分割 DMA (2 枚のバウンスを交互に使う) の写しで、
+    /// オフセットを区間の先頭だけ詰める。区間をずらして繋ぐと 1 枚に写した
+    /// ものと 1 バイトも変わらないこと = デバイスへ渡るバイト列が変わらない
+    /// ことの根拠。
+    #[test]
+    fn split_at_copy_reassembles_to_the_same_bytes() {
+        let src: Vec<u8> = (0..200u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+        // 整列の隙間をまたぐ形の 4 区間 (0..20, 32..60, 60..61, 128..190)。
+        let parts = vec![
+            (
+                0usize,
+                PfHostRange {
+                    ptr: src.as_ptr() as usize,
+                    len: 20,
+                    src: None,
+                },
+            ),
+            (
+                32usize,
+                PfHostRange {
+                    ptr: unsafe { src.as_ptr().add(20) } as usize,
+                    len: 28,
+                    src: None,
+                },
+            ),
+            (
+                60usize,
+                PfHostRange {
+                    ptr: unsafe { src.as_ptr().add(48) } as usize,
+                    len: 1,
+                    src: None,
+                },
+            ),
+            (
+                128usize,
+                PfHostRange {
+                    ptr: unsafe { src.as_ptr().add(49) } as usize,
+                    len: 62,
+                    src: None,
+                },
+            ),
+        ];
+        let need = 190usize;
+        // 従来: 1 枚へ全部写す。
+        let mut one = vec![0x5Au8; need];
+        pf_copy_into_pin(one.as_mut_ptr() as usize, &parts, false);
+        // 分割: 24 バイトずつ、2 枚のバウンスへ交互に詰めて繋ぎ直す。
+        let chunk = 24usize;
+        let mut got = vec![0x5Au8; need];
+        let mut off = 0usize;
+        let mut i = 0usize;
+        while off < need {
+            let n = chunk.min(need - off);
+            let b = i % 2;
+            assert_eq!(b, i % 2);
+            pf_copy_into_pin_at(got.as_mut_ptr() as usize + off, &parts, off, n, false);
+            off += n;
+            i += 1;
+        }
+        assert_eq!(one, got, "分割で組み立てたバイト列が 1 回写しと違う");
+        // 隙間は書かれない。
+        for gap in [20usize..32, 61..128] {
+            for &x in &got[gap] {
+                assert_eq!(x, 0x5A, "整列の隙間を書いてしまった");
+            }
+        }
+        assert_eq!(&got[0..20], &src[0..20]);
+        assert_eq!(&got[32..60], &src[20..48]);
+        assert_eq!(&got[60..61], &src[48..49]);
+        assert_eq!(&got[128..190], &src[49..111]);
     }
 
     /// task 325: `DENNO_PF_PREAD` の写しが memcpy と 1 バイトも変わらないこと。
