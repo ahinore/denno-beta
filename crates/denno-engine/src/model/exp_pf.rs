@@ -1955,6 +1955,81 @@ pub fn pread_blocks(len: usize, blk: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// `DENNO_PF_UP_SPLIT_KB`: 上げスレッドの写しと DMA を何 KiB ずつ重ねるか
+/// (**既定 8192 = 8 MiB**。`0` で従来の「全部写してから 1 回 DMA」)。
+///
+/// # なぜ要るか (task 481 の台帳)
+///
+/// 3,826 cold の `[exp-pf-stream]` は `up_MB=22455.5` に対して `copy_s=1.09`
+/// (20.6 GB/s) で、これが壁 2,119 ms の 51%。中身は 3 往復:
+///
+/// 1. page cache を読む (22.4 GB)
+/// 2. write-combined のバウンスへ書く (22.4 GB)
+/// 3. DMA がバウンスを読み直す (22.4 GB。読み出しは 1 と帯域を食い合う)
+///
+/// 小さなバウンス 2 枚を交互に使い、写し(i+1) を DMA(i) と重ねると、DMA が
+/// 読むのは**ついさっき書いた行**になる。キャッシュコヒーレントな PCIe では
+/// その行がまだ L3 (9800X3D は 96 MB) にあれば DRAM を読み直さない。
+///
+/// # 実測 (lab t481b、`model=flash-next-UD-IQ3_XXS`、depth8k)
+///
+/// | | base2 (従来) | sp8 (8 MiB) | sp16 (16 MiB) |
+/// | --- | --- | --- | --- |
+/// | 3,826 cold | 2.12 s (copy 1.09) | **1.96 s** (copy 0.80) | 1.96 s |
+/// | 14k cold | 5.18 s (copy 1.32) | **5.03 s** (copy 0.94) | 5.09 s |
+/// | decode | 11.1 ms/tok | 11.2 | 11.2 |
+///
+/// copy_s が -27% / -29%、壁が -7.5% / -2.9%。md5 は全コンテキスト SAME。
+///
+/// 値は 1 バイトも変えない (デバイスへ渡るバイト列は 1 回写しと同一。
+/// `pf_stream_tests` の分割一致テストが同じ契約を固定している)。
+pub const UP_SPLIT_KB_ENV: &str = "DENNO_PF_UP_SPLIT_KB";
+
+/// [`UP_SPLIT_KB_ENV`] の既定値 (8 MiB)。
+///
+/// lab t481b (3,826 / 14k cold、`model=flash-next-UD-IQ3_XXS`): 8 MiB と 16 MiB は
+/// 同じだけ効いた (3,826 2.12 -> 1.96 / 1.96、14k 5.18 -> 5.03 / 5.09) ので、
+/// L3 (96 MB) に余裕のある 8 MiB を既定にした。`DENNO_PF_UP_SPLIT_KB=0` で
+/// 従来の「全部写してから 1 回 DMA」へ戻せる。
+pub const DEFAULT_UP_SPLIT_KB: usize = 8192;
+
+/// [`UP_SPLIT_KB_ENV`] の解釈 (純関数)。未設定 / 空 / 解析不能は既定 (8 MiB)、
+/// 明示的な `0` / `off` は分割しない、正の値は 64..=65536 KiB に丸める。
+pub fn up_split_kb_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_UP_SPLIT_KB;
+    };
+    match s.parse::<usize>() {
+        Ok(0) => 0,
+        Ok(n) => n.clamp(64, 65536),
+        Err(_) => match s.to_ascii_lowercase().as_str() {
+            "off" | "false" | "no" => 0,
+            _ => DEFAULT_UP_SPLIT_KB,
+        },
+    }
+}
+
+/// 分割の大きさ (バイト、0 = 分割しない)。プロセスで 1 回だけ env を読む。
+pub fn up_split_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        up_split_kb_from_value(std::env::var(UP_SPLIT_KB_ENV).ok().as_deref()) << 10
+    })
+}
+
+/// 分割 DMA を積んだ回数 (診断。0 ならゲートが発火していない)。
+static UP_SPLIT_CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+/// 分割 DMA を 1 回積んだ。
+pub fn note_up_split() {
+    UP_SPLIT_CHUNKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 分割 DMA を積んだ回数 (リクエスト境界で 0 に戻す)。
+pub fn up_split_chunks() -> u64 {
+    UP_SPLIT_CHUNKS.load(Ordering::Relaxed)
+}
+
 /// `DENNO_PF_PREAD_THREADS`: pread の写し専用のスレッド数 (既定 **32**、
 /// `0` で従来の共有プール = 14 本)。`read_at` は同期なので、デバイスが
 /// レイテンシ律速なら本数を増やすと同時に飛ぶ I/O が増える。
@@ -3926,7 +4001,7 @@ pub fn stats_line() -> Option<String> {
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
              probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} spread={} ut={} dec={} gpuw={} nsync={} group={} min_tok={} \
-             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x} retry={} wbl={} wbskip={}",
+             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x} retry={} wbl={} wbskip={} usplit={} usplit_kb={}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -3955,6 +4030,8 @@ pub fn stats_line() -> Option<String> {
             STREAM_RETRY.load(Ordering::Relaxed),
             u8::from(gdn_wb_last_on()),
             GDN_WB_SKIPS.load(Ordering::Relaxed),
+            UP_SPLIT_CHUNKS.load(Ordering::Relaxed),
+            up_split_bytes() >> 10,
         ));
         // task 254: 表の非同期 H2D が発火したか (gate on の証拠)。
         #[cfg(feature = "cuda")]
@@ -4011,6 +4088,7 @@ pub fn stats_reset() {
         &REG_OK_BYTES,
         &REG_CALLS,
         &REG_NS,
+        &UP_SPLIT_CHUNKS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -5400,6 +5478,17 @@ mod tests {
         assert_eq!(stream_split_from_value(Some("x")), 1, "解析不能は既定へ");
         assert_eq!(stream_split_from_value(Some("4")), 4);
         assert_eq!(stream_split_from_value(Some("64")), 16, "上限 16");
+        // task 481: 上げスレッドの分割 DMA は既定 8 MiB (lab t481b で採用)。
+        assert_eq!(up_split_kb_from_value(None), 8192, "未設定は既定 (on)");
+        assert_eq!(up_split_kb_from_value(Some("")), 8192);
+        assert_eq!(up_split_kb_from_value(Some("0")), 0, "明示的な 0 は従来");
+        assert_eq!(up_split_kb_from_value(Some("off")), 0);
+        assert_eq!(up_split_kb_from_value(Some("false")), 0);
+        assert_eq!(up_split_kb_from_value(Some("x")), 8192, "解析不能は既定へ");
+        assert_eq!(up_split_kb_from_value(Some("16")), 64, "下限 64 KiB");
+        assert_eq!(up_split_kb_from_value(Some("4096")), 4096);
+        assert_eq!(up_split_kb_from_value(Some(" 8192 ")), 8192, "空白は無視");
+        assert_eq!(up_split_kb_from_value(Some("200000")), 65536, "上限 64 MiB");
         // task 239: 均等割りのゲートと上限。
         assert!(
             !chunk_balance_from_value(None),
