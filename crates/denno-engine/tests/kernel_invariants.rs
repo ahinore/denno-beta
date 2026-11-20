@@ -14078,7 +14078,7 @@ fn t482_early_route_window_exit_is_wired() {
 ///
 /// task 474 は 3,826 (残り 1 チャンク = 窓 8.4-9.5 ms) を測って ±0 とし、
 /// 4 チャンク未満を閉じた。そのときの先読みは 8 本で 42 MB に 11.3 ms
-/// (3.7 GB/s) かかっていた。ここでは (1) 門が既定 off であること、
+/// ここでは (1) 門が既定 on であること、
 /// (2) 4 条件 (広い窓でない / ゲート / 窓の形 / ディスク実測) の真理値表、
 /// (3) 判定が router より前にあることを固定する。
 #[test]
@@ -14094,14 +14094,14 @@ fn t486_early_route_small_window_is_wired() {
     ] {
         assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
     }
-    // 既定 off (未設定で false)。env を汚したまま回さない。
+    // 既定 on (未設定で true)。env を汚したまま回さない。
     assert!(
         std::env::var("DENNO_PF_ER_SMALL").is_err(),
         "このテストは env 未設定で回すこと"
     );
     assert!(
-        !denno_engine::model::exp_pf::er_small_from_value(None),
-        "未設定が既定 on になっている"
+        denno_engine::model::exp_pf::er_small_from_value(None),
+        "未設定が既定 on になっていない"
     );
     for v in ["0", "off", "false", "no", ""] {
         assert!(

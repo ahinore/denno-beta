@@ -3161,24 +3161,36 @@ pub fn er_early_exit_on() -> bool {
 // task 474 は「残りの窓が 4 チャンク以上」のときだけ先読みした (3,826 の
 // 残り 1 チャンク = 窓 9.5 ms に 42 MB の先読みが収まらず **±0** だった)。
 // そのときの先読みは **8 本**で読んでおり、42 MB に 11.3 ms かかっていた
-// (3.7 GB/s)。同じ 42 MB を 24 本で読めば窓 (8.4 ms) に収まる見込みなので、
-// 2〜3 チャンクの層でも先読みを試せるようにする。**既定 off** で入れ、
-// lab の A/B が勝ったら既定 on にする。
+// (3.7 GB/s)。
+//
+// task 486 の lab (t486a、UD-Q4_K_XL、depth8k、PROFILE=1) は 2x2 で測った:
+//
+// | COND | 先読みの門 | スレッド | 3,826 copy_s r1/r2 | 3,826 壁 r1/r2 |
+// | --- | --- | --- | --- | --- |
+// | b / b2 | off | 8 | 8.50 / 6.98 | 10.07 / 8.11 |
+// | t | off | 24 | 7.33 / 6.89 | 8.49 / 8.05 |
+// | s8 | **on** | 8 | **6.93 / 6.61** | 8.09 / **7.77** |
+// | s | on | 24 | 7.40 / 7.37 | 9.76 / 8.70 |
+//
+// 門は 3,826 で **発火した** (`er_layers=47 er_experts=740 er_MB=2313`)。
+// 窓 (8.4 ms/層) に収まる範囲だけ読み、`copy_s` が 2 ラウンドとも最小、
+// 壁は round 2 で -4.2%。**24 本にすると悪化した** (先読みが窓を越えて
+// MoE の写しと帯域を奪い合う) ので、スレッドは 8 のまま (既定を触らない)。
 //
 // ただし窓の小さい層では router の同期 (GPU の router GEMV + D2H。3,826 で
-// 48 層 72 ms) が窓を食うので、**ディスクから読んでいる層だけ**通す。
-// 既定モデルは expert が page cache / RAM tier から来るので、先読みは
+// 48 層 62-70 ms、D2H 205 MB) が窓を食うので、**ディスクから読んでいる層だけ**
+// 通す。既定モデルは expert が page cache / RAM tier から来るので、先読みは
 // 1 バイトも得をしない (捨てる計算を増やすだけ)。判定はストリームの実測
 // (`STREAM_BYTES / STREAM_COPY_NS`) をそのまま使う。
 
-/// task 486: 窓の小さい層でも先読みする (`DENNO_PF_ER_SMALL`)。既定 off。
+/// task 486: 窓の小さい層でも先読みする (`DENNO_PF_ER_SMALL`)。**既定 on**。
 pub const ER_SMALL_ENV: &str = "DENNO_PF_ER_SMALL";
 
-/// [`ER_SMALL_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+/// [`ER_SMALL_ENV`] の解釈 (純関数)。既定 on、明示的な偽値だけ off。
 pub fn er_small_from_value(v: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
     )
 }
 
@@ -3246,7 +3258,7 @@ pub fn stream_copy_rate() -> (u64, u64) {
 /// - `nt0` / `nt_all` / `bytes` / `copy_ns` は [`early_route_small_ok`] と
 ///   [`er_small_disk_bound`] へそのまま渡す。
 ///
-/// lab で勝つまで既定 off (`small_on == false` で常に false)。
+/// lab t486a で勝ったので `small_on` の既定は on (`DENNO_PF_ER_SMALL=0` で切る)。
 pub fn er_small_pass(
     wide: bool,
     small_on: bool,
