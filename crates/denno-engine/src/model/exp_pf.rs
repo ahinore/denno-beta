@@ -2702,6 +2702,14 @@ static OD_OK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static OD_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NC_ORD_GRPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NC_ORD_MOVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// task 538: ディスク読みの**同時本数** (バリアの中で何本飛んでいるか)。
+// 写しの壁がディスク律速なら、これは「1 グループ (= 1 回の写し) に
+// 何本入っているか」で決まる。増やす手 (チャンクを広げる / 本数を増やす /
+// 2 グループを重ねる) の効果を、緑ではなくこの数字で数える。
+static RD_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RD_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 常駐の予測を 1 グループぶん積む。`ns` は判定にかかった時間。
 pub fn note_range_residency(judged: usize, miss: usize, miss_bytes: usize, unknown: usize, ns: u64) {
@@ -2730,6 +2738,42 @@ pub fn note_nc_order(moved: usize) {
     let o = std::sync::atomic::Ordering::Relaxed;
     NC_ORD_GRPS.fetch_add(1, o);
     NC_ORD_MOVED.fetch_add(moved as u64, o);
+}
+
+/// task 538: ディスク読み (pread) を 1 本始める。同時本数の最大を更新する。
+pub fn note_rd_enter(len: usize) {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    let n = RD_LIVE.fetch_add(1, o) + 1;
+    RD_MAX.fetch_max(n, o);
+    RD_N.fetch_add(1, o);
+    RD_BYTES.fetch_add(len as u64, o);
+}
+
+/// task 538: ディスク読みを 1 本終える。
+pub fn note_rd_leave() {
+    RD_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 538: 同時本数の台帳 (診断用)。`[exp-pf-stream]` の末尾に足す。
+pub fn rd_stats() -> String {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    if RD_N.load(o) == 0 {
+        return String::new();
+    }
+    format!(
+        " rd_n={} rd_MB={:.1} rd_max={}",
+        RD_N.load(o),
+        RD_BYTES.load(o) as f64 / 1e6,
+        RD_MAX.load(o),
+    )
+}
+
+/// task 538: 同時本数の台帳を 0 に戻す。
+pub fn rd_stats_reset() {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    for c in [&RD_LIVE, &RD_MAX, &RD_N, &RD_BYTES] {
+        c.store(0, o);
+    }
 }
 
 /// O_DIRECT の窓がどれだけ取れたか / 実際に読めたか。
@@ -5179,6 +5223,8 @@ pub fn stats_line() -> Option<String> {
         out.push_str(&range_stats());
         // task 530: 写しの切り分け (常駐の予測 / グループの内訳 / O_DIRECT の窓)。
         out.push_str(&staging_stats());
+        // task 538: ディスク読みの同時本数 (バリアの中で何本飛んだか)。
+        out.push_str(&rd_stats());
         out.push_str(&rc_stats());
         // task 394: 次の層の先読みが発火したかの台帳。
         out.push_str(&layer_pre_stats());
@@ -5238,6 +5284,8 @@ pub fn stats_reset() {
     rc_stats_reset();
     // task 530: 写しの切り分けの台帳も戻す。
     staging_stats_reset();
+    // task 538: ディスク読みの同時本数の台帳も戻す。
+    rd_stats_reset();
     CHECK_LAYERS.store(0, Ordering::Relaxed);
     if let Ok(mut g) = CHECK.lock() {
         *g = None;
@@ -7046,6 +7094,28 @@ mod tests {
         assert!(s.contains("nc_ord_moved=7"), "{s}");
         staging_stats_reset();
         assert!(staging_stats().is_empty(), "戻したら空");
+    }
+
+    /// task 538: ディスク読みの同時本数の台帳 (最大値と本数とバイト、戻すと空)。
+    #[test]
+    fn task538_rd_inflight_ledger() {
+        rd_stats_reset();
+        assert!(rd_stats().is_empty(), "戻したら空");
+        note_rd_enter(1000);
+        note_rd_enter(2000);
+        assert!(rd_stats().contains("rd_max=2"), "{}", rd_stats());
+        note_rd_leave();
+        // 減らしても最大は戻らない (同時本数のピークを残す)。
+        assert!(rd_stats().contains("rd_max=2"), "{}", rd_stats());
+        note_rd_enter(3000);
+        note_rd_leave();
+        note_rd_leave();
+        let s = rd_stats();
+        assert!(s.contains("rd_n=3"), "{s}");
+        assert!(s.contains("rd_MB=0.0"), "{s}");
+        assert!(s.contains("rd_max=2"), "ピークは 2 のまま: {s}");
+        rd_stats_reset();
+        assert!(rd_stats().is_empty(), "また戻せる");
     }
 
     /// task 530: `mincore(2)` は「触った直後の自分のメモリ」を常駐と答える。

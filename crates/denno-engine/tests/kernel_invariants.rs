@@ -14474,6 +14474,35 @@ fn t514_host_page_cache_instruments_and_end_drop_are_wired() {
     );
 }
 
+/// task 538: ディスク読みの同時本数の台帳が配線されているか (静的検査)。
+///
+/// 数値経路は変えない (計器だけ)。`pf_copy_into_pin` の pread の両側に
+/// enter/leave が要る (片方だけだと同時本数が単調増加する)。
+#[test]
+fn t538_staging_disk_inflight_is_counted() {
+    for k in [
+        "pub fn note_rd_enter(len: usize)",
+        "pub fn note_rd_leave()",
+        "pub fn rd_stats() -> String",
+        "rd_max=",
+        "pub fn rd_stats_reset()",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "台帳の定義が無い: {k}");
+    }
+    let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
+    let ent = cp.find("exp_pf::note_rd_enter(len)").expect("enter が無い");
+    let rd = cp
+        .find("exp_pf::read_part_ptr(part, at, dst, len)")
+        .expect("pread が無い");
+    let lv = cp.find("exp_pf::note_rd_leave()").expect("leave が無い");
+    assert!(ent < rd && rd < lv, "pread の両側に無い");
+    assert_eq!(
+        cp.matches("exp_pf::note_rd_enter(").count(),
+        1,
+        "enter は 1 か所だけ (二重に数えない)"
+    );
+}
+
 /// task 530: ステージング写しの切り分けが配線されているか (静的検査)。
 ///
 /// 数値経路を変えるのは 2 つのゲート (`DENNO_PF_PREAD_NC_FIRST` /

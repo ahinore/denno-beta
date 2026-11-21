@@ -12704,7 +12704,11 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             if cached && unsafe { exp_pf::rc_copy_into(part, at, len, dst) } {
                 return;
             }
-            if unsafe { exp_pf::read_part_ptr(part, at, dst, len) } {
+            // task 538: ディスク (または page cache) からの pread。同時本数を数える。
+            exp_pf::note_rd_enter(len);
+            let ok = unsafe { exp_pf::read_part_ptr(part, at, dst, len) };
+            exp_pf::note_rd_leave();
+            if ok {
                 return;
             }
         }
