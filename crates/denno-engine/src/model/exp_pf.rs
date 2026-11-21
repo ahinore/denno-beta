@@ -2675,6 +2675,8 @@ static OD_WIN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static OD_WIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OD_OK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OD_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NC_ORD_GRPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NC_ORD_MOVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 常駐の予測を 1 グループぶん積む。`ns` は判定にかかった時間。
 pub fn note_range_residency(judged: usize, miss: usize, miss_bytes: usize, unknown: usize, ns: u64) {
@@ -2696,6 +2698,13 @@ pub fn note_staging_group(miss_bytes: usize, ns: u64) {
     } else {
         GRP_HIT_NS.fetch_add(ns, o);
     }
+}
+
+/// 並べ替えが何本動かしたか (ゲートが発火した証拠)。
+pub fn note_nc_order(moved: usize) {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    NC_ORD_GRPS.fetch_add(1, o);
+    NC_ORD_MOVED.fetch_add(moved as u64, o);
 }
 
 /// O_DIRECT の窓がどれだけ取れたか / 実際に読めたか。
@@ -2720,6 +2729,7 @@ pub fn staging_stats() -> String {
     format!(
         " nc_judged={judged} nc_miss={} nc_miss_MB={miss_mb:.1} nc_unknown={} nc_ms={:.1} \
          grp={grp} grp_miss={} grp_miss_s={:.2} grp_hit_s={:.2} \
+         nc_ord_grps={} nc_ord_moved={} \
          od_win_MB={od_win:.1} od_win_calls={} od_ok_MB={:.1} od_fail={}",
         NC_MISS.load(o),
         NC_UNKNOWN.load(o),
@@ -2727,6 +2737,8 @@ pub fn staging_stats() -> String {
         GRP_MISS.load(o),
         GRP_MISS_NS.load(o) as f64 / 1e9,
         GRP_HIT_NS.load(o) as f64 / 1e9,
+        NC_ORD_GRPS.load(o),
+        NC_ORD_MOVED.load(o),
         OD_WIN_CALLS.load(o),
         OD_OK_BYTES.load(o) as f64 / 1e6,
         OD_FAIL.load(o),
@@ -2750,6 +2762,8 @@ pub fn staging_stats_reset() {
         &OD_WIN_CALLS,
         &OD_OK_BYTES,
         &OD_FAIL,
+        &NC_ORD_GRPS,
+        &NC_ORD_MOVED,
     ] {
         c.store(0, o);
     }
@@ -6986,6 +7000,7 @@ mod tests {
         note_staging_group(4 << 20, 1_000_000_000);
         note_staging_group(0, 500_000_000);
         note_odirect(8 << 20, 2, 4 << 20, 1);
+        note_nc_order(7);
         let s = staging_stats();
         assert!(s.contains("nc_judged=10"), "{s}");
         assert!(s.contains("nc_miss=4"), "{s}");
@@ -6999,6 +7014,8 @@ mod tests {
         assert!(s.contains("od_win_calls=2"), "{s}");
         assert!(s.contains("od_ok_MB=4.2"), "{s}");
         assert!(s.contains("od_fail=1"), "{s}");
+        assert!(s.contains("nc_ord_grps=1"), "{s}");
+        assert!(s.contains("nc_ord_moved=7"), "{s}");
         staging_stats_reset();
         assert!(staging_stats().is_empty(), "戻したら空");
     }

@@ -14496,6 +14496,8 @@ fn t530_staging_copy_instruments_and_gates_are_wired() {
         "nc_judged={judged}",
         "od_win_MB=",
         "grp_miss_s=",
+        "nc_ord_moved=",
+        "pub fn note_nc_order(",
     ] {
         assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
     }
@@ -14537,6 +14539,10 @@ fn t530_staging_copy_instruments_and_gates_are_wired() {
         "グループの記録は 2 つの出口 (pool 経由 / 素の par_iter) の両方に要る"
     );
     assert!(cp.contains("if exp_pf::nc_first_on() {"), "ゲートで囲んでいない");
+    assert!(
+        cp.contains("exp_pf::note_nc_order(moved)"),
+        "並べ替えが発火したかを数えていない"
+    );
     assert!(
         cp.contains("exp_pf::note_range_residency("),
         "予測の台帳が無い"

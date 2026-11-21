@@ -12274,8 +12274,10 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         );
         if exp_pf::nc_first_on() {
             let ord = exp_pf::nc_first_order(&flags);
+            let moved = ord.iter().enumerate().filter(|&(i, &j)| i != j).count();
             let old = std::mem::take(&mut tasks);
             tasks = ord.into_iter().map(|i| old[i]).collect();
+            exp_pf::note_nc_order(moved);
         }
     }
     let work = |&(off, src, ptr, len, cached): &(usize, Option<(u32, u64)>, usize, usize, bool)| {
