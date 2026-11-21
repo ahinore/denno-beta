@@ -34121,11 +34121,26 @@ pub(crate) fn pf_kv_async_on() -> bool {
 }
 
 /// task 553: `DENNO_PF_KV_DEFER`。K/V の書き戻しの**待ち**を 1 呼び出し
-/// (= 層チャンク) 後ろへずらす。既定 off (lab で採ったら on にする)。
+/// (= 層チャンク) 後ろへずらす。**既定 on** (lab t553a/b で採った)。
 pub const PF_KV_DEFER_ENV: &str = "DENNO_PF_KV_DEFER";
 
-/// 未設定のときの既定 (**lab で採るまで off**)。
-pub const DEFAULT_PF_KV_DEFER: bool = false;
+/// 未設定のときの既定 (**lab で採ったので on**)。切り戻しは `=0` / `off`。
+///
+/// 実測 (GPU ラボ、`MODEL=flash-next-UD-IQ3_XXS`、depth8k、PROFILE=1)。
+/// `full` 段とその `kv_wait` / `kv_push` (同じ run の b / b2 と対):
+///
+/// | run / COND | 3,826 full (kv_wait / kv_push) | 14k full (kv_wait / kv_push) |
+/// | --- | --- | --- |
+/// | t553a b | 105.1-106.9 (34.0-35.6 / 25.2-26.0) | 777.8 (129.1 / 239.1) |
+/// | t553a kvd | 56.8-58.5 (**0.0** / 22.3-23.0) | 857.4 (89.3 / 461.0) |
+/// | t553a kvdnp | 49.6-50.5 (**0.0** / 12.5-13.3) | 702.4 (85.2 / 212.4) |
+/// | t553b b | 104.3-104.4 (34.1-35.3 / 25.5-25.7) | 783.2 (126.4 / 249.2) |
+/// | t553b kvd | 57.6-64.0 (**0.0** / 21.5-25.6) | 715.6 (90.0 / 267.4) |
+/// | t553b kvdnp | 53.3-70.3 (**0.0** / 15.0-15.6) | 738.1 (89.4 / 226.5) |
+///
+/// 14k の壁は 4.96 / 5.09 s (base 5.12 / 5.16)、3,826 の壁は 1.89 s の床で不変。
+/// decode 10.4 ms/tok で不変、md5 は全 COND x 全 6 文脈 SAME、errors 0。
+pub const DEFAULT_PF_KV_DEFER: bool = true;
 
 /// [`PF_KV_DEFER_ENV`] の解釈 (未設定・空は既定、明示的な偽値だけ off)。
 pub(crate) fn pf_kv_defer_from_value(v: Option<&str>) -> bool {
@@ -66567,11 +66582,11 @@ mod task318_tests {
         assert!(!pf_kv_push_from_value(None), "既定が on になっている");
     }
 
-    /// task 553: `DENNO_PF_KV_DEFER` の解釈 (既定 off、明示的な偽値だけ off)。
+    /// task 553: `DENNO_PF_KV_DEFER` の解釈 (既定 on、明示的な偽値だけ off)。
     #[test]
     fn t553_kv_defer_gate_truth_table() {
-        assert!(!pf_kv_defer_from_value(None), "既定が on になっている");
-        assert!(!pf_kv_defer_from_value(Some("")), "空で on になっている");
+        assert!(pf_kv_defer_from_value(None), "既定が off になっている");
+        assert!(pf_kv_defer_from_value(Some("")), "空で off になっている");
         for raw in [Some("0"), Some("off"), Some("FALSE"), Some(" no ")] {
             assert!(!pf_kv_defer_from_value(raw), "raw={raw:?} が on になっている");
         }

@@ -594,15 +594,26 @@ pub(crate) fn pf_kv_noresize_on() -> bool {
 /// task 505: `DENNO_PF_KV_PUSH_PAR` の env 名。ミラーへの写しを rayon で分ける。
 pub const PF_KV_PUSH_PAR_ENV: &str = "DENNO_PF_KV_PUSH_PAR";
 
-/// 未設定のときの既定 (**測って採るまで off**)。
-pub const DEFAULT_PF_KV_PUSH_PAR: bool = false;
+/// 未設定のときの既定 (task 553 の lab t553a/b で採ったので on)。
+///
+/// 実測 (depth8k、PROFILE=1、`MODEL=flash-next-UD-IQ3_XXS`、同じ run の b/b2 と対)。
+/// `full` 段の `kv_push` (14k は 689 MB、3,826 は 188 MB の写し):
+///
+/// | run / COND | 3,826 | 14k |
+/// | --- | ---: | ---: |
+/// | t553a b / np | 25.2-26.0 / **16.6-18.3** ms | 239.1 / **199.3** ms |
+/// | t553b b / np | 25.5-25.7 / **16.8-18.3** ms | 249.2 / **202.7** ms |
+/// | t553b b / kvdnp | 25.5-25.7 / **15.0-15.6** ms | 249.2 / **226.5** ms |
+///
+/// 値・順序・md5 は全 COND で SAME。切り戻しは `DENNO_PF_KV_PUSH_PAR=0`。
+pub const DEFAULT_PF_KV_PUSH_PAR: bool = true;
 
-/// [`PF_KV_PUSH_PAR_ENV`] の解釈 (明示的な真値だけ on)。
+/// [`PF_KV_PUSH_PAR_ENV`] の解釈 (未設定・空は既定、明示的な偽値だけ off)。
 pub fn pf_kv_push_par_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PF_KV_PUSH_PAR,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
 }
 
 /// 写しを分けるか (プロセスで 1 回だけ env を読む)。
@@ -849,8 +860,9 @@ mod attn_cache_tests {
         assert_eq!(a.v(0).unwrap(), b.v(0).unwrap(), "v が違う");
     }
 
-    /// task 505: 2 つのゲートの真理値表。`DENNO_PF_KV_NORESIZE` は lab で採った
-    /// ので未設定・空は on (明示的な偽値だけ off)。`DENNO_PF_KV_PUSH_PAR` は off。
+    /// task 505 / 553: 2 つのゲートの真理値表。`DENNO_PF_KV_NORESIZE` と
+    /// `DENNO_PF_KV_PUSH_PAR` は lab で採ったので未設定・空は on
+    /// (明示的な偽値だけ off)。
     #[test]
     fn task505_kv_push_gates_truth_table() {
         assert!(
@@ -870,13 +882,21 @@ mod attn_cache_tests {
                 "noresize が off のまま: {raw:?}"
             );
         }
-        for raw in [None, Some(""), Some("0"), Some("off"), Some("no")] {
+        for raw in [Some("0"), Some("off"), Some("no")] {
             assert!(
                 !super::pf_kv_push_par_from_value(raw),
                 "push_par が on になった: {raw:?}"
             );
         }
-        for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
+        for raw in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("on"),
+            Some("true"),
+            Some("yes"),
+            Some(" ON "),
+        ] {
             assert!(
                 super::pf_kv_push_par_from_value(raw),
                 "push_par が off のまま: {raw:?}"
