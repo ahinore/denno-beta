@@ -1224,6 +1224,14 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
         if parts.is_empty() {
             continue;
         }
+        // task 561: ホストミラーを伸ばしたときの realloc 回数 (`DENNO_PF_KV_RESERVE`
+        // が効いていれば 0)。`full` の行にだけ添える。
+        if p == FULL {
+            let (n, b) = crate::model::qwen4exp_attn::pf_kv_grow_take();
+            if n > 0 {
+                parts.push(format!("kv_realloc={} ({:.1}M)", n, b as f64 / 1e6));
+            }
+        }
         out.push(format!(
             "[q4ledger-pf]   sub {:<7} sum={:>8.1} of {:>8.1}ms  {}",
             NAMES[p],
