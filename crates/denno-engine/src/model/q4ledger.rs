@@ -704,8 +704,13 @@ pub const SUB_PF_ER: usize = 42;
 pub const SUB_PF_KVWAIT: usize = 43;
 /// task 505: full 層 KV をホストのキャッシュへ積む写し (`AttnCache::push_many`)。
 pub const SUB_PF_KVPUSH: usize = 44;
+/// task 553: `iter_top` のうち PLE の gather 待ち (`rx.recv()` で背景スレッドを待つ)。
+pub const SUB_PF_ITPLE: usize = 45;
+/// task 553: `iter_top` のうち残差の退避域からの復帰 (`pf_res_park_load` の起動と
+/// H2D の待ち。層 0 の `pf_upload_res` も含む)。
+pub const SUB_PF_ITRES: usize = 46;
 /// 副区間の数。
-pub const SUB_N: usize = 45;
+pub const SUB_N: usize = 47;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -753,6 +758,8 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "pf_er",
     "kv_wait",
     "kv_push",
+    "iter_ple",
+    "iter_res",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
@@ -1361,8 +1368,23 @@ mod tests {
         assert_eq!(SUB_NAMES[SUB_PF_KVPUSH], "kv_push");
         assert_eq!(SUB_PF_KVWAIT, 43);
         assert_eq!(SUB_PF_KVPUSH, 44);
-        assert_eq!(SUB_N, SUB_PF_KVPUSH + 1);
         assert_eq!(SUB_NAMES[SUB_PF_ER], "pf_er", "既存の添字が動いた");
+        assert_eq!(SUB_NAMES.len(), SUB_N, "名前の本数が SUB_N と違う");
+    }
+
+    /// task 553: `iter_top` を PLE の gather 待ちと残差の復帰に割る 2 つの副区間。
+    ///
+    /// 名前と添字が 1 対 1 で、既存の添字 (43 / 44) を動かしていないことを固定する。
+    #[test]
+    fn task553_iter_top_split_sub_names_are_wired() {
+        let _g = lock();
+        assert_eq!(SUB_NAMES[SUB_PF_ITPLE], "iter_ple");
+        assert_eq!(SUB_NAMES[SUB_PF_ITRES], "iter_res");
+        assert_eq!(SUB_PF_ITPLE, 45);
+        assert_eq!(SUB_PF_ITRES, 46);
+        assert_eq!(SUB_N, SUB_PF_ITRES + 1);
+        assert_eq!(SUB_NAMES[SUB_PF_ITTOP], "iter_top", "既存の添字が動いた");
+        assert_eq!(SUB_NAMES[SUB_PF_KVPUSH], "kv_push", "既存の添字が動いた");
         assert_eq!(SUB_NAMES.len(), SUB_N, "名前の本数が SUB_N と違う");
     }
 

@@ -1587,6 +1587,13 @@ impl LayerAttn for SsmAttn {
         self.full.spec_restorable()
     }
 
+    /// task 553: 後ろへ回した full 層の KV 書き戻しを今すぐ積む (委譲)。
+    fn flush_deferred(
+        &mut self,
+    ) -> std::result::Result<(), Qwen4ExpError> {
+        self.full.flush_deferred()
+    }
+
     /// P109: GDN 状態 (conv / ssm) を層ごと clone し、full attention 側は
     /// 委譲先の [`crate::model::qwen4exp::SpecFullSnap`] に任せる。
     fn spec_snapshot(&self) -> Box<dyn std::any::Any + Send> {

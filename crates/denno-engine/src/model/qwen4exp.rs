@@ -1715,6 +1715,15 @@ pub trait LayerAttn: Send {
     /// (テスト `reset_matches_fresh_decoder_bitexact`)。
     fn reset(&mut self);
 
+    /// task 553: 後ろへ回した状態の書き出しを今すぐ済ませる。
+    ///
+    /// 層優先 prefill の終端で 1 回だけ呼ぶ。`DENNO_PF_KV_DEFER` は full 層の
+    /// KV 書き戻しを次の呼び出しへ回すので、リクエストの切れ目で持ち越さない
+    /// ようにする。既定は何もしない (状態を後ろへ回す実装だけが上書きする)。
+    fn flush_deferred(&mut self) -> std::result::Result<(), Qwen4ExpError> {
+        Ok(())
+    }
+
     /// P109: [`Self::spec_snapshot`] の状態へ戻す (検証列を棄却したとき)。
     fn spec_restore(
         &mut self,
@@ -5453,12 +5462,16 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 // task 482: `other` の残差 (14k で 672 ms が名前の無い区間) を割る。
                 let _s_itop = q4ledger::sub(q4ledger::SUB_PF_ITTOP);
                 // 残差をデバイスへ (層 0 はホストの初期値、それ以降は退避域から)。
-                if il == 0 {
-                    if !crate::cuda::pf_upload_res(&res_all[start * hc_dim..end * hc_dim]) {
-                        Self::pf_bail("res の H2D に失敗")?;
+                // task 553: `iter_top` のうち残差の復帰を分けて数える。
+                {
+                    let _s_ires = q4ledger::sub(q4ledger::SUB_PF_ITRES);
+                    if il == 0 {
+                        if !crate::cuda::pf_upload_res(&res_all[start * hc_dim..end * hc_dim]) {
+                            Self::pf_bail("res の H2D に失敗")?;
+                        }
+                    } else if !crate::cuda::pf_res_park_load(ci, nt, hc, e) {
+                        Self::pf_bail("res の退避域からの復帰に失敗")?;
                     }
-                } else if !crate::cuda::pf_res_park_load(ci, nt, hc, e) {
-                    Self::pf_bail("res の退避域からの復帰に失敗")?;
                 }
                 // task 218: ステアリング (層の入口)。
                 if steer_dev_apply && steer_apply.map(|a| a.covers(il)).unwrap_or(false) {
@@ -5475,8 +5488,11 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     // 待ちは台帳の `ple` に積む。チャネルはチャンク順なので ci と揃う。
                     if let Some(rx) = ple_rx.as_ref() {
                         let t_ple = prekprof::stamp();
-                        let chunk_rows =
-                            rx.recv().map_err(|_| one("PLE の先読みスレッドが落ちた"))??;
+                        // task 553: `iter_top` のうち PLE の gather 待ちを分けて数える。
+                        let chunk_rows = {
+                            let _s_iple = q4ledger::sub(q4ledger::SUB_PF_ITPLE);
+                            rx.recv().map_err(|_| one("PLE の先読みスレッドが落ちた"))??
+                        };
                         prekprof::mark(t_ple, prekprof::PLE);
                         ples_all.push(chunk_rows);
                     }
@@ -5951,6 +5967,9 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             }
             prekprof::mark(t_lay, prekprof::LAYER);
         }
+        // task 553: 層ループの終端で、後ろへ回した KV の書き戻しを降ろす
+        // (最後の層チャンクの保留を decode や次のリクエストへ持ち越さない)。
+        self.attn.as_mut().flush_deferred()?;
         // 最終チャンクの残差をホストへ (最終 mixer 用)。
         let (lstart, lend) = *ranges.last().expect("ranges は空でない");
         let lnt = lend - lstart;
