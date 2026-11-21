@@ -34002,9 +34002,13 @@ pub fn pf_kv_wb_copy_into(k_out: &mut [f32], v_out: &mut [f32]) -> bool {
             return false;
         };
         let base = pin.ptr as usize;
-        if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
-            unsafe {
-                let _ = (esync)(ev);
+        {
+            // task 505: 待ちを台帳に載せる (`full` 段の cpu 列の中身を割る)。
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_KVWAIT);
+            if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
+                unsafe {
+                    let _ = (esync)(ev);
+                }
             }
         }
         s.bytes = (0, 0);
@@ -34085,9 +34089,13 @@ pub fn pf_kv_wb_with<F: FnOnce(&[f32], &[f32])>(f: F) -> bool {
             return false;
         };
         let base = pin.ptr as usize;
-        if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
-            unsafe {
-                let _ = (esync)(ev);
+        // task 505: 待ちを台帳に載せる (`full` 段の cpu 列の中身を割る)。
+        {
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_KVWAIT);
+            if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
+                unsafe {
+                    let _ = (esync)(ev);
+                }
             }
         }
         s.bytes = (0, 0);
