@@ -220,8 +220,10 @@ errors は全 cond 0。
 - `... --test kernel_invariants -- --test-threads=1`: **145 passed / 0 failed**
   (task427 の dn6 配線テストを dn7 の引数追加に合わせて直し、task504 の
   配線テストを足した)。
-- `cargo build --workspace --release` と `cargo test --workspace`: REPORT の
-  最終 commit 時点で実行 (結果は commit message に書く)。
+- `cargo build --workspace --release` (cuda 無し) と
+  `cargo test --workspace -- --test-threads=1`: **EXIT=0、FAILED 0**
+  (lib 974 passed / 0 failed、kernel_invariants 145 / 0、他クレートも全 ok)。
+  int-auto (task 505) を merge した後の木で再実行した。
 - 既知の赤 (`qwen4exp_decode spec_batch_stops_at_eos`、`qwen4exp_params` の
   validate 2 件) は触っていない。
 
