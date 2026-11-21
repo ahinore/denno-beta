@@ -2412,12 +2412,17 @@ pub unsafe fn read_part_ptr(part: u32, off: u64, dst: *mut u8, len: usize) -> bo
         return false;
     };
     let buf = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+    // task 530: (c) の下調べ — bounce 無しで O_DIRECT に回せる内側が何バイト
+    // あるかは、ゲートを入れなくても整数の計算だけで分かる (計器として常に数える)。
+    let od_win = odirect_window(dst as usize, off, len, ODIRECT_ALIGN);
+    if let Some((_delta, n)) = od_win {
+        note_odirect(n, 1, 0, 0);
+    }
     // task 530: 整列した内側だけ O_DIRECT で読む (bounce 無し)。
     // 条件が揃わない区間は 1 バイトも対象にならない (`od_win_MB` で数える)。
     if odirect_on() {
         if let Some(Some(fod)) = PARTS_OD.get().and_then(|v| v.get(part as usize)) {
-            if let Some((delta, n)) = odirect_window(dst as usize, off, len, ODIRECT_ALIGN) {
-                note_odirect(n, 1, 0, 0);
+            if let Some((delta, n)) = od_win {
                 if read_full(f, off, &mut buf[..delta]).is_ok()
                     && read_full(fod, off + delta as u64, &mut buf[delta..delta + n]).is_ok()
                     && read_full(f, off + (delta + n) as u64, &mut buf[delta + n..]).is_ok()

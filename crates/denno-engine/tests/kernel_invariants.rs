@@ -14520,11 +14520,16 @@ fn t530_staging_copy_instruments_and_gates_are_wired() {
         "O_DIRECT の open が無い"
     );
     let rp = fn_body(EXP_PF_SRC, "pub unsafe fn read_part_ptr(");
-    let win = rp.find("odirect_window(").expect("窓の判定が無い");
-    let gate = rp.find("odirect_on()").expect("ゲートの判定が無い");
+    let win = rp.find("let od_win = odirect_window(").expect("窓の判定が無い");
+    let gate = rp.find("if odirect_on() {").expect("ゲートの判定が無い");
     let buffered = rp.find("read_full(f, off, buf)").expect("buffered の経路が無い");
-    assert!(gate < win, "ゲートより先に窓を計算している");
-    assert!(win < buffered, "O_DIRECT の後に buffered が無い (落ちたとき戻れない)");
+    assert!(win < gate, "窓 (計器) をゲートの前に計算していない");
+    assert!(gate < buffered, "O_DIRECT の後に buffered が無い (落ちたとき戻れない)");
+    // 窓はゲートに関係なく数える (発火しなかった回の上界が読める)。
+    assert!(
+        rp.contains("note_odirect(n, 1, 0, 0)"),
+        "窓の台帳がゲートの外に無い"
+    );
     // 写しの側: 常駐の予測 → (ゲート) 並べ替え → 写し → グループの記録。
     let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
     let res = cp.find("exp_pf::range_resident(").expect("mincore の予測が無い");
