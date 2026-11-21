@@ -17399,27 +17399,33 @@ pub const PF_PIN_MIN_KB_ENV: &str = "DENNO_PF_PIN_MIN_KB";
 ///
 /// # なぜ要るか (2026-11-21)
 ///
-/// UD-Q4_K_XL の warm 短 decode (12.5 ms/tok) は 4 段すべてが GPU の帯域律速
-/// (experts 470 / ssm 420 / mix 300-390 GB/s) で、ホスト側に残っているのは
+/// UD-Q4_K_XL の warm 短 decode (12.7 ms/tok) は 4 段すべてが GPU の帯域律速
+/// (seg の実測 gbs: gate 466 / up 473 / down 346 GB/s) で、ホスト側に残っているのは
 /// **層ごとの小さな同期コピー**だけだった。1 トークンあたりの回数は
 /// seg experts の prologue H2D (10.8 KB) と結果 D2H (10 KB)、GDN の xba H2D
 /// (10.3 KB) と out D2H (10 KB)、full attention の KV ミラー H2D (65 KB) で、
-/// 48 層ぶん並ぶと 200 回前後になる。pageable の 10 KB コピーは 11 us/回
-/// (task 358 の実測) なので、1 トークンで 1-2 ms になりうる。
+/// 実測 (t518b の `[pf-pin]`) は decode で 131 回/token、3,826 の prefill で
+/// 12,572 回・134.8 MB。pageable の 10 KB コピーは 11 us/回 (task 358 の実測)。
 ///
 /// task 318 の 1 MiB の床は「pinned の確保そのものが高い」時代のもの。task 358 で
-/// 共有 1 本 (grow-only) になったので、床を外したときの損得は測り直す価値がある。
+/// 共有 1 本 (grow-only) になったので、床を外したときの損得を測り直したら
+/// **3,826 cold prefill が 2 ラウンドとも -4.6%**、14k cold が -7.0 / -3.9%、
+/// cold の深い decode が -17〜-24%、warm 短 decode は -0.7% (2 ラウンド同値)、
+/// 既定モデルは md5 全 SAME だった (t518a / t518b / t518c)。既定 on。
 /// ここでは **1 MiB 未満だけ**を対象にする (prefill の大きな転送は
 /// `DENNO_PF_PIN_STAGE` の判定のまま = 既存の数字を動かさない)。
 pub const DEC_PIN_SMALL_ENV: &str = "DENNO_DEC_PIN_SMALL";
 
-/// [`DEC_PIN_SMALL_ENV`] の解釈 (純関数)。**既定 off**、明示的な真値だけ on。
+/// [`DEC_PIN_SMALL_ENV`] の解釈 (純関数)。**既定 on** (t518a/t518b で採用)。
+///
+/// 未設定・空文字は on、明示的な偽値 (`0` / `false` / `no` / `off`) だけ切る
+/// (切り戻しは `DENNO_DEC_PIN_SMALL=0`)。
 pub fn dec_pin_small_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim) {
-        None | Some("") => false,
-        Some(s) => matches!(
+        None | Some("") => true,
+        Some(s) => !matches!(
             s.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
+            "0" | "false" | "no" | "off"
         ),
     }
 }
@@ -66087,12 +66093,13 @@ mod task318_tests {
         assert!(!pf_pin_small_window_from(true, (4 << 10) - 1));
         assert!(!pf_pin_small_window_from(true, PF_PIN_MIN_BYTES));
         assert!(!pf_pin_small_window_from(true, 0));
-        // env の解釈: 未設定・空・偽値は off、明示的な真値だけ on。
-        assert!(!dec_pin_small_from_value(None));
-        assert!(!dec_pin_small_from_value(Some("")));
+        // env の解釈: **既定 on** (未設定・空は on)、明示的な偽値だけ off。
+        assert!(dec_pin_small_from_value(None));
+        assert!(dec_pin_small_from_value(Some("")));
         assert!(!dec_pin_small_from_value(Some("0")));
         assert!(!dec_pin_small_from_value(Some("off")));
-        assert!(!dec_pin_small_from_value(Some("yes please")));
+        assert!(!dec_pin_small_from_value(Some("FALSE")));
+        assert!(!dec_pin_small_from_value(Some(" no ")));
         assert!(dec_pin_small_from_value(Some("1")));
         assert!(dec_pin_small_from_value(Some(" on ")));
         assert!(dec_pin_small_from_value(Some("TRUE")));
