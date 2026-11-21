@@ -678,20 +678,38 @@ const KV_PUSH_PAR_MIN: usize = 1 << 18;
 // 毎回 `reserve` して倍々に realloc し、古い領域を捨てて新しいページを踏み直す
 // のが疑わしい (ページのフォルトは要求中に 470k 回)。ここでは 2 つを別ゲートにする:
 //
-// - `DENNO_PF_KV_RESERVE`: 層に初めて積むとき (`cur == 0`) に容量を
+// - `DENNO_PF_KV_RESERVE` (**既定 on**): 層に初めて積むとき (`cur == 0`) に容量を
 //   `min(max_ctx, 32,768) * row` まで確保する。**アドレス空間だけ**で、ページは
 //   書いた分しか触らない (max_ctx まで確保しない元の方針は変えない)。
 //   realloc の写し直しとフォルトの踏み直しが消える。値・順序は変わらない。
-// - `DENNO_PF_KV_HPAGE`: その確保した領域に `madvise(MADV_HUGEPAGE)` を 1 回
-//   かける (このホストの THP は `madvise`)。689 MB が 2 MB ページに載れば
-//   フォルトは 512 分の 1 になり、同じ要求の中で 18 GB の expert 読みが走る
-//   ときのページ回収の細かさも揃う。値は変わらない。
+// - `DENNO_PF_KV_HPAGE` (既定 off): その確保した領域に `madvise(MADV_HUGEPAGE)`
+//   を 1 回かける (このホストの THP は `madvise`)。値は変わらない。
+//
+// 実測 (lab t561a、depth8k、PROFILE=1、x0/b/r/rh/b2 を 1 つの run で、各 COND 2 周):
+//
+// | 段 / 内訳 | 3,826 cold b (2 周) | r | rh |
+// | --- | --- | --- | --- |
+// | `full` 段の壁 | 53.2 / 50.6 (b2 52.8 / 50.6) ms | **46.1 / 44.6** | **45.0 / 44.8** |
+// | `kv_push` | 15.0 / 13.5 (b2 15.7 / 13.5) | **9.3 / 9.6** | **10.0 / 9.3** |
+// | `kv_realloc` | 48 回 (188.1 MB) | **0** | **0** |
+//
+// 3,826 の `full` 段は **-12% (2 ラウンドとも)**。14k cold では `full` の壁が
+// 708.7 (b) / 715.6 (r) / 710.5 (rh) / 709.0 (b2) で**動かない** が、
+// `kv_push` は 224.4 -> 108.9 ms (-51%)、`kv_wait` は 88.7 -> 87.4 で不変。
+// 14k は **CPU が GPU の裏に完全に隠れている** (full の gpu_busy 553.3 対 cpu 407.0)
+// ので、CPU を減らしても壁は動かない。3,826 は段が短く CPU が露出するため効く。
+// `DENNO_PF_KV_HPAGE` は -51% -> -54% で差は noise の内側 (既定 off のまま)。
+// md5 は全 COND x 全 6 文脈 SAME、errors 0、text sane。
 
 /// task 561: `DENNO_PF_KV_RESERVE` の env 名。
 pub const PF_KV_RESERVE_ENV: &str = "DENNO_PF_KV_RESERVE";
 
-/// 未設定のときの既定 (**測定前なので off**)。lab で採ったら on にする。
-pub const DEFAULT_PF_KV_RESERVE: bool = false;
+/// 未設定のときの既定 (**lab t561a で採ったので on**)。切り戻しは `=0`。
+///
+/// 3,826 cold の `full` 段が 53.2/50.6 -> 46.1/44.6 ms (-12%、2 ラウンド)、
+/// `kv_push` が 15.0/13.5 -> 9.3/9.6 ms、realloc が 48 -> 0 回。
+/// 14k cold は `full` の壁が動かない (CPU が GPU に隠れている) が悪くもならない。
+pub const DEFAULT_PF_KV_RESERVE: bool = true;
 
 /// [`PF_KV_RESERVE_ENV`] の解釈 (未設定・空は既定、明示的な真値だけ on)。
 pub fn pf_kv_reserve_from_value(v: Option<&str>) -> bool {
@@ -710,7 +728,7 @@ pub(crate) fn pf_kv_reserve_on() -> bool {
 /// task 561: `DENNO_PF_KV_HPAGE` の env 名。
 pub const PF_KV_HPAGE_ENV: &str = "DENNO_PF_KV_HPAGE";
 
-/// 未設定のときの既定 (**測定前なので off**)。
+/// 未設定のときの既定 (**lab t561a で reserve との差が noise だったので off**)。
 pub const DEFAULT_PF_KV_HPAGE: bool = false;
 
 /// [`PF_KV_HPAGE_ENV`] の解釈 (未設定・空は既定、明示的な真値だけ on)。
@@ -1068,18 +1086,19 @@ mod attn_cache_tests {
         }
     }
 
-    /// task 561: `DENNO_PF_KV_RESERVE` と `DENNO_PF_KV_HPAGE` の真理値表
-    /// (どちらも測定前なので既定は off。明示的な真値だけ on)。
+    /// task 561: `DENNO_PF_KV_RESERVE` (lab で採ったので既定 on) と
+    /// `DENNO_PF_KV_HPAGE` (既定 off) の真理値表。
     #[test]
     fn task561_kv_reserve_and_hpage_gates_truth_table() {
-        for raw in [None, Some(""), Some("0"), Some("off"), Some("no"), Some("false")] {
+        assert!(
+            super::pf_kv_reserve_from_value(None),
+            "reserve: 未設定が off になった (lab で採ったので既定 on)"
+        );
+        assert!(super::pf_kv_reserve_from_value(Some("")));
+        for raw in [Some("0"), Some("off"), Some("no"), Some("false")] {
             assert!(
                 !super::pf_kv_reserve_from_value(raw),
                 "reserve が on になった: {raw:?}"
-            );
-            assert!(
-                !super::pf_kv_hpage_from_value(raw),
-                "hpage が on になった: {raw:?}"
             );
         }
         for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
@@ -1087,6 +1106,14 @@ mod attn_cache_tests {
                 super::pf_kv_reserve_from_value(raw),
                 "reserve が off のまま: {raw:?}"
             );
+        }
+        for raw in [None, Some(""), Some("0"), Some("off"), Some("no"), Some("false")] {
+            assert!(
+                !super::pf_kv_hpage_from_value(raw),
+                "hpage が on になった: {raw:?}"
+            );
+        }
+        for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
             assert!(
                 super::pf_kv_hpage_from_value(raw),
                 "hpage が off のまま: {raw:?}"
