@@ -8379,6 +8379,9 @@ struct SegKKernels {
     mix_r8: Option<CUfunction>,
     /// task 282: mix の down 用 (1 行 = 1 ブロック 256 スレッド)。Q8_0 専用。
     mix_rowblk: Option<CUfunction>,
+    /// task 412 / 526: gate + up + silu を 1 起動で回す版 ([`SEG_K_GU_NAMES`] の順)。
+    /// 古い PTX には無いので `None` (そのときは従来の 3 起動へ落ちる)。
+    gu: [Option<CUfunction>; 4],
 }
 
 // 生ハンドル (context / module / function)。CudaCtx と同じ規約。
@@ -8394,6 +8397,45 @@ const SEG_K_NAMES: [&[u8]; 4] = [
     b"dno_seg_gemv_k_q4k\0",
     b"dno_seg_gemv_k_q5k\0",
 ];
+
+/// task 412 / 526: gate + up + silu を 1 起動で回す版の名前 ([`moe_batch_slot`] の順)。
+const SEG_K_GU_NAMES: [&[u8]; 4] = [
+    b"dno_seg_gemv_gu_q8_0\0",
+    b"dno_seg_gemv_gu_q5_1\0",
+    b"dno_seg_gemv_gu_q4k\0",
+    b"dno_seg_gemv_gu_q5k\0",
+];
+
+/// task 412 / 526: `DENNO_SEG_GU_FUSE` — seg 経路 (K 型モデルの decode) の
+/// gate / up / silu を **1 起動**に畳む (`kernels_seg_k.ptx` の
+/// `dno_seg_gemv_gu_*`)。**既定 off** (lab で採否を決める)。
+///
+/// gate と up は入力 `x` が同じで行数も同じなので、(1) 起動が 3 -> 1、
+/// (2) 1 ブロックあたりの `x` の読みが 1 回、(3) `g` / `u` の作業域
+/// (`nseg x ff`) を書かない。**行ごとの計算順序は `dno_seg_gemv_k_*` と同じ**
+/// (ブロック昇順のアキュムレータ 1 本 + 同じ warp 木) なので、1 行の値は
+/// 従来とビット一致する。
+pub const SEG_GU_FUSE_ENV: &str = "DENNO_SEG_GU_FUSE";
+
+/// [`SEG_GU_FUSE_ENV`] の解釈 (純関数)。`1` / `on` / `true` / `yes` だけが真。
+pub fn seg_gu_fuse_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`SEG_GU_FUSE_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+pub fn seg_gu_fuse_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| seg_gu_fuse_from_value(std::env::var(SEG_GU_FUSE_ENV).ok().as_deref()))
+}
+
+/// task 412 / 526: 融合カーネルの起動形。`kernels/kernels_seg_k.cu` の
+/// `SK_GU_ROWS` と一致させること (テスト `seg_fuse_shape_matches_cu` が突き合わせる)。
+pub(crate) const SEG_WARPS: u32 = 4;
+/// 1 warp が受け持つ gate/up の行数 (`SK_GU_ROWS`)。
+pub(crate) const SEG_GU_ROWS: u32 = 2;
 
 /// task 278: 高速版 GEMV (`kernels_seg_k.ptx`) を使うか。
 ///
@@ -8471,11 +8513,17 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
             // task 282: mix 用の 2 本は任意 (無ければ旧 GEMV へ落ちる)。
             let mix_r8 = get(b"dno_mix_gemv_q8_0_r8\0");
             let mix_rowblk = get(b"dno_mix_gemv_q8_0_rowblk\0");
+            // task 412 / 526: 融合 (gu) の 4 型は任意 (古い PTX でも動く)。
+            let mut gu = [None; 4];
+            for (i, name) in SEG_K_GU_NAMES.iter().enumerate() {
+                gu[i] = get(name);
+            }
             Some(SegKKernels {
                 module,
                 fns,
                 mix_r8,
                 mix_rowblk,
+                gu,
             })
         })
         .as_ref()
@@ -8650,6 +8698,161 @@ fn put_f32s(dst: &mut [u8], src: &[f32]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 498: seg 層の和 (e*4 B) の D2H を小さな pinned バウンス経由にする
+// ---------------------------------------------------------------------------
+//
+// ゲートとカウンタは `crate::model::seg_prof` 側 (CUDA 無しのビルドでも起動ログと
+// リクエスト終端の行を出せるようにするため)。ここは転送の実体だけを持つ。
+// 動機と数値は `seg_prof::SEG_PIN_ENV` のコメントを見ること
+// (lab t498b の `[seg-prof] d2h=13.3-14.8 us/層` = decode の 5%)。
+
+/// 小さな D2H のバウンス 1 本ぶんの大きさ (e*4 = 10 KB に十分な余裕)。
+const SEG_PIN_BYTES: usize = 64 << 10;
+
+/// 専用バウンス (プロセスで 1 本、初回だけ確保する)。
+///
+/// `cuMemHostAlloc` は device を同期させるので、層ごとに取り直さない。
+static SEG_PIN_BUF: OnceLock<std::sync::Mutex<Option<PinMem>>> = OnceLock::new();
+
+fn seg_pin_buf() -> &'static std::sync::Mutex<Option<PinMem>> {
+    SEG_PIN_BUF.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// `src` (デバイス) から `dst` (ホストの `u8`) へ pinned バウンス経由で写す。
+///
+/// 成功で true。pinned が取れない / 転送が失敗したら false を返し、呼び出し側が
+/// 従来の pageable 経路でやり直す (値は同じバイト列)。`dst` は [`SEG_PIN_BYTES`]
+/// 以下であること。
+fn seg_pin_copy_d2h(src: CUdeviceptr, dst: &mut [u8]) -> bool {
+    let bytes = dst.len();
+    if bytes == 0 || bytes > SEG_PIN_BYTES {
+        return false;
+    }
+    let state = seg_pin_buf();
+    let mut g = match state.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if g.is_none() {
+        match PinMem::alloc(SEG_PIN_BYTES) {
+            Ok(p) => *g = Some(p),
+            Err(_) => {
+                crate::model::seg_prof::note_seg_pin_fallback();
+                return false;
+            }
+        }
+    }
+    let pin = g.as_ref().expect("確保済み").ptr;
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(_) => {
+            crate::model::seg_prof::note_seg_pin_fallback();
+            return false;
+        }
+    };
+    let r = unsafe { check((lib.memcpy_dtoh)(pin, src, bytes), "cuMemcpyDtoH (seg pin)") };
+    if r.is_err() {
+        crate::model::seg_prof::note_seg_pin_fallback();
+        return false;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(pin as *const u8, dst.as_mut_ptr(), bytes) };
+    crate::model::seg_prof::note_seg_pin_call();
+    true
+}
+
+// ---------------------------------------------------------------------------
+// task 502: seg 和の D2H を非同期にしてミスの CPU 計算の裏で流す
+// ---------------------------------------------------------------------------
+//
+// ゲートとカウンタは `crate::model::seg_prof` 側 (`DENNO_SEG_SUM_ASYNC`、既定 off)。
+// 動機は `seg_prof::SEG_ASYNC_ENV` のコメント。ここは転送の実体だけを持つ。
+//
+// - バンスは**スレッドごと**に 1 本 (`cuMemHostAlloc` はデバイスを止めるので初回だけ)。
+//   プロセス共有にするとミス計算の間ずっとロックを握ることになるため。
+// - コピーは null ストリーム (和カーネルの後ろ) に出し、**コピーの後にイベントを打って**
+//   その完了だけを待つ。`cuMemcpyDtoH` (同期) はこの文脈の仕事を待つので、
+//   ミス計算の後ろに直列で挟まっていた。
+
+/// 非同期コピーの完了を押さえるイベントのスロット (`seg_ev` の 0..=6 と重ねない)。
+const SEG_ASYNC_EV: usize = 7;
+
+thread_local! {
+    /// 非同期 D2H の行き先 (このスレッド専用)。
+    static SEG_ASYNC_PIN: std::cell::RefCell<Option<PinMem>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 和の D2H を非同期で pinned へ出す。`true` = 出した (完了待ちは
+/// [`seg_async_d2h_collect`])。`false` = 従来の同期経路へ丸ごと落ちる。
+fn seg_async_d2h_issue(src: CUdeviceptr, bytes: usize) -> bool {
+    use crate::model::seg_prof as sp;
+    if bytes == 0 || bytes > SEG_PIN_BYTES {
+        sp::note_seg_async_fallback();
+        return false;
+    }
+    let Ok(l) = lib() else {
+        sp::note_seg_async_fallback();
+        return false;
+    };
+    let ptr = SEG_ASYNC_PIN.with(|c| -> Option<*mut c_void> {
+        let mut g = c.borrow_mut();
+        if g.is_none() {
+            match PinMem::alloc(SEG_PIN_BYTES) {
+                Ok(p) => *g = Some(p),
+                Err(_) => return None,
+            }
+        }
+        g.as_ref().map(|p| p.ptr)
+    });
+    let Some(ptr) = ptr else {
+        sp::note_seg_async_fallback();
+        return false;
+    };
+    let r = unsafe {
+        check(
+            (l.memcpy_dtoh_async)(ptr, src, bytes, std::ptr::null_mut()),
+            "cuMemcpyDtoHAsync (seg sum)",
+        )
+    };
+    if r.is_err() {
+        sp::note_seg_async_fallback();
+        return false;
+    }
+    // ここまで来たらコピーは stream に積まれている。完了をイベントで押さえる
+    // (イベントが張れない環境では従来経路へ。余分なコピーは無害)。
+    if !seg_ev::record_raw(SEG_ASYNC_EV) {
+        sp::note_seg_async_fallback();
+        return false;
+    }
+    sp::note_seg_async_call();
+    true
+}
+
+/// 非同期コピーの完了を待って `dst` へ写す。`false` = 取れなかった。
+fn seg_async_d2h_collect(dst: &mut [u8]) -> bool {
+    let bytes = dst.len();
+    if bytes == 0 || bytes > SEG_PIN_BYTES {
+        return false;
+    }
+    if seg_ev::wait(SEG_ASYNC_EV).is_err() {
+        crate::model::seg_prof::note_seg_async_fallback();
+        return false;
+    }
+    SEG_ASYNC_PIN.with(|c| {
+        let g = c.borrow();
+        match g.as_ref() {
+            Some(p) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(p.ptr as *const u8, dst.as_mut_ptr(), bytes)
+                };
+                true
+            }
+            None => false,
+        }
+    })
+}
+
 /// K 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層を **5 起動 / 1 待ち**で回す (task 278)。
 ///
 /// - `pg` / `pu` / `pd`: segment ごとの重み先頭 (デバイスアドレス)
@@ -8770,6 +8973,21 @@ where
     };
     ctx.make_current()?;
 
+    // task 412 / 526: 融合版 (gate+up+silu 1 起動) の選択。
+    // `kernels_seg_k.ptx` の新しいカーネルが要る (古い PTX では None)。
+    // 高速版 (`seg_k`) の経路でだけ使う: 遅い方の PTX には無い。
+    let fuse_gu: Option<CUfunction> = match fast {
+        // gate と up は型も行長も同じときだけ畳める (x を共有する前提)。
+        Some(k) if seg_gu_fuse_enabled() && ty_g == ty_u && rb_g == rb_u => k.gu[slot_g],
+        _ => None,
+    };
+    // 融合カーネルの起動形 (blockDim = 128 = 4 warp)。
+    let gu_grid = (
+        (ff as u32).div_ceil(SEG_WARPS * SEG_GU_ROWS),
+        nseg as u32,
+        1u32,
+    );
+
     let lay = eb::seg_stage_layout(nseg, n_in);
     let ng = nseg * ff;
     let nh = nseg * e;
@@ -8814,6 +9032,39 @@ where
         // 2. 5 起動を同じストリームに積む (待たない)。
         let base = stage.ptr;
         let _ = seg_ev::record(0); // gate の前
+        // task 412 / 526: 融合版があれば gate / up / silu を 1 起動で済ませる。
+        if let Some(fg) = fuse_gu {
+            let mut pgw = base + lay.pg as u64;
+            let mut puw = base + lay.pu as u64;
+            let mut pxf = base + lay.x as u64;
+            let mut paf = act.ptr;
+            let mut psf = base + lay.sgu as u64;
+            let mut nsf = nseg as c_int;
+            let mut nif = n_in as c_int;
+            let mut nof = ff as c_int;
+            let mut rbf = rb_g as c_int;
+            let _t_launch = crate::model::seg_prof::stamp();
+            unsafe {
+                let mut args = [
+                    &mut pgw as *mut _ as *mut c_void,
+                    &mut puw as *mut _ as *mut c_void,
+                    &mut pxf as *mut _ as *mut c_void,
+                    &mut paf as *mut _ as *mut c_void,
+                    &mut psf as *mut _ as *mut c_void,
+                    &mut nsf as *mut _ as *mut c_void,
+                    &mut nif as *mut _ as *mut c_void,
+                    &mut nof as *mut _ as *mut c_void,
+                    &mut rbf as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(fg, gu_grid, block, 0, &mut args)?;
+            }
+            crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
+            // prof: up / silu の区間は 0 になる (行の形は従来と同じ)。
+            let _ = seg_ev::record(1);
+            let _ = seg_ev::record(2);
+            let _ = seg_ev::record(3);
+        }
+        if fuse_gu.is_none() {
         let mut pw = base + lay.pg as u64;
         let mut px = base + lay.x as u64;
         let mut po = g.ptr;
@@ -8895,6 +9146,7 @@ where
         }
         crate::model::seg_prof::add(crate::model::seg_prof::PH_LAUNCH, _t_launch);
         let _ = seg_ev::record(3); // silu の後
+        } // fuse_gu.is_none()
         // 4. down
         let mut pw = base + lay.pd as u64;
         let mut px = act.ptr;
@@ -8959,6 +9211,15 @@ where
         // 和の後 (ここを待てば 5 起動ぶんが終わる)
         let timed = seg_ev::record(5);
 
+        // task 502: `DENNO_SEG_SUM_ASYNC` のときは、和の直後に D2H を**非同期**で
+        // pinned バウンスへ出す。完了待ちは下の 8. で 1 回だけ行うので、コピーは
+        // 6. のミス CPU 計算 (1 層 ~100 us) の裏に完全に隠れる。同期の
+        // `cuMemcpyDtoH` はこの文脈の仕事を待つため 12-17 us/層 かかり、
+        // task 498 の pinned 同期版でも縮まなかった (t498c)。
+        let async_ok = crate::model::seg_prof::seg_sum_async_on()
+            && e * 4 <= SEG_PIN_BYTES
+            && seg_async_d2h_issue(outb.ptr, e * 4);
+
         // 6. GPU を待つ間にミスの CPU 計算を走らせる (重ね打ち)。
         let _t_miss = crate::model::seg_prof::stamp();
         let miss_r = cpu_miss();
@@ -8985,8 +9246,31 @@ where
         // e=2,560 (10 KB) で 11 us/層かかっていた (lab の `[seg-prof] d2h=`)。
         // `to_slice` は 1 本の作業域へ直接戻し、`DENNO_PF_PIN_STAGE` の窓に入って
         // いれば pinned バウンス経由 (同じバイト列) になる。
+        //
+        // task 498: `DENNO_SEG_SUM_PIN` (既定 off) のときは、この 10 KB の D2H を
+        // **専用の小さな pinned バウンス**へ DMA してからホストへ写す。pageable の
+        // 同期 D2H は driver が内部ステージングを取るので 13-15 us かかる
+        // (lab t498b の `[seg-prof] d2h=13.3-14.8/層`)。失敗したら従来経路へ
+        // 丸ごと落ちる (値は同じバイト列)。
         let _t_d2h = crate::model::seg_prof::stamp();
-        outb.to_slice(&mut out[..e])?;
+        let mut d2h_done = false;
+        // task 502: 非同期で出したコピーの完了を待って pinned から写す
+        // (コピーはミス計算の裏で終わっている)。失敗したら下の同期経路へ。
+        if async_ok {
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(out[..e].as_mut_ptr() as *mut u8, e * 4)
+            };
+            d2h_done = seg_async_d2h_collect(dst);
+        }
+        if !d2h_done && crate::model::seg_prof::seg_sum_pin_on() && e * 4 <= SEG_PIN_BYTES {
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(out[..e].as_mut_ptr() as *mut u8, e * 4)
+            };
+            d2h_done = seg_pin_copy_d2h(outb.ptr, dst);
+        }
+        if !d2h_done {
+            outb.to_slice(&mut out[..e])?;
+        }
         dbg_d2h(e * 4);
         crate::model::seg_prof::add(crate::model::seg_prof::PH_D2H, _t_d2h);
 
@@ -48681,6 +48965,64 @@ mod tests {
         assert!(!seg_k_from_value(Some("false")));
         assert!(!seg_k_from_value(Some("NO")));
     }
+
+    /// task 526: seg の gate+up+silu 融合 (`DENNO_SEG_GU_FUSE`) のゲートは
+    /// **既定 off**。明示的な真値だけが on (lab の A/B で `=1` を立てる)。
+    #[test]
+    fn seg_fuse_gate_default_off() {
+        assert!(!seg_gu_fuse_from_value(None), "未設定は off (既定)");
+        assert!(!seg_gu_fuse_from_value(Some("")));
+        assert!(!seg_gu_fuse_from_value(Some("0")));
+        assert!(!seg_gu_fuse_from_value(Some("off")));
+        assert!(!seg_gu_fuse_from_value(Some("no")));
+        for v in ["1", "on", "true", "yes", " TRUE "] {
+            assert!(seg_gu_fuse_from_value(Some(v)), "gu: {v}");
+        }
+    }
+
+    /// task 526: ホストの起動形 (1 warp が受け持つ行数) と `kernels_seg_k.cu` の
+    /// `#define` が一致していること。片方だけ変えると行の取り違えになる
+    /// (GPU 無しで検出できるのはここまで。値の一致は lab の A/B で見る)。
+    #[test]
+    fn seg_fuse_shape_matches_cu() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_seg_k.cu");
+        let src = std::fs::read_to_string(&p).expect("kernels_seg_k.cu が読めない");
+        let pick = |name: &str| -> u32 {
+            let key = format!("#define {name} ");
+            let line = src
+                .lines()
+                .find(|l| l.starts_with(&key))
+                .unwrap_or_else(|| panic!("{name} の #define が無い"));
+            line[key.len()..].trim().parse().expect("#define の値が数値でない")
+        };
+        assert_eq!(pick("SK_GU_ROWS"), SEG_GU_ROWS, "gu の行数");
+        // ブロックは 128 = 4 warp 固定 (カーネルは blockDim.x >> 5 を使う)。
+        assert_eq!(SEG_WARPS, 4);
+    }
+
+    /// task 526: コミット済みの `kernels_seg_k.ptx` に融合 (gu) の 4 エントリが
+    /// 居ること。**PTX の再生成を忘れると、ゲートを on にしても静かに従来の
+    /// 3 起動へ落ちる** (起動数でしか気づけない) ので、ここで固定する。
+    #[test]
+    fn seg_fuse_ptx_has_new_entries() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_seg_k.ptx");
+        let ptx = std::fs::read_to_string(&p).expect("kernels_seg_k.ptx が読めない");
+        for n in SEG_K_GU_NAMES.iter() {
+            let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
+            let key = format!(".visible .entry {name}(");
+            assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
+        }
+        // 従来の 4 本も残っていること (差し替えではなく追加)。
+        for n in SEG_K_NAMES.iter() {
+            let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
+            let key = format!(".visible .entry {name}(");
+            assert!(ptx.contains(&key), "{name} が消えた");
+        }
+    }
     /// task 282: mix の GEMV 種別 (`DENNO_MIX_QK`) の既定は `(Blk, R8)`。
     /// `0` で旧 GEMV に戻り、`down` / `up` / `seg` で向きごとに選べる。
     #[test]
@@ -66289,6 +66631,73 @@ mod task204_tests {
             Some(MIX_UP_NARGS),
             "upw の PTX 引数数が {MIX_UP_NARGS} でない"
         );
+    }
+}
+
+#[cfg(test)]
+mod task498_tests {
+    use super::*;
+
+    /// バウンスに収まらない長さは「やらない」を返す (呼び出し側は pageable へ落ちる)。
+    ///
+    /// 0 バイトと上限超えは CUDA を触る前に false を返すので、GPU の無い
+    /// コンテナでも判定できる。共有カウンタは読まない (並列テストで競合しない)。
+    #[test]
+    fn seg_pin_copy_rejects_out_of_range() {
+        let mut none: [u8; 0] = [];
+        assert!(!seg_pin_copy_d2h(0, &mut none), "0 バイトは false");
+        let mut big = vec![0u8; SEG_PIN_BYTES + 1];
+        assert!(!seg_pin_copy_d2h(0, &mut big), "上限超えは false");
+    }
+
+    /// GPU の無い環境では pinned が取れず **false (= 従来経路) に落ちる**。
+    /// 落ちた回数が増えるので、リクエスト終端の `[seg-pin] fallbacks=` で判別できる。
+    /// 共有カウンタは他テストと競合し得るので「増えた」だけを見る。
+    #[test]
+    fn seg_pin_copy_falls_back_without_cuda() {
+        let (_, before) = crate::model::seg_prof::seg_pin_counts();
+        let mut dst = vec![0u8; 64];
+        let ok = seg_pin_copy_d2h(0, &mut dst);
+        let (_, after) = crate::model::seg_prof::seg_pin_counts();
+        if ok {
+            // GPU のある環境でだけ通り得る (コンテナでは起きない)。
+            assert_eq!(dst, vec![0u8; 64], "0 番地からの写しは 0 のまま");
+        } else {
+            assert!(after > before, "落ちた回数が増える");
+        }
+    }
+}
+
+#[cfg(test)]
+mod task502_tests {
+    use super::*;
+
+    /// バウンスに収まらない長さは CUDA を触る前に「やらない」を返す。
+    #[test]
+    fn seg_async_issue_rejects_out_of_range() {
+        assert!(!seg_async_d2h_issue(0, 0), "0 バイトは false");
+        assert!(!seg_async_d2h_issue(0, SEG_PIN_BYTES + 1), "上限超えは false");
+    }
+
+    /// collect も範囲外は false (呼び出し側は同期経路へ落ちる)。
+    #[test]
+    fn seg_async_collect_rejects_out_of_range() {
+        let mut none: [u8; 0] = [];
+        assert!(!seg_async_d2h_collect(&mut none), "0 バイトは false");
+        let mut big = vec![0u8; SEG_PIN_BYTES + 1];
+        assert!(!seg_async_d2h_collect(&mut big), "上限超えは false");
+    }
+
+    /// GPU の無い環境では非同期コピーを出せず **false (= 従来経路) に落ちる**。
+    /// 落ちた回数が増えるので、リクエスト終端の `[seg-async] fallbacks=` で判別できる。
+    /// 共有カウンタは他テストと競合し得るので「増えた」だけを見る。
+    #[test]
+    fn seg_async_issue_falls_back_without_cuda() {
+        let (_, before) = crate::model::seg_prof::seg_async_counts();
+        let ok = seg_async_d2h_issue(0, 64);
+        let (_, after) = crate::model::seg_prof::seg_async_counts();
+        assert!(!ok, "コンテナ (GPU 無し) では出せない");
+        assert!(after > before, "落ちた回数が増える");
     }
 }
 
