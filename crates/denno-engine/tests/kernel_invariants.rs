@@ -14413,3 +14413,144 @@ fn t490_wide_window_budget_is_wired() {
         "選んだ KiB を early_route_budget に渡していない"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 514: UD-Q4_K_XL のホスト側 (page cache / RAM tier / 追い出し) の計器と
+// リクエスト終端の page cache drop の配線。
+// ---------------------------------------------------------------------------
+
+const EXPERT_RAM_SRC: &str = include_str!("../src/model/expert_ram.rs");
+
+/// task 514: 計器と配線。
+///
+/// - `/proc/self/io` の差分 (`io_read_MB` = ディスクから読んだ実バイト) と
+///   モデル全体の常駐量 (`file_resident`) が `[exp-ram-probe]` に出る。
+/// - `DENNO_PF_FADV_END=1` でリクエスト終端に expert 範囲を落とす。
+/// - `probe_line` は**従来どおり** `DENNO_EXPERT_RAM_PROBE` / `DENNO_Q4_PROFILE`
+///   でしか動かない (既定のログを増やさない)。
+/// - drop の呼び出しは serve の**リクエスト終端** (probe_line の直後) にあり、
+///   先頭の `drop_pages_if_enabled` とは別のゲート。
+#[test]
+fn t514_host_page_cache_instruments_and_end_drop_are_wired() {
+    for k in [
+        "pub const FADV_END_ENV: &str = \"DENNO_PF_FADV_END\"",
+        "pub fn fadv_end_enabled()",
+        "pub fn drop_expert_pages_end(tag: &str) -> Option<String>",
+        "fn proc_io()",
+        "pub fn install_part_map(",
+        "io_rchar_MB={:.1} io_read_MB={:.1}",
+        "file_resident={}MiB/{}MiB",
+        "expert_resident={}MiB->{}MiB file_resident={}MiB->{}MiB",
+    ] {
+        assert!(EXPERT_RAM_SRC.contains(k), "expert_ram に {k} が無い");
+    }
+    // 終端の drop はゲートを先に読み、`drop_ranges` を呼ぶ (mincore は probe のときだけ)。
+    let f = fn_body(EXPERT_RAM_SRC, "pub fn drop_expert_pages_end(");
+    let gate = f.find("fadv_end_enabled()").expect("ゲートが無い");
+    let drop = f.find("drop_ranges(&parts, &ranges)").expect("drop_ranges が無い");
+    assert!(gate < drop, "ゲートの判定が drop より後ろにある");
+    assert!(
+        f.contains("let probe = flag(PROBE_ENV);"),
+        "mincore を probe のときだけにしていない"
+    );
+    // モデルの全パートの mmap を覚える (file_resident 用)。
+    assert!(
+        QWEN_SRC.contains("expert_ram::install_part_map(pmap)"),
+        "qwen4exp が part map を入れていない"
+    );
+    // リクエスト終端 (統計を出す関数) から呼ぶ。先頭の診断 drop とは別物。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::expert_ram::drop_expert_pages_end(tag)"),
+        "終端の drop が serve_flash に無い"
+    );
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::expert_ram::probe_line(tag)"),
+        "probe_line の配線が無い"
+    );
+    // 既定 off: ゲートを読まない限り数値経路もログも変わらない。
+    assert!(
+        EXPERT_RAM_SRC.contains("\"off\"") || EXPERT_RAM_SRC.contains("Some(\"1\") | Some(\"true\")"),
+        "flag の解釈が無い"
+    );
+}
+
+/// task 530: ステージング写しの切り分けが配線されているか (静的検査)。
+///
+/// 数値経路を変えるのは 2 つのゲート (`DENNO_PF_PREAD_NC_FIRST` /
+/// `DENNO_PF_PREAD_ODIRECT`) だけで、どちらも既定 off。
+/// 計器 (`DENNO_PF_NC`) は既定 on で、`[exp-pf-stream]` の末尾に欄を足す。
+#[test]
+fn t530_staging_copy_instruments_and_gates_are_wired() {
+    // ゲートと計器の定義 (名前を変えたらこのテストも直す)。
+    for k in [
+        "pub const NC_FIRST_ENV: &str = \"DENNO_PF_PREAD_NC_FIRST\"",
+        "pub const NC_ENV: &str = \"DENNO_PF_NC\"",
+        "pub const ODIRECT_ENV: &str = \"DENNO_PF_PREAD_ODIRECT\"",
+        "pub const DEFAULT_NC_FIRST: bool = false",
+        "pub const DEFAULT_ODIRECT: bool = false",
+        "pub const DEFAULT_NC: bool = false",
+        "pub fn odirect_window(",
+        "pub fn nc_first_order(",
+        "pub unsafe fn range_resident(",
+        "pub fn staging_stats() -> String",
+        "nc_judged={judged}",
+        "od_win_MB=",
+        "grp_miss_s=",
+        "nc_ord_moved=",
+        "pub fn note_nc_order(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 台帳はリクエスト終端の `[exp-pf-stream]` に足す (どこにも出なければ読めない)。
+    assert!(
+        EXP_PF_SRC.contains("out.push_str(&staging_stats())"),
+        "staging_stats が [exp-pf-stream] に繋がっていない"
+    );
+    assert!(
+        EXP_PF_SRC.contains("    staging_stats_reset();"),
+        "端末で台帳を戻していない"
+    );
+    // O_DIRECT は専用の読み口を開き、read_part_ptr から窓を使って呼ぶ。
+    assert!(
+        EXP_PF_SRC.contains("static PARTS_OD:"),
+        "O_DIRECT 用の読み口が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("fn open_odirect(p: &std::path::Path)"),
+        "O_DIRECT の open が無い"
+    );
+    let rp = fn_body(EXP_PF_SRC, "pub unsafe fn read_part_ptr(");
+    let win = rp.find("let od_win = odirect_window(").expect("窓の判定が無い");
+    let gate = rp.find("if odirect_on() {").expect("ゲートの判定が無い");
+    let buffered = rp.find("read_full(f, off, buf)").expect("buffered の経路が無い");
+    assert!(win < gate, "窓 (計器) をゲートの前に計算していない");
+    assert!(gate < buffered, "O_DIRECT の後に buffered が無い (落ちたとき戻れない)");
+    // 窓はゲートに関係なく数える (発火しなかった回の上界が読める)。
+    assert!(
+        rp.contains("note_odirect(n, 1, 0, 0)"),
+        "窓の台帳がゲートの外に無い"
+    );
+    // 写しの側: 常駐の予測 → (ゲート) 並べ替え → 写し → グループの記録。
+    let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
+    let res = cp.find("exp_pf::range_resident(").expect("mincore の予測が無い");
+    let ord = cp.find("exp_pf::nc_first_order(").expect("並べ替えが無い");
+    let work = cp.find("let work = |").expect("写しの本体が無い");
+    let grp = cp.find("exp_pf::note_staging_group(").expect("グループの記録が無い");
+    assert!(res < work, "予測が写しの後に来ている");
+    assert!(ord > res && ord < work, "並べ替えが予測と写しの間に無い");
+    assert_eq!(
+        cp.matches("exp_pf::note_staging_group(").count(),
+        2,
+        "グループの記録は 2 つの出口 (pool 経由 / 素の par_iter) の両方に要る"
+    );
+    assert!(cp.contains("if exp_pf::nc_first_on() {"), "ゲートで囲んでいない");
+    assert!(
+        cp.contains("exp_pf::note_nc_order(moved)"),
+        "並べ替えが発火したかを数えていない"
+    );
+    assert!(
+        cp.contains("exp_pf::note_range_residency("),
+        "予測の台帳が無い"
+    );
+    let _ = grp;
+}

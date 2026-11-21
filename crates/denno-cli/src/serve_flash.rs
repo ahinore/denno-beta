@@ -719,6 +719,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     if let Some(line) = denno_engine::model::expert_ram::probe_line(tag) {
         eprintln!("{line}");
     }
+    // task 514: リクエスト終端で expert 範囲の page cache を落とす
+    // (`DENNO_PF_FADV_END=1` のときだけ 1 行)。pread の読み残しだけが消える。
+    if let Some(line) = denno_engine::model::expert_ram::drop_expert_pages_end(tag) {
+        eprintln!("{line}");
+    }
     // task 190: ヒット本数ごとのミス CPU / 上げ直しの表 (PROFILE のときだけ)。
     if tag == "decode" {
         for line in denno_engine::model::exp_iq::hit_lines(128) {
