@@ -1938,6 +1938,11 @@ pub const PREAD_KB_ENV: &str = "DENNO_PF_PREAD_KB";
 /// 512 KiB だけ 2 ラウンド目に 20-30 s へ跳ねた (推定: カーネルの readahead の
 /// 1 窓と同じ長さで、二重読みが起きる回がある)。384 / 256 は 2 ラウンドとも
 /// 揃うので、呼び出し回数が少ない 384 を既定にした。
+///
+/// task 538: これは **広い塊 (`DENNO_PF_SPLIT_WIDE_KB`) が off のときの既定**。
+/// 広い塊が on のときは 1 MiB を使う ([`pread_kb_default`])。1024 単独は
+/// t530b で 16.0 s (384 は 11.8 s) と負けたが、広い塊と組にすると
+/// t538b で 8.3 s (`copy_s`)、3,826 cold が 11.80 -> 9.48 s になった。
 pub const DEFAULT_PREAD_KB: usize = 384;
 
 /// [`PREAD_KB_ENV`] の解釈 (純関数)。64..=65536 KiB に丸める。
@@ -1952,9 +1957,30 @@ pub fn pread_kb_from_value(v: Option<&str>) -> usize {
 }
 
 /// 1 回の `read_at` の長さ (バイト)。
+///
+/// task 538: `DENNO_PF_PREAD_KB` が**未設定**で広い塊 (`DENNO_PF_SPLIT_WIDE_KB`
+/// > 0、既定 on) のときは **1 MiB** を既定にする。384 KiB のままだと広い塊の
+/// 中身が細かすぎて 1 回の `pread` の固定費が効き、逆に 1024 単独 (t530b
+/// 16.0 s) は 8 MiB の塊に 3 本しか入らず負ける。**2 つは組で効く**ので、
+/// 既定も組で決める (明示値はいつでも優先)。
+pub fn pread_kb_default(wide_on: bool) -> usize {
+    if wide_on {
+        1024
+    } else {
+        DEFAULT_PREAD_KB
+    }
+}
+
+/// 1 回の `read_at` の長さ (バイト)。
 pub fn pread_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| pread_kb_from_value(std::env::var(PREAD_KB_ENV).ok().as_deref()) << 10)
+    *N.get_or_init(|| {
+        let kb = match std::env::var(PREAD_KB_ENV).ok().as_deref() {
+            Some(s) if !s.trim().is_empty() => pread_kb_from_value(Some(s)),
+            _ => pread_kb_default(split_wide_bytes() > 0),
+        };
+        kb << 10
+    })
 }
 
 /// `len` バイトを `blk` ずつに切った (転送元の中のオフセット, 長さ) の列。
@@ -2035,6 +2061,71 @@ pub fn up_split_bytes() -> usize {
     })
 }
 
+/// task 538: **ディスクから読むグループだけ**分割 DMA の塊を広げる大きさ (KiB)。
+///
+/// 530 の残りは「ステージング写しのディスク実効 1.6 GB/s」で、1 回の写し
+/// (= 1 チャンク) の中にディスク読みが何本入っているかで決まる。8 MiB の
+/// チャンクには 0.93 MB の区間が 8 本しか入らないので、`DENNO_PF_PREAD_KB`
+/// を 1 MiB にすると**同時に飛ぶ本数が 3 本まで落ちる** (t530b で 1024 が
+/// 16.0 s = 384 KiB の 11.8 s より遅かった理由)。塊を広げれば本数を戻せる。
+///
+/// ただし塊を広げるとバウンスが L3 (96 MB) から溢れて 481 の利得 (DMA が
+/// L3 を読む) を失う。既定モデル (page cache 常駐) はまさにそれで、
+/// t538a の実測: `DENNO_PF_UP_SPLIT_KB=32768` で 3,826 cold が
+/// **1.89 -> 2.12 s (+12%、2 ラウンド同値)**。だからこのゲートは
+/// **`src` を持つ (= ディスク読みを含む) グループにだけ**効かせる。
+///
+/// 0 = off (既定)。64..=262144 KiB。
+pub const SPLIT_WIDE_KB_ENV: &str = "DENNO_PF_SPLIT_WIDE_KB";
+
+/// [`SPLIT_WIDE_KB_ENV`] の既定値 (**32 MiB**、task 538 で採った)。
+///
+/// lab t538b (3,826 cold): 8 MiB のまま (b/b2 11.80 / 11.50) が 32 MiB で
+/// **9.48 / 9.28**、64 MiB で 8.95、`copy_s` は 10.7 -> 8.3 -> 7.0 s。
+/// 64 MiB は 14k が 13.01 -> 14.09 と逆に振れたので 32 MiB を既定にした。
+/// 0 で従来 (8 MiB 固定)。既定モデルは `src` を持たないので発火しない。
+pub const DEFAULT_SPLIT_WIDE_KB: usize = 32768;
+
+/// [`SPLIT_WIDE_KB_ENV`] の解釈 (純関数)。未設定 / 空 / 解析不能は既定 (off)。
+pub fn split_wide_kb_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_SPLIT_WIDE_KB;
+    };
+
+    match s.parse::<usize>() {
+        Ok(0) => 0,
+        Ok(n) => n.clamp(64, 262144),
+        Err(_) => match s.to_ascii_lowercase().as_str() {
+            "off" | "false" | "no" => 0,
+            _ => DEFAULT_SPLIT_WIDE_KB,
+        },
+    }
+}
+
+/// 広い塊の大きさ (バイト、0 = off)。プロセスで 1 回だけ env を読む。
+pub fn split_wide_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        split_wide_kb_from_value(std::env::var(SPLIT_WIDE_KB_ENV).ok().as_deref()) << 10
+    })
+}
+
+/// 1 グループの分割の大きさを決める (純関数)。
+///
+/// `src` を持つ区間が 1 本でもあれば (= ファイルから読むグループ) 広い塊を
+/// 使う。持たないグループ (mmap をそのまま写す = page cache / RAM) は
+/// `base` のままにして L3 の利得を残す。
+pub fn split_chunk_for(base: usize, wide: usize, has_src: bool) -> usize {
+    if base == 0 {
+        return 0;
+    }
+    if has_src && wide > base {
+        wide
+    } else {
+        base
+    }
+}
+
 /// 分割 DMA を積んだ回数 (診断。0 ならゲートが発火していない)。
 static UP_SPLIT_CHUNKS: AtomicU64 = AtomicU64::new(0);
 
@@ -2043,9 +2134,22 @@ pub fn note_up_split() {
     UP_SPLIT_CHUNKS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// task 538: 広い塊 (`DENNO_PF_SPLIT_WIDE_KB`) で写した回数 (発火の証拠)。
+static UP_SPLIT_WIDE_CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+/// task 538: 広い塊を 1 回使った。
+pub fn note_up_split_wide() {
+    UP_SPLIT_WIDE_CHUNKS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 分割 DMA を積んだ回数 (リクエスト境界で 0 に戻す)。
 pub fn up_split_chunks() -> u64 {
     UP_SPLIT_CHUNKS.load(Ordering::Relaxed)
+}
+
+/// task 538: 広い塊で写した回数 (リクエスト単位。0 ならゲートが効いていない)。
+pub fn up_split_wide_chunks() -> u64 {
+    UP_SPLIT_WIDE_CHUNKS.load(Ordering::Relaxed)
 }
 
 /// `DENNO_PF_PREAD_THREADS`: pread の写し専用のスレッド数 (既定 **32**、
@@ -2702,6 +2806,14 @@ static OD_OK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static OD_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NC_ORD_GRPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NC_ORD_MOVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// task 538: ディスク読みの**同時本数** (バリアの中で何本飛んでいるか)。
+// 写しの壁がディスク律速なら、これは「1 グループ (= 1 回の写し) に
+// 何本入っているか」で決まる。増やす手 (チャンクを広げる / 本数を増やす /
+// 2 グループを重ねる) の効果を、緑ではなくこの数字で数える。
+static RD_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RD_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 常駐の予測を 1 グループぶん積む。`ns` は判定にかかった時間。
 pub fn note_range_residency(judged: usize, miss: usize, miss_bytes: usize, unknown: usize, ns: u64) {
@@ -2730,6 +2842,42 @@ pub fn note_nc_order(moved: usize) {
     let o = std::sync::atomic::Ordering::Relaxed;
     NC_ORD_GRPS.fetch_add(1, o);
     NC_ORD_MOVED.fetch_add(moved as u64, o);
+}
+
+/// task 538: ディスク読み (pread) を 1 本始める。同時本数の最大を更新する。
+pub fn note_rd_enter(len: usize) {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    let n = RD_LIVE.fetch_add(1, o) + 1;
+    RD_MAX.fetch_max(n, o);
+    RD_N.fetch_add(1, o);
+    RD_BYTES.fetch_add(len as u64, o);
+}
+
+/// task 538: ディスク読みを 1 本終える。
+pub fn note_rd_leave() {
+    RD_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 538: 同時本数の台帳 (診断用)。`[exp-pf-stream]` の末尾に足す。
+pub fn rd_stats() -> String {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    if RD_N.load(o) == 0 {
+        return String::new();
+    }
+    format!(
+        " rd_n={} rd_MB={:.1} rd_max={}",
+        RD_N.load(o),
+        RD_BYTES.load(o) as f64 / 1e6,
+        RD_MAX.load(o),
+    )
+}
+
+/// task 538: 同時本数の台帳を 0 に戻す。
+pub fn rd_stats_reset() {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    for c in [&RD_LIVE, &RD_MAX, &RD_N, &RD_BYTES] {
+        c.store(0, o);
+    }
 }
 
 /// O_DIRECT の窓がどれだけ取れたか / 実際に読めたか。
@@ -5125,7 +5273,7 @@ pub fn stats_line() -> Option<String> {
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} use_s={use_s:.2} \
              probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} spread={} ut={} dec={} gpuw={} nsync={} group={} min_tok={} \
-             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x} retry={} wbl={} wbskip={} usplit={} usplit_kb={}",
+             chunk_kb={} src={} reg_MB={:.1} reg_ok_MB={:.1} reg_calls={} reg_s={:.2} reg_flags={:#x} retry={} wbl={} wbskip={} usplit={} usplit_kb={} usplit_wide={} usplit_wide_kb={}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -5156,6 +5304,8 @@ pub fn stats_line() -> Option<String> {
             GDN_WB_SKIPS.load(Ordering::Relaxed),
             UP_SPLIT_CHUNKS.load(Ordering::Relaxed),
             up_split_bytes() >> 10,
+            UP_SPLIT_WIDE_CHUNKS.load(Ordering::Relaxed),
+            split_wide_bytes() >> 10,
         ));
         // task 254: 表の非同期 H2D が発火したか (gate on の証拠)。
         #[cfg(feature = "cuda")]
@@ -5179,6 +5329,8 @@ pub fn stats_line() -> Option<String> {
         out.push_str(&range_stats());
         // task 530: 写しの切り分け (常駐の予測 / グループの内訳 / O_DIRECT の窓)。
         out.push_str(&staging_stats());
+        // task 538: ディスク読みの同時本数 (バリアの中で何本飛んだか)。
+        out.push_str(&rd_stats());
         out.push_str(&rc_stats());
         // task 394: 次の層の先読みが発火したかの台帳。
         out.push_str(&layer_pre_stats());
@@ -5229,6 +5381,7 @@ pub fn stats_reset() {
         &REG_CALLS,
         &REG_NS,
         &UP_SPLIT_CHUNKS,
+        &UP_SPLIT_WIDE_CHUNKS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -5238,6 +5391,8 @@ pub fn stats_reset() {
     rc_stats_reset();
     // task 530: 写しの切り分けの台帳も戻す。
     staging_stats_reset();
+    // task 538: ディスク読みの同時本数の台帳も戻す。
+    rd_stats_reset();
     CHECK_LAYERS.store(0, Ordering::Relaxed);
     if let Ok(mut g) = CHECK.lock() {
         *g = None;
@@ -7046,6 +7201,75 @@ mod tests {
         assert!(s.contains("nc_ord_moved=7"), "{s}");
         staging_stats_reset();
         assert!(staging_stats().is_empty(), "戻したら空");
+    }
+
+    /// task 538: 広い塊と pread の塊は組で既定を決める (明示値が優先)。
+    #[test]
+    fn task538_pread_kb_default_follows_wide() {
+        assert_eq!(pread_kb_default(true), 1024, "広い塊のときは 1 MiB");
+        assert_eq!(pread_kb_default(false), DEFAULT_PREAD_KB, "従来は 384");
+        assert_eq!(DEFAULT_PREAD_KB, 384);
+        // 明示値は広い塊の有無に関係なくそのまま効く。
+        assert_eq!(pread_kb_from_value(Some("384")), 384);
+        assert_eq!(pread_kb_from_value(Some("1024")), 1024);
+    }
+
+    /// task 538: 広い塊のゲート (`DENNO_PF_SPLIT_WIDE_KB`) と、グループごとの
+    /// 塊の選び方 (`src` を持つグループだけ広げる)。
+    #[test]
+    fn task538_split_wide_gate_truth_table() {
+        assert_eq!(SPLIT_WIDE_KB_ENV, "DENNO_PF_SPLIT_WIDE_KB");
+        assert_eq!(DEFAULT_SPLIT_WIDE_KB, 32768, "task 538 で既定 on にした");
+        assert_eq!(split_wide_kb_from_value(None), 32768, "既定 on");
+        assert_eq!(split_wide_kb_from_value(Some("")), 32768);
+        assert_eq!(split_wide_kb_from_value(Some("0")), 0, "0 で従来へ戻る");
+        assert_eq!(split_wide_kb_from_value(Some("off")), 0);
+        assert_eq!(
+            split_wide_kb_from_value(Some("x")),
+            32768,
+            "解析不能は既定 (on)"
+        );
+        assert_eq!(split_wide_kb_from_value(Some("32768")), 32768);
+        assert_eq!(split_wide_kb_from_value(Some(" 65536 ")), 65536);
+        assert_eq!(split_wide_kb_from_value(Some("1")), 64, "下限 64 KiB");
+        assert_eq!(split_wide_kb_from_value(Some("999999")), 262144, "上限");
+        // グループごとの選択: src を持つ (ファイルから読む) グループだけ広げる。
+        assert_eq!(split_chunk_for(8192, 0, true), 8192, "ゲート off は従来");
+        assert_eq!(split_chunk_for(8192, 0, false), 8192);
+        assert_eq!(split_chunk_for(8192, 32768, true), 32768);
+        assert_eq!(
+            split_chunk_for(8192, 32768, false),
+            8192,
+            "page cache / RAM のグループは L3 の利得を残す"
+        );
+        assert_eq!(
+            split_chunk_for(32768, 8192, true),
+            32768,
+            "広い塊が細かいときは base"
+        );
+        assert_eq!(split_chunk_for(0, 32768, true), 0, "分割 off は off のまま");
+    }
+
+    /// task 538: ディスク読みの同時本数の台帳 (最大値と本数とバイト、戻すと空)。
+    #[test]
+    fn task538_rd_inflight_ledger() {
+        rd_stats_reset();
+        assert!(rd_stats().is_empty(), "戻したら空");
+        note_rd_enter(1000);
+        note_rd_enter(2000);
+        assert!(rd_stats().contains("rd_max=2"), "{}", rd_stats());
+        note_rd_leave();
+        // 減らしても最大は戻らない (同時本数のピークを残す)。
+        assert!(rd_stats().contains("rd_max=2"), "{}", rd_stats());
+        note_rd_enter(3000);
+        note_rd_leave();
+        note_rd_leave();
+        let s = rd_stats();
+        assert!(s.contains("rd_n=3"), "{s}");
+        assert!(s.contains("rd_MB=0.0"), "{s}");
+        assert!(s.contains("rd_max=2"), "ピークは 2 のまま: {s}");
+        rd_stats_reset();
+        assert!(rd_stats().is_empty(), "また戻せる");
     }
 
     /// task 530: `mincore(2)` は「触った直後の自分のメモリ」を常駐と答える。
