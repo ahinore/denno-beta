@@ -14869,3 +14869,35 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
         assert_eq!(n, 12, "PTX の dno_attn_flashdec_t2 が 12 引数でない");
     }
 }
+
+/// task 546: `DENNO_PF_PREAD_ODIRECT_BOUNCE` の配線 (静的検査)。
+///
+/// 緑は発火の証拠ではないので、lab の `[exp-pf-stream]` の
+/// `odb_MB=` / `odb_n=` / `odb_skip_MB=` で数える。
+#[test]
+fn t546_odirect_bounce_is_wired() {
+    const EP: &str = include_str!("../src/model/exp_pf.rs");
+    for s in [
+        "pub const ODB_ENV: &str = \"DENNO_PF_PREAD_ODIRECT_BOUNCE\";",
+        "pub fn odb_from_value(v: Option<&str>) -> bool {",
+        "pub fn odb_on() -> bool {",
+        "pub fn od_bounce_shape(off: u64, len: usize, align: usize)",
+        "pub unsafe fn read_part_ptr_od_bounce(part: u32, off: u64, dst: *mut u8, len: usize) -> bool {",
+        "ODB_BUF.with(|cell| {",
+        "odirect_on() || odb_on()",
+        "out.push_str(&odb_stats());",
+        "odb_stats_reset();",
+    ] {
+        assert!(EP.contains(s), "exp_pf.rs に {s} が無い");
+    }
+    // 予測 (mincore) を odb でも回し、判定をタスクへ配っていること。
+    for s in [
+        "exp_pf::nc_on() || exp_pf::nc_first_on() || exp_pf::odb_on()",
+        "for (t, &f) in tasks.iter_mut().zip(flags.iter()) {",
+        "if !resident && exp_pf::odb_on() {",
+        "exp_pf::read_part_ptr_od_bounce(part, at, dst, len)",
+        "exp_pf::note_odb(0, len, 0, 0);",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+}
