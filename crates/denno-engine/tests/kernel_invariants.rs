@@ -12904,7 +12904,7 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
         "build_ptx.sh に target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "targets_all の末尾に足していない"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -13481,14 +13481,18 @@ fn task448_flashdec_tile_kernel_and_wiring() {
         "let tile_on = attn_fdec_tile_on();",
         // decode の実サーバ経路 (デバイス連鎖の attn_launch) にも同じ門を置く。
         // ここを忘れると lab では v1 だけが走り、差が出ない (t448a-c の失敗)。
-        "let tile_k = if tile_on && fdt_shape_ok(dh, tile) {",
+        // task 520 で「第 3 版 -> タイル版 -> v1」の 3 段になった。
+        "let shape_ok = tile_on && fdt_shape_ok(dh, tile);",
+        "let tile_k = if t2_k.is_none() && shape_ok {",
         "(kt.f_t, fdt_smem_bytes(tile, dh) as u32)",
         "b\"dno_attn_flashdec_t\\0\"",
         "if tile_on {",
         "if !fdt_shape_ok(a.dh, tile) {",
         "args.push(&mut tile_c as *mut _ as *mut c_void);",
         "fdt_smem_bytes(tile, a.dh) as u32",
-        "FdecImpl::Tile => q4attn_kprof::note_fdt_call(),",
+        // task 520 でタイル版の側に第 3 版の計数が入った (ブロックになった)。
+        "FdecImpl::Tile => {",
+        "q4attn_kprof::note_fdt_call();",
         "q4attn_kprof::note_fdt_fallback();",
         "FDT_CALLS.fetch_add(1",
         "fdt calls={} fallback={} tile={}",
