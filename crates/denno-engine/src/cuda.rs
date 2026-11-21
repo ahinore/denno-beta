@@ -12382,34 +12382,37 @@ fn pf_slot_prepare(
     }
     // 2. デバイス側の置き場所を決める。
     let base = st.slot[s].buf.as_ref().expect("確保済み").ptr();
-    let mut cursor = 0usize;
-    let mut ptrs: Vec<[u64; 3]> = Vec::with_capacity(items.len());
-    for l in &lens {
-        let mut p = [0u64; 3];
-        for m in 0..3 {
-            p[m] = base + cursor as u64;
-            cursor += pf_stage_align_up(l[m]);
-        }
-        ptrs.push(p);
-    }
+    let mut ptrs: Vec<[u64; 3]> = vec![[0u64; 3]; items.len()];
     // 3. バウンスの置き場所。task 227: 転送元が pin のときだけ確保する
     //    (page / reg は mmap をそのまま DMA するので写しが要らない)。
     //    置き場所 (parts) は 3 経路とも要るので常に作る。
+    // task 522: `DENNO_PF_PIN_FILE_ORDER` では (i, m) をファイル順に並べて詰める
+    // (デバイスへ渡るバイト列は同じで、置き場所の順序だけが変わる)。
+    let ord: Vec<(usize, usize)> = if exp_pf::pin_file_order_on() {
+        let src: Vec<Option<[(u32, u64); 3]>> = items
+            .iter()
+            .map(|it| it.2.map(|s| [(s[0].0, s[0].1), (s[1].0, s[1].1), (s[2].0, s[2].1)]))
+            .collect();
+        exp_pf::pin_order(&src)
+    } else {
+        (0..items.len())
+            .flat_map(|i| (0..3).map(move |m| (i, m)))
+            .collect()
+    };
     let mut parts: Vec<(usize, PfHostRange)> = Vec::with_capacity(items.len() * 3);
     let mut cursor = 0usize;
-    for (i, it) in items.iter().enumerate() {
-        let b = &it.1;
-        for m in 0..3 {
-            if !b[m].is_empty() {
-                // task 325: mmap の区間はファイル位置も持たせる (pread 用)。
-                let r = match it.2 {
-                    Some(s) => PfHostRange::of_src(b[m], s[m]),
-                    None => PfHostRange::of(b[m]),
-                };
-                parts.push((cursor, r));
-            }
-            cursor += pf_stage_align_up(lens[i][m]);
+    for &(i, m) in ord.iter() {
+        let b = &items[i].1[m];
+        if !b.is_empty() {
+            // task 325: mmap の区間はファイル位置も持たせる (pread 用)。
+            let r = match items[i].2 {
+                Some(s) => PfHostRange::of_src(b, s[m]),
+                None => PfHostRange::of(b),
+            };
+            parts.push((cursor, r));
         }
+        ptrs[i][m] = base + cursor as u64;
+        cursor += pf_stage_align_up(lens[i][m]);
     }
     if pinned && exp_pf::stream_src() == 0 {
         let cap = st.pin[s].as_ref().map(|p| p.bytes).unwrap_or(0);

@@ -2530,6 +2530,54 @@ pub fn merge_adjacent_runs(runs: &mut Vec<(usize, u32, u64, usize, usize)>) -> u
     merged
 }
 
+/// `DENNO_PF_PIN_FILE_ORDER=1`: pinned の置き場所を**ファイルのオフセット順**に
+/// 並べる (task 522、既定 off)。
+///
+/// 既定は「expert の順 x gate/up/down」で、隣り合う区間がファイル上でも隣とは
+/// 限らない (gate の次は同じ expert の up だが、ファイルでは gate テンソルの
+/// 次の expert が続く)。ファイル順に詰めると、同じテンソルの中で expert が
+/// 連続している区間が pinned 側でも連続になり、[`merge_adjacent_runs`] で
+/// 1 本の pread に畳める (要求が大きいほどディスクが速い)。
+///
+/// デバイスへ渡るバイト列は同じで、置き場所の順序だけが変わる。
+pub const PIN_FILE_ORDER_ENV: &str = "DENNO_PF_PIN_FILE_ORDER";
+
+/// [`PIN_FILE_ORDER_ENV`] の既定値 (off)。
+pub const DEFAULT_PIN_FILE_ORDER: bool = false;
+
+/// [`PIN_FILE_ORDER_ENV`] の解釈 (純関数)。未設定は既定 (off)、`1` 系だけが真。
+pub fn pin_file_order_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PIN_FILE_ORDER,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// 置き場所をファイル順に詰めるか (プロセスで 1 回だけ env を読む)。
+pub fn pin_file_order_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pin_file_order_from_value(std::env::var(PIN_FILE_ORDER_ENV).ok().as_deref()))
+}
+
+/// `(expert, tensor)` の並べ方を返す (純関数)。
+///
+/// `src` は expert ごとの 3 テンソルの (パート, 絶対オフセット)。ファイル位置を
+/// 持つもの (= mmap/pread 経路) を **(パート, オフセット) 昇順**で先に置き、
+/// ファイル位置を持たないもの (RAM tier) は元の順のまま後ろへ回す。
+pub fn pin_order(src: &[Option<[(u32, u64); 3]>]) -> Vec<(usize, usize)> {
+    let mut ord: Vec<(usize, usize)> = (0..src.len())
+        .flat_map(|i| (0..3).map(move |m| (i, m)))
+        .collect();
+    ord.sort_by_key(|&(i, m)| match src.get(i).copied().flatten() {
+        Some(s) => (0u8, s[m].0, s[m].1),
+        None => (1u8, 0, 0),
+    });
+    ord
+}
+
 /// 1 グループぶんの読み区間 `(パート, 絶対オフセット, 長さ)` を台帳へ積む。
 ///
 /// 区間は**同じグループ (= 1 回の MoE 呼び出し)** の中で並べ替えて、隣との
@@ -6440,6 +6488,42 @@ mod tests {
         assert!(!pread_merge_from_value(Some("0")));
         assert!(pread_merge_from_value(Some("1")));
         assert!(pread_merge_from_value(Some("true")));
+    }
+
+    /// task 522: 置き場所の並べ方 (ファイル順) と、その不変条件。
+    #[test]
+    fn task522_pin_order_file_order_truth_table() {
+        // expert 0: gate(part 0, off 3000) up(0, 1000) down(0, 5000)
+        // expert 1: gate(0, 4000) up(0, 2000) down(1, 10)
+        // expert 2: RAM tier (ファイル位置なし)
+        let src = vec![
+            Some([(0u32, 3000u64), (0, 1000), (0, 5000)]),
+            Some([(0, 4000), (0, 2000), (1, 10)]),
+            None,
+        ];
+        let ord = pin_order(&src);
+        // 全 9 個が 1 回ずつ出る (置き忘れ・重複が無い)。
+        assert_eq!(ord.len(), 9);
+        let mut seen = std::collections::HashSet::new();
+        for &(i, m) in &ord {
+            assert!(i < 3 && m < 3);
+            assert!(seen.insert((i, m)), "重複 {:?}", (i, m));
+        }
+        // ファイル位置を持つものが (part, off) 昇順で先頭。
+        let with_src: Vec<(u32, u64)> = ord
+            .iter()
+            .filter_map(|&(i, m)| src[i].map(|s| s[m]))
+            .collect();
+        let mut sorted = with_src.clone();
+        sorted.sort_unstable();
+        assert_eq!(with_src, sorted, "ファイル順になっていない: {with_src:?}");
+        // ファイル位置を持たないものは後ろ 3 個 (元の順)。
+        assert_eq!(&ord[6..], &[(2, 0), (2, 1), (2, 2)]);
+        // ゲート: 既定 off、`1` 系だけ on。
+        assert!(!pin_file_order_from_value(None));
+        assert!(!pin_file_order_from_value(Some("0")));
+        assert!(pin_file_order_from_value(Some("1")));
+        assert!(pin_file_order_from_value(Some("on")));
     }
 
     /// task 522: 区間の台帳は「同じパートの中で隣り合う区間の隙間」だけを数える。
