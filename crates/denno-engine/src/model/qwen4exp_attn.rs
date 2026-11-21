@@ -396,7 +396,21 @@ impl AttnCache {
         } else {
             1
         };
-        self.push_many_opts(layer, k, v, n, pf_kv_noresize_on(), par)
+        self.push_many_opts(
+            layer,
+            k,
+            v,
+            n,
+            pf_kv_noresize_on(),
+            par,
+            pf_kv_reserve_on(),
+        )
+    }
+
+    /// task 561: テスト用に層の確保済み容量 (要素数) を返す。
+    #[cfg(test)]
+    pub(crate) fn kv_capacity(&self, layer: usize) -> usize {
+        self.k.get(layer).map(|v| v.capacity()).unwrap_or(0)
     }
 
     /// task 505: [`Self::push_many`] の中身。ゲートを引数で受ける
@@ -404,6 +418,7 @@ impl AttnCache {
     ///
     /// `noresize` のときは伸ばすときにゼロ埋めをしない (`extend_from_slice`)。
     /// `par > 1` のときは写しを rayon で分ける。どちらも入るバイト列は同じ。
+    /// `reserve` のときは層に初めて積むときに容量を先に確保する (task 561)。
     fn push_many_opts(
         &mut self,
         layer: usize,
@@ -412,6 +427,7 @@ impl AttnCache {
         n: usize,
         noresize: bool,
         par: usize,
+        reserve: bool,
     ) -> Result<()> {
         let row = self.row();
         let cur = self.len(layer)?;
@@ -435,6 +451,17 @@ impl AttnCache {
         let need = (cur + n) * row;
         {
             let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_KVPUSH);
+            // task 561: 層に初めて積むときだけ、容量を先に確保する
+            // (realloc の写し直しと、捨てた領域を踏み直すフォルトを消す)。
+            if reserve && cur == 0 {
+                let rows = self.max_ctx.min(PF_KV_RESERVE_MAX_ROWS);
+                kv_reserve_capacity(&mut self.k[layer], rows, row);
+                kv_reserve_capacity(&mut self.v[layer], rows, row);
+                if pf_kv_hpage_on() {
+                    kv_hpage_advise(&self.k[layer]);
+                    kv_hpage_advise(&self.v[layer]);
+                }
+            }
             if noresize {
                 kv_push_noresize(&mut self.k[layer], &k[..src], cur * row, row, n, par);
                 kv_push_noresize(&mut self.v[layer], &v[..src], cur * row, row, n, par);
@@ -640,6 +667,140 @@ fn kv_push_rows(dst: &mut [f32], src: &[f32], par: usize) {
 /// この要素数未満は 1 本で写す (rayon の分割コストが見合わない)。
 const KV_PUSH_PAR_MIN: usize = 1 << 18;
 
+// ---------------------------------------------------------------------------
+// task 561: 14k cold の `full` 段の `kv_push` (689 MB の写し) を安くする 2 つの案
+// ---------------------------------------------------------------------------
+//
+// 台帳 (t557c b_1 の c8000_cold、14,018 トークン) では `full` が
+// wall 785.4 / gpu_busy 553.6 / exposed 231.8 ms で、CPU の内訳は
+// `kv_wait=87.9` + `kv_push=290.6`。689 MB を 2.37 GB/s でしか書けていない
+// (同じホストの単発 memcpy は 15 GB/s)。伸ばす経路が **14 チャンク x 12 層**で
+// 毎回 `reserve` して倍々に realloc し、古い領域を捨てて新しいページを踏み直す
+// のが疑わしい (ページのフォルトは要求中に 470k 回)。ここでは 2 つを別ゲートにする:
+//
+// - `DENNO_PF_KV_RESERVE` (**既定 on**): 層に初めて積むとき (`cur == 0`) に容量を
+//   `min(max_ctx, 32,768) * row` まで確保する。**アドレス空間だけ**で、ページは
+//   書いた分しか触らない (max_ctx まで確保しない元の方針は変えない)。
+//   realloc の写し直しとフォルトの踏み直しが消える。値・順序は変わらない。
+// - `DENNO_PF_KV_HPAGE` (既定 off): その確保した領域に `madvise(MADV_HUGEPAGE)`
+//   を 1 回かける (このホストの THP は `madvise`)。値は変わらない。
+//
+// 実測 (lab t561a、depth8k、PROFILE=1、x0/b/r/rh/b2 を 1 つの run で、各 COND 2 周):
+//
+// | 段 / 内訳 | 3,826 cold b (2 周) | r | rh |
+// | --- | --- | --- | --- |
+// | `full` 段の壁 | 53.2 / 50.6 (b2 52.8 / 50.6) ms | **46.1 / 44.6** | **45.0 / 44.8** |
+// | `kv_push` | 15.0 / 13.5 (b2 15.7 / 13.5) | **9.3 / 9.6** | **10.0 / 9.3** |
+// | `kv_realloc` | 48 回 (188.1 MB) | **0** | **0** |
+//
+// 3,826 の `full` 段は **-12% (2 ラウンドとも)**。14k cold では `full` の壁が
+// 708.7 (b) / 715.6 (r) / 710.5 (rh) / 709.0 (b2) で**動かない** が、
+// `kv_push` は 224.4 -> 108.9 ms (-51%)、`kv_wait` は 88.7 -> 87.4 で不変。
+// 14k は **CPU が GPU の裏に完全に隠れている** (full の gpu_busy 553.3 対 cpu 407.0)
+// ので、CPU を減らしても壁は動かない。3,826 は段が短く CPU が露出するため効く。
+// `DENNO_PF_KV_HPAGE` は -51% -> -54% で差は noise の内側 (既定 off のまま)。
+// md5 は全 COND x 全 6 文脈 SAME、errors 0、text sane。
+
+/// task 561: `DENNO_PF_KV_RESERVE` の env 名。
+pub const PF_KV_RESERVE_ENV: &str = "DENNO_PF_KV_RESERVE";
+
+/// 未設定のときの既定 (**lab t561a で採ったので on**)。切り戻しは `=0`。
+///
+/// 3,826 cold の `full` 段が 53.2/50.6 -> 46.1/44.6 ms (-12%、2 ラウンド)、
+/// `kv_push` が 15.0/13.5 -> 9.3/9.6 ms、realloc が 48 -> 0 回。
+/// 14k cold は `full` の壁が動かない (CPU が GPU に隠れている) が悪くもならない。
+pub const DEFAULT_PF_KV_RESERVE: bool = true;
+
+/// [`PF_KV_RESERVE_ENV`] の解釈 (未設定・空は既定、明示的な真値だけ on)。
+pub fn pf_kv_reserve_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PF_KV_RESERVE,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// 初回に容量まで確保するか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_kv_reserve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_kv_reserve_from_value(std::env::var(PF_KV_RESERVE_ENV).ok().as_deref()))
+}
+
+/// task 561: `DENNO_PF_KV_HPAGE` の env 名。
+pub const PF_KV_HPAGE_ENV: &str = "DENNO_PF_KV_HPAGE";
+
+/// 未設定のときの既定 (**lab t561a で reserve との差が noise だったので off**)。
+pub const DEFAULT_PF_KV_HPAGE: bool = false;
+
+/// [`PF_KV_HPAGE_ENV`] の解釈 (未設定・空は既定、明示的な真値だけ on)。
+pub fn pf_kv_hpage_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PF_KV_HPAGE,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// 2 MB ページを頼むか (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_kv_hpage_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_kv_hpage_from_value(std::env::var(PF_KV_HPAGE_ENV).ok().as_deref()))
+}
+
+/// 先に確保する行数の上限 (`max_ctx` が大きくても VA を取りすぎない)。
+const PF_KV_RESERVE_MAX_ROWS: usize = 32768;
+
+/// task 561: ミラーを伸ばした回数と、そのバイト数 (k と v で別々に数える)。
+/// ゲートが効いていれば 0 になる (机序の証拠を lab のログに出すため)。
+static KV_GROW_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KV_GROW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 伸ばした回数とバイト数を読んで 0 に戻す (`[q4ledger-pf]` が 1 要求ごとに出す)。
+pub fn pf_kv_grow_take() -> (u64, u64) {
+    let n = KV_GROW_EVENTS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let b = KV_GROW_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    (n, b)
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn madvise(addr: *mut std::os::raw::c_void, len: usize, advice: i32) -> i32;
+}
+
+/// `v` の確保済み領域に 2 MB ページを頼む (失敗は黙って無視する)。
+fn kv_hpage_advise(v: &Vec<f32>) {
+    #[cfg(target_os = "linux")]
+    {
+        const MADV_HUGEPAGE: i32 = 14;
+        let len = v.capacity() * std::mem::size_of::<f32>();
+        if len == 0 {
+            return;
+        }
+        // SAFETY: `capacity` 要素ぶんの確保済み領域を指す。madvise は助言で、
+        // 失敗しても -1 が返るだけ (領域の中身は触らない)。
+        unsafe {
+            let _ = madvise(
+                v.as_ptr() as *mut std::os::raw::c_void,
+                len,
+                MADV_HUGEPAGE,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = v;
+    }
+}
+
+/// 層に初めて積むときに容量を `rows * row` まで確保する (アドレス空間だけ)。
+fn kv_reserve_capacity(v: &mut Vec<f32>, rows: usize, row: usize) {
+    let want = rows * row;
+    if want == 0 {
+        return;
+    }
+    if v.capacity() < want {
+        v.reserve(want - v.len());
+    }
+}
+
 /// task 505: ゼロ埋めせずに `dst_off` から `n * row` 要素を積む。
 ///
 /// `kv.len()` は常に `row` の倍数 (積むのは full 層の行だけ)。既にある範囲は
@@ -659,6 +820,15 @@ fn kv_push_noresize(dst: &mut Vec<f32>, src: &[f32], dst_off: usize, row: usize,
     }
     let s = &src[m..n * row];
     debug_assert_eq!(s.len(), add);
+    // task 561: **容量が足りなくて realloc になる**回数だけ数える (確保済みの
+    // 後ろへ書くだけの追記は数えない)。reserve が効いていれば 0 になる。
+    if dst.capacity() - dst.len() < add {
+        KV_GROW_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        KV_GROW_BYTES.fetch_add(
+            (add * std::mem::size_of::<f32>()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     dst.reserve(add);
     // SAFETY: `reserve(add)` で `len + add` 以上ある。`add` 要素を全部書いてから
     // `set_len` する。`f32` は Copy で、書いた範囲だけを長さに含める。
@@ -806,6 +976,8 @@ mod attn_cache_tests {
         let mut base = AttnCache::new(1, 2, 8, 64).expect("cache");
         let mut nr = AttnCache::new(1, 2, 8, 64).expect("cache");
         let mut npr = AttnCache::new(1, 2, 8, 64).expect("cache");
+        // task 561: 初回に容量まで確保する経路 (値も長さも同じであること)。
+        let mut rsv = AttnCache::new(1, 2, 8, 64).expect("cache");
         // 3 回に分けて積む (1 回目だけが「伸ばす」経路、2 回目以降は書き込み先が
         // 既にある = インプレース。ここが本番の 2 チャンク目以降に対応する)。
         for (i, n) in [3usize, 5, 7].into_iter().enumerate() {
@@ -815,30 +987,40 @@ mod attn_cache_tests {
             let v: Vec<f32> = (0..n * row)
                 .map(|j| -(j as f32) * 0.25 + i as f32 * 7.0 + 1.0)
                 .collect();
-            base.push_many_opts(0, &k, &v, n, false, 1).expect("base");
-            nr.push_many_opts(0, &k, &v, n, true, 1).expect("noresize");
-            npr.push_many_opts(0, &k, &v, n, true, 4).expect("noresize+par");
+            base.push_many_opts(0, &k, &v, n, false, 1, false).expect("base");
+            nr.push_many_opts(0, &k, &v, n, true, 1, false).expect("noresize");
+            npr.push_many_opts(0, &k, &v, n, true, 4, false).expect("noresize+par");
+            rsv.push_many_opts(0, &k, &v, n, true, 4, true).expect("noresize+par+reserve");
         }
-        for (name, c) in [("noresize", &nr), ("noresize+par", &npr)] {
+        for (name, c) in [
+            ("noresize", &nr),
+            ("noresize+par", &npr),
+            ("noresize+par+reserve", &rsv),
+        ] {
             assert_eq!(base.len(0).unwrap(), c.len(0).unwrap(), "{name}: 長さが違う");
             assert_eq!(base.k(0).unwrap(), c.k(0).unwrap(), "{name}: k が違う");
             assert_eq!(base.v(0).unwrap(), c.v(0).unwrap(), "{name}: v が違う");
         }
         // 巻き戻して短く積み直す (clear 後) と同じ長さで積む経路も一致する。
-        for c in [&mut base, &mut nr, &mut npr] {
+        for c in [&mut base, &mut nr, &mut npr, &mut rsv] {
             c.clear(0).expect("clear");
         }
         let k: Vec<f32> = (0..2 * row).map(|j| (j as f32) * 1.5 - 9.0).collect();
         let v: Vec<f32> = (0..2 * row).map(|j| 4.0 - (j as f32)).collect();
-        base.push_many_opts(0, &k, &v, 2, false, 1).expect("base2");
-        nr.push_many_opts(0, &k, &v, 2, true, 1).expect("nr2");
-        npr.push_many_opts(0, &k, &v, 2, true, 4).expect("npr2");
+        base.push_many_opts(0, &k, &v, 2, false, 1, false).expect("base2");
+        nr.push_many_opts(0, &k, &v, 2, true, 1, false).expect("nr2");
+        npr.push_many_opts(0, &k, &v, 2, true, 4, false).expect("npr2");
+        rsv.push_many_opts(0, &k, &v, 2, true, 4, true).expect("rsv2");
         assert_eq!(base.k(0).unwrap(), nr.k(0).unwrap(), "clear 後の k が違う");
         assert_eq!(base.v(0).unwrap(), npr.v(0).unwrap(), "clear 後の v が違う");
+        assert_eq!(base.k(0).unwrap(), rsv.k(0).unwrap(), "clear 後 (reserve) の k が違う");
+        assert_eq!(base.v(0).unwrap(), rsv.v(0).unwrap(), "clear 後 (reserve) の v が違う");
+        assert_eq!(base.len(0).unwrap(), rsv.len(0).unwrap(), "clear 後 (reserve) の長さが違う");
         // 容量超過と短い入力はどの経路でもエラー (黙って伸ばさない)。
         let over = vec![0.0f32; 64 * row];
-        assert!(nr.push_many_opts(0, &over, &over, 64, true, 1).is_err());
-        assert!(npr.push_many_opts(0, &k[..row - 1], &v[..row], 1, true, 4).is_err());
+        assert!(nr.push_many_opts(0, &over, &over, 64, true, 1, false).is_err());
+        assert!(rsv.push_many_opts(0, &over, &over, 64, true, 1, true).is_err());
+        assert!(npr.push_many_opts(0, &k[..row - 1], &v[..row], 1, true, 4, false).is_err());
     }
 
     /// task 505: 伸ばす経路も `par` で分けたとき (1 MB 以上の写し) に同じ結果に
@@ -852,8 +1034,8 @@ mod attn_cache_tests {
             assert!(n * row >= super::KV_PUSH_PAR_MIN, "並列の枝に入らない");
             let k: Vec<f32> = (0..n * row).map(|j| (j as f32) * 1e-3 + i as f32).collect();
             let v: Vec<f32> = (0..n * row).map(|j| 7.0 - (j as f32) * 1e-3).collect();
-            a.push_many_opts(0, &k, &v, n, true, 1).expect("serial");
-            b.push_many_opts(0, &k, &v, n, true, 4).expect("par");
+            a.push_many_opts(0, &k, &v, n, true, 1, false).expect("serial");
+            b.push_many_opts(0, &k, &v, n, true, 4, true).expect("par");
         }
         assert_eq!(a.len(0).unwrap(), b.len(0).unwrap(), "長さが違う");
         assert_eq!(a.k(0).unwrap(), b.k(0).unwrap(), "k が違う");
@@ -902,6 +1084,90 @@ mod attn_cache_tests {
                 "push_par が off のまま: {raw:?}"
             );
         }
+    }
+
+    /// task 561: `DENNO_PF_KV_RESERVE` (lab で採ったので既定 on) と
+    /// `DENNO_PF_KV_HPAGE` (既定 off) の真理値表。
+    #[test]
+    fn task561_kv_reserve_and_hpage_gates_truth_table() {
+        assert!(
+            super::pf_kv_reserve_from_value(None),
+            "reserve: 未設定が off になった (lab で採ったので既定 on)"
+        );
+        assert!(super::pf_kv_reserve_from_value(Some("")));
+        for raw in [Some("0"), Some("off"), Some("no"), Some("false")] {
+            assert!(
+                !super::pf_kv_reserve_from_value(raw),
+                "reserve が on になった: {raw:?}"
+            );
+        }
+        for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
+            assert!(
+                super::pf_kv_reserve_from_value(raw),
+                "reserve が off のまま: {raw:?}"
+            );
+        }
+        for raw in [None, Some(""), Some("0"), Some("off"), Some("no"), Some("false")] {
+            assert!(
+                !super::pf_kv_hpage_from_value(raw),
+                "hpage が on になった: {raw:?}"
+            );
+        }
+        for raw in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
+            assert!(
+                super::pf_kv_hpage_from_value(raw),
+                "hpage が off のまま: {raw:?}"
+            );
+        }
+    }
+
+    /// task 561: 先に容量を確保すると、伸ばすときの `realloc` が起きない
+    /// (lab で見る `kv_push` の差の機序を CPU 側で固定する)。
+    #[test]
+    fn task561_reserve_takes_capacity_in_one_go() {
+        let row = 2 * 8;
+        let mut a = AttnCache::new(1, 2, 8, 64).expect("cache");
+        let mut b = AttnCache::new(1, 2, 8, 64).expect("cache");
+        let k: Vec<f32> = (0..8 * row).map(|i| i as f32).collect();
+        let v: Vec<f32> = (0..8 * row).map(|i| -(i as f32)).collect();
+        // 1 チャンク目で容量が max_ctx * row まで確保される (reserve あり)。
+        a.push_many_opts(0, &k, &v, 8, true, 1, true).expect("rsv");
+        let cap_a = a.kv_capacity(0);
+        // 64 行 x 32 要素 = 2048 要素 (max_ctx = 64)。
+        assert_eq!(cap_a, 64 * row, "reserve 後の容量が max_ctx*row でない");
+        // reserve 無しはチャンクぶんだけ (後で必ず伸ばし直しが起きる)。
+        b.push_many_opts(0, &k, &v, 8, true, 1, false).expect("norsv");
+        assert!(
+            b.kv_capacity(0) < 64 * row,
+            "reserve 無しで容量が先に育っている"
+        );
+        // 続くチャンクで容量が増えない (realloc が起きない)。
+        a.push_many_opts(0, &k, &v, 8, true, 1, true).expect("rsv2");
+        assert_eq!(a.kv_capacity(0), cap_a, "reserve 後に容量が動いた");
+    }
+
+    /// task 561: realloc の回数を数える計器が、reserve 無しでは立ち、
+    /// reserve ありでは 0 になること (lab のログで機序を確かめるための計器)。
+    #[test]
+    fn task561_realloc_counter_sees_the_growth_branch() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let row = 2 * 8;
+        // まず reserve 無し: 3 チャンクで容量が足りなくなるので数える。
+        let mut a = AttnCache::new(1, 2, 8, 64).expect("cache");
+        let k: Vec<f32> = (0..4 * row).map(|i| i as f32).collect();
+        let v: Vec<f32> = (0..4 * row).map(|i| -(i as f32)).collect();
+        let _ = super::pf_kv_grow_take();
+        a.push_many_opts(0, &k, &v, 4, true, 1, false).expect("a1");
+        a.push_many_opts(0, &k, &v, 4, true, 1, false).expect("a2");
+        let (n, b) = super::pf_kv_grow_take();
+        assert!(n >= 2, "realloc を数えていない: {n}");
+        assert!(b > 0, "realloc のバイト数が 0");
+        // reserve あり: 初回だけ容量を取り、以降は確保済みの後ろへ書く。
+        let mut c = AttnCache::new(1, 2, 8, 64).expect("cache");
+        c.push_many_opts(0, &k, &v, 4, true, 1, true).expect("c1");
+        c.push_many_opts(0, &k, &v, 4, true, 1, true).expect("c2");
+        let (n2, _) = super::pf_kv_grow_take();
+        assert_eq!(n2, 0, "reserve ありで realloc が起きた: {n2}");
     }
 
     /// task 393: ゲートの真理値表 (未設定・空は既定、明示的な偽値だけ off)。
