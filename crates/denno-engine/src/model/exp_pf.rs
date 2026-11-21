@@ -1938,6 +1938,11 @@ pub const PREAD_KB_ENV: &str = "DENNO_PF_PREAD_KB";
 /// 512 KiB だけ 2 ラウンド目に 20-30 s へ跳ねた (推定: カーネルの readahead の
 /// 1 窓と同じ長さで、二重読みが起きる回がある)。384 / 256 は 2 ラウンドとも
 /// 揃うので、呼び出し回数が少ない 384 を既定にした。
+///
+/// task 538: これは **広い塊 (`DENNO_PF_SPLIT_WIDE_KB`) が off のときの既定**。
+/// 広い塊が on のときは 1 MiB を使う ([`pread_kb_default`])。1024 単独は
+/// t530b で 16.0 s (384 は 11.8 s) と負けたが、広い塊と組にすると
+/// t538b で 8.3 s (`copy_s`)、3,826 cold が 11.80 -> 9.48 s になった。
 pub const DEFAULT_PREAD_KB: usize = 384;
 
 /// [`PREAD_KB_ENV`] の解釈 (純関数)。64..=65536 KiB に丸める。
@@ -1952,9 +1957,30 @@ pub fn pread_kb_from_value(v: Option<&str>) -> usize {
 }
 
 /// 1 回の `read_at` の長さ (バイト)。
+///
+/// task 538: `DENNO_PF_PREAD_KB` が**未設定**で広い塊 (`DENNO_PF_SPLIT_WIDE_KB`
+/// > 0、既定 on) のときは **1 MiB** を既定にする。384 KiB のままだと広い塊の
+/// 中身が細かすぎて 1 回の `pread` の固定費が効き、逆に 1024 単独 (t530b
+/// 16.0 s) は 8 MiB の塊に 3 本しか入らず負ける。**2 つは組で効く**ので、
+/// 既定も組で決める (明示値はいつでも優先)。
+pub fn pread_kb_default(wide_on: bool) -> usize {
+    if wide_on {
+        1024
+    } else {
+        DEFAULT_PREAD_KB
+    }
+}
+
+/// 1 回の `read_at` の長さ (バイト)。
 pub fn pread_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| pread_kb_from_value(std::env::var(PREAD_KB_ENV).ok().as_deref()) << 10)
+    *N.get_or_init(|| {
+        let kb = match std::env::var(PREAD_KB_ENV).ok().as_deref() {
+            Some(s) if !s.trim().is_empty() => pread_kb_from_value(Some(s)),
+            _ => pread_kb_default(split_wide_bytes() > 0),
+        };
+        kb << 10
+    })
 }
 
 /// `len` バイトを `blk` ずつに切った (転送元の中のオフセット, 長さ) の列。
@@ -2052,14 +2078,20 @@ pub fn up_split_bytes() -> usize {
 /// 0 = off (既定)。64..=262144 KiB。
 pub const SPLIT_WIDE_KB_ENV: &str = "DENNO_PF_SPLIT_WIDE_KB";
 
-/// [`SPLIT_WIDE_KB_ENV`] の既定値 (0 = off)。
-pub const DEFAULT_SPLIT_WIDE_KB: usize = 0;
+/// [`SPLIT_WIDE_KB_ENV`] の既定値 (**32 MiB**、task 538 で採った)。
+///
+/// lab t538b (3,826 cold): 8 MiB のまま (b/b2 11.80 / 11.50) が 32 MiB で
+/// **9.48 / 9.28**、64 MiB で 8.95、`copy_s` は 10.7 -> 8.3 -> 7.0 s。
+/// 64 MiB は 14k が 13.01 -> 14.09 と逆に振れたので 32 MiB を既定にした。
+/// 0 で従来 (8 MiB 固定)。既定モデルは `src` を持たないので発火しない。
+pub const DEFAULT_SPLIT_WIDE_KB: usize = 32768;
 
 /// [`SPLIT_WIDE_KB_ENV`] の解釈 (純関数)。未設定 / 空 / 解析不能は既定 (off)。
 pub fn split_wide_kb_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_SPLIT_WIDE_KB;
     };
+
     match s.parse::<usize>() {
         Ok(0) => 0,
         Ok(n) => n.clamp(64, 262144),
@@ -7171,17 +7203,32 @@ mod tests {
         assert!(staging_stats().is_empty(), "戻したら空");
     }
 
+    /// task 538: 広い塊と pread の塊は組で既定を決める (明示値が優先)。
+    #[test]
+    fn task538_pread_kb_default_follows_wide() {
+        assert_eq!(pread_kb_default(true), 1024, "広い塊のときは 1 MiB");
+        assert_eq!(pread_kb_default(false), DEFAULT_PREAD_KB, "従来は 384");
+        assert_eq!(DEFAULT_PREAD_KB, 384);
+        // 明示値は広い塊の有無に関係なくそのまま効く。
+        assert_eq!(pread_kb_from_value(Some("384")), 384);
+        assert_eq!(pread_kb_from_value(Some("1024")), 1024);
+    }
+
     /// task 538: 広い塊のゲート (`DENNO_PF_SPLIT_WIDE_KB`) と、グループごとの
     /// 塊の選び方 (`src` を持つグループだけ広げる)。
     #[test]
     fn task538_split_wide_gate_truth_table() {
         assert_eq!(SPLIT_WIDE_KB_ENV, "DENNO_PF_SPLIT_WIDE_KB");
-        assert_eq!(DEFAULT_SPLIT_WIDE_KB, 0);
-        assert_eq!(split_wide_kb_from_value(None), 0, "既定 off");
-        assert_eq!(split_wide_kb_from_value(Some("")), 0);
-        assert_eq!(split_wide_kb_from_value(Some("0")), 0);
+        assert_eq!(DEFAULT_SPLIT_WIDE_KB, 32768, "task 538 で既定 on にした");
+        assert_eq!(split_wide_kb_from_value(None), 32768, "既定 on");
+        assert_eq!(split_wide_kb_from_value(Some("")), 32768);
+        assert_eq!(split_wide_kb_from_value(Some("0")), 0, "0 で従来へ戻る");
         assert_eq!(split_wide_kb_from_value(Some("off")), 0);
-        assert_eq!(split_wide_kb_from_value(Some("x")), 0);
+        assert_eq!(
+            split_wide_kb_from_value(Some("x")),
+            32768,
+            "解析不能は既定 (on)"
+        );
         assert_eq!(split_wide_kb_from_value(Some("32768")), 32768);
         assert_eq!(split_wide_kb_from_value(Some(" 65536 ")), 65536);
         assert_eq!(split_wide_kb_from_value(Some("1")), 64, "下限 64 KiB");
