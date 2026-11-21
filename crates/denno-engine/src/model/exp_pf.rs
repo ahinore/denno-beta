@@ -676,6 +676,47 @@ pub fn stream_lookahead() -> usize {
     })
 }
 
+/// `DENNO_PF_UP_WORKERS`: 上げ専用スレッドの本数 (task 554、既定 1)。
+///
+/// # なぜ (task 550 が残した「壁は同時発行の深さ」の続き)
+///
+/// UD-Q4_K_XL の 3,826 cold は壁 10.5 s の 91% が staging の写しで、その
+/// 中身はディスク読み (`[exp-pf-stream]` の `copy_s` 9.06 s / `odb_ms` 112 s の
+/// 積算 = 平均同時発行 12.4 本、枠は 32 本)。**枠 32 に対して 12.4 本しか
+/// 飛んでいない** のは、写しが 1 グループずつの barrier だから: 上げスレッドは
+/// 1 本で、グループ g の最後の 1 本を待ってから g+1 の写しを始める。
+/// 上げスレッドを 2 本にして g と g+1 の写しを重ねると、ディスクの行列が
+/// グループの境目で空にならない (推定: 上限は P522 のプローブの 4.6 GB/s)。
+///
+/// 1 本でも 2 本でも、計算スレッドが待つ `ev_up` はグループごとなので値は
+/// 1 ビットも変わらない (バイト列は同一)。
+pub const UP_WORKERS_ENV: &str = "DENNO_PF_UP_WORKERS";
+
+/// [`UP_WORKERS_ENV`] の既定値 (1 = 従来どおり 1 本)。
+pub const DEFAULT_UP_WORKERS: usize = 1;
+
+/// 上げスレッドの本数の解釈 (純関数)。1..=3 に丸める。
+///
+/// 上限 3 はステージングの枚数 ([`crate::cuda`] の 3 枚) に合わせたもの。
+/// 4 本以上にすると「まだ送っていないグループ」がスロットを待つだけで増える。
+pub fn up_workers_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_UP_WORKERS;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.clamp(1, 3),
+        Err(_) => DEFAULT_UP_WORKERS,
+    }
+}
+
+/// 上げスレッドの本数 (プロセスで 1 回だけ env を読む)。
+pub fn up_workers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        up_workers_from_value(std::env::var(UP_WORKERS_ENV).ok().as_deref())
+    })
+}
+
 /// `DENNO_PF_UP_DECOUPLE=1`: 上げ専用スレッドのホスト待ちを「pinned を前回
 /// 読んだ DMA の完了」だけにし、VRAM ステージングの再利用待ち (カーネルの完了) は
 /// 上げストリームの `cuStreamWaitEvent` として GPU に守らせる (task 320、既定 off)。

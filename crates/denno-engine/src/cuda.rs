@@ -12894,7 +12894,9 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         use rayon::prelude::*;
         // task 325: pread 専用のスレッド数を指定されたら、その本数のプールで回す
         // (`read_at` は同期なので、同時に飛ぶ I/O の本数 = スレッド数)。
-        let nt = exp_pf::pread_threads();
+        // task 554: 上げスレッドが n 本なら 1 本あたり nt/n に割る (総数は同じ)。
+        let nw = crate::model::exp_pf::up_workers().max(1);
+        let nt = exp_pf::pread_threads().div_ceil(nw);
         if pread && nt > 0 {
             if let Some(pool) = pf_pread_pool(nt) {
                 pool.install(|| tasks.par_iter().for_each(work));
@@ -12916,25 +12918,37 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
     }
 }
 
-/// task 325: pread 専用の rayon プール (スレッド数ごとに 1 個だけ作る)。
+/// task 325 / 554: pread 専用の rayon プール (スレッドごとに 1 個、本数ごとに作り直す)。
+///
+/// task 554: 上げ専用スレッドが 2 本以上 (`DENNO_PF_UP_WORKERS`) になると、
+/// 写しが**同時に 2 グループ**走る。1 本の共有プールに両方を入れると、計算側が
+/// 待っているグループ g の残りが相手のグループのタスクの後ろに回りうる
+/// (H2D が遅れて壁が伸びる) ので、スレッドごとに別のプールを持たせ、
+/// 1 本あたりの本数を `DENNO_PF_PREAD_THREADS / ワーカー数` に割る
+/// (総スレッド数は 1 本のときと同じ)。
 #[cfg(feature = "par")]
 fn pf_pread_pool(nt: usize) -> Option<&'static rayon::ThreadPool> {
-    use std::sync::OnceLock;
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    static NT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let first = NT.swap(nt, std::sync::atomic::Ordering::Relaxed) == 0;
-    if !first {
-        // 2 本目以降の違う本数は無視する (プロセスで 1 個)。
-        return POOL.get().and_then(|p| p.as_ref());
+    thread_local! {
+        static POOL: std::cell::RefCell<Option<(usize, &'static rayon::ThreadPool)>> =
+            const { std::cell::RefCell::new(None) };
     }
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(nt)
-            .thread_name(|i| format!("pf-pread-{i}"))
-            .build()
-            .ok()
+    POOL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some((have, p)) = *slot {
+            if have == nt {
+                return Some(p);
+            }
+        }
+        let built: &'static rayon::ThreadPool = Box::leak(Box::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(nt)
+                .thread_name(|i| format!("pf-pread-{i}"))
+                .build()
+                .ok()?,
+        ));
+        *slot = Some((nt, built));
+        Some(built)
     })
-    .as_ref()
 }
 
 /// task 239: pinned の `[start, start + len)` だけを写す (分割 DMA 用)。
@@ -14272,8 +14286,13 @@ unsafe impl Send for PfUpJob {}
 
 /// 上げ専用スレッドの進捗 (計算スレッドはここだけを見る)。
 struct PfUpState {
-    /// ev_up を記録し終えたグループの次。
+    /// `ev_up` を記録し終えたグループの次 (**連続した**前線)。
     ready: u64,
+    /// task 554: グループごとの完了。上げスレッドが 2 本以上になると完了が
+    /// 順不同に届くので、`ready` は「小さい方から途切れずに揃った所」までしか
+    /// 進めない (計算側は `ev_up` を同期する前にここを見るので、飛ばすと
+    /// **まだ記録していない古いイベントで待ちが満たされて重みが壊れる**)。
+    done: Vec<bool>,
     /// グループごとの (写し ns, 積み込み ns, スロット待ち ns)。
     times: Vec<(u64, u64, u64)>,
     /// 最初のグループで測った実 H2D (バイト, ns)。
@@ -14317,8 +14336,13 @@ fn pf_up_publish(
     if err.is_some() && s.err.is_none() {
         s.err = err;
     }
-    if s.ready <= g {
-        s.ready = g + 1;
+    // task 554: 完了は順不同に届く。前線は「途切れずに揃った所」までだけ進める。
+    if s.done.len() <= g as usize {
+        s.done.resize(g as usize + 1, false);
+    }
+    s.done[g as usize] = true;
+    while (s.ready as usize) < s.done.len() && s.done[s.ready as usize] {
+        s.ready += 1;
     }
     cv.notify_all();
 }
@@ -14326,32 +14350,26 @@ fn pf_up_publish(
 /// 上げ専用スレッド。
 struct PfUploader {
     tx: Option<std::sync::mpsc::Sender<PfUpJob>>,
-    st: std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PfUploader {
-    fn start(ctx: &'static CudaCtx) -> Self {
+    /// task 554: 進捗の置き場を共有して起動する (`DENNO_PF_UP_WORKERS` 本で 1 組)。
+    fn start_with(
+        ctx: &'static CudaCtx,
+        st: std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)>,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<PfUpJob>();
-        let st = std::sync::Arc::new((
-            std::sync::Mutex::new(PfUpState {
-                ready: 0,
-                times: Vec::new(),
-                probe: None,
-                err: None,
-            }),
-            std::sync::Condvar::new(),
-        ));
-        let st2 = std::sync::Arc::clone(&st);
         let join = std::thread::Builder::new()
             .name("pf-up".to_string())
-            .spawn(move || pf_up_worker(rx, st2, ctx))
+            .spawn(move || pf_up_worker(rx, st, ctx))
             .ok();
-        PfUploader {
-            tx: Some(tx),
-            st,
-            join,
-        }
+        PfUploader { tx: Some(tx), join }
+    }
+
+    /// ワーカーのスレッドが終わっているか (待ち続けを避けるため)。
+    fn finished(&self) -> bool {
+        self.join.as_ref().map(|j| j.is_finished()).unwrap_or(true)
     }
 
     /// 依頼を 1 本送る (待たない)。
@@ -14363,7 +14381,63 @@ impl PfUploader {
             .map_err(|_| anyhow::anyhow!("上げスレッドが停止している"))
     }
 
-    /// ワーカーがグループ `g` の H2D を積み終えるまで待つ (待ち ns を返す)。
+}
+
+impl Drop for PfUploader {
+    fn drop(&mut self) {
+        // 送信口を閉じるとワーカーの recv が Err で抜ける。
+        self.tx = None;
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// 進捗の置き場を 1 組作る (task 554: ワーカーの本数によらず 1 組を共有する)。
+fn new_up_state() -> std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)> {
+    std::sync::Arc::new((
+        std::sync::Mutex::new(PfUpState {
+            ready: 0,
+            done: Vec::new(),
+            times: Vec::new(),
+            probe: None,
+            err: None,
+        }),
+        std::sync::Condvar::new(),
+    ))
+}
+
+/// task 554: 上げ専用スレッドの束 (`DENNO_PF_UP_WORKERS` 本)。
+///
+/// 依頼はグループ番号の剰余でワーカーへ振り分ける。進捗の置き場は 1 組だけ
+/// 共有するので、計算側の待ち ([`PfUp::wait_ready`]) は「グループ番号の
+/// 小さい方から途切れずに揃った所」までしか進まない ([`pf_up_publish`])。
+struct PfUp {
+    ups: Vec<PfUploader>,
+    st: std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)>,
+}
+
+impl PfUp {
+    /// `n` 本のワーカーを起動する (1 本目が進捗の置き場を作る)。
+    fn start(ctx: &'static CudaCtx, n: usize) -> Self {
+        let st = new_up_state();
+        let mut ups = Vec::with_capacity(n);
+        for _ in 0..n.max(1) {
+            ups.push(PfUploader::start_with(ctx, std::sync::Arc::clone(&st)));
+        }
+        PfUp { ups, st }
+    }
+
+    /// 依頼を 1 本送る。グループ番号でワーカーを選ぶ。
+    fn submit(&self, job: PfUpJob) -> Result<()> {
+        let i = (job.g as usize) % self.ups.len().max(1);
+        match self.ups.get(i) {
+            Some(u) => u.submit(job),
+            None => bail!("上げスレッドが居ない"),
+        }
+    }
+
+    /// グループ `g` の依頼が**積まれた**ことを待つ (待ち ns を返す)。
     fn wait_ready(&self, g: u64) -> Result<u64> {
         let (m, cv) = &*self.st;
         let mut s = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -14380,8 +14454,8 @@ impl PfUploader {
                 .unwrap_or_else(|e| e.into_inner());
             s = s2;
             if to.timed_out() {
-                // スレッドが落ちている (panic 等) なら待ち続けない。
-                let dead = self.join.as_ref().map(|j| j.is_finished()).unwrap_or(true);
+                // 全ワーカーが終わっている (panic 等) なら待ち続けない。
+                let dead = self.ups.iter().all(|u| u.finished());
                 if dead && s.ready <= g {
                     bail!("上げスレッドが終了した (グループ {g} の依頼が処理されていない)");
                 }
@@ -14404,19 +14478,10 @@ impl PfUploader {
     }
 }
 
-impl Drop for PfUploader {
-    fn drop(&mut self) {
-        // 送信口を閉じるとワーカーの recv が Err で抜ける。
-        self.tx = None;
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-}
-
 thread_local! {
     /// task 165: このスレッドの prefill 用の上げ専用スレッド (初回だけ起動)。
-    static PF_UP: std::cell::RefCell<Option<PfUploader>> =
+    /// task 554: `DENNO_PF_UP_WORKERS` 本をまとめて持つ。
+    static PF_UP: std::cell::RefCell<Option<PfUp>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -14426,7 +14491,7 @@ fn pf_up_ensure() {
         if let Ok(mut slot) = cell.try_borrow_mut() {
             if slot.is_none() {
                 if let Some(ctx) = shared_ctx() {
-                    *slot = Some(PfUploader::start(ctx));
+                    *slot = Some(PfUp::start(ctx, crate::model::exp_pf::up_workers()));
                 }
             }
         }
@@ -17742,6 +17807,7 @@ mod pf_stream_tests {
         let st = (
             std::sync::Mutex::new(PfUpState {
                 ready: 0,
+                done: Vec::new(),
                 times: Vec::new(),
                 probe: None,
                 err: None,
@@ -17764,6 +17830,48 @@ mod pf_stream_tests {
         assert_eq!(s.ready, 3, "ready が戻った");
         assert_eq!(s.err.as_deref(), Some("最初のエラー"), "エラーが上書きされた");
         assert_eq!(s.times[2], (12, 22, 32));
+    }
+
+    /// task 554: 上げスレッドが 2 本だと完了が順不同に届く。前線 (`ready`) は
+    /// **途切れずに揃った所**までしか進めない (飛ばすと、まだ記録していない
+    /// 古い `ev_up` で計算側の待ちが満たされて重みが壊れる)。
+    #[test]
+    fn up_progress_frontier_does_not_jump_over_a_gap() {
+        let st = (
+            std::sync::Mutex::new(PfUpState {
+                ready: 0,
+                done: Vec::new(),
+                times: Vec::new(),
+                probe: None,
+                err: None,
+            }),
+            std::sync::Condvar::new(),
+        );
+        // 2 本目が先に終わる (1 本目はまだ)。
+        pf_up_publish(&st, 1, 11, 21, 31, None, None);
+        assert_eq!(st.0.lock().expect("poisoned").ready, 0, "穴を飛び越えた");
+        // 1 本目が終わったら 2 本目まで一気に進む。
+        pf_up_publish(&st, 0, 10, 20, 30, None, None);
+        assert_eq!(st.0.lock().expect("poisoned").ready, 2);
+        // 3 本目 (2 本目の次) も同じ。
+        pf_up_publish(&st, 3, 13, 23, 33, None, None);
+        assert_eq!(st.0.lock().expect("poisoned").ready, 2);
+        pf_up_publish(&st, 2, 12, 22, 32, None, None);
+        assert_eq!(st.0.lock().expect("poisoned").ready, 4);
+    }
+
+    /// task 554: `DENNO_PF_UP_WORKERS` の解釈 (1..=3、壊れた値は 1)。
+    #[test]
+    fn up_workers_values_round_and_default() {
+        use crate::model::exp_pf::{up_workers_from_value, DEFAULT_UP_WORKERS};
+        assert_eq!(DEFAULT_UP_WORKERS, 1, "既定は従来どおり 1 本");
+        assert_eq!(up_workers_from_value(None), 1);
+        assert_eq!(up_workers_from_value(Some("")), 1);
+        assert_eq!(up_workers_from_value(Some("2")), 2);
+        assert_eq!(up_workers_from_value(Some(" 3 ")), 3);
+        assert_eq!(up_workers_from_value(Some("0")), 1, "0 は従来経路へ");
+        assert_eq!(up_workers_from_value(Some("9")), 3, "スロット 3 枚が上限");
+        assert_eq!(up_workers_from_value(Some("x")), 1);
     }
 
     /// task 227: 「1 回の DMA で流す塊」の切り方 (純関数)。
