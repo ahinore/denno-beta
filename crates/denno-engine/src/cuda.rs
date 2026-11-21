@@ -12183,6 +12183,10 @@ impl PfHostRange {
 /// task 325: `pread` が真なら、ファイル範囲を持つ区間は `read_at` で直接
 /// pinned へ読む (`DENNO_PF_PREAD`)。読めなかった区間だけ memcpy へ落ちる。
 fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool) {
+    // task 530: このグループ (= 1 回の呼び出し) の時間を、ディスク読みを
+    // 含むかで分けて積む (barrier のせいでミスが直列化するかの判定材料)。
+    let t_grp = std::time::Instant::now();
+    let mut group_miss = 0usize;
     // task 325: pread のときは「塊」を単位に仕事を作る (1 つの区間を
     // `DENNO_PF_PREAD_KB` ずつに切り、並列度を上げる)。
     // task 474: 区間**丸ごと**が先読みの置き場 (`DENNO_PF_EARLY_ROUTE` の RAM) に
@@ -12230,6 +12234,50 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             tasks.push((off, None, r.ptr, r.len, false));
         }
     }
+    // task 530: page cache の常駐を `mincore(2)` で予測する (計器、既定 on) と、
+    // 載っていない区間を先に並べるゲート (`DENNO_PF_PREAD_NC_FIRST`)。
+    // グループは barrier なので、最後に残った 1 本がディスク待ちだと
+    // 残りのスレッドが遊ぶ。ミスを先に投げると、その待ちが写しの後ろに隠れる。
+    if pread && (exp_pf::nc_on() || exp_pf::nc_first_on()) {
+        let t_nc = std::time::Instant::now();
+        let mut flags: Vec<bool> = Vec::with_capacity(tasks.len());
+        let (mut judged, mut miss, mut unknown) = (0usize, 0usize, 0usize);
+        for &(_off, src, ptr, len, cached) in tasks.iter() {
+            if src.is_some() && !cached {
+                // SAFETY: `ptr` は mmap の区間の先頭 (この層の処理中は有効)。
+                match unsafe { exp_pf::range_resident(ptr, len) } {
+                    Some(true) => {
+                        flags.push(true);
+                        judged += 1;
+                    }
+                    Some(false) => {
+                        flags.push(false);
+                        judged += 1;
+                        miss += 1;
+                        group_miss += len;
+                    }
+                    None => {
+                        flags.push(true);
+                        unknown += 1;
+                    }
+                }
+            } else {
+                flags.push(true);
+            }
+        }
+        exp_pf::note_range_residency(
+            judged,
+            miss,
+            group_miss,
+            unknown,
+            t_nc.elapsed().as_nanos() as u64,
+        );
+        if exp_pf::nc_first_on() {
+            let ord = exp_pf::nc_first_order(&flags);
+            let old = std::mem::take(&mut tasks);
+            tasks = ord.into_iter().map(|i| old[i]).collect();
+        }
+    }
     let work = |&(off, src, ptr, len, cached): &(usize, Option<(u32, u64)>, usize, usize, bool)| {
         let dst = (pin_base + off) as *mut u8;
         if let Some((part, at)) = src {
@@ -12255,6 +12303,9 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         if pread && nt > 0 {
             if let Some(pool) = pf_pread_pool(nt) {
                 pool.install(|| tasks.par_iter().for_each(work));
+                if exp_pf::nc_on() {
+                    exp_pf::note_staging_group(group_miss, t_grp.elapsed().as_nanos() as u64);
+                }
                 return;
             }
         }
@@ -12263,6 +12314,9 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
     #[cfg(not(feature = "par"))]
     {
         tasks.iter().for_each(work);
+    }
+    if exp_pf::nc_on() {
+        exp_pf::note_staging_group(group_miss, t_grp.elapsed().as_nanos() as u64);
     }
 }
 

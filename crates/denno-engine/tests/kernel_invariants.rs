@@ -14473,3 +14473,73 @@ fn t514_host_page_cache_instruments_and_end_drop_are_wired() {
         "flag の解釈が無い"
     );
 }
+
+/// task 530: ステージング写しの切り分けが配線されているか (静的検査)。
+///
+/// 数値経路を変えるのは 2 つのゲート (`DENNO_PF_PREAD_NC_FIRST` /
+/// `DENNO_PF_PREAD_ODIRECT`) だけで、どちらも既定 off。
+/// 計器 (`DENNO_PF_NC`) は既定 on で、`[exp-pf-stream]` の末尾に欄を足す。
+#[test]
+fn t530_staging_copy_instruments_and_gates_are_wired() {
+    // ゲートと計器の定義 (名前を変えたらこのテストも直す)。
+    for k in [
+        "pub const NC_FIRST_ENV: &str = \"DENNO_PF_PREAD_NC_FIRST\"",
+        "pub const NC_ENV: &str = \"DENNO_PF_NC\"",
+        "pub const ODIRECT_ENV: &str = \"DENNO_PF_PREAD_ODIRECT\"",
+        "pub const DEFAULT_NC_FIRST: bool = false",
+        "pub const DEFAULT_ODIRECT: bool = false",
+        "pub const DEFAULT_NC: bool = true",
+        "pub fn odirect_window(",
+        "pub fn nc_first_order(",
+        "pub unsafe fn range_resident(",
+        "pub fn staging_stats() -> String",
+        "nc_judged={judged}",
+        "od_win_MB=",
+        "grp_miss_s=",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    // 台帳はリクエスト終端の `[exp-pf-stream]` に足す (どこにも出なければ読めない)。
+    assert!(
+        EXP_PF_SRC.contains("out.push_str(&staging_stats())"),
+        "staging_stats が [exp-pf-stream] に繋がっていない"
+    );
+    assert!(
+        EXP_PF_SRC.contains("    staging_stats_reset();"),
+        "端末で台帳を戻していない"
+    );
+    // O_DIRECT は専用の読み口を開き、read_part_ptr から窓を使って呼ぶ。
+    assert!(
+        EXP_PF_SRC.contains("static PARTS_OD:"),
+        "O_DIRECT 用の読み口が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("fn open_odirect(p: &std::path::Path)"),
+        "O_DIRECT の open が無い"
+    );
+    let rp = fn_body(EXP_PF_SRC, "pub unsafe fn read_part_ptr(");
+    let win = rp.find("odirect_window(").expect("窓の判定が無い");
+    let gate = rp.find("odirect_on()").expect("ゲートの判定が無い");
+    let buffered = rp.find("read_full(f, off, buf)").expect("buffered の経路が無い");
+    assert!(gate < win, "ゲートより先に窓を計算している");
+    assert!(win < buffered, "O_DIRECT の後に buffered が無い (落ちたとき戻れない)");
+    // 写しの側: 常駐の予測 → (ゲート) 並べ替え → 写し → グループの記録。
+    let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
+    let res = cp.find("exp_pf::range_resident(").expect("mincore の予測が無い");
+    let ord = cp.find("exp_pf::nc_first_order(").expect("並べ替えが無い");
+    let work = cp.find("let work = |").expect("写しの本体が無い");
+    let grp = cp.find("exp_pf::note_staging_group(").expect("グループの記録が無い");
+    assert!(res < work, "予測が写しの後に来ている");
+    assert!(ord > res && ord < work, "並べ替えが予測と写しの間に無い");
+    assert_eq!(
+        cp.matches("exp_pf::note_staging_group(").count(),
+        2,
+        "グループの記録は 2 つの出口 (pool 経由 / 素の par_iter) の両方に要る"
+    );
+    assert!(cp.contains("if exp_pf::nc_first_on() {"), "ゲートで囲んでいない");
+    assert!(
+        cp.contains("exp_pf::note_range_residency("),
+        "予測の台帳が無い"
+    );
+    let _ = grp;
+}
