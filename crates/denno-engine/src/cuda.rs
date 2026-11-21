@@ -12758,7 +12758,9 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
     // `DENNO_PF_PREAD_KB` ずつに切り、並列度を上げる)。
     // task 474: 区間**丸ごと**が先読みの置き場 (`DENNO_PF_EARLY_ROUTE` の RAM) に
     // 載っていれば、その区間は 1 本の memcpy にする (ディスクを読まない)。
-    let mut tasks: Vec<(usize, Option<(u32, u64)>, usize, usize, bool)> = Vec::new();
+    // task 546: 6 番目は「page cache に載っている (または判定不能)」= buffered で
+    // 読んでよい。`DENNO_PF_PREAD_ODIRECT_BOUNCE` のときだけ false が入る。
+    let mut tasks: Vec<(usize, Option<(u32, u64)>, usize, usize, bool, bool)> = Vec::new();
     if pread {
         let blk = exp_pf::pread_bytes().max(1);
         // task 522: 読みの「形」を台帳へ積む (診断専用、既定 on)。
@@ -12773,7 +12775,7 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             match r.src {
                 Some(s) => {
                     if exp_pf::rc_has(s.0, s.1, r.len) {
-                        tasks.push((off, Some(s), r.ptr, r.len, true));
+                        tasks.push((off, Some(s), r.ptr, r.len, true, true));
                     } else {
                         if exp_pf::range_ledger_on() {
                             ledger.push((s.0, s.1, r.len));
@@ -12781,7 +12783,7 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
                         runs.push((off, s.0, s.1, r.len, r.ptr));
                     }
                 }
-                None => tasks.push((off, None, r.ptr, r.len, false)),
+                None => tasks.push((off, None, r.ptr, r.len, false, true)),
             }
         }
         if !runs.is_empty() {
@@ -12791,25 +12793,27 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             for &(off, part, at, len, ptr) in runs.iter() {
                 // task 325: 1 区間を `DENNO_PF_PREAD_KB` ずつに切る。
                 for (k, n) in exp_pf::pread_blocks(len, blk) {
-                    tasks.push((off + k, Some((part, at + k as u64)), ptr + k, n, false));
+                    tasks.push((off + k, Some((part, at + k as u64)), ptr + k, n, false, true));
                 }
             }
         }
         exp_pf::note_read_ranges(&ledger);
     } else {
         for &(off, r) in parts {
-            tasks.push((off, None, r.ptr, r.len, false));
+            tasks.push((off, None, r.ptr, r.len, false, true));
         }
     }
     // task 530: page cache の常駐を `mincore(2)` で予測する (計器、既定 on) と、
     // 載っていない区間を先に並べるゲート (`DENNO_PF_PREAD_NC_FIRST`)。
     // グループは barrier なので、最後に残った 1 本がディスク待ちだと
     // 残りのスレッドが遊ぶ。ミスを先に投げると、その待ちが写しの後ろに隠れる。
-    if pread && (exp_pf::nc_on() || exp_pf::nc_first_on()) {
+    // task 546: バウンス経路 (`DENNO_PF_PREAD_ODIRECT_BOUNCE`) も同じ予測を使う
+    // (載っている区間を O_DIRECT で読むと page cache のヒットを捨ててしまう)。
+    if pread && (exp_pf::nc_on() || exp_pf::nc_first_on() || exp_pf::odb_on()) {
         let t_nc = std::time::Instant::now();
         let mut flags: Vec<bool> = Vec::with_capacity(tasks.len());
         let (mut judged, mut miss, mut unknown) = (0usize, 0usize, 0usize);
-        for &(_off, src, ptr, len, cached) in tasks.iter() {
+        for &(_off, src, ptr, len, cached, _res) in tasks.iter() {
             if src.is_some() && !cached {
                 // SAFETY: `ptr` は mmap の区間の先頭 (この層の処理中は有効)。
                 match unsafe { exp_pf::range_resident(ptr, len) } {
@@ -12839,6 +12843,10 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             unknown,
             t_nc.elapsed().as_nanos() as u64,
         );
+        // task 546: 判定を各タスクへ配る (true = buffered でよい)。
+        for (t, &f) in tasks.iter_mut().zip(flags.iter()) {
+            t.5 = f;
+        }
         if exp_pf::nc_first_on() {
             let ord = exp_pf::nc_first_order(&flags);
             let moved = ord.iter().enumerate().filter(|&(i, &j)| i != j).count();
@@ -12847,12 +12855,26 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             exp_pf::note_nc_order(moved);
         }
     }
-    let work = |&(off, src, ptr, len, cached): &(usize, Option<(u32, u64)>, usize, usize, bool)| {
+    type PfTask = (usize, Option<(u32, u64)>, usize, usize, bool, bool);
+    let work = |&(off, src, ptr, len, cached, resident): &PfTask| {
         let dst = (pin_base + off) as *mut u8;
         if let Some((part, at)) = src {
             // SAFETY: 区間は互いに重ならず、`pin_base` は `need` バイト以上ある。
             if cached && unsafe { exp_pf::rc_copy_into(part, at, len, dst) } {
                 return;
+            }
+            // task 546: page cache に載っていない区間だけ、O_DIRECT + バウンスで読む
+            // (page cache を経由しない = 常駐を追い出さない)。載っている区間と
+            // 失敗した区間は従来の buffered pread。
+            if !resident && exp_pf::odb_on() {
+                exp_pf::note_rd_enter(len);
+                let ok = unsafe { exp_pf::read_part_ptr_od_bounce(part, at, dst, len) };
+                exp_pf::note_rd_leave();
+                if ok {
+                    return;
+                }
+            } else if !resident {
+                exp_pf::note_odb(0, len, 0, 0);
             }
             // task 538: ディスク (または page cache) からの pread。同時本数を数える。
             exp_pf::note_rd_enter(len);
@@ -12876,7 +12898,8 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         if pread && nt > 0 {
             if let Some(pool) = pf_pread_pool(nt) {
                 pool.install(|| tasks.par_iter().for_each(work));
-                if exp_pf::nc_on() {
+                // task 546: バウンス経路も同じ台帳 (ディスク待ちの切り分け) を残す。
+                if exp_pf::nc_on() || exp_pf::odb_on() {
                     exp_pf::note_staging_group(group_miss, t_grp.elapsed().as_nanos() as u64);
                 }
                 return;
@@ -12888,7 +12911,7 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
     {
         tasks.iter().for_each(work);
     }
-    if exp_pf::nc_on() {
+    if exp_pf::nc_on() || exp_pf::odb_on() {
         exp_pf::note_staging_group(group_miss, t_grp.elapsed().as_nanos() as u64);
     }
 }

@@ -2472,7 +2472,8 @@ pub fn install_parts(paths: Vec<Option<std::path::PathBuf>>) {
         eprintln!("[pf-pread] 読み口: {opened} パートを開いた (DENNO_PF_PREAD=1)");
     }
     // task 530: ゲート on のときだけ O_DIRECT 用の読み口も開く。
-    if odirect_on() {
+    // task 546: バウンス経路 (`DENNO_PF_PREAD_ODIRECT_BOUNCE`) でも同じ読み口を使う。
+    if odirect_on() || odb_on() {
         let od: Vec<Option<std::sync::Arc<std::fs::File>>> = paths
             .iter()
             .map(|p| {
@@ -2482,7 +2483,13 @@ pub fn install_parts(paths: Vec<Option<std::path::PathBuf>>) {
             })
             .collect();
         let n = od.iter().filter(|f| f.is_some()).count();
-        eprintln!("[pf-pread] O_DIRECT の読み口: {n} パート (DENNO_PF_PREAD_ODIRECT=1)");
+        if odirect_on() {
+            eprintln!("[pf-pread] O_DIRECT の読み口: {n} パート (DENNO_PF_PREAD_ODIRECT=1)");
+        } else {
+            eprintln!(
+                "[pf-pread] O_DIRECT の読み口: {n} パート (DENNO_PF_PREAD_ODIRECT_BOUNCE=1)"
+            );
+        }
         let _ = PARTS_OD.set(od);
     }
     // task 522: ディスクの素の速さを測る (既定 off、診断専用)。
@@ -2745,6 +2752,168 @@ pub fn odirect_window(dst: usize, at: u64, len: usize, align: usize) -> Option<(
     } else {
         Some((delta, n))
     }
+}
+
+/// task 546: `DENNO_PF_PREAD_ODIRECT_BOUNCE`: **page cache に載っていない**
+/// 区間だけ `O_DIRECT` + 整列バウンスで読む (page cache を経由しない)。既定 off。
+///
+/// # なぜ要るか (task 546 の fresh profile、3,826 cold)
+///
+/// `[exp-pf-stream] copy_s=9.19 s` / `up_MB=43586` / `pread_MB=43640` /
+/// `[exp-ram-probe] io_read_MB=20707` = pread した 43.6 GB のうち 20.7 GB が
+/// ディスク。**残り 22.9 GB は page cache から**来ているので、全部を
+/// `O_DIRECT` にしてはいけない (page cache のヒットを捨てて全部ディスクになる)。
+///
+/// # 何をするか
+///
+/// `mincore(2)` で「載っていない」と分かった区間だけ、`O_DIRECT` の読み口から
+/// 4096 に整列した広さ (`od_bounce_shape`) で thread-local のバウンスへ読み、
+/// 必要な内側を `dst` へ写す。page cache を経由しないので
+/// (a) ディスクの読みが page cache への write と readahead を伴わない、
+/// (b) 読んだ 20 GB が常駐 (49-51 GB) を追い出さない、の 2 点を狙う。
+/// 値は 1 バイトも変わらない (同じバイトを同じ場所へ書く)。
+pub const ODB_ENV: &str = "DENNO_PF_PREAD_ODIRECT_BOUNCE";
+
+/// [`ODB_ENV`] の既定値 (**on**、task 546 で採った)。
+///
+/// lab t546b (UD-Q4_K_XL、depth8k、2 ラウンド同順): 3,826 cold が
+/// b 10,220 / 9,401 ms -> odb **9,197 / 8,730** (**-8.6 / -7.1%**)、
+/// `copy_s` 8.80 / 8.00 -> **7.79 / 7.37**、ディスクの実効 2.19 -> 2.48 GB/s。
+/// 14k cold は 13,690 -> 12,140 (-11.3%、1 サンプル)。decode は不変、
+/// 既定モデルは `src` を持たないので不活性 (`odb_MB` が出ない)。
+pub const DEFAULT_ODB: bool = true;
+
+/// [`ODB_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+pub fn odb_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => DEFAULT_ODB,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// [`ODB_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+pub fn odb_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| odb_from_value(std::env::var(ODB_ENV).ok().as_deref()))
+}
+
+/// `(off, len)` を `align` 単位へ広げた `(start, total, delta)` を返す。
+///
+/// `start` は `off` を align へ切り下げたファイル位置、`total` は align の倍数の
+/// 読み幅、`delta` は読み取ったバウンスの先頭から `dst` へ写す位置。
+/// `off + len <= start + total` は常に成り立つ。
+pub fn od_bounce_shape(off: u64, len: usize, align: usize) -> Option<(u64, usize, usize)> {
+    if len == 0 || align == 0 || !align.is_power_of_two() {
+        return None;
+    }
+    let m = (align - 1) as u64;
+    let start = off & !m;
+    let delta = (off - start) as usize;
+    let total = (delta + len).div_ceil(align) * align;
+    Some((start, total, delta))
+}
+
+static ODB_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ODB_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ODB_SKIP_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ODB_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ODB_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 546: バウンス経由で読んだ量 / 常駐なので buffered に回した量 / 失敗 / 時間。
+pub fn note_odb(read_bytes: usize, skip_bytes: usize, fail: usize, ns: u64) {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    if read_bytes > 0 {
+        ODB_MB.fetch_add(read_bytes as u64, o);
+        ODB_N.fetch_add(1, o);
+    }
+    ODB_SKIP_MB.fetch_add(skip_bytes as u64, o);
+    ODB_FAIL.fetch_add(fail as u64, o);
+    ODB_NS.fetch_add(ns, o);
+}
+
+/// task 546: `[exp-pf-stream]` の末尾へ足すバウンス経路の台帳 (発火が無ければ空)。
+pub fn odb_stats() -> String {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    let n = ODB_N.load(o);
+    let fail = ODB_FAIL.load(o);
+    if n == 0 && fail == 0 {
+        return String::new();
+    }
+    format!(
+        " odb_MB={:.1} odb_n={n} odb_skip_MB={:.1} odb_fail={fail} odb_ms={:.1}",
+        ODB_MB.load(o) as f64 / 1e6,
+        ODB_SKIP_MB.load(o) as f64 / 1e6,
+        ODB_NS.load(o) as f64 / 1e6,
+    )
+}
+
+/// task 546: バウンス経路の台帳を 0 に戻す。
+pub fn odb_stats_reset() {
+    let o = std::sync::atomic::Ordering::Relaxed;
+    for c in [&ODB_MB, &ODB_N, &ODB_SKIP_MB, &ODB_FAIL, &ODB_NS] {
+        c.store(0, o);
+    }
+}
+
+thread_local! {
+    /// task 546: O_DIRECT のバウンス (スレッドごとに 1 枚、足りなければ伸ばす)。
+    static ODB_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// task 546: `part` の `off` から `len` バイトを **O_DIRECT** + 整列バウンスで
+/// `dst` へ読む。成功したら true。失敗 (読み口が無い / 短読み / エラー) は false で、
+/// 呼び出し側は buffered の pread へ落ちる (部分的な書き込みは上書きされる)。
+///
+/// # Safety
+/// `dst` は `len` バイト以上書けること。
+pub unsafe fn read_part_ptr_od_bounce(part: u32, off: u64, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(Some(f)) = PARTS_OD.get().and_then(|v| v.get(part as usize)) else {
+        note_odb(0, 0, 1, 0);
+        return false;
+    };
+    let Some((start, total, delta)) = od_bounce_shape(off, len, ODIRECT_ALIGN) else {
+        note_odb(0, 0, 1, 0);
+        return false;
+    };
+    let t = std::time::Instant::now();
+    let ok = ODB_BUF.with(|cell| {
+        let mut v = cell.borrow_mut();
+        // 4096 に整列した先頭を切り出すので、余白を 1 ページぶん足す。
+        if v.len() < total + ODIRECT_ALIGN {
+            v.resize(total + ODIRECT_ALIGN, 0);
+        }
+        let base = v.as_mut_ptr() as usize;
+        let a = (base + ODIRECT_ALIGN - 1) & !(ODIRECT_ALIGN - 1);
+        // SAFETY: `a .. a + total` は `v` の中 (余白を足してある)。
+        let buf = std::slice::from_raw_parts_mut(a as *mut u8, total);
+        #[cfg(unix)]
+        {
+            if read_full(f, start, buf).is_err() {
+                return false;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (f, start, buf);
+            return false;
+        }
+        // SAFETY: `delta + len <= total` (od_bounce_shape の契約)。dst は len 以上。
+        std::ptr::copy_nonoverlapping(buf.as_ptr().add(delta), dst, len);
+        true
+    });
+    let ns = t.elapsed().as_nanos() as u64;
+    if ok {
+        note_odb(len, 0, 0, ns);
+    } else {
+        note_odb(0, 0, 1, ns);
+    }
+    ok
 }
 
 /// `flags[i] == false` (= page cache に載っていない) を先に、`true` を後に
@@ -5414,6 +5583,8 @@ pub fn stats_line() -> Option<String> {
         out.push_str(&staging_stats());
         // task 538: ディスク読みの同時本数 (バリアの中で何本飛んだか)。
         out.push_str(&rd_stats());
+        // task 546: O_DIRECT + バウンスで読んだ量 (発火の証拠。0 ならゲートは効いていない)。
+        out.push_str(&odb_stats());
         out.push_str(&rc_stats());
         // task 394: 次の層の先読みが発火したかの台帳。
         out.push_str(&layer_pre_stats());
@@ -5476,6 +5647,8 @@ pub fn stats_reset() {
     staging_stats_reset();
     // task 538: ディスク読みの同時本数の台帳も戻す。
     rd_stats_reset();
+    // task 546: バウンス経路の台帳も戻す。
+    odb_stats_reset();
     CHECK_LAYERS.store(0, Ordering::Relaxed);
     if let Ok(mut g) = CHECK.lock() {
         *g = None;
@@ -7262,6 +7435,52 @@ mod tests {
         let (d, n) = w.expect("整列が同じなら取れる");
         assert_eq!(d, 0);
         assert_eq!(n, len / a * a);
+    }
+
+    /// task 546: バウンスの形は 4096 に整列し、元の区間を必ず含む。
+    #[test]
+    fn task546_od_bounce_shape_covers_and_aligns() {
+        assert_eq!(ODB_ENV, "DENNO_PF_PREAD_ODIRECT_BOUNCE");
+        assert!(DEFAULT_ODB, "task 546 の lab (t546b) で採った = 既定 on");
+        for &(off, len) in &[
+            (0u64, 1usize),
+            (0, 4096),
+            (1, 4095),
+            (12345, 950_000),
+            (0x7f00_0000_1234, 1_048_576),
+            (4095, 4097),
+        ] {
+            let (start, total, delta) = od_bounce_shape(off, len, ODIRECT_ALIGN).expect("取れる");
+            assert_eq!(start % ODIRECT_ALIGN as u64, 0, "start が整列");
+            assert_eq!(total % ODIRECT_ALIGN, 0, "total が整列");
+            assert!(total >= delta + len, "バウンスが区間を含む");
+            assert_eq!(start, off - delta as u64);
+            assert!(delta < ODIRECT_ALIGN);
+            assert!(start + total as u64 >= off + len as u64);
+        }
+        assert_eq!(od_bounce_shape(0, 0, ODIRECT_ALIGN), None);
+        assert_eq!(od_bounce_shape(0, 16, 3), None, "2 の冪でない");
+    }
+
+    /// task 546: ゲートの解釈 (明示的な真値だけ on) と台帳の書式。
+    #[test]
+    fn task546_odb_gate_truth_table() {
+        assert!(odb_from_value(None), "既定 on (task 546 の lab で採った)");
+        assert!(odb_from_value(Some("")), "空は既定 (on)");
+        assert!(!odb_from_value(Some("0")));
+        assert!(!odb_from_value(Some("off")));
+        assert!(odb_from_value(Some("1")));
+        assert!(odb_from_value(Some("on")));
+        assert!(odb_from_value(Some(" TRUE ")));
+        odb_stats_reset();
+        assert!(odb_stats().is_empty(), "発火が無ければ行ごと出ない");
+        note_odb(1 << 20, 2 << 20, 0, 5_000_000);
+        let s = odb_stats();
+        assert!(s.contains("odb_MB=1.0"), "{s}");
+        assert!(s.contains("odb_skip_MB=2.1"), "{s}");
+        assert!(s.contains("odb_n=1"), "{s}");
+        odb_stats_reset();
+        assert!(odb_stats().is_empty());
     }
 
     /// task 530: ミスを先に並べる順序は安定で、全体を 1 回ずつ含む。

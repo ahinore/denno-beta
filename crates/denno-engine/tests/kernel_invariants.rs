@@ -14494,16 +14494,30 @@ fn t538_staging_disk_inflight_is_counted() {
         assert!(EXP_PF_SRC.contains(k), "台帳の定義が無い: {k}");
     }
     let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
-    let ent = cp.find("exp_pf::note_rd_enter(len)").expect("enter が無い");
     let rd = cp
         .find("exp_pf::read_part_ptr(part, at, dst, len)")
         .expect("pread が無い");
-    let lv = cp.find("exp_pf::note_rd_leave()").expect("leave が無い");
+    // task 546: buffered pread を挟む対 (バウンス経路の対が手前にあるので、
+    // pread の直前の enter と直後の leave を取る)。
+    let ent = cp[..rd]
+        .rfind("exp_pf::note_rd_enter(len)")
+        .expect("enter が無い");
+    let lv = cp[rd..]
+        .find("exp_pf::note_rd_leave()")
+        .map(|i| rd + i)
+        .expect("leave が無い");
     assert!(ent < rd && rd < lv, "pread の両側に無い");
+    // task 546: O_DIRECT バウンスの読みも同時本数に数えるので、enter/leave は
+    // buffered pread とバウンスの 2 対。片方だけだと本数が単調増加する。
     assert_eq!(
         cp.matches("exp_pf::note_rd_enter(").count(),
-        1,
-        "enter は 1 か所だけ (二重に数えない)"
+        2,
+        "enter は 2 か所 (buffered pread と O_DIRECT バウンス)"
+    );
+    assert_eq!(
+        cp.matches("exp_pf::note_rd_leave()").count(),
+        2,
+        "leave は enter と同じ数"
     );
     // グループごとの塊の選択 (`DENNO_PF_SPLIT_WIDE_KB`): 分割の大きさは
     // `split_chunk_for` で決め、`src` を持つグループだけ広げる。
@@ -14958,5 +14972,37 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
             .filter(|l| l.trim_start().starts_with(".param"))
             .count();
         assert_eq!(n, 12, "PTX の dno_attn_flashdec_t2 が 12 引数でない");
+    }
+}
+
+/// task 546: `DENNO_PF_PREAD_ODIRECT_BOUNCE` の配線 (静的検査)。
+///
+/// 緑は発火の証拠ではないので、lab の `[exp-pf-stream]` の
+/// `odb_MB=` / `odb_n=` / `odb_skip_MB=` で数える。
+#[test]
+fn t546_odirect_bounce_is_wired() {
+    const EP: &str = include_str!("../src/model/exp_pf.rs");
+    for s in [
+        "pub const ODB_ENV: &str = \"DENNO_PF_PREAD_ODIRECT_BOUNCE\";",
+        "pub fn odb_from_value(v: Option<&str>) -> bool {",
+        "pub fn odb_on() -> bool {",
+        "pub fn od_bounce_shape(off: u64, len: usize, align: usize)",
+        "pub unsafe fn read_part_ptr_od_bounce(part: u32, off: u64, dst: *mut u8, len: usize) -> bool {",
+        "ODB_BUF.with(|cell| {",
+        "odirect_on() || odb_on()",
+        "out.push_str(&odb_stats());",
+        "odb_stats_reset();",
+    ] {
+        assert!(EP.contains(s), "exp_pf.rs に {s} が無い");
+    }
+    // 予測 (mincore) を odb でも回し、判定をタスクへ配っていること。
+    for s in [
+        "exp_pf::nc_on() || exp_pf::nc_first_on() || exp_pf::odb_on()",
+        "for (t, &f) in tasks.iter_mut().zip(flags.iter()) {",
+        "if !resident && exp_pf::odb_on() {",
+        "exp_pf::read_part_ptr_od_bounce(part, at, dst, len)",
+        "exp_pf::note_odb(0, len, 0, 0);",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
     }
 }
