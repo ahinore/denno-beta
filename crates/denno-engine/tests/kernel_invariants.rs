@@ -14611,3 +14611,32 @@ fn t534_seg_fast_gates_are_wired() {
         "dn8 の発火を数えていない"
     );
 }
+
+/// task 534 (2/n): Q5_1 の 4 バイトロード版 (`dno_seg_gemv_v4_q5_1`) が
+/// kernels_seg_k.cu に居て、down の選択が k8 → v4 の順に落ちること (静的検査)。
+#[test]
+fn t534_down_q5_1_vector_kernel_is_wired() {
+    let cu = include_str!("../kernels/kernels_seg_k.cu");
+    assert!(
+        cu.contains("dno_seg_gemv_v4_q5_1"),
+        "Q5_1 の 4 バイト版が .cu に無い"
+    );
+    // 24 バイト/32 要素のブロックを読む (Q5_1 の仕様)。
+    assert!(cu.contains("* 24u"), "Q5_1 のブロック長 24 B を使っていない");
+    assert!(
+        cu.contains("#define SK_V4_BLKS 8"),
+        "1 warp = 8 ブロックの定数が無い"
+    );
+    assert!(
+        CUDA_RS.contains("Some(b\"dno_seg_gemv_v4_q5_1\\0\")"),
+        "cuda.rs の v4 の名前が無い"
+    );
+    let body = fn_body(CUDA_RS, "pub fn moe_seg_layer_sum<F>(");
+    let k8 = body.find("k.k8[slot_d]").expect("k8 の選択が無い");
+    let v4 = body.find("k.v4[slot_d]").expect("v4 の選択が無い");
+    assert!(k8 < v4, "k8 を先に見ていない");
+    assert!(
+        body.contains("seg_prof::note_seg_dnv4_call()"),
+        "dnv4 の発火を数えていない"
+    );
+}

@@ -967,3 +967,75 @@ extern "C" __global__ void dno_seg_gemv_k8_q5k(
     acc = sk_reduce(acc);
     if (lane == 0) s.out[row] = acc;
 }
+
+// ===========================================================================
+// task 534: **Q5_1 の 4 バイトロード版** (down 用)
+//
+// なぜ: UD-Q4_K_XL の expert は gate/up が Q4_K、**down が Q5_1** (lab t534b の
+// `[pf-ktc] gate/up=Q4K down=Q5_1 k=2560/640`)。Q5_1 の 1 ブロックは 24 B
+// (d 2 + m 2 + qh 4 + qs 16) で 32 要素。既存 `dno_seg_gemv_k_q5_1` は
+// **1 要素 = 1 バイトロード**で、しかも lane 0-15 と 16-31 が同じ 16 バイトを
+// 読む (要求バイトの半分が無駄)。lab t534b の down は 348 GB/s で
+// gate (Q4_K, 476 GB/s) より遅い。
+//
+// 何をするか: **1 warp = 8 ブロック = 256 要素**にし、lane ごとに qs の
+// 連続 4 バイト (= 8 要素) を 1 回の 32 ビットロードで取る。
+//   lane = 4 * (ブロック内の 4 バイト目 j) + ... ではなく
+//   j = lane & 3 (qs の 4 バイト目)、bg = lane >> 2 (反復内のブロック番号 0..7)。
+//   lane は qs[j*4 .. j*4+4] を読み、要素 j*4+t (下位ニブル) と
+//   要素 j*4+16+t (上位ニブル) を足す。5 ビット目は qh の同じ要素番号の bit。
+//   x の添字は `b * 32 + 要素番号` (既存カーネルと同じ並び)。
+//
+// 値: 1 行の和の順序が変わる (lane 内で 4 + 4 要素、縮約は同じ `sk_reduce`) ので
+// **ビット一致しない**。起動形は同じで、形が固定なので値は決定的
+// (丸め順の変更はタスクの規則で許容。`DENNO_SEG_DN8=0` で戻せる)。
+// ===========================================================================
+
+#define SK_V4_BLKS 8
+
+extern "C" __global__ void dno_seg_gemv_v4_q5_1(
+    const unsigned char* const* __restrict__ wptrs,
+    const float* __restrict__ xbase,
+    float* __restrict__ obase,
+    const unsigned int* __restrict__ seg,
+    int nseg, int n_in, int n_out, int row_bytes)
+{
+    SkSeg s;
+    if (!sk_seg(wptrs, xbase, obase, seg, nseg, n_in, n_out, &s)) return;
+    int lane;
+    const int row = sk_row_of(&lane);
+    if (row >= n_out) return;
+
+    const unsigned char* rowp = s.w + (size_t)row * (size_t)row_bytes;
+    const int nb = n_in >> 5;          // 32 要素ブロックの数
+    const int j = lane & 3;            // qs の 4 バイト目 (要素 j*4 .. j*4+3)
+    const int bg = lane >> 2;          // 反復の中のブロック番号 (0..SK_V4_BLKS-1)
+    float acc = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += SK_V4_BLKS) {
+        const int b = b0 + bg;
+        if (b >= nb) continue;
+        const unsigned char* blk = rowp + (size_t)b * 24u;
+        const float d = sk_f16(blk);
+        const float m = sk_f16(blk + 2);
+        const unsigned int qh = (unsigned int)blk[4]
+                              | ((unsigned int)blk[5] << 8)
+                              | ((unsigned int)blk[6] << 16)
+                              | ((unsigned int)blk[7] << 24);
+        const unsigned int w4 = *(const unsigned int*)(blk + 8 + (size_t)j * 4u);
+        const size_t xo = (size_t)b * 32u + (size_t)j * 4u;
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const unsigned int qb = (w4 >> (unsigned)(8 * t)) & 0xffu;
+            const unsigned int e_lo = (unsigned int)(j * 4 + t);
+            const unsigned int e_hi = e_lo + 16u;
+            const unsigned int lo = qb & 0x0fu;
+            const unsigned int hi = qb >> 4;
+            const float y0 = (float)(lo + (((qh >> e_lo) & 1u) ? 16u : 0u)) * d + m;
+            const float y1 = (float)(hi + (((qh >> e_hi) & 1u) ? 16u : 0u)) * d + m;
+            acc += y0 * s.x[xo + (size_t)t];
+            acc += y1 * s.x[xo + 16u + (size_t)t];
+        }
+    }
+    acc = sk_reduce(acc);
+    if (lane == 0) s.out[row] = acc;
+}

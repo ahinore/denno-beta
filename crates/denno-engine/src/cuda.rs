@@ -8386,6 +8386,8 @@ struct SegKKernels {
     gu8: [Option<CUfunction>; 4],
     /// task 534: 1 行版の 8 バイトロード版 ([`SEG_K_K8_NAMES`] の順)。K 型だけ。
     k8: [Option<CUfunction>; 4],
+    /// task 534: Q5_1 の 4 バイトロード版 ([`SEG_K_V4_NAMES`] の順)。down 用。
+    v4: [Option<CUfunction>; 4],
 }
 
 // 生ハンドル (context / module / function)。CudaCtx と同じ規約。
@@ -8425,6 +8427,16 @@ const SEG_K_K8_NAMES: [Option<&[u8]>; 4] = [
     None,
     Some(b"dno_seg_gemv_k8_q4k\0"),
     Some(b"dno_seg_gemv_k8_q5k\0"),
+];
+
+/// task 534: **Q5_1 の 4 バイトロード**版 ([`moe_batch_slot`] の順)。
+/// UD-Q4_K_XL の down は Q5_1 (`[pf-ktc] gate/up=Q4K down=Q5_1`) なので、
+/// down の速い版はここに入る。1 warp = 8 ブロック = 256 要素。
+const SEG_K_V4_NAMES: [Option<&[u8]>; 4] = [
+    None,
+    Some(b"dno_seg_gemv_v4_q5_1\0"),
+    None,
+    None,
 ];
 
 /// task 412 / 526: `DENNO_SEG_GU_FUSE` — seg 経路 (K 型モデルの decode) の
@@ -8593,6 +8605,12 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
                     k8[i] = get(name);
                 }
             }
+            let mut v4 = [None; 4];
+            for (i, name) in SEG_K_V4_NAMES.iter().enumerate() {
+                if let Some(name) = name {
+                    v4[i] = get(name);
+                }
+            }
             Some(SegKKernels {
                 module,
                 fns,
@@ -8601,6 +8619,7 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
                 gu,
                 gu8,
                 k8,
+                v4,
             })
         })
         .as_ref()
@@ -9067,14 +9086,19 @@ where
         }
         _ => None,
     };
-    // task 534: down の 8 バイトロード版 (引数も起動形も同じ = 差し替えだけ)。
+    // task 534: down のベクトルロード版 (8 バイト版 or Q5_1 の 4 バイト版)。
+    // 引数も起動形も同じ = 関数の差し替えだけ。
     let f_d_seg = match fast {
-        Some(k) if seg_dn8_enabled() => match k.k8[slot_d] {
-            Some(f) => {
+        Some(k) if seg_dn8_enabled() => match (k.k8[slot_d], k.v4[slot_d]) {
+            (Some(f), _) => {
                 crate::model::seg_prof::note_seg_dn8_call();
                 f
             }
-            None => f_d,
+            (None, Some(f)) => {
+                crate::model::seg_prof::note_seg_dnv4_call();
+                f
+            }
+            (None, None) => f_d,
         },
         _ => f_d,
     };
@@ -49142,6 +49166,12 @@ mod tests {
             .join("kernels_seg_k.ptx");
         let ptx = std::fs::read_to_string(&p).expect("kernels_seg_k.ptx が読めない");
         for n in SEG_K_GU_NAMES.iter() {
+            let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
+            let key = format!(".visible .entry {name}(");
+            assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
+        }
+        // task 534: 8 バイトロード版 (gu8 / k8) の 4 エントリも居ること。
+        for n in SEG_K_GU8_NAMES.iter().chain(SEG_K_K8_NAMES.iter()).flatten() {
             let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
             let key = format!(".visible .entry {name}(");
             assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
