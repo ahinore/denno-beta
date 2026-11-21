@@ -14664,10 +14664,19 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
         !cu5.contains("void dno_attn_flashdec_t(") && !cu5.contains("void dno_attn_flashdec("),
         "既存の entry を上書きしている"
     );
-    // 2. 引数は第 2 版と同じ 11 本 (ABI を共有する)。
-    let sig = "int kv_dim, int t_total, int group, int dh, float scale, int n_split,\n    int tile) {";
-    assert!(cu2.contains(sig), "第 2 版の引数並びが変わった");
-    assert!(cu5.contains(sig), "第 3 版の引数並びが第 2 版と違う");
+    // 2. 引数: 第 2 版の 11 本 + 第 3 版は grid 入れ替えの 1 本 (12 本)。
+    let sig2 =
+        "int kv_dim, int t_total, int group, int dh, float scale, int n_split,\n    int tile) {";
+    assert!(cu2.contains(sig2), "第 2 版の引数並びが変わった");
+    assert!(
+        cu5.contains("int kv_dim, int t_total, int group, int dh, float scale, int n_split,\n    int tile,"),
+        "第 3 版の引数並びが第 2 版と違う"
+    );
+    assert!(cu5.contains("int khx) {"), "第 3 版に khx (grid 入れ替え) の引数が無い");
+    assert!(
+        cu5.contains("const int kh = khx ? (int)blockIdx.x : (int)blockIdx.y;"),
+        "khx の (kh, sp) の入れ替えが無い"
+    );
 
     // 3. 1 key あたりの算術の列が第 2 版と同一 (変数名の違いだけを落として
     //    対で比べる。値がビット一致する根拠)。
@@ -14754,7 +14763,7 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
 
     // 4. ホスト側の配線 (2 つの起動点の両方)。
     for s in [
-        "pub(crate) const FDT2_NARGS: usize = 11;",
+        "pub(crate) const FDT2_NARGS: usize = 12;",
         "pub(crate) fn parse_attn_fdec_ilp(v: Option<&str>) -> bool {",
         "fn attn_fdec_ilp_on() -> bool {",
         "\"DENNO_ATTN_FLASHDEC_ILP\"",
@@ -14765,6 +14774,9 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
         "fn fdt2_log(len: usize, n_split: usize, tile: usize) {",
         "fn fdt2_gate_log() {",
         "note_fdt2_call()",
+        "pub(crate) fn parse_attn_fdec_khx(v: Option<&str>) -> bool {",
+        "fn attn_fdec_khx_on() -> bool {",
+        "\"DENNO_ATTN_FLASHDEC_KHX\"",
     ] {
         assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
     }
@@ -14783,9 +14795,8 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
     );
     // 起動 1 行に ilp の状態が出る (lab の env が届いたかの証拠)。
     assert!(
-        CUDA_RS.contains("ilp={} fdtv=5")
-            || CUDA_RS.contains("tile={} ilp={} fdtv=5"),
-        "起動 1 行に ilp= が無い"
+        CUDA_RS.contains("ilp={} khx={} fdtv=5"),
+        "起動 1 行に ilp= / khx= が無い"
     );
 
     // 5. build_ptx.sh の target と、PTX があれば ABI が 11 引数であること。
@@ -14806,6 +14817,6 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
             .take_while(|l| !l.contains(')'))
             .filter(|l| l.trim_start().starts_with(".param"))
             .count();
-        assert_eq!(n, 11, "PTX の dno_attn_flashdec_t2 が 11 引数でない");
+        assert_eq!(n, 12, "PTX の dno_attn_flashdec_t2 が 12 引数でない");
     }
 }

@@ -83,14 +83,21 @@ extern "C" __global__ void dno_attn_flashdec_t2(
     const float *__restrict__ vc,  // [t_total, kv_dim]
     float *__restrict__ part,      // [(n_kv, n_split, group), dh + 2]
     int kv_dim, int t_total, int group, int dh, float scale, int n_split,
-    int tile) {
+    int tile,
+    // task 520 (2): grid の入れ替え。0 = grid (n_split, n_kv) で
+    // kh = blockIdx.y / sp = blockIdx.x (第 2 版と同じ)。1 = grid (n_kv, n_split)
+    // で kh = blockIdx.x / sp = blockIdx.y。**計算は 1 ビットも変わらない**
+    // (どの block がどの (kh, sp) を持つかだけ)。1 にすると同じ row の 2 つの
+    // 1 KB 半分 (kv head 0 と 1) を隣り合う block が同時に読むので、DRAM から見た
+    // アクセスの粒度が 1 KB から 2 KB になる。
+    int khx) {
     // [tile * dh] が K、その次の [tile * dh] が V。
     extern __shared__ float sh[];
     float *sk = sh;
     float *sv = sh + (size_t)tile * (size_t)dh;
 
-    const int kh = blockIdx.y;        // kv head
-    const int sp = blockIdx.x;        // t の分割
+    const int kh = khx ? (int)blockIdx.x : (int)blockIdx.y;  // kv head
+    const int sp = khx ? (int)blockIdx.y : (int)blockIdx.x;  // t の分割
     const int hh = threadIdx.x >> 5;  // この kv head を共有する q head (warp)
     const int lane = threadIdx.x & 31;
     const int kh_off = kh * dh;
