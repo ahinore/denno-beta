@@ -12704,7 +12704,11 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
             if cached && unsafe { exp_pf::rc_copy_into(part, at, len, dst) } {
                 return;
             }
-            if unsafe { exp_pf::read_part_ptr(part, at, dst, len) } {
+            // task 538: ディスク (または page cache) からの pread。同時本数を数える。
+            exp_pf::note_rd_enter(len);
+            let ok = unsafe { exp_pf::read_part_ptr(part, at, dst, len) };
+            exp_pf::note_rd_leave();
+            if ok {
                 return;
             }
         }
@@ -14608,9 +14612,17 @@ fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result
     else {
         bail!("event_create / event_record / event_sync が無い (分割 DMA)");
     };
-    let chunk = exp_pf::up_split_bytes();
+    let chunk = exp_pf::split_chunk_for(
+        exp_pf::up_split_bytes(),
+        exp_pf::split_wide_bytes(),
+        job.parts.iter().any(|p| p.1.src.is_some()),
+    );
     if chunk == 0 {
         bail!("分割の大きさが 0 (分割 DMA)");
+    }
+    // task 538: 広い塊が効いたか (発火の証拠。緑は証拠ではない)。
+    if chunk > exp_pf::up_split_bytes() {
+        exp_pf::note_up_split_wide();
     }
     let real = REAL_HTOD_ASYNC.load(Ordering::Relaxed);
     if real.is_null() {
@@ -14631,6 +14643,20 @@ fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result
         };
         if need_new {
             // 古い 2 枚を先に落としてから作り直す (イベントは Drop が壊す)。
+            // task 538: 塊の大きさがグループごとに変わりうる (広い塊は
+            // ディスク読みを含むグループだけ) ので、落とす前に前の DMA を待つ。
+            if let Some(old) = slot.as_ref() {
+                for b in 0..2 {
+                    if old.used[b] {
+                        unsafe {
+                            check(
+                                esync(old.ev[b]),
+                                "cuEventSynchronize (分割 DMA の作り直し)",
+                            )?;
+                        }
+                    }
+                }
+            }
             *slot = None;
             let a = PinMem::alloc_flags(chunk, false)?;
             let b = PinMem::alloc_flags(chunk, false)?;
