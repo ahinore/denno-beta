@@ -2734,6 +2734,8 @@ impl FullAttn {
         let n_layer = self.cache.n_layer();
         let gen = self.cache.gen(layer)?;
         let t_total = base + nt;
+        // task 553: この呼び出しの D2H を実際に積めたかを、通し番号の前後で見る。
+        let kv_seq0 = crate::cuda::pf_kv_wb_seq();
         // 前半: qkv (+ qk norm/rope)。k / v はホストへ戻る。
         let ok = if let Some((lin, q_off, k_off, v_off, _n_all)) = gate_src {
             crate::cuda::pf_full_qkv_fused(
@@ -2876,6 +2878,7 @@ impl FullAttn {
             // 次の `forward_batch_flat` / `forward_token` が `kv_flush_deferred`
             // で積む。1 回転ぶん GPU が働くので `cuEventSynchronize` が消える。
             let kv_defer_this = crate::cuda::pf_kv_defer_on()
+                && crate::cuda::pf_kv_wb_seq() > kv_seq0
                 && crate::cuda::pf_kv_wb_peek() == Some((layer, nt));
             if kv_defer_this {
                 crate::cuda::pf_kv_defer_note();
