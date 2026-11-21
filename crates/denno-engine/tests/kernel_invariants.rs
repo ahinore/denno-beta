@@ -14685,3 +14685,94 @@ fn t534_down_q5_1_vector_kernel_is_wired() {
         "dnv4 の発火を数えていない"
     );
 }
+
+/// task 565: 14k cold の `other` (942 ms / 露出 741 ms) のうち、
+/// 誰も触っていない 2 本のホスト転送を配線したことの静的検査。
+///
+/// - 残差の往復 (`res_up` 159 ms = 645 MB) を `DENNO_PF_RES_PIN` で pinned へ。
+/// - 戻し (`pf_teardown` 210.5 ms のうち 208 ms) を `DENNO_PF_RESTORE_NOSYNC`
+///   で 1 本ごとに待たない (戻しの終端で 1 回だけ待つ)。
+#[test]
+fn t565_res_pin_and_restore_nosync_are_wired() {
+    // 1. 残差の往復: ゲートを読み、pinned の強制版を通る。
+    let up = fn_body(CUDA_RS, "pub fn pf_upload_res(");
+    assert!(
+        up.contains("crate::model::exp_pf::pf_res_pin()"),
+        "res の上げがゲートを読んでいない"
+    );
+    assert!(
+        up.contains("copy_from_pinned_forced("),
+        "res の上げが pinned の強制版を通っていない"
+    );
+    assert!(
+        up.contains("copy_from(res)"),
+        "pinned が取れないときの従来経路が消えている"
+    );
+    let dn = fn_body(CUDA_RS, "pub fn pf_download_res(");
+    assert!(
+        dn.contains("crate::model::exp_pf::pf_res_pin()"),
+        "res の下げがゲートを読んでいない"
+    );
+    assert!(
+        dn.contains("to_slice_pinned_forced("),
+        "res の下げが pinned の強制版を通っていない"
+    );
+    assert!(
+        dn.contains("to_slice(out)"),
+        "pinned が取れないときの従来経路が消えている"
+    );
+
+    // 2. 戻し: リング経由の待たない H2D と、終端の 1 回の待ち。
+    let up_at = fn_body(CUDA_RS, "pub(crate) fn upload_pinned_at(");
+    assert!(
+        up_at.contains("restore_defer_on()"),
+        "戻しの遅延モードを見ていない"
+    );
+    assert!(
+        up_at.contains("upload_pinned_deferred("),
+        "遅延の上げ経路が無い"
+    );
+    let ring = fn_body(CUDA_RS, "fn upload_pinned_deferred(");
+    for k in [
+        "up_ring_index(",
+        "cuMemcpyHtoDAsync (up ring)",
+        "cuEventRecord (up ring)",
+    ] {
+        assert!(ring.contains(k), "リングの上げに {k} が無い");
+    }
+    // 各スレッドのリングを待つのは戻しの終端だけ (戻しの中では待たない)。
+    let flush = fn_body(CUDA_RS, "pub fn restore_defer_flush_thread(");
+    assert!(flush.contains("event_sync"), "終端でイベントを待っていない");
+
+    let rest = fn_body(QWEN_SRC, "fn pf_restore_experts(");
+    for k in [
+        "crate::model::exp_pf::pf_restore_nosync()",
+        "crate::cuda::restore_defer_begin()",
+        "crate::cuda::restore_defer_end()",
+    ] {
+        assert!(rest.contains(k), "戻しの入口に {k} が無い");
+    }
+    let mt = fn_body(QWEN_SRC, "fn pf_restore_experts_mt(");
+    assert!(
+        mt.contains("restore_defer_flush_thread"),
+        "並列の戻しがスレッドごとにリングを待っていない"
+    );
+    let seq = fn_body(QWEN_SRC, "fn pf_restore_experts_seq(");
+    assert!(
+        seq.contains("restore_defer_flush_thread"),
+        "直列の戻しがリングを待っていない"
+    );
+
+    // 3. ゲートと純関数が exp_pf / cuda にある。
+    for k in [
+        "pub fn pf_restore_nosync(",
+        "pub fn pf_restore_nosync_from_value(",
+        "pub fn pf_res_pin(",
+        "pub fn pf_res_pin_from_value(",
+    ] {
+        assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
+    }
+    for k in ["fn up_ring_index(", "fn pf_pin_admit("] {
+        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+    }
+}

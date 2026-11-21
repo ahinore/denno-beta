@@ -3798,6 +3798,10 @@ impl DevBuffer {
             "DevBuffer::upload_pinned_at: 範囲外 (offset={offset}, bytes={bytes}, len={})",
             self.bytes
         );
+        // task 565: 戻しの最中 (`DENNO_PF_RESTORE_NOSYNC`) は 1 本ごとに待たない。
+        if restore_defer_on() && thread_up_stream().is_some() {
+            return self.upload_pinned_deferred(offset, data);
+        }
         EXPERT_PIN.with(|cell| -> Result<()> {
             let mut slot = cell.borrow_mut();
             if slot.as_ref().map(|p| p.bytes).unwrap_or(0) < bytes {
@@ -3812,6 +3816,83 @@ impl DevBuffer {
                 );
                 self.upload_ptr_at(offset, pin.ptr as *const u8, bytes)
             }
+        })
+    }
+
+    /// task 565: リング経由の待たない H2D (戻し専用)。
+    ///
+    /// 4 枠のリングを使い回す。使い回す枠の DMA だけをイベントで待ち、
+    /// 他の枠の DMA は走らせたまま次の写しに進む。待ちは戻しの終端で
+    /// 1 回 ([`restore_defer_flush_thread`])。
+    fn upload_pinned_deferred(&self, offset: usize, data: &[u8]) -> Result<()> {
+        let bytes = data.len();
+        assert!(
+            offset.saturating_add(bytes) <= self.bytes,
+            "DevBuffer::upload_pinned_deferred: 範囲外 (offset={offset}, bytes={bytes}, len={})",
+            self.bytes
+        );
+        let lib = lib()?;
+        let (Some(ec), Some(rec), Some(es)) =
+            (lib.event_create, lib.event_record, lib.event_sync)
+        else {
+            // イベントが無いドライバでは従来 (1 本ごとに待つ) 経路へ。
+            return EXPERT_PIN.with(|cell| -> Result<()> {
+                let mut slot = cell.borrow_mut();
+                if slot.as_ref().map(|p| p.bytes).unwrap_or(0) < bytes {
+                    *slot = Some(PinMem::alloc(bytes)?);
+                }
+                let pin = slot.as_ref().expect("確保済み");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), pin.ptr as *mut u8, bytes);
+                    self.upload_ptr_at(offset, pin.ptr as *const u8, bytes)
+                }
+            });
+        };
+        let Some((stream, _)) = thread_up_stream() else {
+            return self.upload_ptr_at(offset, data.as_ptr(), bytes);
+        };
+        UP_RING.with(|cell| -> Result<()> {
+            let mut ring = cell.borrow_mut();
+            let idx = up_ring_index(ring.calls);
+            ring.calls = ring.calls.wrapping_add(1);
+            if ring.slots.len() <= idx {
+                ring.slots.resize_with(idx + 1, || None);
+            }
+            // 使い回す枠の DMA だけ待つ (通常は既に完了している)。
+            if let Some(s) = ring.slots[idx].as_ref() {
+                unsafe {
+                    check(es(s.ev), "cuEventSynchronize (up ring)")?;
+                }
+            }
+            let need_new = match ring.slots[idx].as_ref() {
+                Some(s) => s.mem.bytes < bytes,
+                None => true,
+            };
+            if need_new {
+                let mem = PinMem::alloc(bytes)?;
+                let mut ev: CUevent = std::ptr::null_mut();
+                const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+                unsafe {
+                    check(ec(&mut ev, CU_EVENT_DISABLE_TIMING), "cuEventCreate (up ring)")?;
+                }
+                ring.slots[idx] = Some(UpPinSlot { mem, ev });
+            }
+            let slot = ring.slots[idx].as_ref().expect("確保済み");
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), slot.mem.ptr as *mut u8, bytes);
+                check(
+                    (lib.memcpy_htod_async)(
+                        self.ptr + offset as CUdeviceptr,
+                        slot.mem.ptr as *const c_void,
+                        bytes,
+                        stream,
+                    ),
+                    "cuMemcpyHtoDAsync (up ring)",
+                )?;
+                check(rec(slot.ev, stream), "cuEventRecord (up ring)")?;
+            }
+            dbg_htod(bytes);
+            Ok(())
         })
     }
 
@@ -4056,6 +4137,51 @@ impl DevBuffer {
                 (lib()?.memcpy_htod)(self.ptr, pin as *const c_void, bytes),
                 "cuMemcpyHtoD (pin stage)",
             )
+        })?;
+        Ok(done.is_some())
+    }
+
+    /// task 565: [`Self::copy_from_pinned`] の「全体ゲートを無視する」版。
+    ///
+    /// 残差の往復だけを pinned に通すとき (`DENNO_PF_RES_PIN`) に使う。
+    /// 転送するバイト列は pageable の `copy_from` と同一。
+    pub fn copy_from_pinned_forced<T: Copy>(&self, data: &[T]) -> Result<bool> {
+        let bytes = std::mem::size_of_val(data);
+        assert!(
+            bytes <= self.bytes,
+            "DevBuffer::copy_from_pinned_forced: size overflow"
+        );
+        if bytes == 0 {
+            return Ok(true);
+        }
+        let done = with_pf_pin_forced(bytes, |pin| unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, pin as *mut u8, bytes);
+            check(
+                (lib()?.memcpy_htod)(self.ptr, pin as *const c_void, bytes),
+                "cuMemcpyHtoD (pin stage, forced)",
+            )
+        })?;
+        Ok(done.is_some())
+    }
+
+    /// task 565: [`Self::to_slice_pinned`] の「全体ゲートを無視する」版。
+    pub fn to_slice_pinned_forced<T: Copy>(&self, out: &mut [T]) -> Result<bool> {
+        let bytes = std::mem::size_of_val(out);
+        assert!(
+            bytes <= self.bytes,
+            "DevBuffer::to_slice_pinned_forced: size overflow"
+        );
+        if bytes == 0 {
+            return Ok(true);
+        }
+        let dst = out.as_mut_ptr() as *mut u8;
+        let done = with_pf_pin_forced(bytes, |pin| unsafe {
+            check(
+                (lib()?.memcpy_dtoh)(pin, self.ptr, bytes),
+                "cuMemcpyDtoH (pin stage, forced)",
+            )?;
+            std::ptr::copy_nonoverlapping(pin as *const u8, dst, bytes);
+            Ok(())
         })?;
         Ok(done.is_some())
     }
@@ -18123,9 +18249,19 @@ fn pf_pin_window_from(min: usize, bytes: usize) -> bool {
     (min..=PF_PIN_MAX_BYTES).contains(&bytes)
 }
 
-/// 実際の下限で窓を判定する。
-fn pf_pin_window_ok(bytes: usize) -> bool {
-    pf_pin_window_from(pf_pin_min_bytes(), bytes)
+/// task 565: どの転送を pinned バウンスに通すかの判定 (純関数)。
+///
+/// `force` は**全体ゲートだけ**を飛ばす (窓の判定は同じく効く)。残差の往復
+/// (`DENNO_PF_RES_PIN`) のように「この転送だけ」を通したいときに使う。
+fn pf_pin_admit(
+    force: bool,
+    stage_on: bool,
+    small_on: bool,
+    min: usize,
+    bytes: usize,
+) -> bool {
+    let big = (force || stage_on) && pf_pin_window_from(min, bytes);
+    big || pf_pin_small_window_from(small_on, bytes)
 }
 
 /// task 358: 共有バウンスを `want` へ育てる必要があるか (純関数)。
@@ -18235,13 +18371,37 @@ fn with_pf_pin<T>(
     bytes: usize,
     f: impl FnOnce(*mut c_void) -> Result<T>,
 ) -> Result<Option<T>> {
+    with_pf_pin_gate(bytes, false, f)
+}
+
+/// task 565: 全体ゲート (`DENNO_PF_PIN_STAGE`) を無視して窓の判定だけ使う版。
+///
+/// 残差の往復 (`DENNO_PF_RES_PIN`) のように「この転送だけ pinned にしたい」
+/// 呼び出しのためのもの。窓 (1 MiB ..= 256 MiB) の判定は同じく効く。
+fn with_pf_pin_forced<T>(
+    bytes: usize,
+    f: impl FnOnce(*mut c_void) -> Result<T>,
+) -> Result<Option<T>> {
+    with_pf_pin_gate(bytes, true, f)
+}
+
+fn with_pf_pin_gate<T>(
+    bytes: usize,
+    force: bool,
+    f: impl FnOnce(*mut c_void) -> Result<T>,
+) -> Result<Option<T>> {
     if bytes == 0 {
         return Ok(None);
     }
     // task 518: decode の小さな往復は専用の窓 (`DENNO_DEC_PIN_SMALL`)。
     // prefill の大きな転送は従来どおり `DENNO_PF_PIN_STAGE` + 床 1 MiB の判定。
-    let big = pf_pin_stage_on() && pf_pin_window_ok(bytes);
-    if !big && !pf_pin_small_window_from(dec_pin_small_on(), bytes) {
+    if !pf_pin_admit(
+        force,
+        pf_pin_stage_on(),
+        dec_pin_small_on(),
+        pf_pin_min_bytes(),
+        bytes,
+    ) {
         return Ok(None);
     }
     let m = pf_pin_shared();
@@ -18379,6 +18539,82 @@ thread_local! {
     /// task 144: expert の H2D 用の pinned staging (1 本ぶん。grow-only)。
     static EXPERT_PIN: std::cell::RefCell<Option<PinMem>> =
         const { std::cell::RefCell::new(None) };
+    /// task 565: 戻し (`DENNO_PF_RESTORE_NOSYNC`) のリング。4 枠を使い回し、
+    /// **使い回す枠の DMA だけ**待つ。枠は grow-only でプロセス寿命まで持つ。
+    static UP_RING: std::cell::RefCell<UpPinRing> =
+        const { std::cell::RefCell::new(UpPinRing::new()) };
+}
+
+/// task 565: 戻しの H2D のリング 1 枠 (pinned と、その枠を読む DMA のイベント)。
+struct UpPinSlot {
+    mem: PinMem,
+    ev: CUevent,
+}
+
+/// task 565: 戻しの H2D のリング (スレッド局所)。
+struct UpPinRing {
+    slots: Vec<Option<UpPinSlot>>,
+    /// 次に使う枠の通し番号 (枠は `idx % UP_RING_N`)。
+    calls: usize,
+}
+
+impl UpPinRing {
+    const fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            calls: 0,
+        }
+    }
+}
+
+/// task 565: リングの枠数。1 本 2 MB の DMA (40 us) に対して、写し (0.2 ms) が
+/// 支配的なので 2 枠でも足りる。余裕を見て 4。
+const UP_RING_N: usize = 4;
+
+/// task 565: 通し番号 → 枠の添字 (純関数)。
+fn up_ring_index(calls: usize) -> usize {
+    calls % UP_RING_N
+}
+
+/// task 565: 戻しの H2D を「1 本ごとに待たない」モードにする (プロセス全体)。
+///
+/// [`restore_defer_flush_thread`] を各スレッドで呼ぶまで、積んだ DMA は
+/// 走ったままになる。デバイスへ渡るバイト列は 1 本ずつの経路と同一。
+static RESTORE_DEFER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// task 565: 遅延モードの入口 (`DENNO_PF_RESTORE_NOSYNC`)。
+pub fn restore_defer_begin() {
+    RESTORE_DEFER.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 565: 遅延モードの終端。呼んだスレッドのリングの DMA を全部待つ。
+pub fn restore_defer_end() {
+    restore_defer_flush_thread();
+    RESTORE_DEFER.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 565: このスレッドが積んだリングの DMA を全部待つ (枠は残す)。
+pub fn restore_defer_flush_thread() {
+    let Ok(l) = lib() else {
+        return;
+    };
+    let Some(es) = l.event_sync else {
+        return;
+    };
+    UP_RING.with(|cell| {
+        let ring = cell.borrow();
+        for s in ring.slots.iter().flatten() {
+            // 失敗しても次の段は同期コピー/カーネルなので、ここでは握る。
+            unsafe {
+                let _ = es(s.ev);
+            }
+        }
+    });
+}
+
+/// task 565: 遅延モードか (戻しの中だけ真)。
+fn restore_defer_on() -> bool {
+    RESTORE_DEFER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `DENNO_EXPERT_PIN_H2D=1`: expert の H2D を pinned staging 経由にするか。
@@ -30779,10 +31015,17 @@ pub(crate) fn pf_res_dev_ptr() -> CUdeviceptr {
 pub fn pf_upload_res(res: &[f32]) -> bool {
     // task 318: `other` の中の残差の往復を分けて数える (バイト数も付く)。
     let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_RES_UP);
+    // task 565: `DENNO_PF_RES_PIN` なら全体ゲートと無関係に pinned へ通す。
+    let force = crate::model::exp_pf::pf_res_pin();
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.res.as_ref() {
             Some(b) if b.bytes() >= res.len() * 4 => {
+                if force {
+                    if let Ok(true) = b.copy_from_pinned_forced(res) {
+                        return true;
+                    }
+                }
                 // task 318: `DENNO_PF_PIN_STAGE` では pinned 経由 (速い)。失敗したら従来へ。
                 match b.copy_from_pinned(res) {
                     Ok(true) => true,
@@ -30803,10 +31046,18 @@ pub fn pf_download_res(out: &mut [f32]) -> bool {
     // task 318: `other` の中の残差の往復を分けて数える。
     let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_RES_UP);
     let direct = crate::model::qwen4exp::pf_ple_reuse_on();
+    // task 565: `DENNO_PF_RES_PIN` なら全体ゲートと無関係に pinned へ通す
+    // (このホストの pageable D2H は 1 GB/s しか出ない)。
+    let force = crate::model::exp_pf::pf_res_pin();
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.res.as_ref() {
             Some(b) if b.bytes() >= out.len() * 4 => {
+                if force {
+                    if let Ok(true) = b.to_slice_pinned_forced(out) {
+                        return true;
+                    }
+                }
                 // task 318: `DENNO_PF_PIN_STAGE` では pinned 経由 (速い)。失敗したら従来へ。
                 if let Ok(true) = b.to_slice_pinned(out) {
                     return true;
@@ -67101,6 +67352,49 @@ mod task502_tests {
         let (_, after) = crate::model::seg_prof::seg_async_counts();
         assert!(!ok, "コンテナ (GPU 無し) では出せない");
         assert!(after > before, "落ちた回数が増える");
+    }
+}
+
+#[cfg(test)]
+mod task565_tests {
+    use super::*;
+
+    /// task 565: 戻しのリングの枠の選び方 (通し番号を 4 枠で巡回する)。
+    ///
+    /// 4 枠に満たない通し番号では同じ枠を続けて使わない (= 直前の DMA を
+    /// 待たずに次の写しへ進める) ことが要点。5 本目で 0 に戻る。
+    #[test]
+    fn up_ring_index_cycles_over_the_ring() {
+        assert_eq!(UP_RING_N, 4);
+        assert_eq!(up_ring_index(0), 0);
+        assert_eq!(up_ring_index(1), 1);
+        assert_eq!(up_ring_index(2), 2);
+        assert_eq!(up_ring_index(3), 3);
+        assert_eq!(up_ring_index(4), 0);
+        assert_eq!(up_ring_index(4 * 1000 + 3), 3);
+    }
+
+    /// task 565: `force` は**全体ゲートだけ**を飛ばし、窓の判定は残す。
+    ///
+    /// 残差の往復は 14k のチャンクで 84 MB、最終 D2H で 71 MB。どちらも窓の中。
+    /// 逆に、既定 (force も stage も off) では大きな転送を通さない — ここが
+    /// 変わると P358 の棄却を蒸し返すことになる。
+    #[test]
+    fn forced_pin_skips_only_the_stage_gate() {
+        let min = PF_PIN_MIN_BYTES;
+        // force なら全体ゲート off でも窓の中は通る。
+        assert!(pf_pin_admit(true, false, false, min, 84 << 20));
+        assert!(pf_pin_admit(true, false, false, min, 71 << 20));
+        // 窓の外 (上限 256 MiB 超) は force でも通さない。
+        assert!(!pf_pin_admit(true, false, false, min, PF_PIN_MAX_BYTES + 1));
+        // 床 1 MiB 未満は force でも「大きな転送」としては通さない。
+        assert!(!pf_pin_admit(true, false, false, min, min - 1));
+        // force が無ければ従来どおり stage のゲートで決まる (既定 off)。
+        assert!(!pf_pin_admit(false, false, false, min, 84 << 20));
+        assert!(pf_pin_admit(false, true, false, min, 84 << 20));
+        // 小さな往復の窓は force と無関係に従来どおり効く。
+        assert!(pf_pin_admit(false, false, true, min, 64 << 10));
+        assert!(!pf_pin_admit(false, false, false, min, 64 << 10));
     }
 }
 

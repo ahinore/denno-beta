@@ -19273,11 +19273,19 @@ fn pf_restore_experts(
 ) -> (usize, usize) {
     let t = std::time::Instant::now();
     let mt = crate::model::exp_pf::pf_restore_mt();
+    // task 565: `DENNO_PF_RESTORE_NOSYNC` なら 1 本ごとに待たず、終端で 1 回待つ。
+    let nosync = crate::model::exp_pf::pf_restore_nosync();
+    if nosync {
+        crate::cuda::restore_defer_begin();
+    }
     let (n, bytes) = if mt && keys.len() >= 2 {
-        pf_restore_experts_mt(layers, keys)
+        pf_restore_experts_mt(layers, keys, nosync)
     } else {
-        pf_restore_experts_seq(layers, keys)
+        pf_restore_experts_seq(layers, keys, nosync)
     };
+    if nosync {
+        crate::cuda::restore_defer_end();
+    }
     if crate::model::pf_host::on() && !keys.is_empty() {
         eprintln!(
             "[pf-restore] {} 本 / {} MiB を戻した ({} 本は戻せず) {} ms mt={} threads={}",
@@ -19668,6 +19676,7 @@ fn pf_restore_one(
 fn pf_restore_experts_seq(
     layers: &[LayerW],
     keys: &[crate::model::expert_cache::ExpertKey],
+    nosync: bool,
 ) -> (usize, usize) {
     let mut n = 0usize;
     let mut bytes = 0usize;
@@ -19676,6 +19685,10 @@ fn pf_restore_experts_seq(
             n += 1;
             bytes += want;
         }
+    }
+    if nosync {
+        // 直列でもリングは遅延で積むので、ここで 1 回待つ。
+        crate::cuda::restore_defer_flush_thread();
     }
     (n, bytes)
 }
@@ -19700,6 +19713,7 @@ fn pf_restore_experts_seq(
 fn pf_restore_experts_mt(
     layers: &[LayerW],
     keys: &[crate::model::expert_cache::ExpertKey],
+    nosync: bool,
 ) -> (usize, usize) {
     #[cfg(feature = "par")]
     {
@@ -19716,13 +19730,18 @@ fn pf_restore_experts_mt(
                         && crate::cuda::enable_thread_upload_stream()
                 });
                 if !ok.iter().any(|b| *b) {
-                    return pf_restore_experts_seq(layers, keys);
+                    return pf_restore_experts_seq(layers, keys, nosync);
                 }
                 READY.store(true, Ordering::Relaxed);
             }
             use rayon::prelude::*;
             let n = AtomicUsize::new(0);
             let bytes = AtomicUsize::new(0);
+            // task 565: 遅延モードでは、各スレッドが積んだリングの DMA を
+            // プール全スレッドで 1 回ずつ待つ (待ちは戻しの終端で 1 回)。
+            if nosync {
+                pool.broadcast(|_| crate::cuda::restore_defer_begin());
+            }
             pool.install(|| {
                 keys.par_iter().for_each(|k| {
                     if let Some(want) = pf_restore_one(layers, *k, true) {
@@ -19731,10 +19750,14 @@ fn pf_restore_experts_mt(
                     }
                 });
             });
+            if nosync {
+                pool.broadcast(|_| crate::cuda::restore_defer_flush_thread());
+                crate::cuda::restore_defer_flush_thread();
+            }
             return (n.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed));
         }
     }
-    pf_restore_experts_seq(layers, keys)
+    pf_restore_experts_seq(layers, keys, nosync)
 }
 
 /// task 394: 戻し専用の rayon プール (スレッド数ごとに 1 個だけ作る)。
