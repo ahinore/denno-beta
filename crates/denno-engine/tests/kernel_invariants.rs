@@ -14501,6 +14501,22 @@ fn t538_staging_disk_inflight_is_counted() {
         1,
         "enter は 1 か所だけ (二重に数えない)"
     );
+    // グループごとの塊の選択 (`DENNO_PF_SPLIT_WIDE_KB`): 分割の大きさは
+    // `split_chunk_for` で決め、`src` を持つグループだけ広げる。
+    let sp = fn_body(CUDA_RS, "fn pf_up_run_split(");
+    let sel = sp
+        .find("exp_pf::split_chunk_for(")
+        .expect("塊の選択が無い");
+    let anysrc = sp
+        .find("job.parts.iter().any(|p| p.1.src.is_some())")
+        .expect("src の判定が無い");
+    assert!(sel < anysrc, "split_chunk_for に src の判定を渡していない");
+    assert!(
+        sp.contains("exp_pf::note_up_split_wide()"),
+        "広い塊の発火を数えていない"
+    );
+    assert!(EXP_PF_SRC.contains("usplit_wide="), "台帳に欄が無い");
+    assert!(EXP_PF_SRC.contains("SPLIT_WIDE_KB_ENV"));
 }
 
 /// task 530: ステージング写しの切り分けが配線されているか (静的検査)。
