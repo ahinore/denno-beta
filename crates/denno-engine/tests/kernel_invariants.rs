@@ -12989,7 +12989,7 @@ fn task427_dn6_reused_for_full_and_head_is_wired() {
         "head の dn6 実行が無い"
     );
     assert!(
-        CUDA_RS.contains("if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows) {"),
+        CUDA_RS.contains("if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows, None) {"),
         "head が dn6 の成否を見ていない"
     );
     assert!(
@@ -13000,6 +13000,60 @@ fn task427_dn6_reused_for_full_and_head_is_wired() {
     assert!(
         QWEN4EXP_RS.contains("f6={f6} h6={h6}"),
         "`[mix-qchain]` に f6/h6 が無い"
+    );
+}
+
+/// task 504: dn7 (1 対 = 4 レーン) を mix の down 以外へ広げた配線と既定 on。
+///
+/// 新しい `.cu` / `.ptx` は要らない (task 431 の `kernels_mix_dn7.ptx` を再利用)。
+#[test]
+fn task504_dn7_reused_for_out_head_and_gate_audit() {
+    // 再生成は不要 (既存カーネルの再利用)。
+    assert!(
+        BUILD_PTX_SH.contains("mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5"),
+        "build_ptx.sh の targets_all を触っている (再利用なので不要)"
+    );
+    // 門番 (型 Q8_0 + 起動形 + PTX) と起動。
+    for s in [
+        "pub fn gdn_out_dn7_from_value(v: Option<&str>) -> bool {",
+        "pub(crate) fn full_dec_dn7_from_value(raw: Option<&str>) -> bool {",
+        "pub fn head_dn7_from_value(raw: Option<&str>) -> bool {",
+        "fn dn7_dec_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<(usize, usize)> {",
+        "pub fn dn7_gate_on() -> bool {",
+    ] {
+        assert!(CUDA_RS.contains(s), "無い: {s}");
+    }
+    // 起動 (定義 1 + mix down 1 + GDN の out 1 + full の qkv 1 + full の wo 1 + head 1)。
+    assert_eq!(
+        CUDA_RS.matches("launch_mix_dn7(").count(),
+        6,
+        "launch_mix_dn7 の呼び出し点が 6 か所 (定義 1 + 起動 5) でない"
+    );
+    // 発火の計数。
+    assert!(CUDA_RS.contains("pub(crate) fn note_dn7_out_hit()"));
+    assert!(CUDA_RS.contains("pub(crate) fn note_dn7_full_hit()"));
+    assert!(CUDA_RS.contains("pub(crate) fn note_dn7_head_hit()"));
+    // 既定は dn7 (未設定 = true)、明示値は従来へ戻す。
+    assert!(
+        CUDA_RS.contains("        Some(s) => s.ends_with(\"o7\"),\n        None => true,"),
+        "GDN の out が既定 on でない"
+    );
+    assert!(
+        CUDA_RS.contains("        None => true,\n        Some(\"dn7\") | Some(\"d7\") => true,"),
+        "head が既定 on でない"
+    );
+    // 発火の証拠: `[mix-qchain]` の f7 / o7 / h7。
+    for s in ["f7={f7}", "o7={o7}", "h7={h7}"] {
+        assert!(QWEN4EXP_RS.contains(s), "`[mix-qchain]` に {s} が無い");
+    }
+    // 既定 on の PTX 台帳 (gate_audit) に dn7 の行がある。
+    assert!(
+        GATE_AUDIT_SRC.contains("ptx: \"kernels_mix_dn7.ptx\""),
+        "gate_audit に kernels_mix_dn7.ptx の行が無い"
+    );
+    assert!(
+        GATE_AUDIT_SRC.contains("on: crate::cuda::dn7_gate_on,"),
+        "gate_audit の dn7 行が dn7_gate_on を指していない"
     );
 }
 
