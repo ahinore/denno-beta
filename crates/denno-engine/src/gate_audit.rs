@@ -178,6 +178,16 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_MIX_DN5_PTX",
         on: crate::cuda::mix_qk_gate_on,
     },
+    // task 504: 1 対 = 4 レーンの dn7 が **既定**になった (mix の down、GDN の out、
+    // head)。PTX が欠けると mix は dn6、out は dn8、head は dn6 へ静かに落ちる
+    // (遅い) ので台帳に載せる。
+    GatePtx {
+        env: "DENNO_MIX_QK",
+        ptx: "kernels_mix_dn7.ptx",
+        entries: &["dno_mix_gemv_q8_0_dn7"],
+        path_env: "DENNO_MIX_DN7_PTX",
+        on: crate::cuda::dn7_gate_on,
+    },
     // task 496: GDN の qkv/out の既定は **dn8** (レーン詰め + x を shared、
     // lab t496c で採否 yes。ssm -4.2%)。PTX が欠けると `gdn_dn8_plan` の門番で
     // dn6 へ静かに落ちるので台帳に載せる。

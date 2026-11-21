@@ -1714,12 +1714,13 @@ pub(crate) mod dec_kprof {
         /// task 504: dn7 を GDN の out / full 層へ広げるゲート (純関数) と起動形。
         #[test]
         fn dn7_dec_gate_and_plan_truth_table() {
-            // GDN の out: `o7` で終わる値だけ true (既定 off)。
-            assert!(!gdn_out_dn7_from_value(None));
+            // GDN の out: 既定 (未設定) は dn7、`o7` の値も true。
+            assert!(gdn_out_dn7_from_value(None), "既定は out も dn7");
             for raw in ["dn8ao7", "dn8o7", "d8o7", "d8ao7", " DN8AO7 "] {
                 assert!(gdn_out_dn7_from_value(Some(raw)), "raw={raw:?}");
             }
-            for raw in ["dn8", "dn8a", "dn8ar8", "dn6", ""] {
+            // 明示値はその値が決めるカーネルへ戻す (`dn8ar4` が厳密な切り戻し)。
+            for raw in ["dn8ar4", "dn8", "dn8a", "dn8ar8", "dn6", ""] {
                 assert!(!gdn_out_dn7_from_value(Some(raw)), "raw={raw:?}");
             }
             // `o7` の値も qkv は dn8 のまま (out の受け皿も dn8 を保つ)。
@@ -1734,8 +1735,8 @@ pub(crate) mod dec_kprof {
             for raw in ["dn6", "dn6r2", "v5", "1", "0", ""] {
                 assert!(!full_dec_dn7_from_value(Some(raw)), "raw={raw:?}");
             }
-            // head: `dn7` / `d7` だけ true。
-            assert!(!head_dn7_from_value(None));
+            // head: 既定 (未設定) は dn7。`dn6` が切り戻し。
+            assert!(head_dn7_from_value(None), "既定は head も dn7");
             assert!(head_dn7_from_value(Some("dn7")));
             assert!(head_dn7_from_value(Some(" D7 ")));
             for raw in ["dn6", "dn6r4", "v5", "1", ""] {
@@ -10145,13 +10146,16 @@ fn head_dn6_rows() -> usize {
 
 /// task 504: head の GEMV を dn7 (1 対 = 4 レーン) で撃つか (純関数)。
 ///
-/// `DENNO_DEC_HEAD_FAST=dn7` / `d7`。dn6 は 1 レーンが x の 64 要素を
-/// レジスタに載せる (64 本) ので occupancy が下がる。dn7 は 16 要素で済む。
+/// **未設定が既定 on** (lab t504b: head 段 0.60 -> 0.46 ms/tok = -24%、
+/// 2 ラウンド同じ、短い decode 10.6 -> 10.4、14k 後 11.6 -> 11.3、md5 全 SAME)。
+/// dn6 は 1 レーンが x の 64 要素をレジスタに載せる (64 本) ので occupancy が
+/// 下がる。dn7 は 16 要素で済む。切り戻しは `DENNO_DEC_HEAD_FAST=dn6` (旧既定)。
 pub fn head_dn7_from_value(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("dn7") | Some("d7")
-    )
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None => true,
+        Some("dn7") | Some("d7") => true,
+        Some(_) => false,
+    }
 }
 
 /// [`head_dn7_from_value`] をプロセスで 1 回だけ読む。
@@ -36375,11 +36379,17 @@ pub fn mix_dn7_reset() {
 
 /// GDN の out 投影だけ dn7 で撃つか (純関数)。
 ///
-/// `dn8ao7` / `dn8o7` / `d8o7` / `d8ao7` の `o7` が付いた値だけ true。
+/// task 504 (lab t504b で採否): **未設定が既定 on** (ssm 2.93 -> 2.87 = -2.1%、
+/// 2 ラウンド同じ、md5 SAME)。
+/// - 未設定: true = out を dn7
+/// - `dn8ao7` / `dn8o7` / `d8o7` / `d8ao7`: true (明示 on)
+/// - それ以外の明示値 (`dn8ar4` / `dn8a` / `dn8` / `dn6` / `v5` / ...): false
+///   = その値が決める従来のカーネル。**厳密な切り戻しは `dn8ar4`**
+///   (out = dn8 rows 4、t496c の既定)。
 pub fn gdn_out_dn7_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim).map(str::to_ascii_lowercase) {
         Some(s) => s.ends_with("o7"),
-        None => false,
+        None => true,
     }
 }
 
@@ -36457,6 +36467,14 @@ pub fn dn7_head_hits() -> u64 {
 /// task 504: head の 1 本を撃ったことを数える。
 pub(crate) fn note_dn7_head_hit() {
     DN7_HEAD_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 504: dn7 (`kernels_mix_dn7.ptx`) が既定の経路か (gate_audit の台帳用)。
+///
+/// mix の down (既定 dn7) / GDN の out (既定 dn7) / head (既定 dn7) のどれかが
+/// 既定で dn7 を選ぶなら true。PTX が欠けると静かに dn6 / dn8 へ落ちるので載せる。
+pub fn dn7_gate_on() -> bool {
+    matches!(mix_qk_enabled().0, MixGemv::Dn7) || gdn_out_dn7_on() || head_dn7_on()
 }
 
 // ===========================================================================
