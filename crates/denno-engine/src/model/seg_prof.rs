@@ -472,9 +472,12 @@ pub fn seg_fast_reset() {
 /// リクエスト終端の診断行 (どちらかのゲートが on のときだけ)。
 /// `gu8` が 0 なら融合の 8 バイト版は発火していない。
 pub fn seg_fast_report() -> Option<String> {
-    let gu8_on = crate::cuda::seg_gu8_enabled();
-    let dn8_on = crate::cuda::seg_dn8_enabled();
-    if !gu8_on && !dn8_on {
+    // cuda feature 無しではこの経路自体が無効 (cuda 専用の関数は呼べない)。
+    #[cfg(feature = "cuda")]
+    let on = crate::cuda::seg_gu8_enabled() || crate::cuda::seg_dn8_enabled();
+    #[cfg(not(feature = "cuda"))]
+    let on = false;
+    if !on {
         return None;
     }
     let (gu8, dn8, dnv4) = seg_fast_counts();
