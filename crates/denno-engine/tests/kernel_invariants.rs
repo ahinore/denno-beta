@@ -14488,7 +14488,7 @@ fn t530_staging_copy_instruments_and_gates_are_wired() {
         "pub const ODIRECT_ENV: &str = \"DENNO_PF_PREAD_ODIRECT\"",
         "pub const DEFAULT_NC_FIRST: bool = false",
         "pub const DEFAULT_ODIRECT: bool = false",
-        "pub const DEFAULT_NC: bool = true",
+        "pub const DEFAULT_NC: bool = false",
         "pub fn odirect_window(",
         "pub fn nc_first_order(",
         "pub unsafe fn range_resident(",

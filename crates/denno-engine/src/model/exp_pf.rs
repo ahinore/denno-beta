@@ -1919,8 +1919,26 @@ pub fn pread_on() -> bool {
 /// 1 回の `read_at` の長さ (KiB)。
 pub const PREAD_KB_ENV: &str = "DENNO_PF_PREAD_KB";
 
-/// [`PREAD_KB_ENV`] の既定値 (4 MiB)。
-pub const DEFAULT_PREAD_KB: usize = 4096;
+/// [`PREAD_KB_ENV`] の既定値 (**384 KiB**、task 530 で 4 MiB から下げた)。
+///
+/// # なぜ下げたか (lab t530a / t530b、UD-Q4_K_XL、PROFILE=1、depth8k)
+///
+/// 実区間は平均 0.93 MB なので、4 MiB の設定では**切られずに 1 本**になる。
+/// 1 グループ (barrier) の中で 1 本のディスク待ちが残ると 31 本が遊ぶので、
+/// 1 本を小さく切って並列度を上げる方が速い。3,826 cold の壁と `copy_s`:
+///
+/// | 1 回の長さ | t530a 3,826 cold (2 ラウンド) | t530b 3,826 cold | t530b 14k cold |
+/// | --- | --- | --- | --- |
+/// | 4 MiB (旧既定) | 17.14 / 17.24 s (`copy_s` 15.8) | 16.00 / 15.75 s | 19.96 / 20.45 s |
+/// | 1024 KiB | 16.04 / 16.03 s | — | 20.56 s |
+/// | 512 KiB | 13.00 / 13.14 s | 21.32 s (不安定) | 33.56 s (不安定) |
+/// | **384 KiB** | — | **11.84 / 10.57 s** | **15.96 s** |
+/// | 256 KiB | — | 11.75 / 10.39 s | 15.07 s |
+///
+/// 512 KiB だけ 2 ラウンド目に 20-30 s へ跳ねた (推定: カーネルの readahead の
+/// 1 窓と同じ長さで、二重読みが起きる回がある)。384 / 256 は 2 ラウンドとも
+/// 揃うので、呼び出し回数が少ない 384 を既定にした。
+pub const DEFAULT_PREAD_KB: usize = 384;
 
 /// [`PREAD_KB_ENV`] の解釈 (純関数)。64..=65536 KiB に丸める。
 pub fn pread_kb_from_value(v: Option<&str>) -> usize {
@@ -2550,8 +2568,10 @@ pub fn nc_first_on() -> bool {
 /// `mincore(2)` が増える (3,826 で約 4.5 万回)。
 pub const NC_ENV: &str = "DENNO_PF_NC";
 
-/// [`NC_ENV`] の既定値 (on)。
-pub const DEFAULT_NC: bool = true;
+/// [`NC_ENV`] の既定値 (**off**)。task 530 の切り分けでは on で回した
+/// (3,826 で 45,000 回の `mincore(2)` = 約 330 ms、`copy_s` の 2-3%)。
+/// 計器なので採否の判断が済んだら既定 off に戻す。
+pub const DEFAULT_NC: bool = false;
 
 /// [`NC_ENV`] の解釈 (純関数)。未設定・空は既定 (on)、`0` 系だけ偽。
 pub fn nc_from_value(v: Option<&str>) -> bool {
@@ -5626,6 +5646,8 @@ mod tests {
     /// task 325: `DENNO_PF_PREAD_KB` の丸めと既定。
     #[test]
     fn pread_kb_rounds_and_defaults() {
+        // task 530: 実区間 0.93 MB を切る 384 KiB が既定 (4 MiB では 1 本になる)。
+        assert_eq!(DEFAULT_PREAD_KB, 384);
         assert_eq!(pread_kb_from_value(None), DEFAULT_PREAD_KB);
         assert_eq!(pread_kb_from_value(Some("")), DEFAULT_PREAD_KB);
         assert_eq!(pread_kb_from_value(Some("0")), DEFAULT_PREAD_KB);
@@ -6994,8 +7016,9 @@ mod tests {
         assert_eq!(NC_FIRST_ENV, "DENNO_PF_PREAD_NC_FIRST");
         assert_eq!(ODIRECT_ENV, "DENNO_PF_PREAD_ODIRECT");
         // 計器 (mincore) は既定 on、`0` 系でだけ止まる。
-        assert!(nc_from_value(None));
-        assert!(nc_from_value(Some("")));
+        assert!(!nc_from_value(None), "計器は採否の判断後に既定 off");
+        assert!(!nc_from_value(Some("")));
+        assert!(nc_from_value(Some("1")));
         assert!(!nc_from_value(Some("0")));
         assert!(!nc_from_value(Some("false")));
 
