@@ -1734,6 +1734,13 @@ pub(crate) mod dec_kprof {
             for raw in ["dn6", "dn6r2", "v5", "1", "0", ""] {
                 assert!(!full_dec_dn7_from_value(Some(raw)), "raw={raw:?}");
             }
+            // head: `dn7` / `d7` だけ true。
+            assert!(!head_dn7_from_value(None));
+            assert!(head_dn7_from_value(Some("dn7")));
+            assert!(head_dn7_from_value(Some(" D7 ")));
+            for raw in ["dn6", "dn6r4", "v5", "1", ""] {
+                assert!(!head_dn7_from_value(Some(raw)), "raw={raw:?}");
+            }
             // 実形の起動形: GDN の out (6,144 -> 2,560) は 1 行 384 スレッド、
             // full の qkv (2,560 -> 6,144) は 1 行 160 スレッド。
             assert_eq!(mix_dn7_plan(6144, 2560), Some((1, 384)));
@@ -10136,6 +10143,25 @@ fn head_dn6_rows() -> usize {
     })
 }
 
+/// task 504: head の GEMV を dn7 (1 対 = 4 レーン) で撃つか (純関数)。
+///
+/// `DENNO_DEC_HEAD_FAST=dn7` / `d7`。dn6 は 1 レーンが x の 64 要素を
+/// レジスタに載せる (64 本) ので occupancy が下がる。dn7 は 16 要素で済む。
+pub fn head_dn7_from_value(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("dn7") | Some("d7")
+    )
+}
+
+/// [`head_dn7_from_value`] をプロセスで 1 回だけ読む。
+fn head_dn7_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        head_dn7_from_value(std::env::var("DENNO_DEC_HEAD_FAST").ok().as_deref())
+    })
+}
+
 /// task 427: head の GEMV を dn6 で 1 回だけ回す (pinned 経由・同期 1 回)。
 ///
 /// 引数・発行順は [`CudaCtx::moe_gemv_dev_with`] の async 経路と同じで、
@@ -10151,6 +10177,8 @@ fn head_gemv_dn6(
     row_bytes: usize,
     warps: usize,
     rows: usize,
+    // task 504: `Some((rows, threads))` なら dn7 (1 対 = 4 レーン) で撃つ。
+    dn7: Option<(usize, usize)>,
 ) -> Result<bool> {
     let lib = lib()?;
     MOE_SCRATCH.with(|cell| -> Result<bool> {
@@ -10175,7 +10203,11 @@ fn head_gemv_dn6(
                 "cuMemcpyHtoDAsync (head dn6)",
             )?;
         }
-        launch_dn6_gemv(ctx, w.ptr, xp, op, n_in, n_out, row_bytes, warps, rows)?;
+        if let Some((rows7, thr7)) = dn7 {
+            launch_mix_dn7(ctx, w.ptr, xp, op, n_in, n_out, row_bytes, rows7, thr7)?;
+        } else {
+            launch_dn6_gemv(ctx, w.ptr, xp, op, n_in, n_out, row_bytes, warps, rows)?;
+        }
         {
             let po = s.pin_o.as_mut().expect("pin_o は ensure 済み");
             unsafe {
@@ -10227,12 +10259,31 @@ pub fn maybe_gpu_head_gemv_v5(
     };
     // task 427: dn6 経路 (`DENNO_DEC_HEAD_FAST=dn6*`)。形 (Q8_0 / n_in % 64 == 0 /
     // warps <= 8) と PTX が揃ったときだけ。撃てなければ下の v5 へ落ちる。
+    // task 504: `DENNO_DEC_HEAD_FAST=dn7` なら dn7 (1 対 = 4 レーン) で撃つ
+    // (dn7 は 1 レーン 16 要素 = レジスタが軽い)。形が合わなければ dn6 / v5 へ。
+    let dn7_head = if head_dn7_on() {
+        dn7_dec_plan(ty, k, n)
+    } else {
+        None
+    };
+    if let (Some(dn7p), Some(rb)) = (
+        dn7_head,
+        gguf_row_bytes(ty, k),
+    ) {
+        if w.buf.bytes() == n * rb {
+            if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, 1, 1, Some(dn7p)) {
+                note_dn7_head_hit();
+                set_last_linear_ran_on_gpu(true);
+                return true;
+            }
+        }
+    }
     if let (Some((warps, rows)), Some(rb)) = (
         dn6_gemv_plan(ty, k, n, head_dn6_rows()),
         gguf_row_bytes(ty, k),
     ) {
         if w.buf.bytes() == n * rb {
-            if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows) {
+            if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows, None) {
                 note_dn6_head_hit();
                 set_last_linear_ran_on_gpu(true);
                 return true;
@@ -36381,6 +36432,7 @@ pub fn dn7_dec_hits() -> (u64, u64) {
 pub fn dn7_dec_reset() {
     DN7_FULL_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
     DN7_OUT_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    DN7_HEAD_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// task 504: full 層の 1 本を撃ったことを数える。
@@ -36391,6 +36443,20 @@ pub(crate) fn note_dn7_full_hit() {
 /// task 504: GDN の out 1 本を撃ったことを数える。
 pub(crate) fn note_dn7_out_hit() {
     DN7_OUT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 504: head を dn7 で撃った回数 (`[mix-qchain]` の `o7=` に含めず、
+/// `h7=` で出す。head は 1 トークン 1 回)。
+static DN7_HEAD_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 504: head を dn7 で撃った回数。
+pub fn dn7_head_hits() -> u64 {
+    DN7_HEAD_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 504: head の 1 本を撃ったことを数える。
+pub(crate) fn note_dn7_head_hit() {
+    DN7_HEAD_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ===========================================================================

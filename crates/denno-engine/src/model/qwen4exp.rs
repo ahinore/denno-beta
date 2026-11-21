@@ -6732,6 +6732,11 @@ pub fn mix_qchain_line() -> Option<String> {
     let (f7, o7) = crate::cuda::dn7_dec_hits();
     #[cfg(not(feature = "cuda"))]
     let (f7, o7) = (0u64, 0u64);
+    // task 504: head を dn7 で撃った回数。
+    #[cfg(feature = "cuda")]
+    let h7 = crate::cuda::dn7_head_hits();
+    #[cfg(not(feature = "cuda"))]
+    let h7 = 0u64;
     // task 431: xn の H2D を別ストリームへ出した回数 (`DENNO_MIX_ZC=stream`)。
     // 0 なら従来の null ストリーム (発火の証拠)。
     #[cfg(feature = "cuda")]
@@ -6742,7 +6747,7 @@ pub fn mix_qchain_line() -> Option<String> {
     // (`DENNO_MIX_INJ_R4`)。0 なら従来の 1 行ずつの逐次和。
     let inj4 = mix_inj_r4_hits();
     Some(format!(
-        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} dn7={dn7} dn8={dn8} f6={f6} h6={h6} f7={f7} o7={o7} h2s={h2s} inj4={inj4}",
+        "[mix-qchain] on calls={calls} hits={n} frac={:.3} qk={qk} rtr={rtr} dn5={dn5} dn6={dn6} dn7={dn7} dn8={dn8} f6={f6} h6={h6} f7={f7} o7={o7} h7={h7} h2s={h2s} inj4={inj4}",
         if calls > 0 { n as f64 / calls as f64 } else { 0.0 }
     ))
 }
