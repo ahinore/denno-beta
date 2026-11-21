@@ -10897,7 +10897,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12424,7 +12424,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12541,7 +12541,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12736,7 +12736,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12830,7 +12830,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12904,7 +12904,7 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
         "build_ptx.sh に target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "targets_all の末尾に足していない"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -13252,7 +13252,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
@@ -13481,14 +13481,18 @@ fn task448_flashdec_tile_kernel_and_wiring() {
         "let tile_on = attn_fdec_tile_on();",
         // decode の実サーバ経路 (デバイス連鎖の attn_launch) にも同じ門を置く。
         // ここを忘れると lab では v1 だけが走り、差が出ない (t448a-c の失敗)。
-        "let tile_k = if tile_on && fdt_shape_ok(dh, tile) {",
+        // task 520 で「第 3 版 -> タイル版 -> v1」の 3 段になった。
+        "let shape_ok = tile_on && fdt_shape_ok(dh, tile);",
+        "let tile_k = if t2_k.is_none() && shape_ok {",
         "(kt.f_t, fdt_smem_bytes(tile, dh) as u32)",
         "b\"dno_attn_flashdec_t\\0\"",
         "if tile_on {",
         "if !fdt_shape_ok(a.dh, tile) {",
         "args.push(&mut tile_c as *mut _ as *mut c_void);",
         "fdt_smem_bytes(tile, a.dh) as u32",
-        "FdecImpl::Tile => q4attn_kprof::note_fdt_call(),",
+        // task 520 でタイル版の側に第 3 版の計数が入った (ブロックになった)。
+        "FdecImpl::Tile => {",
+        "q4attn_kprof::note_fdt_call();",
         "q4attn_kprof::note_fdt_fallback();",
         "FDT_CALLS.fetch_add(1",
         "fdt calls={} fallback={} tile={}",
@@ -14684,4 +14688,184 @@ fn t534_down_q5_1_vector_kernel_is_wired() {
         body.contains("seg_prof::note_seg_dnv4_call()"),
         "dnv4 の発火を数えていない"
     );
+}
+
+/// task 520: `kernels_attn_dec5.cu` の `dno_attn_flashdec_t2` (2 key 同時版)。
+///
+/// 見るもの: (1) entry が 1 本だけで既存名を上書きしていない、(2) 引数が
+/// 第 2 版と同じ 11 本、(3) **1 key あたりの算術の列が第 2 版と同一**
+/// (名前の揺れだけ落として行単位で比べる = 値がビット一致する根拠)、
+/// (4) ホスト側の門・ローダ・2 つの起動点への配線、(5) build_ptx.sh の target。
+#[test]
+fn task520_flashdec_two_key_kernel_and_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let cu2 = std::fs::read_to_string(root.join("kernels_attn_dec2.cu"))
+        .expect("kernels_attn_dec2.cu が無い");
+    let cu5 = std::fs::read_to_string(root.join("kernels_attn_dec5.cu"))
+        .expect("kernels_attn_dec5.cu が無い");
+
+    // 1. entry は 1 本だけ。
+    assert!(
+        cu5.contains("extern \"C\" __global__ void dno_attn_flashdec_t2("),
+        "第 3 版の entry が無い"
+    );
+    assert!(
+        !cu5.contains("void dno_attn_flashdec_t(") && !cu5.contains("void dno_attn_flashdec("),
+        "既存の entry を上書きしている"
+    );
+    // 2. 引数: 第 2 版の 11 本 + 第 3 版は grid 入れ替えの 1 本 (12 本)。
+    let sig2 =
+        "int kv_dim, int t_total, int group, int dh, float scale, int n_split,\n    int tile) {";
+    assert!(cu2.contains(sig2), "第 2 版の引数並びが変わった");
+    assert!(
+        cu5.contains("int kv_dim, int t_total, int group, int dh, float scale, int n_split,\n    int tile,"),
+        "第 3 版の引数並びが第 2 版と違う"
+    );
+    assert!(cu5.contains("int khx) {"), "第 3 版に khx (grid 入れ替え) の引数が無い");
+    assert!(
+        cu5.contains("const int kh = khx ? (int)blockIdx.x : (int)blockIdx.y;"),
+        "khx の (kh, sp) の入れ替えが無い"
+    );
+
+    // 3. 1 key あたりの算術の列が第 2 版と同一 (変数名の違いだけを落として
+    //    対で比べる。値がビット一致する根拠)。
+    for (a, b) in [
+        // 積和 (b 昇順、x,y,z,w)
+        (
+            "s_ = fmaf(qv[b].x, kb.x, s_);",
+            "s0 = fmaf(qv[b].x, x0.x, s0);",
+        ),
+        (
+            "s_ = fmaf(qv[b].y, kb.y, s_);",
+            "s0 = fmaf(qv[b].y, x0.y, s0);",
+        ),
+        (
+            "s_ = fmaf(qv[b].z, kb.z, s_);",
+            "s0 = fmaf(qv[b].z, x0.z, s0);",
+        ),
+        (
+            "s_ = fmaf(qv[b].w, kb.w, s_);",
+            "s0 = fmaf(qv[b].w, x0.w, s0);",
+        ),
+        // 縮約の段 (16,8,4,2,1)
+        (
+            "s_ += __shfl_xor_sync(0xffffffffu, s_, 16);",
+            "s0 += __shfl_xor_sync(0xffffffffu, s0, 16);",
+        ),
+        (
+            "s_ += __shfl_xor_sync(0xffffffffu, s_, 8);",
+            "s0 += __shfl_xor_sync(0xffffffffu, s0, 8);",
+        ),
+        (
+            "s_ += __shfl_xor_sync(0xffffffffu, s_, 4);",
+            "s0 += __shfl_xor_sync(0xffffffffu, s0, 4);",
+        ),
+        (
+            "s_ += __shfl_xor_sync(0xffffffffu, s_, 2);",
+            "s0 += __shfl_xor_sync(0xffffffffu, s0, 2);",
+        ),
+        (
+            "s_ += __shfl_xor_sync(0xffffffffu, s_, 1);",
+            "s0 += __shfl_xor_sync(0xffffffffu, s0, 1);",
+        ),
+        // online softmax (max 更新あり / なし)
+        ("const float sc_ = s_ * scale;", "const float sc0 = s0 * scale;"),
+        ("if (sc_ > m_run) {", "if (sc0 > m_run) {"),
+        (
+            "corr_ = exp2f((m_run - sc_) * DNO_FDT_LOG2E);",
+            "const float corr = exp2f((m_run - sc0) * DNO_FDT_LOG2E);",
+        ),
+        ("l_run = l_run * corr_ + p_;", "l_run = l_run * corr + 1.0f;"),
+        (
+            "p_ = exp2f((sc_ - m_run) * DNO_FDT_LOG2E);",
+            "const float p_ = exp2f((sc0 - m_run) * DNO_FDT_LOG2E);",
+        ),
+    ] {
+        assert!(cu2.contains(a), "第 2 版に {a} が無い");
+        assert!(cu5.contains(b), "第 3 版に {b} が無い (算術の列が違う)");
+    }
+    // max が動かなかった key の l_run は `l + p` (乗算 1.0 は厳密なので同値)。
+    assert!(cu5.contains("l_run = l_run + p_;"), "l_run の省略形が無い");
+    // acc の更新は 2 通り (max 更新あり / なし) を 1 命令も変えずに持つ。
+    // `a*corr + p*v` と `a + p*v` は corr == 1 で厳密に同値 (乗算 1.0 は厳密)。
+    for s in [
+        "acc[b].x = acc[b].x * corr + p * y.x;",
+        "acc[b].y = acc[b].y * corr + p * y.y;",
+        "acc[b].z = acc[b].z * corr + p * y.z;",
+        "acc[b].w = acc[b].w * corr + p * y.w;",
+        "acc[b].x = acc[b].x + p * y.x;",
+        "acc[b].y = acc[b].y + p * y.y;",
+        "acc[b].z = acc[b].z + p * y.z;",
+        "acc[b].w = acc[b].w + p * y.w;",
+    ] {
+        assert!(cu5.contains(s), "第 3 版に acc の更新 {s} が無い");
+    }
+    assert!(
+        cu5.contains("dno_fdt2_acc_scale(float4 *acc, const float *vrow,")
+            && cu5.contains("float corr,"),
+        "max 更新ありの acc 更新が corr と p を受けていない"
+    );
+    assert!(
+        cu5.contains("dno_fdt2_acc_add(float4 *acc, const float *vrow,"),
+        "corr = 1 の acc 更新 (乗算の省略) が無い"
+    );
+
+    // 4. ホスト側の配線 (2 つの起動点の両方)。
+    for s in [
+        "pub(crate) const FDT2_NARGS: usize = 12;",
+        "pub(crate) fn parse_attn_fdec_ilp(v: Option<&str>) -> bool {",
+        "fn attn_fdec_ilp_on() -> bool {",
+        "\"DENNO_ATTN_FLASHDEC_ILP\"",
+        "\"DENNO_ATTN_FLASHDEC5_PTX\"",
+        "fn fdt2_ptx_path() -> std::path::PathBuf {",
+        "fn fdt2_kernels() -> Option<&'static Fdt2Kernels> {",
+        "b\"dno_attn_flashdec_t2\\0\"",
+        "fn fdt2_log(len: usize, n_split: usize, tile: usize) {",
+        "fn fdt2_gate_log() {",
+        "note_fdt2_call()",
+        "pub(crate) fn parse_attn_fdec_khx(v: Option<&str>) -> bool {",
+        "fn attn_fdec_khx_on() -> bool {",
+        "\"DENNO_ATTN_FLASHDEC_KHX\"",
+    ] {
+        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+    }
+    // デバイス連鎖 (attn_launch) と CPU dispatch の両方で選ぶ。
+    let la = fn_body(CUDA_RS, "fn attn_launch(");
+    assert!(la.contains("fdt2_kernels()"), "attn_launch が第 3 版を選ばない");
+    assert!(
+        la.contains("let tile_arg = t2_k.is_some() || tile_k.is_some();"),
+        "attn_launch の tile 引数の条件が 2 版を見ていない"
+    );
+    let fd = fn_body(CUDA_RS, "fn q4_attn_decode_fdec(");
+    assert!(fd.contains("used_t2"), "q4_attn_decode_fdec が第 3 版を数えない");
+    assert!(
+        fd.contains("if attn_fdec_ilp_on() { fdt2_kernels() } else { None }"),
+        "q4_attn_decode_fdec が第 3 版を試さない"
+    );
+    // 起動 1 行に ilp の状態が出る (lab の env が届いたかの証拠)。
+    assert!(
+        CUDA_RS.contains("ilp={} khx={} fdtv=5"),
+        "起動 1 行に ilp= / khx= が無い"
+    );
+
+    // 5. build_ptx.sh の target と、PTX があれば ABI が 11 引数であること。
+    let sh = include_str!("../kernels/build_ptx.sh");
+    assert!(
+        sh.contains("attn_dec5)    echo \"kernels_attn_dec5.cu|nofmad\""),
+        "build_ptx.sh に attn_dec5 の spec が無い"
+    );
+    assert!(
+        sh.contains("mix_dn8 attn_dec5)"),
+        "targets_all に attn_dec5 が無い"
+    );
+    let ptx = root.join("kernels_attn_dec5.ptx");
+    if let Ok(text) = std::fs::read_to_string(&ptx) {
+        let n = text
+            .lines()
+            .skip_while(|l| !l.contains(".visible .entry dno_attn_flashdec_t2("))
+            .take_while(|l| !l.contains(')'))
+            .filter(|l| l.trim_start().starts_with(".param"))
+            .count();
+        assert_eq!(n, 12, "PTX の dno_attn_flashdec_t2 が 12 引数でない");
+    }
 }

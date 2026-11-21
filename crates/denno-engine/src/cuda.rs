@@ -3029,21 +3029,31 @@ pub(crate) mod dec_full_dev {
                 let tile = attn_fdec_tile();
                 let tile_on = attn_fdec_tile_on();
                 fdt_gate_log(tile_on);
-                let tile_k = if tile_on && fdt_shape_ok(dh, tile) {
+                fdt2_gate_log();
+                // task 520: 第 3 版 (2 key 同時) -> 第 2 版 (tile) -> v1 の順に試す。
+                let shape_ok = tile_on && fdt_shape_ok(dh, tile);
+                let t2_k = if shape_ok && attn_fdec_ilp_on() {
+                    fdt2_kernels()
+                } else {
+                    None
+                };
+                let tile_k = if t2_k.is_none() && shape_ok {
                     fdt_kernels()
                 } else {
                     None
                 };
-                let (f_dec, shmem) = match tile_k {
-                    Some(kt) => {
-                        fdt_log(len, n_split, chunk, dh, tile);
-                        (kt.f_t, fdt_smem_bytes(tile, dh) as u32)
-                    }
-                    None => {
-                        fdec_log(len, n_split, chunk, kv_dim, dh, group);
-                        (k.f_dec, 0u32)
-                    }
+                let (f_dec, shmem) = if let Some(k2) = t2_k {
+                    fdt2_log(len, n_split, tile);
+                    (k2.f_t2, fdt_smem_bytes(tile, dh) as u32)
+                } else if let Some(kt) = tile_k {
+                    fdt_log(len, n_split, chunk, dh, tile);
+                    (kt.f_t, fdt_smem_bytes(tile, dh) as u32)
+                } else {
+                    fdec_log(len, n_split, chunk, kv_dim, dh, group);
+                    (k.f_dec, 0u32)
                 };
+                let tile_arg = t2_k.is_some() || tile_k.is_some();
+                let khx = t2_k.is_some() && attn_fdec_khx_on();
                 // task 460: combine と出力ゲートの融合 (既定 on)。PTX か ABI が
                 // 欠ければ None になり、下の従来 2 起動へ落ちる。
                 let cbg_k = if gate != 0 && attn_fdec_cbg_on() {
@@ -3079,16 +3089,27 @@ pub(crate) mod dec_full_dev {
                         &mut scale_c as *mut _ as *mut c_void,
                         &mut nsplit_c as *mut _ as *mut c_void,
                     ];
-                    // task 448: タイル版だけ 11 本目 (tile 行数) を渡す。
+                    // task 448/520: タイル版と第 3 版だけ 11 本目 (tile 行数) を渡す。
                     let mut tile_c = tile as c_int;
-                    if tile_k.is_some() {
+                    if tile_arg {
                         args.push(&mut tile_c as *mut _ as *mut c_void);
                     }
+                    // task 520 (2): 第 3 版だけ 12 本目 (grid 入れ替え) を渡す。
+                    let mut khx_c = khx as c_int;
+                    if t2_k.is_some() {
+                        args.push(&mut khx_c as *mut _ as *mut c_void);
+                    }
                     let tl = q4attn_kprof::stamp();
+                    // task 520 (2): khx のときは (kh, sp) の順に並べる。
+                    let grid = if khx {
+                        (n_kv as u32, n_split as u32, 1)
+                    } else {
+                        (n_split as u32, n_kv as u32, 1)
+                    };
                     unsafe {
                         ctx.launch_async(
                             f_dec,
-                            (n_split as u32, n_kv as u32, 1),
+                            grid,
                             ((32 * group) as u32, 1, 1),
                             shmem,
                             &mut args,
@@ -3135,7 +3156,10 @@ pub(crate) mod dec_full_dev {
                     }
                     q4attn_kprof::note_launch(tl);
                     q4attn_kprof::note_call();
-                    if tile_k.is_some() {
+                    if t2_k.is_some() {
+                        q4attn_kprof::note_fdt2_call();
+                        q4attn_kprof::note_fdt_call();
+                    } else if tile_k.is_some() {
                         q4attn_kprof::note_fdt_call();
                     } else {
                         q4attn_kprof::note_fdec_call();
@@ -43119,8 +43143,10 @@ pub fn attn_fdec_boot_line() -> String {
         Q4AttnKernel::Fdec1 => "fdec1",
     };
     format!(
-        "[attn-fdec] kernel={k} fdt_on={tile_on} tile={} fdtv=3 (task 448)",
-        attn_fdec_tile()
+        "[attn-fdec] kernel={k} fdt_on={tile_on} tile={} ilp={} khx={} fdtv=5 (task 520)",
+        attn_fdec_tile(),
+        attn_fdec_ilp_on(),
+        attn_fdec_khx_on()
     )
 }
 
@@ -43227,6 +43253,203 @@ fn fdt_log(len: usize, n_split: usize, chunk: usize, dh: usize, tile: usize) {
             fdt_smem_bytes(tile, dh) / 1024
         );
     }
+}
+
+// ---- task 520: flash decoding 第 3 版 (2 key 同時、`kernels_attn_dec5.cu`) -----
+//
+// 動機 (t520a の `[dec-kprof-avg]`): `dno_attn_flashdec_t` は 14k で 66.4 us/層、
+// 2k で 29.3 us/層。key 数が 7 倍でも時間は 2.3 倍 = **1 key の単価がほぼ一定**
+// (458 -> 519 ns) で、帯域ではなく命令発行と依存鎖で決まっている。第 3 版は
+// 「2 key の内積と shfl 縮約を交互に出す」+「max が動かない key では acc の
+// 乗算を省く」。どちらも算術の列を変えないので **値は第 2 版とビット一致**。
+
+/// 第 3 版の引数の個数 (`.cu` と一致。第 2 版の 11 本 + grid 入れ替えの 1 本)。
+pub(crate) const FDT2_NARGS: usize = 12;
+
+/// `DENNO_ATTN_FLASHDEC_ILP` の解釈 (純関数)。**既定 on**。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ第 2 版へ戻す。
+pub(crate) fn parse_attn_fdec_ilp(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+static FD_ILP_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// テスト用: 第 3 版のゲートを差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_fdec_ilp_for_test(on: Option<bool>) {
+    FD_ILP_FORCE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// 第 3 版を使うか (`DENNO_ATTN_FLASHDEC_ILP`、既定 on)。
+fn attn_fdec_ilp_on() -> bool {
+    #[cfg(test)]
+    {
+        let f = FD_ILP_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_attn_fdec_ilp(std::env::var("DENNO_ATTN_FLASHDEC_ILP").ok().as_deref())
+    })
+}
+
+/// `DENNO_ATTN_FLASHDEC_KHX` の解釈 (純関数)。**既定 off**。
+///
+/// grid を (n_kv, n_split) に入れ替えて、同じ row の kv head 0/1 の半分
+/// (各 1 KB) を隣り合う block が同時に読むようにする。計算は 1 ビットも
+/// 変わらない (block の (kh, sp) の割り当てだけ)。
+pub(crate) fn parse_attn_fdec_khx(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+static FD_KHX_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// テスト用: grid 入れ替えのゲートを差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_fdec_khx_for_test(on: Option<bool>) {
+    FD_KHX_FORCE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// grid を入れ替えるか (`DENNO_ATTN_FLASHDEC_KHX`、既定 off)。
+fn attn_fdec_khx_on() -> bool {
+    #[cfg(test)]
+    {
+        let f = FD_KHX_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_attn_fdec_khx(std::env::var("DENNO_ATTN_FLASHDEC_KHX").ok().as_deref())
+    })
+}
+
+/// 第 3 版の PTX (`kernels_attn_dec5.ptx`)。`DENNO_ATTN_FLASHDEC5_PTX` で差し替え可。
+fn fdt2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_ATTN_FLASHDEC5_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_attn_dec5.ptx"),
+    }
+}
+
+/// 第 3 版のカーネル 1 本。読み込み失敗は `None` を焼き付ける (第 2 版へ落ちる)。
+struct Fdt2Kernels {
+    /// モジュールはプロセス終了まで保持する (unload しない)。
+    _module: CUmodule,
+    f_t2: CUfunction,
+}
+
+unsafe impl Send for Fdt2Kernels {}
+unsafe impl Sync for Fdt2Kernels {}
+
+fn fdt2_kernels() -> Option<&'static Fdt2Kernels> {
+    static K: OnceLock<Option<Fdt2Kernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = fdt2_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[attn-fdec5] PTX が読めない ({}) : {e} → 第 2 版 (タイル) へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let text = String::from_utf8_lossy(&image).into_owned();
+        if ptx_entry_params(&text, "dno_attn_flashdec_t2") != Some(FDT2_NARGS) {
+            eprintln!(
+                "[attn-fdec5] PTX の dno_attn_flashdec_t2 が {FDT2_NARGS} 引数でない \
+                 (再生成が必要) → 第 2 版 (タイル) へ"
+            );
+            return None;
+        }
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[attn-fdec5] cuModuleLoadData 失敗 → 第 2 版 (タイル) へ");
+                return None;
+            }
+        }
+        let mut f_t2: CUfunction = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_get_function)(
+                &mut f_t2,
+                module,
+                b"dno_attn_flashdec_t2\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[attn-fdec5] PTX に dno_attn_flashdec_t2 が無い → 第 2 版 (タイル) へ");
+                return None;
+            }
+        }
+        let k = Fdt2Kernels { _module: module, f_t2 };
+        eprintln!("[attn-fdec5] PTX ok: dno_attn_flashdec_t2 nargs={FDT2_NARGS}");
+        Some(k)
+    })
+    .as_ref()
+}
+
+/// 第 3 版の分割・tile を 1 回だけログる (発火の証拠)。
+fn fdt2_log(len: usize, n_split: usize, tile: usize) {
+    static LAST: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let key = n_split.wrapping_mul(1024).wrapping_add(tile);
+    if LAST.load(std::sync::atomic::Ordering::Relaxed) == key {
+        return;
+    }
+    if LAST.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+        eprintln!("[attn-fdec5] len={len} n_split={n_split} tile={tile} (2 key 同時)");
+    }
+}
+
+/// 第 3 版の門を 1 回だけログる (届いたかの証拠)。
+fn fdt2_gate_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[attn-fdec5] gate ilp_on={} tile={} (DENNO_ATTN_FLASHDEC_ILP)",
+            attn_fdec_ilp_on(),
+            attn_fdec_tile()
+        );
+    });
 }
 
 // ---- task 460: combine と出力ゲートの融合 (`kernels_attn_dec4.cu`) --------
@@ -44368,6 +44591,8 @@ fn q4_attn_decode_fdec(a: &Q4AttnCall<'_>, imp: FdecImpl) -> Option<Vec<f32>> {
     // task 448: タイル版は tile 行と smem の門を通ったときだけ。落ちたら None を
     // 返し、呼び出し側 ([`q4_attn_decode`]) が v1 で回す。
     let tile = attn_fdec_tile();
+    // task 520: タイル版の経路では第 3 版 (2 key 同時) を先に試す。
+    let mut used_t2 = false;
     let (f_dec, f_cb, shmem, tile_c) = match imp {
         FdecImpl::V1 => {
             let k = fdec_kernels()?;
@@ -44377,23 +44602,44 @@ fn q4_attn_decode_fdec(a: &Q4AttnCall<'_>, imp: FdecImpl) -> Option<Vec<f32>> {
             if !fdt_shape_ok(a.dh, tile) {
                 return None;
             }
-            let kt = fdt_kernels()?;
             // combine は v1 のモジュールのものを使う (同じ分割・同じ part 形式)。
             let kv1 = fdec_kernels()?;
-            (
-                kt.f_t,
-                kv1.f_cb,
-                fdt_smem_bytes(tile, a.dh) as u32,
-                tile as c_int,
-            )
+            match if attn_fdec_ilp_on() { fdt2_kernels() } else { None } {
+                Some(k2) => {
+                    used_t2 = true;
+                    (
+                        k2.f_t2,
+                        kv1.f_cb,
+                        fdt_smem_bytes(tile, a.dh) as u32,
+                        tile as c_int,
+                    )
+                }
+                None => {
+                    let kt = fdt_kernels()?;
+                    (
+                        kt.f_t,
+                        kv1.f_cb,
+                        fdt_smem_bytes(tile, a.dh) as u32,
+                        tile as c_int,
+                    )
+                }
+            }
         }
     };
     let (n_split, chunk) = q4_fdec_split(a.len, attn_flashdec_chunk_for(a.len));
     match imp {
         FdecImpl::V1 => fdec_log(a.len, n_split, chunk, a.kv_dim, a.dh, a.group),
-        FdecImpl::Tile => fdt_log(a.len, n_split, chunk, a.dh, tile),
+        FdecImpl::Tile => {
+            if used_t2 {
+                fdt2_log(a.len, n_split, tile);
+            } else {
+                fdt_log(a.len, n_split, chunk, a.dh, tile)
+            }
+        }
     }
 
+    // task 520 (2): 第 3 版だけ 12 本目 (grid 入れ替え) を持つ。
+    let khx = used_t2 && attn_fdec_khx_on();
     // ミラー同期は decode / prefill / split と同一の台帳 (1 行追記)。
     let (kptr, vptr) = q4ok(q4_attn_mirror_prepare(
         a.cache_id,
@@ -44448,15 +44694,25 @@ fn q4_attn_decode_fdec(a: &Q4AttnCall<'_>, imp: FdecImpl) -> Option<Vec<f32>> {
         ];
         // task 448: タイル版だけ 11 本目 (tile 行数) を渡す。
         let mut tile_c = tile_c;
+        let mut khx_c = khx as c_int;
         if imp == FdecImpl::Tile {
             args.push(&mut tile_c as *mut _ as *mut c_void);
         }
+        // task 520 (2): 第 3 版だけ 12 本目 (grid 入れ替え) を渡す。
+        if used_t2 {
+            args.push(&mut khx_c as *mut _ as *mut c_void);
+        }
         let tl = q4attn_kprof::stamp();
+        // task 520 (2): khx のときは (kh, sp) の順に並べる。
+        let grid = if khx {
+            (n_kv as u32, n_split as u32, 1)
+        } else {
+            (n_split as u32, n_kv as u32, 1)
+        };
         q4ok(unsafe {
             ctx.launch_async(
                 f_dec,
-                // split が最速次元 (同じ split の kv head が同時に走る)
-                (n_split as u32, n_kv as u32, 1),
+                grid,
                 // 1 warp = 1 q head
                 ((32 * a.group) as u32, 1, 1),
                 shmem,
@@ -44491,7 +44747,12 @@ fn q4_attn_decode_fdec(a: &Q4AttnCall<'_>, imp: FdecImpl) -> Option<Vec<f32>> {
         q4attn_kprof::note_call();
         match imp {
             FdecImpl::V1 => q4attn_kprof::note_fdec_call(),
-            FdecImpl::Tile => q4attn_kprof::note_fdt_call(),
+            FdecImpl::Tile => {
+                if used_t2 {
+                    q4attn_kprof::note_fdt2_call();
+                }
+                q4attn_kprof::note_fdt_call();
+            }
         }
         Some(outv)
     })?;
@@ -44899,6 +45160,17 @@ pub mod q4attn_kprof {
         }
     }
 
+    // ---- task 520: flash decoding 第 3 版 (2 key 同時) のカウンタ --------------
+    /// `dno_attn_flashdec_t2` を回した回数 (= layer x decode token)。
+    /// 0 のままなら第 3 版は選ばれていない (ゲートが off か PTX/形で落ちた)。
+    pub static FDT2_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_fdt2_call() {
+        if on() {
+            FDT2_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     // ---- task 460: combine + ゲートの融合版を回した回数 ----------------------
     /// `dno_attn_flashdec_cbg` を回した回数 (= layer x decode token)。
     /// 0 のままなら融合版は選ばれていない (既定 off)。
@@ -44987,7 +45259,7 @@ pub mod q4attn_kprof {
              pf calls={pf_calls} h2d={:.1}MB q={:.1}MB out={:.1}MB | \
              pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms | \
              split calls={} fallback={} | fdec calls={} fallback={} | \
-             fdt calls={} fallback={} tile={} | cbg calls={}",
+             fdt calls={} fallback={} tile={} | cbg calls={} | t2 calls={}",
             mb(SEED_BYTES.load(Ordering::Relaxed)),
             mb(ROW_BYTES.load(Ordering::Relaxed)),
             mb(Q_BYTES.load(Ordering::Relaxed)),
@@ -45018,6 +45290,7 @@ pub mod q4attn_kprof {
             FDT_FALLBACKS.load(Ordering::Relaxed),
             super::attn_fdec_tile(),
             CBG_CALLS.load(Ordering::Relaxed),
+            FDT2_CALLS.load(Ordering::Relaxed),
         ))
     }
 
@@ -45041,6 +45314,7 @@ pub mod q4attn_kprof {
             &FDT_CALLS,
             &FDT_FALLBACKS,
             &CBG_CALLS,
+            &FDT2_CALLS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -67789,6 +68063,48 @@ mod task448_tests {
         set_attn_fdec_cbg_for_test(Some(false));
         assert!(!attn_fdec_cbg_on());
         set_attn_fdec_cbg_for_test(None);
+    }
+
+    /// task 520 (2): grid 入れ替えは**既定 off**、真値のときだけ on。
+    #[test]
+    fn task520_khx_gate_truth_table() {
+        for v in ["1", "on", "true", "yes", " ON ", "True"] {
+            assert!(parse_attn_fdec_khx(Some(v)), "{v:?} が on でない");
+        }
+        for v in ["0", "off", "false", "no", "", "auto", "x", "  "] {
+            assert!(!parse_attn_fdec_khx(Some(v)), "{v:?} が on になっている");
+        }
+        assert!(!parse_attn_fdec_khx(None), "未設定が on になっている (既定 off)");
+        set_attn_fdec_khx_for_test(Some(true));
+        assert!(attn_fdec_khx_on());
+        set_attn_fdec_khx_for_test(Some(false));
+        assert!(!attn_fdec_khx_on());
+        set_attn_fdec_khx_for_test(None);
+    }
+
+    /// task 520: 第 3 版 (2 key 同時) の門は**既定 on**、明示的な偽値だけ off。
+    #[test]
+    fn task520_ilp_gate_truth_table() {
+        for v in ["1", "on", "true", "yes", " ON ", "True", "", "  ", "auto", "x"] {
+            assert!(parse_attn_fdec_ilp(Some(v)), "{v:?} が on でない (既定 on)");
+        }
+        for v in ["0", "off", "false", "no", " OFF ", "No"] {
+            assert!(!parse_attn_fdec_ilp(Some(v)), "{v:?} が on になっている");
+        }
+        assert!(parse_attn_fdec_ilp(None), "未設定が on でない (既定 on)");
+        // 差し替えフックは env より優先する。
+        set_attn_fdec_ilp_for_test(Some(true));
+        assert!(attn_fdec_ilp_on());
+        set_attn_fdec_ilp_for_test(Some(false));
+        assert!(!attn_fdec_ilp_on());
+        set_attn_fdec_ilp_for_test(None);
+        // ABI の約束 (`.cu` の引数 11 本 = 第 2 版と同じ)。
+        assert_eq!(FDT2_NARGS, 12, "第 3 版の引数が 12 本でない");
+        // 発火計数は GPU 無しでも増える (on のときだけ)。
+        let before = q4attn_kprof::FDT2_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        q4attn_kprof::note_fdt2_call();
+        let after = q4attn_kprof::FDT2_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before, "計数が減った");
     }
 
     /// 融合版の発火計数とログの口。GPU 無しでは 0 のまま。
