@@ -8441,7 +8441,8 @@ const SEG_K_V4_NAMES: [Option<&[u8]>; 4] = [
 
 /// task 412 / 526: `DENNO_SEG_GU_FUSE` — seg 経路 (K 型モデルの decode) の
 /// gate / up / silu を **1 起動**に畳む (`kernels_seg_k.ptx` の
-/// `dno_seg_gemv_gu_*`)。**既定 off** (lab で採否を決める)。
+/// `dno_seg_gemv_gu_*`)。**task 534 から既定 on** (t534c/t534d で
+/// down のベクトル版と組にして 2 ラウンド -5.9 / -6.2%。単独では P526 の -0.9%)。
 ///
 /// gate と up は入力 `x` が同じで行数も同じなので、(1) 起動が 3 -> 1、
 /// (2) 1 ブロックあたりの `x` の読みが 1 回、(3) `g` / `u` の作業域
@@ -8450,11 +8451,16 @@ const SEG_K_V4_NAMES: [Option<&[u8]>; 4] = [
 /// 従来とビット一致する。
 pub const SEG_GU_FUSE_ENV: &str = "DENNO_SEG_GU_FUSE";
 
-/// [`SEG_GU_FUSE_ENV`] の解釈 (純関数)。`1` / `on` / `true` / `yes` だけが真。
+/// [`SEG_GU_FUSE_ENV`] の解釈 (純関数)。**task 534 から既定 on**:
+/// 未設定は有効、`0` / `off` / `false` / `no` だけが偽 (A/B と切り戻し用)。
+///
+/// P526 は単独で -0.9% (2 ラウンドとも 2% 未満) だったので既定 off のまま
+/// 残していた。task 534 では down の Q5_1 ベクトル版と組にして
+/// **2 ラウンド -5.9 / -6.2%** が出たので既定 on にした (t534c / t534d)。
 pub fn seg_gu_fuse_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+    !matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -8493,15 +8499,21 @@ pub fn seg_gu8_enabled() -> bool {
     *ON.get_or_init(|| seg_gu8_from_value(std::env::var(SEG_GU8_ENV).ok().as_deref()))
 }
 
-/// task 534: `DENNO_SEG_DN8` — down を **8 バイトロード**版 (`dno_seg_gemv_k8_*`)
-/// で回す。**既定 off**。引数も起動形も `dno_seg_gemv_k_*` と同一。
+/// task 534: `DENNO_SEG_DN8` — down をベクトルロード版
+/// (`dno_seg_gemv_k8_*` / `dno_seg_gemv_v4_q5_1`) で回す。**task 534 から既定 on**。
+/// 引数も起動形も `dno_seg_gemv_k_*` と同一。
 pub const SEG_DN8_ENV: &str = "DENNO_SEG_DN8";
 
-/// [`SEG_DN8_ENV`] の解釈 (純関数)。
+/// [`SEG_DN8_ENV`] の解釈 (純関数)。**task 534 から既定 on** (未設定は有効、
+/// `0` / `off` / `false` / `no` だけが偽)。
+///
+/// lab t534c / t534d の `dnv4` は 2 ラウンドとも -5.9 / -6.2% (down 30-33 ->
+/// 16-18 us/層、330 -> 555-615 GB/s)。down の型が K 型のときは `k8` 版が
+/// 選ばれる (t412c で gate/up の +5-6% は確認済みだが decode では読めなかった)。
 pub fn seg_dn8_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+    !matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -49087,17 +49099,15 @@ mod tests {
         assert!(!seg_k_from_value(Some("NO")));
     }
 
-    /// task 526: seg の gate+up+silu 融合 (`DENNO_SEG_GU_FUSE`) のゲートは
-    /// **既定 off**。明示的な真値だけが on (lab の A/B で `=1` を立てる)。
+    /// task 526 / 534: seg の gate+up+silu 融合 (`DENNO_SEG_GU_FUSE`) のゲートは
+    /// **task 534 から既定 on**(P526 では既定 off だった)。明示的な偽値だけが off。
     #[test]
-    fn seg_fuse_gate_default_off() {
-        assert!(!seg_gu_fuse_from_value(None), "未設定は off (既定)");
-        assert!(!seg_gu_fuse_from_value(Some("")));
-        assert!(!seg_gu_fuse_from_value(Some("0")));
-        assert!(!seg_gu_fuse_from_value(Some("off")));
-        assert!(!seg_gu_fuse_from_value(Some("no")));
-        for v in ["1", "on", "true", "yes", " TRUE "] {
-            assert!(seg_gu_fuse_from_value(Some(v)), "gu: {v}");
+    fn seg_fuse_gate_default_on() {
+        assert!(seg_gu_fuse_from_value(None), "未設定は on (既定)");
+        assert!(seg_gu_fuse_from_value(Some("")));
+        assert!(seg_gu_fuse_from_value(Some("1")));
+        for v in ["0", "off", "false", "no", " NO "] {
+            assert!(!seg_gu_fuse_from_value(Some(v)), "gu: {v}");
         }
     }
 
@@ -49127,19 +49137,25 @@ mod tests {
         assert!(head.contains("SK_GU_ROWS"), "gu8 が SK_GU_ROWS を使っていない");
     }
 
-    /// task 534: 8 バイトロード版のゲート (`DENNO_SEG_GU8` / `DENNO_SEG_DN8`) は
-    /// **既定 off**。明示的な真値だけが on。
+    /// task 534: `DENNO_SEG_GU8` は **既定 off** (lab で dnv4 と組にしても
+    /// 差が出なかった)、`DENNO_SEG_DN8` は **既定 on** (採用)。
     #[test]
-    fn seg_fast_gates_default_off() {
-        for f in [seg_gu8_from_value, seg_dn8_from_value] {
-            assert!(!f(None), "未設定は off (既定)");
-            assert!(!f(Some("")));
-            assert!(!f(Some("0")));
-            assert!(!f(Some("off")));
-            assert!(!f(Some("no")));
-            for v in ["1", "on", "true", "yes", " TRUE "] {
-                assert!(f(Some(v)), "{v}");
-            }
+    fn seg_fast_gate_defaults() {
+        // gu8: 既定 off
+        assert!(!seg_gu8_from_value(None), "gu8 の未設定は off (既定)");
+        assert!(!seg_gu8_from_value(Some("")));
+        assert!(!seg_gu8_from_value(Some("0")));
+        assert!(!seg_gu8_from_value(Some("off")));
+        assert!(!seg_gu8_from_value(Some("no")));
+        for v in ["1", "on", "true", "yes", " TRUE "] {
+            assert!(seg_gu8_from_value(Some(v)), "gu8: {v}");
+        }
+        // dn8: 既定 on (task 534 で採用)
+        assert!(seg_dn8_from_value(None), "dn8 の未設定は on (既定)");
+        assert!(seg_dn8_from_value(Some("")));
+        assert!(seg_dn8_from_value(Some("1")));
+        for v in ["0", "off", "false", "no", " NO "] {
+            assert!(!seg_dn8_from_value(Some(v)), "dn8: {v}");
         }
     }
 
