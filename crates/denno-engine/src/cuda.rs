@@ -14430,8 +14430,17 @@ impl PfUp {
     }
 
     /// 依頼を 1 本送る。グループ番号でワーカーを選ぶ。
+    ///
+    /// task 554: `pread` を使わない層 (page cache / mmap からの写しだけ = 既定
+    /// モデル) は **ワーカー 0 だけ**に送る。2 本で写すと DRAM 帯域を 2 本で
+    /// 食い合うだけで、既定モデルの prefill は GPU 律速 (写しはカーネルの裏)。
+    /// ここを分けないと、既定モデルで「何も変わらない」が保証できない。
     fn submit(&self, job: PfUpJob) -> Result<()> {
-        let i = (job.g as usize) % self.ups.len().max(1);
+        let i = if job.pread {
+            (job.g as usize) % self.ups.len().max(1)
+        } else {
+            0
+        };
         match self.ups.get(i) {
             Some(u) => u.submit(job),
             None => bail!("上げスレッドが居ない"),
@@ -17861,18 +17870,18 @@ mod pf_stream_tests {
         assert_eq!(st.0.lock().expect("poisoned").ready, 4);
     }
 
-    /// task 554: `DENNO_PF_UP_WORKERS` の解釈 (1..=3、壊れた値は 1)。
+    /// task 554: `DENNO_PF_UP_WORKERS` の解釈 (1..=3、既定 2、壊れた値は既定)。
     #[test]
     fn up_workers_values_round_and_default() {
         use crate::model::exp_pf::{up_workers_from_value, DEFAULT_UP_WORKERS};
-        assert_eq!(DEFAULT_UP_WORKERS, 1, "既定は従来どおり 1 本");
-        assert_eq!(up_workers_from_value(None), 1);
-        assert_eq!(up_workers_from_value(Some("")), 1);
-        assert_eq!(up_workers_from_value(Some("2")), 2);
+        assert_eq!(DEFAULT_UP_WORKERS, 2, "既定は 2 本 (t554a/t554b で採用)");
+        assert_eq!(up_workers_from_value(None), 2);
+        assert_eq!(up_workers_from_value(Some("")), 2);
+        assert_eq!(up_workers_from_value(Some("1")), 1, "切り戻し");
         assert_eq!(up_workers_from_value(Some(" 3 ")), 3);
-        assert_eq!(up_workers_from_value(Some("0")), 1, "0 は従来経路へ");
+        assert_eq!(up_workers_from_value(Some("0")), 1, "0 は 1 本へ");
         assert_eq!(up_workers_from_value(Some("9")), 3, "スロット 3 枚が上限");
-        assert_eq!(up_workers_from_value(Some("x")), 1);
+        assert_eq!(up_workers_from_value(Some("x")), 2, "壊れた値は既定");
     }
 
     /// task 227: 「1 回の DMA で流す塊」の切り方 (純関数)。
