@@ -272,12 +272,294 @@ pub fn flush() -> Option<String> {
     Some(format_line(&s, tok))
 }
 
+// ---------------------------------------------------------------------------
+// task 498: seg 層の和 (e*4 B) の D2H を小さな pinned バウンス経由にする
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t498b の `[seg-prof]`、UD-Q4_K_XL、decode 定常):
+// `d2h=13.3-14.8 us/層` が 1 層 1 本 (= e*4 = 10 KB) の **pageable な同期 D2H** で、
+// 48 層/token で 0.64-0.71 ms/token = decode 13.4 ms の 5%。pageable の D2H は
+// driver が内部ステージングを取ってから写すため 0.7 GB/s しか出ない。
+// 転送の実体は cuda 側 (`cuda::seg_pin_copy_d2h`) に置き、**ゲートとカウンタはここ**
+// に置く (CUDA 無しのビルドでも起動ログとリクエスト終端の行が出せる)。
+
+/// ゲート env。**既定 off** (明示的な真値だけ on)。
+pub const SEG_PIN_ENV: &str = "DENNO_SEG_SUM_PIN";
+
+/// [`SEG_PIN_ENV`] の解釈 (純関数)。
+pub fn seg_sum_pin_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// seg 和の D2H を pinned バウンス経由にするか (プロセスで 1 回だけ env を読む)。
+pub fn seg_sum_pin_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| seg_sum_pin_from_value(std::env::var(SEG_PIN_ENV).ok().as_deref()))
+}
+
+/// 発火した回数 (pinned 経由で写せた) と、従来の pageable へ落ちた回数。
+static SEG_PIN_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_PIN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 発火を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_pin_call() {
+    SEG_PIN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 従来経路へ落ちたことを 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_pin_fallback() {
+    SEG_PIN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// (発火, 落ちた) の回数。
+pub fn seg_pin_counts() -> (u64, u64) {
+    (
+        SEG_PIN_CALLS.load(Ordering::Relaxed),
+        SEG_PIN_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// テスト用: 積算を 0 に戻す。
+#[cfg(test)]
+pub fn seg_pin_reset() {
+    SEG_PIN_CALLS.store(0, Ordering::Relaxed);
+    SEG_PIN_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+/// 起動ログ用: ゲートの状態 (COND の env が届いたかを確かめる)。
+pub fn seg_sum_pin_boot_line() -> String {
+    format!(
+        "[flash] seg sum pin: {} ({SEG_PIN_ENV})",
+        if seg_sum_pin_on() { "on" } else { "off" }
+    )
+}
+
+/// リクエスト終端の診断行 (ゲート on のときだけ)。`calls` が 0 なら**分岐が
+/// 発火していない**ので、そのときは採否の判断をしない (fail closed の証拠)。
+pub fn seg_sum_pin_report() -> Option<String> {
+    if !seg_sum_pin_on() {
+        return None;
+    }
+    let (calls, fallbacks) = seg_pin_counts();
+    Some(format!(
+        "[seg-pin] calls={calls} fallbacks={fallbacks} ({SEG_PIN_ENV})"
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// task 502: seg 層の和 (e*4 B) の D2H を**非同期**にして CPU ミスの裏で流す
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t498b/t498c):
+// - `[seg-prof] d2h` は 12-17 us/層 (10 KB) で 48 層 = 0.6-0.7 ms/token (decode の 5%)。
+// - task 498 が**同期**の pinned 版 (`DENNO_SEG_SUM_PIN`) を試したが 1 us も縮まなかった。
+//   同期の `cuMemcpyDtoH` は「この文脈の仕事を待つ」ので、ミスの CPU 計算の後ろに
+//   直列で挟まるうえ、待ちの中身がこの層のカーネルより広い。
+// - ここでは**和カーネルの直後**に `cuMemcpyDtoHAsync` を pinned へ出し、
+//   ミスの CPU 計算 (1 層 ~100 us) の裏で流す。待ちは「コピーの後に打ったイベント 1 本」
+//   だけなので、コピーはミス計算に完全に隠れる。
+//
+// 数値は同じバイト列 (和カーネルの出力をそのまま写す)。失敗したら false を返し、
+// 呼び出し側は従来の同期経路へ丸ごと落ちる (fail closed)。
+
+/// 非同期 D2H のゲート env。**既定 off**。
+pub const SEG_ASYNC_ENV: &str = "DENNO_SEG_SUM_ASYNC";
+
+/// [`SEG_ASYNC_ENV`] の解釈 (純関数)。
+pub fn seg_sum_async_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// seg 和の D2H を非同期にするか (プロセスで 1 回だけ env を読む)。
+pub fn seg_sum_async_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| seg_sum_async_from_value(std::env::var(SEG_ASYNC_ENV).ok().as_deref()))
+}
+
+/// 非同期コピーを出せた回数 / 落ちた回数。
+static SEG_ASYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_ASYNC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 発火を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_async_call() {
+    SEG_ASYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 従来経路へ落ちたことを 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_async_fallback() {
+    SEG_ASYNC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// (発火, 落ちた) の回数。
+pub fn seg_async_counts() -> (u64, u64) {
+    (
+        SEG_ASYNC_CALLS.load(Ordering::Relaxed),
+        SEG_ASYNC_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// テスト用: 積算を 0 に戻す。
+#[cfg(test)]
+pub fn seg_async_reset() {
+    SEG_ASYNC_CALLS.store(0, Ordering::Relaxed);
+    SEG_ASYNC_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+/// 起動ログ用: ゲートの状態。
+pub fn seg_sum_async_boot_line() -> String {
+    format!(
+        "[flash] seg sum async: {} ({SEG_ASYNC_ENV})",
+        if seg_sum_async_on() { "on" } else { "off" }
+    )
+}
+
+/// リクエスト終端の診断行 (ゲート on のときだけ)。`calls` が 0 なら分岐が
+/// 発火していないので採否に使わない。
+pub fn seg_sum_async_report() -> Option<String> {
+    if !seg_sum_async_on() {
+        return None;
+    }
+    let (calls, fallbacks) = seg_async_counts();
+    Some(format!(
+        "[seg-async] calls={calls} fallbacks={fallbacks} ({SEG_ASYNC_ENV})"
+    ))
+}
+
+/// task 534: 8 バイトロード版 (gu8 / dn8) と Q5_1 の 4 バイト版 (dnv4) の起動回数。
+/// **発火の証拠**。
+static SEG_GU8_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_DN8_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_DNV4_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// gu8 の起動を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_gu8_call() {
+    SEG_GU8_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// dn8 の起動を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_dn8_call() {
+    SEG_DN8_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// down の Q5_1 4 バイト版の起動を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_dnv4_call() {
+    SEG_DNV4_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// (gu8, dn8, dnv4) の回数。
+pub fn seg_fast_counts() -> (u64, u64, u64) {
+    (
+        SEG_GU8_CALLS.load(Ordering::Relaxed),
+        SEG_DN8_CALLS.load(Ordering::Relaxed),
+        SEG_DNV4_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+/// テスト用: 積算を 0 に戻す。
+#[cfg(test)]
+pub fn seg_fast_reset() {
+    SEG_GU8_CALLS.store(0, Ordering::Relaxed);
+    SEG_DN8_CALLS.store(0, Ordering::Relaxed);
+    SEG_DNV4_CALLS.store(0, Ordering::Relaxed);
+}
+
+/// リクエスト終端の診断行 (どちらかのゲートが on のときだけ)。
+/// `gu8` が 0 なら融合の 8 バイト版は発火していない。
+pub fn seg_fast_report() -> Option<String> {
+    // cuda feature 無しではこの経路自体が無効 (cuda 専用の関数は呼べない)。
+    #[cfg(feature = "cuda")]
+    let on = crate::cuda::seg_gu8_enabled() || crate::cuda::seg_dn8_enabled();
+    #[cfg(not(feature = "cuda"))]
+    let on = false;
+    if !on {
+        return None;
+    }
+    let (gu8, dn8, dnv4) = seg_fast_counts();
+    Some(format!("[seg-fast] gu8={gu8} dn8={dn8} dnv4={dnv4}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// task 502: `DENNO_SEG_SUM_ASYNC` の真理値表。**既定は off**。
+    #[test]
+    fn t502_seg_sum_async_truth_table() {
+        assert!(!seg_sum_async_from_value(None), "未設定は既定 off");
+        assert!(!seg_sum_async_from_value(Some("")));
+        assert!(!seg_sum_async_from_value(Some("0")));
+        assert!(!seg_sum_async_from_value(Some("off")));
+        assert!(!seg_sum_async_from_value(Some(" no ")));
+        assert!(seg_sum_async_from_value(Some("1")));
+        assert!(seg_sum_async_from_value(Some("on")));
+        assert!(seg_sum_async_from_value(Some(" TRUE ")));
+        assert!(seg_sum_async_from_value(Some("yes")));
+    }
+
+    /// task 534: gu8 / dn8 / dnv4 の起動回数が別々に積まれること。
+    #[test]
+    fn t534_seg_fast_counts_accumulate() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seg_fast_reset();
+        note_seg_gu8_call();
+        note_seg_gu8_call();
+        note_seg_dn8_call();
+        note_seg_dnv4_call();
+        assert_eq!(seg_fast_counts(), (2, 1, 1));
+        seg_fast_reset();
+        assert_eq!(seg_fast_counts(), (0, 0, 0));
+    }
+
+    /// task 502: 発火 / 落ちた回数が別々に積まれる。
+    #[test]
+    fn t502_seg_async_counts_accumulate() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seg_async_reset();
+        note_seg_async_call();
+        note_seg_async_call();
+        note_seg_async_call();
+        note_seg_async_fallback();
+        assert_eq!(seg_async_counts(), (3, 1));
+        seg_async_reset();
+        assert_eq!(seg_async_counts(), (0, 0));
+    }
+
     /// グローバルの積算を使うのでテストは直列化する。
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// task 498: `DENNO_SEG_SUM_PIN` の真理値表。**既定は off**。
+    #[test]
+    fn t498_seg_sum_pin_truth_table() {
+        assert!(!seg_sum_pin_from_value(None), "未設定は既定 off");
+        assert!(!seg_sum_pin_from_value(Some("")));
+        assert!(!seg_sum_pin_from_value(Some("0")));
+        assert!(!seg_sum_pin_from_value(Some("off")));
+        assert!(!seg_sum_pin_from_value(Some(" no ")));
+        assert!(!seg_sum_pin_from_value(Some("FALSE")));
+        assert!(seg_sum_pin_from_value(Some("1")));
+        assert!(seg_sum_pin_from_value(Some("on")));
+        assert!(seg_sum_pin_from_value(Some(" true ")));
+        assert!(seg_sum_pin_from_value(Some("YES")));
+    }
+
+    /// task 498: 発火 / 落ちた回数が別々に積まれる。
+    #[test]
+    fn t498_seg_pin_counts_accumulate() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seg_pin_reset();
+        note_seg_pin_call();
+        note_seg_pin_call();
+        note_seg_pin_fallback();
+        assert_eq!(seg_pin_counts(), (2, 1));
+        seg_pin_reset();
+        assert_eq!(seg_pin_counts(), (0, 0));
+    }
 
     /// off のときは何も積まない (既定の経路にカウンタが乗らない)。
     #[test]

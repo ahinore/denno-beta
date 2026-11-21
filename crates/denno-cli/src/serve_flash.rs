@@ -3161,6 +3161,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             "off"
         }
     );
+    // task 498: seg 層の和 (10 KB) の D2H を pinned バウンス経由にするゲート
+    // (`DENNO_SEG_SUM_PIN`、既定 off)。COND の env が届いたかを確かめる。
+    eprintln!("{}", denno_engine::model::seg_prof::seg_sum_pin_boot_line());
+    // task 502: seg 層の和の D2H を非同期にするゲート (`DENNO_SEG_SUM_ASYNC`、既定 off)。
+    eprintln!("{}", denno_engine::model::seg_prof::seg_sum_async_boot_line());
     // task 213: 既定 on のゲートが必要とする PTX を起動時に監査する。
     // PTX が無いとその機能は**静かに**従来経路へ落ちる (REPORT_P204 の fold/upw)。
     // 起動は止めず、summary 1 行 + 欠落ごとに 1 行を出す。
@@ -3459,6 +3464,21 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
+                // task 498: seg 和の D2H の pinned バウンスが発火した回数 (ゲート on の
+                // ときだけ)。0 なら分岐が通っていないので採否に使わない。
+                if let Some(line) = denno_engine::model::seg_prof::seg_sum_pin_report() {
+                    eprintln!("{line}");
+                }
+                // task 502: seg 和の D2H の非同期コピーが発火した回数 (ゲート on の
+                // ときだけ)。0 なら分岐が通っていないので採否に使わない。
+                if let Some(line) = denno_engine::model::seg_prof::seg_sum_async_report() {
+                    eprintln!("{line}");
+                }
+                // task 534: 8 バイトロード版 (gu8 / dn8) の起動回数 (ゲート on の
+                // ときだけ)。0 なら新しいカーネルは発火していない。
+                if let Some(line) = denno_engine::model::seg_prof::seg_fast_report() {
+                    eprintln!("{line}");
+                }
                 // task 149: リクエスト境界。prefill の一時領域 (arena) を返し、
                 // 確保の内訳を 1 表だけ出す (1 本目と長い文脈の最初の 1 回)。
                 // `DENNO_SCRATCH_FREE=0` / `DENNO_Q4_PROFILE` なしでは何もしない。
