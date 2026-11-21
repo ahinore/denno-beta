@@ -2475,6 +2475,61 @@ pub fn range_ledger_on() -> bool {
     *ON.get_or_init(|| range_ledger_from_value(std::env::var(RANGE_LEDGER_ENV).ok().as_deref()))
 }
 
+/// `DENNO_PF_PREAD_MERGE=1`: 隣り合う読み区間を 1 本の pread へ畳む (task 522)。
+///
+/// 畳む条件は **pinned 側もファイル側も連続**していること:
+/// `dst_a + len_a == dst_b` かつ `part_a == part_b` かつ `off_a + len_a == off_b`。
+/// どちらかが途切れていれば畳まない (読むバイトも書く位置も 1 バイトも変わらない)。
+/// 要求が大きくなるので、ディスクが 1 MB より大きい塊で速いときに効く。
+pub const PREAD_MERGE_ENV: &str = "DENNO_PF_PREAD_MERGE";
+
+/// [`PREAD_MERGE_ENV`] の既定値 (off)。
+pub const DEFAULT_PREAD_MERGE: bool = false;
+
+/// [`PREAD_MERGE_ENV`] の解釈 (純関数)。未設定は既定 (off)、`1` 系だけが真。
+pub fn pread_merge_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PREAD_MERGE,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// 隣接区間の併合を行うか (プロセスで 1 回だけ env を読む)。
+pub fn pread_merge_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pread_merge_from_value(std::env::var(PREAD_MERGE_ENV).ok().as_deref()))
+}
+
+/// `(pinned オフセット, パート, 絶対オフセット, 長さ, mmap のポインタ)` の列を、
+/// **両側が連続**する隣どうしで 1 本に畳む (純関数)。戻り値は畳んだ回数。
+///
+/// 読むバイト列と書く位置は 1 バイトも変えない (1 本の `pread` が 2 本の
+/// `pread` と同じ範囲を同じ場所へ書くだけ)。読めなかったときの memcpy の
+/// 転送元 (`ptr`) は先頭の区間のものを残す。
+pub fn merge_adjacent_runs(runs: &mut Vec<(usize, u32, u64, usize, usize)>) -> usize {
+    if runs.len() < 2 {
+        return 0;
+    }
+    let mut merged = 0usize;
+    let mut w = 0usize;
+    for r in 1..runs.len() {
+        let (d0, p0, o0, l0, ptr0) = runs[w];
+        let (d1, p1, o1, l1, _) = runs[r];
+        if p0 == p1 && d0 + l0 == d1 && o0 + (l0 as u64) == o1 {
+            runs[w] = (d0, p0, o0, l0 + l1, ptr0);
+            merged += 1;
+        } else {
+            w += 1;
+            runs[w] = runs[r];
+        }
+    }
+    runs.truncate(w + 1);
+    merged
+}
+
 /// 1 グループぶんの読み区間 `(パート, 絶対オフセット, 長さ)` を台帳へ積む。
 ///
 /// 区間は**同じグループ (= 1 回の MoE 呼び出し)** の中で並べ替えて、隣との
@@ -2630,7 +2685,7 @@ pub fn disk_probe_plan() -> Vec<DiskProbeCfg> {
     const M: usize = 1 << 20;
     let mut v = Vec::new();
     for mode in [DiskMode::Buffered, DiskMode::Direct] {
-        for &blk in &[M, 4 * M, 16 * M] {
+        for &blk in &[M, 2 * M, 4 * M, 16 * M] {
             for &threads in &[1usize, 8, 32] {
                 v.push(DiskProbeCfg {
                     mode,
@@ -6307,9 +6362,9 @@ mod tests {
         assert!(!range_ledger_from_value(Some("0")));
         assert!(range_ledger_from_value(Some("1")));
 
-        // 条件表は 2 モード x 3 ブロック長 x 3 本数の 18 条件で、重複が無い。
+        // 条件表は 2 モード x 4 ブロック長 x 3 本数の 24 条件で、重複が無い。
         let plan = disk_probe_plan();
-        assert_eq!(plan.len(), 18);
+        assert_eq!(plan.len(), 24);
         let mut uniq = std::collections::HashSet::new();
         for c in &plan {
             assert!(uniq.insert(c.label()), "重複: {}", c.label());
@@ -6342,6 +6397,49 @@ mod tests {
         }
         assert_eq!(seen.len(), n, "scatter が置換になっていない");
         assert!(seen.iter().all(|&x| x < n));
+    }
+
+    /// task 522: 区間の併合は「pinned 側もファイル側も連続」のときだけ。
+    #[test]
+    fn task522_merge_adjacent_runs_truth_table() {
+        // (dst, part, off, len, ptr)
+        let mut v = vec![
+            (0usize, 0u32, 1000u64, 900usize, 11usize), // 次と両側連続 -> 畳む
+            (900, 0, 1900, 900, 22),                     // 次はファイル側が飛ぶ -> 畳まない
+            (1800, 0, 5000, 900, 33),                    // 次は pinned 側が飛ぶ -> 畳まない
+            (2800, 0, 5900, 900, 44),                    // 次はパートが違う -> 畳まない
+            (3700, 1, 10, 900, 55),
+        ];
+        let n = merge_adjacent_runs(&mut v);
+        assert_eq!(n, 1);
+        assert_eq!(
+            v,
+            vec![
+                (0, 0, 1000, 1800, 11),
+                (1800, 0, 5000, 900, 33),
+                (2800, 0, 5900, 900, 44),
+                (3700, 1, 10, 900, 55),
+            ]
+        );
+        // 連続 3 本は 1 本へ (長さの合計は不変)。
+        let mut v = vec![
+            (0usize, 0u32, 0u64, 100usize, 1usize),
+            (100, 0, 100, 200, 2),
+            (300, 0, 300, 50, 3),
+        ];
+        assert_eq!(merge_adjacent_runs(&mut v), 2);
+        assert_eq!(v, vec![(0, 0, 0, 350, 1)]);
+        // 0 本 / 1 本はそのまま。合計バイトは畳んでも変わらない。
+        let mut one = vec![(0usize, 0u32, 0u64, 7usize, 0usize)];
+        assert_eq!(merge_adjacent_runs(&mut one), 0);
+        let mut none: Vec<(usize, u32, u64, usize, usize)> = Vec::new();
+        assert_eq!(merge_adjacent_runs(&mut none), 0);
+
+        // ゲート: 既定 off、`1` 系だけ on。
+        assert!(!pread_merge_from_value(None));
+        assert!(!pread_merge_from_value(Some("0")));
+        assert!(pread_merge_from_value(Some("1")));
+        assert!(pread_merge_from_value(Some("true")));
     }
 
     /// task 522: 区間の台帳は「同じパートの中で隣り合う区間の隙間」だけを数える。

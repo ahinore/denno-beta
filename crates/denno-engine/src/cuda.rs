@@ -12053,6 +12053,9 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         let blk = exp_pf::pread_bytes().max(1);
         // task 522: 読みの「形」を台帳へ積む (診断専用、既定 on)。
         let mut ledger: Vec<(u32, u64, usize)> = Vec::new();
+        // task 522: まず「区間の列」を作ってから併合し、最後に塊へ切る
+        // (先に切ると併合の単位が崩れる)。
+        let mut runs: Vec<(usize, u32, u64, usize, usize)> = Vec::new();
         for &(off, r) in parts {
             if r.len == 0 {
                 continue;
@@ -12065,19 +12068,21 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
                         if exp_pf::range_ledger_on() {
                             ledger.push((s.0, s.1, r.len));
                         }
-                        // task 325: 1 区間を `DENNO_PF_PREAD_KB` ずつに切る。
-                        for (at, n) in exp_pf::pread_blocks(r.len, blk) {
-                            tasks.push((
-                                off + at,
-                                Some((s.0, s.1 + at as u64)),
-                                r.ptr + at,
-                                n,
-                                false,
-                            ));
-                        }
+                        runs.push((off, s.0, s.1, r.len, r.ptr));
                     }
                 }
                 None => tasks.push((off, None, r.ptr, r.len, false)),
+            }
+        }
+        if !runs.is_empty() {
+            if exp_pf::pread_merge_on() {
+                exp_pf::merge_adjacent_runs(&mut runs);
+            }
+            for &(off, part, at, len, ptr) in runs.iter() {
+                // task 325: 1 区間を `DENNO_PF_PREAD_KB` ずつに切る。
+                for (k, n) in exp_pf::pread_blocks(len, blk) {
+                    tasks.push((off + k, Some((part, at + k as u64)), ptr + k, n, false));
+                }
             }
         }
         exp_pf::note_read_ranges(&ledger);
