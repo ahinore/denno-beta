@@ -12894,9 +12894,10 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         use rayon::prelude::*;
         // task 325: pread 専用のスレッド数を指定されたら、その本数のプールで回す
         // (`read_at` は同期なので、同時に飛ぶ I/O の本数 = スレッド数)。
-        // task 554: 上げスレッドが n 本なら 1 本あたり nt/n に割る (総数は同じ)。
-        let nw = crate::model::exp_pf::up_workers().max(1);
-        let nt = exp_pf::pread_threads().div_ceil(nw);
+        // task 554: 上げスレッドが 2 本なら **それぞれが `DENNO_PF_PREAD_THREADS`
+        // 本**を持つ (lab t554a の w2t64 = 2 x 32 が両方のプロンプトで勝った。
+        // 2 x 16 = 32 本 total の w2 は 14k で 1.6 倍に伸びたので採らない)。
+        let nt = exp_pf::pread_threads();
         if pread && nt > 0 {
             if let Some(pool) = pf_pread_pool(nt) {
                 pool.install(|| tasks.par_iter().for_each(work));
