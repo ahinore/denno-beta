@@ -4024,6 +4024,89 @@ pub fn pf_restore_threads() -> usize {
     })
 }
 
+/// task 565: `DENNO_PF_RESTORE_NOSYNC` — 戻しの H2D を 1 本ごとに待たず、
+/// 戻しの終端で 1 回だけ待つ。
+///
+/// # なぜ要るか (2026-11-21 の既定モデル 14k cold の台帳)
+///
+/// `sub other pf_teardown=210.5 ms` のうち **208 ms が expert の戻し**
+/// (1,003 本 / 1,975 MiB)。戻しの 1 本は 3 回の「pinned へ写す → 非同期 H2D →
+/// イベント待ち」で、**イベント待ちが 1 本 3 回**入る。1 本 2 MB の DMA は
+/// 40 us で終わるのに、待ちの固定費が 8 スレッドでも 1 本 1.6 ms ある
+/// (= 9.5 GB/s。ホスト写し + DMA の帯域なら 3 倍は出る)。
+///
+/// 戻した重みを読むのは次の decode の MoE カーネルで、戻しの中では誰も読まない。
+/// よって待ちは**戻しの終端に 1 回**でよい。pinned バウンスは枠を 4 本の
+/// リングにして、**使い回す枠の DMA だけ**待つ (他の枠の DMA は走らせたまま)。
+///
+/// デバイスへ渡るバイト列は 1 本ずつの経路と同一 (順序と待ち方だけが変わる)。
+/// 既定 off (測ってから決める)。
+pub const PF_RESTORE_NOSYNC_ENV: &str = "DENNO_PF_RESTORE_NOSYNC";
+
+/// [`PF_RESTORE_NOSYNC_ENV`] の既定 (off)。
+pub const DEFAULT_PF_RESTORE_NOSYNC: bool = false;
+
+/// [`PF_RESTORE_NOSYNC_ENV`] の解釈 (純関数)。未設定・空は既定 (off)、
+/// 真値だけ on。
+pub fn pf_restore_nosync_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PF_RESTORE_NOSYNC,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// 戻しの H2D を終端まで待たないか (プロセスで 1 回だけ env を読む)。
+pub fn pf_restore_nosync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_restore_nosync_from_value(std::env::var(PF_RESTORE_NOSYNC_ENV).ok().as_deref())
+    })
+}
+
+/// task 565: `DENNO_PF_RES_PIN` — 残差 (`res`) の往復だけを pinned バウンスに
+/// 通す (共有バウンスの全体ゲート `DENNO_PF_PIN_STAGE` とは別)。
+///
+/// # なぜ要るか (2026-11-21 の既定モデル 14k cold の台帳)
+///
+/// `sub other res_up=158.6 ms [h=574.2M/7 d=71.1M/1]` = 645 MB が 4.0 GB/s。
+/// 上げはチャンク 84 MB の pageable H2D、下げは最終チャンク 71 MB の
+/// pageable D2H で、このホストの pageable D2H は 1 GB/s しか出ない (P309)。
+/// 全体ゲート (`DENNO_PF_PIN_STAGE`) は P358 が旧既定モデルで「`other` が
+/// 動かない」として棄却しているが、**残差の往復だけ**を狙えば他へ影響しない。
+/// # 採否 (lab t565a / t565b)
+///
+/// `res_up` が 14k cold で **99.4 / 98.2 -> 90.1 / 88.8 / 89.6 ms** (-9.4 / -9.6 /
+/// -8.8%、2 ラウンド 3 サンプル) と再現した。`iter_res` も 79.6 -> 67.8。
+/// 他の段・decode・md5 は不変 (全 COND 全 6 文脈 SAME)。壁は 5.13-5.26 s で
+/// COND の位置に 3% 動くため読めず、**タスクの壁 2.5% は満たしていない**。
+/// オペレーター規則 (段で 2 ラウンド 2% 以上 + 他が 1% 超悪化しない + 本文健全)
+/// を満たすので**既定 on**。切り戻しは `DENNO_PF_RES_PIN=0`。
+pub const PF_RES_PIN_ENV: &str = "DENNO_PF_RES_PIN";
+
+/// [`PF_RES_PIN_ENV`] の既定 (lab t565b で採ったので on)。
+pub const DEFAULT_PF_RES_PIN: bool = true;
+
+/// [`PF_RES_PIN_ENV`] の解釈 (純関数)。未設定・空は既定 (on)、
+/// **明示的な偽値だけ off** (`pf_restore_mt_from_value` と同じ規約)。
+pub fn pf_res_pin_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_PF_RES_PIN,
+        Some(s) => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
+}
+
+/// 残差の往復を pinned バウンスに通すか (プロセスで 1 回だけ env を読む)。
+pub fn pf_res_pin() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_res_pin_from_value(std::env::var(PF_RES_PIN_ENV).ok().as_deref()))
+}
+
 /// task 394: 層優先 prefill で、**次の層の expert 重み全体**をページキャッシュへ
 /// 先読みする (`DENNO_PF_LAYER_PRE`)。**既定 off** (測ってから決める)。
 ///
@@ -5521,6 +5604,41 @@ mod tests {
         assert_eq!(pf_restore_threads_from_value(Some(" 12 ")), 12);
         assert_eq!(pf_restore_threads_from_value(Some("999")), 32);
         assert_eq!(pf_restore_threads_from_value(Some("x")), 8);
+    }
+
+    /// task 565: 戻しの「1 本ごとに待たない」ゲートは既定 off、明示の真値だけ on。
+    ///
+    /// 戻しは 14k cold の `pf_teardown` のほぼ全部 (208 / 210.5 ms) で、
+    /// 1 本ごとのイベント待ち (1 本 3 回) が固定費になっている。採るかどうかは
+    /// lab で測ってから既定を決めるので、ここでは真理値表だけを固定する。
+    #[test]
+    fn task565_restore_nosync_gate_truth_table() {
+        assert!(!DEFAULT_PF_RESTORE_NOSYNC, "既定が on になっている");
+        assert!(!pf_restore_nosync_from_value(None), "未設定は既定 (off)");
+        assert!(!pf_restore_nosync_from_value(Some("")), "空も既定 (off)");
+        assert!(!pf_restore_nosync_from_value(Some("0")));
+        assert!(!pf_restore_nosync_from_value(Some("off")));
+        assert!(!pf_restore_nosync_from_value(Some("false")));
+        assert!(!pf_restore_nosync_from_value(Some("no")));
+        assert!(pf_restore_nosync_from_value(Some("1")));
+        assert!(pf_restore_nosync_from_value(Some("on")));
+        assert!(pf_restore_nosync_from_value(Some(" TRUE ")));
+        assert!(pf_restore_nosync_from_value(Some("Yes")));
+    }
+
+    /// task 565: 残差の往復だけを pinned へ通すゲートは**既定 on**
+    /// (lab t565b で採否 OK)、明示的な偽値だけ off。
+    #[test]
+    fn task565_res_pin_gate_truth_table() {
+        assert!(DEFAULT_PF_RES_PIN, "既定 off に戻っている");
+        assert!(pf_res_pin_from_value(None), "未設定は既定 (on)");
+        assert!(pf_res_pin_from_value(Some("")), "空も既定 (on)");
+        assert!(!pf_res_pin_from_value(Some("0")));
+        assert!(!pf_res_pin_from_value(Some("off")));
+        assert!(!pf_res_pin_from_value(Some("FALSE")));
+        assert!(!pf_res_pin_from_value(Some(" no ")));
+        assert!(pf_res_pin_from_value(Some("1")));
+        assert!(pf_res_pin_from_value(Some("on")));
     }
 
     /// task 394: 次の層の先読みのゲートは既定 off、明示の真値だけ on。
