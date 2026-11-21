@@ -49176,6 +49176,12 @@ mod tests {
             let key = format!(".visible .entry {name}(");
             assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
         }
+        // task 534 (2/n): Q5_1 の 4 バイト版 (down) も居ること。
+        for n in SEG_K_V4_NAMES.iter().flatten() {
+            let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
+            let key = format!(".visible .entry {name}(");
+            assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
+        }
         // 従来の 4 本も残っていること (差し替えではなく追加)。
         for n in SEG_K_NAMES.iter() {
             let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
