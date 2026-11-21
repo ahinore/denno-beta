@@ -431,6 +431,47 @@ pub fn seg_sum_async_report() -> Option<String> {
     ))
 }
 
+/// task 534: 8 バイトロード版 (gu8 / dn8) が何回起動したか。**発火の証拠**。
+static SEG_GU8_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_DN8_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// gu8 の起動を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_gu8_call() {
+    SEG_GU8_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// dn8 の起動を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_dn8_call() {
+    SEG_DN8_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// (gu8, dn8) の回数。
+pub fn seg_fast_counts() -> (u64, u64) {
+    (
+        SEG_GU8_CALLS.load(Ordering::Relaxed),
+        SEG_DN8_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+/// テスト用: 積算を 0 に戻す。
+#[cfg(test)]
+pub fn seg_fast_reset() {
+    SEG_GU8_CALLS.store(0, Ordering::Relaxed);
+    SEG_DN8_CALLS.store(0, Ordering::Relaxed);
+}
+
+/// リクエスト終端の診断行 (どちらかのゲートが on のときだけ)。
+/// `gu8` が 0 なら融合の 8 バイト版は発火していない。
+pub fn seg_fast_report() -> Option<String> {
+    let gu8_on = crate::cuda::seg_gu8_enabled();
+    let dn8_on = crate::cuda::seg_dn8_enabled();
+    if !gu8_on && !dn8_on {
+        return None;
+    }
+    let (gu8, dn8) = seg_fast_counts();
+    Some(format!("[seg-fast] gu8={gu8} dn8={dn8}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +488,19 @@ mod tests {
         assert!(seg_sum_async_from_value(Some("on")));
         assert!(seg_sum_async_from_value(Some(" TRUE ")));
         assert!(seg_sum_async_from_value(Some("yes")));
+    }
+
+    /// task 534: gu8 / dn8 の起動回数が別々に積まれること。
+    #[test]
+    fn t534_seg_fast_counts_accumulate() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seg_fast_reset();
+        note_seg_gu8_call();
+        note_seg_gu8_call();
+        note_seg_dn8_call();
+        assert_eq!(seg_fast_counts(), (2, 1));
+        seg_fast_reset();
+        assert_eq!(seg_fast_counts(), (0, 0));
     }
 
     /// task 502: 発火 / 落ちた回数が別々に積まれる。

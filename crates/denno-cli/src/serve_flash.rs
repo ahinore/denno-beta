@@ -3474,6 +3474,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 if let Some(line) = denno_engine::model::seg_prof::seg_sum_async_report() {
                     eprintln!("{line}");
                 }
+                // task 534: 8 バイトロード版 (gu8 / dn8) の起動回数 (ゲート on の
+                // ときだけ)。0 なら新しいカーネルは発火していない。
+                if let Some(line) = denno_engine::model::seg_prof::seg_fast_report() {
+                    eprintln!("{line}");
+                }
                 // task 149: リクエスト境界。prefill の一時領域 (arena) を返し、
                 // 確保の内訳を 1 表だけ出す (1 本目と長い文脈の最初の 1 回)。
                 // `DENNO_SCRATCH_FREE=0` / `DENNO_Q4_PROFILE` なしでは何もしない。

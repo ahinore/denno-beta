@@ -713,3 +713,257 @@ extern "C" __global__ void dno_seg_gemv_gu_q5_1(
     }
 }
 
+
+// ===========================================================================
+// task 534: K 型の 8 バイトロード版 (gu8 = gate+up+silu 融合版、k8 = 1 行版)
+//
+// なぜ: `sk_acc_q4k` / `sk_acc_q5k` は `q[qoff + t]` を 8 回読むので
+// **1 命令あたり 1 バイト**しか要求しない。Q4_K / Q5_K は lane の 8 要素が
+// 連続 8 バイト (`q[qoff..qoff+8]`、`qoff = part * 8`、`row_bytes` は
+// 144 / 176 の倍数) に並ぶので、64 ビットロード 1 回 + シフトで同じバイト列を
+// 取れる (task 412 (3/n) と同じ手法。lab t412c で gate 463 -> 490 GB/s)。
+//
+// 値: 読むバイト列と足す順序 (t 昇順) が同じなので、1 行の値は
+// `dno_seg_gemv_k_*` / `dno_seg_gemv_gu_*` とビット一致する。
+//
+// 起動形は融合版 (`dno_seg_gemv_gu_*`) / 1 行版 (`dno_seg_gemv_k_*`) と同一。
+// Q8_0 / Q5_1 は 1 要素 1 バイトが最小なのでこの版は作らない (= 従来のまま)。
+// ===========================================================================
+
+// Q4_K の 6bit scale/min 展開 (kquant.rs の get_scale_min_k4 と同一)。
+// 既存 2 つの写しと同じ規則。この節だけ独立に読めるよう 3 つ目の写しを持つ。
+__device__ __forceinline__ void sk8_scale_min(int j, const unsigned char* q,
+                                              unsigned int* d, unsigned int* m)
+{
+    if (j < 4) {
+        *d = q[j] & 63u;
+        *m = q[j + 4] & 63u;
+    } else {
+        *d = (q[j + 4] & 0x0fu) | ((unsigned int)(q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)     | ((unsigned int)(q[j]     >> 6) << 4);
+    }
+}
+
+// Q4_K: 1 ブロック (256 要素) のうち lane の 8 要素を acc に足す (8 バイトロード)。
+__device__ __forceinline__ void sk_acc8_q4k(float& acc, const unsigned char* blk,
+                                            const float* xv, int sb, int part, bool high)
+{
+    const float d = sk_f16(blk);
+    const float dmin = sk_f16(blk + 2);
+    unsigned int sc, mn;
+    sk8_scale_min(sb, blk + 4, &sc, &mn);
+    const float d1 = d * (float)sc;
+    const float m1 = dmin * (float)mn;
+    const unsigned char* q = blk + 16 + (size_t)(sb >> 1) * 32u;
+    const int qoff = part * 8;
+    const unsigned long long w8 = *(const unsigned long long*)(q + qoff);
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const unsigned int qb = (unsigned int)((w8 >> (unsigned)(8 * t)) & 0xffull);
+        const unsigned int v = high ? (qb >> 4) : (qb & 0x0fu);
+        const float y = d1 * (float)v - m1;
+        acc += y * xv[t];
+    }
+}
+
+// Q5_K: 同上 (6 ビット目が qh の bit。qh も 8 バイトロード)。
+__device__ __forceinline__ void sk_acc8_q5k(float& acc, const unsigned char* blk,
+                                            const float* xv, int sb, int part, bool high)
+{
+    const float d = sk_f16(blk);
+    const float dmin = sk_f16(blk + 2);
+    unsigned int sc, mn;
+    sk8_scale_min(sb, blk + 4, &sc, &mn);
+    const float d1 = d * (float)sc;
+    const float m1 = dmin * (float)mn;
+    const unsigned char* qh = blk + 16;
+    const unsigned char* q = blk + 48 + (size_t)(sb >> 1) * 32u;
+    const int qoff = part * 8;
+    const unsigned long long h8 = *(const unsigned long long*)(qh + qoff);
+    const unsigned long long w8 = *(const unsigned long long*)(q + qoff);
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const unsigned int qb = (unsigned int)((w8 >> (unsigned)(8 * t)) & 0xffull);
+        const unsigned int hb = (unsigned int)((h8 >> (unsigned)(8 * t)) & 0xffull);
+        const unsigned int base = high ? (qb >> 4) : (qb & 0x0fu);
+        const unsigned int hi = (hb & (1u << sb)) ? 16u : 0u;
+        const float y = d1 * (float)(base + hi) - m1;
+        acc += y * xv[t];
+    }
+}
+
+// gate + up + silu を 1 起動 + 8 バイトロードで (Q4_K / Q5_K)。
+// 形は `dno_seg_gemv_gu_q4k` / `_q5k` と同じ (1 warp = SK_GU_ROWS 行 x gate/up)。
+extern "C" __global__ void dno_seg_gemv_gu8_q4k(
+    const unsigned char* const* __restrict__ gwptrs,
+    const unsigned char* const* __restrict__ uwptrs,
+    const float* __restrict__ xbase,
+    float* __restrict__ abase,
+    const unsigned int* __restrict__ seg,
+    int nseg, int n_in, int n_out, int row_bytes)
+{
+    const int si = (int)blockIdx.y;
+    if (si >= nseg) return;
+    const unsigned int* sg = seg + (size_t)si * 4u;
+    if ((int)sg[1] != 1) return;
+    const unsigned char* gw = gwptrs[si];
+    const unsigned char* uw = uwptrs[si];
+    const float* x = xbase + (size_t)sg[2];
+    float* out = abase + (size_t)sg[3];
+    const int lane = threadIdx.x & 31u;
+    const int warps = (int)(blockDim.x >> 5);
+    const int row0 = (blockIdx.x * warps + (int)(threadIdx.x >> 5)) * SK_GU_ROWS;
+    if (row0 >= n_out) return;
+
+    const int sb = lane >> 2;
+    const int part = lane & 3;
+    const bool high = (sb & 1) != 0;
+    const int nb = n_in >> 8;
+    float ag[SK_GU_ROWS];
+    float au[SK_GU_ROWS];
+    #pragma unroll
+    for (int r = 0; r < SK_GU_ROWS; ++r) {
+        ag[r] = 0.0f;
+        au[r] = 0.0f;
+    }
+    for (int b = 0; b < nb; ++b) {
+        const size_t xo = (size_t)b * 256u + (size_t)(sb >> 1) * 64u
+                          + (size_t)(sb & 1) * 32u + (size_t)(part * 8);
+        float xv[8];
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) xv[t] = x[xo + (size_t)t];
+        #pragma unroll
+        for (int r = 0; r < SK_GU_ROWS; ++r) {
+            const int row = row0 + r;
+            if (row >= n_out) continue;
+            const size_t bo = (size_t)row * (size_t)row_bytes + (size_t)b * 144u;
+            sk_acc8_q4k(ag[r], gw + bo, xv, sb, part, high);
+            sk_acc8_q4k(au[r], uw + bo, xv, sb, part, high);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < SK_GU_ROWS; ++r) {
+        const float g = sk_reduce(ag[r]);
+        const float u = sk_reduce(au[r]);
+        const int row = row0 + r;
+        if (lane == 0 && row < n_out) out[row] = (g / (1.0f + __expf(-g))) * u;
+    }
+}
+
+extern "C" __global__ void dno_seg_gemv_gu8_q5k(
+    const unsigned char* const* __restrict__ gwptrs,
+    const unsigned char* const* __restrict__ uwptrs,
+    const float* __restrict__ xbase,
+    float* __restrict__ abase,
+    const unsigned int* __restrict__ seg,
+    int nseg, int n_in, int n_out, int row_bytes)
+{
+    const int si = (int)blockIdx.y;
+    if (si >= nseg) return;
+    const unsigned int* sg = seg + (size_t)si * 4u;
+    if ((int)sg[1] != 1) return;
+    const unsigned char* gw = gwptrs[si];
+    const unsigned char* uw = uwptrs[si];
+    const float* x = xbase + (size_t)sg[2];
+    float* out = abase + (size_t)sg[3];
+    const int lane = threadIdx.x & 31u;
+    const int warps = (int)(blockDim.x >> 5);
+    const int row0 = (blockIdx.x * warps + (int)(threadIdx.x >> 5)) * SK_GU_ROWS;
+    if (row0 >= n_out) return;
+
+    const int sb = lane >> 2;
+    const int part = lane & 3;
+    const bool high = (sb & 1) != 0;
+    const int nb = n_in >> 8;
+    float ag[SK_GU_ROWS];
+    float au[SK_GU_ROWS];
+    #pragma unroll
+    for (int r = 0; r < SK_GU_ROWS; ++r) {
+        ag[r] = 0.0f;
+        au[r] = 0.0f;
+    }
+    for (int b = 0; b < nb; ++b) {
+        const size_t xo = (size_t)b * 256u + (size_t)(sb >> 1) * 64u
+                          + (size_t)(sb & 1) * 32u + (size_t)(part * 8);
+        float xv[8];
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) xv[t] = x[xo + (size_t)t];
+        #pragma unroll
+        for (int r = 0; r < SK_GU_ROWS; ++r) {
+            const int row = row0 + r;
+            if (row >= n_out) continue;
+            const size_t bo = (size_t)row * (size_t)row_bytes + (size_t)b * 176u;
+            sk_acc8_q5k(ag[r], gw + bo, xv, sb, part, high);
+            sk_acc8_q5k(au[r], uw + bo, xv, sb, part, high);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < SK_GU_ROWS; ++r) {
+        const float g = sk_reduce(ag[r]);
+        const float u = sk_reduce(au[r]);
+        const int row = row0 + r;
+        if (lane == 0 && row < n_out) out[row] = (g / (1.0f + __expf(-g))) * u;
+    }
+}
+
+// 1 行 = 1 warp の 8 バイトロード版 (down 用)。引数と起動形は
+// `dno_seg_gemv_k_*` と完全に同一 (ホストは関数を差し替えるだけ)。
+extern "C" __global__ void dno_seg_gemv_k8_q4k(
+    const unsigned char* const* __restrict__ wptrs,
+    const float* __restrict__ xbase,
+    float* __restrict__ obase,
+    const unsigned int* __restrict__ seg,
+    int nseg, int n_in, int n_out, int row_bytes)
+{
+    SkSeg s;
+    if (!sk_seg(wptrs, xbase, obase, seg, nseg, n_in, n_out, &s)) return;
+    int lane;
+    const int row = sk_row_of(&lane);
+    if (row >= n_out) return;
+
+    const unsigned char* rowp = s.w + (size_t)row * (size_t)row_bytes;
+    const int sb = lane >> 2;
+    const int part = lane & 3;
+    const bool high = (sb & 1) != 0;
+    const int nb = n_in >> 8;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const unsigned char* blk = rowp + (size_t)b * 144u;
+        const size_t xo = (size_t)b * 256u + (size_t)(sb >> 1) * 64u
+                          + (size_t)(sb & 1) * 32u + (size_t)(part * 8);
+        const float* xv = s.x + xo;
+        sk_acc8_q4k(acc, blk, xv, sb, part, high);
+    }
+    acc = sk_reduce(acc);
+    if (lane == 0) s.out[row] = acc;
+}
+
+extern "C" __global__ void dno_seg_gemv_k8_q5k(
+    const unsigned char* const* __restrict__ wptrs,
+    const float* __restrict__ xbase,
+    float* __restrict__ obase,
+    const unsigned int* __restrict__ seg,
+    int nseg, int n_in, int n_out, int row_bytes)
+{
+    SkSeg s;
+    if (!sk_seg(wptrs, xbase, obase, seg, nseg, n_in, n_out, &s)) return;
+    int lane;
+    const int row = sk_row_of(&lane);
+    if (row >= n_out) return;
+
+    const unsigned char* rowp = s.w + (size_t)row * (size_t)row_bytes;
+    const int sb = lane >> 2;
+    const int part = lane & 3;
+    const bool high = (sb & 1) != 0;
+    const int nb = n_in >> 8;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const unsigned char* blk = rowp + (size_t)b * 176u;
+        const size_t xo = (size_t)b * 256u + (size_t)(sb >> 1) * 64u
+                          + (size_t)(sb & 1) * 32u + (size_t)(part * 8);
+        const float* xv = s.x + xo;
+        sk_acc8_q5k(acc, blk, xv, sb, part, high);
+    }
+    acc = sk_reduce(acc);
+    if (lane == 0) s.out[row] = acc;
+}

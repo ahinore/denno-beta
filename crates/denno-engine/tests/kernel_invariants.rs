@@ -14554,3 +14554,60 @@ fn t530_staging_copy_instruments_and_gates_are_wired() {
     );
     let _ = grp;
 }
+
+/// task 534: seg 経路の 8 バイトロード版 (`DENNO_SEG_GU8` / `DENNO_SEG_DN8`) の
+/// 配線 (静的検査)。両方とも既定 off で、on のときだけ関数を差し替える。
+#[test]
+fn t534_seg_fast_gates_are_wired() {
+    // .cu 側: 新しい 4 本のエントリが居る (K 型だけ)。
+    let cu = include_str!("../kernels/kernels_seg_k.cu");
+    for n in [
+        "dno_seg_gemv_gu8_q4k",
+        "dno_seg_gemv_gu8_q5k",
+        "dno_seg_gemv_k8_q4k",
+        "dno_seg_gemv_k8_q5k",
+    ] {
+        assert!(cu.contains(n), "{n} が kernels_seg_k.cu に無い");
+    }
+    // 既存の 6 本は残っている (差し替えではなく追加)。
+    for n in [
+        "dno_seg_gemv_k_q8_0",
+        "dno_seg_gemv_k_q5_1",
+        "dno_seg_gemv_k_q4k",
+        "dno_seg_gemv_k_q5k",
+        "dno_seg_gemv_gu_q4k",
+        "dno_seg_gemv_gu_q5k",
+    ] {
+        assert!(cu.contains(n), "{n} が消えた");
+    }
+    // ゲートの定義と既定 off。
+    for k in [
+        "pub const SEG_GU8_ENV: &str = \"DENNO_SEG_GU8\"",
+        "pub const SEG_DN8_ENV: &str = \"DENNO_SEG_DN8\"",
+        "pub fn seg_gu8_from_value(",
+        "pub fn seg_dn8_from_value(",
+        "const SEG_K_GU8_NAMES:",
+        "const SEG_K_K8_NAMES:",
+    ] {
+        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+    }
+    // 選び方: 融合 (gu) の枝の中 → gu8 を先に見る / down の起動は差し替え後。
+    let body = fn_body(CUDA_RS, "pub fn moe_seg_layer_sum<F>(");
+    let fuse = body.find("let fuse_gu: Option<CUfunction>").expect("fuse_gu が無い");
+    let gu8 = body.find("k.gu8[slot_g]").expect("gu8 の選択が無い");
+    let gu = body.find("_ => k.gu[slot_g]").expect("従来の融合版への落ち口が無い");
+    assert!(fuse < gu8 && gu8 < gu, "gu8 を先に見ていない");
+    let dn = body.find("let f_d_seg").expect("down の差し替えが無い");
+    let dn8 = body.find("k.k8[slot_d]").expect("k8 (down) の選択が無い");
+    let launch = body.find("f_d_seg,").expect("起動が差し替え後でない");
+    assert!(dn < dn8 && dn8 < launch, "down の選択と起動の順が違う");
+    // 発火を数える (緑は発火の証拠ではない)。
+    assert!(
+        body.contains("seg_prof::note_seg_gu8_call()"),
+        "gu8 の発火を数えていない"
+    );
+    assert!(
+        body.contains("seg_prof::note_seg_dn8_call()"),
+        "dn8 の発火を数えていない"
+    );
+}

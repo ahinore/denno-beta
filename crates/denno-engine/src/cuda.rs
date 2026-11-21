@@ -8382,6 +8382,10 @@ struct SegKKernels {
     /// task 412 / 526: gate + up + silu を 1 起動で回す版 ([`SEG_K_GU_NAMES`] の順)。
     /// 古い PTX には無いので `None` (そのときは従来の 3 起動へ落ちる)。
     gu: [Option<CUfunction>; 4],
+    /// task 534: 上の 8 バイトロード版 ([`SEG_K_GU8_NAMES`] の順)。K 型だけ。
+    gu8: [Option<CUfunction>; 4],
+    /// task 534: 1 行版の 8 バイトロード版 ([`SEG_K_K8_NAMES`] の順)。K 型だけ。
+    k8: [Option<CUfunction>; 4],
 }
 
 // 生ハンドル (context / module / function)。CudaCtx と同じ規約。
@@ -8404,6 +8408,23 @@ const SEG_K_GU_NAMES: [&[u8]; 4] = [
     b"dno_seg_gemv_gu_q5_1\0",
     b"dno_seg_gemv_gu_q4k\0",
     b"dno_seg_gemv_gu_q5k\0",
+];
+
+/// task 534: 融合版の **8 バイトロード**版 ([`moe_batch_slot`] の順)。
+/// **Q8_0 / Q5_1 は 1 要素 1 バイトが最小**なのでこの版は無い = `None`。
+const SEG_K_GU8_NAMES: [Option<&[u8]>; 4] = [
+    None,
+    None,
+    Some(b"dno_seg_gemv_gu8_q4k\0"),
+    Some(b"dno_seg_gemv_gu8_q5k\0"),
+];
+
+/// task 534: 1 行版の **8 バイトロード**版 ([`moe_batch_slot`] の順)。同上。
+const SEG_K_K8_NAMES: [Option<&[u8]>; 4] = [
+    None,
+    None,
+    Some(b"dno_seg_gemv_k8_q4k\0"),
+    Some(b"dno_seg_gemv_k8_q5k\0"),
 ];
 
 /// task 412 / 526: `DENNO_SEG_GU_FUSE` — seg 経路 (K 型モデルの decode) の
@@ -8436,6 +8457,47 @@ pub fn seg_gu_fuse_enabled() -> bool {
 pub(crate) const SEG_WARPS: u32 = 4;
 /// 1 warp が受け持つ gate/up の行数 (`SK_GU_ROWS`)。
 pub(crate) const SEG_GU_ROWS: u32 = 2;
+
+/// task 534: `DENNO_SEG_GU8` — 融合版 (gate+up+silu) を **8 バイトロード**で回す
+/// (`dno_seg_gemv_gu8_*`)。**既定 off**。
+///
+/// `dno_seg_gemv_gu_*` は `q[qoff + t]` を 8 回読むので 1 命令 1 バイト。
+/// Q4_K / Q5_K は lane の 8 要素が連続 8 バイトなので 64 ビットロード 1 回で
+/// 同じバイト列を取れる (読む順も足す順も同じ = **値はビット一致**)。
+/// 融合 (`DENNO_SEG_GU_FUSE`) の経路でだけ効く (単独では何もしない)。
+pub const SEG_GU8_ENV: &str = "DENNO_SEG_GU8";
+
+/// [`SEG_GU8_ENV`] の解釈 (純関数)。`1` / `on` / `true` / `yes` だけが真。
+pub fn seg_gu8_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`SEG_GU8_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+pub fn seg_gu8_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| seg_gu8_from_value(std::env::var(SEG_GU8_ENV).ok().as_deref()))
+}
+
+/// task 534: `DENNO_SEG_DN8` — down を **8 バイトロード**版 (`dno_seg_gemv_k8_*`)
+/// で回す。**既定 off**。引数も起動形も `dno_seg_gemv_k_*` と同一。
+pub const SEG_DN8_ENV: &str = "DENNO_SEG_DN8";
+
+/// [`SEG_DN8_ENV`] の解釈 (純関数)。
+pub fn seg_dn8_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`SEG_DN8_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+pub fn seg_dn8_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| seg_dn8_from_value(std::env::var(SEG_DN8_ENV).ok().as_deref()))
+}
 
 /// task 278: 高速版 GEMV (`kernels_seg_k.ptx`) を使うか。
 ///
@@ -8518,12 +8580,27 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
             for (i, name) in SEG_K_GU_NAMES.iter().enumerate() {
                 gu[i] = get(name);
             }
+            // task 534: 8 バイトロード版 (K 型だけ)。古い PTX では None。
+            let mut gu8 = [None; 4];
+            for (i, name) in SEG_K_GU8_NAMES.iter().enumerate() {
+                if let Some(name) = name {
+                    gu8[i] = get(name);
+                }
+            }
+            let mut k8 = [None; 4];
+            for (i, name) in SEG_K_K8_NAMES.iter().enumerate() {
+                if let Some(name) = name {
+                    k8[i] = get(name);
+                }
+            }
             Some(SegKKernels {
                 module,
                 fns,
                 mix_r8,
                 mix_rowblk,
                 gu,
+                gu8,
+                k8,
             })
         })
         .as_ref()
@@ -8978,8 +9055,28 @@ where
     // 高速版 (`seg_k`) の経路でだけ使う: 遅い方の PTX には無い。
     let fuse_gu: Option<CUfunction> = match fast {
         // gate と up は型も行長も同じときだけ畳める (x を共有する前提)。
-        Some(k) if seg_gu_fuse_enabled() && ty_g == ty_u && rb_g == rb_u => k.gu[slot_g],
+        Some(k) if seg_gu_fuse_enabled() && ty_g == ty_u && rb_g == rb_u => {
+            // task 534: 8 バイトロード版があればそちら (無ければ従来の融合版)。
+            match k.gu8[slot_g] {
+                Some(f) if seg_gu8_enabled() => {
+                    crate::model::seg_prof::note_seg_gu8_call();
+                    Some(f)
+                }
+                _ => k.gu[slot_g],
+            }
+        }
         _ => None,
+    };
+    // task 534: down の 8 バイトロード版 (引数も起動形も同じ = 差し替えだけ)。
+    let f_d_seg = match fast {
+        Some(k) if seg_dn8_enabled() => match k.k8[slot_d] {
+            Some(f) => {
+                crate::model::seg_prof::note_seg_dn8_call();
+                f
+            }
+            None => f_d,
+        },
+        _ => f_d,
     };
     // 融合カーネルの起動形 (blockDim = 128 = 4 warp)。
     let gu_grid = (
@@ -9171,7 +9268,7 @@ where
                 &mut rb2 as *mut _ as *mut c_void,
             ];
             ctx.launch_async(
-                f_d,
+                f_d_seg,
                 plan_d.grid,
                 block,
                 smem_d,
@@ -49000,6 +49097,39 @@ mod tests {
         assert_eq!(pick("SK_GU_ROWS"), SEG_GU_ROWS, "gu の行数");
         // ブロックは 128 = 4 warp 固定 (カーネルは blockDim.x >> 5 を使う)。
         assert_eq!(SEG_WARPS, 4);
+        // task 534: 8 バイトロード版も同じ 2 つの定数を使う (同じ起動形)。
+        let gu8 = src.split("dno_seg_gemv_gu8_q4k").nth(1).expect("gu8_q4k が無い");
+        let head: String = gu8.chars().take(3000).collect();
+        assert!(head.contains("SK_GU_ROWS"), "gu8 が SK_GU_ROWS を使っていない");
+    }
+
+    /// task 534: 8 バイトロード版のゲート (`DENNO_SEG_GU8` / `DENNO_SEG_DN8`) は
+    /// **既定 off**。明示的な真値だけが on。
+    #[test]
+    fn seg_fast_gates_default_off() {
+        for f in [seg_gu8_from_value, seg_dn8_from_value] {
+            assert!(!f(None), "未設定は off (既定)");
+            assert!(!f(Some("")));
+            assert!(!f(Some("0")));
+            assert!(!f(Some("off")));
+            assert!(!f(Some("no")));
+            for v in ["1", "on", "true", "yes", " TRUE "] {
+                assert!(f(Some(v)), "{v}");
+            }
+        }
+    }
+
+    /// task 534: 8 バイトロード版の名前は K 型 2 つだけ (Q8_0 / Q5_1 は無い) で、
+    /// 添字は `moe_batch_slot` の並び (2 = Q4_K, 3 = Q5_K) に一致していること。
+    #[test]
+    fn seg_fast_names_are_k_types_only() {
+        for (i, (g, k)) in SEG_K_GU8_NAMES.iter().zip(SEG_K_K8_NAMES.iter()).enumerate() {
+            if i < 2 {
+                assert!(g.is_none() && k.is_none(), "slot {i} に K 型以外の版がある");
+            } else {
+                assert!(g.is_some() && k.is_some(), "slot {i} の K 型版が無い");
+            }
+        }
     }
 
     /// task 526: コミット済みの `kernels_seg_k.ptx` に融合 (gu) の 4 エントリが
