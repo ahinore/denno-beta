@@ -12051,6 +12051,8 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
     let mut tasks: Vec<(usize, Option<(u32, u64)>, usize, usize, bool)> = Vec::new();
     if pread {
         let blk = exp_pf::pread_bytes().max(1);
+        // task 522: 読みの「形」を台帳へ積む (診断専用、既定 on)。
+        let mut ledger: Vec<(u32, u64, usize)> = Vec::new();
         for &(off, r) in parts {
             if r.len == 0 {
                 continue;
@@ -12060,6 +12062,9 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
                     if exp_pf::rc_has(s.0, s.1, r.len) {
                         tasks.push((off, Some(s), r.ptr, r.len, true));
                     } else {
+                        if exp_pf::range_ledger_on() {
+                            ledger.push((s.0, s.1, r.len));
+                        }
                         // task 325: 1 区間を `DENNO_PF_PREAD_KB` ずつに切る。
                         for (at, n) in exp_pf::pread_blocks(r.len, blk) {
                             tasks.push((
@@ -12075,6 +12080,7 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
                 None => tasks.push((off, None, r.ptr, r.len, false)),
             }
         }
+        exp_pf::note_read_ranges(&ledger);
     } else {
         for &(off, r) in parts {
             tasks.push((off, None, r.ptr, r.len, false));

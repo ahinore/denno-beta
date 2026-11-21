@@ -2341,6 +2341,10 @@ pub fn install_parts(paths: Vec<Option<std::path::PathBuf>>) {
     if PARTS.set(files).is_ok() && pread_on() {
         eprintln!("[pf-pread] 読み口: {opened} パートを開いた (DENNO_PF_PREAD=1)");
     }
+    // task 522: ディスクの素の速さを測る (既定 off、診断専用)。
+    if disk_probe_on() {
+        run_disk_probe(&paths);
+    }
 }
 
 /// パートが 1 本でも開けているか (診断用)。
@@ -2417,6 +2421,431 @@ pub fn pread_stats() -> String {
 pub fn pread_stats_reset() {
     for c in [&PREAD_BYTES, &PREAD_CALLS, &PREAD_FAIL] {
         c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 522: 読みの「形」の台帳 (区間の数 / 隙間の分布 / 覆う範囲)
+// ---------------------------------------------------------------------------
+
+static RANGE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RANGE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RANGE_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAP_EQ0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAP_LE64K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAP_LE256K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAP_LE1M: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAP_GT1M: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 隣り合う区間の隙間 (バイト) を 5 つの階級へ振る (純関数、0 = 隙間なし)。
+pub fn gap_bucket(gap: u64) -> usize {
+    match gap {
+        0 => 0,
+        g if g <= 64 << 10 => 1,
+        g if g <= 256 << 10 => 2,
+        g if g <= 1 << 20 => 3,
+        _ => 4,
+    }
+}
+
+/// `DENNO_PF_RANGE_LEDGER=0`: 読み区間の形の台帳 (task 522) を止める。
+///
+/// 既定 on。1 グループあたり数十個の区間を並べ替えて隙間を数えるだけで、
+/// 読みの計画には触らない (診断専用)。オフにすると `rn=` の欄が消える。
+pub const RANGE_LEDGER_ENV: &str = "DENNO_PF_RANGE_LEDGER";
+
+/// [`RANGE_LEDGER_ENV`] の既定値 (on)。
+pub const DEFAULT_RANGE_LEDGER: bool = true;
+
+/// [`RANGE_LEDGER_ENV`] の解釈 (純関数)。未設定は既定 (on)、`0` 系だけが偽。
+pub fn range_ledger_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_RANGE_LEDGER,
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" | "no" => false,
+            "1" | "on" | "true" | "yes" => true,
+            _ => DEFAULT_RANGE_LEDGER,
+        },
+    }
+}
+
+/// 読み区間の台帳を積むか (プロセスで 1 回だけ env を読む)。
+pub fn range_ledger_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| range_ledger_from_value(std::env::var(RANGE_LEDGER_ENV).ok().as_deref()))
+}
+
+/// 1 グループぶんの読み区間 `(パート, 絶対オフセット, 長さ)` を台帳へ積む。
+///
+/// 区間は**同じグループ (= 1 回の MoE 呼び出し)** の中で並べ替えて、隣との
+/// 隙間を数える。「隙間が小さい = まとめて読める」の証拠になる。
+/// 入力はそのまま (順序を変えない) — 呼び出し側は読みの計画に使っている。
+pub fn note_read_ranges(ranges: &[(u32, u64, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut v: Vec<(u32, u64, u64)> = ranges.iter().map(|&(p, o, l)| (p, o, l as u64)).collect();
+    v.sort_unstable();
+    let mut bytes = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let part = v[i].0;
+        let start = v[i].1;
+        let mut end = v[i].1.saturating_add(v[i].2);
+        bytes = bytes.saturating_add(v[i].2);
+        let mut j = i + 1;
+        while j < v.len() && v[j].0 == part {
+            let (o, l) = (v[j].1, v[j].2);
+            bytes = bytes.saturating_add(l);
+            if o > end {
+                let b = &[
+                    &GAP_EQ0,
+                    &GAP_LE64K,
+                    &GAP_LE256K,
+                    &GAP_LE1M,
+                    &GAP_GT1M,
+                ][gap_bucket(o - end)];
+                b.fetch_add(1, Ordering::Relaxed);
+            } else if o == end {
+                GAP_EQ0.fetch_add(1, Ordering::Relaxed);
+            }
+            end = end.max(o.saturating_add(l));
+            j += 1;
+        }
+        RANGE_SPAN.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+        i = j;
+    }
+    RANGE_N.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+    RANGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `[exp-pf-stream]` の末尾へ足す、読み区間の形の台帳。
+///
+/// `n` = 区間の数 (≒ pread の回数)、`MB` = 要求バイト、`span_MB` = 区間が
+/// 覆う範囲 (隙間込み)、`gap0/64k/256k/1m/gt` = 隣接区間の隙間の階級別の数。
+pub fn range_stats() -> String {
+    let n = RANGE_N.load(Ordering::Relaxed);
+    if n == 0 {
+        return String::new();
+    }
+    let mb = RANGE_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+    let span = RANGE_SPAN.load(Ordering::Relaxed) as f64 / 1e6;
+    format!(
+        " rn={n} rMB={mb:.1} rspan_MB={span:.1} gap0={} gap64k={} gap256k={} gap1m={} gapgt={}",
+        GAP_EQ0.load(Ordering::Relaxed),
+        GAP_LE64K.load(Ordering::Relaxed),
+        GAP_LE256K.load(Ordering::Relaxed),
+        GAP_LE1M.load(Ordering::Relaxed),
+        GAP_GT1M.load(Ordering::Relaxed),
+    )
+}
+
+/// 読み区間の台帳を 0 に戻す。
+pub fn range_stats_reset() {
+    for c in [
+        &RANGE_N,
+        &RANGE_BYTES,
+        &RANGE_SPAN,
+        &GAP_EQ0,
+        &GAP_LE64K,
+        &GAP_LE256K,
+        &GAP_LE1M,
+        &GAP_GT1M,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 522: ディスクの素の速さを測る (`DENNO_DISK_PROBE=1`、既定 off)
+// ---------------------------------------------------------------------------
+
+/// `DENNO_DISK_PROBE=1`: モデル読み込みの直後に、GGUF のパートを
+/// 「ブロック長 x 同時本数 x 順序 x (buffered / O_DIRECT)」で読んで GB/s を出す。
+///
+/// expert の読みは 1 本あたり 0.9-1.2 MB のランダムな pread なので、
+/// **同じ形 (scatter) と素直な順序 (seq) の両方**を測る。ページキャッシュの
+/// 影響を避けるため、条件ごとに**別の窓**を読む。
+///
+/// 出力は `[disk-probe] ...` の 1 行/条件 + 最後に `best=`。
+pub const DISK_PROBE_ENV: &str = "DENNO_DISK_PROBE";
+
+/// [`DISK_PROBE_ENV`] の解釈 (純関数)。既定 off、`1` 系だけが真。
+pub fn disk_probe_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => false,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// プローブを走らせるか (プロセスで 1 回だけ env を読む)。
+pub fn disk_probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| disk_probe_from_value(std::env::var(DISK_PROBE_ENV).ok().as_deref()))
+}
+
+/// 読み方 (バッファ経由 / ページキャッシュを迂回)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskMode {
+    Buffered,
+    Direct,
+}
+
+impl DiskMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            DiskMode::Buffered => "buf",
+            DiskMode::Direct => "odirect",
+        }
+    }
+}
+
+/// プローブの 1 条件。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskProbeCfg {
+    pub mode: DiskMode,
+    pub blk: usize,
+    pub threads: usize,
+    /// true = expert のように飛び飛びに読む、false = 昇順。
+    pub scatter: bool,
+}
+
+impl DiskProbeCfg {
+    pub fn label(&self) -> String {
+        format!(
+            "{} blk_KB={} threads={} order={}",
+            self.mode.name(),
+            self.blk >> 10,
+            self.threads,
+            if self.scatter { "scatter" } else { "seq" }
+        )
+    }
+}
+
+/// 条件の表 (純関数)。expert の実形 (1 MB 前後) と、より大きい塊を比べる。
+pub fn disk_probe_plan() -> Vec<DiskProbeCfg> {
+    const M: usize = 1 << 20;
+    let mut v = Vec::new();
+    for mode in [DiskMode::Buffered, DiskMode::Direct] {
+        for &blk in &[M, 4 * M, 16 * M] {
+            for &threads in &[1usize, 8, 32] {
+                v.push(DiskProbeCfg {
+                    mode,
+                    blk,
+                    threads,
+                    scatter: threads > 1,
+                });
+            }
+        }
+    }
+    v
+}
+
+/// 条件 `idx` が読む窓の開始位置 (純関数)。条件ごとに別の 1 GiB 窓。
+///
+/// 窓は 1 GiB + 256 MiB の間隔で並べ、ファイルの終端を超えるなら `None`。
+pub fn disk_probe_window(idx: usize, window: usize, file_len: u64) -> Option<u64> {
+    let stride = (window + (256 << 20)) as u64;
+    let base = (idx as u64 + 1).saturating_mul(stride);
+    if base.saturating_add(window as u64) <= file_len {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+/// 4096 バイト境界に揃えた作業バッファ (O_DIRECT 用)。
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedBuf {
+    fn new(len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let layout = std::alloc::Layout::from_size_align(len, 4096).ok()?;
+        // SAFETY: 長さ > 0、align は 2 の冪。
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(AlignedBuf { ptr, len })
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `new` で len バイト確保済み。
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        if let Ok(layout) = std::alloc::Layout::from_size_align(self.len, 4096) {
+            // SAFETY: `new` と同じ layout で確保した領域。
+            unsafe { std::alloc::dealloc(self.ptr, layout) };
+        }
+    }
+}
+
+/// O_DIRECT で開く (Linux のみ。失敗したら `None` = 呼び出し側が buffered へ落とす)。
+#[cfg(target_os = "linux")]
+fn open_direct(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    const O_RDONLY: i32 = 0;
+    const O_DIRECT: i32 = 0o40000;
+    extern "C" {
+        fn open(path: *const std::os::raw::c_char, flags: i32, ...) -> i32;
+    }
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: NUL 終端のパスを渡すだけ。O_CREAT は付けないので第 3 引数は渡さない。
+    let fd = unsafe { open(c.as_ptr(), O_RDONLY | O_DIRECT) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `open` が返した fd の所有権を受け取る。
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_direct(_path: &std::path::Path) -> Option<std::fs::File> {
+    None
+}
+
+/// ブロック `i` の順序を散らす (純関数)。`n` は 2 の冪。
+///
+/// 線形合同法 (`a ≡ 1 mod 4`, `c` 奇数) は `n` が 2 の冪なら全周期なので、
+/// 0..n の置換になる (重複なし)。expert の選択のように飛び飛びの順序を作る。
+pub fn scatter_perm(i: usize, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = i as u64;
+    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (x as usize) % n
+}
+
+/// 1 条件を測る。戻り値 = (バイト, 秒)。
+fn disk_probe_measure(
+    file: &std::fs::File,
+    base: u64,
+    window: usize,
+    cfg: DiskProbeCfg,
+) -> std::io::Result<(usize, f64)> {
+    use std::os::unix::fs::FileExt;
+    let blk = cfg.blk;
+    let nblk = (window / blk).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let err: Mutex<Option<std::io::Error>> = Mutex::new(None);
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..cfg.threads.max(1) {
+            s.spawn(|| {
+                let mut buf = match AlignedBuf::new(blk) {
+                    Some(b) => b,
+                    None => return,
+                };
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= nblk {
+                        return;
+                    }
+                    let j = if cfg.scatter { scatter_perm(i, nblk) } else { i };
+                    let off = base + (j as u64) * (blk as u64);
+                    if let Err(e) = file.read_exact_at(buf.as_mut_slice(), off) {
+                        let mut g = err.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let dt = t0.elapsed().as_secs_f64();
+    if let Some(e) = err.lock().unwrap().take() {
+        return Err(e);
+    }
+    Ok((nblk * blk, dt))
+}
+
+/// プローブ本体。最大のパート 1 本について条件表を回し、1 行/条件を出す。
+///
+/// 失敗しても**モデルの読み込みは続ける** (診断専用)。
+pub fn run_disk_probe(paths: &[Option<std::path::PathBuf>]) {
+    use std::os::unix::fs::FileExt;
+    let mut best: Option<(String, f64)> = None;
+    for (pi, p) in paths.iter().enumerate() {
+        let Some(p) = p.as_ref() else { continue };
+        let Ok(f) = std::fs::File::open(p) else { continue };
+        let Ok(md) = f.metadata() else { continue };
+        let len = md.len();
+        if len < (3u64 << 30) {
+            continue;
+        }
+        eprintln!(
+            "[disk-probe] part={pi} path={} size_GB={:.1}",
+            p.display(),
+            len as f64 / 1e9
+        );
+        let plan = disk_probe_plan();
+        let window = 512usize << 20;
+        for (idx, cfg) in plan.iter().enumerate() {
+            let Some(base) = disk_probe_window(idx, window, len) else {
+                continue;
+            };
+            let file = match cfg.mode {
+                DiskMode::Buffered => Some(std::fs::File::open(p)),
+                DiskMode::Direct => open_direct(p).map(Ok),
+            };
+            let Some(Ok(file)) = file else {
+                eprintln!("[disk-probe] {} -> open 失敗 (skip)", cfg.label());
+                continue;
+            };
+            match disk_probe_measure(&file, base, window, *cfg) {
+                Ok((bytes, s)) if s > 0.0 => {
+                    let gbs = bytes as f64 / 1e9 / s;
+                    eprintln!(
+                        "[disk-probe] {} MB={:.0} s={s:.3} GB/s={gbs:.2}",
+                        cfg.label(),
+                        bytes as f64 / 1e6
+                    );
+                    if best.as_ref().map(|(_, b)| gbs > *b).unwrap_or(true) {
+                        best = Some((cfg.label(), gbs));
+                    }
+                }
+                Ok((_, s)) => eprintln!("[disk-probe] {} -> s={s} (skip)", cfg.label()),
+                Err(e) => eprintln!("[disk-probe] {} -> {e} (skip)", cfg.label()),
+            }
+        }
+        // 最後に 1 回だけ、読み終わった窓の先頭 1 MiB を読み直して
+        // 「ページキャッシュに載っている速さ」も出す (buffered のみ)。
+        let w = 1usize << 20;
+        if let Some(base) = disk_probe_window(0, w, len) {
+            let mut buf = vec![0u8; w];
+            let t0 = std::time::Instant::now();
+            if f.read_exact_at(&mut buf, base).is_ok() {
+                let s = t0.elapsed().as_secs_f64();
+                if s > 0.0 {
+                    eprintln!(
+                        "[disk-probe] warm(buf, 1 MiB) s={s:.4} GB/s={:.1}",
+                        w as f64 / 1e9 / s
+                    );
+                }
+            }
+        }
+        break;
+    }
+    match best {
+        Some((l, g)) => eprintln!("[disk-probe] best=\" {l} \" GB/s={g:.2}"),
+        None => eprintln!("[disk-probe] 測定できた条件なし"),
     }
 }
 
@@ -4235,6 +4664,8 @@ pub fn stats_line() -> Option<String> {
         }
         // task 325: 1 回目の読みの経路 (pread / 先読み) が発火したかの台帳。
         out.push_str(&pread_stats());
+        // task 522: 読み区間の形 (数 / 隙間の分布 / 覆う範囲)。
+        out.push_str(&range_stats());
         out.push_str(&rc_stats());
         // task 394: 次の層の先読みが発火したかの台帳。
         out.push_str(&layer_pre_stats());
@@ -4297,6 +4728,8 @@ pub fn stats_reset() {
     crate::cuda::pf_tab_counts_reset();
     // task 325: 1 回目の読みの台帳もリクエスト単位にする。
     pread_stats_reset();
+    // task 522: 読み区間の形の台帳もリクエスト単位にする。
+    range_stats_reset();
     rc_stats_reset();
     // task 394: 次の層の先読みの台帳もリクエスト単位にする。
     layer_pre_stats_reset();
@@ -5845,5 +6278,89 @@ mod tests {
         assert_eq!(c.max_abs, 5.0e-6);
         assert_eq!(c.max_rel, 2.0e-6);
         assert!(take_check().is_none(), "取り出したら空になる");
+    }
+
+    /// task 522: 読み区間の形の台帳 (隙間の階級) と、プローブの窓・順序の純関数。
+    #[test]
+    fn task522_gap_bucket_and_probe_plan_truth_table() {
+        // 隙間の階級: 0 / 64 KiB 以下 / 256 KiB 以下 / 1 MiB 以下 / それ以上。
+        assert_eq!(gap_bucket(0), 0);
+        assert_eq!(gap_bucket(1), 1);
+        assert_eq!(gap_bucket(64 << 10), 1);
+        assert_eq!(gap_bucket((64 << 10) + 1), 2);
+        assert_eq!(gap_bucket(256 << 10), 2);
+        assert_eq!(gap_bucket((256 << 10) + 1), 3);
+        assert_eq!(gap_bucket(1 << 20), 3);
+        assert_eq!(gap_bucket((1 << 20) + 1), 4);
+
+        // ゲートの解釈: 未設定は off、`0` 系も off、`1` 系だけ on。
+        assert!(!disk_probe_from_value(None));
+        assert!(!disk_probe_from_value(Some("")));
+        assert!(!disk_probe_from_value(Some("0")));
+        assert!(!disk_probe_from_value(Some("off")));
+        assert!(disk_probe_from_value(Some("1")));
+        assert!(disk_probe_from_value(Some("YES")));
+
+        // 区間の台帳のゲートは**既定 on** (計器なので)。`0` 系でだけ止まる。
+        assert!(range_ledger_from_value(None));
+        assert!(range_ledger_from_value(Some("")));
+        assert!(!range_ledger_from_value(Some("0")));
+        assert!(range_ledger_from_value(Some("1")));
+
+        // 条件表は 2 モード x 3 ブロック長 x 3 本数の 18 条件で、重複が無い。
+        let plan = disk_probe_plan();
+        assert_eq!(plan.len(), 18);
+        let mut uniq = std::collections::HashSet::new();
+        for c in &plan {
+            assert!(uniq.insert(c.label()), "重複: {}", c.label());
+            assert!(c.blk.is_power_of_two() && c.blk >= 1 << 20);
+        }
+        // 1 本の条件は scatter しない (順序の効果を分けて見る)。
+        assert!(plan.iter().filter(|c| c.threads == 1).all(|c| !c.scatter));
+
+        // 窓は条件ごとに重ならない。
+        let len = 32u64 << 30;
+        let w = 512usize << 20;
+        let mut spans = Vec::new();
+        for i in 0..plan.len() {
+            if let Some(b) = disk_probe_window(i, w, len) {
+                spans.push((b, b + w as u64));
+            }
+        }
+        assert_eq!(spans.len(), plan.len(), "32 GiB なら全条件が入る");
+        for k in 1..spans.len() {
+            assert!(spans[k].0 >= spans[k - 1].1, "窓が重なった: {:?}", &spans[k - 1..=k]);
+        }
+        // ファイルが小さいときは窓が取れない (読みに行かない)。
+        assert!(disk_probe_window(3, w, 2u64 << 30).is_none());
+
+        // scatter の順序は 0..n の置換 (n は 2 の冪)。
+        let n = 64usize;
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..n {
+            seen.insert(scatter_perm(i, n));
+        }
+        assert_eq!(seen.len(), n, "scatter が置換になっていない");
+        assert!(seen.iter().all(|&x| x < n));
+    }
+
+    /// task 522: 区間の台帳は「同じパートの中で隣り合う区間の隙間」だけを数える。
+    #[test]
+    fn task522_range_ledger_counts_gaps() {
+        // 台帳はプロセス全体の静的カウンタなので、このテスト専用に戻してから使う。
+        range_stats_reset();
+        // パート 0: [1000, 2000) と [2000, 3000) = 隙間 0、[4000, 5000) = 隙間 1000。
+        // パート 1: [10, 20) は別パートなので、パート 0 との間に隙間を数えない。
+        let v = [(0u32, 1000u64, 1000usize), (0, 2000, 1000), (0, 4000, 1000), (1, 10, 10)];
+        note_read_ranges(&v);
+        let s = range_stats();
+        assert!(s.contains("rn=4"), "{s}");
+        assert!(s.contains("rMB=0.0"), "{s}");
+        assert!(s.contains("gap0=1"), "隣接 1 つ: {s}");
+        assert!(s.contains("gap64k=1"), "1000 B の隙間: {s}");
+        assert!(s.contains("gapgt=0"), "{s}");
+        // 覆う範囲 = (5000-1000) + (20-10) = 4010 B。
+        assert!(s.contains("rspan_MB=0.0"), "{s}");
+        range_stats_reset();
     }
 }
