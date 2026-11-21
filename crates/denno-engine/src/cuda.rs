@@ -33285,7 +33285,7 @@ pub fn pf_full_qkv(
         //    コンテキスト全体を待つので、168 回の待ちが full 段の露出になっていた。
         let mut async_started = false;
         if staged.is_some() && pf_kv_async_on() {
-            match pf_kv_wb_begin(kdb.ptr(), vdb.ptr(), nt * kv * 4, nt * kv * 4) {
+            match pf_kv_wb_begin(kdb.ptr(), vdb.ptr(), nt * kv * 4, nt * kv * 4, layer, nt) {
                 Ok(true) => async_started = true,
                 Ok(false) => {}
                 Err(e) => pf2_warn(&format!("full qkv: KV の非同期 D2H: {e:#}")),
@@ -33631,7 +33631,7 @@ pub fn pf_full_qkv_fused(
         //    (`DENNO_PF_KV_ASYNC`。待つのは `pf_kv_wb_copy_into` まで)。
         let mut async_started = false;
         if staged.is_some() && pf_kv_async_on() {
-            match pf_kv_wb_begin(kdb.ptr(), vdb.ptr(), nt * kv * 4, nt * kv * 4) {
+            match pf_kv_wb_begin(kdb.ptr(), vdb.ptr(), nt * kv * 4, nt * kv * 4, layer, nt) {
                 Ok(true) => async_started = true,
                 Ok(false) => {}
                 Err(e) => pf2_warn(&format!("full qkv (融合): KV の非同期 D2H: {e:#}")),
@@ -34120,33 +34120,187 @@ pub(crate) fn pf_kv_async_on() -> bool {
     *ON.get_or_init(|| pf_kv_async_from_value(std::env::var("DENNO_PF_KV_ASYNC").ok().as_deref()))
 }
 
+/// task 553: `DENNO_PF_KV_DEFER`。K/V の書き戻しの**待ち**を 1 呼び出し
+/// (= 層チャンク) 後ろへずらす。既定 off (lab で採ったら on にする)。
+pub const PF_KV_DEFER_ENV: &str = "DENNO_PF_KV_DEFER";
+
+/// 未設定のときの既定 (**lab で採るまで off**)。
+pub const DEFAULT_PF_KV_DEFER: bool = false;
+
+/// [`PF_KV_DEFER_ENV`] の解釈 (未設定・空は既定、明示的な偽値だけ off)。
+pub(crate) fn pf_kv_defer_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_PF_KV_DEFER,
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        Some(_) => true,
+    }
+}
+
+#[cfg(test)]
+static PF_KV_DEFER_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_kv_defer_for_test(v: Option<bool>) {
+    PF_KV_DEFER_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// 待ちを後ろへずらすか。
+pub(crate) fn pf_kv_defer_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_KV_DEFER_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_kv_defer_from_value(std::env::var(PF_KV_DEFER_ENV).ok().as_deref()))
+}
+
+/// 待ちを後ろへずらした回数 (分岐が発火した証拠。lab のログに 1 回だけ出す)。
+static PF_KV_DEFER_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 待ちを後ろへずらしたことを数える (呼び出し側は積むのを省く)。
+pub fn pf_kv_defer_note() {
+    let n = PF_KV_DEFER_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 {
+        eprintln!("[pf553] full 層 KV の書き戻しの待ちを 1 呼び出し後ろへずらす (DENNO_PF_KV_DEFER)");
+    }
+}
+
+/// 待ちを後ろへずらした回数。
+pub fn pf_kv_defer_count() -> u64 {
+    PF_KV_DEFER_N.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 非同期の k/v 書き戻しの置き場 (スレッド局所・grow-only)。
-struct KvWbSc {
+///
+/// task 553: 待ちを後ろへずらすときは 2 枚を交互に使う (1 枚だと次の
+/// `begin` がまだ読んでいない転送を上書きしてしまう)。`seq` は古い順に
+/// 流すための通し番号。
+struct KvWbSlot {
     pin: Option<PinMem>,
     ev: Option<CUevent>,
     /// 保留中のバイト数 (k, v)。(0, 0) で保留なし。
     bytes: (usize, usize),
+    /// 保留の持ち主 (層, 行数)。
+    owner: (usize, usize),
+    /// 積んだ順 (0 = 空)。
+    seq: u64,
+}
+
+impl KvWbSlot {
+    const fn new() -> Self {
+        Self {
+            pin: None,
+            ev: None,
+            bytes: (0, 0),
+            owner: (0, 0),
+            seq: 0,
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.bytes.0 > 0
+    }
+}
+
+struct KvWbSc {
+    slots: [KvWbSlot; 2],
+    /// 次に `begin` が書くスロット (`defer` のときだけ交互に進める)。
+    next: usize,
+    /// `begin` の通し番号。
+    seq: u64,
 }
 
 thread_local! {
     static KV_WB_SC: std::cell::RefCell<KvWbSc> = const {
-        std::cell::RefCell::new(KvWbSc { pin: None, ev: None, bytes: (0, 0) })
+        std::cell::RefCell::new(KvWbSc {
+            slots: [KvWbSlot::new(), KvWbSlot::new()],
+            next: 0,
+            seq: 0,
+        })
     };
+}
+
+/// 次に `begin` が使うスロットを選ぶ (純関数。テストで固定する)。
+///
+/// `defer` のときは空いている枚を選ぶ (2 枚交互)。そうでなければ 1 枚しか
+/// 使わない (従来と同じく、保留があるうちは積まない)。
+fn kv_wb_pick_slot(pending: [bool; 2], next: usize, defer: bool) -> Option<usize> {
+    if !defer {
+        return if pending[0] || pending[1] { None } else { Some(0) };
+    }
+    let a = next % 2;
+    if !pending[a] {
+        return Some(a);
+    }
+    let b = (next + 1) % 2;
+    if !pending[b] {
+        return Some(b);
+    }
+    None
+}
+
+/// 一番古い保留スロット。
+fn kv_wb_oldest(s: &KvWbSc) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, sl) in s.slots.iter().enumerate() {
+        if !sl.pending() {
+            continue;
+        }
+        match best {
+            None => best = Some(i),
+            Some(j) if sl.seq < s.slots[j].seq => best = Some(i),
+            _ => {}
+        }
+    }
+    best
 }
 
 /// 保留中の k/v 書き戻しがあるか。
 pub fn pf_kv_wb_pending() -> bool {
-    KV_WB_SC.with(|c| c.borrow().bytes.0 > 0)
+    KV_WB_SC.with(|c| c.borrow().slots.iter().any(KvWbSlot::pending))
+}
+
+/// 一番古い保留の持ち主 `(層, 行数)`。無ければ `None`。
+///
+/// task 553: `DENNO_PF_KV_DEFER` では呼び出し側が「この層チャンクの分が
+/// 保留に載ったか」をこれで確かめてから積むのを後ろへ回す。
+pub fn pf_kv_wb_peek() -> Option<(usize, usize)> {
+    KV_WB_SC.with(|c| {
+        let s = c.borrow();
+        kv_wb_oldest(&s).map(|i| s.slots[i].owner)
+    })
+}
+
+/// 一番古い保留の長さ (k, v の要素数)。無ければ `None`。
+pub fn pf_kv_wb_len() -> Option<(usize, usize)> {
+    KV_WB_SC.with(|c| {
+        let s = c.borrow();
+        kv_wb_oldest(&s).map(|i| (s.slots[i].bytes.0 / 4, s.slots[i].bytes.1 / 4))
+    })
 }
 
 /// k/v を pinned へ非同期で積む (ストリーム順序。待たない)。
 ///
-/// `Ok(false)` = 積まなかった (ゲート off / イベントが取れない / 既に保留あり)。
+/// `Ok(false)` = 積まなかった (ゲート off / イベントが取れない / 空きが無い)。
 fn pf_kv_wb_begin(
     kptr: CUdeviceptr,
     vptr: CUdeviceptr,
     k_bytes: usize,
     v_bytes: usize,
+    layer: usize,
+    rows: usize,
 ) -> Result<bool> {
     if !pf_kv_async_on() || k_bytes == 0 || v_bytes == 0 {
         return Ok(false);
@@ -34155,17 +34309,19 @@ fn pf_kv_wb_begin(
     let (Some(create), Some(record)) = (lib.event_create, lib.event_record) else {
         return Ok(false);
     };
+    let defer = pf_kv_defer_on();
     KV_WB_SC.with(|cell| -> Result<bool> {
         let mut s = cell.borrow_mut();
-        if s.bytes.0 > 0 {
+        let pending = [s.slots[0].pending(), s.slots[1].pending()];
+        let Some(i) = kv_wb_pick_slot(pending, s.next, defer) else {
             return Ok(false);
-        }
+        };
         let total = k_bytes + v_bytes;
-        let need = !matches!(&s.pin, Some(p) if p.bytes >= total);
+        let need = !matches!(&s.slots[i].pin, Some(p) if p.bytes >= total);
         if need {
-            s.pin = Some(PinMem::alloc(total)?);
+            s.slots[i].pin = Some(PinMem::alloc(total)?);
         }
-        let base = s.pin.as_ref().expect("確保済み").ptr as usize;
+        let base = s.slots[i].pin.as_ref().expect("確保済み").ptr as usize;
         unsafe {
             check(
                 (lib.memcpy_dtoh_async)(base as *mut c_void, kptr, k_bytes, std::ptr::null_mut()),
@@ -34181,18 +34337,28 @@ fn pf_kv_wb_begin(
                 "cuMemcpyDtoHAsync (full v)",
             )?;
         }
-        if s.ev.is_none() {
+        if s.slots[i].ev.is_none() {
             let mut ev: CUevent = std::ptr::null_mut();
             if unsafe { create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
                 return Ok(false);
             }
-            s.ev = Some(ev);
+            s.slots[i].ev = Some(ev);
         }
-        let ev = s.ev.expect("作成済み");
+        let ev = s.slots[i].ev.expect("作成済み");
         if unsafe { record(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
             return Ok(false);
         }
-        s.bytes = (k_bytes, v_bytes);
+        s.seq += 1;
+        let seq = s.seq;
+        {
+            let sl = &mut s.slots[i];
+            sl.bytes = (k_bytes, v_bytes);
+            sl.owner = (layer, rows);
+            sl.seq = seq;
+        }
+        if defer {
+            s.next = (i + 1) % 2;
+        }
         Ok(true)
     })
 }
@@ -34201,26 +34367,26 @@ fn pf_kv_wb_begin(
 pub fn pf_kv_wb_copy_into(k_out: &mut [f32], v_out: &mut [f32]) -> bool {
     KV_WB_SC.with(|cell| {
         let mut s = cell.borrow_mut();
-        let (kb, vb) = s.bytes;
-        if kb == 0 {
+        let Some(i) = kv_wb_oldest(&s) else {
             return false;
-        }
+        };
+        let (kb, vb) = s.slots[i].bytes;
         let (kf, vf) = (kb / 4, vb / 4);
-        let Some(pin) = s.pin.as_ref() else {
-            s.bytes = (0, 0);
+        let Some(pin) = s.slots[i].pin.as_ref() else {
+            s.slots[i].bytes = (0, 0);
             return false;
         };
         let base = pin.ptr as usize;
         {
             // task 505: 待ちを台帳に載せる (`full` 段の cpu 列の中身を割る)。
             let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_KVWAIT);
-            if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
+            if let (Some(ev), Some(esync)) = (s.slots[i].ev, lib().ok().and_then(|l| l.event_sync)) {
                 unsafe {
                     let _ = (esync)(ev);
                 }
             }
         }
-        s.bytes = (0, 0);
+        s.slots[i].bytes = (0, 0);
         if k_out.len() < kf || v_out.len() < vf {
             return false;
         }
@@ -34289,25 +34455,25 @@ pub fn pf_kv_push_on() -> bool {
 pub fn pf_kv_wb_with<F: FnOnce(&[f32], &[f32])>(f: F) -> bool {
     KV_WB_SC.with(|cell| {
         let mut s = cell.borrow_mut();
-        let (kb, vb) = s.bytes;
-        if kb == 0 {
+        let Some(i) = kv_wb_oldest(&s) else {
             return false;
-        }
-        let Some(pin) = s.pin.as_ref() else {
-            s.bytes = (0, 0);
+        };
+        let (kb, vb) = s.slots[i].bytes;
+        let Some(pin) = s.slots[i].pin.as_ref() else {
+            s.slots[i].bytes = (0, 0);
             return false;
         };
         let base = pin.ptr as usize;
         // task 505: 待ちを台帳に載せる (`full` 段の cpu 列の中身を割る)。
         {
             let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_KVWAIT);
-            if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
+            if let (Some(ev), Some(esync)) = (s.slots[i].ev, lib().ok().and_then(|l| l.event_sync)) {
                 unsafe {
                     let _ = (esync)(ev);
                 }
             }
         }
-        s.bytes = (0, 0);
+        s.slots[i].bytes = (0, 0);
         // SAFETY: pinned は `kb + vb` バイト以上あり、転送はイベントで完了済み。
         let k = unsafe { std::slice::from_raw_parts(base as *const f32, kb / 4) };
         let v = unsafe { std::slice::from_raw_parts((base + kb) as *const f32, vb / 4) };
@@ -34320,16 +34486,20 @@ pub fn pf_kv_wb_with<F: FnOnce(&[f32], &[f32])>(f: F) -> bool {
 pub fn pf_kv_wb_discard() -> bool {
     KV_WB_SC.with(|cell| {
         let mut s = cell.borrow_mut();
-        if s.bytes.0 == 0 {
-            return false;
-        }
-        if let (Some(ev), Some(esync)) = (s.ev, lib().ok().and_then(|l| l.event_sync)) {
-            unsafe {
-                let _ = (esync)(ev);
+        let mut any = false;
+        for i in 0..s.slots.len() {
+            if !s.slots[i].pending() {
+                continue;
             }
+            any = true;
+            if let (Some(ev), Some(esync)) = (s.slots[i].ev, lib().ok().and_then(|l| l.event_sync)) {
+                unsafe {
+                    let _ = (esync)(ev);
+                }
+            }
+            s.slots[i].bytes = (0, 0);
         }
-        s.bytes = (0, 0);
-        true
+        any
     })
 }
 
@@ -66387,6 +66557,41 @@ mod task318_tests {
         assert!(!pf_kv_push_from_value(None), "既定が on になっている");
     }
 
+    /// task 553: `DENNO_PF_KV_DEFER` の解釈 (既定 off、明示的な偽値だけ off)。
+    #[test]
+    fn t553_kv_defer_gate_truth_table() {
+        assert!(!pf_kv_defer_from_value(None), "既定が on になっている");
+        assert!(!pf_kv_defer_from_value(Some("")), "空で on になっている");
+        for raw in [Some("0"), Some("off"), Some("FALSE"), Some(" no ")] {
+            assert!(!pf_kv_defer_from_value(raw), "raw={raw:?} が on になっている");
+        }
+        for raw in [Some("1"), Some("on"), Some("true"), Some("yes")] {
+            assert!(pf_kv_defer_from_value(raw), "raw={raw:?} が off になっている");
+        }
+    }
+
+    /// task 553: 2 枚のスロットの選び方。
+    ///
+    /// ずらさないときは 1 枚だけ (保留があるうちは積まない = 従来と同じ)、
+    /// ずらすときは空きを交互に使う。両方埋まっていれば積まない
+    /// (上書きしない)。
+    #[test]
+    fn t553_kv_wb_pick_slot_rotates_and_never_overwrites() {
+        // 従来 (defer off): 保留が無ければ 0 番、あれば None。
+        assert_eq!(kv_wb_pick_slot([false, false], 0, false), Some(0));
+        assert_eq!(kv_wb_pick_slot([true, false], 0, false), None);
+        assert_eq!(kv_wb_pick_slot([false, true], 0, false), None);
+        // defer on: next の枚が空いていればそこ、埋まっていればもう 1 枚。
+        assert_eq!(kv_wb_pick_slot([false, false], 0, true), Some(0));
+        assert_eq!(kv_wb_pick_slot([false, false], 1, true), Some(1));
+        assert_eq!(kv_wb_pick_slot([true, false], 1, true), Some(1));
+        assert_eq!(kv_wb_pick_slot([true, false], 0, true), Some(1));
+        assert_eq!(kv_wb_pick_slot([false, true], 1, true), Some(0));
+        // 両方埋まっていれば上書きしない。
+        assert_eq!(kv_wb_pick_slot([true, true], 0, true), None);
+        assert_eq!(kv_wb_pick_slot([true, true], 1, true), None);
+    }
+
     /// task 369: 保留が無いとき `pf_kv_wb_with` は closure を呼ばず false を返す。
     #[test]
     fn t369_kv_wb_with_without_pending_does_not_call() {
@@ -66403,7 +66608,7 @@ mod task318_tests {
         set_pf_kv_async_for_test(Some(false));
         assert!(!pf_kv_async_on());
         assert!(
-            matches!(pf_kv_wb_begin(1, 2, 64, 64), Ok(false)),
+            matches!(pf_kv_wb_begin(1, 2, 64, 64, 0, 0), Ok(false)),
             "ゲート off で積もうとした"
         );
         assert!(!pf_kv_wb_pending(), "ゲート off なのに保留が立った");

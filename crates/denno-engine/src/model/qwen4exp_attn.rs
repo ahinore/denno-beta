@@ -2285,6 +2285,12 @@ impl FullAttn {
     }
     /// キャッシュを空にし、位置も 0 に戻す。
     pub fn reset(&mut self) {
+        // task 553: 保留にした KV を先に積んでから空にする (積んだまま捨てると
+        // 次のリクエストの最初の層チャンクが前の文脈の行を積む)。
+        #[cfg(feature = "cuda")]
+        {
+            let _ = self.kv_flush_deferred();
+        }
         self.cache.clear_all();
         self.pos = 0;
         if let Some(q) = self.qsa.as_mut() {
@@ -2331,6 +2337,10 @@ impl FullAttn {
                 self.cache.n_layer()
             );
         }
+        // task 553: 保留にした KV を先に積む (積まずに切り詰めると、あとから
+        // 巻き戻した位置の行が積まれて長さが合わなくなる)。
+        #[cfg(feature = "cuda")]
+        self.kv_flush_deferred()?;
         for (layer, &len) in snap.lens.iter().enumerate() {
             self.cache.truncate_layer(layer, len)?;
         }
@@ -2381,6 +2391,10 @@ impl FullAttn {
         // 続けて 2 回呼ばれた場合と「次のトークン」が区別できない (token-major の
         // 共有 pos があって初めて区別できた)。守りは 16 トークンの参照一致
         // (real_model_greedy_matches_llamacpp) と全テストで取る。
+        // task 553: 保留にした KV を先に積む (`cache.len` を読む前)。decode では
+        // prefill の最後の層チャンクの保留がここで降りる。
+        #[cfg(feature = "cuda")]
+        self.kv_flush_deferred()?;
         let pos = self.cache.len(layer)?;
         if pos >= self.cache.max_ctx() {
             bail!("FullAttn::forward: 層 {layer} が容量 max_ctx = {} に達した", self.cache.max_ctx());
@@ -2433,6 +2447,49 @@ impl FullAttn {
         Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect())
     }
 
+    /// task 553: `DENNO_PF_KV_DEFER` で後ろへ回した KV の書き戻しをここで積む。
+    ///
+    /// 前の呼び出し (層チャンク) の D2H はそのあいだに GPU が 1 回転ぶん
+    /// (mix / MoE / ssm) 働くので、`cuEventSynchronize` はほぼ即返る。
+    /// 積むバイト列は従来と同じ (`AttnCache::push_many` の値も同じ)。
+    ///
+    /// 呼ぶ場所は **`cache.len(layer)` を読む前**でなければならない
+    /// (保留があると長さが 1 チャンクぶん短い = 位置がずれる)。
+    #[cfg(feature = "cuda")]
+    fn kv_flush_deferred(&mut self) -> Result<()> {
+        if !crate::cuda::pf_kv_defer_on() {
+            return Ok(());
+        }
+        let cache = &mut self.cache;
+        while let Some((layer, nt)) = crate::cuda::pf_kv_wb_peek() {
+            let mut err: Option<anyhow::Error> = None;
+            // task 553: push の経路 (`DENNO_PF_KV_PUSH` / `DENNO_PF_KV_BULK`) に
+            // かかわらず 1 回の `push_many` で積む (値も順序も同じ)。
+            let used = crate::cuda::pf_kv_wb_with(|k: &[f32], v: &[f32]| {
+                if let Err(e) = cache.push_many(layer, k, v, nt) {
+                    err = Some(e);
+                }
+            });
+            if !used {
+                let Some((kf, vf)) = crate::cuda::pf_kv_wb_len() else {
+                    break;
+                };
+                if kf == 0 {
+                    break;
+                }
+                let mut k = vec![0f32; kf];
+                let mut v = vec![0f32; vf];
+                if crate::cuda::pf_kv_wb_copy_into(&mut k, &mut v) {
+                    cache.push_many(layer, &k, &v, nt)?;
+                }
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// task 200: [`Self::forward_batch`] の平坦版。入力 `flat` (`nt` 行 ×
     /// `n_embd`) をそのまま使い、出力も平坦な 1 本で返す (トークンごとの
     /// `Vec<f32>` を作らない)。数値は [`Self::forward_batch`] とビット一致する。
@@ -2446,6 +2503,9 @@ impl FullAttn {
         if nt == 0 {
             return Ok(Vec::new());
         }
+        // task 553: 保留にした KV を先に積む (`cache.len` を読む前に)。
+        #[cfg(feature = "cuda")]
+        self.kv_flush_deferred()?;
         if flat.len() != nt * n_embd {
             bail!(
                 "FullAttn::forward_batch_flat: 入力長 {} が nt={nt} * n_embd={n_embd} と違う",
@@ -2810,43 +2870,54 @@ impl FullAttn {
             // `DENNO_PF_KV_PUSH` では pinned から直接積む (ks/vs への写しを省く)。
             // task 393: `DENNO_PF_KV_BULK` では pinned から **1 回の写し**で積む
             // (2,048 回の `push` を 1 回の `push_many` にする。値は同じ)。
-            let mut err = None;
-            let used = (crate::cuda::pf_kv_push_on() || kv_bulk)
-                && crate::cuda::pf_kv_wb_with(|k: &[f32], v: &[f32]| {
-                    if kv_bulk {
-                        if let Err(e) = self.cache.push_many(layer, k, v, nt) {
-                            err = Some(e);
-                        }
-                        return;
-                    }
-                    for t in 0..nt {
-                        if let Err(e) = self.cache.push(
-                            layer,
-                            &k[t * kv..(t + 1) * kv],
-                            &v[t * kv..(t + 1) * kv],
-                        ) {
-                            err = Some(e);
+            //
+            // task 553: `DENNO_PF_KV_DEFER` では、この層チャンクの D2H が保留に
+            // 載っているなら積むのを次の呼び出し (次の層チャンク) の頭まで回す。
+            // 次の `forward_batch_flat` / `forward_token` が `kv_flush_deferred`
+            // で積む。1 回転ぶん GPU が働くので `cuEventSynchronize` が消える。
+            let kv_defer_this = crate::cuda::pf_kv_defer_on()
+                && crate::cuda::pf_kv_wb_peek() == Some((layer, nt));
+            if kv_defer_this {
+                crate::cuda::pf_kv_defer_note();
+            } else {
+                let mut err = None;
+                let used = (crate::cuda::pf_kv_push_on() || kv_bulk)
+                    && crate::cuda::pf_kv_wb_with(|k: &[f32], v: &[f32]| {
+                        if kv_bulk {
+                            if let Err(e) = self.cache.push_many(layer, k, v, nt) {
+                                err = Some(e);
+                            }
                             return;
                         }
-                    }
-                });
-            if !used {
-                crate::cuda::pf_kv_wb_copy_into(&mut kv_scratch.k, &mut kv_scratch.v);
-                if kv_bulk {
-                    self.cache
-                        .push_many(layer, &kv_scratch.k, &kv_scratch.v, nt)?;
-                } else {
-                    for t in 0..nt {
-                        self.cache.push(
-                            layer,
-                            &kv_scratch.k[t * kv..(t + 1) * kv],
-                            &kv_scratch.v[t * kv..(t + 1) * kv],
-                        )?;
+                        for t in 0..nt {
+                            if let Err(e) = self.cache.push(
+                                layer,
+                                &k[t * kv..(t + 1) * kv],
+                                &v[t * kv..(t + 1) * kv],
+                            ) {
+                                err = Some(e);
+                                return;
+                            }
+                        }
+                    });
+                if !used {
+                    crate::cuda::pf_kv_wb_copy_into(&mut kv_scratch.k, &mut kv_scratch.v);
+                    if kv_bulk {
+                        self.cache
+                            .push_many(layer, &kv_scratch.k, &kv_scratch.v, nt)?;
+                    } else {
+                        for t in 0..nt {
+                            self.cache.push(
+                                layer,
+                                &kv_scratch.k[t * kv..(t + 1) * kv],
+                                &kv_scratch.v[t * kv..(t + 1) * kv],
+                            )?;
+                        }
                     }
                 }
-            }
-            if let Some(e) = err {
-                return Err(e);
+                if let Some(e) = err {
+                    return Err(e);
+                }
             }
         }
         if self.pos < base + nt {
@@ -2949,6 +3020,21 @@ impl LayerAttn for FullAttn {
     /// P118: KV・pos・QSA を空にする (固有の [`FullAttn::reset`] へ委譲)。
     fn reset(&mut self) {
         FullAttn::reset(self)
+    }
+
+    /// task 553: 後ろへ回した KV の書き戻しを今すぐ積む。
+    fn flush_deferred(
+        &mut self,
+    ) -> std::result::Result<(), crate::model::qwen4exp::Qwen4ExpError> {
+        #[cfg(feature = "cuda")]
+        {
+            self.kv_flush_deferred()
+                .map_err(|e| crate::model::qwen4exp::Qwen4ExpError(vec![format!("{e:#}")]))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Ok(())
+        }
     }
 
     /// P109: QSA 無効なら KV の長さ戻しで巻き戻せる。
