@@ -14413,3 +14413,63 @@ fn t490_wide_window_budget_is_wired() {
         "選んだ KiB を early_route_budget に渡していない"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 514: UD-Q4_K_XL のホスト側 (page cache / RAM tier / 追い出し) の計器と
+// リクエスト終端の page cache drop の配線。
+// ---------------------------------------------------------------------------
+
+const EXPERT_RAM_SRC: &str = include_str!("../src/model/expert_ram.rs");
+
+/// task 514: 計器と配線。
+///
+/// - `/proc/self/io` の差分 (`io_read_MB` = ディスクから読んだ実バイト) と
+///   モデル全体の常駐量 (`file_resident`) が `[exp-ram-probe]` に出る。
+/// - `DENNO_PF_FADV_END=1` でリクエスト終端に expert 範囲を落とす。
+/// - `probe_line` は**従来どおり** `DENNO_EXPERT_RAM_PROBE` / `DENNO_Q4_PROFILE`
+///   でしか動かない (既定のログを増やさない)。
+/// - drop の呼び出しは serve の**リクエスト終端** (probe_line の直後) にあり、
+///   先頭の `drop_pages_if_enabled` とは別のゲート。
+#[test]
+fn t514_host_page_cache_instruments_and_end_drop_are_wired() {
+    for k in [
+        "pub const FADV_END_ENV: &str = \"DENNO_PF_FADV_END\"",
+        "pub fn fadv_end_enabled()",
+        "pub fn drop_expert_pages_end(tag: &str) -> Option<String>",
+        "fn proc_io()",
+        "pub fn install_part_map(",
+        "io_rchar_MB={:.1} io_read_MB={:.1}",
+        "file_resident={}MiB/{}MiB",
+        "expert_resident={}MiB->{}MiB file_resident={}MiB->{}MiB",
+    ] {
+        assert!(EXPERT_RAM_SRC.contains(k), "expert_ram に {k} が無い");
+    }
+    // 終端の drop はゲートを先に読み、`drop_ranges` を呼ぶ (mincore は probe のときだけ)。
+    let f = fn_body(EXPERT_RAM_SRC, "pub fn drop_expert_pages_end(");
+    let gate = f.find("fadv_end_enabled()").expect("ゲートが無い");
+    let drop = f.find("drop_ranges(&parts, &ranges)").expect("drop_ranges が無い");
+    assert!(gate < drop, "ゲートの判定が drop より後ろにある");
+    assert!(
+        f.contains("let probe = flag(PROBE_ENV);"),
+        "mincore を probe のときだけにしていない"
+    );
+    // モデルの全パートの mmap を覚える (file_resident 用)。
+    assert!(
+        QWEN_SRC.contains("expert_ram::install_part_map(pmap)"),
+        "qwen4exp が part map を入れていない"
+    );
+    // リクエスト終端 (統計を出す関数) から呼ぶ。先頭の診断 drop とは別物。
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::expert_ram::drop_expert_pages_end(tag)"),
+        "終端の drop が serve_flash に無い"
+    );
+    assert!(
+        SERVE_FLASH_SRC.contains("denno_engine::model::expert_ram::probe_line(tag)"),
+        "probe_line の配線が無い"
+    );
+    // 既定 off: ゲートを読まない限り数値経路もログも変わらない。
+    assert!(
+        EXPERT_RAM_SRC.contains("\"off\"") || EXPERT_RAM_SRC.contains("Some(\"1\") | Some(\"true\")"),
+        "flag の解釈が無い"
+    );
+}

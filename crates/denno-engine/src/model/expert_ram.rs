@@ -441,6 +441,28 @@ static PARTS: RwLock<Vec<std::path::PathBuf>> = RwLock::new(Vec::new());
 static MMAP: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
 /// 前回の (minflt, majflt)。
 static LAST_FAULTS: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+/// 前回の `/proc/self/io` の (rchar, read_bytes)。task 514。
+static LAST_IO: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+/// モデル全パートの mmap (ptr, len)。「モデル全体で page cache に何 MiB」を測る。task 514。
+static PARTMAP: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+
+/// task 514: `DENNO_PF_FADV_END=1` で**リクエスト終端**に expert 範囲の page cache を
+/// `posix_fadvise(DONTNEED)` で落とす。**既定 off**。
+///
+/// なぜ終端か: このコンテナ (kernel 7.0.0) で実測した挙動 —
+/// (a) mmap してフォールトしたページは `fadvise(DONTNEED)` では落ちない
+/// (mapcount > 0 のページは invalidate されない。`/tmp/pc_test2.py` の実測:
+/// 64 MiB をフォールト → drop 後も 65,536 KiB のまま)、(b) pread で page cache に
+/// 入っただけのページは落ちる (同 0 KiB)。
+/// つまりこの drop は **pread の読み残しだけ**を落とし、mmap で使ったページは
+/// 残す。目的は「expert の pread (リクエストあたり 43-53 GB) が dense / PLE の
+/// page cache を追い出し続ける」のを止めること。
+pub const FADV_END_ENV: &str = "DENNO_PF_FADV_END";
+
+/// [`FADV_END_ENV`] が on か。
+pub fn fadv_end_enabled() -> bool {
+    flag(FADV_END_ENV)
+}
 
 fn flag(k: &str) -> bool {
     matches!(
@@ -476,6 +498,80 @@ pub fn install_ranges(
     *PARTS.write().unwrap_or_else(|e| e.into_inner()) = parts;
     *RANGES.write().unwrap_or_else(|e| e.into_inner()) = ranges;
     *MMAP.write().unwrap_or_else(|e| e.into_inner()) = mmap;
+}
+
+/// task 514: `/proc/self/io` の (rchar, read_bytes)。
+///
+/// `read_bytes` は**ディスクから実際に読んだ**バイト (page cache で済んだぶんは
+/// 入らない)。`rchar` は read 系 (pread / readahead を含む) の要求バイト。
+/// この 2 つの差が「page cache が効いたぶん」になる。
+fn proc_io() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/io").ok()?;
+    let mut rchar = None;
+    let mut read_bytes = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("rchar: ") {
+            rchar = v.trim().parse::<u64>().ok();
+        } else if let Some(v) = line.strip_prefix("read_bytes: ") {
+            read_bytes = v.trim().parse::<u64>().ok();
+        }
+    }
+    Some((rchar?, read_bytes?))
+}
+
+/// task 514: モデル全パートの mmap 範囲を覚える (page cache の常駐量を測る)。
+pub fn install_part_map(v: Vec<(usize, usize)>) {
+    *PARTMAP.write().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// expert テンソルの mmap の常駐バイト (mincore の合計)。
+fn expert_resident() -> u64 {
+    let mm = MMAP.read().unwrap_or_else(|e| e.into_inner());
+    mm.iter().map(|&(p, l)| resident_bytes(p, l)).sum()
+}
+
+/// モデル全体の mmap の常駐バイト (mincore の合計)。dense / PLE も含む。
+fn file_resident() -> u64 {
+    let pm = PARTMAP.read().unwrap_or_else(|e| e.into_inner());
+    pm.iter().map(|&(p, l)| resident_bytes(p, l)).sum()
+}
+
+/// task 514: リクエスト終端で expert 範囲の page cache を落とす。
+///
+/// ゲート ([`FADV_END_ENV`]) off なら `None`。落とせるのは **mapcount 0 の
+/// ページだけ** なので、mmap で使ったページは残り、pread の読み残しだけが
+/// 消える (モジュール冒頭の実測を参照)。
+pub fn drop_expert_pages_end(tag: &str) -> Option<String> {
+    if !fadv_end_enabled() {
+        return None;
+    }
+    let parts = PARTS.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let ranges = RANGES.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if parts.is_empty() || ranges.is_empty() {
+        return Some(format!(
+            "[exp-pc-end] {tag} 範囲が未登録なので落とせない ({FADV_END_ENV})"
+        ));
+    }
+    let probe = flag(PROBE_ENV);
+    let (before, before_file) = if probe {
+        (expert_resident(), file_resident())
+    } else {
+        (0, 0)
+    };
+    let t0 = std::time::Instant::now();
+    let line = drop_ranges(&parts, &ranges);
+    let s = t0.elapsed().as_secs_f64();
+    let mut out = format!("[exp-pc-end] {tag} s={s:.2} {line}");
+    if probe {
+        out.push_str(&format!(
+            " expert_resident={}MiB->{}MiB file_resident={}MiB->{}MiB",
+            before >> 20,
+            expert_resident() >> 20,
+            before_file >> 20,
+            file_resident() >> 20
+        ));
+    }
+    Some(out)
 }
 
 /// `/proc/self/stat` の (minflt, majflt)。
@@ -536,6 +632,20 @@ pub fn probe_line(tag: &str) -> Option<String> {
         "[exp-ram-probe] {tag} minflt={dm} majflt={dM} memavail={}MiB",
         mem_available().map(|b| b >> 20).unwrap_or(0)
     );
+    // task 514: ディスクから実際に読んだバイト (`/proc/self/io`)。
+    // `io_read_MB` がタスク文の「disk bytes」、`io_rchar_MB` は read 系の要求量。
+    if let Some((rc, rb)) = proc_io() {
+        let mut g = LAST_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let d = (
+            rc.saturating_sub(g.0) as f64 / 1e6,
+            rb.saturating_sub(g.1) as f64 / 1e6,
+        );
+        *g = (rc, rb);
+        line.push_str(&format!(
+            " io_rchar_MB={:.1} io_read_MB={:.1}",
+            d.0, d.1
+        ));
+    }
     if flag(PROBE_ENV) {
         let ranges = MMAP.read().unwrap_or_else(|e| e.into_inner());
         let mut res = 0u64;
@@ -554,6 +664,22 @@ pub fn probe_line(tag: &str) -> Option<String> {
                 0.0
             }
         ));
+        // task 514: モデル全体 (dense / PLE を含む) の常駐。差分が「expert 以外」。
+        let fr = file_resident();
+        let ftot: u64 = PARTMAP
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|&(_, l)| l as u64)
+            .sum();
+        if ftot > 0 {
+            line.push_str(&format!(
+                " file_resident={}MiB/{}MiB ({:.1}%)",
+                fr >> 20,
+                ftot >> 20,
+                fr as f64 * 100.0 / ftot as f64
+            ));
+        }
     }
     Some(line)
 }
@@ -826,5 +952,119 @@ mod tests {
             return; // ゲートを立てて走らせている環境では検査しない
         }
         assert!(drop_pages_if_enabled().is_empty());
+    }
+
+    /// task 514: `DENNO_PF_FADV_END` の終端 drop もゲート off なら `None`。
+    #[test]
+    fn end_drop_is_inert_without_the_gate() {
+        if std::env::var(FADV_END_ENV).is_ok() {
+            return;
+        }
+        assert!(drop_expert_pages_end("test").is_none());
+    }
+
+    /// task 514: この環境での `posix_fadvise(DONTNEED)` の挙動を固定する。
+    ///
+    /// 実測 (kernel 7.0.0): **mapcount 0 のページは落ちる**が、
+    /// **mmap してフォールトしたページは落ちない**。`DENNO_PF_FADV_END` を
+    /// 「リクエスト終端に expert 範囲を落とす」設計にしたのはこの性質のため
+    /// (pread の読み残しだけが消え、mmap で使ったページは残る)。
+    #[test]
+    #[cfg(unix)]
+    fn fadvise_drops_unmapped_but_not_mapped_pages() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join("denno_t514_fadv");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("f.bin");
+        let n = 8usize << 20;
+        {
+            let mut f = std::fs::File::create(&p).expect("create");
+            f.write_all(&vec![9u8; n]).expect("write");
+            f.sync_all().expect("sync");
+        }
+        let file = std::fs::File::open(&p).expect("open");
+        let map = unsafe { memmap2::Mmap::map(&file).expect("mmap") };
+        let ptr = map.as_ptr() as usize;
+        let parts = vec![p.clone()];
+        let ranges = vec![(0usize, 0u64, n as u64)];
+
+        // (1) pread で page cache に入れる (まだ 1 ページもフォールトしていない)。
+        let mut buf = vec![0u8; n];
+        let mut off = 0usize;
+        while off < n {
+            let got = file.read_at(&mut buf[off..], off as u64).expect("pread");
+            off += got;
+        }
+        assert!(buf[n - 1] == 9);
+        let before = resident_bytes(ptr, n);
+        assert_eq!(before, n as u64, "pread のページが常駐していない: {before}");
+        let _ = drop_ranges(&parts, &ranges);
+        assert_eq!(
+            resident_bytes(ptr, n),
+            0,
+            "unmapped のページが落ちていない"
+        );
+
+        // (2) mmap でフォールトしてから落とす → 残る。
+        let mut s = 0u64;
+        for i in (0..n).step_by(4096) {
+            s += map[i] as u64;
+        }
+        assert!(s > 0);
+        let faulted = resident_bytes(ptr, n);
+        assert!(faulted >= (n as u64) / 2, "フォールトしていない: {faulted}");
+        let _ = drop_ranges(&parts, &ranges);
+        assert!(
+            resident_bytes(ptr, n) >= faulted / 2,
+            "mapped のページまで落ちている (設計と違う)"
+        );
+    }
+
+    /// task 514: `/proc/self/io` の差分が読める (read した量が rchar に出る)。
+    #[test]
+    #[cfg(unix)]
+    fn proc_io_see_pread_bytes() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join("denno_t514_io");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("i.bin");
+        let n = 4usize << 20;
+        {
+            let mut f = std::fs::File::create(&p).expect("create");
+            f.write_all(&vec![1u8; n]).expect("write");
+        }
+        let (r0, b0) = proc_io().expect("/proc/self/io");
+        let file = std::fs::File::open(&p).expect("open");
+        let mut buf = vec![0u8; n];
+        let mut off = 0usize;
+        while off < n {
+            let got = file.read_at(&mut buf[off..], off as u64).expect("pread");
+            off += got;
+        }
+        let (r1, b1) = proc_io().expect("/proc/self/io");
+        assert!(
+            r1.saturating_sub(r0) >= n as u64,
+            "rchar の差分が足りない: {} < {n}",
+            r1 - r0
+        );
+        // read_bytes は「ディスクから読んだ」ぶんなので 0 でもよい (page cache)。
+        assert!(b1 >= b0);
+    }
+
+    /// task 514: `install_part_map` が覚えた範囲で `file_resident` が数えられる。
+    #[test]
+    fn part_map_is_used_by_file_resident() {
+        let n = 4 << 20;
+        let mut v = vec![0u8; n];
+        for i in (0..n).step_by(4096) {
+            v[i] = 7;
+        }
+        install_part_map(vec![(v.as_ptr() as usize, n)]);
+        let r = file_resident();
+        assert!(r >= (n as u64) / 2, "file_resident が数えていない: {r}");
+        install_part_map(Vec::new());
+        assert_eq!(file_resident(), 0);
     }
 }
