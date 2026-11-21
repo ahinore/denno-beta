@@ -2774,8 +2774,14 @@ pub fn odirect_window(dst: usize, at: u64, len: usize, align: usize) -> Option<(
 /// 値は 1 バイトも変わらない (同じバイトを同じ場所へ書く)。
 pub const ODB_ENV: &str = "DENNO_PF_PREAD_ODIRECT_BOUNCE";
 
-/// [`ODB_ENV`] の既定値 (off)。task 546 で A/B して決める。
-pub const DEFAULT_ODB: bool = false;
+/// [`ODB_ENV`] の既定値 (**on**、task 546 で採った)。
+///
+/// lab t546b (UD-Q4_K_XL、depth8k、2 ラウンド同順): 3,826 cold が
+/// b 10,220 / 9,401 ms -> odb **9,197 / 8,730** (**-8.6 / -7.1%**)、
+/// `copy_s` 8.80 / 8.00 -> **7.79 / 7.37**、ディスクの実効 2.19 -> 2.48 GB/s。
+/// 14k cold は 13,690 -> 12,140 (-11.3%、1 サンプル)。decode は不変、
+/// 既定モデルは `src` を持たないので不活性 (`odb_MB` が出ない)。
+pub const DEFAULT_ODB: bool = true;
 
 /// [`ODB_ENV`] の解釈 (純関数)。明示的な真値だけ on。
 pub fn odb_from_value(v: Option<&str>) -> bool {
@@ -7317,7 +7323,7 @@ mod tests {
     #[test]
     fn task546_od_bounce_shape_covers_and_aligns() {
         assert_eq!(ODB_ENV, "DENNO_PF_PREAD_ODIRECT_BOUNCE");
-        assert!(!DEFAULT_ODB, "task 546 の採否は lab で決める");
+        assert!(DEFAULT_ODB, "task 546 の lab (t546b) で採った = 既定 on");
         for &(off, len) in &[
             (0u64, 1usize),
             (0, 4096),
@@ -7341,8 +7347,8 @@ mod tests {
     /// task 546: ゲートの解釈 (明示的な真値だけ on) と台帳の書式。
     #[test]
     fn task546_odb_gate_truth_table() {
-        assert!(!odb_from_value(None));
-        assert!(!odb_from_value(Some("")));
+        assert!(odb_from_value(None), "既定 on (task 546 の lab で採った)");
+        assert!(odb_from_value(Some("")), "空は既定 (on)");
         assert!(!odb_from_value(Some("0")));
         assert!(!odb_from_value(Some("off")));
         assert!(odb_from_value(Some("1")));

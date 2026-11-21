@@ -14494,16 +14494,30 @@ fn t538_staging_disk_inflight_is_counted() {
         assert!(EXP_PF_SRC.contains(k), "台帳の定義が無い: {k}");
     }
     let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
-    let ent = cp.find("exp_pf::note_rd_enter(len)").expect("enter が無い");
     let rd = cp
         .find("exp_pf::read_part_ptr(part, at, dst, len)")
         .expect("pread が無い");
-    let lv = cp.find("exp_pf::note_rd_leave()").expect("leave が無い");
+    // task 546: buffered pread を挟む対 (バウンス経路の対が手前にあるので、
+    // pread の直前の enter と直後の leave を取る)。
+    let ent = cp[..rd]
+        .rfind("exp_pf::note_rd_enter(len)")
+        .expect("enter が無い");
+    let lv = cp[rd..]
+        .find("exp_pf::note_rd_leave()")
+        .map(|i| rd + i)
+        .expect("leave が無い");
     assert!(ent < rd && rd < lv, "pread の両側に無い");
+    // task 546: O_DIRECT バウンスの読みも同時本数に数えるので、enter/leave は
+    // buffered pread とバウンスの 2 対。片方だけだと本数が単調増加する。
     assert_eq!(
         cp.matches("exp_pf::note_rd_enter(").count(),
-        1,
-        "enter は 1 か所だけ (二重に数えない)"
+        2,
+        "enter は 2 か所 (buffered pread と O_DIRECT バウンス)"
+    );
+    assert_eq!(
+        cp.matches("exp_pf::note_rd_leave()").count(),
+        2,
+        "leave は enter と同じ数"
     );
     // グループごとの塊の選択 (`DENNO_PF_SPLIT_WIDE_KB`): 分割の大きさは
     // `split_chunk_for` で決め、`src` を持つグループだけ広げる。
