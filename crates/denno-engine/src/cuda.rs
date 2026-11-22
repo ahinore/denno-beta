@@ -23840,15 +23840,24 @@ pub fn sh_gu_loaded() -> bool {
     sh_gu_kernels().is_some()
 }
 
-/// `DENNO_DEC_SH_GU` の解釈 (純関数)。**明示的な真値のときだけ on**。
+/// `DENNO_DEC_SH_GU` の解釈 (純関数)。未設定は既定 (on)、明示的な偽値だけ off。
+///
+/// lab t576b (既定モデル、depth8k、2 ラウンド交互) で採った:
+/// **shared 段 0.58 -> 0.45 ms/token (-22%、起動 192 -> 96 本/token)、
+/// step 9.97/10.01 -> 9.85/9.81 (-1.2% / -2.0%)、decode 中央値 10.0 -> 9.8
+/// (-2.0%)、他の段は不変、md5 全 COND 全 6 文脈 SAME、errors 0**。
+/// 切り戻しは `DENNO_DEC_SH_GU=0`。
 fn parse_sh_gu(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    match raw {
+        None => true,
+        Some(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            !matches!(s.as_str(), "" | "0" | "off" | "false" | "no")
+        }
+    }
 }
 
-/// 融合経路を使うか (`DENNO_DEC_SH_GU`、既定 **off**。lab で採ったら on にする)。
+/// 融合経路を使うか (`DENNO_DEC_SH_GU`、既定 **on**。切り戻しは `=0`)。
 fn sh_gu_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| parse_sh_gu(std::env::var("DENNO_DEC_SH_GU").ok().as_deref()))
@@ -50470,14 +50479,14 @@ mod tests {
     // task 576: shared gate+up+silu 融合の真理値表と、索引算術の CPU ミラー
     // -----------------------------------------------------------------------
 
-    /// `DENNO_DEC_SH_GU` は既定 off・明示的な真値だけ on。
+    /// `DENNO_DEC_SH_GU` は既定 on・明示的な偽値だけ off。
     #[test]
     fn sh_gu_gate_truth_table() {
-        assert!(!parse_sh_gu(None), "未設定は既定 off");
-        for v in ["", "0", "off", "false", "no", "2", "yes"] {
+        assert!(parse_sh_gu(None), "未設定は既定 on");
+        for v in ["", "0", "off", "false", "no", " OFF ", " FALSE "] {
             assert!(!parse_sh_gu(Some(v)), "raw={v:?}");
         }
-        for v in ["1", "on", "true", " ON ", " TRUE "] {
+        for v in ["1", "on", "true", "yes", "2"] {
             assert!(parse_sh_gu(Some(v)), "raw={v:?}");
         }
     }
