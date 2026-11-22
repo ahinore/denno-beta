@@ -23755,6 +23755,191 @@ fn sh_cache_insert(jobs: &[&SharedGemvJob<'_>; 3], plans: &[MoeGemvPlan], pins: 
     });
 }
 
+// ---------------------------------------------------------------------------
+// task 576: shared expert の gate + up + silu*mul を 1 発に畳む (`DENNO_DEC_SH_GU`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t572b の `[q4ledger] shared`、既定モデル warm 短 decode):
+//   段 0.59 ms/token のうち launch=0.24 (192 本 = 48 層 x 4) + cpu=0.21 で
+//   **sh_wait は 0.05** = 段は GPU ではなくホストの投入で決まっている。
+//   1 層 4 発のうち gate と up は同じ x を読み、silu は 640 要素 (0.9 us)。
+//   起動 3 本を 1 本にすれば 2 本 x 48 層 = 96 本/token が消える。
+//
+// 数値: 1 行の積和は `kernels_moe_v5.cu::dno_gemv_q8_0_v5` と同じ演算列
+// (アキュムレータ 4 本 / `j & 3` / ブロック 0 -> 1 / shfl 1,2,4...)、silu は
+// `kernels_dec_epi.cu::dno_dec_silu_mul` と同じ式。**ビット一致**。
+
+/// 新カーネル名 (`kernels_sh_gu.cu`)。
+const SH_GU_KERNEL_NAME: &str = "dno_dec_sh_gateup_silu";
+/// 引数の数 (wg, wu, x, act, n_in, n_out, row_bytes, rows_per_block, lanes)。
+const SH_GU_NARGS: usize = 9;
+
+struct ShGuKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for ShGuKernels {}
+unsafe impl Sync for ShGuKernels {}
+
+static SH_GU_KERNELS: OnceLock<Option<ShGuKernels>> = OnceLock::new();
+
+fn sh_gu_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_SH_GU_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_sh_gu.ptx"),
+    }
+}
+
+/// 新カーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn sh_gu_kernels() -> Option<&'static ShGuKernels> {
+    SH_GU_KERNELS
+        .get_or_init(|| {
+            let path = sh_gu_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, SH_GU_KERNEL_NAME) != Some(SH_GU_NARGS) {
+                eprintln!(
+                    "[sh-gu] PTX の引数が {SH_GU_NARGS} 本でない → v5 (gate/up 2 発) へ。\
+                     `bash build_ptx.sh sh_gu` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = SH_GU_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[sh-gu] PTX に {SH_GU_KERNEL_NAME} が無い → v5 (gate/up 2 発) へ");
+                    return None;
+                }
+                Some(ShGuKernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 新カーネルが載っているか (テスト / 診断用)。
+pub fn sh_gu_loaded() -> bool {
+    sh_gu_kernels().is_some()
+}
+
+/// `DENNO_DEC_SH_GU` の解釈 (純関数)。未設定は既定 (on)、明示的な偽値だけ off。
+///
+/// lab t576b (既定モデル、depth8k、2 ラウンド交互) で採った:
+/// **shared 段 0.58 -> 0.45 ms/token (-22%、起動 192 -> 96 本/token)、
+/// step 9.97/10.01 -> 9.85/9.81 (-1.2% / -2.0%)、decode 中央値 10.0 -> 9.8
+/// (-2.0%)、他の段は不変、md5 全 COND 全 6 文脈 SAME、errors 0**。
+/// 切り戻しは `DENNO_DEC_SH_GU=0`。
+fn parse_sh_gu(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            !matches!(s.as_str(), "" | "0" | "off" | "false" | "no")
+        }
+    }
+}
+
+/// 融合経路を使うか (`DENNO_DEC_SH_GU`、既定 **on**。切り戻しは `=0`)。
+fn sh_gu_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_sh_gu(std::env::var("DENNO_DEC_SH_GU").ok().as_deref()))
+}
+
+/// 融合経路の門番 (純関数)。`.cu` の前提をここで全部見る。
+///
+/// - Q8_0 (ホスト側で別途) / `n_in % 64 == 0` / 32 要素ブロック数が偶数 /
+///   `np = n_in/64` が lanes で割り切れる / `rows * lanes <= 1024`。
+pub fn sh_gu_shape_ok(k: usize, n: usize, rows: usize, lanes: usize) -> bool {
+    if k == 0 || n == 0 || rows == 0 || lanes == 0 {
+        return false;
+    }
+    if k % 64 != 0 || !lanes.is_power_of_two() || lanes > 32 {
+        return false;
+    }
+    if (k / 64) % lanes != 0 {
+        return false;
+    }
+    rows.saturating_mul(lanes) <= 1024
+}
+
+/// 融合カーネルを 1 発積む (grid = ceil(n_out / rows)、block = rows * lanes)。
+#[allow(clippy::too_many_arguments)]
+fn launch_sh_gu(
+    ctx: &CudaCtx,
+    stream: CUstream,
+    wg: CUdeviceptr,
+    wu: CUdeviceptr,
+    x: CUdeviceptr,
+    act: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+    rows: usize,
+    lanes: usize,
+) -> Result<()> {
+    let k = sh_gu_kernels().ok_or_else(|| anyhow::anyhow!("sh_gu のカーネルが無い"))?;
+    let (mut pwg, mut pwu, mut px, mut pa) = (wg, wu, x, act);
+    let (mut ni, mut no, mut rb) = (n_in as c_int, n_out as c_int, row_bytes as c_int);
+    let (mut rw, mut ln) = (rows as c_int, lanes as c_int);
+    let mut args = [
+        &mut pwg as *mut _ as *mut c_void,
+        &mut pwu as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut pa as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut no as *mut _ as *mut c_void,
+        &mut rb as *mut _ as *mut c_void,
+        &mut rw as *mut _ as *mut c_void,
+        &mut ln as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        ctx.launch_async_on(
+            stream,
+            k.f,
+            (n_out.div_ceil(rows) as u32, 1, 1),
+            ((rows * lanes) as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// 発火を数える (診断。`[sh-gu]` の 1 行に出る)。
+static SH_GU_FUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 門番で落ちた回数 (v5 経路へ)。
+static SH_GU_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `[sh-gu]` の 1 行 (ゲート off なら `None`)。テスト用にも公開する。
+pub fn sh_gu_line() -> Option<String> {
+    if !sh_gu_on() {
+        return None;
+    }
+    let f = SH_GU_FUSED.load(std::sync::atomic::Ordering::Relaxed);
+    let b = SH_GU_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+    Some(format!(
+        "[sh-gu] fused={f} fallback={b} ptx={}",
+        if sh_gu_loaded() { "ok" } else { "none" }
+    ))
+}
+
 /// task 187: shared expert の 4 発 (gate/up/silu/down) をサイドストリームへ積む。
 pub fn shared_expert_begin(
     x: &[f32],
@@ -23939,31 +24124,78 @@ fn shared_expert_enqueue(
         bail!("cuMemcpyHtoDAsync (shared x) が失敗");
     }
     // gate → up → silu*up → down (すべて同じサイドストリーム)。
-    ctx.launch_moe_gemv_on(&plans[0], wptrs[0], dx, dg, gate.k, gate.n, stream)?;
-    ctx.launch_moe_gemv_on(&plans[1], wptrs[1], dx, du, up.k, up.n, stream)?;
-    unsafe {
-        let (mut pg, mut pu, mut pa, mut pn) = (
-            dg as *mut c_void,
-            du as *mut c_void,
-            dact as *mut c_void,
-            gate.n as c_int,
-        );
-        let mut args = [
-            &mut pg as *mut _ as *mut c_void,
-            &mut pu as *mut _ as *mut c_void,
-            &mut pa as *mut _ as *mut c_void,
-            &mut pn as *mut _ as *mut c_void,
-        ];
-        let threads = 256usize;
-        let blocks = gate.n.div_ceil(threads) as u32;
-        ctx.launch_async_on(
-            stream,
-            epi.silu,
-            (blocks.max(1), 1, 1),
-            (threads as u32, 1, 1),
-            0,
-            &mut args,
-        )?;
+    // task 576: ゲート + 形 + PTX が揃っていれば gate/up/silu を 1 発に畳む。
+    let mut gu_fused = false;
+    if sh_gu_on() {
+        let both_q8 = gate.ty == crate::kquant::GgmlType::Q8_0
+            && up.ty == crate::kquant::GgmlType::Q8_0;
+        let same = gate.k == up.k
+            && gate.n == up.n
+            && plans[0].rows_per_block == plans[1].rows_per_block
+            && plans[0].lanes == plans[1].lanes
+            && plans[0].rb == plans[1].rb;
+        let v5q8 = gemv_v5_kernels().map(|k| k.f[0]);
+        if both_q8
+            && same
+            && Some(plans[0].f) == v5q8
+            && Some(plans[1].f) == v5q8
+            && sh_gu_shape_ok(gate.k, gate.n, plans[0].rows_per_block, plans[0].lanes)
+            && sh_gu_kernels().is_some()
+        {
+            match launch_sh_gu(
+                ctx,
+                stream,
+                wptrs[0],
+                wptrs[1],
+                dx,
+                dact,
+                gate.k,
+                gate.n,
+                plans[0].rb,
+                plans[0].rows_per_block,
+                plans[0].lanes,
+            ) {
+                Ok(()) => {
+                    gu_fused = true;
+                    SH_GU_FUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(err) => {
+                    let _ = shared_overlap_drain(s);
+                    s.broken = true;
+                    bail!("sh_gu の起動に失敗: {err:#}");
+                }
+            }
+        } else {
+            SH_GU_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if !gu_fused {
+        ctx.launch_moe_gemv_on(&plans[0], wptrs[0], dx, dg, gate.k, gate.n, stream)?;
+        ctx.launch_moe_gemv_on(&plans[1], wptrs[1], dx, du, up.k, up.n, stream)?;
+        unsafe {
+            let (mut pg, mut pu, mut pa, mut pn) = (
+                dg as *mut c_void,
+                du as *mut c_void,
+                dact as *mut c_void,
+                gate.n as c_int,
+            );
+            let mut args = [
+                &mut pg as *mut _ as *mut c_void,
+                &mut pu as *mut _ as *mut c_void,
+                &mut pa as *mut _ as *mut c_void,
+                &mut pn as *mut _ as *mut c_void,
+            ];
+            let threads = 256usize;
+            let blocks = gate.n.div_ceil(threads) as u32;
+            ctx.launch_async_on(
+                stream,
+                epi.silu,
+                (blocks.max(1), 1, 1),
+                (threads as u32, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
     }
     ctx.launch_moe_gemv_on(&plans[2], wptrs[2], dact, dout, down.k, down.n, stream)?;
     if unsafe { (l.memcpy_dtoh_async)(po, dout, down.n * 4, stream) } != CUDA_SUCCESS {
@@ -50240,6 +50472,247 @@ mod tests {
         }
         for v in ["1", "on", "true", " ON ", " TRUE "] {
             assert!(parse_sh_begin_cache(Some(v)), "raw={v:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // task 576: shared gate+up+silu 融合の真理値表と、索引算術の CPU ミラー
+    // -----------------------------------------------------------------------
+
+    /// `DENNO_DEC_SH_GU` は既定 on・明示的な偽値だけ off。
+    #[test]
+    fn sh_gu_gate_truth_table() {
+        assert!(parse_sh_gu(None), "未設定は既定 on");
+        for v in ["", "0", "off", "false", "no", " OFF ", " FALSE "] {
+            assert!(!parse_sh_gu(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(parse_sh_gu(Some(v)), "raw={v:?}");
+        }
+    }
+
+    /// 門番: 実形 (k=2560 / n=640 / rows=8 / lanes=8) は通り、前提を外すと落ちる。
+    #[test]
+    fn sh_gu_shape_truth_table() {
+        // 既定モデルの shared expert (k=2560, n=640) + v5 の計画 (rows=8, lanes=8)。
+        assert!(sh_gu_shape_ok(2560, 640, 8, 8));
+        assert!(sh_gu_shape_ok(2560, 640, 8, 4));
+        assert!(sh_gu_shape_ok(640, 2560, 8, 2), "down の形 (np=10) は lanes=2 なら通る");
+        // k が 64 の倍数でない / np が lanes で割り切れない / スレッド過多 / 0。
+        assert!(!sh_gu_shape_ok(0, 640, 8, 8));
+        assert!(!sh_gu_shape_ok(2560, 0, 8, 8));
+        assert!(!sh_gu_shape_ok(2592, 640, 8, 8), "k % 64 != 0");
+        assert!(!sh_gu_shape_ok(2560, 640, 8, 3), "lanes は 2 の冪");
+        assert!(!sh_gu_shape_ok(2560, 640, 8, 64), "lanes <= 32");
+        assert!(!sh_gu_shape_ok(2560, 640, 128, 32), "rows*lanes > 1024");
+        // np = k/64 = 40 は lanes=16 で割り切れない (40 % 16 != 0)。
+        assert!(!sh_gu_shape_ok(2560, 640, 4, 16));
+    }
+
+    /// `.cu` の索引算術を 2 通りに写して**ビット一致**を確かめる。
+    ///
+    /// - `byte_row`: Q8_0 の生レイアウトを 1 バイトずつ読む (ggml 仕様の直接の写し)。
+    /// - `word_row`: 融合カーネルと同じ 17 ワード + `cg[(2+j)>>2]` /
+    ///   `cg[9+(j>>2)]` の切り出し。
+    ///
+    /// 演算列 (アキュムレータ 4 本 `j & 3` / ブロック 0 -> 1 / 最後に
+    /// `(a0+a1)+(a2+a3)`) は両方で同じ = v5 と同じ。
+    mod shgu_mirror {
+        fn f16_to_f32(h: u16) -> f32 {
+            let sign = ((h as u32) & 0x8000) << 16;
+            let exp = ((h as u32) >> 10) & 0x1f;
+            let man = (h as u32) & 0x3ff;
+            let bits = if exp == 0 {
+                if man == 0 {
+                    sign
+                } else {
+                    let mut e: i32 = -14;
+                    let mut m = man;
+                    while (m & 0x400) == 0 {
+                        m <<= 1;
+                        e -= 1;
+                    }
+                    m &= 0x3ff;
+                    sign | (((e + 127) as u32) << 23) | (m << 13)
+                }
+            } else if exp == 31 {
+                sign | 0x7f80_0000 | (man << 13)
+            } else {
+                sign | ((exp + 112) << 23) | (man << 13)
+            };
+            f32::from_bits(bits)
+        }
+
+        /// 生バイトから 1 レーン分の内積 (v5 と同じ演算列)。
+        fn byte_row(row: &[u8], np: usize, x: &[f32], lane: usize, lanes: usize) -> f32 {
+            let per = np / lanes;
+            let p0 = lane * per;
+            let mut acc = [0f32; 4];
+            for p in p0..p0 + per {
+                let b = &row[p * 68..p * 68 + 68];
+                let d0 = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                let d1 = f16_to_f32(u16::from_le_bytes([b[34], b[35]]));
+                for j in 0..32 {
+                    let q = b[2 + j] as i8 as f32;
+                    acc[j & 3] += (q * d0) * x[p * 64 + j];
+                }
+                for j in 0..32 {
+                    let q = b[36 + j] as i8 as f32;
+                    acc[j & 3] += (q * d1) * x[p * 64 + 32 + j];
+                }
+            }
+            (acc[0] + acc[1]) + (acc[2] + acc[3])
+        }
+
+        /// 融合カーネルと同じ 17 ワード切り出し。
+        fn word_row(row: &[u8], np: usize, x: &[f32], lane: usize, lanes: usize) -> f32 {
+            let per = np / lanes;
+            let p0 = lane * per;
+            let mut acc = [0f32; 4];
+            for p in p0..p0 + per {
+                let base = p * 68;
+                let mut c = [0u32; 17];
+                for (i, w) in c.iter_mut().enumerate() {
+                    let o = base + i * 4;
+                    *w = u32::from_le_bytes([row[o], row[o + 1], row[o + 2], row[o + 3]]);
+                }
+                let d0 = f16_to_f32((c[0] & 0xffff) as u16);
+                let d1 = f16_to_f32(((c[8] >> 16) & 0xffff) as u16);
+                for j in 0..32 {
+                    let w = c[(2 + j) >> 2];
+                    let byte = (2 + j) & 3;
+                    let q = ((w >> (byte * 8)) & 0xff) as u8 as i8 as f32;
+                    acc[j & 3] += (q * d0) * x[p * 64 + j];
+                }
+                for j in 0..32 {
+                    let w = c[9 + (j >> 2)];
+                    let q = ((w >> ((j & 3) * 8)) & 0xff) as u8 as i8 as f32;
+                    acc[j & 3] += (q * d1) * x[p * 64 + 32 + j];
+                }
+            }
+            (acc[0] + acc[1]) + (acc[2] + acc[3])
+        }
+
+        /// lanes 本を shfl_down (offset 1, 2, 4 ...) の順で畳む (= `dno_v5_reduce`)。
+        fn reduce_lanes(v: &[f32]) -> f32 {
+            let n = v.len();
+            let mut a = v.to_vec();
+            let mut off = 1;
+            while off < n {
+                for i in 0..n {
+                    if i + off < n {
+                        a[i] += a[i + off];
+                    }
+                }
+                off <<= 1;
+            }
+            a[0]
+        }
+
+        /// 決定的な擬似乱数 (テスト用。外部 crate を使わない)。
+        fn lcg(state: &mut u64) -> u32 {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (*state >> 33) as u32
+        }
+
+        /// 実形 (k=2560 / n=640 / lanes=8) で 2 バイト読みと 17 ワード読みが
+        /// **1 ビットも違わない**こと、レーン分割が全対を 1 回ずつ覆うこと。
+        #[test]
+        fn shgu_word_and_byte_rows_agree_and_partition_covers_once() {
+            let k = 2560usize;
+            let n = 32usize;
+            let np = k / 64;
+            let rows_per_block = 8usize;
+            let lanes = 8usize;
+            assert!(super::sh_gu_shape_ok(k, n, rows_per_block, lanes));
+            let mut st = 0x1234_5678_9abc_def0u64;
+            // x は実形の 2,560 要素 (f32 の範囲に収まる適当な値)。
+            let x: Vec<f32> = (0..k)
+                .map(|_| ((lcg(&mut st) % 2001) as f32 - 1000.0) / 997.0)
+                .collect();
+            // 重みは ggml Q8_0 の 68 B 対 (d は f16 として妥当な範囲)。
+            let row_bytes = np * 68;
+            let mut w = vec![0u8; n * row_bytes];
+            for b in w.iter_mut() {
+                // f16 として 0x2400..0x3c00 (= 0.0625..1.0) に収める。
+                *b = 0;
+            }
+            for r in 0..n {
+                for p in 0..np {
+                    let o = r * row_bytes + p * 68;
+                    let d0 = 0x2c00u16 + (lcg(&mut st) % 0x0400) as u16;
+                    let d1 = 0x3000u16 + (lcg(&mut st) % 0x0400) as u16;
+                    w[o..o + 2].copy_from_slice(&d0.to_le_bytes());
+                    w[o + 34..o + 36].copy_from_slice(&d1.to_le_bytes());
+                    for j in 0..32 {
+                        w[o + 2 + j] = lcg(&mut st) as u8;
+                        w[o + 36 + j] = lcg(&mut st) as u8;
+                    }
+                }
+            }
+            let per = np / lanes;
+            for r in 0..n {
+                let row = &w[r * row_bytes..(r + 1) * row_bytes];
+                let mut v_byte = Vec::with_capacity(lanes);
+                let mut v_word = Vec::with_capacity(lanes);
+                for lane in 0..lanes {
+                    let a = byte_row(row, np, &x, lane, lanes);
+                    let b = word_row(row, np, &x, lane, lanes);
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "row={r} lane={lane}: byte={a} word={b}"
+                    );
+                    v_byte.push(a);
+                    v_word.push(b);
+                }
+                assert_eq!(
+                    reduce_lanes(&v_byte).to_bits(),
+                    reduce_lanes(&v_word).to_bits(),
+                    "row={r}: 縮約後が違う"
+                );
+                // レーン分割は 40 対を 5 対ずつ 8 レーンで 1 回ずつ覆う。
+                assert_eq!(per * lanes, np);
+            }
+        }
+
+        /// 融合 (gate/up を同じスレッドで) の silu は `dno_dec_silu_mul` と同じ式。
+        #[test]
+        fn shgu_silu_formula_matches_epilogue() {
+            for g in [-8.0f32, -1.5, -0.25, 0.0, 0.5, 3.0, 12.0] {
+                let u = 0.75f32;
+                let s = g / (1.0 + (-g).exp());
+                let want = s * u;
+                // カーネルは __expf を使うので厳密一致は GPU 上でしか取れない。
+                // ここでは式の形 (g / (1 + exp(-g)) * u) を固定する。
+                let got = g / (1.0 + (-g).exp()) * u;
+                assert_eq!(got.to_bits(), want.to_bits());
+            }
+        }
+    }
+
+    /// 融合の配線 (cuda.rs の門番 / 起動形 / .cu の名前 / build_ptx の target)。
+    #[test]
+    fn sh_gu_fusion_is_wired() {
+        let src = include_str!("cuda.rs");
+        assert!(src.contains("dno_dec_sh_gateup_silu"));
+        assert!(src.contains("DENNO_DEC_SH_GU"));
+        assert!(src.contains("launch_sh_gu("));
+        let cu = include_str!("../kernels/kernels_sh_gu.cu");
+        assert!(cu.contains("extern \"C\" __global__ void dno_dec_sh_gateup_silu"));
+        let sh = include_str!("../kernels/build_ptx.sh");
+        assert!(sh.contains("sh_gu)"), "build_ptx.sh に target が無い");
+        assert!(sh.contains("kernels_sh_gu.cu"), "build_ptx.sh に .cu が無い");
+        // 収録 PTX があるなら引数 9 本であること (生成前は無くてよい)。
+        let ptx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_sh_gu.ptx");
+        if let Ok(text) = std::fs::read_to_string(&ptx) {
+            assert_eq!(
+                ptx_entry_params(&text, SH_GU_KERNEL_NAME),
+                Some(SH_GU_NARGS),
+                "収録 PTX の引数が違う"
+            );
         }
     }
 

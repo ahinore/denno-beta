@@ -150,3 +150,12 @@ pub fn attn_fdec_boot_line() -> Option<String> {
     #[cfg(not(feature = "cuda"))]
     None
 }
+
+/// task 576: shared expert の gate+up+silu 融合 (`DENNO_DEC_SH_GU`) の診断行。
+/// ゲート off なら `None`。cuda 無しのビルドでは常に `None`。
+pub fn sh_gu_line() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    return crate::cuda::sh_gu_line();
+    #[cfg(not(feature = "cuda"))]
+    None
+}
