@@ -2368,6 +2368,10 @@ impl AttnLayer {
                         wo_n: self.wo.n(),
                         n_embd: self.n_embd,
                         cur,
+                        // task 572: ミラーが遅れている回に埋めるためのホスト K/V
+                        // (`len - 1` 行ぶん。今の行はデバイス側で作る)。
+                        k_host: cache.k(layer)?,
+                        v_host: cache.v(layer)?,
                         x_dev,
                     };
                     if let Some(o) = crate::cuda::dec_full_dev::forward(&call) {

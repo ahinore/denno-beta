@@ -2087,6 +2087,59 @@ pub(crate) mod dec_full_dev {
         FORCE.with(|c| c.set(v));
     }
 
+    /// `DENNO_FULL_DEC_MIRROR_FILL` (task 572, 既定 off)。
+    ///
+    /// この経路は KV ミラーの 1 行追記 (`mirror_append`) が「ミラーがちょうど
+    /// 1 行遅れている」ときだけ通り、1 行でも足りないと `None` を返して**その層は
+    /// 以後ずっとホスト経路へ落ちる** (ホスト経路は自分の push 後の長さまでしか
+    /// ミラーを同期しないので、次もまた 1 行足りない)。この門を立てると、足りない
+    /// 行だけをホストの K/V から H2D で埋めてから追記をやり直す (埋めるのは 1 回
+    /// だけで、以降は普通の D2D 追記に戻る)。
+    fn mirror_fill_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            mirror_fill_from_value(std::env::var("DENNO_FULL_DEC_MIRROR_FILL").ok().as_deref())
+        })
+    }
+
+    /// [`mirror_fill_on`] の解釈 (純関数)。未設定と明示的な偽値だけ off。
+    fn mirror_fill_from_value(v: Option<&str>) -> bool {
+        match v {
+            None => false,
+            Some(s) => {
+                let s = s.trim().to_ascii_lowercase();
+                !matches!(s.as_str(), "" | "0" | "off" | "false" | "no")
+            }
+        }
+    }
+
+    /// 一度に埋めてよい行数 (これを超える遅れは従来どおり断る = 巨大な H2D を
+    /// 層ごとに撃たない)。既定 64 行。
+    fn mirror_fill_max_rows() -> usize {
+        static N: OnceLock<usize> = OnceLock::new();
+        *N.get_or_init(|| match std::env::var("DENNO_FULL_DEC_MIRROR_FILL_MAX").ok() {
+            Some(v) => v.trim().parse::<usize>().unwrap_or(64),
+            None => 64,
+        })
+    }
+
+    /// 埋めた回数 / 行数 (lab の `[full-dec-dbg]` に出す)。
+    pub(crate) static MIRROR_FILLS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static MIRROR_FILL_ROWS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// 埋めてよい遅れか (純関数)。`have` 行を持っている状態で `host_len` 行が
+    /// 必要。0 (既に足りている) と上限超えは埋めない。
+    fn mirror_fill_gap_ok(host_len: usize, have: usize, max_rows: usize) -> Option<usize> {
+        let gap = host_len.saturating_sub(have);
+        if gap == 0 || gap > max_rows {
+            None
+        } else {
+            Some(gap)
+        }
+    }
+
     /// rope の cos/sin 表の上限 (対の本数)。`n_rot <= 2 * CS_MAX`。
     const CS_MAX: usize = 64;
 
@@ -2146,6 +2199,10 @@ pub(crate) mod dec_full_dev {
         pub n_embd: usize,
         /// 層の入力 (ホスト)
         pub cur: &'a [f32],
+        /// task 572: この層のホスト KV キャッシュの行 `[0, len-1)` (f32)。ミラーが
+        /// 遅れている回に、足りない行だけを埋めるのに使う (`DENNO_FULL_DEC_MIRROR_FILL`)。
+        pub k_host: &'a [f32],
+        pub v_host: &'a [f32],
         /// task 468: 層の入力を**デバイスから**読む (直前の mix の鎖が残した
         /// `mixed` の f32 `qkv_k` 本)。`Some` のとき `cur` は空でよく、
         /// pinned への写しも H2D も撃たない (値は同じバイト列)。
@@ -2446,8 +2503,10 @@ pub(crate) mod dec_full_dev {
         if calls % 256 == 1 {
             let f: Vec<u64> = FULL_DEC_FAIL.iter().map(|c| c.load(AO::Relaxed)).collect();
             eprintln!(
-                "[full-dec-dbg] calls={calls} gate={} shape={} ctx={} mirror={} plan={} other={}",
-                f[0], f[1], f[2], f[3], f[4], f[5]
+                "[full-dec-dbg] calls={calls} gate={} shape={} ctx={} mirror={} plan={} other={} fill={} fill_rows={}",
+                f[0], f[1], f[2], f[3], f[4], f[5],
+                MIRROR_FILLS.load(AO::Relaxed),
+                MIRROR_FILL_ROWS.load(AO::Relaxed)
             );
         }
     }
@@ -2689,7 +2748,7 @@ pub(crate) mod dec_full_dev {
         kp_mark!("fd_prep");
 
         // 3) KV ミラー 1 行を D2D で追記
-        let (mkptr, mvptr) = mirror_append(
+        let (mkptr, mvptr) = match mirror_append(
             a.cache_id,
             a.n_layer,
             kv_dim,
@@ -2698,8 +2757,63 @@ pub(crate) mod dec_full_dev {
             a.len,
             kout,
             kv + (kv_dim * 4) as u64,
-        )
-        .ok_or_else(|| anyhow!("ミラーの 1 行追記ができない (全行シードが必要)"))?;
+        ) {
+            Some(p) => p,
+            None => {
+                // task 572: ミラーが遅れている回は、足りない行だけをホストの K/V から
+                // 埋めてから追記をやり直す (`DENNO_FULL_DEC_MIRROR_FILL`, 既定 off)。
+                // 埋めるのは 1 回だけ。以降は普通の 1 行 D2D 追記に戻る。
+                let mut filled = false;
+                if mirror_fill_on() {
+                    let host_len = a.len.saturating_sub(1);
+                    let (kn, vn) = (
+                        a.k_host.len() / kv_dim.max(1),
+                        a.v_host.len() / kv_dim.max(1),
+                    );
+                    if host_len > 0 && kn >= host_len && vn >= host_len {
+                        let have =
+                            q4_attn_mirror_have_rows(a.cache_id, a.n_layer, kv_dim, a.layer, a.layer_gen)
+                                .unwrap_or(0);
+                        if let Some(gap) =
+                            mirror_fill_gap_ok(host_len, have, mirror_fill_max_rows())
+                        {
+                            if q4_attn_mirror_prepare(
+                                a.cache_id,
+                                a.n_layer,
+                                kv_dim,
+                                a.layer,
+                                a.layer_gen,
+                                host_len,
+                                a.k_host,
+                                a.v_host,
+                                false,
+                            )
+                            .is_ok()
+                            {
+                                filled = true;
+                                MIRROR_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                MIRROR_FILL_ROWS
+                                    .fetch_add(gap as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                if !filled {
+                    bail!("ミラーの 1 行追記ができない (全行シードが必要)");
+                }
+                mirror_append(
+                    a.cache_id,
+                    a.n_layer,
+                    kv_dim,
+                    a.layer,
+                    a.layer_gen,
+                    a.len,
+                    kout,
+                    kv + (kv_dim * 4) as u64,
+                )
+                .ok_or_else(|| anyhow!("ミラーを埋めた後も 1 行追記ができない"))?
+            }
+        };
         kp_mark!("fd_mirror");
 
         // 4) attention (デバイス入力・出力)。task 460: 融合版 (combine + gate) を
@@ -2910,6 +3024,27 @@ pub(crate) mod dec_full_dev {
                 &mut args[..nargs],
             )
         }
+    }
+
+    /// task 572: ミラーがこの層で何行持っているか (世代が違えば 0)。
+    /// 読み取りだけで、台帳もバッファも触らない。エントリが無ければ `None`。
+    fn q4_attn_mirror_have_rows(
+        cache_id: u64,
+        n_layer: usize,
+        kv_dim: usize,
+        layer: usize,
+        gen: u64,
+    ) -> Option<usize> {
+        let mirrors = Q4_ATTN_MIRRORS.get()?;
+        let ms = match mirrors.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let (_, m, _) = ms.iter().find(|(k, _, _)| *k == cache_id)?;
+        if m.kv_dim != kv_dim || m.state.len.len() != n_layer {
+            return None;
+        }
+        Some(q4_mirror_have(&m.state, layer, usize::MAX, gen))
     }
 
     /// ミラーへ 1 行だけ D2D で追記する。全行シードが要るときは None。
@@ -3352,7 +3487,42 @@ pub(crate) mod dec_full_dev {
                 wo_n: 2_560,
                 n_embd: 2_560,
                 cur,
+                k_host: &[],
+                v_host: &[],
                 x_dev: None,
+            }
+        }
+
+        /// task 572: 埋めてよい遅れかの真理値表。0 (既に足りている) と上限超えは
+        /// 埋めない、1..=max だけ埋める。
+        #[test]
+        fn mirror_fill_gap_truth_table() {
+            // 1 行遅れ (いちばん普通の回) は埋める。
+            assert_eq!(mirror_fill_gap_ok(10, 9, 64), Some(1));
+            // 数十行遅れも上限までなら埋める。
+            assert_eq!(mirror_fill_gap_ok(100, 36, 64), Some(64));
+            // 既に足りている (0) は埋めない。
+            assert_eq!(mirror_fill_gap_ok(10, 10, 64), None);
+            // ミラーが先行しているのも埋めない (負の差)。
+            assert_eq!(mirror_fill_gap_ok(10, 12, 64), None);
+            // 上限を 1 行でも超えたら断る (巨大な H2D を撃たない)。
+            assert_eq!(mirror_fill_gap_ok(100, 35, 64), None);
+            // 先頭 (host_len 0) も埋めない。
+            assert_eq!(mirror_fill_gap_ok(0, 0, 64), None);
+        }
+
+        /// task 572: 門の解釈。未設定は off、明示的な偽値だけ off。
+        #[test]
+        fn mirror_fill_gate_truth_table() {
+            assert!(!mirror_fill_from_value(None), "未設定で on になった");
+            for v in ["", "0", "off", "false", "no", " OFF "] {
+                assert!(
+                    !mirror_fill_from_value(Some(v)),
+                    "{v:?} で on になった"
+                );
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(mirror_fill_from_value(Some(v)), "{v:?} で off のまま");
             }
         }
 
