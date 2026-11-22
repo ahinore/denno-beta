@@ -606,6 +606,12 @@ pub const DEFAULT_STREAM_MIN_TOK: usize = 512;
 /// 段差はグループのバイト数に比例するので、g64 → g32 で半減する。lab t324b
 /// (3,826 cold、2 ラウンド): g64 2,605 / 2,607 → g32 2,532 / 2,532 ms (-2.8%)、
 /// 14k cold 6,641 → 6,517 (-1.9%)。`DENNO_PF_STREAM_GROUP=64` で切り戻せる。
+///
+/// task 550: UD-Q4_K_XL で **64 を測り直して棄却** (lab t550b)。ミス読みが
+/// O_DIRECT (既定 on) になったので同時発行を増やす狙いだったが、3,826 cold の
+/// `copy_s` は g32 7.69 / 7.24 に対し g64 **7.60 / 17.32 s** (2 ラウンド目に跳ねる)、
+/// 14k は 8.35 → **14.99 s**。g64 + 512 KiB は 6.83 / 6.93 と速かったが、
+/// t550c で再現しなかった (§REPORT_P550)。既定 32 のまま。
 pub const DEFAULT_STREAM_GROUP: usize = 32;
 
 /// [`STREAM_PIN_ENV`] の既定値 (1 = pinned バウンス + 非同期)。
@@ -667,6 +673,67 @@ pub fn stream_lookahead() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         stream_lookahead_from_value(std::env::var(STREAM_LOOKAHEAD_ENV).ok().as_deref())
+    })
+}
+
+/// `DENNO_PF_UP_WORKERS`: 上げ専用スレッドの本数 (task 554、既定 2)。
+///
+/// # なぜ (task 550 が残した「壁は同時発行の深さ」の続き)
+///
+/// UD-Q4_K_XL の 3,826 cold は壁 9.8 s の 90% が `up_wait` (ステージングの写し
+/// 待ち) で、その中身はディスク読み。`[exp-pf-stream]` の実測 (t554a の b) では
+/// ディスクのミスが **1 グループあたり 15.6 本** (`odb_n/grp` = 26,044/1,674)
+/// しかなく、pread の枠 32 本に対して平均同時発行は 11.3 本 (`odb_ms/copy_s`)。
+/// 写しは 1 グループずつの barrier なので、枠を増やしても (PREAD_THREADS 48/64)、
+/// 読みを細かくしても (P530)、グループを広げても (P550 g64) 埋まらない。
+/// **上げスレッドを 2 本にして 2 グループの写しを重ねる**と、グループの境目でも
+/// プールに仕事が残り、ディスクが遊ばない。
+///
+/// lab の実測 (UD-Q4_K_XL、depth8k、baseline の 4 本 + `DENNO_PF_UP_WORKERS`)。
+/// 壁時計は `[q4ledger-pf] tok=3826/14018 wall=`:
+///
+/// | lab | SHA | COND | 3,826 cold | 14k cold |
+/// | --- | --- | --- | ---: | ---: |
+/// | t554e | 8cc3e19 | b (1 本) | 9,034 ms | 12,400 ms |
+/// | t554e | 8cc3e19 | d2 (既定 2 本) | **7,580 / 7,541 ms** | **11,138 ms** |
+/// | t554e | 8cc3e19 | b2 (1 本、末尾) | 8,592 ms | 13,365 ms |
+///
+/// 3,826 で -16.1 / -16.5% (対 b)、-11.2 / -11.7% (対 b2)、14k で -10.2% (対 b)、
+/// -16.7% (対 b2)。値はビット一致 (`c2000_cold` = `73510e1f`、`c8000_cold` =
+/// `47c833e2` が全 COND SAME)、decode 13.1 ms/tok で不変。
+///
+/// 既定モデル (UD-IQ3_XXS) は t554h で 4 COND x 2 ラウンドとも
+/// `c2000_cold` = `9b28e018` / decode 10.4 ms/tok / 3,826 cold 2,110-2,138 ms で
+/// 差 0 (pread を使わない層はワーカー 0 にだけ送る)。
+///
+/// 1 本あたりの pread 本数は `DENNO_PF_PREAD_THREADS` (32) のままで、2 本は
+/// **1 本の pool を共有する**。2 本に分けた版 (2 x 32 本) は t554a/t554b で
+/// 3,826 が -29%、14k が -19/-25% とさらに速かったが、**既定モデルの 3,826 cold が
+/// 返らなくなった** (t554c/t554d) ので捨てた。
+pub const UP_WORKERS_ENV: &str = "DENNO_PF_UP_WORKERS";
+
+/// [`UP_WORKERS_ENV`] の既定値 (2 = 2 グループの写しを重ねる)。
+pub const DEFAULT_UP_WORKERS: usize = 2;
+
+/// 上げスレッドの本数の解釈 (純関数)。1..=3 に丸める。
+///
+/// 上限 3 はステージングの枚数 ([`crate::cuda`] の 3 枚) に合わせたもの
+/// (計算側が 2 グループ先までしか依頼しないので、3 本目は待つだけ)。
+pub fn up_workers_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_UP_WORKERS;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.clamp(1, 3),
+        Err(_) => DEFAULT_UP_WORKERS,
+    }
+}
+
+/// 上げスレッドの本数 (プロセスで 1 回だけ env を読む)。
+pub fn up_workers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        up_workers_from_value(std::env::var(UP_WORKERS_ENV).ok().as_deref())
     })
 }
 
@@ -1943,6 +2010,14 @@ pub const PREAD_KB_ENV: &str = "DENNO_PF_PREAD_KB";
 /// 広い塊が on のときは 1 MiB を使う ([`pread_kb_default`])。1024 単独は
 /// t530b で 16.0 s (384 は 11.8 s) と負けたが、広い塊と組にすると
 /// t538b で 8.3 s (`copy_s`)、3,826 cold が 11.80 -> 9.48 s になった。
+///
+/// task 550: ミス側が O_DIRECT (既定 on) になった後の UD-Q4_K_XL で **512 と
+/// 384 を測り直して棄却** (lab t550b / t550c)。3,826 cold の `copy_s` は
+/// 1024 7.69 / 7.24 と 8.31 / 7.27 に対し 512 **7.28 / 7.39** と **7.64 / 7.33**、
+/// 384 は 7.75 / 6.86。pread の本数は 30k → 58k (512) / 85k (384) へ増えるが、
+/// 壁は同じ run の位置ドリフト (3,826 で b 8.31 → b2 7.16、-8%) の内側。
+/// 14k は 512 が t550b で 8.35 → 7.32 s だったが t550c で 8.03 → 7.79 s と
+/// 再現しなかった。**既定 1 MiB のまま** (詳細は REPORT_P550)。
 pub const DEFAULT_PREAD_KB: usize = 384;
 
 /// [`PREAD_KB_ENV`] の解釈 (純関数)。64..=65536 KiB に丸める。
@@ -3168,6 +3243,16 @@ pub fn range_ledger_on() -> bool {
 /// `dst_a + len_a == dst_b` かつ `part_a == part_b` かつ `off_a + len_a == off_b`。
 /// どちらかが途切れていれば畳まない (読むバイトも書く位置も 1 バイトも変わらない)。
 /// 要求が大きくなるので、ディスクが 1 MB より大きい塊で速いときに効く。
+///
+/// task 550: ミス側が O_DIRECT (既定 on) になった後の UD-Q4_K_XL で
+/// **再挑戦して棄却** (lab t550a。t522 の +48% は buffered 固有の
+/// 「大きい pread がカーネル内で直列化する」せいだという仮説を潰す試験)。
+/// 併合 + `DENNO_PF_PREAD_KB=4096` は 1 本の平均 0.79 → **2.24 MB**、
+/// pread 26,792 → 7,970 本になったが、3,826 cold は base 10.51 / 8.56 に対し
+/// **12.41 / 11.09 s**、14k は 13.77 → **16.41 s** (2 ラウンド同じ向き)。
+/// 併合だけ (`PREAD_KB=1024`) は 9.93 / 9.19 と base 同等。page cache を
+/// 汚さない O_DIRECT でも大きい読みは負ける = 律速は読みの形ではなく
+/// 同時発行数 (t522 §6(a) の側)。
 pub const PREAD_MERGE_ENV: &str = "DENNO_PF_PREAD_MERGE";
 
 /// [`PREAD_MERGE_ENV`] の既定値 (off)。
