@@ -8661,7 +8661,7 @@ pub fn seg_gu8_enabled() -> bool {
 }
 
 /// task 562: `DENNO_SEG_GU16` — 融合版 (gate+up+silu) を **16 バイトロード**で
-/// 回す (`dno_seg_gemv_gu16_q4k`)。**既定 off** (lab の A/B で採否を決める)。
+/// 回す (`dno_seg_gemv_gu16_q4k`)。**task 562 から既定 on**。
 ///
 /// `dno_seg_gemv_gu8_q4k` は lane が 8 バイト読み、**同じ 8 バイトを隣の lane
 /// (上位ニブル側) がもう一度読む** ので、要求バイトが有効バイトの 2 倍になる。
@@ -8671,13 +8671,19 @@ pub fn seg_gu8_enabled() -> bool {
 /// 値: 1 lane の和が 32 要素になるので丸め順が変わる (ビット一致しない)。
 /// 起動形は `gu` / `gu8` と同一。**Q4_K のときだけ**効く (UD-Q4_K_XL の
 /// gate/up が Q4_K)。
+///
+/// lab t562a (depth) / t562b (depth8k) の 4 サンプル中央値で gate+up+silu の段が
+/// **33.3-34.3 -> 23.8-24.2 us/層 (-29%、gbs 228-267 -> 340-342)**。decode の壁は
+/// -1% (ノイズ内)、prefill と既定モデルは不変なので、オペレーター規則
+/// (段で 2 ラウンド 2% 以上 + 他が 1% 超悪化しない + 本文健全) で既定 on。
 pub const SEG_GU16_ENV: &str = "DENNO_SEG_GU16";
 
-/// [`SEG_GU16_ENV`] の解釈 (純関数)。`1` / `on` / `true` / `yes` だけが真。
+/// [`SEG_GU16_ENV`] の解釈 (純関数)。**task 562 から既定 on** (未設定は有効、
+/// `0` / `off` / `false` / `no` だけが偽 = A/B と切り戻し用)。
 pub fn seg_gu16_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+    !matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -50447,17 +50453,16 @@ mod tests {
         }
     }
 
-    /// task 562: `DENNO_SEG_GU16` は **既定 off** (lab の A/B で採否を決める)。
-    /// 真値は 8 バイト版と同じ (明示的な真値だけ on)。
+    /// task 562: `DENNO_SEG_GU16` は **既定 on** (lab で gate 段 -29%、2 ラウンド)。
+    /// 明示的な偽値だけが off (切り戻し `DENNO_SEG_GU16=0`)。
     #[test]
     fn t562_gu16_gate_truth_table() {
-        assert!(!seg_gu16_from_value(None), "未設定は off (既定)");
-        assert!(!seg_gu16_from_value(Some("")));
-        assert!(!seg_gu16_from_value(Some("0")));
-        assert!(!seg_gu16_from_value(Some("off")));
-        assert!(!seg_gu16_from_value(Some("no")));
-        for v in ["1", "on", "true", "yes", " TRUE "] {
-            assert!(seg_gu16_from_value(Some(v)), "gu16: {v}");
+        assert!(seg_gu16_from_value(None), "未設定は on (既定)");
+        assert!(seg_gu16_from_value(Some("")));
+        assert!(seg_gu16_from_value(Some(" ")));
+        assert!(seg_gu16_from_value(Some("1")));
+        for v in ["0", "off", "false", "no", " NO "] {
+            assert!(!seg_gu16_from_value(Some(v)), "gu16: {v}");
         }
     }
 
