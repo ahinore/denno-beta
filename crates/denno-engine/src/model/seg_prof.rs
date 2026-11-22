@@ -432,10 +432,21 @@ pub fn seg_sum_async_report() -> Option<String> {
 }
 
 /// task 534: 8 バイトロード版 (gu8 / dn8) と Q5_1 の 4 バイト版 (dnv4) の起動回数。
-/// **発火の証拠**。
+/// task 562: Q4_K の 16 バイト版 (gu16) も同じ台帳に積む。**発火の証拠**。
 static SEG_GU8_CALLS: AtomicU64 = AtomicU64::new(0);
 static SEG_DN8_CALLS: AtomicU64 = AtomicU64::new(0);
 static SEG_DNV4_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_GU16_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// gu16 (Q4_K の 16 バイトロード融合版) の起動を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_gu16_call() {
+    SEG_GU16_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// gu16 の回数 (task 562 の A/B で発火を数える)。
+pub fn seg_gu16_calls() -> u64 {
+    SEG_GU16_CALLS.load(Ordering::Relaxed)
+}
 
 /// gu8 の起動を 1 回積む (cuda 側から呼ぶ)。
 pub fn note_seg_gu8_call() {
@@ -467,6 +478,7 @@ pub fn seg_fast_reset() {
     SEG_GU8_CALLS.store(0, Ordering::Relaxed);
     SEG_DN8_CALLS.store(0, Ordering::Relaxed);
     SEG_DNV4_CALLS.store(0, Ordering::Relaxed);
+    SEG_GU16_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// リクエスト終端の診断行 (どちらかのゲートが on のときだけ)。
@@ -474,14 +486,18 @@ pub fn seg_fast_reset() {
 pub fn seg_fast_report() -> Option<String> {
     // cuda feature 無しではこの経路自体が無効 (cuda 専用の関数は呼べない)。
     #[cfg(feature = "cuda")]
-    let on = crate::cuda::seg_gu8_enabled() || crate::cuda::seg_dn8_enabled();
+    let on =
+        crate::cuda::seg_gu8_enabled() || crate::cuda::seg_dn8_enabled() || crate::cuda::seg_gu16_enabled();
     #[cfg(not(feature = "cuda"))]
     let on = false;
     if !on {
         return None;
     }
     let (gu8, dn8, dnv4) = seg_fast_counts();
-    Some(format!("[seg-fast] gu8={gu8} dn8={dn8} dnv4={dnv4}"))
+    let gu16 = seg_gu16_calls();
+    Some(format!(
+        "[seg-fast] gu8={gu8} dn8={dn8} dnv4={dnv4} gu16={gu16}"
+    ))
 }
 
 #[cfg(test)]
@@ -514,6 +530,23 @@ mod tests {
         assert_eq!(seg_fast_counts(), (2, 1, 1));
         seg_fast_reset();
         assert_eq!(seg_fast_counts(), (0, 0, 0));
+    }
+
+    /// task 562: gu16 (Q4_K の 16 バイト版) の回数が独立に積まれ、リセットで
+    /// 0 に戻ること。発火の証拠は lab の `[seg-fast] gu16=N` で数える。
+    #[test]
+    fn t562_seg_gu16_counts_accumulate() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seg_fast_reset();
+        assert_eq!(seg_gu16_calls(), 0);
+        note_seg_gu16_call();
+        note_seg_gu16_call();
+        note_seg_gu16_call();
+        assert_eq!(seg_gu16_calls(), 3);
+        // 他の台帳を汚さないこと。
+        assert_eq!(seg_fast_counts(), (0, 0, 0));
+        seg_fast_reset();
+        assert_eq!(seg_gu16_calls(), 0);
     }
 
     /// task 502: 発火 / 落ちた回数が別々に積まれる。

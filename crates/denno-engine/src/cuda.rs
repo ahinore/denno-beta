@@ -8536,6 +8536,8 @@ struct SegKKernels {
     gu8: [Option<CUfunction>; 4],
     /// task 534: 1 行版の 8 バイトロード版 ([`SEG_K_K8_NAMES`] の順)。K 型だけ。
     k8: [Option<CUfunction>; 4],
+    /// task 562: Q4_K の 16 バイトロード版 ([`SEG_K_GU16_NAMES`] の順)。gate/up 用。
+    gu16: [Option<CUfunction>; 4],
     /// task 534: Q5_1 の 4 バイトロード版 ([`SEG_K_V4_NAMES`] の順)。down 用。
     v4: [Option<CUfunction>; 4],
 }
@@ -8577,6 +8579,15 @@ const SEG_K_K8_NAMES: [Option<&[u8]>; 4] = [
     None,
     Some(b"dno_seg_gemv_k8_q4k\0"),
     Some(b"dno_seg_gemv_k8_q5k\0"),
+];
+
+/// task 562: **Q4_K の 16 バイトロード**版 ([`moe_batch_slot`] の順) のうち
+/// gate+up 融合版。K 型のうち Q4_K だけ (UD-Q4_K_XL の gate/up が Q4_K)。
+const SEG_K_GU16_NAMES: [Option<&[u8]>; 4] = [
+    None,
+    None,
+    Some(b"dno_seg_gemv_gu16_q4k\0"),
+    None,
 ];
 
 /// task 534: **Q5_1 の 4 バイトロード**版 ([`moe_batch_slot`] の順)。
@@ -8647,6 +8658,33 @@ pub fn seg_gu8_from_value(v: Option<&str>) -> bool {
 pub fn seg_gu8_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| seg_gu8_from_value(std::env::var(SEG_GU8_ENV).ok().as_deref()))
+}
+
+/// task 562: `DENNO_SEG_GU16` — 融合版 (gate+up+silu) を **16 バイトロード**で
+/// 回す (`dno_seg_gemv_gu16_q4k`)。**既定 off** (lab の A/B で採否を決める)。
+///
+/// `dno_seg_gemv_gu8_q4k` は lane が 8 バイト読み、**同じ 8 バイトを隣の lane
+/// (上位ニブル側) がもう一度読む** ので、要求バイトが有効バイトの 2 倍になる。
+/// この版は 1 warp = 4 ブロック・1 ブロック = 8 lane にして、lane が qs の
+/// 連続 16 バイト (= 下位 16 + 上位 16 要素) を読む。要求バイト = 有効バイト。
+///
+/// 値: 1 lane の和が 32 要素になるので丸め順が変わる (ビット一致しない)。
+/// 起動形は `gu` / `gu8` と同一。**Q4_K のときだけ**効く (UD-Q4_K_XL の
+/// gate/up が Q4_K)。
+pub const SEG_GU16_ENV: &str = "DENNO_SEG_GU16";
+
+/// [`SEG_GU16_ENV`] の解釈 (純関数)。`1` / `on` / `true` / `yes` だけが真。
+pub fn seg_gu16_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`SEG_GU16_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+pub fn seg_gu16_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| seg_gu16_from_value(std::env::var(SEG_GU16_ENV).ok().as_deref()))
 }
 
 /// task 534: `DENNO_SEG_DN8` — down をベクトルロード版
@@ -8773,6 +8811,13 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
                     v4[i] = get(name);
                 }
             }
+            // task 562: 16 バイトロード版 (Q4_K の gate/up)。古い PTX では None。
+            let mut gu16 = [None; 4];
+            for (i, name) in SEG_K_GU16_NAMES.iter().enumerate() {
+                if let Some(name) = name {
+                    gu16[i] = get(name);
+                }
+            }
             Some(SegKKernels {
                 module,
                 fns,
@@ -8782,6 +8827,7 @@ fn seg_k_kernels() -> Option<&'static SegKKernels> {
                 gu8,
                 k8,
                 v4,
+                gu16,
             })
         })
         .as_ref()
@@ -9237,13 +9283,20 @@ where
     let fuse_gu: Option<CUfunction> = match fast {
         // gate と up は型も行長も同じときだけ畳める (x を共有する前提)。
         Some(k) if seg_gu_fuse_enabled() && ty_g == ty_u && rb_g == rb_u => {
+            // task 562: 16 バイトロード版 (Q4_K) を最優先。
             // task 534: 8 バイトロード版があればそちら (無ければ従来の融合版)。
-            match k.gu8[slot_g] {
-                Some(f) if seg_gu8_enabled() => {
-                    crate::model::seg_prof::note_seg_gu8_call();
+            match k.gu16[slot_g] {
+                Some(f) if seg_gu16_enabled() => {
+                    crate::model::seg_prof::note_seg_gu16_call();
                     Some(f)
                 }
-                _ => k.gu[slot_g],
+                _ => match k.gu8[slot_g] {
+                    Some(f) if seg_gu8_enabled() => {
+                        crate::model::seg_prof::note_seg_gu8_call();
+                        Some(f)
+                    }
+                    _ => k.gu[slot_g],
+                },
             }
         }
         _ => None,
@@ -50394,6 +50447,112 @@ mod tests {
         }
     }
 
+    /// task 562: `DENNO_SEG_GU16` は **既定 off** (lab の A/B で採否を決める)。
+    /// 真値は 8 バイト版と同じ (明示的な真値だけ on)。
+    #[test]
+    fn t562_gu16_gate_truth_table() {
+        assert!(!seg_gu16_from_value(None), "未設定は off (既定)");
+        assert!(!seg_gu16_from_value(Some("")));
+        assert!(!seg_gu16_from_value(Some("0")));
+        assert!(!seg_gu16_from_value(Some("off")));
+        assert!(!seg_gu16_from_value(Some("no")));
+        for v in ["1", "on", "true", "yes", " TRUE "] {
+            assert!(seg_gu16_from_value(Some(v)), "gu16: {v}");
+        }
+    }
+
+    /// task 562: 16 バイト版は Q4_K (slot 2) の gate+up 融合版だけ。他の 3 スロットは
+    /// 無い = 古い PTX や他型では従来の融合版へ落ちる。
+    #[test]
+    fn t562_gu16_names_are_q4k_only() {
+        for (i, g) in SEG_K_GU16_NAMES.iter().enumerate() {
+            if i == 2 {
+                assert!(g.is_some(), "Q4_K (slot 2) の 16 バイト版が無い");
+            } else {
+                assert!(g.is_none(), "slot {i} に 16 バイト版がある");
+            }
+        }
+    }
+
+    /// task 562: 新しい Q4_K 16 バイト版 (`dno_seg_gemv_gu16_q4k`) の索引算術を
+    /// CPU に写し、**各要素をちょうど 1 回**、Q4_K の仕様どおりのバイト位置・
+    /// ニブル (下位/上位)・サブブロックのスケールで読むことを確かめる。
+    /// GPU 無しで検出できるのはここまで (値の一致は lab の A/B と `DENNO_EXPERT_GPU_CHECK`)。
+    #[test]
+    fn t562_gu16_q4k_lane_mapping_covers_every_element_once() {
+        const BLKS: usize = 4;
+        const LANES: usize = 8;
+        let nb = 10usize; // n_in = 2560
+        let mut seen = vec![vec![false; 256]; nb];
+        let mut lanes = 0usize;
+        for lane in 0..32usize {
+            let lb = lane & (LANES - 1);
+            let bi = lane >> 3;
+            let j = lb >> 1;
+            let h = lb & 1;
+            let mut b0 = 0usize;
+            while b0 < nb {
+                let b = b0 + bi;
+                if b < nb {
+                    lanes += 1;
+                    for t in 0..16usize {
+                        // xv[t] = 下位 16 要素、xv[32 + t] = 上位 16 要素
+                        for (xvi, e) in [
+                            (t, 64 * j + 16 * h + t),
+                            (32 + t, 64 * j + 32 + 16 * h + t),
+                        ] {
+                            // Q4_K の仕様: 要素 e -> 塊 cj = e/64、i = e%64
+                            // バイト = cj*32 + (i < 32 ? i : i-32)、ニブルは i>=32 が上位
+                            let cj = e / 64;
+                            let i = e % 64;
+                            let exp_byte = cj * 32 + if i < 32 { i } else { i - 32 };
+                            let exp_hi = i >= 32;
+                            let exp_sb = 2 * cj + usize::from(exp_hi);
+                            // カーネル: バイト = j*32 + h*16 + t、xvi >= 32 が上位
+                            let kbyte = j * 32 + h * 16 + t;
+                            let khi = xvi >= 32;
+                            let ksb = 2 * j + usize::from(khi);
+                            assert_eq!(
+                                (kbyte, khi, ksb),
+                                (exp_byte, exp_hi, exp_sb),
+                                "lane {lane} t {t} xvi {xvi} e {e}"
+                            );
+                            assert!(!seen[b][e], "要素が 2 回読まれた: b {b} e {e}");
+                            seen[b][e] = true;
+                        }
+                    }
+                }
+                b0 += BLKS;
+            }
+        }
+        assert_eq!(lanes, nb * 8, "1 ブロック 8 lane で 10 ブロックを覆っていない");
+        for (b, row) in seen.iter().enumerate() {
+            assert!(row.iter().all(|x| *x), "block {b} に読まれない要素がある");
+        }
+    }
+
+    /// task 562: カーネル側の `#define` とホスト側の前提 (1 warp = 4 ブロック、
+    /// 1 ブロック = 8 lane) が一致していること。
+    #[test]
+    fn t562_gu16_shape_matches_cu() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_seg_k.cu");
+        let src = std::fs::read_to_string(&p).expect("kernels_seg_k.cu が読めない");
+        let pick = |name: &str| -> usize {
+            let key = format!("#define {name} ");
+            let line = src
+                .lines()
+                .find(|l| l.starts_with(&key))
+                .unwrap_or_else(|| panic!("{name} の #define が無い"));
+            line[key.len()..].trim().parse().expect("#define の値が数値でない")
+        };
+        assert_eq!(pick("SK_G16_BLKS"), 4, "1 warp のブロック数");
+        assert_eq!(pick("SK_G16_LANES"), 8, "1 ブロックの lane 数");
+        // 16 バイト = 8 バイトロード 2 回で、行は 8 バイト境界に載る前提。
+        assert_eq!(144 % 8, 0, "Q4_K のブロック長が 8 の倍数でない");
+    }
+
     /// task 526: コミット済みの `kernels_seg_k.ptx` に融合 (gu) の 4 エントリが
     /// 居ること。**PTX の再生成を忘れると、ゲートを on にしても静かに従来の
     /// 3 起動へ落ちる** (起動数でしか気づけない) ので、ここで固定する。
@@ -50410,6 +50569,12 @@ mod tests {
         }
         // task 534: 8 バイトロード版 (gu8 / k8) の 4 エントリも居ること。
         for n in SEG_K_GU8_NAMES.iter().chain(SEG_K_K8_NAMES.iter()).flatten() {
+            let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
+            let key = format!(".visible .entry {name}(");
+            assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
+        }
+        // task 562: Q4_K の 16 バイト版 (gate+up 融合) も居ること。
+        for n in SEG_K_GU16_NAMES.iter().flatten() {
             let name = std::str::from_utf8(n).expect("ASCII").trim_end_matches('\u{0}');
             let key = format!(".visible .entry {name}(");
             assert!(ptx.contains(&key), "{name} が kernels_seg_k.ptx に無い (PTX 再生成要)");
