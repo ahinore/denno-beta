@@ -657,6 +657,72 @@ pub const STREAM_LOOKAHEAD_ENV: &str = "DENNO_PF_STREAM_LOOKAHEAD";
 /// [`STREAM_LOOKAHEAD_ENV`] の既定値 (1 = 1 つ先だけ)。
 pub const DEFAULT_STREAM_LOOKAHEAD: usize = 1;
 
+/// `DENNO_PF_STREAM_LOOKAHEAD_PREAD`: **pread を使うグループだけ** 何グループ先まで
+/// 依頼するか (task 570、既定 2 = 3 枚のステージングを埋める)。
+///
+/// # なぜ「pread のときだけ」か
+///
+/// UD-Q4_K_XL の prefill はディスク律速で、深さがまだ効く (lab t566a、
+/// `MODEL=flash-next-UD-Q4_K_XL`、depth8k、同じ run の b / b2 に対して):
+///
+/// | COND | 3,826 cold (r1 / r2) | 14k cold | `rd_max` | 平均同時 |
+/// | --- | --- | --- | --- | --- |
+/// | b (既定) | 7,339.4 / 6,765.4 ms | 11,370 ms | 64 | 19-22 本 |
+/// | `d3` (lookahead 2 + workers 3) | **6,599.8 / 6,346.6 ms** | **10,860 ms** | 82-84 | 28-32 本 |
+///
+/// 14k の対照は末尾の b2 (11,440 ms) なので -5.1%。3,826 は b の中央値 7,052 に
+/// 対して -8.2%、b2 の 6,730 に対しても -4.1%。decode は 12.9 ms/tok で不変、
+/// md5 は `c2000_cold` / `c8000_cold` が全 COND SAME。
+///
+/// 一方 **既定モデル (UD-IQ3_XXS) はこの深さを要らない**: P379 が同じ既定モデルで
+/// `DENNO_PF_STREAM_LOOKAHEAD=2` を測って 3,826 +2.4% / 14k +3% と**負けて**いる
+/// (写しは DRAM 21 GB/s で、深くすると `pf_slot_prepare` の再利用待ちが増えるだけ)。
+/// そこで**既定の lookahead は 1 のまま**にし、`pread` の立つグループだけ深くする。
+/// 既定モデルの経路は 1 グループ先のまま (= P379 の設定そのもの) なので、
+/// 既定モデルの数字は構造的に変わらない (lab t570b でも decode 32.3 / prefill
+/// 28.98 -> 29.02 s、md5 SAME、errors 0 で不変を確認)。
+///
+/// `0` で「base と同じ」= このゲートを切った状態へ戻せる
+/// (`DENNO_PF_STREAM_LOOKAHEAD_PREAD=0` または `DENNO_PF_STREAM_LOOKAHEAD=1` +
+/// `DENNO_PF_UP_WORKERS=2` で t566a 以前と同じ)。
+pub const STREAM_LOOKAHEAD_PREAD_ENV: &str = "DENNO_PF_STREAM_LOOKAHEAD_PREAD";
+
+/// [`STREAM_LOOKAHEAD_PREAD_ENV`] の既定値 (2 = 3 グループを同時に流す)。
+pub const DEFAULT_STREAM_LOOKAHEAD_PREAD: usize = 2;
+
+/// 依頼を何グループ先まで出すか (純関数)。0..=2 に丸める。0 は「base と同じ」。
+pub fn stream_lookahead_pread_from_value(v: Option<&str>) -> usize {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_STREAM_LOOKAHEAD_PREAD;
+    };
+    match s.parse::<usize>() {
+        Ok(n) => n.min(2),
+        Err(_) => DEFAULT_STREAM_LOOKAHEAD_PREAD,
+    }
+}
+
+/// pread のときの依頼先読み数 (プロセスで 1 回だけ env を読む)。
+pub fn stream_lookahead_pread() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        stream_lookahead_pread_from_value(
+            std::env::var(STREAM_LOOKAHEAD_PREAD_ENV).ok().as_deref(),
+        )
+    })
+}
+
+/// このグループの実効の依頼先読み数 (純関数)。
+///
+/// `pread` の立つグループだけ [`stream_lookahead_pread`] まで深くし、それ以外は
+/// `base` のまま。値が小さい側へは動かさない (`max`)。
+pub fn lookahead_for(pread: bool, base: usize, deep: usize) -> usize {
+    if pread {
+        base.max(deep)
+    } else {
+        base
+    }
+}
+
 /// 依頼を何グループ先まで出すか (純関数)。1..=2 に丸める。
 pub fn stream_lookahead_from_value(v: Option<&str>) -> usize {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -712,8 +778,21 @@ pub fn stream_lookahead() -> usize {
 /// 返らなくなった** (t554c/t554d) ので捨てた。
 pub const UP_WORKERS_ENV: &str = "DENNO_PF_UP_WORKERS";
 
-/// [`UP_WORKERS_ENV`] の既定値 (2 = 2 グループの写しを重ねる)。
-pub const DEFAULT_UP_WORKERS: usize = 2;
+/// [`UP_WORKERS_ENV`] の既定値 (3 = 3 グループの写しを重ねる。task 570 で 2 -> 3)。
+///
+/// # なぜ 3 か (lab t566a、UD-Q4_K_XL、depth8k、同じ run の b / b2 に対して)
+///
+/// 2 本にしたとき (task 554) は 3,826 で -16% だったが、写しの壁はまだ
+/// 「1 グループの最後の 1 本」で伸びていた (`rd_max` 63 に対し平均同時 19-22 本)。
+/// 3 本にすると平均同時が 28-32 本・`rd_max` 82-84 になり、**3,826 cold が
+/// 7,339.4 / 6,765.4 -> 6,599.8 / 6,346.6 ms、14k cold が 11,370 -> 10,860 ms**
+/// (decode 12.9 ms/tok 不変、md5 全 COND SAME)。詳細は
+/// [`STREAM_LOOKAHEAD_PREAD_ENV`] の doc。
+///
+/// **非 pread の層 (既定モデル) はワーカー 0 にしか送らない** ([`crate::cuda`] の
+/// `PfUp::submit`) ので、既定モデルの経路は 2 本のときと同一 (t570b で
+/// decode 32.3 / prefill 28.98 -> 29.02 s、md5 SAME、errors 0)。
+pub const DEFAULT_UP_WORKERS: usize = 3;
 
 /// 上げスレッドの本数の解釈 (純関数)。1..=3 に丸める。
 ///

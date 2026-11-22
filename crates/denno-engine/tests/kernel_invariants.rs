@@ -11288,9 +11288,25 @@ fn task320_upload_thread_lookahead_is_wired() {
         .expect("stream_lookahead_from_value が無い");
     assert!(f.contains(".clamp(1, 2)"), "1..=2 に丸めていない");
     // 依頼ループ: 先読みをゲートから取る。
+    // task 570: base は `DENNO_PF_STREAM_LOOKAHEAD`、pread のグループだけ
+    // `DENNO_PF_STREAM_LOOKAHEAD_PREAD` まで深くする (実効の深さは純関数
+    // `lookahead_for` が決める)。
     assert!(
-        CUDA_RS.contains("let look = if ut { exp_pf::stream_lookahead() } else { 0 };"),
+        CUDA_RS.contains("let look_base = if ut { exp_pf::stream_lookahead() } else { 0 };"),
         "依頼ループが先読みをゲートから取っていない"
+    );
+    assert!(
+        CUDA_RS.contains("look = exp_pf::lookahead_for(pread, look_base, look_deep);"),
+        "依頼ループが pread のグループで深さを変えていない"
+    );
+    assert!(
+        EXP_PF_SRC
+            .contains("pub const STREAM_LOOKAHEAD_PREAD_ENV: &str = \"DENNO_PF_STREAM_LOOKAHEAD_PREAD\";"),
+        "pread の先読み env 名が無い"
+    );
+    assert!(
+        EXP_PF_SRC.contains("pub fn lookahead_for(pread: bool, base: usize, deep: usize) -> usize"),
+        "実効の深さを決める純関数が無い"
     );
     assert!(
         CUDA_RS.contains("while submitted <= gi + look && submitted < bounds.len() {"),

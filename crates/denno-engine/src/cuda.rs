@@ -14611,19 +14611,23 @@ fn pf_up_ensure() {
     });
 }
 
-/// グループ `g` の上げを専用スレッドへ依頼する (戻り値はデバイスポインタ表)。
+/// グループ `g` の上げを専用スレッドへ依頼する (戻り値はデバイスポインタ表と、
+/// そのグループが `pread` を使ったか)。
+///
+/// task 570: `pread` の真偽を返すのは、依頼の深さを pread のグループだけ深くする
+/// ため ([`crate::model::exp_pf::lookahead_for`])。
 fn pf_submit_group(
     g: u64,
     items: &[PfItem<'_>],
     probe: bool,
-) -> Result<Option<Vec<[u64; 3]>>> {
+) -> Result<(Option<Vec<[u64; 3]>>, bool)> {
     pf_up_ensure();
-    PF_STREAM.with(|cell| -> Result<Option<Vec<[u64; 3]>>> {
+    PF_STREAM.with(|cell| -> Result<(Option<Vec<[u64; 3]>>, bool)> {
         let mut st = cell.borrow_mut();
-        PF_UP.with(|uc| -> Result<Option<Vec<[u64; 3]>>> {
+        PF_UP.with(|uc| -> Result<(Option<Vec<[u64; 3]>>, bool)> {
             let slot = uc.borrow();
             let Some(up) = slot.as_ref() else {
-                return Ok(None);
+                return Ok((None, false));
             };
             let plan = pf_slot_prepare(&mut st, g, items, true)?;
             let s = plan.slot;
@@ -14674,7 +14678,7 @@ fn pf_submit_group(
                 up_ev,
                 probe,
             })?;
-            Ok(Some(plan.ptrs))
+            Ok((Some(plan.ptrs), plan.pread))
         })
     })
 }
@@ -16389,7 +16393,11 @@ fn moe_experts_iq_pf_layer_stream_io(
             });
             // task 320: 上げ専用スレッドへ何グループ先まで依頼するか。
             // 1 つ先だけだと、待つグループの写しがまだ終わっておらず隠れない。
-            let look = if ut { exp_pf::stream_lookahead() } else { 0 };
+            // task 570: **pread の立つグループだけ**深くする (既定モデルの経路は
+            // 1 グループ先のまま。`exp_pf::lookahead_for` の doc を見よ)。
+            let look_base = if ut { exp_pf::stream_lookahead() } else { 0 };
+            let look_deep = exp_pf::stream_lookahead_pread();
+            let mut look = look_base;
             // task 325: 写しの外から何グループ先を先読みするか。
             let ra = exp_pf::ra_groups();
             // task 333: ここまでに 1 グループでも計算したか。
@@ -16415,11 +16423,14 @@ fn moe_experts_iq_pf_layer_stream_io(
                         let k = submitted;
                         if !items_of[k].is_empty() {
                             let first = !probe_sent;
-                            ready_ptrs[k] =
+                            // task 570: 依頼したグループが pread を使うかで深さを決める。
+                            let (ptrs, pread) =
                                 pf_submit_group(base_g + k as u64, &items_of[k], first)?;
+                            ready_ptrs[k] = ptrs;
                             if ready_ptrs[k].is_some() {
                                 probe_sent = true;
                             }
+                            look = exp_pf::lookahead_for(pread, look_base, look_deep);
                         }
                         submitted = k + 1;
                     }
@@ -17977,18 +17988,52 @@ mod pf_stream_tests {
         assert_eq!(s.done, vec![true, true, false, true], "空の 2 番目は false のまま");
     }
 
-    /// task 554: `DENNO_PF_UP_WORKERS` の解釈 (1..=3、既定 2、壊れた値は既定)。
+    /// task 554/570: `DENNO_PF_UP_WORKERS` の解釈 (1..=3、既定 3、壊れた値は既定)。
     #[test]
     fn up_workers_values_round_and_default() {
         use crate::model::exp_pf::{up_workers_from_value, DEFAULT_UP_WORKERS};
-        assert_eq!(DEFAULT_UP_WORKERS, 2, "既定は 2 本 (t554e で -16% / 14k -10%)");
-        assert_eq!(up_workers_from_value(None), 2);
-        assert_eq!(up_workers_from_value(Some("")), 2);
+        assert_eq!(
+            DEFAULT_UP_WORKERS, 3,
+            "既定は 3 本 (task 570 で 2 -> 3。lab t566a の 3,826 -4..-8% / 14k -5%)"
+        );
+        assert_eq!(up_workers_from_value(None), 3);
+        assert_eq!(up_workers_from_value(Some("")), 3);
         assert_eq!(up_workers_from_value(Some("1")), 1, "切り戻し");
         assert_eq!(up_workers_from_value(Some(" 3 ")), 3);
         assert_eq!(up_workers_from_value(Some("0")), 1, "0 は 1 本へ");
         assert_eq!(up_workers_from_value(Some("9")), 3, "スロット 3 枚が上限");
-        assert_eq!(up_workers_from_value(Some("x")), 2, "壊れた値は既定");
+        assert_eq!(up_workers_from_value(Some("x")), 3, "壊れた値は既定");
+    }
+
+    /// task 570: `DENNO_PF_STREAM_LOOKAHEAD_PREAD` の解釈と、実効の深さ。
+    ///
+    /// **pread の立つグループだけ深い**。既定モデル (非 pread) は base のまま
+    /// (= P379 が +2.4% と測った深さへ動かさない)。
+    #[test]
+    fn lookahead_pread_gate_and_effective_depth() {
+        use crate::model::exp_pf::{
+            lookahead_for, stream_lookahead_pread_from_value,
+            DEFAULT_STREAM_LOOKAHEAD, DEFAULT_STREAM_LOOKAHEAD_PREAD,
+        };
+        assert_eq!(DEFAULT_STREAM_LOOKAHEAD, 1, "base は 1 のまま (既定モデル)");
+        assert_eq!(DEFAULT_STREAM_LOOKAHEAD_PREAD, 2, "pread は 2 (3 グループ)");
+        assert_eq!(
+            stream_lookahead_pread_from_value(None),
+            DEFAULT_STREAM_LOOKAHEAD_PREAD
+        );
+        assert_eq!(stream_lookahead_pread_from_value(Some("")), 2);
+        assert_eq!(stream_lookahead_pread_from_value(Some("0")), 0, "切り戻し");
+        assert_eq!(stream_lookahead_pread_from_value(Some("1")), 1, "切り戻し");
+        assert_eq!(stream_lookahead_pread_from_value(Some("2")), 2);
+        assert_eq!(stream_lookahead_pread_from_value(Some("9")), 2, "上限は 2");
+        assert_eq!(stream_lookahead_pread_from_value(Some("x")), 2);
+        // 実効の深さ: pread のときだけ深い。非 pread は base のまま。
+        assert_eq!(lookahead_for(false, 1, 2), 1, "既定モデルは 1 のまま");
+        assert_eq!(lookahead_for(true, 1, 2), 2, "UD は 2");
+        assert_eq!(lookahead_for(true, 0, 2), 2, "ut off は 0 だが pread なら 2");
+        assert_eq!(lookahead_for(true, 1, 0), 1, "ゲートを 0 にすると base");
+        assert_eq!(lookahead_for(true, 2, 1), 2, "小さい側へは動かさない");
+        assert_eq!(lookahead_for(false, 2, 0), 2);
     }
 
     /// task 558: `DENNO_PF_PREAD_POOL_PER_UP` の解釈と、番号ごとのプールの割り当て。
