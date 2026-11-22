@@ -12899,8 +12899,7 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         // 2 x 16 = 32 本 total の w2 は 14k で 1.6 倍に伸びたので採らない)。
         let nt = exp_pf::pread_threads();
         if pread && nt > 0 {
-            if let Some(pool) = pf_pread_pool(nt) {
-                pool.install(|| tasks.par_iter().for_each(work));
+            if pf_pread_pool_install(nt, || tasks.par_iter().for_each(&work)).is_some() {
                 // task 546: バウンス経路も同じ台帳 (ディスク待ちの切り分け) を残す。
                 if exp_pf::nc_on() || exp_pf::odb_on() {
                     exp_pf::note_staging_group(group_miss, t_grp.elapsed().as_nanos() as u64);
@@ -12919,36 +12918,38 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
     }
 }
 
-/// task 325 / 554: pread 専用の rayon プール (スレッドごとに 1 個、本数ごとに作り直す)。
+/// task 325 / 554: pread 専用の rayon プール (スレッドごとに 1 個)。
 ///
 /// task 554: 上げ専用スレッドが 2 本以上 (`DENNO_PF_UP_WORKERS`) になると、
 /// 写しが**同時に 2 グループ**走る。1 本の共有プールに両方を入れると、計算側が
 /// 待っているグループ g の残りが相手のグループのタスクの後ろに回りうる
-/// (H2D が遅れて壁が伸びる) ので、スレッドごとに別のプールを持たせ、
-/// 1 本あたりの本数を `DENNO_PF_PREAD_THREADS / ワーカー数` に割る
-/// (総スレッド数は 1 本のときと同じ)。
+/// (H2D が遅れて壁が伸びる) ので、スレッドごとに別のプールを持たせる。
+///
+/// **プールはスレッドと一緒に落とす** (`'static` にしない)。上げスレッドは
+/// リクエストごとに作り直されるので、`Box::leak` すると 1 リクエストあたり
+/// 32 本のスレッドが解放されずに積み上がる。
 #[cfg(feature = "par")]
-fn pf_pread_pool(nt: usize) -> Option<&'static rayon::ThreadPool> {
+fn pf_pread_pool_install<R: Send>(nt: usize, op: impl FnOnce() -> R + Send) -> Option<R> {
     thread_local! {
-        static POOL: std::cell::RefCell<Option<(usize, &'static rayon::ThreadPool)>> =
+        static POOL: std::cell::RefCell<Option<(usize, rayon::ThreadPool)>> =
             const { std::cell::RefCell::new(None) };
     }
     POOL.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if let Some((have, p)) = *slot {
-            if have == nt {
-                return Some(p);
-            }
-        }
-        let built: &'static rayon::ThreadPool = Box::leak(Box::new(
-            rayon::ThreadPoolBuilder::new()
+        let need_new = match slot.as_ref() {
+            Some((have, _)) => *have != nt,
+            None => true,
+        };
+        if need_new {
+            let p = rayon::ThreadPoolBuilder::new()
                 .num_threads(nt)
                 .thread_name(|i| format!("pf-pread-{i}"))
                 .build()
-                .ok()?,
-        ));
-        *slot = Some((nt, built));
-        Some(built)
+                .ok()?;
+            *slot = Some((nt, p));
+        }
+        let (_, pool) = slot.as_ref()?;
+        Some(pool.install(op))
     })
 }
 
