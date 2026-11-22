@@ -14279,12 +14279,13 @@ unsafe impl Send for PfUpJob {}
 
 /// 上げ専用スレッドの進捗 (計算スレッドはここだけを見る)。
 struct PfUpState {
-    /// `ev_up` を記録し終えたグループの次 (**連続した**前線)。
-    ready: u64,
-    /// task 554: グループごとの完了。上げスレッドが 2 本以上になると完了が
-    /// 順不同に届くので、`ready` は「小さい方から途切れずに揃った所」までしか
-    /// 進めない (計算側は `ev_up` を同期する前にここを見るので、飛ばすと
-    /// **まだ記録していない古いイベントで待ちが満たされて重みが壊れる**)。
+    /// task 554: グループごとに `ev_up` を記録し終えたか。
+    ///
+    /// 上げスレッドが 2 本以上になると完了が順不同に届くので、**前線 (連続した
+    /// 番号) では待てない**。1 本のときも番号に穴が空く (`items` が空のグループは
+    /// 依頼しない) ので、待ちはグループ単位の旗で行う。旗を飛ばして古い `ev_up`
+    /// で待ちが満たされると重みが壊れるため、ここは「そのグループが記録済みか」
+    /// だけを見る。
     done: Vec<bool>,
     /// グループごとの (写し ns, 積み込み ns, スロット待ち ns)。
     times: Vec<(u64, u64, u64)>,
@@ -14329,14 +14330,12 @@ fn pf_up_publish(
     if err.is_some() && s.err.is_none() {
         s.err = err;
     }
-    // task 554: 完了は順不同に届く。前線は「途切れずに揃った所」までだけ進める。
+    // task 554: 完了は順不同に届くので、グループごとの旗を立てるだけにする
+    // (連続した前線にすると、依頼しない空のグループで止まって待ちが返らない)。
     if s.done.len() <= g as usize {
         s.done.resize(g as usize + 1, false);
     }
     s.done[g as usize] = true;
-    while (s.ready as usize) < s.done.len() && s.done[s.ready as usize] {
-        s.ready += 1;
-    }
     cv.notify_all();
 }
 
@@ -14390,7 +14389,6 @@ impl Drop for PfUploader {
 fn new_up_state() -> std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)> {
     std::sync::Arc::new((
         std::sync::Mutex::new(PfUpState {
-            ready: 0,
             done: Vec::new(),
             times: Vec::new(),
             probe: None,
@@ -14448,7 +14446,7 @@ impl PfUp {
             if let Some(e) = s.err.as_deref() {
                 bail!("上げスレッド: {e}");
             }
-            if s.ready > g {
+            if s.done.get(g as usize).copied().unwrap_or(false) {
                 return Ok(t.elapsed().as_nanos() as u64);
             }
             let (s2, to) = cv
@@ -14458,7 +14456,7 @@ impl PfUp {
             if to.timed_out() {
                 // 全ワーカーが終わっている (panic 等) なら待ち続けない。
                 let dead = self.ups.iter().all(|u| u.finished());
-                if dead && s.ready <= g {
+                if dead && !s.done.get(g as usize).copied().unwrap_or(false) {
                     bail!("上げスレッドが終了した (グループ {g} の依頼が処理されていない)");
                 }
             }
@@ -17803,12 +17801,12 @@ mod pf_stream_tests {
         assert_eq!(next, 26);
     }
 
-    /// task 165: 上げスレッドの進捗公開は単調で、エラーは最初の 1 本を残す。
+    /// task 165 / 554: 上げスレッドの進捗公開はグループ単位の旗で、エラーは
+    /// 最初の 1 本を残す。
     #[test]
-    fn up_progress_publishes_in_order() {
+    fn up_progress_publishes_per_group() {
         let st = (
             std::sync::Mutex::new(PfUpState {
-                ready: 0,
                 done: Vec::new(),
                 times: Vec::new(),
                 probe: None,
@@ -17820,28 +17818,28 @@ mod pf_stream_tests {
         pf_up_publish(&st, 1, 11, 21, 31, None, None);
         {
             let s = st.0.lock().expect("poisoned");
-            assert_eq!(s.ready, 2, "2 グループ目まで公開したら ready=2");
+            assert_eq!(s.done, vec![true, true], "2 グループとも記録済み");
             assert_eq!(s.times[0], (10, 20, 30));
             assert_eq!(s.times[1], (11, 21, 31));
             assert_eq!(s.probe, Some((1_000, 5)));
         }
-        // 遅れて届いた小さい番号でも ready は戻らず、エラーは残る。
+        // 遅れて届いた小さい番号でも旗は戻らず、エラーは残る。
         pf_up_publish(&st, 0, 0, 0, 0, None, Some("最初のエラー".to_string()));
         pf_up_publish(&st, 2, 12, 22, 32, None, Some("2 本目".to_string()));
         let s = st.0.lock().expect("poisoned");
-        assert_eq!(s.ready, 3, "ready が戻った");
+        assert_eq!(s.done, vec![true, true, true]);
         assert_eq!(s.err.as_deref(), Some("最初のエラー"), "エラーが上書きされた");
         assert_eq!(s.times[2], (12, 22, 32));
     }
 
-    /// task 554: 上げスレッドが 2 本だと完了が順不同に届く。前線 (`ready`) は
-    /// **途切れずに揃った所**までしか進めない (飛ばすと、まだ記録していない
-    /// 古い `ev_up` で計算側の待ちが満たされて重みが壊れる)。
+    /// task 554: 上げスレッドが 2 本だと完了が**順不同**に届く。旗はグループ
+    /// 単位なので、2 本目が先に届いても 1 本目の旗は立たない (= 古い `ev_up` で
+    /// 計算側の待ちが満たされない)。空のグループ (依頼しない番号) があっても
+    /// 他のグループの待ちは返る。
     #[test]
-    fn up_progress_frontier_does_not_jump_over_a_gap() {
+    fn up_progress_flags_do_not_leak_across_groups() {
         let st = (
             std::sync::Mutex::new(PfUpState {
-                ready: 0,
                 done: Vec::new(),
                 times: Vec::new(),
                 probe: None,
@@ -17851,15 +17849,15 @@ mod pf_stream_tests {
         );
         // 2 本目が先に終わる (1 本目はまだ)。
         pf_up_publish(&st, 1, 11, 21, 31, None, None);
-        assert_eq!(st.0.lock().expect("poisoned").ready, 0, "穴を飛び越えた");
-        // 1 本目が終わったら 2 本目まで一気に進む。
+        {
+            let s = st.0.lock().expect("poisoned");
+            assert_eq!(s.done, vec![false, true], "1 本目の旗が立った");
+        }
         pf_up_publish(&st, 0, 10, 20, 30, None, None);
-        assert_eq!(st.0.lock().expect("poisoned").ready, 2);
-        // 3 本目 (2 本目の次) も同じ。
+        // 3 番目は依頼しない (空のグループ) まま 4 番目が届く。
         pf_up_publish(&st, 3, 13, 23, 33, None, None);
-        assert_eq!(st.0.lock().expect("poisoned").ready, 2);
-        pf_up_publish(&st, 2, 12, 22, 32, None, None);
-        assert_eq!(st.0.lock().expect("poisoned").ready, 4);
+        let s = st.0.lock().expect("poisoned");
+        assert_eq!(s.done, vec![true, true, false, true], "空の 2 番目は false のまま");
     }
 
     /// task 554: `DENNO_PF_UP_WORKERS` の解釈 (1..=3、既定 2、壊れた値は既定)。
