@@ -12899,7 +12899,8 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         // 2 x 16 = 32 本 total の w2 は 14k で 1.6 倍に伸びたので採らない)。
         let nt = exp_pf::pread_threads();
         if pread && nt > 0 {
-            if pf_pread_pool_install(nt, || tasks.par_iter().for_each(&work)).is_some() {
+            if let Some(pool) = pf_pread_pool(nt) {
+                pool.install(|| tasks.par_iter().for_each(work));
                 // task 546: バウンス経路も同じ台帳 (ディスク待ちの切り分け) を残す。
                 if exp_pf::nc_on() || exp_pf::odb_on() {
                     exp_pf::note_staging_group(group_miss, t_grp.elapsed().as_nanos() as u64);
@@ -12918,39 +12919,29 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
     }
 }
 
-/// task 325 / 554: pread 専用の rayon プール (スレッドごとに 1 個)。
+/// task 325: pread 専用の rayon プール (スレッド数ごとに 1 個だけ作る)。
 ///
-/// task 554: 上げ専用スレッドが 2 本以上 (`DENNO_PF_UP_WORKERS`) になると、
-/// 写しが**同時に 2 グループ**走る。1 本の共有プールに両方を入れると、計算側が
-/// 待っているグループ g の残りが相手のグループのタスクの後ろに回りうる
-/// (H2D が遅れて壁が伸びる) ので、スレッドごとに別のプールを持たせる。
-///
-/// **プールはスレッドと一緒に落とす** (`'static` にしない)。上げスレッドは
-/// リクエストごとに作り直されるので、`Box::leak` すると 1 リクエストあたり
-/// 32 本のスレッドが解放されずに積み上がる。
+/// task 554: **int-auto の実装のまま**。上げスレッドを 2 本にしても 1 本の
+/// プールを共有する (2 本に分けた版 = `pf_pread_pool_install` は、既定モデルの
+/// 3,826 cold が返らなくなる t554c/t554d の原因を切り分けられなかったので捨てた)。
 #[cfg(feature = "par")]
-fn pf_pread_pool_install<R: Send>(nt: usize, op: impl FnOnce() -> R + Send) -> Option<R> {
-    thread_local! {
-        static POOL: std::cell::RefCell<Option<(usize, rayon::ThreadPool)>> =
-            const { std::cell::RefCell::new(None) };
+fn pf_pread_pool(nt: usize) -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    static NT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let first = NT.swap(nt, std::sync::atomic::Ordering::Relaxed) == 0;
+    if !first {
+        // 2 本目以降の違う本数は無視する (プロセスで 1 個)。
+        return POOL.get().and_then(|p| p.as_ref());
     }
-    POOL.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let need_new = match slot.as_ref() {
-            Some((have, _)) => *have != nt,
-            None => true,
-        };
-        if need_new {
-            let p = rayon::ThreadPoolBuilder::new()
-                .num_threads(nt)
-                .thread_name(|i| format!("pf-pread-{i}"))
-                .build()
-                .ok()?;
-            *slot = Some((nt, p));
-        }
-        let (_, pool) = slot.as_ref()?;
-        Some(pool.install(op))
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(nt)
+            .thread_name(|i| format!("pf-pread-{i}"))
+            .build()
+            .ok()
     })
+    .as_ref()
 }
 
 /// task 239: pinned の `[start, start + len)` だけを写す (分割 DMA 用)。
