@@ -17934,16 +17934,17 @@ mod pf_stream_tests {
 
     /// task 558: `DENNO_PF_PREAD_POOL_PER_UP` の解釈と、番号ごとのプールの割り当て。
     ///
-    /// ゲートは明示的な真値だけ on (既定 off = 1 本共有のまま)。プールは
-    /// 上げスレッドの番号ごとに別の実体を返し、範囲外の番号は `None`
-    /// (呼び出し側が共有プールへ落ちる)。
+    /// 既定 on (task 558 で採用、lab の 3,826 cold が -10.8% / -8.3%)。
+    /// `0` で 1 本共有へ切り戻せる。プールは上げスレッドの番号ごとに別の実体を
+    /// 返し、範囲外の番号は `None` (呼び出し側が共有プールへ落ちる)。
     #[test]
     fn pread_pool_per_up_gate_and_pools() {
         use crate::model::exp_pf::{pread_pool_per_up_from_value, DEFAULT_PREAD_POOL_PER_UP};
-        assert!(!DEFAULT_PREAD_POOL_PER_UP, "既定 off (切り戻しできる)");
-        assert!(!pread_pool_per_up_from_value(None));
-        assert!(!pread_pool_per_up_from_value(Some("")));
-        assert!(!pread_pool_per_up_from_value(Some("0")));
+        assert!(DEFAULT_PREAD_POOL_PER_UP, "lab で採ったのに既定 off に戻っている");
+        assert!(pread_pool_per_up_from_value(None), "未設定は既定 on");
+        assert!(pread_pool_per_up_from_value(Some("")));
+        assert!(!pread_pool_per_up_from_value(Some("0")), "切り戻し");
+        assert!(!pread_pool_per_up_from_value(Some("off")));
         assert!(pread_pool_per_up_from_value(Some("1")));
         assert!(pread_pool_per_up_from_value(Some(" ON ")));
         // 計算スレッド (このテストスレッド) は番号を持たない = 共有プール。

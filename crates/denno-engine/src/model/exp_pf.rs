@@ -2274,7 +2274,7 @@ pub fn pread_threads() -> usize {
 }
 
 /// `DENNO_PF_PREAD_POOL_PER_UP`: pread のプールを**上げスレッドごとに**持つ。
-/// 既定 off (task 558)。
+/// 既定 on (task 558 で採用)。
 ///
 /// # なぜ (task 554 が残した 1 行)
 ///
@@ -2304,10 +2304,10 @@ pub fn pread_threads() -> usize {
 /// 32 → 64)。効果の有無は lab の既定モデル COND で確かめる。
 pub const PREAD_POOL_PER_UP_ENV: &str = "DENNO_PF_PREAD_POOL_PER_UP";
 
-/// [`PREAD_POOL_PER_UP_ENV`] の既定値 (off = task 554 の 1 本共有のまま)。
-pub const DEFAULT_PREAD_POOL_PER_UP: bool = false;
+/// [`PREAD_POOL_PER_UP_ENV`] の既定値 (on = task 558 で採用。`0` で 1 本共有へ)。
+pub const DEFAULT_PREAD_POOL_PER_UP: bool = true;
 
-/// [`PREAD_POOL_PER_UP_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+/// [`PREAD_POOL_PER_UP_ENV`] の解釈 (純関数)。未設定は既定 (on)、`0` 系だけ off。
 pub fn pread_pool_per_up_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim).filter(|s| !s.is_empty()) {
         None => DEFAULT_PREAD_POOL_PER_UP,
