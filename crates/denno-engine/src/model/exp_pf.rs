@@ -2273,6 +2273,59 @@ pub fn pread_threads() -> usize {
     })
 }
 
+/// `DENNO_PF_PREAD_POOL_PER_UP`: pread のプールを**上げスレッドごとに**持つ。
+/// 既定 on (task 558 で採用)。
+///
+/// # なぜ (task 554 が残した 1 行)
+///
+/// task 554 は上げスレッドを 2 本にして、2 グループの写しを重ねた
+/// (`DENNO_PF_UP_WORKERS`、既定 2)。ただし **pread のプールは 1 本を共有** した
+/// ままなので、同時に飛ぶ I/O は 32 本のまま。t554a/t554b でプールを 2 本に
+/// 分けた版 (2 x 32 = 64 本) は 3,826 cold が -28/-29%、14k cold が -19/-25% と
+/// さらに速かったが、**既定モデルの 3,826 cold が返らなくなった**ので捨てた。
+/// そのハングの原因は後に分かった: 進捗を「連続した前線」で持っていたため、
+/// `items` が空で依頼しないグループで待ちが止まっていた (task 554 で
+/// グループ単位の旗 `done[g]` に直した)。つまり棄却理由は解消済みで、
+/// 同時発行の深さそのものは**修正後のコードでは未測定**。
+///
+/// # 何が変わるか
+///
+/// 上げスレッド `wid` ごとに `DENNO_PF_PREAD_THREADS` (32) 本のプールを持ち、
+/// そのスレッドの `par_iter` は自分のプールで回す。2 本なら同時 64 本。
+/// プールは**プロセスで 1 組**だけ作り (上げスレッドの番号で引く)、リクエストを
+/// またいで使い回す。計算スレッドの経路 (番号なし) は従来の共有プールのまま。
+/// デバイスへ渡るバイト列・値は 1 ビットも変わらない (読む順番だけが違う)。
+///
+/// # 既定モデルへの影響
+///
+/// `pread` を使わない写し (mmap からの memcpy だけ) はワーカー 0 にだけ行くので
+/// 変わらない。ただし既定モデル (UD-IQ3_XXS) も expert が cold のときは
+/// `pread_MB` が出る (t577a) ので、**その経路はプールが分かれる** (同時発行が
+/// 32 → 64)。効果の有無は lab の既定モデル COND で確かめる。
+pub const PREAD_POOL_PER_UP_ENV: &str = "DENNO_PF_PREAD_POOL_PER_UP";
+
+/// [`PREAD_POOL_PER_UP_ENV`] の既定値 (on = task 558 で採用。`0` で 1 本共有へ)。
+pub const DEFAULT_PREAD_POOL_PER_UP: bool = true;
+
+/// [`PREAD_POOL_PER_UP_ENV`] の解釈 (純関数)。未設定は既定 (on)、`0` 系だけ off。
+pub fn pread_pool_per_up_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => DEFAULT_PREAD_POOL_PER_UP,
+        Some(s) => matches!(
+            s.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// [`PREAD_POOL_PER_UP_ENV`] が有効か (プロセスで 1 回だけ env を読む)。
+pub fn pread_pool_per_up_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pread_pool_per_up_from_value(std::env::var(PREAD_POOL_PER_UP_ENV).ok().as_deref())
+    })
+}
+
 /// `DENNO_PF_STREAM_PREAD`: task 349。IQ 系のストリームでも `read_at` を使う。
 ///
 /// task 325 の pread は「pinned バウンスが write-combined でない」スロットだけ

@@ -12899,7 +12899,16 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         // `UP_WORKERS_ENV` の doc を参照)。
         let nt = exp_pf::pread_threads();
         if pread && nt > 0 {
-            if let Some(pool) = pf_pread_pool(nt) {
+            // task 558: `DENNO_PF_PREAD_POOL_PER_UP` のときは、上げスレッドの
+            // 番号ごとに 32 本のプールを持たせる (2 本で同時 64 本)。t554a/b が
+            // 測った形。計算スレッド経路 (番号無し) と、ゲート off は 1 本共有のまま。
+            let pool = match exp_pf::pread_pool_per_up_on() {
+                true => pf_up_idx()
+                    .and_then(|i| pf_pread_pool_up(nt, i))
+                    .or_else(|| pf_pread_pool(nt)),
+                false => pf_pread_pool(nt),
+            };
+            if let Some(pool) = pool {
                 pool.install(|| tasks.par_iter().for_each(work));
                 // task 546: バウンス経路も同じ台帳 (ディスク待ちの切り分け) を残す。
                 if exp_pf::nc_on() || exp_pf::odb_on() {
@@ -12942,6 +12951,49 @@ fn pf_pread_pool(nt: usize) -> Option<&'static rayon::ThreadPool> {
             .ok()
     })
     .as_ref()
+}
+
+/// task 558: 上げスレッドの番号ごとの pread プール (`DENNO_PF_PREAD_POOL_PER_UP`)。
+///
+/// プールは**プロセスで 1 組**だけ作り、リクエストをまたいで使い回す
+/// (上げスレッドはリクエストごとに作り直されるので、スレッドローカルに持つと
+/// リクエストごとに 32 本が解放されず積み上がる。t554 の版はこれで漏れた)。
+/// 番号が範囲外 (上げスレッド 3 本を超えた等) は `None` を返し、呼び出し側が
+/// 共有プールへ落ちる。
+#[cfg(feature = "par")]
+fn pf_pread_pool_up(nt: usize, up: usize) -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    // 上げスレッドは最大 3 本 (`up_workers_from_value` の上限)。
+    const MAX_UP: usize = 3;
+    if up >= MAX_UP {
+        return None;
+    }
+    static POOLS: OnceLock<Vec<Option<rayon::ThreadPool>>> = OnceLock::new();
+    let n = crate::model::exp_pf::up_workers().clamp(1, MAX_UP);
+    let pools = POOLS.get_or_init(|| {
+        (0..n)
+            .map(|u| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(nt)
+                    .thread_name(move |i| format!("pf-pread-u{u}-{i}"))
+                    .build()
+                    .ok()
+            })
+            .collect()
+    });
+    pools.get(up).and_then(|p| p.as_ref())
+}
+
+thread_local! {
+    /// task 558: このスレッドが上げ専用スレッドなら、その番号 (0..)。
+    /// 計算スレッドは `None` のまま (従来の共有プールを使う)。
+    static PF_UP_IDX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// task 558: このスレッドの上げ番号 (上げスレッドでなければ `None`)。
+#[cfg(feature = "par")]
+fn pf_up_idx() -> Option<usize> {
+    PF_UP_IDX.with(|c| c.get())
 }
 
 /// task 239: pinned の `[start, start + len)` だけを写す (分割 DMA 用)。
@@ -14347,14 +14399,16 @@ struct PfUploader {
 
 impl PfUploader {
     /// task 554: 進捗の置き場を共有して起動する (`DENNO_PF_UP_WORKERS` 本で 1 組)。
+    /// task 558: `idx` はこのスレッドの番号 (pread プールを分けるための印)。
     fn start_with(
         ctx: &'static CudaCtx,
         st: std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)>,
+        idx: usize,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<PfUpJob>();
         let join = std::thread::Builder::new()
-            .name("pf-up".to_string())
-            .spawn(move || pf_up_worker(rx, st, ctx))
+            .name(format!("pf-up-{idx}"))
+            .spawn(move || pf_up_worker(rx, st, ctx, idx))
             .ok();
         PfUploader { tx: Some(tx), join }
     }
@@ -14413,8 +14467,8 @@ impl PfUp {
     fn start(ctx: &'static CudaCtx, n: usize) -> Self {
         let st = new_up_state();
         let mut ups = Vec::with_capacity(n);
-        for _ in 0..n.max(1) {
-            ups.push(PfUploader::start_with(ctx, std::sync::Arc::clone(&st)));
+        for i in 0..n.max(1) {
+            ups.push(PfUploader::start_with(ctx, std::sync::Arc::clone(&st), i));
         }
         PfUp { ups, st }
     }
@@ -14600,7 +14654,11 @@ fn pf_up_worker(
     rx: std::sync::mpsc::Receiver<PfUpJob>,
     st: std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)>,
     ctx: &'static CudaCtx,
+    idx: usize,
 ) {
+    // task 558: このスレッドの番号を焼く (`pf_copy_into_pin` が pread プールを
+    // 分けるのに使う)。計算スレッドは `None` のまま。
+    let _ = PF_UP_IDX.try_with(|c| c.set(Some(idx)));
     // CUDA の current context はスレッドローカルなので、このスレッドでも張る。
     let ctx_ok = ctx.make_current().is_ok();
     loop {
@@ -17872,6 +17930,51 @@ mod pf_stream_tests {
         assert_eq!(up_workers_from_value(Some("0")), 1, "0 は 1 本へ");
         assert_eq!(up_workers_from_value(Some("9")), 3, "スロット 3 枚が上限");
         assert_eq!(up_workers_from_value(Some("x")), 2, "壊れた値は既定");
+    }
+
+    /// task 558: `DENNO_PF_PREAD_POOL_PER_UP` の解釈と、番号ごとのプールの割り当て。
+    ///
+    /// 既定 on (task 558 で採用、lab の 3,826 cold が -10.8% / -8.3%)。
+    /// `0` で 1 本共有へ切り戻せる。プールは上げスレッドの番号ごとに別の実体を
+    /// 返し、範囲外の番号は `None` (呼び出し側が共有プールへ落ちる)。
+    #[test]
+    fn pread_pool_per_up_gate_and_pools() {
+        use crate::model::exp_pf::{pread_pool_per_up_from_value, DEFAULT_PREAD_POOL_PER_UP};
+        assert!(DEFAULT_PREAD_POOL_PER_UP, "lab で採ったのに既定 off に戻っている");
+        assert!(pread_pool_per_up_from_value(None), "未設定は既定 on");
+        assert!(pread_pool_per_up_from_value(Some("")));
+        assert!(!pread_pool_per_up_from_value(Some("0")), "切り戻し");
+        assert!(!pread_pool_per_up_from_value(Some("off")));
+        assert!(pread_pool_per_up_from_value(Some("1")));
+        assert!(pread_pool_per_up_from_value(Some(" ON ")));
+        // 計算スレッド (このテストスレッド) は番号を持たない = 共有プール。
+        assert_eq!(pf_up_idx(), None, "計算スレッドに上げ番号が付いた");
+        // 番号 0..2 はそれぞれ別のプール、3 以上は範囲外。
+        let p0 = pf_pread_pool_up(2, 0);
+        let p1 = pf_pread_pool_up(2, 1);
+        assert!(p0.is_some() && p1.is_some(), "番号ごとのプールが作れない");
+        assert!(
+            !std::ptr::eq(p0.expect("確保済み"), p1.expect("確保済み")),
+            "番号 0 と 1 が同じプールを共有している"
+        );
+        assert!(pf_pread_pool_up(2, 3).is_none(), "範囲外は共有プールへ");
+    }
+
+    /// task 558: 上げスレッド本体が自分の番号を焼くと、そのスレッドの
+    /// `pf_copy_into_pin` だけが番号付きのプールを選ぶ (計算スレッドは None)。
+    #[test]
+    fn pread_pool_per_up_index_is_thread_local() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            // pf_up_worker と同じ焼き方をする。
+            let _ = PF_UP_IDX.try_with(|c| c.set(Some(1usize)));
+            s.lock().expect("poisoned").push(pf_up_idx());
+        })
+        .join()
+        .expect("スレッドが落ちた");
+        assert_eq!(*seen.lock().expect("poisoned"), vec![Some(1)]);
+        assert_eq!(pf_up_idx(), None, "別スレッドの番号が漏れた");
     }
 
     /// task 227: 「1 回の DMA で流す塊」の切り方 (純関数)。
