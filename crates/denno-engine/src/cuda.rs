@@ -2087,7 +2087,7 @@ pub(crate) mod dec_full_dev {
         FORCE.with(|c| c.set(v));
     }
 
-    /// `DENNO_FULL_DEC_MIRROR_FILL` (task 572, 既定 off)。
+    /// `DENNO_FULL_DEC_MIRROR_FILL` (task 572, **既定 on**)。
     ///
     /// この経路は KV ミラーの 1 行追記 (`mirror_append`) が「ミラーがちょうど
     /// 1 行遅れている」ときだけ通り、1 行でも足りないと `None` を返して**その層は
@@ -2095,6 +2095,11 @@ pub(crate) mod dec_full_dev {
     /// ミラーを同期しないので、次もまた 1 行足りない)。この門を立てると、足りない
     /// 行だけをホストの K/V から H2D で埋めてから追記をやり直す (埋めるのは 1 回
     /// だけで、以降は普通の D2D 追記に戻る)。
+    ///
+    /// task 572 の lab t572b / t572c (既定モデル、depth8k、2 ラウンド) で
+    /// **full 段 1.25-1.26 -> 0.96 ms/token (-23%)、短い decode 10.4 -> 10.0
+    /// ms/tok (-3.4%)、8k 後と prefill は不変、md5 全 COND SAME、errors 0**。
+    /// 切り戻しは `DENNO_FULL_DEC_MIRROR_FILL=0`。
     fn mirror_fill_on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
@@ -2102,10 +2107,10 @@ pub(crate) mod dec_full_dev {
         })
     }
 
-    /// [`mirror_fill_on`] の解釈 (純関数)。未設定と明示的な偽値だけ off。
+    /// [`mirror_fill_on`] の解釈 (純関数)。未設定は既定 (on)、明示的な偽値だけ off。
     fn mirror_fill_from_value(v: Option<&str>) -> bool {
         match v {
-            None => false,
+            None => true,
             Some(s) => {
                 let s = s.trim().to_ascii_lowercase();
                 !matches!(s.as_str(), "" | "0" | "off" | "false" | "no")
@@ -3511,10 +3516,10 @@ pub(crate) mod dec_full_dev {
             assert_eq!(mirror_fill_gap_ok(0, 0, 64), None);
         }
 
-        /// task 572: 門の解釈。未設定は off、明示的な偽値だけ off。
+        /// task 572: 門の解釈。未設定は既定 on、明示的な偽値だけ off。
         #[test]
         fn mirror_fill_gate_truth_table() {
-            assert!(!mirror_fill_from_value(None), "未設定で on になった");
+            assert!(mirror_fill_from_value(None), "未設定で off になった");
             for v in ["", "0", "off", "false", "no", " OFF "] {
                 assert!(
                     !mirror_fill_from_value(Some(v)),
