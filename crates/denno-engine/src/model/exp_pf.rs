@@ -4288,17 +4288,33 @@ pub fn pf_res_pin() -> bool {
 /// 1.6 ms/84 MB) より写しが大きい、というのが本タスクの読み。
 ///
 /// 値を変えない (バイト列の写しだけ) ので決定性も md5 も動かない。
-/// 既定 off (lab で採否を決める)。
+///
+/// # 採否 (lab t581a、既定モデル、depth8k、2 ラウンド交互)
+///
+/// `res_up` が 3,826 で **48.6 / 46.9 (b) -> 36.9 / 39.4 (m)**、b2 の 47.0 / 47.0
+/// と並べると **-19%** (2 ラウンド)。14k は 1 サンプルずつで 84.5 -> 72.0 (-15%)。
+/// `other` 段の和も 125.3 -> 107.0 / 113.7。gpu_busy (1,201.7 -> 1,203.0) と
+/// decode (10.4 ms/tok) は不変、md5 は全 COND・全 6 文脈で SAME。
+/// 内訳 (`DENNO_PF_RES_XPROF=1`、14k): 574 MB の上げが
+/// **写し 49.1 + DMA 19.8 -> 写し 37.9 + DMA 22.0 ms**、下げ (71 MB) が
+/// **DMA 6.9 + 写し 41.7 -> 6.9 + 5.3 ms** (下げは宛先 Vec の初回タッチが
+/// 並列化で消えるため)。写しは 1 スレッド 11.7 -> 8 スレッド 15.1 GB/s で、
+/// このホストの memcpy 天井 (574 MB の 1 スレッドが 19.9 GB/s、8 スレッドで
+/// 18.8 GB/s) にほぼ達している — **これ以上は並列度では伸びない**。
+/// 既定 on (lab t581a で採った)。切り戻しは `DENNO_PF_RES_MT=0`。
 pub const PF_RES_MT_ENV: &str = "DENNO_PF_RES_MT";
 
-/// [`PF_RES_MT_ENV`] の既定 (測るまで off)。
-pub const DEFAULT_PF_RES_MT: bool = false;
+/// [`PF_RES_MT_ENV`] の既定 (lab t581a で採ったので on)。
+pub const DEFAULT_PF_RES_MT: bool = true;
 
-/// [`PF_RES_MT_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+/// [`PF_RES_MT_ENV`] の解釈 (純関数)。未設定・空は既定 (on)、**明示的な偽値だけ off**。
 pub fn pf_res_mt_from_value(v: Option<&str>) -> bool {
     match v.map(str::trim) {
         None | Some("") => DEFAULT_PF_RES_MT,
-        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+        Some(s) => !matches!(
+            s.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
     }
 }
 
@@ -5870,20 +5886,19 @@ mod tests {
         assert!(pf_res_pin_from_value(Some("on")));
     }
 
-    /// task 581: 残差の写しの並列化と内訳はどちらも既定 off、明示の真値だけ on。
+    /// task 581: 残差の写しの並列化は**既定 on** (lab t581a で採否 OK)。
+    /// 内訳の計器は既定 off。明示的な偽値だけ off。
     #[test]
     fn task581_res_mt_and_xprof_gate_truth_table() {
-        assert!(!DEFAULT_PF_RES_MT, "既定が on になっている");
-        assert!(!pf_res_mt_from_value(None), "未設定は既定 (off)");
-        assert!(!pf_res_mt_from_value(Some("")), "空も既定 (off)");
+        assert!(DEFAULT_PF_RES_MT, "既定 off に戻っている");
+        assert!(pf_res_mt_from_value(None), "未設定は既定 (on)");
+        assert!(pf_res_mt_from_value(Some("")), "空も既定 (on)");
         assert!(!pf_res_mt_from_value(Some("0")));
         assert!(!pf_res_mt_from_value(Some("off")));
         assert!(!pf_res_mt_from_value(Some("FALSE")));
-        assert!(!pf_res_mt_from_value(Some("no")));
+        assert!(!pf_res_mt_from_value(Some(" no ")));
         assert!(pf_res_mt_from_value(Some("1")));
         assert!(pf_res_mt_from_value(Some("on")));
-        assert!(pf_res_mt_from_value(Some(" TRUE ")));
-        assert!(pf_res_mt_from_value(Some("Yes")));
 
         assert!(!DEFAULT_PF_RES_XPROF, "既定が on になっている");
         assert!(!pf_res_xprof_from_value(None), "未設定は既定 (off)");
