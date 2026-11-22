@@ -10897,7 +10897,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12440,7 +12440,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12557,7 +12557,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12752,7 +12752,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12846,7 +12846,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12920,7 +12920,7 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
         "build_ptx.sh に target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
+        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
         "targets_all の末尾に足していない"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -13268,7 +13268,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
@@ -14981,7 +14981,7 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
         "build_ptx.sh に attn_dec5 の spec が無い"
     );
     assert!(
-        sh.contains("mix_dn8 attn_dec5)"),
+        sh.contains("mix_dn8 attn_dec5 sh_gu)"),
         "targets_all に attn_dec5 が無い"
     );
     let ptx = root.join("kernels_attn_dec5.ptx");
