@@ -811,6 +811,10 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::qwen4exp::mix_qchain_reset();
+    // task 576: shared expert の gate+up+silu 融合 (`DENNO_DEC_SH_GU` のときだけ 1 行)。
+    if let Some(line) = denno_engine::cuda::sh_gu_line() {
+        eprintln!("{line}");
+    }
     // task 358: pinned バウンス (`DENNO_PF_PIN_STAGE`) が流した量 (発火しなければ出ない)。
     if let Some(line) = denno_engine::gpu_report::pf_pin_line() {
         eprintln!("{line}");

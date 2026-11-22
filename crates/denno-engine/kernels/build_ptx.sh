@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy gdn_pf_wy4 exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf exp_k_tc mix_inj3 mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5 gdn_pf_wy6 gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy gdn_pf_wy4 exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf exp_k_tc mix_inj3 mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5 gdn_pf_wy6 gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -223,6 +223,10 @@ spec() {
         mix_dn6)      echo "kernels_mix_dn6.cu|nofmad" ;;
         # task 431: mix down の 1 対 = 4 レーン版 (丸め順が変わるので nofmad)。
         mix_dn7)      echo "kernels_mix_dn7.cu|nofmad" ;;
+        # task 576: shared expert の gate+up+silu 融合 (Q8_0)。1 行の積和は v5 と
+        # 同一の演算列 (アキュムレータ 4 本 / ブロック 0 -> 1 / shfl 1,2,4) なので
+        # bit-exact 契約を守るため -fmad=false。
+        sh_gu)        echo "kernels_sh_gu.cu|nofmad" ;;
         # task 496: dn6 のレーン詰め版 (1 ブロック = rows*np 個の (行, 対))。
         # 1 対の積和は dn6 と同一なので -fmad=false (丸め契約を揃える)。
         mix_dn8)      echo "kernels_mix_dn8.cu|nofmad" ;;
