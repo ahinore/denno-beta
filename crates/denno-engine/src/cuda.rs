@@ -12894,9 +12894,9 @@ fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)], pread: bool
         use rayon::prelude::*;
         // task 325: pread 専用のスレッド数を指定されたら、その本数のプールで回す
         // (`read_at` は同期なので、同時に飛ぶ I/O の本数 = スレッド数)。
-        // task 554: 上げスレッドが 2 本なら **それぞれが `DENNO_PF_PREAD_THREADS`
-        // 本**を持つ (lab t554a の w2t64 = 2 x 32 が両方のプロンプトで勝った。
-        // 2 x 16 = 32 本 total の w2 は 14k で 1.6 倍に伸びたので採らない)。
+        // task 554: 上げスレッドが 2 本でも pool は 1 本を共有する (2 本に分けた版は
+        // 既定モデルの 3,826 cold が返らなくなったので捨てた。exp_pf の
+        // `UP_WORKERS_ENV` の doc を参照)。
         let nt = exp_pf::pread_threads();
         if pread && nt > 0 {
             if let Some(pool) = pf_pread_pool(nt) {
@@ -17864,7 +17864,7 @@ mod pf_stream_tests {
     #[test]
     fn up_workers_values_round_and_default() {
         use crate::model::exp_pf::{up_workers_from_value, DEFAULT_UP_WORKERS};
-        assert_eq!(DEFAULT_UP_WORKERS, 2, "既定は 2 本 (t554a/t554b で採用)");
+        assert_eq!(DEFAULT_UP_WORKERS, 2, "既定は 2 本 (t554e で -16% / 14k -10%)");
         assert_eq!(up_workers_from_value(None), 2);
         assert_eq!(up_workers_from_value(Some("")), 2);
         assert_eq!(up_workers_from_value(Some("1")), 1, "切り戻し");
