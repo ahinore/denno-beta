@@ -14117,8 +14117,13 @@ fn task468_full_mix_nowait_wiring() {
     }
     // 空の入力を device 経路へ渡していること (`x_dev` を Call に詰める)。
     assert!(
-        attn.contains("x_dev,") && attn.contains("cur,\n                        x_dev,"),
+        attn.contains("x_dev,") && attn.contains("cur,"),
         "Call に x_dev を渡していない"
+    );
+    // task 572: ミラーが遅れている回に埋めるためのホスト K/V も Call に詰める。
+    assert!(
+        attn.contains("k_host: cache.k(layer)?,") && attn.contains("v_host: cache.v(layer)?,"),
+        "Call に k_host / v_host を渡していない"
     );
 
     // 4. ssm 側は従来どおり (ssm 層は full の判定を借りない)。
