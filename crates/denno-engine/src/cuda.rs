@@ -31058,16 +31058,249 @@ pub(crate) fn pf_res_dev_ptr() -> CUdeviceptr {
     })
 }
 
+/// task 581: 残差の往復のホスト側 — 写しの並列化と内訳。
+///
+/// # 何を直すか (P565 / P577 の台帳、既定モデル 14k cold)
+///
+/// `sub other res_up=89.3 ms [h=574.2M/7 d=71.1M/1]` = 645 MB。`DENNO_PF_RES_PIN`
+/// (task 565) で pinned バウンスへは通っているが、それでも 7.2 GB/s しか出ない。
+/// 1 本は「pageable の memcpy (1 スレッド) → `cuMemcpyHtoD`」の直列で、84 MB を
+/// 1 コアで写している。**バイト列は変わらない**ので決定性も md5 も動かない。
+///
+/// 内訳 (`DENNO_PF_RES_XPROF=1`) は台帳の `[q4ledger-pf] resx` 行に出す。
+#[cfg(feature = "cuda")]
+pub mod res_xfer {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 専用の pinned バウンス (残差だけが使う。共有バウンスのロックを取らない)。
+    ///
+    /// `PinnedHost::alloc` は device 全体を同期させるので、**育つときだけ**呼ぶ
+    /// (共有バウンスと同じ規律。3,826 の 39 MiB -> 14k の 143 MiB で 2 回)。
+    struct ResPin {
+        buf: Option<PinnedHost>,
+    }
+
+    fn res_pin() -> &'static std::sync::Mutex<ResPin> {
+        static S: std::sync::OnceLock<std::sync::Mutex<ResPin>> = std::sync::OnceLock::new();
+        S.get_or_init(|| std::sync::Mutex::new(ResPin { buf: None }))
+    }
+
+    /// 写し専用のプール (層ループの rayon を奪わない)。本数は控えめに 8。
+    fn copy_pool() -> Option<&'static rayon::ThreadPool> {
+        static P: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+        P.get_or_init(|| {
+            let n = rayon::current_num_threads().clamp(2, 8);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|i| format!("pf-res-{i}"))
+                .build()
+                .ok()
+        })
+        .as_ref()
+    }
+
+    /// 1 タスクの塊 (これ未満は直列のほうが速い)。
+    const BLK: usize = 1 << 20;
+    /// 並列に分ける下限。
+    const MT_MIN: usize = 4 << 20;
+
+    /// `len` バイトを `src` から `dst` へ写す (中身は同じバイト列)。
+    ///
+    /// `par` が真で 4 MiB 以上なら 1 MiB の塊に分けて並列に写す。行の区切りと
+    /// 無関係な**バイト列の写し**なので、値も決定性も変わらない。
+    pub(crate) fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, par: bool) {
+        if len == 0 {
+            return;
+        }
+        if !par || len < MT_MIN {
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+            return;
+        }
+        // 生ポインタは usize で閉包へ渡す (塊は互いに重ならない)。
+        let (dst_a, src_a) = (dst as usize, src as usize);
+        let nblk = (len + BLK - 1) / BLK;
+        let run = || {
+            use rayon::prelude::*;
+            (0..nblk).into_par_iter().for_each(|i| {
+                let off = i * BLK;
+                let n = BLK.min(len - off);
+                let d = (dst_a + off) as *mut u8;
+                let s = (src_a + off) as *const u8;
+                unsafe { std::ptr::copy_nonoverlapping(s, d, n) };
+            });
+        };
+        match copy_pool() {
+            Some(p) => p.install(run),
+            None => run(),
+        }
+    }
+
+    /// 残差の H2D (pinned 経由)。成功したら `Ok(())`。
+    ///
+    /// 専用バウンスが取れない (pinned の確保に失敗) ときは `Err` を返し、
+    /// 呼び出し側は従来の共有バウンス経路へ落ちる (値は同じ)。
+    pub(crate) fn to_dev(dst: CUdeviceptr, data: &[f32], par: bool, xp: bool) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut g = res_pin().lock().unwrap_or_else(|e| e.into_inner());
+        let cur = g.buf.as_ref().map(|b| b.bytes()).unwrap_or(0);
+        if cur < bytes {
+            // 新しい 1 本を取る前に古い 1 本を落とす (pinned を二重に持たない)。
+            g.buf = None;
+            match PinnedHost::alloc(bytes.next_power_of_two().max(bytes)) {
+                Some(p) => g.buf = Some(p),
+                None => bail!("残差用の pinned バウンスを確保できない ({bytes} B)"),
+            }
+        }
+        let pin = g.buf.as_ref().expect("確保済み").ptr();
+        let t = std::time::Instant::now();
+        copy_bytes(pin, data.as_ptr() as *const u8, bytes, par);
+        let gather_ns = t.elapsed().as_nanos() as u64;
+        let t = std::time::Instant::now();
+        let lib = lib()?;
+        unsafe {
+            check(
+                (lib.memcpy_htod)(dst, pin as *const c_void, bytes),
+                "cuMemcpyHtoD (res pin, mt)",
+            )?;
+        }
+        if xp {
+            note_up(gather_ns, t.elapsed().as_nanos() as u64, bytes);
+        }
+        Ok(())
+    }
+
+    /// 残差の D2H (pinned 経由)。成功したら `Ok(())`。
+    pub(crate) fn to_host(src: CUdeviceptr, out: &mut [f32], par: bool, xp: bool) -> Result<()> {
+        let bytes = std::mem::size_of_val(out);
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut g = res_pin().lock().unwrap_or_else(|e| e.into_inner());
+        let cur = g.buf.as_ref().map(|b| b.bytes()).unwrap_or(0);
+        if cur < bytes {
+            g.buf = None;
+            match PinnedHost::alloc(bytes.next_power_of_two().max(bytes)) {
+                Some(p) => g.buf = Some(p),
+                None => bail!("残差用の pinned バウンスを確保できない ({bytes} B)"),
+            }
+        }
+        let pin = g.buf.as_ref().expect("確保済み").ptr();
+        let t = std::time::Instant::now();
+        let lib = lib()?;
+        unsafe {
+            check(
+                (lib.memcpy_dtoh)(pin as *mut c_void, src, bytes),
+                "cuMemcpyDtoH (res pin, mt)",
+            )?;
+        }
+        let dma_ns = t.elapsed().as_nanos() as u64;
+        let t = std::time::Instant::now();
+        copy_bytes(
+            out.as_mut_ptr() as *mut u8,
+            pin as *const u8,
+            bytes,
+            par,
+        );
+        if xp {
+            note_down(t.elapsed().as_nanos() as u64, dma_ns, bytes);
+        }
+        Ok(())
+    }
+
+    // ---- 内訳 (診断。既定 off では 1 度も触らない) ----
+    static UP_GATHER_NS: AtomicU64 = AtomicU64::new(0);
+    static UP_DMA_NS: AtomicU64 = AtomicU64::new(0);
+    static UP_BYTES: AtomicU64 = AtomicU64::new(0);
+    static UP_CALLS: AtomicU64 = AtomicU64::new(0);
+    static DOWN_GATHER_NS: AtomicU64 = AtomicU64::new(0);
+    static DOWN_DMA_NS: AtomicU64 = AtomicU64::new(0);
+    static DOWN_BYTES: AtomicU64 = AtomicU64::new(0);
+    static DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    fn note_up(gather_ns: u64, dma_ns: u64, bytes: usize) {
+        UP_GATHER_NS.fetch_add(gather_ns, Ordering::Relaxed);
+        UP_DMA_NS.fetch_add(dma_ns, Ordering::Relaxed);
+        UP_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        UP_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_down(gather_ns: u64, dma_ns: u64, bytes: usize) {
+        DOWN_GATHER_NS.fetch_add(gather_ns, Ordering::Relaxed);
+        DOWN_DMA_NS.fetch_add(dma_ns, Ordering::Relaxed);
+        DOWN_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        DOWN_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 積んだ内訳を 1 行で返し、0 に戻す (prefill 1 回につき 1 行)。
+    pub fn take_line() -> Option<String> {
+        let c = UP_CALLS.swap(0, Ordering::Relaxed) + DOWN_CALLS.swap(0, Ordering::Relaxed);
+        if c == 0 {
+            return None;
+        }
+        let up_g = UP_GATHER_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let up_d = UP_DMA_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let up_b = UP_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let dn_g = DOWN_GATHER_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let dn_d = DOWN_DMA_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let dn_b = DOWN_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        Some(format!(
+            "[q4ledger-pf] resx up gather={up_g:.1} dma={up_d:.1}ms ({up_b:.1}MB) \
+             down dma={dn_d:.1} gather={dn_g:.1}ms ({dn_b:.1}MB)"
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 並列の写しは直列と同じバイト列 (決定性の証拠)。塊の境界も跨ぐ。
+        #[test]
+        fn task581_copy_bytes_is_identical_to_serial() {
+            for len in [0usize, 1, 4095, 1 << 20, (4 << 20) + 12345] {
+                let src: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                let mut a = vec![0u8; len];
+                let mut b = vec![0u8; len];
+                copy_bytes(a.as_mut_ptr(), src.as_ptr(), len, false);
+                copy_bytes(b.as_mut_ptr(), src.as_ptr(), len, true);
+                assert_eq!(a, src, "直列の写しが違う (len={len})");
+                assert_eq!(b, src, "並列の写しが違う (len={len})");
+            }
+        }
+
+        /// 内訳の行は「1 回も転送していない」ときは出ない (余計な行を足さない)。
+        #[test]
+        fn task581_xprof_line_only_when_used() {
+            // 他のテストと共有の静的カウンタなので、ここでは take してから見る。
+            let _ = take_line();
+            assert!(take_line().is_none(), "転送 0 回で行が出た");
+        }
+    }
+}
+
 /// task 154: チャンクの残差 (`[nt][hc][e]`) をデバイスへ置く。
 pub fn pf_upload_res(res: &[f32]) -> bool {
     // task 318: `other` の中の残差の往復を分けて数える (バイト数も付く)。
     let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_RES_UP);
     // task 565: `DENNO_PF_RES_PIN` なら全体ゲートと無関係に pinned へ通す。
     let force = crate::model::exp_pf::pf_res_pin();
+    // task 581: 専用バウンス + 並列写し (`DENNO_PF_RES_MT`)。値は同じバイト列。
+    // `DENNO_PF_RES_XPROF` は同じ道を直列で通して内訳だけ出す (ゲートは独立)。
+    let xp = crate::model::exp_pf::pf_res_xprof();
+    let mt = crate::model::exp_pf::pf_res_mt();
+    let use_xfer = mt || xp;
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.res.as_ref() {
             Some(b) if b.bytes() >= res.len() * 4 => {
+                if use_xfer {
+                    if res_xfer::to_dev(b.ptr(), res, mt, xp).is_ok() {
+                        return true;
+                    }
+                }
                 if force {
                     if let Ok(true) = b.copy_from_pinned_forced(res) {
                         return true;
@@ -31096,10 +31329,19 @@ pub fn pf_download_res(out: &mut [f32]) -> bool {
     // task 565: `DENNO_PF_RES_PIN` なら全体ゲートと無関係に pinned へ通す
     // (このホストの pageable D2H は 1 GB/s しか出ない)。
     let force = crate::model::exp_pf::pf_res_pin();
+    // task 581: 専用バウンス + 並列写し (pinned からの取り出し側)。
+    let xp = crate::model::exp_pf::pf_res_xprof();
+    let mt = crate::model::exp_pf::pf_res_mt();
+    let use_xfer = mt || xp;
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.res.as_ref() {
             Some(b) if b.bytes() >= out.len() * 4 => {
+                if use_xfer {
+                    if res_xfer::to_host(b.ptr(), out, mt, xp).is_ok() {
+                        return true;
+                    }
+                }
                 if force {
                     if let Ok(true) = b.to_slice_pinned_forced(out) {
                         return true;

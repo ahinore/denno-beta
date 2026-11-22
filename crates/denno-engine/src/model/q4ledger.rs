@@ -1276,6 +1276,12 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
             ));
         }
     }
+    // task 581: 残差の往復の内訳 (ホスト写し / DMA)。`DENNO_PF_RES_XPROF=1` の
+    // run だけで出る (積んでいなければ行を足さない)。
+    #[cfg(feature = "cuda")]
+    if let Some(l) = crate::cuda::res_xfer::take_line() {
+        out.push(l);
+    }
     // task 254: 突き合わせ。wall = GPU の実時間 + 露出したホスト時間 (+ 層の外)
     // が 1 s 以内で閉じるか。`gpu_busy` は起動ペアのイベントの和 (アイドルを
     // 含まない)、`exposed_host` は区間ごとの `max(0, wall - busy)` の和。
