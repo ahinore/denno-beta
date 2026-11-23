@@ -1,4 +1,4 @@
-ADOPT: yes t617a t617b
+ADOPT: yes t617a t617b t617c
 
 # task 617 (dev2) — 既定モデル (flash-next-UD-IQ3_XXS) の prefill:
 # **hc inject が F32 重みのため、4 行に対して 16 行タイルの GEMM で回っていた**
@@ -19,15 +19,18 @@ br613 は REPORT のみ (コード変更 0 行) なので merge していない�
 `DENNO_EXPERT_IQ_GPU=1 DENNO_EXPERT_VRAM_MB=22000 DENNO_EXPERT_GPU_MIN_HIT=0
 DENNO_GPU_WEIGHT_MB=12000`、全 COND に `DENNO_PF_MIX_KPROF=1`、先頭に捨て COND)。
 lab 名と SHA: **t617a = `67eff9e95`** (`x0 b g b2`、load_before 1.98)、
-**t617b = `abda534bb`** (`x0 b g g2 b2`、load_before 1.48)。
+**t617b = `abda534bb`** (`x0 b g g2 b2`、load_before 1.48)、
+**t617c = `3dfcf5b85`** (最終ツリー、既定 on と `=0` の対、load_before 1.91)。
 
 ## 0. 結論 (7 行)
 
 1. **採る (`ADOPT: yes`)。** inject の段 (mix の GPU) が **-178.1 ms (-27.1%)**、
-   2 ラウンドとも再現。14k の **gpu_busy は 4 サンプルで -176/-183 ms (-4.3%)**。
-2. **壁は 14k -3.1% / 3,826 -2.4%** (2 run の 4-6 サンプルの中央値)。
+   2 ラウンドとも再現。14k の **gpu_busy は 7 サンプルで -176..-183 ms (-4.3%)**。
+2. **壁は 14k -3.1% / 3,826 -2.1%** (3 run の 8-14 サンプルの中央値)。
    タスクの目標 (2.5%) を 14k 側で満たし、3,826 も悪化していない。
    **ただし t617a 単独では 14k -1.4%** だった (§8 のばらつき)。
+   最終ツリー (既定 on) と切り戻しの対は t617c で取り、14k -2.8% / 3,826 -1.7%、
+   `=0` で md5 が旧値に戻ることを確認した (§3.3)。
 3. **選んだ理由**: P613 が nsys で「唯一 1 本で 2.5% を取れる可能性がある」と
    書いた 302 ms の `dno_gemm_f32_mt` の正体が、**inject の形 (n=4) と
    カーネルのタイル (16 行) の不一致**で、しかも **BF16 用の速いカーネルは
@@ -133,12 +136,34 @@ BF16 だった旧モデルは task 198 でこの形を k 分割カーネルへ�
 | --- | --- | --- | ---: |
 | 14k cold (t617a) | 4.930 / 4.930 | 4.860 | -1.4% |
 | 14k cold (t617b) | 5.130 / 5.100 | 4.830 / 4.860 | -4.8% |
-| **14k cold (4+3 サンプル)** | 中央 **5.010** | 中央 **4.860** | **-3.1%** |
+| 14k cold (t617c、off 側) | 5.250 / 4.934 | 4.951 (既定 on) | -2.8% |
+| **14k cold (6 off 側 + 4 on)** | 中央 **5.017** | 中央 **4.860** | **-3.1%** |
 | 3,826 cold (t617a) | 2.160 / 2.110 / 2.118 / 2.118 | 2.082 / 2.067 | |
 | 3,826 cold (t617b) | 2.12 / 2.13 / 2.13 / 2.12 | 2.09 / 2.07 / 2.07 / 2.07 | |
-| **3,826 cold (12 サンプル)** | 中央 **2.12** | 中央 **2.07** | **-2.4%** |
+| 3,826 cold (t617c) | 2.76 / 2.14 / 2.18 / 2.12 | 2.13 / 2.10 | |
+| **3,826 cold (14 off 側 + 8 on)** | 中央 **2.12** | 中央 **2.076** | **-2.1%** |
 
-### 3.3 decode (悪化していないこと)
+### 3.3 t617c — 最終ツリー (ゲート既定 on) と切り戻しの対
+
+`3dfcf5b85` (REPORT と merge を含む最終ツリー) をラボで回した。**既定が on** なので
+`off` COND だけ `DENNO_PF_INJ_F32_BF16=0` で落とした (`x0 off on off2`、2 ラウンドずつ)。
+
+| COND | 14k wall ms | 14k gpu_busy | 3,826 (r1 / r2) s | md5 (cold / turn2) |
+| --- | ---: | ---: | --- | --- |
+| off (`=0`) | 5,250.4 | 4,142.9 | 2.76 / 2.14 | 旧 (`672fec07` / `199f23b3`) |
+| on (既定) | **4,951.2** | **3,965.4** | **2.13 / 2.10** | 新 (`672fec07` / `7c72f4ed`) |
+| off2 (`=0`) | 4,933.5 | 4,145.5 | 2.18 / 2.12 | 旧 |
+
+- **既定 on で `inj2_calls=672` が出る** (on COND のみ)。`off` 側は 0。
+- gpu_busy **4,142.9 / 4,145.5 -> 3,965.4 (-177 / -180 ms)**。t617a/t617b と同じ値
+  (**通算 7 サンプルで -176..-183 ms**)。
+- 壁は 14k off の中央 5,092 -> **4,951 (-2.8%)**、3,826 off の中央 2.15 ->
+  **2.115 (-1.7%)**。この run の先頭は非常に冷えており (x0 の 3,826 が 8.19 s)、
+  off の round 1 はまだ温まり途中 (2.76) だった。
+- **`=0` で md5 が旧値に完全に戻る** (切り戻しが効く証拠)。
+- decode は 9.8-9.9 ms/tok、14k 後 decode も off 12.4 / on 12.5 / off2 12.1 で差なし。
+
+### 3.4 decode (悪化していないこと)
 
 - warm short decode (RESULT の中央値): t617a x0 9.9 / b 9.8 / g 9.8 / b2 9.9、
   t617b 全部 **9.9**。
@@ -216,6 +241,9 @@ errors 0。
   kernel_invariants.rs は衝突なし、`targets_all` の衝突も無い (どちらの側も
   カーネルを足していない)。merge 後にテストを回し直した (§下)。
 - この REPORT はリポジトリ直下 (`REPORT_P617.md`)。docs への移動は次の担当に任せる。
+- **最終ツリー (`3dfcf5b85`) をラボで回した (t617c)**: 既定 on で `inj2_calls=672` が
+  出て、gpu_busy が off の 4,142.9 / 4,145.5 から 3,965.4 へ落ち、`=0` で md5 が
+  旧値に戻る (§3.3)。**merge 後・既定 on のままで採否の数字が再現している。**
 - `cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1`
   -> **1426 passed / 0 failed / 103 ignored** (`CARGO_TARGET_DIR=/tmp/t617`)
 - `cargo test --release -p denno-engine --features cuda --test kernel_invariants
@@ -233,9 +261,10 @@ errors 0。
 
 - §1/§3 は GPU ラボの実測。§4 の ms と % は実測からの計算。「推定」だけが見積り。
 - **14k はラウンド 1 にしか出ない = 1 COND 1 サンプル/COND** で、COND の位置で
-  最大 ±7% 動く (P613 と同じ)。だから 2 run 取って中央値で読んだ (§3.2)。
-  **t617a 単独では 14k -1.4%**、t617b では -4.8%。run 間で動いたのは
-  baseline (4.92 vs 5.12) で、g 側は 4.83-4.86 と安定。
+  最大 ±7% 動く (P613 と同じ)。だから 3 run 取って中央値で読んだ (§3.2)。
+  **t617a 単独では 14k -1.4%**、t617b では -4.8%、t617c では -2.8%。
+  run 間で動いたのは baseline (4.93 vs 5.13 vs 5.25/4.93) で、
+  **on 側は 4.83-4.96 と安定** (GPU を削った分だけ上げの揺れに鈍い)。
 - t617a の b_1 (3,826) は **load=14.83** の回で 2,160.8 ms と外れた
   (b_2 は 2,108.6)。中央値には両方入れてある。
 - `[pf-mix-kprof]` の `inj` 区間 (イベント計測) は**プールが尽きて出なかった**
@@ -245,9 +274,9 @@ errors 0。
 
 ## 9. GPU で確認してほしいこと
 
-1. **静かなラボで 14k をもう 2-3 サンプル** (`DENNO_PF_INJ_F32_BF16=1` と `=0` を
-   交互)。本タスクは 14k が 1 サンプル/COND なので、-3.1% がどこに落ち着くか。
-   **gpu_busy の -177 ms と `inj2_calls=` は動かないので、そちらで採否を読める。**
+1. **14k のサンプルは 3 run で 10 本取った** (off 側 6 / on 側 4)。中央値で -3.1%。
+   ばらつきは baseline 側だけで、on 側は 4.83-4.96 と安定している (§8)。
+   これ以上を詰めるより、`gpu_busy` (-177 ms) と `inj2_calls=` で読むのが早い。
 2. **本番形 (serve_flash) の長い prefill** で `inj2_calls=` が
    層数 x 2 x チャンクになること、`DENNO_PF_INJ_F32_BF16=0` で 0 に戻ること。
 3. **UD-Q4_K_XL で退行しないこと**: あのモデルの inject も F32 (k=10,240 / n=4)
@@ -287,4 +316,19 @@ VERDICT baseline x0 errors 0 text ok
 ```
 
 (`vs x0` は捨て COND との比較。x0 は 14k と 3,826 が cold なので差が大きく出るだけで、
-採否の判定には使っていない。判定は §3.1/§3.2 の b/b2 との対で読む。)
+採否の判定には使っていない。判定は §3.1/§3.2 の b/b2/off との対で読む。)
+
+t617c (`3dfcf5b85`、最終ツリー。x0 と on が既定 on、off が `=0`):
+
+```text
+VERDICT off vs x0 OK decode -0.4% prefill +0.0% md5 DIFF errors 0
+VERDICT on vs x0 OK decode +0.4% prefill -0.9% md5 SAME errors 0
+VERDICT off2 vs x0 OK decode +0.0% prefill -0.9% md5 DIFF errors 0
+VERDICT_DEPTH off c8000_cold vs x0 decode +0.0% prefill -15.3%
+VERDICT_DEPTH on c8000_cold vs x0 decode +0.8% prefill -20.1%
+VERDICT_DEPTH off2 c8000_cold vs x0 decode -2.3% prefill -20.5%
+VERDICT_DEPTH off c2000_cold vs x0 decode -11.2% prefill -52.3%
+VERDICT_DEPTH on c2000_cold vs x0 decode -12.3% prefill -58.9%
+VERDICT_DEPTH off2 c2000_cold vs x0 decode -12.3% prefill -58.2%
+VERDICT baseline x0 errors 0 text ok
+```
