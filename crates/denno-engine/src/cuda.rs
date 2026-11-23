@@ -30578,6 +30578,87 @@ pub(crate) fn mix_inj2_ok(k: usize, n: usize, nt: usize, bf16: bool) -> bool {
     bf16 && k > 0 && n >= 1 && n <= MIX_INJ2_MAX_N && nt >= 1
 }
 
+// ---------------------------------------------------------------------------
+// task 617: F32 の inject 重みを BF16 に丸めて k 分割 GEMV へ回す
+// ---------------------------------------------------------------------------
+// `pf_weight` の F32 腕は重みを f32 のまま上げ、汎用の `dno_gemm_f32_mt`
+// (1 ブロック 16 行 x 32 トークン) で回していた。既定モデル
+// (flash-next-UD-IQ3_XXS) の hc inject (`hc_*_inject`) は **F32** で n = hc = 4
+// なので、16 行タイルの 12 行が空回りする。nsys (t613a) では
+// `dno_gemm_f32_mt` が 960 呼び出し 平均 315 us = 302 ms (14k と 3,826 の
+// prefill 合計)。BF16 だった旧モデルは task 198 で `dno_mix_inj2_bf16`
+// (k を 256 スレッドに分割・1 ブロック 1 トークン) へ移っていて、同じ形が
+// 40-50 us/呼び出しで済む。ここでは **重みだけ** BF16 に丸めて (RNE) その経路へ
+// 載せる。
+//
+// 数値: 重みの丸めだけが変わる (inject の値が相対 1e-3 程度動き、sigmoid を
+// 通って hc combine の倍率になる)。演算の意味・決定性は変わらない。
+// 切り戻しは `DENNO_PF_INJ_F32_BF16=0`。
+
+/// task 617: F32 の inject 重みを BF16 に丸めて k 分割 GEMV へ回すか。
+pub const PF_INJ_F32_BF16_ENV: &str = "DENNO_PF_INJ_F32_BF16";
+
+/// [`PF_INJ_F32_BF16_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+pub(crate) fn pf_inj_f32_bf16_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim()),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// ゲートの実効値 (プロセスで 1 回だけ env を読む)。
+pub(crate) fn pf_inj_f32_bf16_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_inj_f32_bf16_from_value(std::env::var(PF_INJ_F32_BF16_ENV).ok().as_deref())
+    })
+}
+
+/// その形を BF16 化して k 分割の inject へ回してよいか (純関数)。
+///
+/// inject の実形は k = hc*n_embd = 10,240 / n = hc = 4。トークン数は
+/// [`mix_inj2_ok`] 側で見る (重みはトークン数に依らない)。
+pub(crate) fn pf_inj_bf16_shape(k: usize, n: usize) -> bool {
+    k > 0 && n >= 1 && n <= MIX_INJ2_MAX_N
+}
+
+/// f32 のバイト列 (リトルエンディアン、k*n 個) を BF16 (上位 16 bit・RNE) へ畳む。
+///
+/// 純関数 (テストで固定する)。NaN は上位 16 bit に落とすだけで inf に化けさせない。
+pub(crate) fn f32_bytes_to_bf16_bytes(src: &[u8]) -> Option<Vec<u8>> {
+    if src.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(src.len() / 2);
+    for c in src.chunks_exact(4) {
+        let b = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let hi = if b & 0x7fff_ffff > 0x7f80_0000 {
+            // NaN (指数が全部 1 で仮数が非 0)。
+            ((b >> 16) | 0x0040) as u16
+        } else {
+            // round-to-nearest-even。
+            let lsb = (b >> 16) & 1;
+            (b.wrapping_add(0x7fff + lsb) >> 16) as u16
+        };
+        out.extend_from_slice(&hi.to_le_bytes());
+    }
+    Some(out)
+}
+
+/// task 617: inject を k 分割カーネルで撃った回数 (発火の証拠。`[pf-mix-kprof]` の
+/// `inj2_calls=` に出る)。
+static PF_INJ2_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// [`PF_INJ2_CALLS`] を読む。
+pub(crate) fn pf_inj2_calls() -> u64 {
+    PF_INJ2_CALLS.load(Ordering::Relaxed)
+}
+
+/// 計数を 0 に戻す (リクエスト終端)。
+pub(crate) fn pf_inj2_calls_reset() {
+    PF_INJ2_CALLS.store(0, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod mix_split_inj2_tests {
     use super::*;
@@ -30638,6 +30719,94 @@ mod mix_split_inj2_tests {
         assert!(!mix_inj2_ok(0, 4, 512, true));
         assert!(!mix_inj2_ok(10240, 0, 512, true));
         assert!(!mix_inj2_ok(10240, 9, 512, true));
+    }
+
+    /// task 617: `DENNO_PF_INJ_F32_BF16` の真理値表 (既定 off・明示的な真値だけ on)。
+    #[test]
+    fn pf_inj_f32_bf16_gate_truth_table() {
+        assert!(
+            !pf_inj_f32_bf16_from_value(None),
+            "未設定は既定 off (値が変わるので lab で決める)"
+        );
+        for v in ["0", "off", "false", "no", "", " off ", "2"] {
+            assert!(!pf_inj_f32_bf16_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", " 1 "] {
+            assert!(pf_inj_f32_bf16_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    /// task 617: BF16 化してよい形は inject の実形だけ (k = 10240, n = hc <= 8)。
+    #[test]
+    fn pf_inj_bf16_shape_checks_inject_form() {
+        assert!(pf_inj_bf16_shape(10240, 4));
+        assert!(pf_inj_bf16_shape(10240, 8));
+        assert!(pf_inj_bf16_shape(2560, 1));
+        // down / up の形は対象外。
+        assert!(!pf_inj_bf16_shape(10240, 320));
+        assert!(!pf_inj_bf16_shape(320, 10240));
+        assert!(!pf_inj_bf16_shape(10240, 9));
+        assert!(!pf_inj_bf16_shape(0, 4));
+        assert!(!pf_inj_bf16_shape(10240, 0));
+        // `mix_inj2_ok` と両立する (BF16 化したあとに k 分割で撃てる)。
+        assert!(mix_inj2_ok(10240, 4, 512, pf_inj_bf16_shape(10240, 4)));
+    }
+
+    /// task 617: f32 -> bf16 の丸め (RNE) と、NaN / 端数の扱い。
+    #[test]
+    fn f32_bytes_to_bf16_bytes_rounds_to_nearest_even() {
+        let f = |v: f32| v.to_bits().to_le_bytes();
+        let mut src = Vec::new();
+        for v in [1.0f32, -2.5, 0.0, 1e-30] {
+            src.extend_from_slice(&f(v));
+        }
+        let out = f32_bytes_to_bf16_bytes(&src).expect("4 の倍数");
+        assert_eq!(out.len(), src.len() / 2, "バイト数が半分でない");
+        let bf = |i: usize| u16::from_le_bytes([out[i * 2], out[i * 2 + 1]]);
+        assert_eq!(bf(0), 0x3f80, "1.0 は 0x3f80");
+        assert_eq!(bf(1), 0xc020, "-2.5 は 0xc020");
+        assert_eq!(bf(2), 0x0000, "0.0 は 0x0000");
+        // bf16 の指数は f32 と同じ 8 bit なので 1e-30 も表せる (丸め誤差 1% 以内)。
+        let back = f32::from_bits((bf(3) as u32) << 16);
+        assert!(
+            (back - 1e-30f32).abs() <= 1e-30f32 * 0.01,
+            "1e-30 の丸めが大きすぎる: {back:e}"
+        );
+
+        // 中点 (仮数の下位 16 bit がちょうど 0x8000) は偶数側へ。
+        let mid_even = f32::from_bits(0x3f80_8000); // 1.0 + 1 ulp(bf16 の中点)
+        let mid_odd = f32::from_bits(0x3f81_8000);
+        let src = [mid_even, mid_odd]
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect::<Vec<u8>>();
+        let out = f32_bytes_to_bf16_bytes(&src).unwrap();
+        let bf = |i: usize| u16::from_le_bytes([out[i * 2], out[i * 2 + 1]]);
+        assert_eq!(bf(0), 0x3f80, "中点は偶数 (0x3f80) へ");
+        assert_eq!(bf(1), 0x3f82, "中点は偶数 (0x3f82) へ");
+
+        // NaN は inf に化けない。
+        let nan = f32::from_bits(0x7fc0_1234);
+        let src = nan.to_bits().to_le_bytes().to_vec();
+        let out = f32_bytes_to_bf16_bytes(&src).unwrap();
+        let hi = u16::from_le_bytes([out[0], out[1]]);
+        assert_eq!(hi & 0x7f80, 0x7f80, "指数は全部 1 のまま");
+        assert_ne!(hi & 0x007f, 0, "仮数が 0 でない = NaN のまま");
+
+        // 端数 (4 の倍数でない) は None。
+        assert!(f32_bytes_to_bf16_bytes(&[0u8; 6]).is_none());
+        assert_eq!(f32_bytes_to_bf16_bytes(&[]).unwrap().len(), 0);
+    }
+
+    /// task 617: 発火の計数 (撃った回数が数えられ、reset で戻る)。
+    #[test]
+    fn pf_inj2_calls_counts_and_resets() {
+        pf_inj2_calls_reset();
+        assert_eq!(pf_inj2_calls(), 0);
+        PF_INJ2_CALLS.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(pf_inj2_calls(), 2);
+        pf_inj2_calls_reset();
+        assert_eq!(pf_inj2_calls(), 0);
     }
 }
 
@@ -30722,6 +30891,8 @@ pub mod pf_mix_kprof {
             CNT[i].store(0, Ordering::Relaxed);
         }
         CALLS.store(0, Ordering::Relaxed);
+        // task 617: inject を k 分割で撃った回数も同じ区切りで戻す。
+        pf_inj2_calls_reset();
         open_reset();
     }
 
@@ -30772,6 +30943,11 @@ pub mod pf_mix_kprof {
                 ns as f64 / 1e3 / n as f64,
                 ns as f64 / 1e6
             ));
+        }
+        // task 617: inject を k 分割カーネル (BF16 重み) で撃った回数。
+        let inj2 = pf_inj2_calls();
+        if inj2 > 0 {
+            s.push_str(&format!(" | inj2_calls={inj2}"));
         }
         vec![s]
     }
@@ -32160,6 +32336,11 @@ pub fn pf_take_mixed(out: &mut [f32]) -> bool {
 /// F32 はそのままのバイト列を置く (1 本 40 KB)。
 static PF_F32_W: OnceLock<Mutex<std::collections::HashMap<u64, DevBuffer>>> = OnceLock::new();
 
+/// task 617: F32 の inject 重みを BF16 に丸めた写しの常駐表 (uid -> BF16 バイト列)。
+///
+/// `PF_F32_W` とは別に持つ (f32 のままが要る経路があっても壊さない)。1 本 80 KB。
+static PF_INJ_BF_W: OnceLock<Mutex<std::collections::HashMap<u64, DevBuffer>>> = OnceLock::new();
+
 /// task 334: mix の norm (`gamma`) のデバイス常駐表。
 ///
 /// 従来は `pf_mix` のたびに `d.gamma` へホストから上げ直していた。14k の層優先
@@ -32243,6 +32424,30 @@ fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, PfWKind)> {
             let want = l.k.checked_mul(l.n)?.checked_mul(4)?;
             if l.blocks.len() != want {
                 return None;
+            }
+            // task 617: inject の実形 (n = hc <= 8) は **重みだけ BF16 に丸めて**
+            // `dno_mix_inj2_bf16` (k 分割・1 ブロック 1 トークン) へ回す。
+            // f32 のまま汎用 GEMM に渡すと 16 行タイルに 4 行しか乗らない。
+            if want_bf16
+                && pf_inj_f32_bf16_on()
+                && mix_inj2_on()
+                && pf_inj_bf16_shape(l.k, l.n)
+            {
+                if let Some(bits) = f32_bytes_to_bf16_bytes(l.blocks) {
+                    let reg = PF_INJ_BF_W.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+                    let mut m = match reg.lock() {
+                        Ok(g) => g,
+                        Err(_) => return None,
+                    };
+                    if let Some(b) = m.get(&l.uid) {
+                        return Some((b.ptr(), PfWKind::Bf16));
+                    }
+                    if let Ok(b) = DevBuffer::from_slice_tagged(&bits, crate::mem_audit::TAG_OTHER) {
+                        let p = b.ptr();
+                        m.insert(l.uid, b);
+                        return Some((p, PfWKind::Bf16));
+                    }
+                }
             }
             let reg = PF_F32_W.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
             let mut m = match reg.lock() {
@@ -33419,6 +33624,10 @@ pub fn pf_mix(
             // (`DENNO_PF_MIX_INJ2`。丸め順は変わるが決定論的)。
             if mix_inj2_on() && mix_inj2_ok(kk, nn, nt, kind == PfWKind::Bf16) {
                 if let Some(fns) = mix_inj2_kernels() {
+                    // task 617: inject を k 分割で撃った回数 (発火の証拠)。
+                    if tag == "inject" {
+                        PF_INJ2_CALLS.fetch_add(1, Ordering::Relaxed);
+                    }
                     let (mut pw, mut px, mut py) = (w, x, y);
                     let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, kk as c_int, nn as c_int);
                     let mut args = [
