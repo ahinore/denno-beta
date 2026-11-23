@@ -8602,35 +8602,49 @@ fn gdn_scan3_kernel_is_wired() {
         "scan3 の dk 前提が無い"
     );
     assert!(
-        GDN_SCAN3_SRC.contains("#define DNO_S3_NS 16"),
-        "scan3 の 1 レーン行数 (16) が無い"
+        GDN_SCAN3_SRC.contains("#define DNO_S3_NS 32"),
+        "scan3 の 1 レーン行数 (32 = 第 2 版と同じ) が無い"
     );
     assert!(
         GDN_SCAN3_SRC.contains("float S[DNO_S3_NS];"),
         "scan3 の状態がレジスタ配列でない"
     );
     assert!(
-        GDN_SCAN3_SRC.contains("__shfl_down_sync(0xffffffffu, v, 1, 8)")
-            && GDN_SCAN3_SRC.contains("__shfl_down_sync(0xffffffffu, v, 2, 8)")
-            && GDN_SCAN3_SRC.contains("__shfl_down_sync(0xffffffffu, v, 4, 8)"),
-        "scan3 の 8 レーン縮約が無い"
+        GDN_SCAN3_SRC.contains("__shfl_down_sync(0xffffffffu, v, 1, 4)")
+            && GDN_SCAN3_SRC.contains("__shfl_down_sync(0xffffffffu, v, 2, 4)"),
+        "scan3 の 4 レーン縮約が無い"
     );
     assert!(
-        GDN_SCAN3_SRC.contains("const int c = t >> 3;")
-            && GDN_SCAN3_SRC.contains("const int lane = t & 7;"),
-        "scan3 のスレッド割り当て (列 = t/8、レーン = t%8) が変わった"
+        GDN_SCAN3_SRC.contains("const int c = t >> 2;")
+            && GDN_SCAN3_SRC.contains("const int lane = t & 3;"),
+        "scan3 のスレッド割り当て (列 = t/4、レーン = t%4) が変わった"
     );
     // 8 レーン x 16 行 = 128 で全行を 1 回ずつ覆う (取りこぼし・重複の検出)。
     assert!(
         GDN_SCAN3_SRC.contains("const int r = lane * DNO_S3_NS + i;"),
         "scan3 の行の割り当てが lane * NS + i でない"
     );
-    // 1024 スレッド = 1 SM 1 ブロックなので 64 レジスタが上限。宣言が無いと
-    // ptxas の割り当てが 64 を超えて cuLaunchKernel が error 701 で落ちる (lab t592a)。
+    // 起動時の block は 4*dk = 512 (lab t592a は 1024 スレッド版で error 701 になった)。
     assert!(
-        GDN_SCAN3_SRC.contains("__launch_bounds__(1024, 1) dno_gdn_scan_sig3("),
-        "scan3 に __launch_bounds__(1024, 1) が無い (error 701 で起動できない)"
+        GDN_SCAN3_SRC.contains("__launch_bounds__(512, 1) dno_gdn_scan_sig3("),
+        "scan3 の __launch_bounds__ が 512 でない"
     );
+    // 単一スレッドの逐次和は **実行時引数ではなく定数**で回す (展開させる)。
+    // i < dk / i < dv に戻すと、和の順序は同じでも展開が効かなくなる。
+    let mut n_const = 0;
+    for (i, line) in GDN_SCAN3_SRC.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;   // 説明文のループは対象外
+        }
+        if line.contains("for (int i = 0; i < dk; ++i)") || line.contains("for (int i = 0; i < dv; ++i)") {
+            panic!("scan3 の逐次和が実行時長のループに戻っている (行 {})", i + 1);
+        }
+        if line.contains("for (int i = 0; i < DNO_S3_DK; ++i)") {
+            n_const += 1;
+        }
+    }
+    assert_eq!(n_const, 2, "scan3 の定数ループが 2 本 (q/k の和と o の和) でない");
     // 引数 23 本 (kernel_params は `__global__ void NAME(` の形しか見ないので、
     // launch_bounds が間に入る scan3 は自分で括弧を開く)。
     let at = GDN_SCAN3_SRC
@@ -8644,8 +8658,8 @@ fn gdn_scan3_kernel_is_wired() {
     // ホスト側: 第 2 版より先に選び、block は 8*dk。
     let pick = fn_body(CUDA_RS, "fn gdn_scan_pick(");
     assert!(
-        pick.contains("return (f, (8 * dk) as u32);"),
-        "scan3 の block が 8*dk でない"
+        pick.contains("return (f, (4 * dk) as u32);"),
+        "scan3 の block が 4*dk でない"
     );
     assert!(
         pick.find("gdn_scan3_on()").unwrap_or(usize::MAX) < pick.find("gdn_scan2_on()").unwrap_or(0),

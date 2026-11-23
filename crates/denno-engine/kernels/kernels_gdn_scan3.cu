@@ -1,50 +1,42 @@
-// task 592: decode の GDN (ssm) スキャンの第 3 版。第 2 版
-// (`kernels_gdn_scan2.cu` / `dno_gdn_scan_sig2`) のレーン数を 4 -> 8 にしただけ。
+// task 592: decode の GDN (ssm) スキャンの第 3 版。
 //
-// 背景 (REPORT_P588 §4): decode の scan は 1 ヘッド = 1 ブロック (grid = nv = 48)
-// で、第 2 版は 512 スレッド = 16 warp/ブロック。5090 は 170 SM あるので
-// **48 ブロックでは 28% の SM しか埋まらず、1 SM あたり 4.5 warp しか立たない**
-// (状態 3.1 MB の読み書きが 590 GB/s でしか流れない)。ヘッド数 (= ブロック数) は
-// モデルで固定なので、ブロックを増やさずに warp を増やすには 1 列を分担する
-// レーン数を増やすしかない。列 (dv) を割ると step 2/5 の全和がブロックを跨ぐので
-// 2 パスが要る (P588 §4)。**レーンを 8 にすると 1024 スレッド = 32 warp/ブロック、
-// 48 ブロックで 1536 warp = 9 warp/SM (第 2 版の 2 倍) になり、パスを増やさずに
-// メモリレベルの並列度を稼げる。**
+// lab t592b で **レーンを 4 -> 8 (1024 スレッド) にすると遅くなった** (ssm 段
+// 2.82 -> 2.92 ms/tok、+3.5%、2 ラウンド一致、md5 SAME)。48 ブロックしかないので
+// ブロックは 48 SM にしか載らず、warp を増やしても SM は増えない。増えるのは
+// `__syncthreads` の参加 warp 数だけで、barrier が 5 回/token あるため損になる。
+// つまりこのカーネルは**メモリのレイテンシ隠蔽では決まっていない** (P588 §4 の
+// 「占有 28% が律速」という見立ては外れ)。1024 スレッド版は捨てた。
 //
-// 数値: レーンを増やすと skv / o の縮約の木が変わる (第 2 版は 32 行ずつ 4 レーン、
-// こちらは 16 行ずつ 8 レーン)。**要素ごとの演算 (decay の乗算、update の k*dlt
-// 加算、conv の左結合、q/k の L2 正規化の逐次和、出力の rmsnorm * wnorm * sigmoid(z))
-// は第 2 版と 1 演算 1 丸めで同一**で、変わるのは和の結合順だけ (固定木 = 決定的)。
-// よって md5 は DIFF しうる (意図した丸めの変更)。
+// そこでこの版は、第 2 版 (`kernels_gdn_scan2.cu`) のスレッド構成 (1 列 4 レーン /
+// 512 スレッド) をそのままに、**単一スレッドの逐次和 2 本をコンパイル時定数の
+// ループへ変えて展開する**。第 2 版は
+//   for (int i = 0; i < dk; ++i) { sq += q_sh[i]*q_sh[i]; sk2 += k_sh[i]*k_sh[i]; }
+// のように **dk / dv がカーネル引数 (実行時値)** なので展開されず、shared の
+// ロード latency (約 30 cycle) が 1 反復ごとに露出する (128 反復 x 2 本/token)。
+// 定数 (`DNO_S3_DK`) にすると `#pragma unroll` が効いてロードが先に発行される。
+//
+// 数値は **第 2 版とビット一致**: 加算の順序 (i 昇順、2 本の独立な鎖) も
+// 被加数も 1 つも変えない。`-fmad=false` なので積と和は融合しない。
 //
 // 前提 (ホスト側で保証する): dk == dv == 128 / d_conv == 4 / cs == 3。
-// それ以外は従来カーネル (`kernels_gdn.ptx` の dno_gdn_scan_sig) を使う。
-//
-// `__launch_bounds__(1024, 1)` は必須 (lab t592a で外したら cuLaunchKernel が
-// error 701 = LAUNCH_OUT_OF_RESOURCES で落ちた): 1024 スレッドのブロックは
-// 1 SM あたり 1 ブロックなので **1 スレッド 64 レジスタが上限**で、これを
-// 宣言しないと ptxas は 64 を超える割り当てをして起動できない。S (16) は
-// ホットなのでレジスタに残り、溢れるのは lane 0 だけが使う conv の窓と
-// ポインタ引数 (1 トークン 1 回) になる。
 //
 // PTX (このコンテナには nvcc が無いので denno-gpu 側で行う):
 //   nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels_gdn_scan3.cu -o kernels_gdn_scan3.ptx
 // まとめて作るなら `kernels/build_ptx.sh gdn_scan3`。
 
 #define DNO_S3_DK 128
-#define DNO_S3_NS 16   // 1 レーンが持つ列の要素数 (dk / 8)
+#define DNO_S3_NS 32   // 1 レーンが持つ列の要素数 (dk / 4)
 
-// 同じ列の 8 レーン (幅 8) の合計。lane 0 の値だけが使われる。
-// 加算順は固定 (offset 1 -> 2 -> 4)。
-__device__ __forceinline__ float dno_s3_octet_sum(float v)
+// 同じ列の 4 レーン (幅 4) の合計。lane 0 の値だけが使われる。
+// 加算順は固定 (offset 1 -> 2)。
+__device__ __forceinline__ float dno_s3_quad_sum(float v)
 {
-    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 1, 8));
-    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 2, 8));
-    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 4, 8));
+    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 1, 4));
+    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 2, 4));
     return v;
 }
 
-extern "C" __global__ void __launch_bounds__(1024, 1) dno_gdn_scan_sig3(
+extern "C" __global__ void __launch_bounds__(512, 1) dno_gdn_scan_sig3(
     const float* __restrict__ qkv,   // [n, conv_dim] (conv 入力 = 投影済み qkv 行)
     const float* __restrict__ z,     // [n, value_dim]
     const float* __restrict__ beta,  // [n, nv]
@@ -65,9 +57,9 @@ extern "C" __global__ void __launch_bounds__(1024, 1) dno_gdn_scan_sig3(
     const int kh = h % nk;
     const int kd_total = nk * dk;
     const int vd = nv * dv;
-    const int t = threadIdx.x;      // 0 .. dv*8-1
-    const int c = t >> 3;           // 列 (0..dv-1)
-    const int lane = t & 7;         // 0..7 (同じ列の 8 レーン)
+    const int t = threadIdx.x;      // 0 .. dv*4-1
+    const int c = t >> 2;           // 列 (0..dv-1)
+    const int lane = t & 3;         // 0..3 (同じ列の 4 レーン)
 
     extern __shared__ float sh[];
     // layout: q_sh[dk] | k_sh[dk] | v_sh[dk] | o_sh[dv] | scalars[5]
@@ -133,9 +125,12 @@ extern "C" __global__ void __launch_bounds__(1024, 1) dno_gdn_scan_sig3(
         __syncthreads();
 
         // ---- 2. q/k L2 正規化スケール + decay/beta (単一スレッド逐次和) -----
+        // 反復数をコンパイル時定数にして展開する (和の順序は i 昇順のまま =
+        // 第 2 版とビット一致。変わるのは「ロードを先に発行できる」ことだけ)。
         if (t == 0) {
             float sq = 0.0f, sk2 = 0.0f;
-            for (int i = 0; i < dk; ++i) {
+#pragma unroll 8
+            for (int i = 0; i < DNO_S3_DK; ++i) {
                 sq += q_sh[i] * q_sh[i];
                 sk2 += k_sh[i] * k_sh[i];
             }
@@ -156,7 +151,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) dno_gdn_scan_sig3(
         }
         __syncthreads();
 
-        // ---- 4. デルタルール (列ごとに完結・8 レーンで分担) ----------------
+        // ---- 4. デルタルール (列ごとに完結・4 レーンで分担) ----------------
         const float eg = sc[2];
         const float b = sc[3];
         float part = 0.0f; // sk[c] = Σ_r k[r] * S[r][c] のレーン分担
@@ -166,12 +161,12 @@ extern "C" __global__ void __launch_bounds__(1024, 1) dno_gdn_scan_sig3(
             S[i] = __fmul_rn(S[i], eg); // S ← S * exp(g)
             part = __fadd_rn(part, __fmul_rn(k_sh[r], S[i]));
         }
-        part = dno_s3_octet_sum(part);
+        part = dno_s3_quad_sum(part);
         float dlt = 0.0f;
         if (lane == 0) {
             dlt = __fmul_rn(b, __fsub_rn(v_sh[c], part)); // d[c] = beta * (v[c] - sk[c])
         }
-        dlt = __shfl_sync(0xffffffffu, dlt, 0, 8);
+        dlt = __shfl_sync(0xffffffffu, dlt, 0, 4);
         float o = 0.0f; // o[c] = Σ_r q[r] * S[r][c] のレーン分担
 #pragma unroll
         for (int i = 0; i < DNO_S3_NS; ++i) {
@@ -179,16 +174,18 @@ extern "C" __global__ void __launch_bounds__(1024, 1) dno_gdn_scan_sig3(
             S[i] = __fadd_rn(S[i], __fmul_rn(k_sh[r], dlt));
             o = __fadd_rn(o, __fmul_rn(q_sh[r], S[i]));
         }
-        o = dno_s3_octet_sum(o);
+        o = dno_s3_quad_sum(o);
         if (lane == 0) {
             o_sh[c] = o;
         }
         __syncthreads();
 
         // ---- 5. gated RMS norm: rmsnorm(o) * w * sigmoid(z) ----------------
+        // ここも定数展開 (dv == dk == 128 はホスト側の門番が保証する)。
         if (t == 0) {
             float s = 0.0f;
-            for (int i = 0; i < dv; ++i) {
+#pragma unroll 8
+            for (int i = 0; i < DNO_S3_DK; ++i) {
                 s += o_sh[i] * o_sh[i];
             }
             sc[4] = 1.0f / sqrtf(s / (float)dv + eps);

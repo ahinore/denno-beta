@@ -67125,14 +67125,18 @@ fn gdn_scan2_kernel() -> Option<CUfunction> {
 /// `dno_gdn_scan_sig3`、**1 列 8 レーン** + 列レジスタ) に差し替えるか
 /// (`DENNO_GDN_SCAN3`、既定 off)。
 ///
-/// 第 2 版は 512 スレッド = 16 warp/ブロックで、grid は nv = 48 のまま。170 SM の
-/// 28% しか埋まらず 4.5 warp/SM なので、状態 3.1 MB の読み書きが 590 GB/s で
-/// 止まる (REPORT_P588 §4)。列を割ると step 2/5 の全和がブロックを跨ぐので
-/// パスが増えるが、**レーンを 8 にすると 1024 スレッド = 32 warp/ブロック**に
-/// なり、パスを増やさずに warp/SM を 2 倍にできる。
+/// lab t592b で **1 列 8 レーン (1024 スレッド) は ssm 段 +3.5% で負けた**
+/// (2.82 -> 2.92 ms/tok、2 ラウンド一致、md5 SAME)。48 ブロックしか無いので
+/// ブロックは 48 SM にしか載らず、warp を 2 倍にしても SM は増えない。増えるのは
+/// `__syncthreads` の参加 warp だけ (5 回/token) で、損になる。このカーネルは
+/// メモリのレイテンシ隠蔽では決まっていない (P588 §4 の見立ては外れ)。
 ///
-/// 数値: skv / o の縮約の木だけが変わる (1 演算 1 丸め・固定木で決定的)。
-/// 丸めが変わるので既定 off。on のときは第 2 版より優先する (形と PTX が揃えば)。
+/// 第 3 版はその反省で、スレッド構成は第 2 版と同じ (1 列 4 レーン / 512 スレッド)
+/// のまま、**単一スレッドの逐次和 2 本の反復数をコンパイル時定数にして展開**する
+/// (`dk` / `dv` が引数だと展開されず、shared のロード latency が 128 反復ぶん
+/// 露出していた)。和の順序は変えないので**値は第 2 版とビット一致**。
+///
+/// 既定 off。on のときは第 2 版より優先する (形と PTX が揃えば)。
 fn gdn_scan3_from_value(v: Option<&str>, default_on: bool) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
@@ -67212,10 +67216,10 @@ fn gdn_scan3_kernel() -> Option<CUfunction> {
                 // 起動せずに第 2 版へ落とす (ラッチで decode 経路ごと止めないため)。
                 if let Some(g) = lib.func_get_attribute {
                     let mut maxthr: c_int = 0;
-                    if g(&mut maxthr, 0, f) == CUDA_SUCCESS && (maxthr as u32) < 8 * 128 {
+                    if g(&mut maxthr, 0, f) == CUDA_SUCCESS && (maxthr as u32) < 4 * 128 {
                         eprintln!(
                             "[gdn-scan3] max_threads={maxthr} < {} → 第 2 版 scan へ",
-                            8 * 128
+                            4 * 128
                         );
                         return None;
                     }
@@ -67230,13 +67234,14 @@ fn gdn_scan3_kernel() -> Option<CUfunction> {
 
 /// `gdn_decode_submit` が使う scan カーネルと blockDim.x。
 ///
-/// 第 3 版は 1 列を 8 レーンで持つので block は dk の 8 倍 (`DENNO_GDN_SCAN3`)。
+/// 第 3 版は第 2 版と同じく 1 列 4 レーンなので block は dk の 4 倍
+/// (`DENNO_GDN_SCAN3`。差は逐次和の定数展開だけ)。
 /// 形が合わない / PTX が無いときは第 2 版 → 従来カーネルの順に落ちる。
 fn gdn_scan_pick(base: CUfunction, dk: usize, dv: usize) -> (CUfunction, u32) {
     if dk == 128 && dv == 128 {
         if gdn_scan3_on() {
             if let Some(f) = gdn_scan3_kernel() {
-                return (f, (8 * dk) as u32);
+                return (f, (4 * dk) as u32);
             }
         }
         if gdn_scan2_on() {
