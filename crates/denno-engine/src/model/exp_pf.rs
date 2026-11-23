@@ -4986,6 +4986,111 @@ pub fn stream_copy_rate() -> (u64, u64) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// task 609: 窓が**広い**層の先読みも、ストリームが page cache 速度なら止める
+// (`DENNO_PF_ER_PAGE_HIT`)
+// ---------------------------------------------------------------------------
+//
+// # なぜ (lab t609a の 14k、`model=flash-next-UD-IQ3_XXS`)
+//
+// 既定モデルの 14k cold は expert の 28,015 MB のうち **18,328 MB を `pread`** で
+// 読んでいた (`[exp-pf-stream] pread_MB=18328.5 ra_ms=1110.0`)。しかし同じ行の
+// `io_read_MB=782` が示すとおり、その 18.3 GB は **page cache から来ている**
+// (`ER_SMALL_MAX_GBS` = 12 GB/s の判定は 16.5 GB/s で「ディスクではない」)。
+// それでも窓の広い層は先読みしていた (窓の判定 `early_route_window_ok` に
+// レートの条件が無い) ため、次の 5 往復を払っていた:
+//
+// 1. page cache → `rc_plan` (pread の読み)
+// 2. `rc_plan` のページを書く
+// 3. `rc_plan` → pinned のバウンス (MoE の写し)
+// 4. バウンスを書く
+// 5. DMA がバウンスを読み直す (VRAM へ)
+//
+// 先読みをしないときは 3 往復 (page cache → バウンス、バウンス → VRAM) で済む。
+// 増える 2 往復 = 36.6 GB は、14k の壁 5.5 s のうち DDR で 0.5-0.6 s に相当する
+// (**推定**。DDR 62 GB/s)。さらに先読み自身のホスト時間 (`sub other pf_er`) が
+// 14k で 242 ms あった。
+//
+// # 何をしないか
+//
+// - ディスクから読んでいる層 (UD-Q4_K_XL の 5.9-7.1 GB/s) は**従来どおり先読み**
+//   する。判定は実測が `ER_SMALL_MIN_BYTES` 以上たまってから (`er_stream_page_hit`)。
+// - 値は 1 バイトも変えない (先読みを飛ばすだけで、MoE は同じバイト列を
+//   mmap から写す)。md5 は全 COND で SAME が期待値。
+pub const ER_PAGE_HIT_ENV: &str = "DENNO_PF_ER_PAGE_HIT";
+
+/// [`ER_PAGE_HIT_ENV`] の既定 (lab t609c で勝ったら true へ。測るあいだは off)。
+pub const DEFAULT_ER_PAGE_HIT: bool = false;
+
+/// [`ER_PAGE_HIT_ENV`] の解釈 (純関数)。未設定・空は既定、明示的な真値だけ on。
+pub fn er_page_hit_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("") => DEFAULT_ER_PAGE_HIT,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+#[cfg(test)]
+static ER_PAGE_HIT_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub fn set_er_page_hit_for_test(v: Option<bool>) {
+    ER_PAGE_HIT_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// 窓の広い層の先読みを page cache 速度で止めるか (プロセスで 1 回だけ env を読む)。
+pub fn er_page_hit_on() -> bool {
+    #[cfg(test)]
+    {
+        match ER_PAGE_HIT_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        er_page_hit_from_value(std::env::var(ER_PAGE_HIT_ENV).ok().as_deref())
+    })
+}
+
+/// ストリームの実測が「ディスクではない」と言っているか (純関数)。
+///
+/// [`er_small_disk_bound`] の裏返しだが、**実測が薄いあいだは false**
+/// (まだ分からない = 先読みする側に倒す)。bytes/ns はそのまま GB/s。
+pub fn er_stream_page_hit(bytes: u64, copy_ns: u64) -> bool {
+    if copy_ns == 0 || bytes < ER_SMALL_MIN_BYTES as u64 {
+        return false;
+    }
+    let gbs = bytes as f64 / copy_ns as f64;
+    gbs > ER_SMALL_MAX_GBS
+}
+
+/// task 609: 先読みを page cache 速度で止めた層の数 (発火の証拠)。
+static ER_PH_LAYERS: AtomicU64 = AtomicU64::new(0);
+
+/// 1 層ぶん止めた (診断用)。
+pub fn note_er_page_hit() {
+    ER_PH_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// [`ER_PH_LAYERS`] を読む (テストと `[exp-pf-stream]` 用)。
+pub fn er_page_hit_layers() -> u64 {
+    ER_PH_LAYERS.load(Ordering::Relaxed)
+}
+
+/// 止めた層の数を 0 に戻す。
+pub fn er_page_hit_reset() {
+    ER_PH_LAYERS.store(0, Ordering::Relaxed);
+}
+
 /// 窓の小さい経路を通すか (純関数)。分岐の条件は全部ここに集める。
 ///
 /// - `wide` = task 474 の規則 (残り 4 チャンク以上)。広い窓が立っていれば
@@ -5029,12 +5134,19 @@ pub fn note_early_route(experts: usize, bytes: usize, calls: usize) {
 /// `[exp-pf-stream]` の末尾へ足す台帳 (発火していなければ空)。
 pub fn early_route_stats() -> String {
     let n = ER_LAYERS.load(Ordering::Relaxed);
+    // task 609: page cache 速度で先読みを止めた層の数 (発火の証拠)。
+    let ph = er_page_hit_layers();
+    let ph_txt = if ph > 0 {
+        format!(" er_ph_layers={ph}")
+    } else {
+        String::new()
+    };
     if n == 0 {
-        return String::new();
+        return ph_txt;
     }
     let mb = ER_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
     format!(
-        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={}",
+        " er_layers={n} er_experts={} er_MB={mb:.1} er_calls={}{ph_txt}",
         ER_EXPERTS.load(Ordering::Relaxed),
         ER_CALLS.load(Ordering::Relaxed)
     )
@@ -6228,6 +6340,58 @@ mod tests {
         assert!(s.contains("er_MB=268.4"), "{s}");
         early_route_stats_reset();
         assert_eq!(early_route_stats(), "");
+    }
+
+    /// task 609: 窓の広い層の先読みを page cache 速度で止める判定。
+    ///
+    /// - env の真理値表 (未設定は既定 = off)。
+    /// - 実測が薄いあいだ (256 MiB 未満) と copy_ns = 0 は**先読みする側** (false)。
+    /// - 12 GB/s を超えたら止める (page cache)。UD の 5.9-7.1 GB/s は止めない。
+    /// - 台帳 (`er_ph_layers`) が `[exp-pf-stream]` の末尾に出る (発火の証拠)。
+    #[test]
+    fn er_page_hit_gate_and_stats() {
+        assert!(!er_page_hit_from_value(None), "未設定の既定は off");
+        assert!(!er_page_hit_from_value(Some("")));
+        for on in ["1", "on", "true", "yes", "ON"] {
+            assert!(er_page_hit_from_value(Some(on)), "{on}");
+        }
+        for off in ["0", "off", "false", "no"] {
+            assert!(!er_page_hit_from_value(Some(off)), "{off}");
+        }
+
+        // 1 GB を 0.024 s = 41.7 GB/s (既定モデルの 14k の実測 42 GB/s)。
+        assert!(er_stream_page_hit(1 << 30, 24_000_000), "page cache 速度なら止める");
+        // 同じ 1 GB を 0.169 s = 5.9 GB/s (UD の実測) は止めない。
+        assert!(!er_stream_page_hit(1 << 30, 169_000_000), "ディスクは先読みする");
+        // 14k の pread 実測 16.5 GB/s も止める側。
+        assert!(er_stream_page_hit(18_328_500_000, 1_110_000_000));
+        // 実測が薄い / 時間が 0 なら「まだ分からない」= 先読みする。
+        assert!(!er_stream_page_hit(ER_SMALL_MIN_BYTES as u64 - 1, 1));
+        assert!(!er_stream_page_hit(1 << 30, 0));
+
+        // 台帳: 積んだ層数だけ出る (先読みの台帳が空でも出る)。
+        er_page_hit_reset();
+        early_route_stats_reset();
+        assert_eq!(er_page_hit_layers(), 0);
+        note_er_page_hit();
+        note_er_page_hit();
+        assert_eq!(er_page_hit_layers(), 2);
+        let s = early_route_stats();
+        assert!(s.contains("er_ph_layers=2"), "{s}");
+        assert!(!s.contains("er_layers="), "先読みしていないのに er_layers が出た: {s}");
+        note_early_route(10, 1 << 20, 3);
+        let s = early_route_stats();
+        assert!(s.contains("er_layers=1") && s.contains("er_ph_layers=2"), "{s}");
+        er_page_hit_reset();
+        early_route_stats_reset();
+        assert_eq!(early_route_stats(), "");
+
+        // ゲートはテスト上書きで切り替わる (env を読む前に固定できる)。
+        set_er_page_hit_for_test(Some(false));
+        assert!(!er_page_hit_on());
+        set_er_page_hit_for_test(Some(true));
+        assert!(er_page_hit_on());
+        set_er_page_hit_for_test(None);
     }
 
     /// task 474: 先読みの置き場 (RAM) の割り当てと索引。

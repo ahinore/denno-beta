@@ -19416,6 +19416,18 @@ fn pf_early_route_prefetch(
     if crate::model::exp_pf::er_early_exit_on() && !(wide || narrow) {
         return None;
     }
+    // task 609: 窓が広くても、ストリームの実測が page cache 速度なら先読みしない
+    // (`DENNO_PF_ER_PAGE_HIT`、既定 off)。理由は `exp_pf::ER_PAGE_HIT_ENV` の doc
+    // (14k で 18.3 GB を page cache から 5 往復で運んでいた)。
+    // ここは router の同期より前なので、止める層は router の GPU 仕事も払わない
+    // (task 482 が窓の判定を前へ出したのと同じ理由)。
+    if wide
+        && crate::model::exp_pf::er_page_hit_on()
+        && crate::model::exp_pf::er_stream_page_hit(rate_bytes, rate_ns)
+    {
+        crate::model::exp_pf::note_er_page_hit();
+        return None;
+    }
     // 窓が無い (1 チャンクで終わる) / 形が合わない層は何もしない。
     if nt0 == 0 || nt0 >= nt_all || k == 0 || ne == 0 || lw.gate_inp.k() != e {
         return None;
@@ -20981,6 +20993,30 @@ fn expert_gemv_cached_seq(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task 609: `DENNO_PF_ER_PAGE_HIT` が**本経路**に配線されているか。
+    ///
+    /// ゲートを足したのに呼び出し側へ繋ぎ忘れる (緑だが分岐が無い) のを防ぐ。
+    /// `pf_early_route_prefetch` の本体が 3 つ (ゲート / 判定 / 台帳) を呼び、
+    /// 止めたら `None` を返していることだけをソースで固定する。
+    #[test]
+    fn pf609_er_page_hit_is_wired_into_the_prefetch() {
+        let src = include_str!("qwen4exp.rs");
+        let i = src
+            .find("fn pf_early_route_prefetch(")
+            .expect("pf_early_route_prefetch が無い");
+        let body = &src[i..i + src[i..].find("\n}\n").map(|e| e + 3).unwrap_or(0)];
+        assert!(body.contains("er_page_hit_on()"), "ゲートを読んでいない");
+        assert!(body.contains("er_stream_page_hit("), "レートの判定をしていない");
+        assert!(body.contains("note_er_page_hit()"), "発火を数えていない");
+        // 止める判定は router の同期より前 (窓の判定の直後) にある。
+        let gate = body.find("er_page_hit_on()").unwrap();
+        let router = body.find("pf_router_dev_topk(").expect("router が無い");
+        assert!(gate < router, "ゲートが router の同期より後ろにある");
+        // 先読みの本体 (計画を組むループ) はゲートより後ろ。
+        let plan = body.find("for (i, key) in keys.iter().enumerate()").expect("計画が無い");
+        assert!(gate < plan && router < plan);
+    }
 
     /// task 317: keep の判定は層種別ごとのゲートに従う (full = `DENNO_PF_MIXKEEP`、
     /// ssm = `DENNO_PF_MIXKEEP_SSM`)。dev-in が off・平坦でない・短いチャンクは
