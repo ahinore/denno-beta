@@ -8587,6 +8587,108 @@ fn gdn_scan2_kernel_is_wired() {
 }
 
 // ---------------------------------------------------------------------------
+// task 592: decode の GDN scan 第 3 版 (1 列 8 レーン = 1024 スレッド)
+// ---------------------------------------------------------------------------
+const GDN_SCAN3_SRC: &str = include_str!("../kernels/kernels_gdn_scan3.cu");
+
+/// scan 第 3 版の前提 (dk=dv=128 / 8 レーン / 1024 スレッド) と起動。
+///
+/// 第 2 版との差はレーン数だけ (1 列 4 -> 8 レーン) で、要素ごとの演算列は同じ。
+/// ホスト側の block が 8*dk でないと **列の一部しか書かない** ので固定する。
+#[test]
+fn gdn_scan3_kernel_is_wired() {
+    assert!(
+        GDN_SCAN3_SRC.contains("#define DNO_S3_DK 128"),
+        "scan3 の dk 前提が無い"
+    );
+    assert!(
+        GDN_SCAN3_SRC.contains("#define DNO_S3_NS 32"),
+        "scan3 の 1 レーン行数 (32 = 第 2 版と同じ) が無い"
+    );
+    assert!(
+        GDN_SCAN3_SRC.contains("float S[DNO_S3_NS];"),
+        "scan3 の状態がレジスタ配列でない"
+    );
+    assert!(
+        GDN_SCAN3_SRC.contains("__shfl_down_sync(0xffffffffu, v, 1, 4)")
+            && GDN_SCAN3_SRC.contains("__shfl_down_sync(0xffffffffu, v, 2, 4)"),
+        "scan3 の 4 レーン縮約が無い"
+    );
+    assert!(
+        GDN_SCAN3_SRC.contains("const int c = t >> 2;")
+            && GDN_SCAN3_SRC.contains("const int lane = t & 3;"),
+        "scan3 のスレッド割り当て (列 = t/4、レーン = t%4) が変わった"
+    );
+    // 8 レーン x 16 行 = 128 で全行を 1 回ずつ覆う (取りこぼし・重複の検出)。
+    assert!(
+        GDN_SCAN3_SRC.contains("const int r = lane * DNO_S3_NS + i;"),
+        "scan3 の行の割り当てが lane * NS + i でない"
+    );
+    // 起動時の block は 4*dk = 512 (lab t592a は 1024 スレッド版で error 701 になった)。
+    assert!(
+        GDN_SCAN3_SRC.contains("__launch_bounds__(512, 1) dno_gdn_scan_sig3("),
+        "scan3 の __launch_bounds__ が 512 でない"
+    );
+    // 単一スレッドの逐次和は **実行時引数ではなく定数**で回す (展開させる)。
+    // i < dk / i < dv に戻すと、和の順序は同じでも展開が効かなくなる。
+    let mut n_const = 0;
+    for (i, line) in GDN_SCAN3_SRC.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;   // 説明文のループは対象外
+        }
+        if line.contains("for (int i = 0; i < dk; ++i)") || line.contains("for (int i = 0; i < dv; ++i)") {
+            panic!("scan3 の逐次和が実行時長のループに戻っている (行 {})", i + 1);
+        }
+        if line.contains("for (int i = 0; i < DNO_S3_DK; ++i)") {
+            n_const += 1;
+        }
+    }
+    assert_eq!(n_const, 2, "scan3 の定数ループが 2 本 (q/k の和と o の和) でない");
+    // 引数 23 本 (kernel_params は `__global__ void NAME(` の形しか見ないので、
+    // launch_bounds が間に入る scan3 は自分で括弧を開く)。
+    let at = GDN_SCAN3_SRC
+        .find("dno_gdn_scan_sig3(")
+        .expect("scan3 の定義が無い");
+    let params = split_top_args(call_inner(
+        GDN_SCAN3_SRC,
+        at + "dno_gdn_scan_sig3".len(),
+    ));
+    assert_eq!(params.len(), 23, "scan3 の引数が 23 本でない: {}", params.len());
+    // ホスト側: 第 2 版より先に選び、block は 8*dk。
+    let pick = fn_body(CUDA_RS, "fn gdn_scan_pick(");
+    assert!(
+        pick.contains("return (f, (4 * dk) as u32);"),
+        "scan3 の block が 4*dk でない"
+    );
+    assert!(
+        pick.find("gdn_scan3_on()").unwrap_or(usize::MAX) < pick.find("gdn_scan2_on()").unwrap_or(0),
+        "scan3 が第 2 版より先に選ばれていない"
+    );
+    assert!(
+        CUDA_RS.contains(r#"if ptx_entry_params(&text, "dno_gdn_scan_sig3") != Some(23)"#),
+        "scan3 の ABI 検査が無い"
+    );
+    // ゲートは lab t592c の採否で既定 on (ssm 段 -2.8%、値は scan2 とビット一致)。
+    assert!(
+        CUDA_RS.contains("const GDN_SCAN3_DEFAULT: bool = true;"),
+        "scan3 が既定 on でない (lab t592c で採否 yes)"
+    );
+    assert!(
+        BUILD_PTX_SH.contains(r#"gdn_scan3)    echo "kernels_gdn_scan3.cu|nofmad" ;;"#),
+        "build_ptx.sh の gdn_scan3 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.trim_end().ends_with("gdn_scan3)"),
+        "targets_all の末尾に gdn_scan3 が無い: {targets}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // task 187: decode の epilogue カーネル (`kernels_dec_epi.cu`)
 //
 // `cuda.rs` は `cuLaunchKernel` の引数を**手で並べる**ので、カーネルの引数順が
@@ -10943,7 +11045,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(targets.contains("gdn_pf_wy5"), "targets_all に gdn_pf_wy5 が無い");
     // task 407: 末尾は wy6 / wy6p (自分の分を足すときは必ず末尾に足す)。
     assert!(
-        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
+        targets.trim_end().ends_with("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
@@ -12486,7 +12588,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "build_ptx.sh に wy6p の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
@@ -12603,7 +12705,7 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
         "build_ptx.sh に wy7q の target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
 }
@@ -12798,7 +12900,7 @@ fn task418_mix_dn5_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12892,7 +12994,7 @@ fn task422_mix_dn6_kernel_is_wired() {
         "targets_all に足していない"
     );
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
+        BUILD_PTX_SH.contains("gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "targets_all の末尾を動かしている (他ブランチと衝突する)"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -12966,7 +13068,7 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
         "build_ptx.sh に target が無い"
     );
     assert!(
-        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
+        BUILD_PTX_SH.contains("attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "targets_all の末尾に足していない"
     );
     // 収録済みの PTX (lab が生成) があるなら entry と引数の数を検査する。
@@ -13314,7 +13416,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
 fn task437_up4_four_lanes_per_pair_up_is_wired() {
     // 新しい .cu と target を足した (PTX は lab が生成して commit する)。
     assert!(
-        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu)"),
+        BUILD_PTX_SH.contains("mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "build_ptx.sh の targets_all に mix_up4 が無い"
     );
     assert!(
@@ -15027,7 +15129,7 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
         "build_ptx.sh に attn_dec5 の spec が無い"
     );
     assert!(
-        sh.contains("mix_dn8 attn_dec5 sh_gu)"),
+        sh.contains("mix_dn8 attn_dec5 sh_gu gdn_scan3)"),
         "targets_all に attn_dec5 が無い"
     );
     let ptx = root.join("kernels_attn_dec5.ptx");
