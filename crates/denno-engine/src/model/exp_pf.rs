@@ -5234,18 +5234,31 @@ pub const RC_CACHE_MB_ENV: &str = "DENNO_PF_RA_CACHE_MB";
 /// [`RC_CACHE_MB_ENV`] の既定 (MiB)。
 pub const DEFAULT_RC_CACHE_MB: usize = 512;
 
-/// `DENNO_PF_RA_THREADS`: 先読みの並列度。**既定 8**。
+/// `DENNO_PF_RA_THREADS`: 先読みの並列度。**既定 32** (task 602 で 8 -> 32)。
 ///
 /// 窓のあいだディスクを回す本数。コピー側は 32 本 (`DENNO_PF_PREAD_THREADS`) だが、
-/// 窓は短いので上げすぎても立ち上げで損をする (t470d の実測: 14 本で 3.2-5.5 GB/s)。
+/// t470d の実測 (14 本で 3.2-5.5 GB/s) を見て task 474 は 8 本にしていた。
+///
+/// # なぜ 32 か (lab t602b、UD-Q4_K_XL、depth8k、8 本の既定 CONDs と対)
+///
+/// 8 本では先読みが **時間で切られて** 置き場へ入るバイトが予算の 6 割しか無かった
+/// (`ra_MB` 11,339 / 11,284 対 `er_MB` 18,880)。16/32 本にすると `ra_MB` は
+/// 16,776 / 17,679 (+48/+56%) になり、**ディスクから読むバイトが 7 GB 減る**
+/// (`nc_miss_MB`=O_DIRECT 23,134 / 19,510 -> 16,042 / 15,743)。
+/// 14k cold の壁は 11,598.5 / 10,532.5 -> **9,550.4 / 9,503.2 ms**
+/// (対 b -17.7/-18.1%、対 b2 -9.3/-9.8%)、`ready_s` 7.06 / 6.27 -> 5.54 / 5.41、
+/// `copy_s` 19.17 / 16.83 -> 14.53 / 14.15。3,826 は柵の内側 (-3.7 .. +1.1%)、
+/// decode 12.0-12.2 ms/tok で不変、md5 は cold 2 文脈が全 COND SAME。
 pub const RC_THREADS_ENV: &str = "DENNO_PF_RA_THREADS";
 
-/// [`RC_THREADS_ENV`] の既定 (task 486 でも 8 のまま)。
+/// [`RC_THREADS_ENV`] の既定 (task 602 で 8 -> 32。切り戻しは `=8`)。
 ///
-/// task 486 は「窓の中の先読みを 24 本にすると 2〜3 チャンクの窓にも収まる」
-/// という仮説を lab の A/B で測る (`DENNO_PF_RA_THREADS=24`)。勝ったときだけ
-/// ここを 24 へ上げる。既定は task 474 のまま (8)。
-pub const DEFAULT_RC_THREADS: usize = 8;
+/// task 486 は「24 本にすると窓を越えて MoE の写しと帯域を奪い合う」として 8 のまま
+/// にしたが、そのときの MoE の写しは**1 本の pread プールを共有**していた。
+/// task 558/570 で上げスレッドごとのプール (32 本 x 3) と O_DIRECT バウンスが
+/// 既定になってからは、先読みを太くしても写しを止めない (t602b の `ready_s` が
+/// 両方の 8 本 CONDs より短い)。上限 32 は [`rc_threads_from_value`] の丸めのまま。
+pub const DEFAULT_RC_THREADS: usize = 32;
 
 /// [`RC_CACHE_MB_ENV`] の解釈 (純関数)。0 は「置き場なし」、それ以外は
 /// 32..=2048 MiB に丸める。
@@ -6472,6 +6485,10 @@ mod tests {
         assert_eq!(rc_threads_from_value(Some("4")), 4);
         assert_eq!(rc_threads_from_value(Some("999")), 32, "上限 32");
         assert_eq!(rc_threads_from_value(Some("x")), DEFAULT_RC_THREADS);
+        // task 602: 既定を 8 -> 32 にした (lab t602b、14k cold -9.3/-9.8%)。
+        // 切り戻しは `DENNO_PF_RA_THREADS=8` (この値がそのまま通ること)。
+        assert_eq!(DEFAULT_RC_THREADS, 32, "t602b で 8 -> 32");
+        assert_eq!(rc_threads_from_value(Some("8")), 8, "切り戻しの値が通る");
     }
 
     /// task 474: 窓の下限 (残りチャンク 4 本)。
