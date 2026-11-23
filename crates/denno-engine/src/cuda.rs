@@ -67121,14 +67121,114 @@ fn gdn_scan2_kernel() -> Option<CUfunction> {
         .map(|k| k.f)
 }
 
+/// task 592: GDN decode のスキャンを第 3 版 (`kernels_gdn_scan3.cu` の
+/// `dno_gdn_scan_sig3`、**1 列 8 レーン** + 列レジスタ) に差し替えるか
+/// (`DENNO_GDN_SCAN3`、既定 off)。
+///
+/// 第 2 版は 512 スレッド = 16 warp/ブロックで、grid は nv = 48 のまま。170 SM の
+/// 28% しか埋まらず 4.5 warp/SM なので、状態 3.1 MB の読み書きが 590 GB/s で
+/// 止まる (REPORT_P588 §4)。列を割ると step 2/5 の全和がブロックを跨ぐので
+/// パスが増えるが、**レーンを 8 にすると 1024 スレッド = 32 warp/ブロック**に
+/// なり、パスを増やさずに warp/SM を 2 倍にできる。
+///
+/// 数値: skv / o の縮約の木だけが変わる (1 演算 1 丸め・固定木で決定的)。
+/// 丸めが変わるので既定 off。on のときは第 2 版より優先する (形と PTX が揃えば)。
+fn gdn_scan3_from_value(v: Option<&str>, default_on: bool) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
+    }
+}
+
+/// lab t592a で採否を決めるまで既定 off (丸めが変わるため)。
+const GDN_SCAN3_DEFAULT: bool = false;
+
+pub(crate) fn gdn_scan3_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        gdn_scan3_from_value(
+            std::env::var("DENNO_GDN_SCAN3").ok().as_deref(),
+            GDN_SCAN3_DEFAULT,
+        )
+    })
+}
+
+/// kernels_gdn_scan3.ptx の `dno_gdn_scan_sig3`。
+struct Scan3Kernel {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for Scan3Kernel {}
+unsafe impl Sync for Scan3Kernel {}
+
+static GDN_SCAN3_KERNEL: OnceLock<Option<Scan3Kernel>> = OnceLock::new();
+
+fn scan3_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GDN_SCAN3_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_scan3.ptx"),
+    }
+}
+
+/// 第 3 版のカーネル (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn gdn_scan3_kernel() -> Option<CUfunction> {
+    GDN_SCAN3_KERNEL
+        .get_or_init(|| {
+            let path = scan3_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, "dno_gdn_scan_sig3") != Some(23) {
+                eprintln!("[gdn-scan3] PTX の引数が 23 本でない → 従来 scan へ");
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(
+                    &mut f,
+                    module,
+                    b"dno_gdn_scan_sig3\0".as_ptr() as *const c_char,
+                ) != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                Some(Scan3Kernel { module, f })
+            }
+        })
+        .as_ref()
+        .map(|k| k.f)
+}
+
 /// `gdn_decode_submit` が使う scan カーネルと blockDim.x。
 ///
-/// 第 2 版は 1 列を 4 レーンで持つので block は dk の 4 倍。形が合わない /
-/// PTX が無いときは従来カーネル (block = dk) をそのまま返す。
+/// 第 3 版は 1 列を 8 レーンで持つので block は dk の 8 倍 (`DENNO_GDN_SCAN3`)。
+/// 形が合わない / PTX が無いときは第 2 版 → 従来カーネルの順に落ちる。
 fn gdn_scan_pick(base: CUfunction, dk: usize, dv: usize) -> (CUfunction, u32) {
-    if gdn_scan2_on() && dk == 128 && dv == 128 {
-        if let Some(f) = gdn_scan2_kernel() {
-            return (f, (4 * dk) as u32);
+    if dk == 128 && dv == 128 {
+        if gdn_scan3_on() {
+            if let Some(f) = gdn_scan3_kernel() {
+                return (f, (8 * dk) as u32);
+            }
+        }
+        if gdn_scan2_on() {
+            if let Some(f) = gdn_scan2_kernel() {
+                return (f, (4 * dk) as u32);
+            }
         }
     }
     (base, dk as u32)
@@ -68587,6 +68687,25 @@ mod task184_tests {
         }
         assert_eq!(GDN_SCAN2_DEFAULT, true);
         assert!(gdn_scan2_on(), "DENNO_GDN_SCAN2 が既定 off に戻っている");
+    }
+
+    /// task 592: scan3 の env 解釈 (既定は off) と、既定 off の確認。
+    #[test]
+    fn gdn_scan3_truth_table() {
+        for raw in [None, Some(""), Some("  "), Some("x"), Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(
+                !gdn_scan3_from_value(raw, GDN_SCAN3_DEFAULT),
+                "raw={raw:?} が on になっている"
+            );
+        }
+        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true "), Some("yes")] {
+            assert!(
+                gdn_scan3_from_value(raw, GDN_SCAN3_DEFAULT),
+                "raw={raw:?} が off になっている"
+            );
+        }
+        assert_eq!(GDN_SCAN3_DEFAULT, false, "scan3 が既定 on に戻っている");
+        assert_eq!(gdn_scan3_from_value(Some("off"), true), false);
     }
 
     /// 形状の門番: scan2 は dk == dv == 128 のときだけ選ばれる。
