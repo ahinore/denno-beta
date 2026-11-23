@@ -30595,15 +30595,18 @@ pub(crate) fn mix_inj2_ok(k: usize, n: usize, nt: usize, bf16: bool) -> bool {
 // 通って hc combine の倍率になる)。演算の意味・決定性は変わらない。
 // 切り戻しは `DENNO_PF_INJ_F32_BF16=0`。
 
-/// task 617: F32 の inject 重みを BF16 に丸めて k 分割 GEMV へ回すか。
+/// task 617: F32 の inject 重みを BF16 に丸めて k 分割 GEMV へ回すか
+/// (**既定 on**。lab t617a/t617b で採否 yes。`=0` で切り戻し)。
 pub const PF_INJ_F32_BF16_ENV: &str = "DENNO_PF_INJ_F32_BF16";
 
-/// [`PF_INJ_F32_BF16_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+/// [`PF_INJ_F32_BF16_ENV`] の解釈 (純関数)。**既定 on** (t617a/t617b)。
+/// 明示的な偽値 (`0` / `off` / `false` / `no` / 空) だけが off
+/// (`DENNO_PF_MIX_INJ2` と同じ表)。
 pub(crate) fn pf_inj_f32_bf16_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim()),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v {
+        None => true,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
 }
 
 /// ゲートの実効値 (プロセスで 1 回だけ env を読む)。
@@ -30721,17 +30724,17 @@ mod mix_split_inj2_tests {
         assert!(!mix_inj2_ok(10240, 9, 512, true));
     }
 
-    /// task 617: `DENNO_PF_INJ_F32_BF16` の真理値表 (既定 off・明示的な真値だけ on)。
+    /// task 617: `DENNO_PF_INJ_F32_BF16` の真理値表 (**既定 on**、明示的な偽値だけ off)。
     #[test]
     fn pf_inj_f32_bf16_gate_truth_table() {
         assert!(
-            !pf_inj_f32_bf16_from_value(None),
-            "未設定は既定 off (値が変わるので lab で決める)"
+            pf_inj_f32_bf16_from_value(None),
+            "未設定は既定 on (lab t617a/t617b で採否 yes)"
         );
-        for v in ["0", "off", "false", "no", "", " off ", "2"] {
+        for v in ["0", "off", "false", "no", "", " off "] {
             assert!(!pf_inj_f32_bf16_from_value(Some(v)), "{v:?} が on になった");
         }
-        for v in ["1", "on", "true", "yes", " 1 "] {
+        for v in ["1", "on", "true", "yes", " 1 ", "2"] {
             assert!(pf_inj_f32_bf16_from_value(Some(v)), "{v:?} が off のまま");
         }
     }

@@ -9515,7 +9515,7 @@ fn mix_inj2_gate_defaults_on() {
 
 /// task 617: F32 の inject 重みを BF16 に丸めて k 分割 GEMV へ載せる配線。
 ///
-/// - ゲート名 (`DENNO_PF_INJ_F32_BF16`) と既定 off
+/// - ゲート名 (`DENNO_PF_INJ_F32_BF16`) と既定 on (t617a/t617b で採否 yes)
 /// - `pf_weight` の F32 腕が `pf_inj_bf16_shape` を見て `PF_INJ_BF_W` へ BF16 写しを上げる
 /// - 撃った回数 (`inj2_calls=`) を `[pf-mix-kprof]` に出す
 #[test]
@@ -9529,12 +9529,12 @@ fn pf_inj_f32_bf16_is_wired() {
         .expect("pf_inj_f32_bf16_from_value が無い");
     let body: String = CUDA_RS[i..].chars().take(300).collect();
     assert!(
-        body.contains("Some(\"1\")") && body.contains("Some(\"yes\")"),
-        "明示的な真値だけ on になっていない: {body}"
+        body.contains("None => true,"),
+        "既定が on でない (t617a/t617b で採否 yes): {body}"
     );
     assert!(
-        !body.contains("None => true"),
-        "既定が on になっている (値が変わるので既定 off)"
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が変わった: {body}"
     );
     // pf_weight の F32 腕: BF16 写しの表と形の判定。
     let w = CUDA_RS
