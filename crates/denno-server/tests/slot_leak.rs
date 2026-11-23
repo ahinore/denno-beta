@@ -393,17 +393,25 @@ async fn dropped_stream_receivers_do_not_leak_kv_slots() {
         assert_eq!(busy, 0, "busy スロットが {busy} 残っている");
     }
 
-    let resp_rx = state
-        .scheduler
-        .submit_chat(
+    // in_flight はワーカーが pull したジョブしか数えないので、上のループを抜けた
+    // 時点でも切断済みジョブが待ち行列 (長さ 8) に残っていることがある。遅い CI
+    // ではそのまま submit すると QueueFull になる (2026-11-18 の 7e9bbc6 で観測)。
+    // ループと同じく、ワーカーが待ち行列を捌くまで再試行する。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let resp_rx = loop {
+        match state.scheduler.submit_chat(
             None,
             vec![ChatMessage { role: "user".into(), content: "t0".into() }],
             GenParams { max_tokens: 4, temperature: Some(0.0), ..Default::default() },
             None,
             None,
             None,
-        )
-        .unwrap();
+        ) {
+            Ok(rx) => break rx,
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(5)).await,
+            Err(_) => panic!("submit_chat が QueueFull のまま (ワーカー停止?)"),
+        }
+    };
     let out = timeout(Duration::from_secs(30), resp_rx)
         .await
         .expect("通常ジョブが完了しない (スロット枯渇?)")
