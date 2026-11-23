@@ -8070,14 +8070,14 @@ fn pf230_gates_are_wired_and_defaults_set() {
     );
     // MIXKEEP: full 層の attn mix で D2H を飛ばし、qkv がデバイスから読む。
     assert!(
-        QWEN_SRC.contains("if Self::pf_mix_keep_layer(flat_attn, nt, self.p.layer_kind(il).ok()) {")
-            && QWEN_SRC.contains("crate::cuda::pf_mixed_keep_dev(mixed_flat.as_ptr(), nt, e);"),
+        qwen4exp_src().contains("if Self::pf_mix_keep_layer(flat_attn, nt, self.p.layer_kind(il).ok()) {")
+            && qwen4exp_src().contains("crate::cuda::pf_mixed_keep_dev(mixed_flat.as_ptr(), nt, e);"),
         "mix の D2H を飛ばす分岐が無い"
     );
     // task 317: ゲートは層種別ごと (full = MIXKEEP、ssm = MIXKEEP_SSM)。
     assert!(
-        QWEN_SRC.contains("Some(LayerKind::FullAttn) => crate::cuda::pf_mix_keep_on()")
-            && QWEN_SRC.contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
+        qwen4exp_src().contains("Some(LayerKind::FullAttn) => crate::cuda::pf_mix_keep_on()")
+            && qwen4exp_src().contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
         "MIXKEEP の層種別の切り分けが無い"
     );
     assert!(
@@ -8961,7 +8961,34 @@ fn pf_mix_stage_sync_uses_an_event() {
 // ---------------------------------------------------------------------------
 
 const MOE_V5_Q5K_SRC: &str = include_str!("../kernels/kernels_moe_v5_q5k.cu");
-const QWEN4EXP_RS: &str = include_str!("../src/model/qwen4exp.rs");
+/// task 668: `src/model/qwen4exp.rs` は `src/model/qwen4exp/` のディレクトリ
+/// モジュールへ分割された (純粋な移動)。ソース文字列を見るテストのために、
+/// ディレクトリ内の全 `*.rs` をファイル名の昇順 (決定的) で連結して返す。
+/// 分割前と 1 ファイルで見ていたのと同じ「全体」を返すので、assert は弱めない。
+fn qwen4exp_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/qwen4exp");
+        let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{} が読めない: {e}", dir.display()))
+            .map(|e| e.expect("read_dir の要素").file_name())
+            .collect();
+        names.sort();
+        let mut out = String::new();
+        for n in names {
+            let p = dir.join(&n);
+            if p.extension().map(|x| x == "rs").unwrap_or(false) {
+                out.push_str(
+                    &std::fs::read_to_string(&p)
+                        .unwrap_or_else(|e| panic!("{} が読めない: {e}", p.display())),
+                );
+                out.push('\n');
+            }
+        }
+        out
+    })
+}
+
 const MIX_DEV2_SRC: &str = include_str!("../kernels/kernels_mix_dev2.cu");
 
 /// Q5_K の v5 カーネルは v3 / v4 / v5 と同じ 8 引数 ABI で、cuda.rs が
@@ -9169,7 +9196,7 @@ fn dec_router_early_splits_begin_and_finish() {
         "into が begin -> finish に分かれていない"
     );
     // 呼び出し側: begin が SharedExpertOverlap::begin より前にある。
-    let f = fn_body(QWEN4EXP_RS, "fn moe_ffn_quant_impl(");
+    let f = fn_body(qwen4exp_src(), "fn moe_ffn_quant_impl(");
     let early = f.find("maybe_gpu_router_gemv_begin(").expect("begin の呼び出しが無い");
     let shed = f.find("SharedExpertOverlap::begin(lw, x)").expect("shared の enqueue が無い");
     assert!(early < shed, "ルータの begin が共有 expert の後ろにある");
@@ -9695,15 +9722,14 @@ fn pf_inj_f32_bf16_is_wired() {
 // task 195: PLE 注入と router のゲート (既定 off・数値はビット一致)
 // ---------------------------------------------------------------------------
 
-const QWEN_SRC: &str = include_str!("../src/model/qwen4exp.rs");
 const MOE_SRC: &str = include_str!("../src/model/moe.rs");
 
 /// `DENNO_PF_PLE_FAST` / `DENNO_PF_ROUTER_FAST` の既定は **on** (task 198 で反転)。
 #[test]
 fn pf195_gates_default_on() {
     for (src, name) in [
-        (QWEN_SRC, "fn pf_ple_fast_from_value"),
-        (QWEN_SRC, "fn pf_router_fast_from_value"),
+        (qwen4exp_src(), "fn pf_ple_fast_from_value"),
+        (qwen4exp_src(), "fn pf_router_fast_from_value"),
     ] {
         let i = src
             .find(name)
@@ -9731,7 +9757,7 @@ fn pf195_ple_fast_is_wired() {
         "if pf_ple_fast_on() {",
         "ple_inject_batch_flat(",
     ] {
-        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+        assert!(qwen4exp_src().contains(k), "qwen4exp.rs に {k} が無い");
     }
 }
 
@@ -9739,11 +9765,11 @@ fn pf195_ple_fast_is_wired() {
 #[test]
 fn pf195_router_fast_is_wired() {
     assert!(
-        QWEN_SRC.contains("select_topk_into_fast(pr, k, s)"),
+        qwen4exp_src().contains("select_topk_into_fast(pr, k, s)"),
         "router_topk_rows が挿入法を使っていない"
     );
     assert!(
-        QWEN_SRC.contains("pf_router_fast_on(),"),
+        qwen4exp_src().contains("pf_router_fast_on(),"),
         "呼び出し側がゲートを渡していない"
     );
     assert!(
@@ -9764,10 +9790,10 @@ const ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
 /// ことを固定する (ゲートを足したら発火を数える)。
 #[test]
 fn pf_attn_flat_gate_defaults_on_and_is_wired() {
-    let i = QWEN_SRC
+    let i = qwen4exp_src()
         .find("pub(crate) fn pf_attn_flat_from_value")
         .expect("pf_attn_flat_from_value が無い");
-    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    let body: String = qwen4exp_src()[i..].chars().take(260).collect();
     assert!(
         body.contains("None => true,"),
         "pf_attn_flat_from_value(None) が on でない: {body}"
@@ -9783,11 +9809,11 @@ fn pf_attn_flat_gate_defaults_on_and_is_wired() {
         "PF_ATTN_FLAT_CALLS.fetch_add",
         "PF_ATTN_ROWS_CALLS.fetch_add",
     ] {
-        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+        assert!(qwen4exp_src().contains(k), "qwen4exp.rs に {k} が無い");
     }
     // 平坦入口そのものが ssm / full の両方に実装されていること。
     assert!(
-        QWEN_SRC.contains("fn forward_batch_flat("),
+        qwen4exp_src().contains("fn forward_batch_flat("),
         "trait に forward_batch_flat が無い"
     );
     for (src, name) in [(SSM_SRC, "SsmLayer"), (ATTN_SRC, "FullAttn")] {
@@ -9802,10 +9828,10 @@ fn pf_attn_flat_gate_defaults_on_and_is_wired() {
 /// ssm 連鎖が層出力をデバイスに残し、combine が転送なしで読む配線を固定する。
 #[test]
 fn pf_attn_devres_gate_defaults_on_and_is_wired() {
-    let i = QWEN_SRC
+    let i = qwen4exp_src()
         .find("pub(crate) fn pf_attn_devres_from_value")
         .expect("pf_attn_devres_from_value が無い");
-    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    let body: String = qwen4exp_src()[i..].chars().take(260).collect();
     assert!(
         body.contains("None => true,"),
         "pf_attn_devres_from_value(None) が on でない: {body}"
@@ -9817,7 +9843,7 @@ fn pf_attn_devres_gate_defaults_on_and_is_wired() {
         "pf_combine_dev(nt, hc, e)",
         "let dev_out = flat_outs.is_empty();",
     ] {
-        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+        assert!(qwen4exp_src().contains(k), "qwen4exp.rs に {k} が無い");
     }
     // 連鎖側: 要求とゲートの両方が立ったときだけ D2H を飛ばす。
     for k in [
@@ -9894,16 +9920,16 @@ fn pf209_pin_and_mixdevin_gates_default_on_and_are_wired() {
         "let mut sh_buf = PfHostBuf::new(nt * e);",
         "crate::cuda::pf_mixed_dev_in_ptr(xs.as_ptr(), nt, e)",
     ] {
-        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+        assert!(qwen4exp_src().contains(k), "qwen4exp.rs に {k} が無い");
     }
     // 記録は resident 経路を出るときに消える (非常駐経路が拾わない)。
     assert!(
-        QWEN_SRC.contains("crate::cuda::pf_mixed_mark_clear();"),
+        qwen4exp_src().contains("crate::cuda::pf_mixed_mark_clear();"),
         "Guard の drop が記録を消していない"
     );
     // router はゲートが立っていても k == e のときだけデバイスを読む。
     assert!(
-        QWEN_SRC.contains("let dev_router_in = if lw.gate_inp.k() == e {"),
+        qwen4exp_src().contains("let dev_router_in = if lw.gate_inp.k() == e {"),
         "router の形チェックが無い"
     );
 }
@@ -10005,7 +10031,7 @@ fn task213_default_on_gate_ptx_all_exist() {
 #[test]
 fn task213_gate_envs_are_real() {
     let rows = gate_audit_rows();
-    let qwen_src = include_str!("../src/model/qwen4exp.rs");
+    let qwen_src = qwen4exp_src();
     let exp_pf_src = include_str!("../src/model/exp_pf.rs");
     let batch_src = include_str!("../src/model/expert_batch.rs");
     for (env, ptx, _) in &rows {
@@ -10192,11 +10218,11 @@ fn task225_router225_kernel_is_wired() {
     );
     // ゲートは qwen4exp の router 経路に配線されている (mask 有りはホストへ)。
     assert!(
-        QWEN4EXP_RS.contains("crate::cuda::pf_router_dev_on()"),
+        qwen4exp_src().contains("crate::cuda::pf_router_dev_on()"),
         "router のデバイス経路が qwen4exp に配線されていない"
     );
     assert!(
-        QWEN4EXP_RS.contains("&& expert_mask.is_none()"),
+        qwen4exp_src().contains("&& expert_mask.is_none()"),
         "mask 有り (介入中) でデバイス経路に入ってしまう"
     );
     assert!(
@@ -10351,7 +10377,7 @@ fn steer_ptx_matches_the_host_launch_abi() {
 /// 実際に配線されていること (値は lab の担当)。
 #[test]
 fn t242_lm_work_area_is_group_local_and_experts_come_back() {
-    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let lm = fn_body(qwen4exp_src(), "fn forward_prefill_batch_resident_lm(");
     // 1. 追い出すときに鍵を控える (控えないと戻せない)。
     assert!(
         lm.contains("crate::model::expert_vram::emergency_free_keys("),
@@ -10413,7 +10439,7 @@ fn t242_lm_work_area_is_group_local_and_experts_come_back() {
     );
     // 5. 戻す経路はラッチしない acquire_soft を使う (失敗しても decode を殺さない)。
     //    task 394: 1 本ぶんの処理は `pf_restore_one` へ切り出した (直列と並列で共有)。
-    let restore = fn_body(QWEN_SRC, "fn pf_restore_one(");
+    let restore = fn_body(qwen4exp_src(), "fn pf_restore_one(");
     assert!(
         restore.contains("expert_vram::acquire_soft("),
         "戻す経路が acquire_soft でない (確保失敗で CPU に張り付く)"
@@ -10447,7 +10473,7 @@ fn t242_lm_work_area_is_group_local_and_experts_come_back() {
 /// - 台帳 `[pf-restore]` が `DENNO_Q4_PROFILE` で出る (ゲートが効いた証拠を lab で読む)。
 #[test]
 fn t394_restore_mt_is_wired() {
-    let f = fn_body(QWEN_SRC, "fn pf_restore_experts(");
+    let f = fn_body(qwen4exp_src(), "fn pf_restore_experts(");
     for k in [
         "crate::model::exp_pf::pf_restore_mt()",
         "pf_restore_experts_mt(",
@@ -10456,7 +10482,7 @@ fn t394_restore_mt_is_wired() {
     ] {
         assert!(f.contains(k), "戻しの入口に {k} が無い");
     }
-    let mt = fn_body(QWEN_SRC, "fn pf_restore_experts_mt(");
+    let mt = fn_body(qwen4exp_src(), "fn pf_restore_experts_mt(");
     for k in [
         "crate::cuda::make_current_on_this_thread()",
         "crate::cuda::enable_thread_upload_stream()",
@@ -10467,7 +10493,7 @@ fn t394_restore_mt_is_wired() {
         assert!(mt.contains(k), "並列の戻しに {k} が無い");
     }
     // プールはプロセスで 1 個 (スレッド局所の pinned とストリームを使い回す)。
-    let pool = fn_body(QWEN_SRC, "fn pf_restore_pool(");
+    let pool = fn_body(qwen4exp_src(), "fn pf_restore_pool(");
     assert!(
         pool.contains("OnceLock<Option<rayon::ThreadPool>>"),
         "戻しのプールが 1 個に固定されていない"
@@ -10484,7 +10510,7 @@ fn t394_restore_mt_is_wired() {
         assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
     }
     // 層優先のループが「次の層」を先読みしている (attention の裏でディスクを回す)。
-    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let lm = fn_body(qwen4exp_src(), "fn forward_prefill_batch_resident_lm(");
     for k in [
         "crate::model::exp_pf::layer_pre()",
         "pf_layer_prefetch(&self.layers[0])",
@@ -10492,7 +10518,7 @@ fn t394_restore_mt_is_wired() {
     ] {
         assert!(lm.contains(k), "層優先のループに {k} が無い");
     }
-    let pf = fn_body(QWEN_SRC, "fn pf_layer_prefetch(");
+    let pf = fn_body(qwen4exp_src(), "fn pf_layer_prefetch(");
     for k in [
         "w.slice_abs(0)",
         "crate::model::exp_pf::readahead_part(",
@@ -10532,7 +10558,7 @@ fn t470_early_route_is_wired() {
         assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
     }
     // 層優先のループ: 1 チャンク目だけ、MoE 入力の確定 (park_mixed) のあと。
-    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let lm = fn_body(qwen4exp_src(), "fn forward_prefill_batch_resident_lm(");
     let park = lm
         .find("pf_lm_park_mixed(start, nt, e)")
         .expect("層優先のループに pf_lm_park_mixed が無い");
@@ -10546,7 +10572,7 @@ fn t470_early_route_is_wired() {
         "先読みの戻り値を使っている (値に触ってはいけない)"
     );
     // 本体: 実 routing → 常駐を飛ばす → RAM の置き場へ読む (task 474)。
-    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    let f = fn_body(qwen4exp_src(), "fn pf_early_route_prefetch(");
     for k in [
         "crate::cuda::pf_lm_mixed_ptr(0, nt0, e)",
         "crate::cuda::pf_router_dev_topk(",
@@ -10628,7 +10654,7 @@ fn t474_ram_readahead_cache_is_wired() {
         "区間まるごとの判定 (rc_has) が無い"
     );
     // 窓の終わりは層の MoE の直前 (先読みの呼び出しより後ろ)。
-    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let lm = fn_body(qwen4exp_src(), "fn forward_prefill_batch_resident_lm(");
     let call = lm
         .find("pf_early_route_prefetch(")
         .expect("先読みの呼び出しが無い");
@@ -10654,8 +10680,8 @@ const EXP_PF_SRC: &str = include_str!("../src/model/exp_pf.rs");
 /// 出力) になるだけで、点は動かない。
 #[test]
 fn t233_lm_steer_points_match_chunk_path() {
-    let chunk = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident(");
-    let lm = fn_body(QWEN_SRC, "fn forward_prefill_batch_resident_lm(");
+    let chunk = fn_body(qwen4exp_src(), "fn forward_prefill_batch_resident(");
+    let lm = fn_body(qwen4exp_src(), "fn forward_prefill_batch_resident_lm(");
     for (name, body) in [("chunk", chunk), ("lm", lm)] {
         let p_apply = body
             .find("crate::cuda::pf_steer_apply(")
@@ -10715,12 +10741,12 @@ fn t233_lm_steer_points_match_chunk_path() {
         "pub fn row_table_with_shared(",
     ] {
         assert!(
-            QWEN_SRC.contains(k) || cuda_rs().contains(k) || EXP_PF_SRC.contains(k),
+            qwen4exp_src().contains(k) || cuda_rs().contains(k) || EXP_PF_SRC.contains(k),
             "どこにも {k} が無い"
         );
     }
     assert!(
-        !QWEN_SRC.contains("pf_lm_mixed_ptr(tok0, nt_all, e)"),
+        !qwen4exp_src().contains("pf_lm_mixed_ptr(tok0, nt_all, e)"),
         "タイル 2 枚目で dev MoE が落ちる形 (task 318 で直した)"
     );
 }
@@ -11412,11 +11438,11 @@ fn task317_ssm_mix_keep_is_wired() {
     );
     // 判定は層種別ごと (full = MIXKEEP、ssm = MIXKEEP_SSM)。
     assert!(
-        QWEN4EXP_RS.contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
+        qwen4exp_src().contains("crate::cuda::pf_mix_keep_ssm_on() && pf_gdn_chain_on()"),
         "ssm 層の keep 判定が無い (連鎖が off の環境で D2H を飛ばすと無駄)"
     );
     // 層優先の経路も keep を通る (D2H 固定のままなら発火しない)。
-    let lm = QWEN4EXP_RS
+    let lm = qwen4exp_src()
         .split("fn forward_prefill_batch_resident_lm(")
         .nth(1)
         .expect("forward_prefill_batch_resident_lm が無い");
@@ -11698,13 +11724,13 @@ fn t333_stream_decline_names_the_gate() {
         "試行の入口で理由を 0 に戻していない"
     );
     // 層優先 dev MoE の 1 行に内訳が乗る。
-    assert!(QWEN_SRC.contains("fn lm_decline_detail()"), "内訳が無い");
+    assert!(qwen4exp_src().contains("fn lm_decline_detail()"), "内訳が無い");
     assert!(
-        QWEN_SRC.contains("let why = crate::cuda::pf_stream_why();"),
+        qwen4exp_src().contains("let why = crate::cuda::pf_stream_why();"),
         "cuda 側の理由を読んでいない"
     );
     assert!(
-        QWEN_SRC.contains("\"[pf-lm] 層 {il}: dev MoE を諦めた (理由: {}{}) → CPU (タイル {} 単位)\""),
+        qwen4exp_src().contains("\"[pf-lm] 層 {il}: dev MoE を諦めた (理由: {}{}) → CPU (タイル {} 単位)\""),
         "[pf-lm] の 1 行に内訳が入っていない"
     );
 }
@@ -11748,11 +11774,11 @@ fn t333_stream_retry_swaps_only_the_transfer_owner() {
         "serial が ut の判定に入っていない"
     );
     assert!(
-        QWEN_SRC.contains("r = run(&mut tgt, true);"),
+        qwen4exp_src().contains("r = run(&mut tgt, true);"),
         "直列の再試行が無い"
     );
     assert!(
-        QWEN_SRC.contains("crate::model::exp_pf::stream_retry_pays(why)"),
+        qwen4exp_src().contains("crate::model::exp_pf::stream_retry_pays(why)"),
         "再試行の可否をゲートに繋いでいない"
     );
     // 発火の台帳 (lab の [exp-pf-stream] に retry= が出る)。
@@ -11868,29 +11894,29 @@ fn t349_ple_pipe_is_wired_and_does_not_double_read() {
     );
     // 生産スレッドはチャンク順に全部を流し、sync_channel で 1 個ずつ渡す。
     assert!(
-        QWEN_SRC.contains("crate::model::exp_pf::ple_pipe()"),
+        qwen4exp_src().contains("crate::model::exp_pf::ple_pipe()"),
         "qwen4exp からゲートを読んでいない"
     );
     assert!(
-        QWEN_SRC.contains("std::sync::mpsc::sync_channel::<Result<Vec<Option<Vec<f32>>>>>(2)"),
+        qwen4exp_src().contains("std::sync::mpsc::sync_channel::<Result<Vec<Option<Vec<f32>>>>>(2)"),
         "生産と消費の口が無い"
     );
     assert!(
-        QWEN_SRC.contains("let mut s = 0usize;"),
+        qwen4exp_src().contains("let mut s = 0usize;"),
         "生産スレッドが先頭から流していない"
     );
     assert!(
-        QWEN_SRC.contains("rx.recv()"),
+        qwen4exp_src().contains("rx.recv()"),
         "消費者が受け取っていない"
     );
     // 二重読みしない: パイプが居るときは 1 チャンク先読みを起こさない。
     assert!(
-        QWEN_SRC.contains("if ple_pre && ple_pipe_rx.is_none() && end < ctx.len() {"),
+        qwen4exp_src().contains("if ple_pre && ple_pipe_rx.is_none() && end < ctx.len() {"),
         "1 チャンク先読みとパイプが同時に走る"
     );
     // 値は変えない: 同じ gather 関数を通る。
     assert!(
-        QWEN_SRC.contains("gather_ple_many_rt(rt.as_deref(), &c[..e], s)"),
+        qwen4exp_src().contains("gather_ple_many_rt(rt.as_deref(), &c[..e], s)"),
         "パイプが gather 本体を通っていない"
     );
 }
@@ -11916,15 +11942,15 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
     );
     // 層優先の先頭 gather が専用プールで回る (task 415 で埋め込みも N 本になった)。
     assert!(
-        QWEN_SRC.contains("let ple_wide = ple_batch && crate::model::exp_pf::ple_pipe();"),
+        qwen4exp_src().contains("let ple_wide = ple_batch && crate::model::exp_pf::ple_pipe();"),
         "LM 経路がゲートを見ていない"
     );
     assert!(
-        QWEN_SRC.contains("let ple_threads = crate::model::exp_pf::ple_threads().max(1);"),
+        qwen4exp_src().contains("let ple_threads = crate::model::exp_pf::ple_threads().max(1);"),
         "専用プールの本数が env から来ていない"
     );
     assert!(
-        QWEN_SRC.contains("Ok(p) => p.install(run)?,"),
+        qwen4exp_src().contains("Ok(p) => p.install(run)?,"),
         "専用プールで gather を回していない"
     );
     // task 415: `DENNO_PF_EMBED_OVL` では同じ gather を背景スレッドで回し、
@@ -11932,26 +11958,26 @@ fn t349_ple_pipe_widens_the_lm_gather_pool() {
     // task 423: 受け渡しはチャネル (チャンクごと)。off のときは層ループの前に
     // 全部受け、`DENNO_PF_PLE_LJOIN` では層ループの PLE 層で 1 チャンクずつ受ける。
     assert!(
-        QWEN_SRC.contains("let (tx, rx) = std::sync::mpsc::channel::<PleChunk>();")
-            && QWEN_SRC.contains("if tx.send(r).is_err() || bad {"),
+        qwen4exp_src().contains("let (tx, rx) = std::sync::mpsc::channel::<PleChunk>();")
+            && qwen4exp_src().contains("if tx.send(r).is_err() || bad {"),
         "背景の gather がチャンクを送っていない"
     );
     assert!(
-        QWEN_SRC.contains("if ple_wide && !ljoin {")
-            && QWEN_SRC.contains("rx.recv().map_err(|_| one(\"PLE の先読みスレッドが落ちた\"))??"),
+        qwen4exp_src().contains("if ple_wide && !ljoin {")
+            && qwen4exp_src().contains("rx.recv().map_err(|_| one(\"PLE の先読みスレッドが落ちた\"))??"),
         "LJOIN off のときに層ループの前で受けていない"
     );
     assert!(
-        QWEN_SRC.contains("let ljoin = ple_ovl && crate::model::exp_pf::ple_ljoin();"),
+        qwen4exp_src().contains("let ljoin = ple_ovl && crate::model::exp_pf::ple_ljoin();"),
         "LJOIN のゲートが配線されていない"
     );
     assert!(
-        QWEN_SRC.contains("ples_all.push(chunk_rows);"),
+        qwen4exp_src().contains("ples_all.push(chunk_rows);"),
         "LJOIN on のときに PLE 層でチャンクを受けていない"
     );
     // 値は変えない: 同じ gather 本体を通る。
     assert!(
-        QWEN_SRC.contains("out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);"),
+        qwen4exp_src().contains("out.push(gather_ple_many_rt(rt.as_deref(), &ctx[..end], start)?);"),
         "LM の wide 経路が gather 本体を通っていない"
     );
 }
@@ -11976,11 +12002,11 @@ fn t357_ple_threads_gate_is_wired_to_the_pool() {
     assert_eq!(ple_threads_from_value(Some("4096")), 128, "上限 128");
     // プールの生成に env の本数が渡る (定数で固定されていない)。
     assert!(
-        QWEN_SRC.contains(".num_threads(ple_threads)"),
+        qwen4exp_src().contains(".num_threads(ple_threads)"),
         "プールの本数が env を見ていない"
     );
     assert!(
-        !QWEN_SRC.contains("const PLE_PIPE_THREADS: usize = 32;"),
+        !qwen4exp_src().contains("const PLE_PIPE_THREADS: usize = 32;"),
         "32 本固定が残っている"
     );
 }
@@ -12167,7 +12193,7 @@ fn task379_gdn_wb_last_skip_wraps_the_writeback() {
 /// 層優先 prefill が attn の直前に「最終チャンクか」を立て、直後に戻す。
 #[test]
 fn task379_gdn_last_chunk_flag_is_set_in_the_layer_major_loop() {
-    let lm = QWEN_SRC
+    let lm = qwen4exp_src()
         .split("fn forward_prefill_batch_resident_lm(")
         .nth(1)
         .expect("層優先 prefill が無い");
@@ -12302,17 +12328,17 @@ fn task393_kv_bulk_is_wired_through_push_many() {
 #[test]
 fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
     assert_eq!(
-        QWEN_SRC
+        qwen4exp_src()
             .matches("pub const PLE_PIN_ENV: &str = \"DENNO_PF_PLE_PIN\";")
             .count(),
         1,
         "env 名の宣言が 1 箇所でない"
     );
     assert!(
-        QWEN_SRC.contains("pub const DEFAULT_PLE_PIN: bool = true;"),
+        qwen4exp_src().contains("pub const DEFAULT_PLE_PIN: bool = true;"),
         "既定が on でない (lab t393a/t393b で採った)"
     );
-    let f = QWEN_SRC
+    let f = qwen4exp_src()
         .split("pub(crate) fn pf_ple_pin_from_value(")
         .nth(1)
         .expect("解釈が無い");
@@ -12326,7 +12352,7 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
         "未設定・空が既定へ落ちていない"
     );
     // 取る側: ゲート on なら pinned の 1 本を使い回す (長さは要求どおり)。
-    let take = QWEN_SRC
+    let take = qwen4exp_src()
         .split("fn pf_ple_back_take_with(")
         .nth(1)
         .expect("take が無い");
@@ -12335,7 +12361,7 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
             .contains("pf_ple_back_take_pin(len, reuse, pf_ple_pin_on())"),
         "take がゲートを見ていない"
     );
-    let pin = QWEN_SRC
+    let pin = qwen4exp_src()
         .split("fn pf_ple_back_take_pin(")
         .nth(1)
         .expect("pinned の枝が無い");
@@ -12346,7 +12372,7 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
         "pinned の確保が無い"
     );
     assert!(
-        QWEN_SRC.contains("type PlePinBuf = crate::cuda::PfHostBuf;"),
+        qwen4exp_src().contains("type PlePinBuf = crate::cuda::PfHostBuf;"),
         "pinned の実体が PfHostBuf でない"
     );
     assert!(
@@ -12354,7 +12380,7 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
         "grow-only の使い回しでない"
     );
     // 返す側: pinned は pinned の置き場へ、Vec は Vec の置き場へ。
-    let ret = QWEN_SRC
+    let ret = qwen4exp_src()
         .split("fn pf_ple_back_return(")
         .nth(1)
         .expect("return が無い");
@@ -12369,11 +12395,11 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
     );
     // 呼び出し側は今までどおりスライスとして使う (Deref/DerefMut)。
     assert!(
-        QWEN_SRC.contains("impl std::ops::DerefMut for PleBack {"),
+        qwen4exp_src().contains("impl std::ops::DerefMut for PleBack {"),
         "DerefMut が無い (呼び出し側が &mut [f32] を受ける前提が壊れる)"
     );
     // 往復の 2 本のコピーは今までどおり `pf_download_res` / `pf_upload_res`。
-    let uses = QWEN_SRC.matches("crate::cuda::pf_download_res(&mut back)").count();
+    let uses = qwen4exp_src().matches("crate::cuda::pf_download_res(&mut back)").count();
     assert_eq!(
         uses, 2,
         "PLE 層の res D2H が 2 箇所 (層優先 / チャンク優先) に無い"
@@ -12835,7 +12861,7 @@ fn task415_embed_par_and_overlap_are_wired() {
     );
     // 2. 層優先の prefill が (a) ゲートを読み、(b) 並列の引き口を呼び、
     //    (c) 背景の gather を join し、(d) 直列の従来経路も残していること。
-    let f = fn_body(QWEN4EXP_RS, "fn forward_prefill_batch_resident_lm(");
+    let f = fn_body(qwen4exp_src(), "fn forward_prefill_batch_resident_lm(");
     assert!(
         f.contains("crate::model::exp_pf::embed_par()"),
         "埋め込みの本数を読んでいない"
@@ -13092,8 +13118,8 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
     // 発火の証拠 (`[mix-qchain]` の `dn8=`) と計数の reset。
     assert!(cuda_rs().contains("pub fn mix_dn8_hits() -> u64 {"));
     assert!(cuda_rs().contains("pub fn mix_dn8_reset() {"));
-    assert!(QWEN4EXP_RS.contains("dn8={dn8}"), "[mix-qchain] に dn8= が無い");
-    assert!(QWEN4EXP_RS.contains("crate::cuda::mix_dn8_reset();"));
+    assert!(qwen4exp_src().contains("dn8={dn8}"), "[mix-qchain] に dn8= が無い");
+    assert!(qwen4exp_src().contains("crate::cuda::mix_dn8_reset();"));
     // build_ptx.sh: target と targets_all の末尾。
     assert!(
         BUILD_PTX_SH.contains("mix_dn8)      echo \"kernels_mix_dn8.cu|nofmad\" ;;"),
@@ -13194,7 +13220,7 @@ fn task427_dn6_reused_for_full_and_head_is_wired() {
     );
     // 発火の証拠: `[mix-qchain]` の f6 / h6。
     assert!(
-        QWEN4EXP_RS.contains("f6={f6} h6={h6}"),
+        qwen4exp_src().contains("f6={f6} h6={h6}"),
         "`[mix-qchain]` に f6/h6 が無い"
     );
 }
@@ -13240,7 +13266,7 @@ fn task504_dn7_reused_for_out_head_and_gate_audit() {
     );
     // 発火の証拠: `[mix-qchain]` の f7 / o7 / h7。
     for s in ["f7={f7}", "o7={o7}", "h7={h7}"] {
-        assert!(QWEN4EXP_RS.contains(s), "`[mix-qchain]` に {s} が無い");
+        assert!(qwen4exp_src().contains(s), "`[mix-qchain]` に {s} が無い");
     }
     // 既定 on の PTX 台帳 (gate_audit) に dn7 の行がある。
     assert!(
@@ -13277,7 +13303,7 @@ fn task419_iq_min_rows_is_wired_into_the_stream_split() {
     assert!(v.contains("s.parse().unwrap_or(DEFAULT_IQ_MIN_ROWS)"), "解析の失敗先が既定でない");
     // 2. ストリーム経路: IQ モードのとき IQ の床を読み、床未満を CPU の列へ回す。
     //    K 系の床と CPU の flat 経路はそのまま残っていること。
-    let f = fn_body(QWEN4EXP_RS, "fn moe_experts_iq_pf_batch(");
+    let f = fn_body(qwen4exp_src(), "fn moe_experts_iq_pf_batch(");
     assert!(f.contains("let iq_mode = iq_expert_mode(lw);"), "IQ 判定が無い");
     assert!(
         f.contains("crate::model::exp_pf::iq_min_rows()"),
@@ -13366,7 +13392,7 @@ fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
     );
     // 発火の証拠は既定 on の診断行に出す。
     assert!(
-        QWEN4EXP_RS.contains("h2s={h2s}"),
+        qwen4exp_src().contains("h2s={h2s}"),
         "`[mix-qchain]` に h2s が無い"
     );
 }
@@ -13425,7 +13451,7 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
         f.contains("MIX_DN7_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)"),
         "発火の計数が無い"
     );
-    assert!(QWEN4EXP_RS.contains("dn7={dn7}"), "`[mix-qchain]` に dn7 が無い");
+    assert!(qwen4exp_src().contains("dn7={dn7}"), "`[mix-qchain]` に dn7 が無い");
     // PTX が入っていれば entry と引数の数を検査する (無い間はスキップ)。
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/kernels_mix_dn7.ptx");
@@ -14117,8 +14143,7 @@ fn task457_pf_elem_off_path_keeps_old_kernels() {
 #[test]
 fn task464_mix_nowait_wiring() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let host = std::fs::read_to_string(root.join("src/model/qwen4exp.rs"))
-        .expect("qwen4exp.rs が読めない");
+    let host = qwen4exp_src();
     let ssm = std::fs::read_to_string(root.join("src/model/qwen4exp_ssm.rs"))
         .expect("qwen4exp_ssm.rs が読めない");
 
@@ -14225,8 +14250,7 @@ fn task464_mix_nowait_wiring() {
 #[test]
 fn task468_full_mix_nowait_wiring() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let host = std::fs::read_to_string(root.join("src/model/qwen4exp.rs"))
-        .expect("qwen4exp.rs が読めない");
+    let host = qwen4exp_src();
     let attn = std::fs::read_to_string(root.join("src/model/qwen4exp_attn.rs"))
         .expect("qwen4exp_attn.rs が読めない");
     let ssm = std::fs::read_to_string(root.join("src/model/qwen4exp_ssm.rs"))
@@ -14371,7 +14395,7 @@ fn t482_early_route_window_exit_is_wired() {
     assert!(denno_engine::model::exp_pf::early_route_window_ok(2002, 14018));
 
     // 本体: 早期終了が router / VRAM 参照 / 置き場の計画より前にある。
-    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    let f = fn_body(qwen4exp_src(), "fn pf_early_route_prefetch(");
     let exit = f
         .find("exp_pf::er_early_exit_on()")
         .expect("早期終了のゲートが無い");
@@ -14478,7 +14502,7 @@ fn t486_early_route_small_window_is_wired() {
     assert!(!ok(false, true, 1913, 3826, 40 * GB, 2_100_000_000)); // page cache
 
     // 本体: 門の判定が router / VRAM 参照 / 置き場の計画より前にある。
-    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    let f = fn_body(qwen4exp_src(), "fn pf_early_route_prefetch(");
     let small = f.find("exp_pf::er_small_pass(").expect("門が無い");
     for later in [
         "pf_router_dev_topk(",
@@ -14602,7 +14626,7 @@ fn t490_wide_window_budget_is_wired() {
     assert_eq!(early_route_budget(0, 24, 1_913), 47_013_888);
 
     // 配線: `wide` を見て選び、その値を予算へ渡す。
-    let f = fn_body(QWEN_SRC, "fn pf_early_route_prefetch(");
+    let f = fn_body(qwen4exp_src(), "fn pf_early_route_prefetch(");
     let pick = f.find("exp_pf::er_route_kb(").expect("予算の選択が無い");
     assert!(f[pick..].contains("wide,"), "er_route_kb に wide を渡していない");
     let bud = f.find("exp_pf::early_route_budget(").expect("予算の計算が無い");
@@ -14654,7 +14678,7 @@ fn t514_host_page_cache_instruments_and_end_drop_are_wired() {
     );
     // モデルの全パートの mmap を覚える (file_resident 用)。
     assert!(
-        QWEN_SRC.contains("expert_ram::install_part_map(pmap)"),
+        qwen4exp_src().contains("expert_ram::install_part_map(pmap)"),
         "qwen4exp が part map を入れていない"
     );
     // リクエスト終端 (統計を出す関数) から呼ぶ。先頭の診断 drop とは別物。
@@ -14957,7 +14981,7 @@ fn t565_res_pin_and_restore_nosync_are_wired() {
     let flush = fn_body(cuda_rs(), "pub fn restore_defer_flush_thread(");
     assert!(flush.contains("event_sync"), "終端でイベントを待っていない");
 
-    let rest = fn_body(QWEN_SRC, "fn pf_restore_experts(");
+    let rest = fn_body(qwen4exp_src(), "fn pf_restore_experts(");
     for k in [
         "crate::model::exp_pf::pf_restore_nosync()",
         "crate::cuda::restore_defer_begin()",
@@ -14965,12 +14989,12 @@ fn t565_res_pin_and_restore_nosync_are_wired() {
     ] {
         assert!(rest.contains(k), "戻しの入口に {k} が無い");
     }
-    let mt = fn_body(QWEN_SRC, "fn pf_restore_experts_mt(");
+    let mt = fn_body(qwen4exp_src(), "fn pf_restore_experts_mt(");
     assert!(
         mt.contains("restore_defer_flush_thread"),
         "並列の戻しがスレッドごとにリングを待っていない"
     );
-    let seq = fn_body(QWEN_SRC, "fn pf_restore_experts_seq(");
+    let seq = fn_body(qwen4exp_src(), "fn pf_restore_experts_seq(");
     assert!(
         seq.contains("restore_defer_flush_thread"),
         "直列の戻しがリングを待っていない"
