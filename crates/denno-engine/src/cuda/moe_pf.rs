@@ -360,6 +360,74 @@ pub(crate) fn moe_batch_kernels() -> Option<&'static MoeBatchKernels> {
 }
 
 
+thread_local! {
+    /// task 594: seg prologue の H2D 用の pinned バウンス (grow-only)。
+    ///
+    /// 同じスレッドが 1 本を使い回す。DMA を出したあと次にこのバッファへ書くのは
+    /// 「和カーネルの後のイベントを待つ」より後なので、前の DMA は完了している
+    /// (同じ null ストリームに積んでいるため順序も保証される)。
+    static SEG_H2D_PIN: std::cell::RefCell<Option<PinMem>> = const { std::cell::RefCell::new(None) };
+}
+
+/// task 594: seg prologue を pinned へ組んで同じストリームへ非同期 DMA する。
+///
+/// `Ok(true)` = 送った (カーネルは同じストリームに積むので順序は保証される)。
+/// `Ok(false)` / `Err` = ゲート off / 確保失敗 / 非同期コピー不可。
+/// 送るバイト列は pageable 経路 (`put_*` + `copy_from`) と 1 バイトも変わらない。
+#[allow(clippy::too_many_arguments)]
+fn seg_prologue_pinned(
+    stage_ptr: u64,
+    lay: &crate::model::expert_batch::SegStage,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    w: &[f32],
+    x: &[f32],
+    n_in: usize,
+    nseg: usize,
+) -> Result<bool> {
+    if !crate::model::seg_prof::seg_h2d_pin_on() {
+        return Ok(false);
+    }
+    let bytes = lay.total;
+    if bytes == 0 {
+        return Ok(true);
+    }
+    SEG_H2D_PIN.with(|cell| -> Result<bool> {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().map(|p| p.bytes).unwrap_or(0) < bytes {
+            match PinMem::alloc(bytes) {
+                Ok(p) => *slot = Some(p),
+                Err(_) => return Ok(false),
+            }
+        }
+        let pin = slot.as_mut().expect("確保済み");
+        let h = &mut pin.as_mut_slice::<u8>()[..bytes];
+        put_u64s(&mut h[lay.pg..lay.pg + nseg * 8], pg);
+        put_u64s(&mut h[lay.pu..lay.pu + nseg * 8], pu);
+        put_u64s(&mut h[lay.pd..lay.pd + nseg * 8], pd);
+        put_u32s(&mut h[lay.sgu..lay.sgu + nseg * 16], seg_gu);
+        put_u32s(&mut h[lay.sgd..lay.sgd + nseg * 16], seg_d);
+        put_f32s(&mut h[lay.wt..lay.wt + nseg * 4], w);
+        put_f32s(&mut h[lay.x..lay.x + n_in * 4], &x[..n_in]);
+        let src = pin.ptr as *const c_void;
+        let dst = stage_ptr as CUdeviceptr;
+        let ok = unsafe {
+            check(
+                (lib()?.memcpy_htod_async)(dst, src, bytes, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (seg prologue)",
+            )
+            .is_ok()
+        };
+        if ok {
+            dbg_htod(bytes);
+        }
+        Ok(ok)
+    })
+}
+
 /// K 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層を **5 起動 / 1 待ち**で回す (task 278)。
 ///
 /// - `pg` / `pu` / `pd`: segment ごとの重み先頭 (デバイスアドレス)
@@ -545,16 +613,35 @@ where
 
         // 1. prologue を 1 本に詰めて **1 回の H2D** で送る。
         let _t_tbl = crate::model::seg_prof::stamp();
-        if sc.host.len() < lay.total {
-            sc.host.resize(lay.total, 0);
+        // task 594: `DENNO_SEG_H2D_PIN` のときは pinned へ直接組んで同じ
+        // (null) ストリームへ非同期 DMA する。pageable の同期 `cuMemcpyHtoD`
+        // は 10.8 KB で 8 us/層、ホストのミス計算の前に直列に挟まっていた。
+        // 送るバイト列は従来経路と同一 (同じ `put_*` を pinned に対して回す)。
+        let mut pin_sent = false;
+        if crate::model::seg_prof::seg_h2d_pin_on() {
+            let stage_ptr = sc.stage.as_ref().expect("確保済み").ptr;
+            match seg_prologue_pinned(
+                stage_ptr, &lay, pg, pu, pd, seg_gu, seg_d, w, x, n_in, nseg,
+            ) {
+                Ok(true) => {
+                    crate::model::seg_prof::note_seg_h2d_call();
+                    pin_sent = true;
+                }
+                _ => crate::model::seg_prof::note_seg_h2d_fallback(),
+            }
         }
-        put_u64s(&mut sc.host[lay.pg..lay.pg + nseg * 8], pg);
-        put_u64s(&mut sc.host[lay.pu..lay.pu + nseg * 8], pu);
-        put_u64s(&mut sc.host[lay.pd..lay.pd + nseg * 8], pd);
-        put_u32s(&mut sc.host[lay.sgu..lay.sgu + nseg * 16], seg_gu);
-        put_u32s(&mut sc.host[lay.sgd..lay.sgd + nseg * 16], seg_d);
-        put_f32s(&mut sc.host[lay.wt..lay.wt + nseg * 4], w);
-        put_f32s(&mut sc.host[lay.x..lay.x + n_in * 4], &x[..n_in]);
+        if !pin_sent {
+            if sc.host.len() < lay.total {
+                sc.host.resize(lay.total, 0);
+            }
+            put_u64s(&mut sc.host[lay.pg..lay.pg + nseg * 8], pg);
+            put_u64s(&mut sc.host[lay.pu..lay.pu + nseg * 8], pu);
+            put_u64s(&mut sc.host[lay.pd..lay.pd + nseg * 8], pd);
+            put_u32s(&mut sc.host[lay.sgu..lay.sgu + nseg * 16], seg_gu);
+            put_u32s(&mut sc.host[lay.sgd..lay.sgd + nseg * 16], seg_d);
+            put_f32s(&mut sc.host[lay.wt..lay.wt + nseg * 4], w);
+            put_f32s(&mut sc.host[lay.x..lay.x + n_in * 4], &x[..n_in]);
+        }
         crate::model::seg_prof::add(crate::model::seg_prof::PH_TABLE, _t_tbl);
 
         let stage = sc.stage.as_ref().expect("確保済み");
@@ -564,8 +651,10 @@ where
         let h = sc.h.as_ref().expect("確保済み");
         let outb = sc.out.as_ref().expect("確保済み");
         let _t_h2d = crate::model::seg_prof::stamp();
-        stage.copy_from(&sc.host[..lay.total])?;
-        dbg_htod(lay.total);
+        if !pin_sent {
+            stage.copy_from(&sc.host[..lay.total])?;
+            dbg_htod(lay.total);
+        }
         crate::model::seg_prof::add(crate::model::seg_prof::PH_H2D, _t_h2d);
 
         // 2. 5 起動を同じストリームに積む (待たない)。
