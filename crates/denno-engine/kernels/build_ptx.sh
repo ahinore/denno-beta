@@ -237,6 +237,13 @@ spec() {
         # task 437: mix up (silu + up + hc_mixed) の 1 対 = 4 レーン版。
         # 4 レーンの逐次加算で丸め順が変わるので nofmad。
         mix_up4)      echo "kernels_mix_up4.cu|nofmad" ;;
+        # task 640: step 2 (f16 -> f32) の速度 A/B 用。同じ .cu を旧実装
+        # (-DDNO_F16_LEGACY=1) で作り、ホストの `DENNO_*_PTX` で差し替えて測る。
+        # `all` と `--list` には出さない (targets_all の末尾を検査する
+        # kernel_invariants の配線テストがあるため。名前を直接指定して作る)。
+        exp_iq_v3_legacy) echo "kernels_exp_iq_v3.cu|nofmad_legacy" ;;
+        mix_dn7_legacy)   echo "kernels_mix_dn7.cu|nofmad_legacy" ;;
+        mix_up4_legacy)   echo "kernels_mix_up4.cu|nofmad_legacy" ;;
         # task 225: prefill の ssm beta/alpha 射影 (F32 重み 2,560 x 48) を
         # 48 行 x 64 トークンのタイルで回す GEMM。出力 1 要素 1 アキュムレータ・
         # k 昇順の明示 __fmaf_rn なので -fmad=false (演算列を読めるようにする)。
@@ -290,6 +297,8 @@ compile() {
     [ -f "$src" ] || { echo "missing source: $src" >&2; exit 2; }
     case "$mode" in
         nofmad) set -- -ptx -arch="$arch" -fmad=false -O3 "$src" -o "kernels_$name.ptx" ;;
+        # task 640: f16 -> f32 の旧実装 (手書きのビット展開) で作る A/B 用。
+        nofmad_legacy) set -- -ptx -arch="$arch" -fmad=false -O3 -DDNO_F16_LEGACY=1 "$src" -o "kernels_$name.ptx" ;;
         fmad)   set -- -ptx -arch="$arch" -O3 "$src" -o "kernels_$name.ptx" ;;
     esac
     echo "+ nvcc $*"

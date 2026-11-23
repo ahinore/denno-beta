@@ -36,11 +36,15 @@
 // まとめて作るなら `kernels/build_ptx.sh mix_up4`。
 
 #include <cstdint>
+#include <cuda_fp16.h>
 
 // ---- Q8_0 / f16 の読み方 (kernels_mix_dn7.cu と同じ実装) -------------------
 
 __device__ __forceinline__ float dno_up4_f16_bits(unsigned int h)
 {
+#ifdef DNO_F16_LEGACY
+    // task 640: A/B 測定用の旧実装 (build_ptx.sh の `<name>_legacy` target だけが
+    // -DDNO_F16_LEGACY=1 で作る。通常のビルドでは使われない)。
     const unsigned int sign = (h & 0x8000u) << 16;
     const unsigned int exp = (h >> 10) & 0x1fu;
     const unsigned int man = h & 0x3ffu;
@@ -61,6 +65,18 @@ __device__ __forceinline__ float dno_up4_f16_bits(unsigned int h)
         bits = sign | ((exp + 112u) << 23) | (man << 13);
     }
     return __int_as_float(bits);
+#else
+    // task 640: 手書きのビット展開をハードウェアの cvt.f32.f16 (`__half2float`) に
+    // 置き換えた。f16 -> f32 の拡張は IEEE 754 で一意なので結果は同じ (0 / 非正規化数
+    // を含む全 65536 パターンで旧実装と一致することを cuda.rs の
+    // f16_cvt_exhaustive で確認済み)。NaN と inf だけは旧実装の式をそのまま残す
+    // (ハードウェアは NaN を quiet 化するので、ペイロードの再現性のため)。
+    if ((h & 0x7c00u) == 0x7c00u) {
+        const unsigned int sign = (h & 0x8000u) << 16;
+        return __int_as_float(sign | 0x7f800000u | ((h & 0x3ffu) << 13));
+    }
+    return __half2float(__ushort_as_half((unsigned short)h));
+#endif
 }
 
 // このレーンの 16 要素 (u16 x 8 = 16 バイト) と x の 16 要素の内積。

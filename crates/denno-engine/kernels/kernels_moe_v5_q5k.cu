@@ -28,30 +28,21 @@
 //
 // ブロックレイアウトは ggml 仕様 (llama.cpp, MIT) に従う。ライセンス台帳は
 // `docs/history/80_licenses.md`。
+#include <cuda_fp16.h>
 
 // ---- f16 → f32 (kernels_moe_v5.cu の dno_v5_f16_bits と同じ実装) -----------
 __device__ __forceinline__ float dno_v5q_f16_bits(unsigned int h)
 {
-    const unsigned int sign = (h & 0x8000u) << 16;
-    const unsigned int exp = (h >> 10) & 0x1fu;
-    const unsigned int man = h & 0x3ffu;
-    unsigned int bits;
-    if (exp == 0) {
-        if (man == 0) {
-            bits = sign;
-        } else {
-            int e = -14;
-            unsigned int m = man;
-            while ((m & 0x400u) == 0) { m <<= 1; --e; }
-            m &= 0x3ffu;
-            bits = sign | ((unsigned int)(e + 127) << 23) | (m << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (man << 13);
-    } else {
-        bits = sign | ((exp + 112u) << 23) | (man << 13);
+    // task 640: 手書きのビット展開をハードウェアの cvt.f32.f16 (`__half2float`) に
+    // 置き換えた。f16 -> f32 の拡張は IEEE 754 で一意なので結果は同じ (0 / 非正規化数
+    // を含む全 65536 パターンで旧実装と一致することを cuda.rs の
+    // f16_cvt_exhaustive で確認済み)。NaN と inf だけは旧実装の式をそのまま残す
+    // (ハードウェアは NaN を quiet 化するので、ペイロードの再現性のため)。
+    if ((h & 0x7c00u) == 0x7c00u) {
+        const unsigned int sign = (h & 0x8000u) << 16;
+        return __int_as_float(sign | 0x7f800000u | ((h & 0x3ffu) << 13));
     }
-    return __int_as_float(bits);
+    return __half2float(__ushort_as_half((unsigned short)h));
 }
 
 // x[n]..x[n+31] をレジスタへ先読み (kernels_moe_v5.cu と同じ形)。

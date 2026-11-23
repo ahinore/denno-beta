@@ -13,6 +13,7 @@
 //     matching `iter().map(|v| v*v).sum::<f32>()`.
 
 #include <cstdint>
+#include <cuda_fp16.h>
 
 #define N_TABLE 32  // EXP2F_TABLE_BITS = 5
 
@@ -220,6 +221,60 @@ extern "C" __global__ void dno_expf_probe(
     const float *in, float *out, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) out[i] = dno_expf(in[i]);
+}
+
+// ---------------------------------------------------------------------------
+// task 640: f16 -> f32 の全 65536 パターンで「手書きのビット展開 (旧)」と
+// 「ハードウェアの cvt.f32.f16 (新)」が 1 ビットも違わないことを確かめる probe。
+//
+// dno_f16cvt_old は task 640 以前に各カーネルが持っていた dno_v5_f16_bits と
+// 同一の式。dno_f16cvt_new は各カーネルに入れた新しい式 (NaN / inf だけ旧式を
+// 残し、それ以外は __half2float)。
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float dno_f16cvt_old(unsigned int h)
+{
+    const unsigned int sign = (h & 0x8000u) << 16;
+    const unsigned int exp = (h >> 10) & 0x1fu;
+    const unsigned int man = h & 0x3ffu;
+    unsigned int bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;
+        } else {
+            int e = -14;
+            unsigned int m = man;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3ffu;
+            bits = sign | ((unsigned int)(e + 127) << 23) | (m << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (man << 13);
+    }
+    return __int_as_float(bits);
+}
+
+__device__ __forceinline__ float dno_f16cvt_new(unsigned int h)
+{
+    if ((h & 0x7c00u) == 0x7c00u) {
+        const unsigned int sign = (h & 0x8000u) << 16;
+        return __int_as_float(sign | 0x7f800000u | ((h & 0x3ffu) << 13));
+    }
+    return __half2float(__ushort_as_half((unsigned short)h));
+}
+
+/// cnt = 不一致の件数 / first = 最初の不一致パターン (無ければ 0xffffffff のまま)
+extern "C" __global__ void dno_f16cvt_probe(unsigned int *cnt, unsigned int *first)
+{
+    const unsigned int stride = (unsigned int)blockDim.x * (unsigned int)gridDim.x;
+    for (unsigned int h = (unsigned int)(blockIdx.x * blockDim.x + threadIdx.x);
+         h < 65536u; h += stride) {
+        if (__float_as_uint(dno_f16cvt_old(h)) != __float_as_uint(dno_f16cvt_new(h))) {
+            atomicAdd(cnt, 1u);
+            atomicMin(first, h);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -4540,6 +4540,10 @@ pub struct CudaCtx {
     f_addnorm: CUfunction,
     #[allow(dead_code)]
     f_expf: CUfunction,
+    /// task 640: f16 -> f32 の全 65536 パターン照合 probe。
+    /// 未収録の elem PTX を読んだときは None (テストだけが skip する)。
+    #[allow(dead_code)]
+    f_f16probe: Option<CUfunction>,
     // P17g: decode attention (exactness 緩和・ユーザー承認)
     f_attn: CUfunction,
     // P17j: prefill attention (flash 風 online softmax・exactness 緩和・ユーザー承認)
@@ -4770,6 +4774,19 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_expf, module_elem, b"dno_expf_probe\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_expf_probe)",
             )?;
+            // task 640: f16 -> f32 の全 65536 パターン照合 probe (elem PTX に無ければ
+            // None。テストだけが skip する)。
+            let mut f_f16probe: CUfunction = std::ptr::null_mut();
+            let f_f16probe = if (lib.module_get_function)(
+                &mut f_f16probe,
+                module_elem,
+                b"dno_f16cvt_probe\0".as_ptr() as *const c_char,
+            ) == 0
+            {
+                Some(f_f16probe)
+            } else {
+                None
+            };
             let mut f_attn: CUfunction = std::ptr::null_mut();
             check(
                 (lib.module_get_function)(&mut f_attn, module_elem, b"dno_attention\0".as_ptr() as *const c_char),
@@ -5179,6 +5196,7 @@ impl CudaCtx {
                 f_swiglu_int,
                 f_addnorm,
                 f_expf,
+                f_f16probe,
                 f_attn,
                 f_attn_pf,
                 f_attn_pf2,
@@ -48167,6 +48185,28 @@ pub fn chain_expf_probe(inp: &[f32]) -> Option<Vec<f32>> {
     chain_download(CH_ACT, n)
 }
 
+/// task 640: f16 -> f32 の全 65536 パターンで「旧 (手書きのビット展開)」と
+/// 「新 (cvt.f32.f16)」を GPU 上で突き合わせる。戻り値は
+/// (不一致の件数, 最初の不一致パターン)。不一致が無ければ (0, 0xffff_ffff)。
+/// GPU / 収録 PTX が無ければ None (テストは skip する)。
+pub fn chain_f16cvt_probe() -> Option<(u32, u32)> {
+    let ctx = chain_ctx()?;
+    let fp = ctx.f_f16probe?;
+    ok(chain_ensure_buf(CH_ACT, 8))?;
+    chain_upload(CH_ACT, &[0.0f32, f32::from_bits(0xffff_ffff)], 2, 1)?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let p = s.bufs[CH_ACT].as_ref()?.ptr();
+        let mut pc = p;
+        let mut pf = p + 4;
+        let mut args = [&mut pc as *mut _ as *mut c_void, &mut pf as *mut _ as *mut c_void];
+        // 256 x 16 ブロックで 65536 パターンを 16 個ずつ舐める。
+        ok(unsafe { ctx.launch_async(fp, (16, 1, 1), (256, 1, 1), 0, &mut args) })
+    })?;
+    let out = chain_download(CH_ACT, 2)?;
+    Some((out[0].to_bits(), out[1].to_bits()))
+}
+
 // ===========================================================================
 // C4: qwen35 デバイス常駐 decode チェーン (GDN 状態 GPU ミラー)
 // ===========================================================================
@@ -51934,6 +51974,156 @@ mod tests {
             sign | (((exp as u32) + 112) << 23) | (man << 13)
         };
         f32::from_bits(bits)
+    }
+
+    /// task 640: カーネルから消した手書きのビット展開 (旧実装) の写し。
+    /// 全 65536 パターンで新実装 (cvt.f32.f16 + NaN だけ旧式) と一致することを
+    /// `f16_cvt_exhaustive` で示す。
+    fn f16_old_bits(h: u16) -> u32 {
+        let sign = ((h & 0x8000) as u32) << 16;
+        let exp = ((h >> 10) & 0x1f) as u32;
+        let man = (h & 0x3ff) as u32;
+        if exp == 0 {
+            if man == 0 {
+                sign
+            } else {
+                let mut e: i32 = -14;
+                let mut m = man;
+                while (m & 0x400) == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                m &= 0x3ff;
+                sign | (((e + 127) as u32) << 23) | (m << 13)
+            }
+        } else if exp == 31 {
+            sign | 0x7f80_0000 | (man << 13)
+        } else {
+            sign | ((exp + 112) << 23) | (man << 13)
+        }
+    }
+
+    /// task 640: 新実装の写し。NaN / inf は旧式のまま、それ以外は IEEE 754 の
+    /// 厳密な f16 -> f32 拡張 (ハードウェアの cvt.f32.f16 と同じ値) を f64 で作る。
+    /// f16 の値は f64 に厳密に入り、f32 へ 1 回丸めても情報が落ちないので
+    /// (仮数 11 bit) この計算は丸め誤差ゼロ = ハードウェアと同じビット列になる。
+    fn f16_new_bits(h: u16) -> u32 {
+        if (h & 0x7c00) == 0x7c00 {
+            return f16_old_bits(h);
+        }
+        let sign = ((h & 0x8000) as u32) << 16;
+        let exp = (h >> 10) & 0x1f;
+        let man = (h & 0x3ff) as f64 / 1024.0;
+        let v = if exp == 0 {
+            man * (-14f64).exp2()
+        } else {
+            (1.0 + man) * (((exp as i32) - 15) as f64).exp2()
+        };
+        let f = v as f32;
+        assert!(!f.is_nan(), "有限パターンが NaN になった: {h:#06x}");
+        sign | f.to_bits()
+    }
+
+    /// task 640 (step 2): f16 -> f32 の全 65536 パターンで旧実装と新実装が
+    /// 1 ビットも違わないこと (0 / 非正規化数 / inf / NaN を含む)。
+    #[test]
+    fn f16_cvt_exhaustive() {
+        let mut bad = Vec::new();
+        let mut subnormal = 0usize;
+        let mut nan_pat = 0usize;
+        for h in 0u32..=0xffffu32 {
+            let h16 = h as u16;
+            let (a, b) = (f16_old_bits(h16), f16_new_bits(h16));
+            if a != b {
+                bad.push((h16, a, b));
+            }
+            if (h & 0x7c00) == 0 && (h & 0x3ff) != 0 {
+                subnormal += 1;
+            }
+            if (h & 0x7c00) == 0x7c00 && (h & 0x3ff) != 0 {
+                nan_pat += 1;
+            }
+        }
+        assert!(bad.is_empty(), "不一致 {} 件: {:x?}", bad.len(), &bad[..bad.len().min(8)]);
+        // 空振りでないこと: 非正規化数 1023 x 2 と NaN 2046 パターンを通している。
+        assert_eq!(subnormal, 2046, "非正規化数のパターン数");
+        assert_eq!(nan_pat, 2046, "NaN のパターン数");
+        // NaN は旧式のまま (sNaN を quiet 化しない)。0x7c01 -> 0x7f802000。
+        assert_eq!(f16_new_bits(0x7c01), 0x7f80_2000);
+        assert_eq!(f16_new_bits(0xfc01), 0xff80_2000);
+        assert_eq!(f16_new_bits(0x7e00), 0x7fc0_0000);
+        // 代表値: 1.0 / 最大非正規化数 / 最小非正規化数。
+        assert_eq!(f16_new_bits(0x3c00), 1.0f32.to_bits());
+        assert_eq!(f16_new_bits(0x03ff), f32::from_bits(0x387f_c000).to_bits());
+        assert_eq!(f16_new_bits(0x0001), 0x3380_0000);
+    }
+
+    /// task 640 (step 2): 30 本の .cu が実際にハードウェア変換に置き換わって
+    /// いること (写し忘れを検出する)。kernels_elem.cu は probe のために旧式も
+    /// 残す。exp_iq_v3 / mix_dn7 / mix_up4 は A/B 用の `#ifdef DNO_F16_LEGACY`
+    /// の中にだけ旧式を残す (build_ptx.sh の `*_legacy` target 専用)。
+    #[test]
+    fn f16_cvt_sources_use_hardware_cvt() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let files = [
+            "kernels_exp_iq.cu", "kernels_exp_iq_pf.cu", "kernels_exp_iq_tc.cu",
+            "kernels_exp_iq_v2.cu", "kernels_exp_k_pf.cu", "kernels_exp_k_tc.cu",
+            "kernels_gemm.cu", "kernels_gemm_grouped.cu", "kernels_gemm_sn.cu",
+            "kernels_gemm_sn2.cu", "kernels_gemm_sn3.cu", "kernels_gemm_tc.cu",
+            "kernels_gemm_tc2.cu", "kernels_mix_dn5.cu", "kernels_mix_dn6.cu",
+            "kernels_mix_dn8.cu", "kernels_mix_upmix_q8.cu", "kernels_moe.cu",
+            "kernels_moe_batch.cu", "kernels_moe_fp16.cu", "kernels_moe_v2.cu",
+            "kernels_moe_v3.cu", "kernels_moe_v4.cu", "kernels_moe_v5.cu",
+            "kernels_moe_v5_q5k.cu", "kernels_seg_k.cu", "kernels_sh_gu.cu",
+        ];
+        for f in files {
+            let src = std::fs::read_to_string(dir.join(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+            assert!(
+                src.contains("__half2float(__ushort_as_half"),
+                "{f} がハードウェア変換を使っていない"
+            );
+            assert!(src.contains("#include <cuda_fp16.h>"), "{f} に include が無い");
+            assert!(
+                !src.contains("while ((m & 0x400u) == 0)"),
+                "{f} に旧式の非正規化ループが残っている"
+            );
+            assert!(!src.contains("int e = -14;"), "{f} に旧式の非正規化ループが残っている");
+        }
+        // A/B 用に旧式を残した 3 本は、#ifdef の中にだけ旧式があること。
+        for f in ["kernels_exp_iq_v3.cu", "kernels_mix_dn7.cu", "kernels_mix_up4.cu"] {
+            let src = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert!(src.contains("#ifdef DNO_F16_LEGACY"), "{f} に旧式の分岐が無い");
+            assert!(src.contains("__half2float(__ushort_as_half"), "{f} が新式を使っていない");
+            let legacy_at = src.find("#ifdef DNO_F16_LEGACY").unwrap();
+            let loop_at = src.find("while ((m & 0x400u) == 0)").expect("旧式が無い");
+            assert!(legacy_at < loop_at, "{f}: 旧式が #ifdef の外にある");
+            assert_eq!(
+                src.matches("while ((m & 0x400u) == 0)").count(),
+                1,
+                "{f}: 旧式のループが 2 箇所以上"
+            );
+        }
+        // probe 側 (elem) は旧式と新式の両方を持つ。
+        let elem = std::fs::read_to_string(dir.join("kernels_elem.cu")).unwrap();
+        assert!(elem.contains("dno_f16cvt_probe"));
+        assert!(elem.contains("dno_f16cvt_old"));
+        assert!(elem.contains("dno_f16cvt_new"));
+        assert!(elem.contains("while ((m & 0x400u) == 0)"), "probe の旧式が消えた");
+    }
+
+    /// task 640 (step 2): GPU 上で全 65536 パターンを照合する。
+    /// GPU / 収録 PTX が無い環境では skip (このコンテナでは skip される)。
+    #[test]
+    fn f16_cvt_probe_on_gpu() {
+        match chain_f16cvt_probe() {
+            None => {
+                eprintln!("[f16cvt] GPU または収録 PTX が無いので skip");
+            }
+            Some((cnt, first)) => {
+                assert_eq!(cnt, 0, "GPU で不一致 {cnt} 件 (最初のパターン {first:#06x})");
+                assert_eq!(first, 0xffff_ffff);
+            }
+        }
     }
 
     /// task 382: `DENNO_MIX_UPQ8` の真理値表と形の門番。
