@@ -50,6 +50,31 @@
 // f16 -> f32 (kernels_exp_iq_v2.cu と同一の式。モジュールが別なので写しを持つ)
 __device__ __forceinline__ float e3_f16(const unsigned char* b)
 {
+#ifdef DNO_F16_LEGACY
+    // task 640: A/B 測定用の旧実装 (build_ptx.sh の `<name>_legacy` target だけが
+    // -DDNO_F16_LEGACY=1 で作る。通常のビルドでは使われない)。
+    const unsigned int h = (unsigned int)b[0] | ((unsigned int)b[1] << 8);
+    const unsigned int sign = (h & 0x8000u) << 16;
+    const unsigned int exp = (h >> 10) & 0x1fu;
+    const unsigned int man = h & 0x3ffu;
+    unsigned int bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;
+        } else {
+            int e = -14;
+            unsigned int m = man;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3ffu;
+            bits = sign | ((unsigned int)(e + 127) << 23) | (m << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (man << 13);
+    }
+    return __int_as_float(bits);
+#else
     // task 640: 手書きのビット展開をハードウェアの cvt.f32.f16 (`__half2float`) に
     // 置き換えた。f16 -> f32 の拡張は IEEE 754 で一意なので結果は同じ (0 / 非正規化数
     // を含む全 65536 パターンで旧実装と一致することを cuda.rs の
@@ -61,6 +86,7 @@ __device__ __forceinline__ float e3_f16(const unsigned char* b)
         return __int_as_float(sign | 0x7f800000u | ((h & 0x3ffu) << 13));
     }
     return __half2float(__ushort_as_half((unsigned short)h));
+#endif
 }
 
 __device__ __forceinline__ unsigned int e3_u32(const unsigned char* p)

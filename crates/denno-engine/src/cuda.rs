@@ -51848,18 +51848,18 @@ mod tests {
 
     /// task 640 (step 2): 30 本の .cu が実際にハードウェア変換に置き換わって
     /// いること (写し忘れを検出する)。kernels_elem.cu は probe のために旧式も
-    /// 残すので、while ループの不在チェックから外す。
+    /// 残す。exp_iq_v3 / mix_dn7 / mix_up4 は A/B 用の `#ifdef DNO_F16_LEGACY`
+    /// の中にだけ旧式を残す (build_ptx.sh の `*_legacy` target 専用)。
     #[test]
     fn f16_cvt_sources_use_hardware_cvt() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
         let files = [
             "kernels_exp_iq.cu", "kernels_exp_iq_pf.cu", "kernels_exp_iq_tc.cu",
-            "kernels_exp_iq_v2.cu", "kernels_exp_iq_v3.cu", "kernels_exp_k_pf.cu",
-            "kernels_exp_k_tc.cu", "kernels_gemm.cu", "kernels_gemm_grouped.cu",
-            "kernels_gemm_sn.cu", "kernels_gemm_sn2.cu", "kernels_gemm_sn3.cu",
-            "kernels_gemm_tc.cu", "kernels_gemm_tc2.cu", "kernels_mix_dn5.cu",
-            "kernels_mix_dn6.cu", "kernels_mix_dn7.cu", "kernels_mix_dn8.cu",
-            "kernels_mix_up4.cu", "kernels_mix_upmix_q8.cu", "kernels_moe.cu",
+            "kernels_exp_iq_v2.cu", "kernels_exp_k_pf.cu", "kernels_exp_k_tc.cu",
+            "kernels_gemm.cu", "kernels_gemm_grouped.cu", "kernels_gemm_sn.cu",
+            "kernels_gemm_sn2.cu", "kernels_gemm_sn3.cu", "kernels_gemm_tc.cu",
+            "kernels_gemm_tc2.cu", "kernels_mix_dn5.cu", "kernels_mix_dn6.cu",
+            "kernels_mix_dn8.cu", "kernels_mix_upmix_q8.cu", "kernels_moe.cu",
             "kernels_moe_batch.cu", "kernels_moe_fp16.cu", "kernels_moe_v2.cu",
             "kernels_moe_v3.cu", "kernels_moe_v4.cu", "kernels_moe_v5.cu",
             "kernels_moe_v5_q5k.cu", "kernels_seg_k.cu", "kernels_sh_gu.cu",
@@ -51875,9 +51875,20 @@ mod tests {
                 !src.contains("while ((m & 0x400u) == 0)"),
                 "{f} に旧式の非正規化ループが残っている"
             );
-            assert!(
-                !src.contains("int e = -14;"),
-                "{f} に旧式の非正規化ループが残っている"
+            assert!(!src.contains("int e = -14;"), "{f} に旧式の非正規化ループが残っている");
+        }
+        // A/B 用に旧式を残した 3 本は、#ifdef の中にだけ旧式があること。
+        for f in ["kernels_exp_iq_v3.cu", "kernels_mix_dn7.cu", "kernels_mix_up4.cu"] {
+            let src = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert!(src.contains("#ifdef DNO_F16_LEGACY"), "{f} に旧式の分岐が無い");
+            assert!(src.contains("__half2float(__ushort_as_half"), "{f} が新式を使っていない");
+            let legacy_at = src.find("#ifdef DNO_F16_LEGACY").unwrap();
+            let loop_at = src.find("while ((m & 0x400u) == 0)").expect("旧式が無い");
+            assert!(legacy_at < loop_at, "{f}: 旧式が #ifdef の外にある");
+            assert_eq!(
+                src.matches("while ((m & 0x400u) == 0)").count(),
+                1,
+                "{f}: 旧式のループが 2 箇所以上"
             );
         }
         // probe 側 (elem) は旧式と新式の両方を持つ。
