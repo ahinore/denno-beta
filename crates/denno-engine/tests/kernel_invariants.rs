@@ -1,7 +1,7 @@
 //! s100 (P3-3 続き): CUDA カーネル (`.cu`) の静的不変条件テスト (インテグレーション版)。
 //!
 //! s75 の `kernel_source_shared_stride_and_block_shape_are_consistent` は
-//! `src/cuda.rs` の `#[cfg(all(test, feature = "cuda"))] mod tests` に置かれていたため、
+//! `src/cuda/` (task 664 で `src/cuda.rs` から分割) の `#[cfg(all(test, feature = "cuda"))] mod tests` に置かれていたため、
 //! **既定ビルド (cuda feature 無し) では原理的に走らなかった**。同じ検査をこの
 //! インテグレーションテストへ移設し、`.cu` を `include_str!` でテキストとして読む
 //! だけの静的な検査にして feature ゲートを外した。GPU・cuda feature とも不要。
@@ -23,7 +23,37 @@ use std::collections::HashMap;
 // `.cu` テキストの読み取りヘルパ
 // ---------------------------------------------------------------------------
 
-const CUDA_RS: &str = include_str!("../src/cuda.rs");
+/// task 664: `src/cuda.rs` は `src/cuda/` 配下の複数ファイルへ分割された。
+/// テキスト検査は `src/cuda/mod.rs` と `src/cuda/*.rs` を**ファイル名のソート順**に
+/// `"\n"` で連結した 1 本の文字列を対象にする (旧 `include_str!("../src/cuda.rs")` と
+/// 同じ「全体を 1 枚のテキストとして見る」性質を保つ。順序は決定的)。
+fn cuda_rs() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("src/cuda が読めない")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension().map_or(false, |x| x == "rs") {
+                    p.file_name()?.to_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort();
+        let mut out = String::new();
+        for n in names {
+            out.push_str(
+                &std::fs::read_to_string(dir.join(&n)).unwrap_or_else(|e| panic!("{n}: {e}")),
+            );
+            out.push('\n');
+        }
+        out
+    })
+}
+
 
 /// `#define NAME VALUE` を取り出す。VALUE は他の define を参照し得るので、
 /// 数値化は [`eval_define`] で依存順に展開する (s75 のテストと同じ方式)。
@@ -139,17 +169,17 @@ fn rust_const(name: &str) -> i64 {
     let needle = format!("const {name}: ");
     let mut cursor = 0usize;
     // 先頭一致は `GEMM_TILE` が `GEMM_TILE_N` を誤ヒットし得るので、宣言の形で探す。
-    while let Some(off) = CUDA_RS[cursor..].find(&needle) {
+    while let Some(off) = cuda_rs()[cursor..].find(&needle) {
         let at = cursor + off;
         cursor = at + needle.len();
         // 直前が識別子の一部 (例: `_GEMM_TILE: `) なら別名なので飛ばす
-        let prev = CUDA_RS[..at].chars().next_back();
+        let prev = cuda_rs()[..at].chars().next_back();
         if let Some(p) = prev {
             if p.is_ascii_alphanumeric() || p == '_' {
                 continue;
             }
         }
-        let rest = &CUDA_RS[cursor..];
+        let rest = &cuda_rs()[cursor..];
         let eq = rest
             .find('=')
             .unwrap_or_else(|| panic!("cuda.rs の const {name} に = が無い"));
@@ -606,18 +636,18 @@ let d = defines(GDN_SRC);
     }
     // ホスト側の必要量 = (2*dk*dk + 2*dk + 3) floats * 4 B (上の 5 宣言の和)。
     assert!(
-        CUDA_RS.contains("(2 * dk * dk + 2 * dk + 3) * 4"),
+        cuda_rs().contains("(2 * dk * dk + 2 * dk + 3) * 4"),
         "cuda.rs の共有メモリ版 pass 1 の smem 式がカーネルのレイアウトと一致しない"
     );
     // launch は「選んだカーネル・block・shmem」を 1 組で渡す (shmem だけ旧式が
     // 残ると共有領域外書きになる — s99 と同じ型の欠陥)。
     assert!(
-        CUDA_RS.contains("shm_pre,"),
+        cuda_rs().contains("shm_pre,"),
         "cuda.rs の pass 1 launch が選択結果 (shm_pre) を渡していない"
     );
     assert!(
-        CUDA_RS.contains("fn gdn_pre_sm_gate(")
-            && CUDA_RS.contains("ctx.f_gdn_chunk_pre_sm.is_some()"),
+        cuda_rs().contains("fn gdn_pre_sm_gate(")
+            && cuda_rs().contains("ctx.f_gdn_chunk_pre_sm.is_some()"),
         "cuda.rs の共有メモリ版 pass 1 のゲートが無い (カーネル不在で落ちる)"
     );
 
@@ -627,7 +657,7 @@ let d = defines(GDN_SRC);
     // task 167 の gdn_pf_chain) で、chunk 経路は `shmem_scan` の名前で同じ式を
     // 使う (下で個別に確認する)。
     let host_expr = "let shmem = ((3 * dk + dv + 5) * 4) as u32;";
-    let n_host = CUDA_RS.matches(host_expr).count();
+    let n_host = cuda_rs().matches(host_expr).count();
     assert_eq!(
         n_host, 4,
         "cuda.rs の gdn smem 計算 (`{host_expr}`) が {n_host} 箇所 (期待 4): \
@@ -635,12 +665,12 @@ let d = defines(GDN_SRC);
     );
     // chunk 経路は別名 (`shmem_scan`) で同じ式。
     assert!(
-        CUDA_RS.contains("let shmem_scan = ((3 * dk + dv + 5) * 4) as u32;"),
+        cuda_rs().contains("let shmem_scan = ((3 * dk + dv + 5) * 4) as u32;"),
         "cuda.rs の chunk 経路の smem 計算が 3*dk + dv + 5 でない"
     );
     // pass 1 (k/v のみ) は `(2 * dk + 3) * 4` — カーネルの sc 基点と一致
     assert!(
-        CUDA_RS.contains("let shmem_pre = ((2 * dk + 3) * 4) as u32;"),
+        cuda_rs().contains("let shmem_pre = ((2 * dk + 3) * 4) as u32;"),
         "cuda.rs の pass 1 smem 計算が k/v + scalars[3] と一致しない"
     );
     // dk == dv 前提のとき、共有領域は 4*dk + 5 floats。48KiB に収まること。
@@ -659,7 +689,7 @@ let d = defines(GDN_SRC);
 
     // ---- (4) block = dk で、共有領域を全スレッドが書くこと ----
     assert!(
-        CUDA_RS.contains(".launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem"),
+        cuda_rs().contains(".launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem"),
         "cuda.rs が gdn カーネルを grid=(nv) block=(dk) で起動していない"
     );
     assert!(
@@ -915,7 +945,7 @@ fn gdn_kernel_column_arrays_fit_host_limits() {
 
     // ホスト側: dk / dv の上限ゲート (q35_chain_shapes_ok の形状条件)
     assert!(
-        CUDA_RS.contains("dk == dv && d_conv == 4 && (1..=256).contains(&dk)"),
+        cuda_rs().contains("dk == dv && d_conv == 4 && (1..=256).contains(&dk)"),
         "cuda.rs の gdn 形状ゲート (dk == dv / d_conv == 4 / dk <= 256) が変わった: \
          列配列 [256] を超えるとスタックを壊す"
     );
@@ -1065,7 +1095,7 @@ fn elem_attention_prefill_tile_matches_host() {
     }
     // ホスト側の計算式が同じであること (attn_pf_sh_f)
     assert!(
-        CUDA_RS.contains(
+        cuda_rs().contains(
             "(ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1) + ATTN_PF_BQ * ATTN_PF_BK + 2 * ATTN_PF_BQ"
         ),
         "cuda.rs の attn_pf_sh_f の式が変わった (カーネルのレイアウトと同時に更新すること)"
@@ -1083,7 +1113,7 @@ fn elem_attention_prefill_tile_matches_host() {
 
     // block が PF_BQ 行 owner を持つ前提: dh >= PF_BQ (ホスト側ゲートと一致)
     assert!(
-        CUDA_RS.contains("if dh < ATTN_PF_BQ || dh > 1024 {"),
+        cuda_rs().contains("if dh < ATTN_PF_BQ || dh > 1024 {"),
         "cuda.rs の dh >= ATTN_PF_BQ ゲートが変わった"
     );
     assert!(
@@ -4528,7 +4558,7 @@ extern "C" __global__ void fake_row(const signed char *src) {{
 #[test]
 fn kernel_launch_block_shapes_bound_symbolic_smem_rows() {
     // ---- (1) cuda.rs の起動サイト表 ----
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     println!("launch sites: {} calls, {} kernels, {} unresolved sites", map.calls_seen, map.sites.len(), map.unresolved_sites.len());
     println!("launch map: {}", map.summary());
     for (line, why) in &map.unresolved_sites {
@@ -4860,7 +4890,7 @@ fn kernel_launch_block_shapes_bound_symbolic_smem_rows() {
 #[test]
 fn kernel_launch_grid_shapes_bound_block_idx_smem_rows() {
     // ---- (1) 実カーネル: grid は 1 件も静的に解決できない ----
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     println!("launch map (block / grid): {}", map.summary());
     // 行番号の自己検査: 各サイトの行が **生の cuda.rs** の `.launch_async(` 行を指すこと。
     // mask_literals が行を落とすと 1 行ずれ、囲みガードとカーネル範囲の対応も崩れる
@@ -4868,7 +4898,7 @@ fn kernel_launch_grid_shapes_bound_block_idx_smem_rows() {
     //  1 行手前に報告されていた)。
     for (k, sites) in &map.sites {
         for s in sites {
-            let raw = CUDA_RS.lines().nth(s.line.saturating_sub(1)).unwrap_or("");
+            let raw = cuda_rs().lines().nth(s.line.saturating_sub(1)).unwrap_or("");
             assert!(
                 raw.contains(".launch_async("),
                 "起動サイト {k} の行番号 {} が実際の `.launch_async(` 行と一致しない \
@@ -5390,7 +5420,7 @@ fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
 
     // env の解釈が刻みを捨てると、64 行ブロックに対し 3 行などのタイルを受け、
     // 1 ブロックがタイルバッファの外まで A を読む (確保は cap 行ぶんしかない)。
-    let parse = fn_body(CUDA_RS, "fn parse_q4_m_tile(");
+    let parse = fn_body(cuda_rs(), "fn parse_q4_m_tile(");
     assert!(
         parse.contains("(Q4_M_TILE_STEP..=Q4_M_TILE_MAX).contains(&t) && t % Q4_M_TILE_STEP == 0"),
         "parse_q4_m_tile が「刻みの倍数のみ」を受けなくなった"
@@ -5398,14 +5428,14 @@ fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
 
     // 1 タイルの最大行数が「tile + 端数併合の閾値」でないと、併合された最終タイル
     // (tile+tail 行) がタイルバッファをはみ出す。
-    let max_rows = fn_body(CUDA_RS, "fn q4_tile_max_rows(");
+    let max_rows = fn_body(cuda_rs(), "fn q4_tile_max_rows(");
     assert!(
         max_rows.contains("tile.saturating_add(q4_tail_merge_below())"),
         "q4_tile_max_rows が tile + q4_tail_merge_below() でない"
     );
     // 併合の条件が「閾値以下の端数」でないと、cap が見込んでいない行数が 1 回の
     // launch に載る (上の cap と食い違う)。
-    let group = fn_body(CUDA_RS, "fn q4_group_rows(");
+    let group = fn_body(cuda_rs(), "fn q4_group_rows(");
     assert!(
         group.contains("if rem > 0 && rem <= q4_tail_merge_below()"),
         "q4_group_rows の併合条件が rem <= q4_tail_merge_below() でない"
@@ -5423,7 +5453,7 @@ fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
         "fn chain_mlp_prefill_q4_impl(",
         "fn chain_gdn_prefill_q4_impl(",
     ] {
-        let b = fn_body(CUDA_RS, sig);
+        let b = fn_body(cuda_rs(), sig);
         assert!(
             b.contains("let tile = q4_m_tile();"),
             "{sig}: タイル幅が実効値 q4_m_tile() でない"
@@ -5437,7 +5467,7 @@ fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
     // ---- FFN チェーンの中間バッファは 1 タイル分 (cap) ----
     // m (プロンプト全体) で確保すると 13k 行で ff 中間 3 枚が 2.7 GiB になり、
     // 27B の prefill が cuMemAlloc error 2 で CPU へ落ちる (s124 の実測)。
-    let mlp = fn_body(CUDA_RS, "fn chain_mlp_prefill_q4_impl(");
+    let mlp = fn_body(cuda_rs(), "fn chain_mlp_prefill_q4_impl(");
     assert!(
         mlp.contains("let cap = q4_tile_max_rows(tile).min(m);"),
         "FFN チェーンの cap が「1 タイルの最大行数」でない"
@@ -5482,7 +5512,7 @@ fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
     );
 
     // ---- GDN チェーンのバッファ ----
-    let gdn = fn_body(CUDA_RS, "fn chain_gdn_prefill_q4_impl(");
+    let gdn = fn_body(cuda_rs(), "fn chain_gdn_prefill_q4_impl(");
     assert!(
         gdn.contains("let cap = q4_tile_max_rows(tile).min(n);"),
         "GDN チェーンの cap が「1 タイルの最大行数」でない"
@@ -5510,7 +5540,7 @@ fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
     );
 
     // ---- 残差ストリームの予約は全行 + rmsnorm の重み作業域 ----
-    let reserve = fn_body(CUDA_RS, "fn chain_pf_reserve(");
+    let reserve = fn_body(cuda_rs(), "fn chain_pf_reserve(");
     assert!(
         reserve.contains("let rows = n.checked_mul(e)?.checked_mul(4)?;"),
         "chain_pf_reserve の行バイト数が n*e*4 でない"
@@ -5528,7 +5558,7 @@ fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
             "chain_pf_reserve の {slot} が全行ぶんでない"
         );
     }
-    let rn = fn_body(CUDA_RS, "pub fn chain_rmsnorm_slot(");
+    let rn = fn_body(cuda_rs(), "pub fn chain_rmsnorm_slot(");
     assert!(
         rn.contains("let wb = cols * 4;"),
         "chain_rmsnorm_slot の重み作業域が cols*4 でない"
@@ -5549,10 +5579,10 @@ fn prefill_chain_launches_match_per_op_kernel_and_args() {
     let d = defines(INT8);
     let gm = eval_define("Q4_GM", &d);
     let gn = eval_define("Q4_GN", &d);
-    let code = prod_source(&strip_line_comments(CUDA_RS));
+    let code = prod_source(&strip_line_comments(cuda_rs()));
 
-    let per_op = fn_body(CUDA_RS, "fn q4_dispatch_tile(");
-    let chain = fn_body(CUDA_RS, "fn chain_gemm_q4_pf(");
+    let per_op = fn_body(cuda_rs(), "fn q4_dispatch_tile(");
+    let chain = fn_body(cuda_rs(), "fn chain_gemm_q4_pf(");
 
     // 起動点が 2 箇所でないなら、その経路は「per-op と同じ起動」の保証が無い
     // (チェーンが別の PTX エントリや別引数で回り始めるとビット一致が崩れる)。
@@ -5653,9 +5683,9 @@ fn prefill_chain_launches_match_per_op_kernel_and_args() {
         vec!["gateup", "out", "ff", "width", "total"],
         "dno_swiglu_int の仮引数が (gateup, out, ff, width, total) でない"
     );
-    let sw_split = fn_body(CUDA_RS, "fn chain_swiglu_split(");
-    let sw_rows = fn_body(CUDA_RS, "fn chain_swiglu_rows(");
-    let sw_int = fn_body(CUDA_RS, "fn chain_swiglu_int_at(");
+    let sw_split = fn_body(cuda_rs(), "fn chain_swiglu_split(");
+    let sw_rows = fn_body(cuda_rs(), "fn chain_swiglu_rows(");
+    let sw_int = fn_body(cuda_rs(), "fn chain_swiglu_int_at(");
     assert_eq!(
         launch_arg_names(sw_split),
         vec!["pg", "pu", "po", "tc"],
@@ -5691,7 +5721,7 @@ fn prefill_chain_launches_match_per_op_kernel_and_args() {
         "chain_swiglu_int_at の width が 2*ff でない"
     );
     // total は「行 x ff」— mr*2ff を渡すと CH_ACT の外まで書く。
-    let mlp = fn_body(CUDA_RS, "fn chain_mlp_prefill_q4_impl(");
+    let mlp = fn_body(cuda_rs(), "fn chain_mlp_prefill_q4_impl(");
     assert!(
         mlp.contains("chain_swiglu_int_at(pga, pact, ff, mr * ff)"),
         "FFN チェーンの swiglu (行内) の total が mr*ff でない"
@@ -5756,7 +5786,7 @@ fn prefill_residual_stream_is_written_before_read() {
 
     // 発動条件が純粋述語でない (呼び出し側に条件の写しがある) と、片方だけ直した
     // ときに「残差は常駐だが層はホスト経路」のような半端な状態になる。
-    let code = prod_source(&strip_line_comments(CUDA_RS));
+    let code = prod_source(&strip_line_comments(cuda_rs()));
     let mut gate_calls = 0usize;
     for (i, _) in code.match_indices("pf_res_gate(") {
         if !code[..i].trim_end().ends_with("fn") {
@@ -5767,12 +5797,12 @@ fn prefill_residual_stream_is_written_before_read() {
         gate_calls, 2,
         "pf_res_gate の呼び出しが pf_res_gate_now と pf_layer_geom の 2 箇所でない (条件の写しが増えた)"
     );
-    let now = fn_body(CUDA_RS, "pub fn pf_res_gate_now(");
+    let now = fn_body(cuda_rs(), "pub fn pf_res_gate_now(");
     assert!(
         now.contains("pf_res_gate(n, e, all_q4, diag, gemm_min_m(), max_m())"),
         "pf_res_gate_now が純粋述語 pf_res_gate に env 実効値を渡していない"
     );
-    let lg = fn_body(CUDA_RS, "pub fn pf_layer_geom(");
+    let lg = fn_body(cuda_rs(), "pub fn pf_layer_geom(");
     assert!(
         lg.contains("pf_res_gate(n, e, true, false, gemm_min, max_m)"),
         "層ゲートが pf_res_gate を通っていない (全体ゲートと別の条件になる)"
@@ -5857,17 +5887,17 @@ fn prefill_residual_stream_is_written_before_read() {
 
     // 残差バッファの確保は常に全行 (タイル分にすると 2 タイル目以降が未初期化)。
     let mut res_sites = 0usize;
-    for (i, _) in CUDA_RS.match_indices("chain_ensure_buf(CH_PF_RES,") {
+    for (i, _) in cuda_rs().match_indices("chain_ensure_buf(CH_PF_RES,") {
         res_sites += 1;
-        let end = CUDA_RS[i..].find(')').map(|e| i + e).unwrap_or(CUDA_RS.len());
-        let line = &CUDA_RS[i..end];
+        let end = cuda_rs()[i..].find(')').map(|e| i + e).unwrap_or(cuda_rs().len());
+        let line = &cuda_rs()[i..end];
         assert!(
             line.contains("rows") || line.contains("bytes"),
             "CH_PF_RES の確保が全行ぶんの式でない: {line}"
         );
     }
     assert!(res_sites >= 2, "CH_PF_RES の確保点が 2 箇所未満");
-    let upload = fn_body(CUDA_RS, "pub fn chain_pf_res_upload(");
+    let upload = fn_body(cuda_rs(), "pub fn chain_pf_res_upload(");
     assert!(
         upload.contains("let bytes = n_elems.checked_mul(4)?;")
             && upload.contains("chain_ensure_buf(CH_PF_RES, bytes)"),
@@ -5883,7 +5913,7 @@ fn prefill_residual_stream_is_written_before_read() {
         vec!["x", "proj", "w", "out", "cols", "eps"],
         "dno_add_rmsnorm の仮引数が (x, proj, w, out, cols, eps) でない"
     );
-    let rn = fn_body(CUDA_RS, "pub fn chain_rmsnorm_slot(");
+    let rn = fn_body(cuda_rs(), "pub fn chain_rmsnorm_slot(");
     assert_eq!(
         launch_arg_names(rn),
         vec!["px", "pp", "pw", "po", "mc", "ec"],
@@ -5926,7 +5956,7 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
         "PF_PH_SWIGLU",
         "PF_PH_FFN_DOWN",
     ];
-    let code_c = strip_line_comments(CUDA_RS);
+    let code_c = strip_line_comments(cuda_rs());
     let code_q = strip_line_comments(QWEN35_RS);
 
     // id が表示順の index と違うと、PF_PH_NAMES / PF_PH_BUCKETS の並びと
@@ -5945,7 +5975,7 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
         "PF_PH_N が位相の数と違う"
     );
     assert!(
-        CUDA_RS.contains("pub const PF_PH_NONE: u8 = 0xFF;"),
+        cuda_rs().contains("pub const PF_PH_NONE: u8 = 0xFF;"),
         "PF_PH_NONE が 0xFF でない (位相 id と衝突し得る)"
     );
 
@@ -5959,14 +5989,14 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
 
     // マーカーは発行グループの**先頭**にある (直後に置くとその launch が
     // 1 つ前の位相に落ちる — P25 で実測した誤帰属)。
-    let ovl = fn_body(CUDA_RS, "fn chain_gdn_prefill_q4_dev_ovl<F>(");
+    let ovl = fn_body(cuda_rs(), "fn chain_gdn_prefill_q4_dev_ovl<F>(");
     let p = ovl.find("pf_phase(PF_PH_GDN_PROJ)").expect("GDN_PROJ が無い");
     let c = ovl
         .find("chain_gdn_prefill_q4_impl(")
         .expect("GDN 本体の呼び出しが無い");
     assert!(p < c, "GDN_PROJ が GDN 本体 (h2 の D2H) より後にある");
 
-    let gdn = fn_body(CUDA_RS, "fn chain_gdn_prefill_q4_impl(");
+    let gdn = fn_body(cuda_rs(), "fn chain_gdn_prefill_q4_impl(");
     let (s, o) = (
         gdn.find("pf_phase(PF_PH_GDN_SCAN)").expect("GDN_SCAN が無い"),
         gdn.find("pf_phase(PF_PH_GDN_OPROJ)").expect("GDN_OPROJ が無い"),
@@ -5981,13 +6011,13 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
         "GDN_OPROJ が o_proj の起動より後にある"
     );
 
-    let qkv = fn_body(CUDA_RS, "fn chain_qkv_prefill_q4_dev(");
+    let qkv = fn_body(cuda_rs(), "fn chain_qkv_prefill_q4_dev(");
     assert!(
         qkv.find("pf_phase(PF_PH_FULL_QK)").expect("FULL_QK が無い")
             < qkv.find("chain_gemm_q4_pf(gwq").expect("q GEMM が無い"),
         "FULL_QK が qkv GEMM の起動より後にある"
     );
-    let oproj = fn_body(CUDA_RS, "fn chain_oproj_prefill_q4(");
+    let oproj = fn_body(cuda_rs(), "fn chain_oproj_prefill_q4(");
     assert!(
         oproj
             .find("pf_phase(PF_PH_FULL_OPROJ)")
@@ -5996,7 +6026,7 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
         "FULL_OPROJ が o_proj GEMM の起動より後にある"
     );
 
-    let mlp = fn_body(CUDA_RS, "fn chain_mlp_prefill_q4_impl(");
+    let mlp = fn_body(cuda_rs(), "fn chain_mlp_prefill_q4_impl(");
     let (g, sw, dn) = (
         mlp.find("pf_phase(PF_PH_FFN_GATE)").expect("FFN_GATE が無い"),
         mlp.find("pf_phase(PF_PH_SWIGLU)").expect("SWIGLU が無い"),
@@ -6084,7 +6114,7 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
 
     // マーカーは計測専用 — カーネル起動もコピーもしない (数値経路と発行順に
     // 触れない)。ここに launch/memcpy が入ると、計測 ON のときだけ挙動が変わる。
-    let pf = fn_body(CUDA_RS, "pub fn pf_phase(");
+    let pf = fn_body(cuda_rs(), "pub fn pf_phase(");
     for bad in ["launch_async", "memcpy", "sync()"] {
         assert!(
             !pf.contains(bad),
@@ -6103,13 +6133,13 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
 /// 「その出力点が同期も launch も増やさない」ことをソースで固定する。
 #[test]
 fn gdn_kprof_line_is_wired_at_prefill_end_without_sync() {
-    let read = fn_body(CUDA_RS, "pub fn pf_timing_read(");
+    let read = fn_body(cuda_rs(), "pub fn pf_timing_read(");
     assert!(
         read.contains("gdn_kprof_report_at_prefill_end()"),
         "prefill 終了時 (pf_timing_read) に [GDN_KPROF] の出力点が無い \
          (DENNO_PROFILE を unset する本番起動では行が消える)"
     );
-    let site = fn_body(CUDA_RS, "pub fn gdn_kprof_report_at_prefill_end(");
+    let site = fn_body(cuda_rs(), "pub fn gdn_kprof_report_at_prefill_end(");
     for bad in ["sync(", "launch_async", "memcpy", "event_record", "event_create"] {
         assert!(
             !site.contains(bad),
@@ -6131,7 +6161,7 @@ fn gdn_kprof_line_is_wired_at_prefill_end_without_sync() {
 /// 読む経路 (`y_dst = None`)」の 1 箇所だけに残す。
 #[test]
 fn gdn_chunked_scan_device_output_path_has_no_host_sync() {
-    let f = fn_body(CUDA_RS, "fn gdn_scan_chunked_impl(");
+    let f = fn_body(cuda_rs(), "fn gdn_scan_chunked_impl(");
     // 呼び出し形 (`?` 付き) で数える — コメント中の `ctx.sync()` を拾わない。
     assert_eq!(
         f.matches("ctx.sync()?").count(),
@@ -6161,7 +6191,7 @@ fn gdn_chunked_scan_device_output_path_has_no_host_sync() {
 /// 集計行より前に読まないと最後の層の区間が捨てられる。
 #[test]
 fn gdn_kprof_pending_read_happens_before_prefill_end_report() {
-    let read = fn_body(CUDA_RS, "pub fn pf_timing_read(");
+    let read = fn_body(cuda_rs(), "pub fn pf_timing_read(");
     let p = read
         .find("kprof_read_pending()")
         .expect("pf_timing_read に保留区間の読み出しが無い (P45 の遅延読みが捨てられる)");
@@ -6188,8 +6218,8 @@ fn gdn_kprof_pending_read_happens_before_prefill_end_report() {
 /// - ストリーム/イベントが作れないときは従来経路へ落ち、GPU_BROKEN を立てない。
 #[test]
 fn prefill_full_qk_q_copy_overlaps_kv_gemm() {
-    let qkv = fn_body(CUDA_RS, "fn chain_qkv_prefill_q4_dev(");
-    let begin = fn_body(CUDA_RS, "fn pf_qk_copy_begin(");
+    let qkv = fn_body(cuda_rs(), "fn chain_qkv_prefill_q4_dev(");
+    let begin = fn_body(cuda_rs(), "fn pf_qk_copy_begin(");
 
     // (1) 記録点の位置 (q GEMM の後・k GEMM の前)。
     let i_q = qkv.find("chain_gemm_q4_pf(gwq").expect("q GEMM が無い");
@@ -6241,7 +6271,7 @@ fn prefill_full_qk_q_copy_overlaps_kv_gemm() {
         1,
         "full_qk の ctx.sync() が 1 回でない"
     );
-    let sync = fn_body(CUDA_RS, "pub fn sync(&self)");
+    let sync = fn_body(cuda_rs(), "pub fn sync(&self)");
     assert!(
         sync.contains("(lib.ctx_sync)()"),
         "sync が cuCtxSynchronize でない (コピーストリームが join されない)"
@@ -6294,7 +6324,7 @@ fn prefill_full_qk_q_copy_overlaps_kv_gemm() {
 /// - v の宛先は P44 のまま (ホスト KV キャッシュの行 = prepare が触らない)。
 #[test]
 fn prefill_full_qk_d2h_lands_in_pinned_staging() {
-    let qkv = fn_body(CUDA_RS, "fn chain_qkv_prefill_q4_dev(");
+    let qkv = fn_body(cuda_rs(), "fn chain_qkv_prefill_q4_dev(");
     // 3 発 (q/k/v) のまま。連結 (1〜2 発) も分割 (4 発以上) もしない。
     assert_eq!(
         qkv.matches("memcpy_dtoh_async").count(),
@@ -6414,15 +6444,15 @@ fn attn_flashdec_kernel_matches_host() {
     );
     assert!(dec.contains("const int lane = threadIdx.x & 31;"));
     assert!(
-        CUDA_RS.contains("((32 * a.group) as u32, 1, 1)"),
+        cuda_rs().contains("((32 * a.group) as u32, 1, 1)"),
         "cuda.rs の block 形 (32 * group) がカーネルと不一致"
     );
     assert!(
-        CUDA_RS.contains("(n_split as u32, n_kv as u32, 1)"),
+        cuda_rs().contains("(n_split as u32, n_kv as u32, 1)"),
         "cuda.rs の grid 形 (split, kv head) がカーネルと不一致"
     );
     assert!(
-        CUDA_RS.contains("(a.group as u32, nkv_c as u32, 1)"),
+        cuda_rs().contains("(a.group as u32, nkv_c as u32, 1)"),
         "combine の grid (q head, kv head) がカーネルと不一致"
     );
 
@@ -6464,7 +6494,7 @@ fn attn_flashdec_kernel_matches_host() {
         "カーネルの分割式が変わった (q4_fdec_split と同時に更新すること)"
     );
     assert!(
-        CUDA_RS.contains("let chunk = t_total.div_ceil(n).max(1);"),
+        cuda_rs().contains("let chunk = t_total.div_ceil(n).max(1);"),
         "q4_fdec_split の chunk 計算が変わった"
     );
     assert_eq!(
@@ -6585,7 +6615,7 @@ fn pf_tc_gemm_tile_matches_host() {
     let threads = warps * 32;
     assert_eq!(threads, 256, "1 ブロックのスレッド数が 256 でない");
     assert!(
-        CUDA_RS.contains("(256, 1, 1),"),
+        cuda_rs().contains("(256, 1, 1),"),
         "cuda.rs の起動 block が (256, 1, 1) でない"
     );
 
@@ -6608,7 +6638,7 @@ fn pf_tc_gemm_tile_matches_host() {
         "静的共有メモリ {expect_smem} B が 48 KiB を超える"
     );
     assert!(
-        CUDA_RS.contains("(256, 1, 1), 0, &mut args)?;"),
+        cuda_rs().contains("(256, 1, 1), 0, &mut args)?;"),
         "ホストが動的 smem を渡している (カーネルは静的配列なので 0 のはず)"
     );
 }
@@ -6642,7 +6672,7 @@ fn pf_tc_gemm_is_bf16_mma_q8_0() {
         "Q8_0 の量子値の先頭 (blk + 2 + j) が変わった"
     );
     assert!(
-        CUDA_RS.contains("b\"dno_gemm_tc_q8_0_w\\0\""),
+        cuda_rs().contains("b\"dno_gemm_tc_q8_0_w\\0\""),
         "cuda.rs が dno_gemm_tc_q8_0_w を読んでいない"
     );
 
@@ -6678,7 +6708,7 @@ const GDN_PF_SRC: &str = include_str!("../kernels/kernels_gdn_pf.cu");
 #[test]
 fn gdn_pf_scan_kernel_is_wired() {
     assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_scan128\\0\""),
+        cuda_rs().contains("b\"dno_gdn_pf_scan128\\0\""),
         "cuda.rs が dno_gdn_pf_scan128 を読んでいない"
     );
     assert!(
@@ -6721,7 +6751,7 @@ fn gdn_pf_scan_kernel_is_wired() {
         "build_ptx.sh の targets_all に gdn_pf が無い: {targets}"
     );
     // 起動サイト: block は 512 に静的解決できる (グリッドは nv なので動的でよい)
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     assert_eq!(
         map.block_status("dno_gdn_pf_scan128"),
         ShapeStatus::Resolved([512, 1, 1]),
@@ -6730,11 +6760,11 @@ fn gdn_pf_scan_kernel_is_wired() {
     );
     // Rust 側のスレッド数定数とカーネルの #define が一致する
     assert!(
-        CUDA_RS.contains("const GDN_PF_SCAN_THREADS: usize = 512;"),
+        cuda_rs().contains("const GDN_PF_SCAN_THREADS: usize = 512;"),
         "GDN_PF_SCAN_THREADS が 512 でない"
     );
     assert!(
-        CUDA_RS.contains("const GDN_PF_DK: usize = 128;"),
+        cuda_rs().contains("const GDN_PF_DK: usize = 128;"),
         "GDN_PF_DK が 128 でない"
     );
 }
@@ -6746,13 +6776,13 @@ fn gdn_pf_scan_kernel_is_wired() {
 #[test]
 fn gdn_pf_fast_gate_defaults_on() {
     assert!(
-        CUDA_RS.contains("Some(s) => !matches!(s.as_str(), \"0\" | \"off\" | \"false\" | \"no\" | \"\"),"),
+        cuda_rs().contains("Some(s) => !matches!(s.as_str(), \"0\" | \"off\" | \"false\" | \"no\" | \"\"),"),
         "gdn_pf_fast_from_value の真理値表が変わった"
     );
-    let i = CUDA_RS
+    let i = cuda_rs()
         .find("pub(crate) fn gdn_pf_fast_from_value")
         .expect("gdn_pf_fast_from_value が無い");
-    let body = &CUDA_RS[i..(i + 400).min(CUDA_RS.len())];
+    let body = &cuda_rs()[i..(i + 400).min(cuda_rs().len())];
     assert!(
         body.contains("None => true,"),
         "gdn_pf_fast_from_value(None) が on でない: {body}"
@@ -6831,11 +6861,11 @@ fn pf_tc2_gemm_tile_matches_host() {
 
     // 起動形状: blockDim 256・動的 smem 0 (カーネルは静的配列)。
     assert!(
-        CUDA_RS.contains("(256, 1, 1), 0, &mut args)?;"),
+        cuda_rs().contains("(256, 1, 1), 0, &mut args)?;"),
         "ホストが動的 smem を渡している (カーネルは静的配列なので 0 のはず)"
     );
     assert!(
-        CUDA_RS.contains("const TC2_BN: usize = 128;"),
+        cuda_rs().contains("const TC2_BN: usize = 128;"),
         "cuda.rs に TC2_BN のミラーが無い"
     );
 }
@@ -6873,7 +6903,7 @@ fn pf_tc2_gemm_is_bf16_mma_and_kquant() {
             "入口 {name} が無い"
         );
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
     }
@@ -7035,11 +7065,11 @@ fn pf_sn_gemm_tile_matches_host() {
         "1 ブロックの列範囲が TC_SN_BN でない"
     );
     assert!(
-        CUDA_RS.contains("let grid_x = (n_out / TC_SN_BN) as u32;"),
+        cuda_rs().contains("let grid_x = (n_out / TC_SN_BN) as u32;"),
         "ホストの grid x が TC_SN_BN で割っていない"
     );
     assert!(
-        CUDA_RS.contains("const TC_SN_BN: usize = 64;"),
+        cuda_rs().contains("const TC_SN_BN: usize = 64;"),
         "cuda.rs に TC_SN_BN のミラーが無い"
     );
     // 重みタイルは 1 組 (64 行) だけ: tid>>2 が 0..63 を覆う。
@@ -7077,7 +7107,7 @@ fn pf_sn_gemm_is_bf16_mma_and_q4k() {
             "入口 {name} が無い"
         );
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
     }
@@ -7233,11 +7263,11 @@ fn pf_sn2_gemm_tile_matches_host() {
         "1 ブロックの列範囲が TC_SN2_BN でない"
     );
     assert!(
-        CUDA_RS.contains("let grid_x = (n_out / TC_SN2_BN) as u32;"),
+        cuda_rs().contains("let grid_x = (n_out / TC_SN2_BN) as u32;"),
         "ホストの grid x が TC_SN2_BN で割っていない"
     );
     assert!(
-        CUDA_RS.contains("const TC_SN2_BN: usize = 64;"),
+        cuda_rs().contains("const TC_SN2_BN: usize = 64;"),
         "cuda.rs に TC_SN2_BN のミラーが無い"
     );
     assert!(
@@ -7266,7 +7296,7 @@ fn pf_sn2_gemm_is_bf16_mma_and_q4k() {
             "入口 {name} が無い"
         );
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
     }
@@ -7365,12 +7395,12 @@ fn pf_sn3_gemm_tile_matches_host() {
         "1 ブロックのタイル範囲が SN3_BN / SN3_BM でない"
     );
     assert!(
-        CUDA_RS.contains("let grid_x = (n_out / SN3_BN) as u32;"),
+        cuda_rs().contains("let grid_x = (n_out / SN3_BN) as u32;"),
         "ホストの grid x が SN3_BN で割っていない"
     );
     assert!(
-        CUDA_RS.contains("ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;")
-            && CUDA_RS.contains("let grid_y = m.div_ceil(SN3_BM) as u32;"),
+        cuda_rs().contains("ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;")
+            && cuda_rs().contains("let grid_y = m.div_ceil(SN3_BM) as u32;"),
         "sn3 の起動形状がカーネルの前提と違う"
     );
 }
@@ -7389,7 +7419,7 @@ fn pf_sn3_gemm_covers_q5k_and_bf16() {
             "入口 {name} が無い"
         );
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
     }
@@ -7454,10 +7484,10 @@ fn pf222_sn3_gates_are_wired_and_default_on() {
         ("pf_mix_q8_tc_from_value", "DENNO_PF_MIX_Q8TC", true),
         ("pf_tc_shared4_from_value", "DENNO_PF_TC_SHARED4", false),
     ] {
-        let at = CUDA_RS
+        let at = cuda_rs()
             .find(&format!("pub(crate) fn {fname}("))
             .unwrap_or_else(|| panic!("{fname} が無い"));
-        let body = &CUDA_RS[at..];
+        let body = &cuda_rs()[at..];
         let end = body.find("\n}").expect("関数の終わりが無い");
         let body = &body[..end];
         assert!(
@@ -7474,15 +7504,15 @@ fn pf222_sn3_gates_are_wired_and_default_on() {
         }
         // ゲートは env から読む (強制はテスト用の static)。
         assert!(
-            CUDA_RS.contains(&format!("std::env::var(\"{env}\")")),
+            cuda_rs().contains(&format!("std::env::var(\"{env}\")")),
             "{env} を env から読んでいない"
         );
     }
     // shared: sh4 (tc2, N>=2048) → sn3 → sn2 → 従来の順で、sn3 が sn2 より先。
-    let shared_at = CUDA_RS
+    let shared_at = cuda_rs()
         .find("fn pf2_gemm_shared(")
         .expect("pf2_gemm_shared が無い");
-    let shared = &CUDA_RS[shared_at..];
+    let shared = &cuda_rs()[shared_at..];
     let sh4_at = shared
         .find("pf_tc_shared4_on() && pf_tc_shared4_eligible(")
         .expect("shared に sh4 の分岐が無い");
@@ -7498,20 +7528,20 @@ fn pf222_sn3_gates_are_wired_and_default_on() {
     );
     // mix: BF16 (既定 on) と Q8_0 (task 301、既定 on) の down / up を sn3 に渡すこと。
     assert!(
-        CUDA_RS.contains(
+        cuda_rs().contains(
             "PfWKind::Bf16 if pf_mix_tc_on() => Some((crate::kquant::GgmlType::Bf16, kk * 2))"
-        ) && CUDA_RS.contains(
+        ) && cuda_rs().contains(
             "PfWKind::Quant(crate::kquant::GgmlType::Q8_0, _, rb, _) if pf_mix_q8_tc_on()"
         ),
         "mix の BF16 / Q8_0 経路が sn3 に繋がっていない"
     );
     assert!(
-        CUDA_RS.contains("return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, rb)"),
+        cuda_rs().contains("return sn3_gemm_launch(ctx, fns, ty, w, x, y, nt, kk, nn, rb)"),
         "mix の sn3 起動が行バイト数を型から渡していない"
     );
     // 入力の下限: 64 行未満 (19 トークンの next turn) は従来経路のまま。
     assert!(
-        CUDA_RS.contains("&& nt >= min_m.max(SN3_BM)"),
+        cuda_rs().contains("&& nt >= min_m.max(SN3_BM)"),
         "sn3 の行数の下限が SN3_BM でない"
     );
 }
@@ -7594,10 +7624,10 @@ fn pf222_attn_pf2_tile_matches_host() {
 /// ゲートが既定 on (lab t222b で採用) で、`pf_full_out` の起動が v2 と従来で切り替わること。
 #[test]
 fn pf222_attn_pf2_gate_is_wired_and_default_on() {
-    let at = CUDA_RS
+    let at = cuda_rs()
         .find("pub(crate) fn pf_attn_tc_from_value(")
         .expect("pf_attn_tc_from_value が無い");
-    let body = &CUDA_RS[at..];
+    let body = &cuda_rs()[at..];
     let end = body.find("\n}").expect("関数の終わりが無い");
     let body = &body[..end];
     assert!(
@@ -7609,26 +7639,26 @@ fn pf222_attn_pf2_gate_is_wired_and_default_on() {
         "既定が on でない (lab t222b で採用)"
     );
     assert!(
-        CUDA_RS.contains("std::env::var(\"DENNO_PF_ATTN_TC\")"),
+        cuda_rs().contains("std::env::var(\"DENNO_PF_ATTN_TC\")"),
         "DENNO_PF_ATTN_TC を env から読んでいない"
     );
     // 起動の切り替え: ゲートと形 (dh) と PTX の有無を見て、ダメなら従来カーネルへ。
     // task 230: v3 (DENNO_PF_ATTN_V3) が優先で、v2 はその次。
     assert!(
-        CUDA_RS.contains("let use_v2 = !use_v3\n                    && pf_attn_tc_on()")
-            && CUDA_RS.contains("&& dh == ATTN_PF2_DH")
-            && CUDA_RS.contains("&& !ctx.f_attn_pf2.is_null();"),
+        cuda_rs().contains("let use_v2 = !use_v3\n                    && pf_attn_tc_on()")
+            && cuda_rs().contains("&& dh == ATTN_PF2_DH")
+            && cuda_rs().contains("&& !ctx.f_attn_pf2.is_null();"),
         "pf_full_out が v2 の形 (dh / PTX) を検査していない"
     );
     // 従来カーネルへの切り戻しが else 側に残っていること。
     assert!(
-        CUDA_RS.contains("ctx.f_attn_pf2,")
-            && CUDA_RS.contains("(attn_pf_sh_f(dh) * 4) as u32,"),
+        cuda_rs().contains("ctx.f_attn_pf2,")
+            && cuda_rs().contains("(attn_pf_sh_f(dh) * 4) as u32,"),
         "v2 が使えないときの従来カーネルへの切り戻しが無い"
     );
     // PTX 名と引数 (12 個) の一致。
     assert!(
-        CUDA_RS.contains("b\"dno_attention_prefill2\\0\""),
+        cuda_rs().contains("b\"dno_attention_prefill2\\0\""),
         "cuda.rs が dno_attention_prefill2 を読んでいない"
     );
     let sig = ATTN_PF2_SRC
@@ -7751,7 +7781,7 @@ fn pf230_attn_pf3_tile_matches_host() {
     );
     // PTX の入口名と引数 (12 個) の一致。
     assert!(
-        CUDA_RS.contains("b\"dno_attention_prefill3\\0\""),
+        cuda_rs().contains("b\"dno_attention_prefill3\\0\""),
         "cuda.rs が dno_attention_prefill3 を読んでいない"
     );
     let sig = ATTN_PF3_SRC
@@ -7859,11 +7889,11 @@ fn task465_pf_attn_v4_is_v3_with_bf16_kv() {
     );
     // PTX の入口名と引数 (12 個) の一致。
     assert!(
-        CUDA_RS.contains("b\"dno_attention_prefill4\\0\""),
+        cuda_rs().contains("b\"dno_attention_prefill4\\0\""),
         "cuda.rs が dno_attention_prefill4 を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("b\"dno_kv_f32_to_bf16\\0\""),
+        cuda_rs().contains("b\"dno_kv_f32_to_bf16\\0\""),
         "cuda.rs が dno_kv_f32_to_bf16 を読んでいない"
     );
     for (entry, want) in [("dno_attention_prefill4", 11), ("dno_kv_f32_to_bf16", 6)] {
@@ -8003,8 +8033,8 @@ fn pf230_gates_are_wired_and_defaults_set() {
             true,
         ),
     ] {
-        let at = CUDA_RS.find(fname).unwrap_or_else(|| panic!("{fname} が無い"));
-        let body = &CUDA_RS[at..];
+        let at = cuda_rs().find(fname).unwrap_or_else(|| panic!("{fname} が無い"));
+        let body = &cuda_rs()[at..];
         let end = body.find("\n}").expect("関数の終わりが無い");
         let body = &body[..end];
         assert!(
@@ -8019,23 +8049,23 @@ fn pf230_gates_are_wired_and_defaults_set() {
             if default_on { "on" } else { "off" }
         );
         assert!(
-            CUDA_RS.contains(&format!("std::env::var(\"{var}\")")),
+            cuda_rs().contains(&format!("std::env::var(\"{var}\")")),
             "{var} を env から読んでいない"
         );
     }
     // v3 の起動: ゲートと形 (dh) と PTX の有無を見て、ダメなら v2 / 従来へ。
     assert!(
-        CUDA_RS.contains("let use_v3 = pf_attn_v3_on()")
-            && CUDA_RS.contains("&& dh == ATTN_PF3_DH")
-            && CUDA_RS.contains("&& !ctx.f_attn_pf3.is_null();"),
+        cuda_rs().contains("let use_v3 = pf_attn_v3_on()")
+            && cuda_rs().contains("&& dh == ATTN_PF3_DH")
+            && cuda_rs().contains("&& !ctx.f_attn_pf3.is_null();"),
         "pf_full_out が v3 の形 (dh / PTX) を検査していない"
     );
     assert!(
-        CUDA_RS.contains("(heads as u32, nt.div_ceil(ATTN_PF3_BQ) as u32, 1),"),
+        cuda_rs().contains("(heads as u32, nt.div_ceil(ATTN_PF3_BQ) as u32, 1),"),
         "v3 のグリッドが (head, クエリブロック) でない"
     );
     assert!(
-        CUDA_RS.contains("let use_v2 = !use_v3"),
+        cuda_rs().contains("let use_v2 = !use_v3"),
         "v3 が使えないときの v2 への切り戻しが無い"
     );
     // MIXKEEP: full 層の attn mix で D2H を飛ばし、qkv がデバイスから読む。
@@ -8051,12 +8081,12 @@ fn pf230_gates_are_wired_and_defaults_set() {
         "MIXKEEP の層種別の切り分けが無い"
     );
     assert!(
-        CUDA_RS.contains("let xptr = match pf2_dev_x(x, nt, e) {")
-            && CUDA_RS.contains("fn pf2_dev_x(x: &[f32], nt: usize, e: usize) -> Option<CUdeviceptr> {"),
+        cuda_rs().contains("let xptr = match pf2_dev_x(x, nt, e) {")
+            && cuda_rs().contains("fn pf2_dev_x(x: &[f32], nt: usize, e: usize) -> Option<CUdeviceptr> {"),
         "qkv がデバイス入力を読む経路が無い"
     );
     assert!(
-        CUDA_RS.contains("pub(crate) fn pf_mixed_restore_host("),
+        cuda_rs().contains("pub(crate) fn pf_mixed_restore_host("),
         "dev-only を降ろす経路が無い (古いバイト列で計算する)"
     );
     assert!(
@@ -8087,7 +8117,7 @@ fn pf3_kernels_gate_and_gather() {
         "dno_pf3_gather が無い"
     );
     assert!(
-        CUDA_RS.contains("b\"dno_pf3_gate_mul\\0\"") && CUDA_RS.contains("b\"dno_pf3_gather\\0\""),
+        cuda_rs().contains("b\"dno_pf3_gate_mul\\0\"") && cuda_rs().contains("b\"dno_pf3_gather\\0\""),
         "cuda.rs が pf3 の入口を読んでいない"
     );
     // gate: qg の 1 トークンあたりの行数は ld (融合 1 本なら 13,312)。
@@ -8153,15 +8183,15 @@ fn gemv_v5_kernels_have_the_v4_abi() {
     }
     // cuda.rs 側のカーネル名と ABI 検査 (8 本) が揃っている。
     assert!(
-        CUDA_RS.contains(r#"const V5_KERNEL_NAMES: [&str; 2] = ["dno_gemv_q8_0_v5", "dno_gemv_q4k_v5"];"#),
+        cuda_rs().contains(r#"const V5_KERNEL_NAMES: [&str; 2] = ["dno_gemv_q8_0_v5", "dno_gemv_q4k_v5"];"#),
         "cuda.rs の V5_KERNEL_NAMES が 2 本揃っていない"
     );
     assert!(
-        CUDA_RS.contains("const V5_NARGS: usize = 8;"),
+        cuda_rs().contains("const V5_NARGS: usize = 8;"),
         "v5 の ABI 検査が 8 引数でない"
     );
     // 起動は v4 と同じ `gdn_launch_gemv_dev` (引数の並びを共有する)。
-    let body = fn_body(CUDA_RS, "fn gdn_launch_gemv_dev(");
+    let body = fn_body(cuda_rs(), "fn gdn_launch_gemv_dev(");
     for line in [
         "let (mut pw, mut px, mut po) = (dev_w.ptr(), x_dev, out_dev);",
         "let (mut n_in_c, mut n_out_c, mut rb_c) = (n_in as c_int, n_out as c_int, rb as c_int);",
@@ -8170,7 +8200,7 @@ fn gemv_v5_kernels_have_the_v4_abi() {
         assert!(body.contains(line), "gdn_launch_gemv_dev の引数組み立てが変わった: {line}");
     }
     // 計画: 8 行/ブロック・レーンは「担当単位が割り切れる最大の 2 の冪」。
-    let plan = fn_body(CUDA_RS, "fn plan_moe_gemv_v5(");
+    let plan = fn_body(cuda_rs(), "fn plan_moe_gemv_v5(");
     assert!(plan.contains("const ROWS: usize = 8;"), "v5 の rows が 8 でない");
     // task 281: 上限は env (`DENNO_GEMV_V5_LANES`)。既定は 8 = task 184 のまま。
     assert!(
@@ -8178,11 +8208,11 @@ fn gemv_v5_kernels_have_the_v4_abi() {
         "v5 のレーン決定が per_unit / 上限 (env) でない"
     );
     assert!(
-        CUDA_RS.contains("fn parse_v5_lanes(raw: Option<&str>) -> usize {"),
+        cuda_rs().contains("fn parse_v5_lanes(raw: Option<&str>) -> usize {"),
         "task 281: lane 上限の解釈が無い"
     );
     assert!(
-        CUDA_RS.contains("parse_v5_lanes(std::env::var(\"DENNO_GEMV_V5_LANES\").ok().as_deref())"),
+        cuda_rs().contains("parse_v5_lanes(std::env::var(\"DENNO_GEMV_V5_LANES\").ok().as_deref())"),
         "task 281: DENNO_GEMV_V5_LANES を読んでいない"
     );
     assert!(
@@ -8208,7 +8238,7 @@ const MIX_PF_SRC: &str = include_str!("../kernels/kernels_mix_pf.cu");
 #[test]
 fn mix_pf_gemm_kernel_is_wired() {
     assert!(
-        CUDA_RS.contains("b\"dno_mix_pf_gemm\\0\""),
+        cuda_rs().contains("b\"dno_mix_pf_gemm\\0\""),
         "cuda.rs が dno_mix_pf_gemm を読んでいない"
     );
     assert!(
@@ -8252,7 +8282,7 @@ fn mix_pf_gemm_kernel_is_wired() {
         "build_ptx.sh の targets_all に mix_pf が無い: {targets}"
     );
     // 起動サイト: block は 128 に静的解決できる
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     assert_eq!(
         map.block_status("dno_mix_pf_gemm"),
         ShapeStatus::Resolved([128, 1, 1]),
@@ -8265,7 +8295,7 @@ fn mix_pf_gemm_kernel_is_wired() {
         "pub(crate) const MIX_PF_BM: usize = 32;",
         "pub(crate) const MIX_PF_THREADS: usize = 128;",
     ] {
-        assert!(CUDA_RS.contains(line), "{line} が無い");
+        assert!(cuda_rs().contains(line), "{line} が無い");
     }
 }
 
@@ -8273,10 +8303,10 @@ fn mix_pf_gemm_kernel_is_wired() {
 /// (採択したらこのテストも on 側へ直す)。
 #[test]
 fn mix_pf_fast_gate_defaults_off() {
-    let i = CUDA_RS
+    let i = cuda_rs()
         .find("pub(crate) fn mix_pf_fast_from_value")
         .expect("mix_pf_fast_from_value が無い");
-    let body: String = CUDA_RS[i..].chars().take(200).collect();
+    let body: String = cuda_rs()[i..].chars().take(200).collect();
     assert!(
         body.contains("None => false,"),
         "mix_pf_fast_from_value(None) が off でない: {body}"
@@ -8294,7 +8324,7 @@ const MIX_INJ_SRC: &str = include_str!("../kernels/kernels_mix_inj.cu");
 #[test]
 fn mix_inj_gemv_kernel_is_wired() {
     assert!(
-        CUDA_RS.contains("b\"dno_mix_inj_bf16\\0\""),
+        cuda_rs().contains("b\"dno_mix_inj_bf16\\0\""),
         "cuda.rs が dno_mix_inj_bf16 を読んでいない"
     );
     assert!(
@@ -8325,7 +8355,7 @@ fn mix_inj_gemv_kernel_is_wired() {
         targets.contains("mix_inj"),
         "build_ptx.sh の targets_all に mix_inj が無い: {targets}"
     );
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     assert_eq!(
         map.block_status("dno_mix_inj_bf16"),
         ShapeStatus::Resolved([128, 1, 1]),
@@ -8336,17 +8366,17 @@ fn mix_inj_gemv_kernel_is_wired() {
         "pub(crate) const MIX_INJ_THREADS: usize = 128;",
         "pub(crate) const MIX_INJ_MAX_N: usize = 8;",
     ] {
-        assert!(CUDA_RS.contains(line), "{line} が無い");
+        assert!(cuda_rs().contains(line), "{line} が無い");
     }
 }
 
 /// ゲート (`DENNO_PF_MIX_INJ`) の既定は **off** (lab の結果で決める)。
 #[test]
 fn mix_inj_gate_defaults_off() {
-    let i = CUDA_RS
+    let i = cuda_rs()
         .find("pub(crate) fn mix_inj_from_value")
         .expect("mix_inj_from_value が無い");
-    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    let body: String = cuda_rs()[i..].chars().take(300).collect();
     assert!(
         body.contains("None => false,"),
         "mix_inj_from_value(None) が off でない: {body}"
@@ -8370,7 +8400,7 @@ fn gdn_pf2_scan_kernel_is_wired() {
             "kernels_gdn_pf2.cu に {name} が無い"
         );
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
     }
@@ -8435,23 +8465,23 @@ fn gdn_pf2_scan_kernel_is_wired() {
 #[test]
 fn gemv_v5_is_opt_in_through_the_existing_selector() {
     assert!(
-        CUDA_RS.contains(r#""DENNO_GDN_DEC_GEMV""#),
+        cuda_rs().contains(r#""DENNO_GDN_DEC_GEMV""#),
         "既存のセレクタ env が無い"
     );
     assert!(
-        CUDA_RS.contains(r#"Some("v5") => GdnDecGemv::V5,"#),
+        cuda_rs().contains(r#"Some("v5") => GdnDecGemv::V5,"#),
         "DENNO_GDN_DEC_GEMV=v5 の解釈が無い"
     );
     assert!(
-        CUDA_RS.contains("const GDN_DEC_GEMV5_DEFAULT: bool = true;"),
+        cuda_rs().contains("const GDN_DEC_GEMV5_DEFAULT: bool = true;"),
         "v5 が既定 on でない (lab t184a で採否 yes)"
     );
     assert!(
-        CUDA_RS.contains("kernels_moe_v5.ptx"),
+        cuda_rs().contains("kernels_moe_v5.ptx"),
         "v5 の PTX パスが無い"
     );
     // v5 の形が合わない単位は v4 へ落ちる (CPU へは落とさない)。
-    let v4on = fn_body(CUDA_RS, "fn gdn_dec_gemv_v4_on(");
+    let v4on = fn_body(cuda_rs(), "fn gdn_dec_gemv_v4_on(");
     assert!(
         v4on.contains("GdnDecGemv::V5"),
         "v5 選択時に v4 へ落ちる経路が無い"
@@ -8475,14 +8505,14 @@ fn mix_dev_kernels_abi_and_gate() {
     );
     // host 側: 5 引数ずつで起動している (並びはカーネルと同じ)。
     assert!(
-        CUDA_RS.contains(r#"if ptx_entry_params(&text, "dno_mix_norm") != Some(5)"#),
+        cuda_rs().contains(r#"if ptx_entry_params(&text, "dno_mix_norm") != Some(5)"#),
         "norm の ABI 検査が無い"
     );
     assert!(
-        CUDA_RS.contains(r#"|| ptx_entry_params(&text, "dno_mix_inj") != Some(5)"#),
+        cuda_rs().contains(r#"|| ptx_entry_params(&text, "dno_mix_inj") != Some(5)"#),
         "inject の ABI 検査が無い"
     );
-    let chain3 = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    let chain3 = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_bf16_chain3_into(");
     for line in [
         "let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());",
         "let (mut ec, mut epsc) = (e as c_int, eps);",
@@ -8502,7 +8532,7 @@ fn mix_dev_kernels_abi_and_gate() {
     }
     // ゲートは既定 off (採否前)。
     assert!(
-        CUDA_RS.contains("const MIX_DEC_DEV_DEFAULT: bool = true;"),
+        cuda_rs().contains("const MIX_DEC_DEV_DEFAULT: bool = true;"),
         "DENNO_MIX_DEC_DEV が既定 on でない (lab t184a で採否 yes)"
     );
     // build_ptx.sh: mix_dev が nofmad で targets に入っている。
@@ -8545,7 +8575,7 @@ fn gdn_scan2_kernel_is_wired() {
     let p = kernel_params(GDN_SCAN2_SRC, "dno_gdn_scan_sig2");
     assert_eq!(p.len(), 23, "scan2 の引数が 23 本でない: {}", p.len());
     // ホスト側: dk == dv == 128 のときだけ選び、block は 4*dk。
-    let pick = fn_body(CUDA_RS, "fn gdn_scan_pick(");
+    let pick = fn_body(cuda_rs(), "fn gdn_scan_pick(");
     assert!(
         pick.contains("dk == 128 && dv == 128"),
         "scan2 の形の門番が無い"
@@ -8555,19 +8585,19 @@ fn gdn_scan2_kernel_is_wired() {
         "scan2 の block が 4*dk でない"
     );
     assert!(
-        CUDA_RS.contains(r#"if ptx_entry_params(&text, "dno_gdn_scan_sig2") != Some(23)"#),
+        cuda_rs().contains(r#"if ptx_entry_params(&text, "dno_gdn_scan_sig2") != Some(23)"#),
         "scan2 の ABI 検査が無い"
     );
     assert!(
-        CUDA_RS.contains("(scan_thr, 1, 1),"),
+        cuda_rs().contains("(scan_thr, 1, 1),"),
         "起動が scan_thr を使っていない"
     );
     // ゲートは lab t184a の採否で既定 on。
     assert!(
-        CUDA_RS.contains("const GDN_SCAN2_DEFAULT: bool = true;"),
+        cuda_rs().contains("const GDN_SCAN2_DEFAULT: bool = true;"),
         "scan2 が既定 on でない (lab t184a で採否 yes)"
     );
-    let gate = fn_body(CUDA_RS, "fn gdn_scan2_from_value(");
+    let gate = fn_body(cuda_rs(), "fn gdn_scan2_from_value(");
     assert!(
         gate.contains(r#""0" | "false" | "off" | "no""#),
         "scan2 の真理値表に明示 off が無い"
@@ -8656,7 +8686,7 @@ fn gdn_scan3_kernel_is_wired() {
     ));
     assert_eq!(params.len(), 23, "scan3 の引数が 23 本でない: {}", params.len());
     // ホスト側: 第 2 版より先に選び、block は 8*dk。
-    let pick = fn_body(CUDA_RS, "fn gdn_scan_pick(");
+    let pick = fn_body(cuda_rs(), "fn gdn_scan_pick(");
     assert!(
         pick.contains("return (f, (4 * dk) as u32);"),
         "scan3 の block が 4*dk でない"
@@ -8666,12 +8696,12 @@ fn gdn_scan3_kernel_is_wired() {
         "scan3 が第 2 版より先に選ばれていない"
     );
     assert!(
-        CUDA_RS.contains(r#"if ptx_entry_params(&text, "dno_gdn_scan_sig3") != Some(23)"#),
+        cuda_rs().contains(r#"if ptx_entry_params(&text, "dno_gdn_scan_sig3") != Some(23)"#),
         "scan3 の ABI 検査が無い"
     );
     // ゲートは lab t592c の採否で既定 on (ssm 段 -2.8%、値は scan2 とビット一致)。
     assert!(
-        CUDA_RS.contains("const GDN_SCAN3_DEFAULT: bool = true;"),
+        cuda_rs().contains("const GDN_SCAN3_DEFAULT: bool = true;"),
         "scan3 が既定 on でない (lab t592c で採否 yes)"
     );
     assert!(
@@ -8760,7 +8790,7 @@ fn dec_epi_kernel_is_registered_in_build_ptx() {
         "targets_all に dec_epi が無い: {targets}"
     );
     // Rust 側は同じ 8 引数をこの順で渡す (h, w, sh, sgw, out, e, nseg, has_sh)。
-    let body = fn_body(CUDA_RS, "fn iq_layer_run<F>(");
+    let body = fn_body(cuda_rs(), "fn iq_layer_run<F>(");
     let launch = &body[body.find("dno_dec_exp_sum").unwrap_or(0)..];
     for p in ["let mut ph = h.ptr;", "let mut pwv = w_addr", "let mut psh = std::ptr::null_mut"] {
         assert!(launch.contains(p), "起動配列に {p} が無い");
@@ -8835,7 +8865,7 @@ fn gdn_pf2_kernel_is_wired() {
         "build_ptx.sh の targets_all に gdn_pf2 が無い: {targets}"
     );
     // 起動サイトの block 形状
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     assert_eq!(
         map.block_status("dno_gdn_pf_scan64"),
         ShapeStatus::Resolved([256, 1, 1]),
@@ -8854,7 +8884,7 @@ fn gdn_pf2_kernel_is_wired() {
         "pub(crate) const GDN_PF2_COLS: usize = 64;",
         "pub(crate) const GDN_PF2_NORM_THREADS: usize = 128;",
     ] {
-        assert!(CUDA_RS.contains(line), "{line} が無い");
+        assert!(cuda_rs().contains(line), "{line} が無い");
     }
 }
 
@@ -8862,10 +8892,10 @@ fn gdn_pf2_kernel_is_wired() {
 /// scan_pf 2,853 -> 1,295 ms・wall -3.2%・md5 SAME を確認して既定を反転した)。
 #[test]
 fn gdn_pf2_gate_defaults_on() {
-    let i = CUDA_RS
+    let i = cuda_rs()
         .find("pub(crate) fn gdn_pf2_from_value")
         .expect("gdn_pf2_from_value が無い");
-    let body: String = CUDA_RS[i..].chars().take(400).collect();
+    let body: String = cuda_rs()[i..].chars().take(400).collect();
     assert!(
         body.contains("None => true,"),
         "gdn_pf2_from_value(None) が on でない: {body}"
@@ -8886,7 +8916,7 @@ fn gdn_pf2_gate_defaults_on() {
 /// ストリーム) の完了待ちが mix の壁時計に戻る (t187c の 3.6 s)。
 #[test]
 fn pf_mix_stage_sync_uses_an_event() {
-    let body = fn_body(CUDA_RS, "fn pf_sync_own_stream");
+    let body = fn_body(cuda_rs(), "fn pf_sync_own_stream");
     assert!(
         body.contains("check(es(ev)"),
         "cuEventSynchronize を呼んでいない: {body}"
@@ -8896,7 +8926,7 @@ fn pf_mix_stage_sync_uses_an_event() {
         "CU_EVENT_DISABLE_TIMING でイベントを作っていない: {body}"
     );
     assert!(
-        CUDA_RS.contains("CU_STREAM_NON_BLOCKING"),
+        cuda_rs().contains("CU_STREAM_NON_BLOCKING"),
         "upload が非ブロッキングである根拠 (と 0x01 の定義) が消えた"
     );
     // mix と combine の両方がこの同期を通る (片方だけだと待ちが残る)。
@@ -8905,12 +8935,12 @@ fn pf_mix_stage_sync_uses_an_event() {
     // 通り、そこから `pf_stage_sync` を呼ぶ。steer の 2 本は直呼びのまま
     // (ホストが直後に読むので、待ちを外してはいけない)。
     assert_eq!(
-        CUDA_RS.matches("pf_stage_sync(ctx)").count(),
+        cuda_rs().matches("pf_stage_sync(ctx)").count(),
         3,
         "steer 2 本 + `pf_stage_sync_maybe` の中の 1 本"
     );
     assert_eq!(
-        CUDA_RS.matches("pf_stage_sync_maybe(ctx)").count(),
+        cuda_rs().matches("pf_stage_sync_maybe(ctx)").count(),
         2,
         "pf_mix / pf_combine がゲート付きの同期を通っていない"
     );
@@ -8922,7 +8952,7 @@ fn pf_mix_stage_sync_uses_an_event() {
         "pf_mix_kprof::begin(pf_mix_kprof::INJ)",
         "pf_mix_kprof::collect()",
     ] {
-        assert!(CUDA_RS.contains(k), "mix の段計測 {k} が無い");
+        assert!(cuda_rs().contains(k), "mix の段計測 {k} が無い");
     }
 }
 
@@ -8964,19 +8994,19 @@ fn gemv_v5_q5k_kernel_is_wired() {
     );
     // cuda.rs: 別ファイルを読み、名前と 8 引数を検査している。
     assert!(
-        CUDA_RS.contains("kernels_moe_v5_q5k.ptx"),
+        cuda_rs().contains("kernels_moe_v5_q5k.ptx"),
         "cuda.rs が kernels_moe_v5_q5k.ptx を読んでいない"
     );
     assert!(
-        CUDA_RS.contains(r#"const V5_Q5K_KERNEL_NAME: &str = "dno_gemv_q5k_v5";"#),
+        cuda_rs().contains(r#"const V5_Q5K_KERNEL_NAME: &str = "dno_gemv_q5k_v5";"#),
         "cuda.rs のカーネル名が変わった"
     );
     assert!(
-        CUDA_RS.contains("ptx_entry_params(&text, V5_Q5K_KERNEL_NAME) != Some(V5_NARGS)"),
+        cuda_rs().contains("ptx_entry_params(&text, V5_Q5K_KERNEL_NAME) != Some(V5_NARGS)"),
         "Q5_K の ABI (8 引数) 検査が無い"
     );
     // 計画: Q5_K は Q4_K と同じくスーパーブロック単位・v5 のゲートで切れる。
-    let plan = fn_body(CUDA_RS, "fn plan_moe_gemv_v5(");
+    let plan = fn_body(cuda_rs(), "fn plan_moe_gemv_v5(");
     assert!(
         plan.contains("T::Q5K => {"),
         "plan_moe_gemv_v5 に Q5_K の腕が無い"
@@ -9047,14 +9077,14 @@ fn mix_fold_kernel_is_wired() {
     );
     // cuda.rs: 別ファイル・9 引数・ゲート・起動 (grid 1 / block 256)。
     assert!(
-        CUDA_RS.contains("kernels_mix_dev2.ptx"),
+        cuda_rs().contains("kernels_mix_dev2.ptx"),
         "cuda.rs が kernels_mix_dev2.ptx を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("const MIX_FOLD_NARGS: usize = 9;"),
+        cuda_rs().contains("const MIX_FOLD_NARGS: usize = 9;"),
         "fold 版の ABI 検査が 9 引数でない"
     );
-    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    let body = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
         body.contains("mix_dec_fold_on() && hc <= 4"),
         "fold 版の門番 (hc <= 4) が無い"
@@ -9089,23 +9119,23 @@ fn mix_fold_kernel_is_wired() {
 /// task 192: full 層の GEMV は `DENNO_FULL_DEC_FAST` の下で v5 -> v4 -> 従来。
 #[test]
 fn full_dec_fast_plans_v5_first() {
-    let plan = fn_body(CUDA_RS, "fn dec_plan(");
+    let plan = fn_body(cuda_rs(), "fn dec_plan(");
     let v5 = plan.find("plan_moe_gemv_v5").unwrap_or(usize::MAX);
     let v4 = plan.find("plan_moe_gemv_v4").unwrap_or(usize::MAX);
     let old = plan.find("plan_moe_gemv(ty, k, n, gemv_kernel_mode())").unwrap_or(usize::MAX);
     assert!(v5 < v4 && v4 < old, "dec_plan の優先順が v5 -> v4 -> 従来でない");
-    let body = fn_body(CUDA_RS, "fn forward_inner(");
+    let body = fn_body(cuda_rs(), "fn forward_inner(");
     assert!(
         body.contains("dec_plan(ctx, u.ty, u.k, u.n)?"),
         "full の qkv GEMV が dec_plan を通っていない"
     );
-    let wo = fn_body(CUDA_RS, "fn wo_plan(");
+    let wo = fn_body(cuda_rs(), "fn wo_plan(");
     assert!(
         wo.contains("plan_moe_gemv_v5(a.wo_ty, a.wo_k, a.wo_n)"),
         "wo の plan が v5 を先に試していない"
     );
     assert!(
-        CUDA_RS.contains(r#"std::env::var("DENNO_FULL_DEC_FAST")"#),
+        cuda_rs().contains(r#"std::env::var("DENNO_FULL_DEC_FAST")"#),
         "DENNO_FULL_DEC_FAST の読み取りが無い"
     );
 }
@@ -9114,7 +9144,7 @@ fn full_dec_fast_plans_v5_first() {
 /// 共有 expert の enqueue より前に `begin` を通ること。
 #[test]
 fn dec_router_early_splits_begin_and_finish() {
-    let begin = fn_body(CUDA_RS, "pub fn maybe_gpu_router_gemv_begin(");
+    let begin = fn_body(cuda_rs(), "pub fn maybe_gpu_router_gemv_begin(");
     assert!(
         !begin.contains("sync_default_or_ctx"),
         "begin が同期している (early の意味が無い)"
@@ -9123,7 +9153,7 @@ fn dec_router_early_splits_begin_and_finish() {
         begin.contains("ROUTER_PENDING_N.with(|c| c.set(n));"),
         "begin が pending を記録していない"
     );
-    let fin = fn_body(CUDA_RS, "pub fn maybe_gpu_router_gemv_finish(");
+    let fin = fn_body(cuda_rs(), "pub fn maybe_gpu_router_gemv_finish(");
     assert!(
         fin.contains("sync_default_or_ctx(ctx, router_fused_enabled())?"),
         "finish が既定ストリームだけを待っていない"
@@ -9132,7 +9162,7 @@ fn dec_router_early_splits_begin_and_finish() {
         fin.contains("out.copy_from_slice(&ho.as_slice::<f32>()[..n]);"),
         "finish がロジットを写していない"
     );
-    let into = fn_body(CUDA_RS, "pub fn maybe_gpu_router_gemv_into(");
+    let into = fn_body(cuda_rs(), "pub fn maybe_gpu_router_gemv_into(");
     assert!(
         into.contains("maybe_gpu_router_gemv_begin(uid, bytes, k, n, x)")
             && into.contains("maybe_gpu_router_gemv_finish(out)"),
@@ -9148,7 +9178,7 @@ fn dec_router_early_splits_begin_and_finish() {
         "finish の呼び出しが無い"
     );
     assert!(
-        CUDA_RS.contains(r#"std::env::var("DENNO_DEC_ROUTER_EARLY")"#),
+        cuda_rs().contains(r#"std::env::var("DENNO_DEC_ROUTER_EARLY")"#),
         "DENNO_DEC_ROUTER_EARLY の読み取りが無い"
     );
 }
@@ -9167,7 +9197,7 @@ fn mix_up_warp_per_row_kernel_is_wired() {
         vec!["x", "w", "out", "k", "n"],
         "dno_mix_up_bf16 の引数が (x, w, out, k, n) と違う: {p:?}"
     );
-    let launch = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    let launch = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
         launch.contains("let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());"),
         "up の起動が (入力, 重み, 出力) の順でない"
@@ -9196,18 +9226,18 @@ fn mix_up_warp_per_row_kernel_is_wired() {
     );
     // cuda.rs: 別ファイル・5 引数・fold ゲート・grid = n/8。
     assert!(
-        CUDA_RS.contains("kernels_mix_up.ptx"),
+        cuda_rs().contains("kernels_mix_up.ptx"),
         "cuda.rs が kernels_mix_up.ptx を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("const MIX_UP_NARGS: usize = 5;"),
+        cuda_rs().contains("const MIX_UP_NARGS: usize = 5;"),
         "up 版の ABI 検査が 5 引数でない"
     );
     assert!(
-        CUDA_RS.contains("const MIX_UP_ROWS: usize = 8;"),
+        cuda_rs().contains("const MIX_UP_ROWS: usize = 8;"),
         "up 版の行数ミラーが無い"
     );
-    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    let body = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_bf16_chain3_into(");
     // task 216: up 版の選択は「融合版が選ばれていない」「upw ゲート」「up_reduce」
     // 「k2 % 8」の 4 条件を全部見る (行の折り返しに依らず条件ごとに固定する)。
     assert!(
@@ -9283,18 +9313,18 @@ fn mix_down_uint4_kernel_is_wired() {
     );
     // cuda.rs: 別ファイル・6 引数・512 スレッド・ゲート・k % 8 の門番。
     assert!(
-        CUDA_RS.contains("kernels_mix_down.ptx"),
+        cuda_rs().contains("kernels_mix_down.ptx"),
         "cuda.rs が kernels_mix_down.ptx を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("const MIX_DOWN_NARGS: usize = 6;"),
+        cuda_rs().contains("const MIX_DOWN_NARGS: usize = 6;"),
         "down 版の ABI 検査が 6 引数でない"
     );
     assert!(
-        CUDA_RS.contains("const MIX_DOWN_THREADS: usize = 512;"),
+        cuda_rs().contains("const MIX_DOWN_THREADS: usize = 512;"),
         "down 版のスレッド数のミラーが無い"
     );
-    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    let body = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
         body.contains("if dec_mix_downw_on() && k1 % 8 == 0 {"),
         "down 版の門番 (downw / k % 8) が無い"
@@ -9305,8 +9335,8 @@ fn mix_down_uint4_kernel_is_wired() {
     );
     // ゲートは既定 off (PTX を足しただけで既定の挙動が動かないこと)。
     assert!(
-        CUDA_RS.contains("fn dec_mix_downw_on() -> bool {")
-            && CUDA_RS.contains("parse_dec_mix_downw(std::env::var(\"DENNO_DEC_MIX_DOWNW\")"),
+        cuda_rs().contains("fn dec_mix_downw_on() -> bool {")
+            && cuda_rs().contains("parse_dec_mix_downw(std::env::var(\"DENNO_DEC_MIX_DOWNW\")"),
         "DENNO_DEC_MIX_DOWNW の口が無い"
     );
     assert!(
@@ -9365,19 +9395,19 @@ fn mix_upmix_kernel_is_wired() {
     );
     // cuda.rs 側。
     assert!(
-        CUDA_RS.contains("kernels_mix_upmix.ptx"),
+        cuda_rs().contains("kernels_mix_upmix.ptx"),
         "cuda.rs が kernels_mix_upmix.ptx を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("const MIX_UPMIX_NARGS: usize = 9;"),
+        cuda_rs().contains("const MIX_UPMIX_NARGS: usize = 9;"),
         "upmix 版の ABI 検査が 9 引数でない"
     );
     assert!(
-        CUDA_RS.contains("const MIX_UPMIX_EPB: usize = 2;")
-            && CUDA_RS.contains("const MIX_UPMIX_HC: usize = 4;"),
+        cuda_rs().contains("const MIX_UPMIX_EPB: usize = 2;")
+            && cuda_rs().contains("const MIX_UPMIX_HC: usize = 4;"),
         "upmix 版の形のミラーが無い"
     );
-    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    let body = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
         body.contains("let upmix_ver = dec_mix_upmix_ver();")
             && body.contains("if up_reduce && hc == MIX_UPMIX_HC {"),
@@ -9385,11 +9415,11 @@ fn mix_upmix_kernel_is_wired() {
     );
     // task 216: ビット一致版 (`=2`) も同じ口から選ぶ。形は grid = e / block = 256。
     assert!(
-        CUDA_RS.contains("const MIX_UPMIX2_KERNEL_NAME: &str = \"dno_mix_upmix2_bf16\";"),
+        cuda_rs().contains("const MIX_UPMIX2_KERNEL_NAME: &str = \"dno_mix_upmix2_bf16\";"),
         "ビット一致版のカーネル名が無い"
     );
     assert!(
-        CUDA_RS.contains("const MIX_UPMIX2_NARGS: usize = 9;"),
+        cuda_rs().contains("const MIX_UPMIX2_NARGS: usize = 9;"),
         "ビット一致版の ABI 検査が 9 引数でない"
     );
     assert!(
@@ -9464,7 +9494,7 @@ const MIX_SPLIT_SRC: &str = include_str!("../kernels/kernels_mix_split.cu");
 #[test]
 fn mix_split_gemm_kernel_is_wired() {
     assert!(
-        CUDA_RS.contains("b\"dno_mix_split_gemm\\0\""),
+        cuda_rs().contains("b\"dno_mix_split_gemm\\0\""),
         "cuda.rs が dno_mix_split_gemm を読んでいない"
     );
     assert!(
@@ -9510,9 +9540,9 @@ fn mix_split_gemm_kernel_is_wired() {
         "pub(crate) const MIX_SPLIT_BM: usize = 32;",
         "pub(crate) const MIX_SPLIT_THREADS: usize = 128;",
     ] {
-        assert!(CUDA_RS.contains(line), "{line} が無い");
+        assert!(cuda_rs().contains(line), "{line} が無い");
     }
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     assert_eq!(
         map.block_status("dno_mix_split_gemm"),
         ShapeStatus::Resolved([128, 1, 1]),
@@ -9524,10 +9554,10 @@ fn mix_split_gemm_kernel_is_wired() {
 /// ゲート (`DENNO_PF_MIX_SPLIT`) の既定は **on** (task 198 で反転。明示 off は効く)。
 #[test]
 fn mix_split_gate_defaults_on() {
-    let i = CUDA_RS
+    let i = cuda_rs()
         .find("pub(crate) fn mix_split_from_value")
         .expect("mix_split_from_value が無い");
-    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    let body: String = cuda_rs()[i..].chars().take(300).collect();
     assert!(
         body.contains("None => true,"),
         "mix_split_from_value(None) が on でない: {body}"
@@ -9549,7 +9579,7 @@ const MIX_INJ2_SRC: &str = include_str!("../kernels/kernels_mix_inj2.cu");
 #[test]
 fn mix_inj2_gemv_kernel_is_wired() {
     assert!(
-        CUDA_RS.contains("b\"dno_mix_inj2_bf16\\0\""),
+        cuda_rs().contains("b\"dno_mix_inj2_bf16\\0\""),
         "cuda.rs が dno_mix_inj2_bf16 を読んでいない"
     );
     assert!(
@@ -9587,9 +9617,9 @@ fn mix_inj2_gemv_kernel_is_wired() {
         "pub(crate) const MIX_INJ2_THREADS: usize = 256;",
         "pub(crate) const MIX_INJ2_MAX_N: usize = 8;",
     ] {
-        assert!(CUDA_RS.contains(line), "{line} が無い");
+        assert!(cuda_rs().contains(line), "{line} が無い");
     }
-    let map = launch_map_from_cuda(CUDA_RS);
+    let map = launch_map_from_cuda(cuda_rs());
     assert_eq!(
         map.block_status("dno_mix_inj2_bf16"),
         ShapeStatus::Resolved([256, 1, 1]),
@@ -9601,10 +9631,10 @@ fn mix_inj2_gemv_kernel_is_wired() {
 /// ゲート (`DENNO_PF_MIX_INJ2`) の既定は **on** (task 198 で反転。明示 off は効く)。
 #[test]
 fn mix_inj2_gate_defaults_on() {
-    let i = CUDA_RS
+    let i = cuda_rs()
         .find("pub(crate) fn mix_inj2_from_value")
         .expect("mix_inj2_from_value が無い");
-    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    let body: String = cuda_rs()[i..].chars().take(300).collect();
     assert!(
         body.contains("None => true,"),
         "mix_inj2_from_value(None) が on でない: {body}"
@@ -9623,13 +9653,13 @@ fn mix_inj2_gate_defaults_on() {
 #[test]
 fn pf_inj_f32_bf16_is_wired() {
     assert!(
-        CUDA_RS.contains("pub const PF_INJ_F32_BF16_ENV: &str = \"DENNO_PF_INJ_F32_BF16\";"),
+        cuda_rs().contains("pub const PF_INJ_F32_BF16_ENV: &str = \"DENNO_PF_INJ_F32_BF16\";"),
         "ゲート名が無い"
     );
-    let i = CUDA_RS
+    let i = cuda_rs()
         .find("pub(crate) fn pf_inj_f32_bf16_from_value")
         .expect("pf_inj_f32_bf16_from_value が無い");
-    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    let body: String = cuda_rs()[i..].chars().take(300).collect();
     assert!(
         body.contains("None => true,"),
         "既定が on でない (t617a/t617b で採否 yes): {body}"
@@ -9639,10 +9669,10 @@ fn pf_inj_f32_bf16_is_wired() {
         "明示 off の表が変わった: {body}"
     );
     // pf_weight の F32 腕: BF16 写しの表と形の判定。
-    let w = CUDA_RS
+    let w = cuda_rs()
         .find("fn pf_weight(")
         .expect("pf_weight が無い");
-    let arm: String = CUDA_RS[w..].chars().take(2200).collect();
+    let arm: String = cuda_rs()[w..].chars().take(2200).collect();
     for s in [
         "pf_inj_f32_bf16_on()",
         "mix_inj2_on()",
@@ -9654,9 +9684,9 @@ fn pf_inj_f32_bf16_is_wired() {
         assert!(arm.contains(s), "pf_weight の F32 腕に {s} が無い");
     }
     // 発火の計数が台帳に出る。
-    assert!(CUDA_RS.contains("| inj2_calls={inj2}"), "inj2_calls= が無い");
+    assert!(cuda_rs().contains("| inj2_calls={inj2}"), "inj2_calls= が無い");
     assert!(
-        CUDA_RS.contains("if tag == \"inject\" {"),
+        cuda_rs().contains("if tag == \"inject\" {"),
         "inject のときだけ数えていない"
     );
 }
@@ -9797,7 +9827,7 @@ fn pf_attn_devres_gate_defaults_on_and_is_wired() {
         "pf_attn_dev_requested() && crate::model::qwen4exp::pf_attn_devres_on()",
         "pf_attn_dev_store(po, nt, e)",
     ] {
-        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+        assert!(cuda_rs().contains(k), "cuda.rs に {k} が無い");
     }
     assert!(
         SSM_SRC.contains("if kept_dev {"),
@@ -9821,17 +9851,17 @@ fn pf209_pin_and_mixdevin_gates_default_on_and_are_wired() {
         "fn pf_pin_from_value",
         "fn pf_dev_in_from_value",
     ] {
-        let i = CUDA_RS
+        let i = cuda_rs()
             .find(name)
             .unwrap_or_else(|| panic!("cuda.rs に {name} が無い"));
-        let body: String = CUDA_RS[i..].chars().take(300).collect();
+        let body: String = cuda_rs()[i..].chars().take(300).collect();
         assert!(
             body.contains("None => true"),
             "{name} の既定が on でない: {body}"
         );
     }
     // ゲートの真理値表は unit test 側 (cuda.rs の pf_pin_tests) にある。
-    assert!(CUDA_RS.contains("mod pf_pin_tests {"), "unit test が無い");
+    assert!(cuda_rs().contains("mod pf_pin_tests {"), "unit test が無い");
     // pinned バッファと借用の口。
     for k in [
         "pub struct PfHostBuf {",
@@ -9839,7 +9869,7 @@ fn pf209_pin_and_mixdevin_gates_default_on_and_are_wired() {
         "pub fn as_mut_slice(&mut self) -> &mut [f32]",
         "static PF_HOST_FREE:",
     ] {
-        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+        assert!(cuda_rs().contains(k), "cuda.rs に {k} が無い");
     }
     // デバイス直読みの口。
     for k in [
@@ -9852,7 +9882,7 @@ fn pf209_pin_and_mixdevin_gates_default_on_and_are_wired() {
         "enum BatchIn<'a> {",
         "enum SharedIn<'a> {",
     ] {
-        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+        assert!(cuda_rs().contains(k), "cuda.rs に {k} が無い");
     }
     // 層ループ側の配線。
     for k in [
@@ -9979,7 +10009,7 @@ fn task213_gate_envs_are_real() {
     let exp_pf_src = include_str!("../src/model/exp_pf.rs");
     let batch_src = include_str!("../src/model/expert_batch.rs");
     for (env, ptx, _) in &rows {
-        let found = CUDA_RS.contains(&format!("\"{env}\""))
+        let found = cuda_rs().contains(&format!("\"{env}\""))
             || qwen_src.contains(&format!("\"{env}\""))
             || exp_pf_src.contains(&format!("\"{env}\""))
             || batch_src.contains(&format!("\"{env}\""));
@@ -10055,7 +10085,7 @@ fn cu_kernel_nargs(src: &str, name: &str) -> usize {
 fn task225_ba225_kernel_is_wired() {
     assert!(GEMM_BA225_SRC.contains("dno_gemm_f32_ba"));
     assert!(
-        CUDA_RS.contains("b\"dno_gemm_f32_ba\\0\""),
+        cuda_rs().contains("b\"dno_gemm_f32_ba\\0\""),
         "cuda.rs が dno_gemm_f32_ba を読んでいない"
     );
     for line in [
@@ -10073,15 +10103,15 @@ fn task225_ba225_kernel_is_wired() {
     );
     // ホスト側の定数がカーネルのタイルと一致する (起動形状の食い違い防止)。
     assert!(
-        CUDA_RS.contains("pub(crate) const BA225_ROWS: usize = 48;"),
+        cuda_rs().contains("pub(crate) const BA225_ROWS: usize = 48;"),
         "BA225_ROWS が .cu の BA225_ROWS と違う"
     );
     assert!(
-        CUDA_RS.contains("pub(crate) const BA225_TOKS: usize = 64;"),
+        cuda_rs().contains("pub(crate) const BA225_TOKS: usize = 64;"),
         "BA225_TOKS が .cu の BA225_TOKS と違う"
     );
     assert!(
-        CUDA_RS.contains("ctx.launch_async(fns.ba_gemm, grid, (256, 1, 1), 0, &mut args)"),
+        cuda_rs().contains("ctx.launch_async(fns.ba_gemm, grid, (256, 1, 1), 0, &mut args)"),
         "beta/alpha GEMM の block が 256 でない"
     );
     assert!(
@@ -10114,7 +10144,7 @@ fn task225_ba225_kernel_is_wired() {
         "呼び出し側が pf_ba_w_check で型・形を確かめていない"
     );
     assert!(
-        CUDA_RS.contains("pf_ba_w_check(w.ty, w.k, w.n, &ba.beta_rows, nv, e)"),
+        cuda_rs().contains("pf_ba_w_check(w.ty, w.k, w.n, &ba.beta_rows, nv, e)"),
         "gdn_pf_chain が同じ判定を使っていない"
     );
     assert!(
@@ -10123,7 +10153,7 @@ fn task225_ba225_kernel_is_wired() {
     );
     // router の logits も同じカーネルで回す (累積順が同じなので値はビット一致)。
     assert!(
-        CUDA_RS.contains("pf_ba_gemm_dev_launch(ctx, wp, xp, dlogit.ptr(), nt, k_in, n)"),
+        cuda_rs().contains("pf_ba_gemm_dev_launch(ctx, wp, xp, dlogit.ptr(), nt, k_in, n)"),
         "router の logits GEMM が専用カーネルに切り替わっていない"
     );
 }
@@ -10132,7 +10162,7 @@ fn task225_ba225_kernel_is_wired() {
 fn task225_router225_kernel_is_wired() {
     assert!(ROUTER225_SRC.contains("dno_router_softmax_topk"));
     assert!(
-        CUDA_RS.contains("b\"dno_router_softmax_topk\\0\""),
+        cuda_rs().contains("b\"dno_router_softmax_topk\\0\""),
         "cuda.rs が dno_router_softmax_topk を読んでいない"
     );
     for line in [
@@ -10153,11 +10183,11 @@ fn task225_router225_kernel_is_wired() {
         "1 ブロック 4 ワープ = 4 トークンの割り方が変わっている"
     );
     assert!(
-        CUDA_RS.contains("let grid = (nt.div_ceil(4) as u32, 1, 1);"),
+        cuda_rs().contains("let grid = (nt.div_ceil(4) as u32, 1, 1);"),
         "router カーネルの grid が ceil(nt/4) でない"
     );
     assert!(
-        CUDA_RS.contains("ctx.launch_async(f_rt, grid, (128, 1, 1), 0, &mut args)"),
+        cuda_rs().contains("ctx.launch_async(f_rt, grid, (128, 1, 1), 0, &mut args)"),
         "router カーネルの block が 128 でない"
     );
     // ゲートは qwen4exp の router 経路に配線されている (mask 有りはホストへ)。
@@ -10187,7 +10217,7 @@ fn task225_router225_kernel_is_wired() {
 fn task225_gdn_pf3_kernel_is_wired() {
     assert!(GDN_PF3_SRC.contains("dno_gdn_pf_scan32"));
     assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_scan32\\0\""),
+        cuda_rs().contains("b\"dno_gdn_pf_scan32\\0\""),
         "cuda.rs が dno_gdn_pf_scan32 を読んでいない"
     );
     for line in [
@@ -10230,11 +10260,11 @@ fn task225_gdn_pf3_kernel_is_wired() {
         "barrier が 2 個でない"
     );
     assert!(
-        CUDA_RS.contains("(nv as u32, GDN_PF3_BLOCKS, 1)"),
+        cuda_rs().contains("(nv as u32, GDN_PF3_BLOCKS, 1)"),
         "v3 スキャンの grid が (nv, 4) でない"
     );
     assert!(
-        CUDA_RS.contains("pub(crate) const GDN_PF3_BLOCKS: u32 = 4;"),
+        cuda_rs().contains("pub(crate) const GDN_PF3_BLOCKS: u32 = 4;"),
         "GDN_PF3_BLOCKS が 4 でない"
     );
     assert!(
@@ -10251,7 +10281,7 @@ fn task225_gdn_pf3_kernel_is_wired() {
     );
     // v2 の norm を再利用する (演算列を増やさない)。
     assert!(
-        CUDA_RS.contains("let norm = gdn_pf2_kernels()?.norm;"),
+        cuda_rs().contains("let norm = gdn_pf2_kernels()?.norm;"),
         "v3 が v2 の norm を使っていない"
     );
 }
@@ -10303,11 +10333,11 @@ fn steer_ptx_matches_the_host_launch_abi() {
     }
     // ホスト側のゲートがこの 3 本を名前で引いていること。
     assert!(
-        CUDA_RS.contains("b\"dno_steer_acc\\0\""),
+        cuda_rs().contains("b\"dno_steer_acc\\0\""),
         "cuda.rs が dno_steer_acc を引いていない"
     );
     assert!(
-        CUDA_RS.contains("b\"dno_steer_sub\\0\"") && CUDA_RS.contains("b\"dno_steer_proj\\0\""),
+        cuda_rs().contains("b\"dno_steer_sub\\0\"") && cuda_rs().contains("b\"dno_steer_proj\\0\""),
         "cuda.rs が sub / proj を引いていない"
     );
 }
@@ -10350,7 +10380,7 @@ fn t242_lm_work_area_is_group_local_and_experts_come_back() {
         "ゲート lm_reload_evicted を読んでいない"
     );
     // 3. ストリーミングはグループ局所のときだけ行の添字を 0 起点にする。
-    let io = fn_body(CUDA_RS, "fn moe_experts_iq_pf_layer_stream_io(");
+    let io = fn_body(cuda_rs(), "fn moe_experts_iq_pf_layer_stream_io(");
     assert!(
         io.contains("exp_pf::max_group_rows(seg, &bounds)"),
         "作業域の行数をグループの最大行数から取っていない"
@@ -10589,7 +10619,7 @@ fn t474_ram_readahead_cache_is_wired() {
         );
     }
     // 写しの側: 当たれば置き場から、外れればディスク。
-    let pin = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
+    let pin = fn_body(cuda_rs(), "fn pf_copy_into_pin(");
     let hit = pin.find("exp_pf::rc_copy_into(").expect("置き場を使っていない");
     let rd = pin.find("exp_pf::read_part_ptr(").expect("ディスクの読みが無い");
     assert!(hit < rd, "置き場の判定がディスクの読みより後ろにある");
@@ -10685,7 +10715,7 @@ fn t233_lm_steer_points_match_chunk_path() {
         "pub fn row_table_with_shared(",
     ] {
         assert!(
-            QWEN_SRC.contains(k) || CUDA_RS.contains(k) || EXP_PF_SRC.contains(k),
+            QWEN_SRC.contains(k) || cuda_rs().contains(k) || EXP_PF_SRC.contains(k),
             "どこにも {k} が無い"
         );
     }
@@ -10706,7 +10736,7 @@ fn t233_lm_steer_points_match_chunk_path() {
 fn task228_gdn_pf_wy_kernel_is_wired() {
     assert!(GDN_PF_WY_SRC.contains("dno_gdn_pf_wy32"));
     assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_wy32\\0\""),
+        cuda_rs().contains("b\"dno_gdn_pf_wy32\\0\""),
         "cuda.rs が dno_gdn_pf_wy32 を読んでいない"
     );
     for line in [
@@ -10783,7 +10813,7 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
     );
     assert_eq!(
         total,
-        CUDA_RS
+        cuda_rs()
             .lines()
             .find_map(|l| l
                 .trim()
@@ -10796,11 +10826,11 @@ fn task228_gdn_pf_wy_kernel_is_wired() {
     // task 311: 起動形状は `gdn_pf_wy_launch` の引数になったので、呼び出し側が
     // wy32 の形 (vblocks=1 / 512 / 91,012 B) を渡していることを見る。
     assert!(
-        CUDA_RS.contains("1, GDN_PF_WY_THREADS, GDN_PF_WY_SMEM_BYTES as u32,"),
+        cuda_rs().contains("1, GDN_PF_WY_THREADS, GDN_PF_WY_SMEM_BYTES as u32,"),
         "WY (wy32) の呼び出しが vblocks=1 / GDN_PF_WY_THREADS / WY_SMEM でない"
     );
     assert!(
-        CUDA_RS.contains("pub(crate) const GDN_PF_WY_THREADS: usize = 512;"),
+        cuda_rs().contains("pub(crate) const GDN_PF_WY_THREADS: usize = 512;"),
         "GDN_PF_WY_THREADS が 512 でない"
     );
     // 状態は共有メモリ、縮約はワープ (32 レーン)。
@@ -10838,7 +10868,7 @@ fn task311_gdn_pf_wy4_kernel_is_wired() {
     let src = include_str!("../kernels/kernels_gdn_pf_wy4.cu");
     assert!(src.contains("dno_gdn_pf_wy4"));
     assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_wy4\\0\""),
+        cuda_rs().contains("b\"dno_gdn_pf_wy4\\0\""),
         "cuda.rs が dno_gdn_pf_wy4 を読んでいない"
     );
     for line in [
@@ -10899,11 +10929,11 @@ fn task311_gdn_pf_wy4_kernel_is_wired() {
     assert!(total * 4 < 48 * 1024, "48 KB 既定を超える");
     // ホスト側の定数と呼び出し。
     assert!(
-        CUDA_RS.contains("pub(crate) const GDN_PF_WY4_SMEM_FLOATS: usize = 7393;"),
+        cuda_rs().contains("pub(crate) const GDN_PF_WY4_SMEM_FLOATS: usize = 7393;"),
         "GDN_PF_WY4_SMEM_FLOATS が 7393 でない"
     );
     assert!(
-        CUDA_RS.contains("GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY4_SMEM_BYTES as u32,"),
+        cuda_rs().contains("GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY4_SMEM_BYTES as u32,"),
         "wy4 の呼び出しが (BLOCKS, THREADS, SMEM) を渡していない"
     );
     assert_eq!(total, 7393, "WY4_TOTAL と Rust 側の見積りが違う");
@@ -10939,7 +10969,7 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     let src = include_str!("../kernels/kernels_gdn_pf_wy5.cu");
     assert!(src.contains("dno_gdn_pf_wy5"));
     assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_wy5\\0\""),
+        cuda_rs().contains("b\"dno_gdn_pf_wy5\\0\""),
         "cuda.rs が dno_gdn_pf_wy5 を読んでいない"
     );
     // 引数は wy4 と同じ 17 個 (ホストの起動 `gdn_pf_wy_launch` を共有する)。
@@ -11007,30 +11037,30 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
     assert!(src.matches("__syncthreads()").count() <= 10, "バリアが多すぎる");
     // ホスト側: 定数・起動形・選択順 (wy5 -> wy4)。
     assert!(
-        CUDA_RS.contains("pub(crate) const GDN_PF_WY5_SMEM_FLOATS: usize = GDN_PF_WY4_SMEM_FLOATS;"),
+        cuda_rs().contains("pub(crate) const GDN_PF_WY5_SMEM_FLOATS: usize = GDN_PF_WY4_SMEM_FLOATS;"),
         "GDN_PF_WY5_SMEM_FLOATS が wy4 と同じでない"
     );
     assert!(
-        CUDA_RS.contains("GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY5_SMEM_BYTES as u32,"),
+        cuda_rs().contains("GDN_PF_WY4_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY5_SMEM_BYTES as u32,"),
         "wy5 の呼び出しが (BLOCKS, THREADS, SMEM) を渡していない"
     );
-    let pick5 = CUDA_RS
+    let pick5 = cuda_rs()
         .find("let pf_scan_wy5 = if pf_scan_wy6p.is_none()")
         .expect("wy5 の選択が無い");
-    let pick4 = CUDA_RS
+    let pick4 = cuda_rs()
         .find("let pf_scan_wy4 = if pf_scan_wy5.is_none()")
         .expect("wy4 の選択が wy5 の後ろに無い");
     assert!(pick5 < pick4, "wy5 が wy4 より先に選ばれていない");
-    let launch5 = CUDA_RS
+    let launch5 = cuda_rs()
         .find("if let Some(fns) = pf_scan_wy5 {")
         .expect("wy5 の起動が無い");
-    let launch4 = CUDA_RS
+    let launch4 = cuda_rs()
         .find("} else if let Some(fns) = pf_scan_wy4 {")
         .expect("wy4 の起動が wy5 の後ろに無い");
     assert!(launch5 < launch4, "wy5 の起動が wy4 より後ろにある");
     // v3 へ落ちる前の判定にも wy5 が入っていること。
     assert!(
-        CUDA_RS.contains("&& pf_scan_wy5.is_none()\n        && pf_scan_wy4.is_none()"),
+        cuda_rs().contains("&& pf_scan_wy5.is_none()\n        && pf_scan_wy4.is_none()"),
         "fail closed の判定に wy5 が入っていない"
     );
     // build_ptx.sh の target (targets_all の**末尾**に足す = merge の衝突を避ける)。
@@ -11049,10 +11079,10 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
         "targets_all の末尾に無い (merge で衝突する)"
     );
     // 書き戻しの非同期化 (`DENNO_PF_GDN_WB_ASYNC`)。
-    let f = CUDA_RS
+    let f = cuda_rs()
         .find("fn gdn_wb_async_copy(")
         .expect("gdn_wb_async_copy が無い");
-    let tail = &CUDA_RS[f..];
+    let tail = &cuda_rs()[f..];
     let end = tail.find("\n}\n").map(|e| e + 3).unwrap_or(tail.len());
     let body = &tail[..end];
     assert!(body.contains("memcpy_dtoh_async"), "非同期コピーでない");
@@ -11061,10 +11091,10 @@ fn task397_gdn_pf_wy5_kernel_is_wired() {
         !body.contains("(lib.memcpy_dtoh)("),
         "同期コピー (コンテキスト全体の待ち) が混ざっている"
     );
-    let wb = CUDA_RS
+    let wb = cuda_rs()
         .find("fn gdn_host_writeback(")
         .expect("gdn_host_writeback が無い");
-    let wb_body = &CUDA_RS[wb..];
+    let wb_body = &cuda_rs()[wb..];
     let gate = wb_body.find("gdn_wb_async_on()").expect("ゲートを見ていない");
     let direct = wb_body
         .find("gdn_wb_direct_on()")
@@ -11096,7 +11126,7 @@ fn task278_seg_k_kernels_are_wired() {
     ] {
         assert!(SEG_K_SRC.contains(name), "{name} が .cu に無い");
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
         assert_eq!(
@@ -11133,7 +11163,7 @@ fn task278_seg_k_kernels_are_wired() {
         .unwrap_or("");
     assert!(targets.contains("seg_k"), "targets_all に seg_k が無い");
     // ホスト側のゲート名 (gate_audit の台帳に載せる前の固定)
-    assert!(CUDA_RS.contains("\"DENNO_SEG_K\""), "DENNO_SEG_K のゲートが無い");
+    assert!(cuda_rs().contains("\"DENNO_SEG_K\""), "DENNO_SEG_K のゲートが無い");
 }
 
 // ===========================================================================
@@ -11153,11 +11183,11 @@ fn task282_mix_gemv_kernels_are_wired() {
     assert_eq!(cu_kernel_nargs(SEG_K_SRC, "dno_mix_gemv_q8_0_r8"), 8);
     assert!(SEG_K_SRC.contains("#define SK_R8 8"), "r8 の行数が 8 でない");
     assert!(
-        CUDA_RS.contains("b\"dno_mix_gemv_q8_0_r8\\0\""),
+        cuda_rs().contains("b\"dno_mix_gemv_q8_0_r8\\0\""),
         "cuda.rs が r8 を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("(((n2 + 31) / 32) as u32, 1, 1)"),
+        cuda_rs().contains("(((n2 + 31) / 32) as u32, 1, 1)"),
         "r8 の grid が 32 行 / ブロックでない"
     );
     // down: 1 行 1 ブロック 256 スレッド (8 warp)、部分和 8 本を固定順で加算。
@@ -11173,15 +11203,15 @@ fn task282_mix_gemv_kernels_are_wired() {
         "部分和の加算順が固定でない"
     );
     assert!(
-        CUDA_RS.contains("b\"dno_mix_gemv_q8_0_rowblk\\0\""),
+        cuda_rs().contains("b\"dno_mix_gemv_q8_0_rowblk\\0\""),
         "cuda.rs が rowblk を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("(n1 as u32, 1, 1), (256, 1, 1), 32"),
+        cuda_rs().contains("(n1 as u32, 1, 1), (256, 1, 1), 32"),
         "rowblk の起動形 (grid=行数 / block=256 / smem=32) が違う"
     );
     // ゲート名と、既定 on の台帳 (gate_audit) への登録。
-    assert!(CUDA_RS.contains("\"DENNO_MIX_QK\""), "DENNO_MIX_QK のゲートが無い");
+    assert!(cuda_rs().contains("\"DENNO_MIX_QK\""), "DENNO_MIX_QK のゲートが無い");
     let audit = include_str!("../src/gate_audit.rs");
     assert!(
         audit.contains("\"DENNO_MIX_QK\""),
@@ -11219,29 +11249,29 @@ fn task286_mix_gemv_v5_is_wired() {
         "v5 のレーン分割が変わった"
     );
     // cuda.rs: 形の決定 (純関数)・起動・v5 の関数ポインタ。
-    assert!(CUDA_RS.contains("pub fn mix_v5_shape("), "mix_v5_shape が無い");
-    assert!(CUDA_RS.contains("fn launch_mix_v5("), "launch_mix_v5 が無い");
+    assert!(cuda_rs().contains("pub fn mix_v5_shape("), "mix_v5_shape が無い");
+    assert!(cuda_rs().contains("fn launch_mix_v5("), "launch_mix_v5 が無い");
     assert!(
-        CUDA_RS.contains("gemv_v5_kernels()?.f[0]"),
+        cuda_rs().contains("gemv_v5_kernels()?.f[0]"),
         "mix_v5_plan が v5 の Q8_0 を取っていない"
     );
     // 引数 8 本 (rows_per_block / lanes を落とさない)。
     assert!(
-        CUDA_RS.contains("let (mut rows, mut lanes) = (plan.rows_per_block as c_int, plan.lanes as c_int);"),
+        cuda_rs().contains("let (mut rows, mut lanes) = (plan.rows_per_block as c_int, plan.lanes as c_int);"),
         "launch_mix_v5 が rows/lanes を渡していない"
     );
     // 既定は task 422 で down だけ dn6、up は v5。`v5` / `1` / `both` で
     // v5 両方向 (task 286 の形) へ戻せる。
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::Dn7, MixGemv::V5),"),
+        cuda_rs().contains("_ => (MixGemv::Dn7, MixGemv::V5),"),
         "既定が (Dn6, V5) になっていない"
     );
     assert!(
-        CUDA_RS.contains("Some(\"1\") | Some(\"both\") | Some(\"v5\") => (MixGemv::V5, MixGemv::V5),"),
+        cuda_rs().contains("Some(\"1\") | Some(\"both\") | Some(\"v5\") => (MixGemv::V5, MixGemv::V5),"),
         "v5 両方向への切り戻しが無い"
     );
     assert!(
-        CUDA_RS.contains("Some(\"blk\") | Some(\"r8\") => (MixGemv::Blk, MixGemv::R8)"),
+        cuda_rs().contains("Some(\"blk\") | Some(\"r8\") => (MixGemv::Blk, MixGemv::R8)"),
         "task 282 の形への切り戻しが無い"
     );
 }
@@ -11352,15 +11382,15 @@ fn mix_dev3_down_inj_is_wired() {
 #[test]
 fn task317_ssm_mix_keep_is_wired() {
     assert!(
-        CUDA_RS.contains("pub(crate) fn pf_mix_keep_ssm_on()"),
+        cuda_rs().contains("pub(crate) fn pf_mix_keep_ssm_on()"),
         "ゲートの実体が無い"
     );
     assert!(
-        CUDA_RS.contains("DENNO_PF_MIXKEEP_SSM"),
+        cuda_rs().contains("DENNO_PF_MIXKEEP_SSM"),
         "env 名が無い"
     );
     // gdn_pf_chain: 記録があれば x を H2D しない。
-    let chain = CUDA_RS
+    let chain = cuda_rs()
         .split("pub fn gdn_pf_chain(")
         .nth(1)
         .expect("gdn_pf_chain が無い");
@@ -11440,11 +11470,11 @@ fn task320_upload_thread_lookahead_is_wired() {
     // `DENNO_PF_STREAM_LOOKAHEAD_PREAD` まで深くする (実効の深さは純関数
     // `lookahead_for` が決める)。
     assert!(
-        CUDA_RS.contains("let look_base = if ut { exp_pf::stream_lookahead() } else { 0 };"),
+        cuda_rs().contains("let look_base = if ut { exp_pf::stream_lookahead() } else { 0 };"),
         "依頼ループが先読みをゲートから取っていない"
     );
     assert!(
-        CUDA_RS.contains("look = exp_pf::lookahead_for(pread, look_base, look_deep);"),
+        cuda_rs().contains("look = exp_pf::lookahead_for(pread, look_base, look_deep);"),
         "依頼ループが pread のグループで深さを変えていない"
     );
     assert!(
@@ -11457,16 +11487,16 @@ fn task320_upload_thread_lookahead_is_wired() {
         "実効の深さを決める純関数が無い"
     );
     assert!(
-        CUDA_RS.contains("while submitted <= gi + look && submitted < bounds.len() {"),
+        cuda_rs().contains("while submitted <= gi + look && submitted < bounds.len() {"),
         "依頼ループが 1 つ先に固定されたまま"
     );
     assert!(
-        !CUDA_RS.contains("while submitted <= gi + 1 && submitted < bounds.len() {"),
+        !cuda_rs().contains("while submitted <= gi + 1 && submitted < bounds.len() {"),
         "旧い 1 つ先のループが残っている"
     );
     // ステージングの枚数 (3) と上限 (2) の対応。
     assert!(
-        CUDA_RS.contains("pub(crate) const PF_STAGE_SLOTS: usize = 3;"),
+        cuda_rs().contains("pub(crate) const PF_STAGE_SLOTS: usize = 3;"),
         "ステージングの枚数が変わった (先読みの上限 2 を見直すこと)"
     );
 }
@@ -11490,17 +11520,19 @@ fn task320_up_decouple_orders_copy_before_stream_wait() {
     );
     // 依頼に pin_ev が載る。
     assert!(
-        CUDA_RS.contains("let pin_ev = if exp_pf::up_decouple_on() && st.slot[s].used {"),
+        cuda_rs().contains("let pin_ev = if exp_pf::up_decouple_on() && st.slot[s].used {"),
         "依頼が pin の再利用イベントを組んでいない"
     );
-    assert!(CUDA_RS.contains("    pin_ev: usize,"), "依頼の欄が無い");
+    // task 664: `PfUpJob` は cuda/mod.rs と cuda/moe_pf.rs の両方から触るので
+    // 欄が `pub(crate)` になった (宣言の字下げは固定しない)。
+    assert!(cuda_rs().contains("pin_ev: usize,"), "依頼の欄が無い");
     // ワーカー: ホスト待ちの切り替え。
     assert!(
-        CUDA_RS.contains("let host_ev = if decouple { job.pin_ev } else { job.wait_ev };"),
+        cuda_rs().contains("let host_ev = if decouple { job.pin_ev } else { job.wait_ev };"),
         "ホスト待ちが分離モードで切り替わっていない"
     );
     // 順序: 写し → cuStreamWaitEvent → DMA。
-    let run = CUDA_RS
+    let run = cuda_rs()
         .split("fn pf_up_run(")
         .nth(1)
         .expect("pf_up_run が無い");
@@ -11552,11 +11584,11 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
     );
     // ゲートは ut 経路の内側だけ (従来経路 / page / reg の挙動は変えない)。
     assert!(
-        CUDA_RS.contains("let gpuwait = ut && exp_pf::up_gpuwait_on();"),
+        cuda_rs().contains("let gpuwait = ut && exp_pf::up_gpuwait_on();"),
         "ゲートが ut の内側に無い"
     );
     // 順序: ready → ストリーム待ち → カーネル。
-    let block = CUDA_RS
+    let block = cuda_rs()
         .split("// (c) **自分のグループの H2D 完了だけ**を待つ (ホスト)。")
         .nth(1)
         .expect("(c) の待ちが無い");
@@ -11573,7 +11605,7 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
         "既定の待ちが消えている"
     );
     // ストリーム待ちの実体はホストを止めない (event_sync を呼ばない)。
-    let def = CUDA_RS
+    let def = cuda_rs()
         .split("fn pf_stream_wait_up_in(")
         .nth(1)
         .expect("ストリーム待ちの実体が無い");
@@ -11586,7 +11618,7 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
         "nosync の env 名が無い"
     );
     assert!(EXP_PF_SRC.contains("nsync={}"), "台帳に nsync= が無い");
-    let acc = CUDA_RS
+    let acc = cuda_rs()
         .split("let nosync = host_out.is_none() && exp_pf::stream_nosync_on();")
         .nth(1)
         .expect("nosync の判定が無い");
@@ -11596,7 +11628,7 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
         "同期の経路が消えている (既定 off で従来どおり待つこと)"
     );
     assert!(
-        !CUDA_RS.contains("let nosync = exp_pf::stream_nosync_on();"),
+        !cuda_rs().contains("let nosync = exp_pf::stream_nosync_on();"),
         "ホスト出力の経路まで同期を省いている"
     );
     // task 324 (3): 先頭グループは GPU 側で待つ経路のときだけ小さく切る。
@@ -11609,15 +11641,15 @@ fn task324_gpuwait_orders_stream_wait_before_kernel() {
         "先頭だけ小さく切る関数が無い"
     );
     assert!(
-        CUDA_RS.contains("let first_g = if gpuwait {"),
+        cuda_rs().contains("let first_g = if gpuwait {"),
         "先頭グループの絞りが gpuwait の内側に無い"
     );
     assert!(
-        CUDA_RS.contains("exp_pf::group_bounds_first(&needs, slot_cap, group, first_g)"),
+        cuda_rs().contains("exp_pf::group_bounds_first(&needs, slot_cap, group, first_g)"),
         "グループ分けが新しい関数を通っていない"
     );
     assert!(
-        !CUDA_RS.contains("exp_pf::group_bounds(&needs, slot_cap, group)"),
+        !cuda_rs().contains("exp_pf::group_bounds(&needs, slot_cap, group)"),
         "旧い呼び出しが残っている"
     );
 }
@@ -11656,13 +11688,13 @@ fn t333_stream_decline_names_the_gate() {
         ("\"ptr_table\"", "ポインタ表の不一致"),
     ] {
         assert!(
-            CUDA_RS.contains(&format!("pf_stream_skip({why})")),
+            cuda_rs().contains(&format!("pf_stream_skip({why})")),
             "{what} ({why}) に理由の名前が付いていない"
         );
     }
     // 層の入口で理由を消す (前の層 / 前の試行の理由を残さない)。
     assert!(
-        CUDA_RS.contains("pf_stream_why_set(\"\");"),
+        cuda_rs().contains("pf_stream_why_set(\"\");"),
         "試行の入口で理由を 0 に戻していない"
     );
     // 層優先 dev MoE の 1 行に内訳が乗る。
@@ -11695,24 +11727,24 @@ fn t333_stream_retry_swaps_only_the_transfer_owner() {
     );
     // 1 グループでも計算した後 (`out` を触った後) は再試行しない。
     assert!(
-        CUDA_RS.contains("\"no_upload_late\""),
+        cuda_rs().contains("\"no_upload_late\""),
         "書いた後の門に別名が無い (二重加算になる)"
     );
     assert!(
-        CUDA_RS.contains("\"ptr_table_late\""),
+        cuda_rs().contains("\"ptr_table_late\""),
         "書いた後の門に別名が無い (二重加算になる)"
     );
     assert!(
-        CUDA_RS.contains("let mut wrote = false;"),
+        cuda_rs().contains("let mut wrote = false;"),
         "書いたかどうかの追跡が無い"
     );
     assert!(
-        CUDA_RS.contains("wrote = true;"),
+        cuda_rs().contains("wrote = true;"),
         "カーネルを積んだ後に印を付けていない"
     );
     // 直列の再試行は「上げスレッドを使わない」だけを変える。
     assert!(
-        CUDA_RS.contains("let ut = !serial && pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;"),
+        cuda_rs().contains("let ut = !serial && pinned && exp_pf::stream_ut() && exp_pf::stream_src() == 0;"),
         "serial が ut の判定に入っていない"
     );
     assert!(
@@ -11758,7 +11790,7 @@ fn t349_stream_pread_is_wired_through_the_wc_decision() {
     );
     // 3. WC の判断に繋がっている (WC のままだと pread は発火しない)。
     assert!(
-        CUDA_RS.contains(
+        cuda_rs().contains(
             "let wc = exp_pf::stream_wc_for(st.k_mode) && !exp_pf::stream_pread();"
         ),
         "WC の判断にゲートが入っていない (pread が発火しない)"
@@ -11766,7 +11798,7 @@ fn t349_stream_pread_is_wired_through_the_wc_decision() {
     // 4. pread の可否は従来どおり `!pin_wc` で決まる (この 1 本を消すと
     //    WC へ read(2) して極端に遅くなる)。
     assert!(
-        CUDA_RS.contains("&& !st.pin_wc[s]"),
+        cuda_rs().contains("&& !st.pin_wc[s]"),
         "pread の可否から pin_wc の条件が消えている"
     );
     // 5. 台帳 (`[exp-pf-stream]`) に spread= が出る。
@@ -11970,28 +12002,28 @@ fn t369_kv_async_is_wired() {
     assert!(!pf_kv_wb_pending(), "起動直後に保留がある");
     // 同期 D2H は 2 箇所 (pf_full_qkv / _fused)。どちらも `!async_started` の内側。
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("kdb.to_slice(&mut k_out[..nt * kv])?")
             .count(),
         2,
         "同期 D2H の箇所が 2 つでない"
     );
     assert_eq!(
-        CUDA_RS.matches("if !async_started {").count(),
+        cuda_rs().matches("if !async_started {").count(),
         2,
         "非同期の分岐が 2 箇所に無い"
     );
     assert_eq!(
-        CUDA_RS.matches("if staged.is_some() && pf_kv_async_on() {").count(),
+        cuda_rs().matches("if staged.is_some() && pf_kv_async_on() {").count(),
         2,
         "非同期の開始条件が 2 箇所に無い"
     );
     assert!(
-        CUDA_RS.contains("(mirror_direct || k_cpu.len() >= t_total * kv_dim)"),
+        cuda_rs().contains("(mirror_direct || k_cpu.len() >= t_total * kv_dim)"),
         "pf_full_out がミラー直書きのときもホスト KV を要求している"
     );
     assert!(
-        CUDA_RS.contains("if !pf_kv_async_on() {"),
+        cuda_rs().contains("if !pf_kv_async_on() {"),
         "pf_full_mirror_direct にゲートが無い"
     );
     // 呼び出し側: 遅延の判定と、pf_full_out の後ろの push。
@@ -12021,12 +12053,12 @@ fn t369_kv_async_is_wired() {
     );
     // pinned から直接 push する枝 (`DENNO_PF_KV_PUSH`、既定 off) も配線されている。
     assert_eq!(
-        CUDA_RS.matches("pub const PF_KV_PUSH_ENV: &str = \"DENNO_PF_KV_PUSH\";").count(),
+        cuda_rs().matches("pub const PF_KV_PUSH_ENV: &str = \"DENNO_PF_KV_PUSH\";").count(),
         1,
         "env 名が 1 箇所でない"
     );
     assert!(
-        CUDA_RS.contains("pub fn pf_kv_wb_with<F: FnOnce(&[f32], &[f32])>(f: F) -> bool {"),
+        cuda_rs().contains("pub fn pf_kv_wb_with<F: FnOnce(&[f32], &[f32])>(f: F) -> bool {"),
         "pinned 直送の入口が無い"
     );
     assert!(
@@ -12088,7 +12120,7 @@ fn task379_gdn_wb_last_gate_is_single_and_on_by_default() {
 /// (飛ばす判断と書き戻しが別々の条件になると、両方真のときに書き戻しが消える)。
 #[test]
 fn task379_gdn_wb_last_skip_wraps_the_writeback() {
-    let chain = CUDA_RS
+    let chain = cuda_rs()
         .split("fn gdn_pf_chain(")
         .nth(1)
         .expect("gdn_pf_chain が無い");
@@ -12114,7 +12146,7 @@ fn task379_gdn_wb_last_skip_wraps_the_writeback() {
         "飛ばした回数を数えていない (発火の証拠が読めない)"
     );
     // 飛ばせる条件: ゲート on / デバイスが正本 / 最終チャンクでない / 診断でない。
-    let sk = CUDA_RS
+    let sk = cuda_rs()
         .split("pub fn pf_gdn_last_chunk_skippable(")
         .nth(1)
         .expect("判断の実体が無い");
@@ -12125,7 +12157,7 @@ fn task379_gdn_wb_last_skip_wraps_the_writeback() {
     assert!(body.contains("!crate::gdn::gdn_dbg_enabled_for(li as i64)"), "診断の除外が無い");
     // 旗の既定は真 (どこから呼ばれても従来どおり書き戻す)。
     assert!(
-        CUDA_RS.contains(
+        cuda_rs().contains(
             "static PF_GDN_LAST_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };"
         ),
         "旗の既定が真でない"
@@ -12359,17 +12391,17 @@ fn task393_ple_pin_is_wired_to_the_round_trip_buffer() {
 #[test]
 fn task393_gdn_wstat_is_wired_through_one_helper() {
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("pub const GDN_WSTAT_ENV: &str = \"DENNO_PF_GDN_WSTAT\";")
             .count(),
         1,
         "env 名の宣言が 1 箇所でない"
     );
     assert!(
-        CUDA_RS.contains("pub const DEFAULT_GDN_WSTAT: bool = false;"),
+        cuda_rs().contains("pub const DEFAULT_GDN_WSTAT: bool = false;"),
         "既定が off でない (lab で採るまで off)"
     );
-    let f = CUDA_RS
+    let f = cuda_rs()
         .split("pub(crate) fn gdn_wstat_from_value(")
         .nth(1)
         .expect("解釈が無い");
@@ -12384,21 +12416,21 @@ fn task393_gdn_wstat_is_wired_through_one_helper() {
     );
     // 生の copy_from は 0、鍵を通る呼び出しが 3 箇所。
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("s.wc.as_ref().unwrap().copy_from(wconv)?")
             .count(),
         0,
         "鍵を通らない重みのアップロードが残っている"
     );
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("gdn_put_weights(&s, li, [wconv, wa, wdt, wnorm])?")
             .count(),
         3,
         "重みのアップロードが 3 箇所 (層優先 / チャンク優先 / decode) でない"
     );
     // 鍵は純関数で、層・転送元・置き場の全部を見る。
-    let k = CUDA_RS
+    let k = cuda_rs()
         .split("fn gdn_wstat_key(")
         .nth(1)
         .expect("鍵の関数が無い");
@@ -12408,7 +12440,7 @@ fn task393_gdn_wstat_is_wired_through_one_helper() {
     assert!(kbody.contains("src[i].1"), "転送元の長さが鍵に入っていない");
     assert!(kbody.contains("dst[i]"), "置き場が鍵に入っていない");
     // ゲート off では必ず上げ直す (鍵を読まない)。
-    let put = CUDA_RS
+    let put = cuda_rs()
         .split("fn gdn_put_weights(")
         .nth(1)
         .expect("上げ直しの関数が無い");
@@ -12434,11 +12466,11 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
     assert!(src6.contains("dno_gdn_pf_wy6"));
     assert!(src6p.contains("dno_gdn_pf_wy6p"));
     assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_wy6\\0\""),
+        cuda_rs().contains("b\"dno_gdn_pf_wy6\\0\""),
         "cuda.rs が dno_gdn_pf_wy6 を読んでいない"
     );
     assert!(
-        CUDA_RS.contains("b\"dno_gdn_pf_wy6p\\0\""),
+        cuda_rs().contains("b\"dno_gdn_pf_wy6p\\0\""),
         "cuda.rs が dno_gdn_pf_wy6p を読んでいない"
     );
     assert_eq!(cu_kernel_nargs(src6, "dno_gdn_pf_wy6"), 17, "引数の個数が wy5 と違う");
@@ -12523,17 +12555,17 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
     assert!(src6p.matches("__syncthreads()").count() <= 10, "バリアが多すぎる");
     // ホスト側: 定数と起動形。
     assert!(
-        CUDA_RS.contains(
+        cuda_rs().contains(
             "pub(crate) const GDN_PF_WY6_SMEM_FLOATS: usize = GDN_PF_WY4_SMEM_FLOATS;"
         ),
         "共有メモリが wy4 と同じでない"
     );
     assert!(
-        CUDA_RS.contains("pub(crate) const GDN_PF_WY6_THREADS: usize = 512;"),
+        cuda_rs().contains("pub(crate) const GDN_PF_WY6_THREADS: usize = 512;"),
         "スレッド数が 512 でない"
     );
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("GDN_PF_WY6_BLOCKS, GDN_PF_WY6_THREADS, GDN_PF_WY6_SMEM_BYTES as u32,")
             .count(),
         2,
@@ -12550,7 +12582,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
     ];
     let mut prev = 0usize;
     for (name, pat) in picks {
-        let at = CUDA_RS
+        let at = cuda_rs()
             .find(pat)
             .unwrap_or_else(|| panic!("{name} の選択が無い"));
         assert!(at > prev || prev == 0, "{name} の選択順が wy7q -> wy7 -> wy6p -> wy6 -> wy5 -> wy4 でない");
@@ -12565,7 +12597,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
     ];
     let mut prev = 0usize;
     for (name, pat) in launches {
-        let at = CUDA_RS
+        let at = cuda_rs()
             .find(pat)
             .unwrap_or_else(|| panic!("{name} の起動が無い"));
         assert!(at > prev || prev == 0, "{name} の起動順が選択順と違う");
@@ -12573,7 +12605,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
     }
     // fail closed の判定にも全部入っていること。
     assert!(
-        CUDA_RS.contains(
+        cuda_rs().contains(
             "&& pf_scan_wy7q.is_none()\n        && pf_scan_wy7.is_none()\n        && pf_scan_wy6p.is_none()\n        && pf_scan_wy6.is_none()\n        && pf_scan_wy5.is_none()"
         ),
         "fail closed の判定に wy7q / wy7 / wy6p / wy6 が入っていない"
@@ -12592,7 +12624,7 @@ fn task407_gdn_pf_wy6_kernel_is_wired() {
         "targets_all の末尾に足していない (他ブランチと衝突する)"
     );
     // kprof: 未完了の段を捨てない (捨てると段の合計が小さく出る)。
-    let kprof = CUDA_RS
+    let kprof = cuda_rs()
         .split("pub mod gdn_pf_kprof {")
         .nth(1)
         .expect("gdn_pf_kprof が無い");
@@ -12616,8 +12648,8 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
     let src7q = include_str!("../kernels/kernels_gdn_pf_wy7q.cu");
     assert!(src7.contains("dno_gdn_pf_wy7"));
     assert!(src7q.contains("dno_gdn_pf_wy7q"));
-    assert!(CUDA_RS.contains("b\"dno_gdn_pf_wy7\\0\""), "cuda.rs が wy7 を読んでいない");
-    assert!(CUDA_RS.contains("b\"dno_gdn_pf_wy7q\\0\""), "cuda.rs が wy7q を読んでいない");
+    assert!(cuda_rs().contains("b\"dno_gdn_pf_wy7\\0\""), "cuda.rs が wy7 を読んでいない");
+    assert!(cuda_rs().contains("b\"dno_gdn_pf_wy7q\\0\""), "cuda.rs が wy7q を読んでいない");
     assert_eq!(cu_kernel_nargs(src7, "dno_gdn_pf_wy7"), 17, "引数の個数が wy5 と違う");
     assert_eq!(cu_kernel_nargs(src7q, "dno_gdn_pf_wy7q"), 17, "引数の個数が wy5 と違う");
     for line in [
@@ -12679,17 +12711,17 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
     assert!(src7q.contains("Pp[warp * WY7Q_C * WY7Q_DV + i * WY7Q_DV + c] = sk[i];"));
     assert!(src7q.contains("for (int w = 0; w < WY7Q_WARPS; ++w) {"));
     // ホスト側: 定数と起動形 (スレッドは 256 のまま、smem だけ wy7q が広い)。
-    assert!(CUDA_RS.contains("pub(crate) const GDN_PF_WY7_SMEM_BYTES: usize = GDN_PF_WY7_SMEM_FLOATS * 4;"));
-    assert!(CUDA_RS.contains("pub(crate) const GDN_PF_WY7Q_PART_FLOATS: usize = 2 * 8 * 8 * 32;"));
+    assert!(cuda_rs().contains("pub(crate) const GDN_PF_WY7_SMEM_BYTES: usize = GDN_PF_WY7_SMEM_FLOATS * 4;"));
+    assert!(cuda_rs().contains("pub(crate) const GDN_PF_WY7Q_PART_FLOATS: usize = 2 * 8 * 8 * 32;"));
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("GDN_PF_WY6_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY7Q_SMEM_BYTES as u32,")
             .count(),
         1,
         "wy7q の起動が 256 スレッド + wy7q の smem を渡していない"
     );
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("GDN_PF_WY6_BLOCKS, GDN_PF_WY4_THREADS, GDN_PF_WY7_SMEM_BYTES as u32,")
             .count(),
         1,
@@ -12719,15 +12751,15 @@ fn task407_gdn_pf_wy7_kernel_is_wired() {
 #[test]
 fn task407_gdn_tc1_gate_is_wired() {
     assert!(
-        CUDA_RS.contains("std::env::var(\"DENNO_PF_GDN_TC1\")"),
+        cuda_rs().contains("std::env::var(\"DENNO_PF_GDN_TC1\")"),
         "env 名が DENNO_PF_GDN_TC1 でない"
     );
     assert!(
-        CUDA_RS.contains("pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {"),
+        cuda_rs().contains("pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {"),
         "純関数が無い"
     );
     // 既定 on (未設定で true) であること。
-    let f = CUDA_RS
+    let f = cuda_rs()
         .split("pub(crate) fn gdn_pf_tc1_from_value(v: Option<&str>) -> bool {")
         .nth(1)
         .expect("純関数の本体が無い");
@@ -12735,7 +12767,7 @@ fn task407_gdn_tc1_gate_is_wired() {
     assert!(body.contains("None => true"), "未設定の既定が on でない");
     assert!(body.contains("\"0\" | \"off\" | \"false\" | \"no\" | \"\""), "偽値の集合が違う");
     // tc2 の分岐が prefer_tc1 で飛ばせること。
-    let g = CUDA_RS
+    let g = cuda_rs()
         .split("fn gguf_gemm_dev_launch(")
         .nth(1)
         .expect("gguf_gemm_dev_launch が無い");
@@ -12751,15 +12783,15 @@ fn task407_gdn_tc1_gate_is_wired() {
     );
     // GDN 連鎖の 2 か所 (qkv/z と out) がゲートを渡すこと。
     assert_eq!(
-        CUDA_RS
+        cuda_rs()
             .matches("n_out, gdn_pf_tc1_on())")
             .count()
-            + CUDA_RS.matches("vd, e, gdn_pf_tc1_on())").count(),
+            + cuda_rs().matches("vd, e, gdn_pf_tc1_on())").count(),
         2,
         "GDN 連鎖の 2 か所がゲートを渡していない"
     );
     // モデル全体の既定は動かさない (tc2 は既定 on のまま)。
-    let t = CUDA_RS
+    let t = cuda_rs()
         .split("pub(crate) fn pf_tc2_gemm_from_value(v: Option<&str>) -> bool {")
         .nth(1)
         .expect("tc2 のゲートが無い");
@@ -12863,31 +12895,31 @@ fn task418_mix_dn5_kernel_is_wired() {
     }
     // ホスト側: 名前 / 引数の数 / warp の上限 / 起動形。
     assert!(
-        CUDA_RS.contains("const MIX_DN5_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn5\";"),
+        cuda_rs().contains("const MIX_DN5_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn5\";"),
         "cuda.rs のカーネル名が違う"
     );
-    assert!(CUDA_RS.contains("const MIX_DN5_NARGS: usize = 6;"));
-    assert!(CUDA_RS.contains("const MIX_DN5_MAX_WARPS: usize = 8;"), "`.cu` の part[8]");
+    assert!(cuda_rs().contains("const MIX_DN5_NARGS: usize = 6;"));
+    assert!(cuda_rs().contains("const MIX_DN5_MAX_WARPS: usize = 8;"), "`.cu` の part[8]");
     assert_eq!(
-        CUDA_RS.matches(".join(\"kernels_mix_dn5.ptx\")").count(),
+        cuda_rs().matches(".join(\"kernels_mix_dn5.ptx\")").count(),
         1,
         "PTX のパスが違う"
     );
     // ゲート: dn5 は明示したときだけ (既定は v5 のまま)。
     assert!(
-        CUDA_RS.contains("Some(\"dn5\") | Some(\"d5\") => (MixGemv::Dn5, MixGemv::V5),"),
+        cuda_rs().contains("Some(\"dn5\") | Some(\"d5\") => (MixGemv::Dn5, MixGemv::V5),"),
         "ゲートの解釈が無い"
     );
     // task 422: 既定は dn6 になったので、dn5 は明示したときだけ (切り戻し段)。
     assert!(
-        CUDA_RS.contains("_ => (MixGemv::Dn7, MixGemv::V5),"),
+        cuda_rs().contains("_ => (MixGemv::Dn7, MixGemv::V5),"),
         "既定が dn6 になっていない"
     );
     // 形の門番と launch (block = 32 * warps)。
-    assert!(CUDA_RS.contains("pub fn mix_dn5_warps(n_in: usize) -> Option<usize> {"));
-    assert!(CUDA_RS.contains("((32 * warps) as u32, 1, 1),"), "block が 32 * warps でない");
+    assert!(cuda_rs().contains("pub fn mix_dn5_warps(n_in: usize) -> Option<usize> {"));
+    assert!(cuda_rs().contains("((32 * warps) as u32, 1, 1),"), "block が 32 * warps でない");
     assert!(
-        CUDA_RS.contains("launch_mix_dn5(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps)?;"),
+        cuda_rs().contains("launch_mix_dn5(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps)?;"),
         "down の起動点が dn5 を通っていない"
     );
     // build_ptx.sh: target と targets_all (末尾の wy7q は動かさない)。
@@ -12939,49 +12971,49 @@ fn task422_mix_dn6_kernel_is_wired() {
     }
     // ホスト側: 名前 / 引数の数 / 上限 / PTX のパス。
     assert!(
-        CUDA_RS.contains("const MIX_DN6_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn6\";"),
+        cuda_rs().contains("const MIX_DN6_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn6\";"),
         "cuda.rs のカーネル名が違う"
     );
-    assert!(CUDA_RS.contains("const MIX_DN6_NARGS: usize = 7;"));
-    assert!(CUDA_RS.contains("const MIX_DN6_MAX_WARPS: usize = 8;"), "`.cu` の part[8]");
-    assert!(CUDA_RS.contains("const MIX_DN6_MAX_ROWS: usize = 8;"));
+    assert!(cuda_rs().contains("const MIX_DN6_NARGS: usize = 7;"));
+    assert!(cuda_rs().contains("const MIX_DN6_MAX_WARPS: usize = 8;"), "`.cu` の part[8]");
+    assert!(cuda_rs().contains("const MIX_DN6_MAX_ROWS: usize = 8;"));
     assert_eq!(
-        CUDA_RS.matches(".join(\"kernels_mix_dn6.ptx\")").count(),
+        cuda_rs().matches(".join(\"kernels_mix_dn6.ptx\")").count(),
         1,
         "PTX のパスが違う"
     );
     // ゲート: dn6 は明示したときだけ (既定は dn5 / v5 のまま)。
     assert!(
-        CUDA_RS.contains("Some(\"dn6\") | Some(\"d6\")"),
+        cuda_rs().contains("Some(\"dn6\") | Some(\"d6\")"),
         "mix のゲートの解釈が無い"
     );
-    assert!(CUDA_RS.contains("_ => (MixGemv::Dn7, MixGemv::V5),"), "既定が dn7 でない");
+    assert!(cuda_rs().contains("_ => (MixGemv::Dn7, MixGemv::V5),"), "既定が dn7 でない");
     // GDN 側: 新しい値 dn6 と、起動点 2 か所 (qkv / out) が dn6 を通る。
-    assert!(CUDA_RS.contains("Some(\"dn6\") | Some(\"d6\") | Some(\"dn6r1\")"), "GDN のゲートが無い");
+    assert!(cuda_rs().contains("Some(\"dn6\") | Some(\"d6\") | Some(\"dn6r1\")"), "GDN のゲートが無い");
     assert!(
-        CUDA_RS.contains("pub(crate) fn gdn_dec_gemv_dn6_on() -> bool {"),
+        cuda_rs().contains("pub(crate) fn gdn_dec_gemv_dn6_on() -> bool {"),
         "GDN の dn6 判定が無い"
     );
     // task 422: GDN の既定も dn6 (lab t422c で ssm -19%。切り戻しは v5)。
     assert!(
-        CUDA_RS.contains("const GDN_DEC_GEMV_DN6_DEFAULT: bool = true;"),
+        cuda_rs().contains("const GDN_DEC_GEMV_DN6_DEFAULT: bool = true;"),
         "GDN の既定が dn6 でない"
     );
-    assert!(CUDA_RS.contains("GDN_DEC_GEMV_DN6_DEFAULT"), "既定の分岐が無い");
+    assert!(cuda_rs().contains("GDN_DEC_GEMV_DN6_DEFAULT"), "既定の分岐が無い");
     assert_eq!(
-        CUDA_RS.matches("match gdn_dn6_plan(").count(),
+        cuda_rs().matches("match gdn_dn6_plan(").count(),
         2,
         "GDN の起動点 (qkv / out) が dn6 を通っていない"
     );
     // 形の門番と launch (block = 32 * warps * rows、grid = ceil(n_out / rows))。
-    assert!(CUDA_RS.contains("pub fn mix_dn6_warps(n_in: usize) -> Option<usize> {"));
-    assert!(CUDA_RS.contains("pub fn mix_dn6_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<(usize, usize)> {"));
+    assert!(cuda_rs().contains("pub fn mix_dn6_warps(n_in: usize) -> Option<usize> {"));
+    assert!(cuda_rs().contains("pub fn mix_dn6_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<(usize, usize)> {"));
     assert!(
-        CUDA_RS.contains("let block = (32 * warps * rows) as u32;"),
+        cuda_rs().contains("let block = (32 * warps * rows) as u32;"),
         "block が 32 * warps * rows でない"
     );
     assert!(
-        CUDA_RS.contains("launch_mix_dn6(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps, rows)?;"),
+        cuda_rs().contains("launch_mix_dn6(ctx, wd, xdev, dlo.ptr(), k1, n1, rb_d, warps, rows)?;"),
         "down の起動点が dn6 を通っていない"
     );
     // build_ptx.sh: target と targets_all (末尾の wy7q は動かさない)。
@@ -13034,32 +13066,32 @@ fn task496_mix_dn8_lane_packed_gemv_is_wired() {
     assert!(src.contains("float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;"));
     assert!(src.contains("__shared__") == false || src.contains("extern __shared__ float smem[];"));
     // ホスト側: 名前 / 引数 / plan / launch (shmem を渡す)。
-    assert!(CUDA_RS.contains("const MIX_DN8_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn8\";"));
-    assert!(CUDA_RS.contains("const MIX_DN8_NARGS: usize = 7;"));
-    assert!(CUDA_RS.contains("pub fn mix_dn8_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<MixDn8Plan> {"));
-    assert!(CUDA_RS.contains("plan.shmem as u32,"), "shared を渡していない");
+    assert!(cuda_rs().contains("const MIX_DN8_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn8\";"));
+    assert!(cuda_rs().contains("const MIX_DN8_NARGS: usize = 7;"));
+    assert!(cuda_rs().contains("pub fn mix_dn8_plan(n_in: usize, n_out: usize, want_rows: usize) -> Option<MixDn8Plan> {"));
+    assert!(cuda_rs().contains("plan.shmem as u32,"), "shared を渡していない");
     assert_eq!(
-        CUDA_RS.matches(".join(\"kernels_mix_dn8.ptx\")").count(),
+        cuda_rs().matches(".join(\"kernels_mix_dn8.ptx\")").count(),
         1,
         "PTX のパスが違う"
     );
     // ゲート: `DENNO_GDN_DEC_GEMV=dn8` (既存 env の新しい値) と、dn6 の受け皿。
-    assert!(CUDA_RS.contains("Some(\"dn8\") | Some(\"d8\")"), "dn8 のゲートが無い");
-    assert!(CUDA_RS.contains("fn dn6_alive_for(c: GdnDecGemv) -> bool {"));
-    assert!(CUDA_RS.contains("matches!(c, GdnDecGemv::Dn6 | GdnDecGemv::Dn8)"));
+    assert!(cuda_rs().contains("Some(\"dn8\") | Some(\"d8\")"), "dn8 のゲートが無い");
+    assert!(cuda_rs().contains("fn dn6_alive_for(c: GdnDecGemv) -> bool {"));
+    assert!(cuda_rs().contains("matches!(c, GdnDecGemv::Dn6 | GdnDecGemv::Dn8)"));
     // 起動点: GDN の qkv が dn8 を先に試し、形が合わなければ dn6 へ落ちる。
-    assert!(CUDA_RS.contains("let dn8 = gdn_dn8_plan(u.ty, u.k, u.n, gdn_dn8_rows());"));
-    assert!(CUDA_RS.contains("fn gdn_dn8_plan("));
-    assert!(CUDA_RS.contains("want_rows: usize,\n) -> Option<MixDn8Plan> {"));
+    assert!(cuda_rs().contains("let dn8 = gdn_dn8_plan(u.ty, u.k, u.n, gdn_dn8_rows());"));
+    assert!(cuda_rs().contains("fn gdn_dn8_plan("));
+    assert!(cuda_rs().contains("want_rows: usize,\n) -> Option<MixDn8Plan> {"));
     // out 側 (`dn8a`) の起動点と、np 32 倍数を許す口。
-    assert!(CUDA_RS.contains("let dn8_out = gdn_dn8_plan(\n            req.out_unit.ty,"));
-    assert!(CUDA_RS.contains("mix_dn8_plan_with(k, n, want_rows, gdn_dn8_all())"));
+    assert!(cuda_rs().contains("let dn8_out = gdn_dn8_plan(\n            req.out_unit.ty,"));
+    assert!(cuda_rs().contains("mix_dn8_plan_with(k, n, want_rows, gdn_dn8_all())"));
     // レジスタ上限 (t496b の error 701) で block を 640 に抑えていること。
-    assert!(CUDA_RS.contains("const MIX_DN8_MAX_BLOCK: usize = 640;"));
-    assert!(CUDA_RS.contains("const GDN_DN8_OUT_ROWS: usize = 4;"));
+    assert!(cuda_rs().contains("const MIX_DN8_MAX_BLOCK: usize = 640;"));
+    assert!(cuda_rs().contains("const GDN_DN8_OUT_ROWS: usize = 4;"));
     // 発火の証拠 (`[mix-qchain]` の `dn8=`) と計数の reset。
-    assert!(CUDA_RS.contains("pub fn mix_dn8_hits() -> u64 {"));
-    assert!(CUDA_RS.contains("pub fn mix_dn8_reset() {"));
+    assert!(cuda_rs().contains("pub fn mix_dn8_hits() -> u64 {"));
+    assert!(cuda_rs().contains("pub fn mix_dn8_reset() {"));
     assert!(QWEN4EXP_RS.contains("dn8={dn8}"), "[mix-qchain] に dn8= が無い");
     assert!(QWEN4EXP_RS.contains("crate::cuda::mix_dn8_reset();"));
     // build_ptx.sh: target と targets_all の末尾。
@@ -13100,64 +13132,64 @@ fn task427_dn6_reused_for_full_and_head_is_wired() {
     );
     // 呼び出し点の門番と起動。
     assert!(
-        CUDA_RS.contains("pub(crate) fn dn6_gemv_plan("),
+        cuda_rs().contains("pub(crate) fn dn6_gemv_plan("),
         "dn6_gemv_plan が無い"
     );
     assert!(
-        CUDA_RS.contains("if want_rows == 0 || ty != crate::kquant::GgmlType::Q8_0 {"),
+        cuda_rs().contains("if want_rows == 0 || ty != crate::kquant::GgmlType::Q8_0 {"),
         "dn6_gemv_plan が Q8_0 以外を通す"
     );
     assert!(
-        CUDA_RS.contains("pub(crate) fn launch_dn6_gemv("),
+        cuda_rs().contains("pub(crate) fn launch_dn6_gemv("),
         "launch_dn6_gemv が無い"
     );
     assert!(
-        CUDA_RS.contains("launch_mix_dn6(ctx, w, x, o, n_in, n_out, row_bytes, warps, rows)"),
+        cuda_rs().contains("launch_mix_dn6(ctx, w, x, o, n_in, n_out, row_bytes, warps, rows)"),
         "launch_dn6_gemv が dn6 カーネルを撃っていない"
     );
     // full 層: qkv の unit ループと wo の 2 か所が dn6 を通る。
     assert_eq!(
-        CUDA_RS.matches("dn6_gemv_plan(u.ty, u.k, u.n, dn6_rows())").count(),
+        cuda_rs().matches("dn6_gemv_plan(u.ty, u.k, u.n, dn6_rows())").count(),
         1,
         "qkv の unit が dn6 を通っていない"
     );
     assert!(
-        CUDA_RS.contains("dn6_gemv_plan(a.wo_ty, a.wo_k, a.wo_n, dn6_rows())"),
+        cuda_rs().contains("dn6_gemv_plan(a.wo_ty, a.wo_k, a.wo_n, dn6_rows())"),
         "wo が dn6 を通っていない"
     );
     assert_eq!(
-        CUDA_RS.matches("note_dn6_full_hit();").count(),
+        cuda_rs().matches("note_dn6_full_hit();").count(),
         2,
         "full 層の発火計数が 2 か所に無い"
     );
     // ゲートの解釈 (既定は 0 = v5 のまま)。
     assert!(
-        CUDA_RS.contains("pub(crate) fn full_dec_dn6_rows_from_value(raw: Option<&str>) -> usize {"),
+        cuda_rs().contains("pub(crate) fn full_dec_dn6_rows_from_value(raw: Option<&str>) -> usize {"),
         "full 層のゲートが無い"
     );
     assert!(
-        CUDA_RS.contains("std::env::var(\"DENNO_FULL_DEC_FAST\").ok().as_deref())"),
+        cuda_rs().contains("std::env::var(\"DENNO_FULL_DEC_FAST\").ok().as_deref())"),
         "full 層が既存 env を見ていない"
     );
     // head: dn6 の実行と v5 への落ち方。
     assert!(
-        CUDA_RS.contains("pub fn head_dn6_rows_from_value(raw: Option<&str>) -> usize {"),
+        cuda_rs().contains("pub fn head_dn6_rows_from_value(raw: Option<&str>) -> usize {"),
         "head のゲートが無い"
     );
     assert!(
-        CUDA_RS.contains("std::env::var(\"DENNO_DEC_HEAD_FAST\").ok().as_deref())"),
+        cuda_rs().contains("std::env::var(\"DENNO_DEC_HEAD_FAST\").ok().as_deref())"),
         "head が既存 env を見ていない"
     );
     assert!(
-        CUDA_RS.contains("fn head_gemv_dn6("),
+        cuda_rs().contains("fn head_gemv_dn6("),
         "head の dn6 実行が無い"
     );
     assert!(
-        CUDA_RS.contains("if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows, None) {"),
+        cuda_rs().contains("if let Ok(true) = head_gemv_dn6(ctx, &w.buf, x, k, n, out, rb, warps, rows, None) {"),
         "head が dn6 の成否を見ていない"
     );
     assert!(
-        CUDA_RS.contains("note_dn6_head_hit();"),
+        cuda_rs().contains("note_dn6_head_hit();"),
         "head の発火計数が無い"
     );
     // 発火の証拠: `[mix-qchain]` の f6 / h6。
@@ -13185,25 +13217,25 @@ fn task504_dn7_reused_for_out_head_and_gate_audit() {
         "fn dn7_dec_plan(ty: crate::kquant::GgmlType, k: usize, n: usize) -> Option<(usize, usize)> {",
         "pub fn dn7_gate_on() -> bool {",
     ] {
-        assert!(CUDA_RS.contains(s), "無い: {s}");
+        assert!(cuda_rs().contains(s), "無い: {s}");
     }
     // 起動 (定義 1 + mix down 1 + GDN の out 1 + full の qkv 1 + full の wo 1 + head 1)。
     assert_eq!(
-        CUDA_RS.matches("launch_mix_dn7(").count(),
+        cuda_rs().matches("launch_mix_dn7(").count(),
         6,
         "launch_mix_dn7 の呼び出し点が 6 か所 (定義 1 + 起動 5) でない"
     );
     // 発火の計数。
-    assert!(CUDA_RS.contains("pub(crate) fn note_dn7_out_hit()"));
-    assert!(CUDA_RS.contains("pub(crate) fn note_dn7_full_hit()"));
-    assert!(CUDA_RS.contains("pub(crate) fn note_dn7_head_hit()"));
+    assert!(cuda_rs().contains("pub(crate) fn note_dn7_out_hit()"));
+    assert!(cuda_rs().contains("pub(crate) fn note_dn7_full_hit()"));
+    assert!(cuda_rs().contains("pub(crate) fn note_dn7_head_hit()"));
     // 既定は dn7 (未設定 = true)、明示値は従来へ戻す。
     assert!(
-        CUDA_RS.contains("        Some(s) => s.ends_with(\"o7\"),\n        None => true,"),
+        cuda_rs().contains("        Some(s) => s.ends_with(\"o7\"),\n        None => true,"),
         "GDN の out が既定 on でない"
     );
     assert!(
-        CUDA_RS.contains("        None => true,\n        Some(\"dn7\") | Some(\"d7\") => true,"),
+        cuda_rs().contains("        None => true,\n        Some(\"dn7\") | Some(\"d7\") => true,"),
         "head が既定 on でない"
     );
     // 発火の証拠: `[mix-qchain]` の f7 / o7 / h7。
@@ -13282,10 +13314,10 @@ fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
     );
     // (1) 融合版の出力先が mdev (= zc_out のとき device から見える pinned)。
     assert!(
-        CUDA_RS.contains("let mdev = if zc_out {"),
+        cuda_rs().contains("let mdev = if zc_out {"),
         "mdev の決定が無い"
     );
-    let f = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_q_chain_into(");
+    let f = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_q_chain_into(");
     assert!(
         f.contains("let pout = if fu_use {\n                mdev"),
         "融合版 (upq8) が mdev を受け取っていない (zc_out と併用できない)"
@@ -13302,11 +13334,11 @@ fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
     );
     // (2) H2D 専用の非ブロッキングストリーム。
     assert!(
-        CUDA_RS.contains("fn mix_h2s_ensure(s: &mut MixGpuScratch)"),
+        cuda_rs().contains("fn mix_h2s_ensure(s: &mut MixGpuScratch)"),
         "mix_h2s_ensure が無い"
     );
     assert!(
-        CUDA_RS.contains("stream_create(&mut st, CU_STREAM_NON_BLOCKING)"),
+        cuda_rs().contains("stream_create(&mut st, CU_STREAM_NON_BLOCKING)"),
         "別ストリームを非ブロッキングで作っていない"
     );
     assert_eq!(
@@ -13325,11 +13357,11 @@ fn task431_mix_zc_out_with_fused_up_and_side_stream_h2d_are_wired() {
     );
     // ゲートは既存 env の新しい値 (lab の COND は新しい env 名を落とす)。
     assert!(
-        CUDA_RS.contains("pub fn mix_zc_h2d_stream_from_value(v: Option<&str>) -> bool {"),
+        cuda_rs().contains("pub fn mix_zc_h2d_stream_from_value(v: Option<&str>) -> bool {"),
         "ゲートの純関数が無い"
     );
     assert!(
-        CUDA_RS.contains("std::env::var(MIX_ZC_ENV).ok().as_deref())"),
+        cuda_rs().contains("std::env::var(MIX_ZC_ENV).ok().as_deref())"),
         "既存 env (DENNO_MIX_ZC) を見ていない"
     );
     // 発火の証拠は既定 on の診断行に出す。
@@ -13376,15 +13408,15 @@ fn task431_dn7_down_four_lanes_per_pair_is_wired() {
         "x の 16 要素が 64 バイト境界から読まれていない"
     );
     // ホスト側: 門番・起動・計数・ゲート。
-    assert!(CUDA_RS.contains("pub fn mix_dn7_plan(n_in: usize, n_out: usize) -> Option<(usize, usize)> {"));
-    assert!(CUDA_RS.contains("const MIX_DN7_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn7\";"));
-    assert!(CUDA_RS.contains("const MIX_DN7_NARGS: usize = 7;"));
-    assert!(CUDA_RS.contains("fn launch_mix_dn7("));
+    assert!(cuda_rs().contains("pub fn mix_dn7_plan(n_in: usize, n_out: usize) -> Option<(usize, usize)> {"));
+    assert!(cuda_rs().contains("const MIX_DN7_KERNEL_NAME: &str = \"dno_mix_gemv_q8_0_dn7\";"));
+    assert!(cuda_rs().contains("const MIX_DN7_NARGS: usize = 7;"));
+    assert!(cuda_rs().contains("fn launch_mix_dn7("));
     assert!(
-        CUDA_RS.contains("Some(\"dn7\") | Some(\"d7\") => (MixGemv::Dn7, MixGemv::V5),"),
+        cuda_rs().contains("Some(\"dn7\") | Some(\"d7\") => (MixGemv::Dn7, MixGemv::V5),"),
         "ゲートの解釈が無い"
     );
-    let f = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_q_chain_into(");
+    let f = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_q_chain_into(");
     assert!(
         f.contains("MixGemv::Dn7 => {"),
         "鎖の down が dn7 を撃っていない"
@@ -13455,19 +13487,19 @@ fn task437_up4_four_lanes_per_pair_up_is_wired() {
         "1 行 20 スレッドでない"
     );
     // ホスト側: 3 本の読み込み・門番・起動形・計数・ゲート。
-    assert!(CUDA_RS.contains("const MIX_UP4_KERNEL: &str = \"dno_mix_upmix_q8_up4\";"));
-    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC: usize = 6;"));
-    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS: u32 = 480;"));
-    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC_W: usize = 12;"));
-    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS_W: u32 = 960;"));
-    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_JC_X: usize = 4;"));
-    assert!(CUDA_RS.contains("pub(crate) const MIX_UP4_THREADS_X: u32 = 320;"));
-    assert!(CUDA_RS.contains("pub fn mix_up4_plan(v: u8) -> Option<(u8, usize, u32)> {"));
-    assert!(CUDA_RS.contains("Some(\"3\") | Some(\"u4\") | Some(\"up4\") => 3,"));
-    assert!(CUDA_RS.contains("Some(\"4\") | Some(\"u4f\") | Some(\"up4f\") => 4,"));
-    assert!(CUDA_RS.contains("Some(\"5\") | Some(\"u4w\") | Some(\"up4w\") => 5,"));
-    assert!(CUDA_RS.contains("Some(\"6\") | Some(\"u4x\") | Some(\"up4x\") => 6,"));
-    let f = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_q_chain_into(");
+    assert!(cuda_rs().contains("const MIX_UP4_KERNEL: &str = \"dno_mix_upmix_q8_up4\";"));
+    assert!(cuda_rs().contains("pub(crate) const MIX_UP4_JC: usize = 6;"));
+    assert!(cuda_rs().contains("pub(crate) const MIX_UP4_THREADS: u32 = 480;"));
+    assert!(cuda_rs().contains("pub(crate) const MIX_UP4_JC_W: usize = 12;"));
+    assert!(cuda_rs().contains("pub(crate) const MIX_UP4_THREADS_W: u32 = 960;"));
+    assert!(cuda_rs().contains("pub(crate) const MIX_UP4_JC_X: usize = 4;"));
+    assert!(cuda_rs().contains("pub(crate) const MIX_UP4_THREADS_X: u32 = 320;"));
+    assert!(cuda_rs().contains("pub fn mix_up4_plan(v: u8) -> Option<(u8, usize, u32)> {"));
+    assert!(cuda_rs().contains("Some(\"3\") | Some(\"u4\") | Some(\"up4\") => 3,"));
+    assert!(cuda_rs().contains("Some(\"4\") | Some(\"u4f\") | Some(\"up4f\") => 4,"));
+    assert!(cuda_rs().contains("Some(\"5\") | Some(\"u4w\") | Some(\"up4w\") => 5,"));
+    assert!(cuda_rs().contains("Some(\"6\") | Some(\"u4x\") | Some(\"up4x\") => 6,"));
+    let f = fn_body(cuda_rs(), "pub fn maybe_gpu_mix_q_chain_into(");
     assert!(
         f.contains("let up4_plan = if fu_pre.is_some() && mix_up4_kernels().is_some() {"),
         "u4 の選択が無い"
@@ -13621,10 +13653,7 @@ fn task448_flashdec_tile_kernel_and_wiring() {
     );
 
     // 4. ホスト側の配線 (ゲート・門番・smem・起動・計数)。
-    let host = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda.rs"),
-    )
-    .expect("cuda.rs が読めない");
+    let host = cuda_rs();
     for s in [
         "enum FdecImpl {",
         "Some(\"tile\") | Some(\"fdt\") | Some(\"fdec2\") => Q4AttnKernel::Tile,",
@@ -13801,10 +13830,7 @@ fn task460_flashdec_combine_gate_kernel_and_wiring() {
     assert_eq!(td, tf, "dno_expf の写しが dec_dev と違う (定数が動く)");
 
     // 5. ホスト側の配線。
-    let host = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda.rs"),
-    )
-    .expect("cuda.rs が読めない");
+    let host = cuda_rs();
     for s in [
         "pub(crate) const FCBG_NARGS: usize = 6;",
         "pub(crate) fn parse_attn_fdec_cbg(v: Option<&str>) -> bool {",
@@ -13882,7 +13908,7 @@ fn task457_pf_elem_kernel_and_wiring() {
             "kernels_pf_elem.cu に {name} が無い"
         );
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
     }
@@ -13901,7 +13927,7 @@ fn task457_pf_elem_kernel_and_wiring() {
         "pub(crate) const PF_MIX_FASTSIG_MIN_TOK: usize = 32;",
         "pub(crate) const PF_MIX_FASTSIG_MAX_HC: usize = 8;",
     ] {
-        assert!(CUDA_RS.contains(line), "{line} が無い");
+        assert!(cuda_rs().contains(line), "{line} が無い");
     }
     // 3. norm は 1 演算 1 丸め (__fadd_rn / __fmul_rn) のまま、縮約だけ木にする。
     for s in [
@@ -13967,7 +13993,7 @@ fn task461_pf_ple_kernel_and_wiring() {
             "kernels_pf_ple.cu に {name} が無い"
         );
         assert!(
-            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            cuda_rs().contains(&format!("b\"{name}\\0\"")),
             "cuda.rs が {name} を読んでいない"
         );
     }
@@ -13990,7 +14016,7 @@ fn task461_pf_ple_kernel_and_wiring() {
         "pub(crate) const PF_PLE_GATE_NARGS: usize = 11;",
         "pub(crate) const PF_PLE_CONV_NARGS: usize = 18;",
     ] {
-        assert!(CUDA_RS.contains(line), "{line} が無い");
+        assert!(cuda_rs().contains(line), "{line} が無い");
     }
     // 1 演算 1 丸め (明示 __*_rn)。gate の縮約は warp の木 + warp 間の順次。
     for s in [
@@ -14051,8 +14077,8 @@ fn task457_pf_elem_gates_default_on() {
         "pub(crate) fn pf_mix_normp_from_value",
         "pub(crate) fn pf_mix_fastsig_from_value",
     ] {
-        let i = CUDA_RS.find(f).unwrap_or_else(|| panic!("{f} が無い"));
-        let body: String = CUDA_RS[i..].chars().take(340).collect();
+        let i = cuda_rs().find(f).unwrap_or_else(|| panic!("{f} が無い"));
+        let body: String = cuda_rs()[i..].chars().take(340).collect();
         assert!(body.contains("None => true,"), "{f}(None) が on でない: {body}");
         assert!(
             body.contains(r#""0" | "off" | "false" | "no" | """#),
@@ -14073,7 +14099,7 @@ fn task457_pf_elem_off_path_keeps_old_kernels() {
         // 発火の証拠 (COND ごとに 1 行出る)。
         "\"[pf-elem] {tag} grid={}x{}x{} threads={threads} {detail}\"",
     ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+        assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
     }
 }
 
@@ -14126,7 +14152,7 @@ fn task464_mix_nowait_wiring() {
         "if cur_empty && !gdn_x_in_mix_armed(req.n_embd) {",
         "入力が空で mix の控えも無い → 要求を落とす",
     ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+        assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
     }
 
     // 2. 呼ぶのは ssm 層の attn mix だけ。defer の入口は 1 箇所 (定義 + 1 呼び出し)。
@@ -14225,11 +14251,11 @@ fn task468_full_mix_nowait_wiring() {
         "&& len <= 65535",
         "&& (self.x_dev.is_some() || self.cur.len() == self.qkv_k)",
     ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+        assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
     }
     assert!(
-        CUDA_RS.contains("\"full\"")
-            && CUDA_RS.contains("fn mix_nowait_full_from_value(v: Option<&str>) -> bool {"),
+        cuda_rs().contains("\"full\"")
+            && cuda_rs().contains("fn mix_nowait_full_from_value(v: Option<&str>) -> bool {"),
         "full の門が既存 env の値でない"
     );
 
@@ -14514,7 +14540,7 @@ fn task481_up_split_dma_wiring() {
         // 従来経路は残っている (既定で切ったときの戻り先)。
         "pf_copy_into_pin(job.pin, &job.parts, job.pread);",
     ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+        assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
     }
 }
 
@@ -14662,7 +14688,7 @@ fn t538_staging_disk_inflight_is_counted() {
     ] {
         assert!(EXP_PF_SRC.contains(k), "台帳の定義が無い: {k}");
     }
-    let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
+    let cp = fn_body(cuda_rs(), "fn pf_copy_into_pin(");
     let rd = cp
         .find("exp_pf::read_part_ptr(part, at, dst, len)")
         .expect("pread が無い");
@@ -14690,7 +14716,7 @@ fn t538_staging_disk_inflight_is_counted() {
     );
     // グループごとの塊の選択 (`DENNO_PF_SPLIT_WIDE_KB`): 分割の大きさは
     // `split_chunk_for` で決め、`src` を持つグループだけ広げる。
-    let sp = fn_body(CUDA_RS, "fn pf_up_run_split(");
+    let sp = fn_body(cuda_rs(), "fn pf_up_run_split(");
     let sel = sp
         .find("exp_pf::split_chunk_for(")
         .expect("塊の選択が無い");
@@ -14763,7 +14789,7 @@ fn t530_staging_copy_instruments_and_gates_are_wired() {
         "窓の台帳がゲートの外に無い"
     );
     // 写しの側: 常駐の予測 → (ゲート) 並べ替え → 写し → グループの記録。
-    let cp = fn_body(CUDA_RS, "fn pf_copy_into_pin(");
+    let cp = fn_body(cuda_rs(), "fn pf_copy_into_pin(");
     let res = cp.find("exp_pf::range_resident(").expect("mincore の予測が無い");
     let ord = cp.find("exp_pf::nc_first_order(").expect("並べ替えが無い");
     let work = cp.find("let work = |").expect("写しの本体が無い");
@@ -14821,10 +14847,10 @@ fn t534_seg_fast_gates_are_wired() {
         "const SEG_K_GU8_NAMES:",
         "const SEG_K_K8_NAMES:",
     ] {
-        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+        assert!(cuda_rs().contains(k), "cuda.rs に {k} が無い");
     }
     // 選び方: 融合 (gu) の枝の中 → gu8 を先に見る / down の起動は差し替え後。
-    let body = fn_body(CUDA_RS, "pub fn moe_seg_layer_sum<F>(");
+    let body = fn_body(cuda_rs(), "pub fn moe_seg_layer_sum<F>(");
     let fuse = body.find("let fuse_gu: Option<CUfunction>").expect("fuse_gu が無い");
     let gu8 = body.find("k.gu8[slot_g]").expect("gu8 の選択が無い");
     let gu = body.find("_ => k.gu[slot_g]").expect("従来の融合版への落ち口が無い");
@@ -14860,10 +14886,10 @@ fn t534_down_q5_1_vector_kernel_is_wired() {
         "1 warp = 8 ブロックの定数が無い"
     );
     assert!(
-        CUDA_RS.contains("Some(b\"dno_seg_gemv_v4_q5_1\\0\")"),
+        cuda_rs().contains("Some(b\"dno_seg_gemv_v4_q5_1\\0\")"),
         "cuda.rs の v4 の名前が無い"
     );
-    let body = fn_body(CUDA_RS, "pub fn moe_seg_layer_sum<F>(");
+    let body = fn_body(cuda_rs(), "pub fn moe_seg_layer_sum<F>(");
     let k8 = body.find("k.k8[slot_d]").expect("k8 の選択が無い");
     let v4 = body.find("k.v4[slot_d]").expect("v4 の選択が無い");
     assert!(k8 < v4, "k8 を先に見ていない");
@@ -14882,7 +14908,7 @@ fn t534_down_q5_1_vector_kernel_is_wired() {
 #[test]
 fn t565_res_pin_and_restore_nosync_are_wired() {
     // 1. 残差の往復: ゲートを読み、pinned の強制版を通る。
-    let up = fn_body(CUDA_RS, "pub fn pf_upload_res(");
+    let up = fn_body(cuda_rs(), "pub fn pf_upload_res(");
     assert!(
         up.contains("crate::model::exp_pf::pf_res_pin()"),
         "res の上げがゲートを読んでいない"
@@ -14895,7 +14921,7 @@ fn t565_res_pin_and_restore_nosync_are_wired() {
         up.contains("copy_from(res)"),
         "pinned が取れないときの従来経路が消えている"
     );
-    let dn = fn_body(CUDA_RS, "pub fn pf_download_res(");
+    let dn = fn_body(cuda_rs(), "pub fn pf_download_res(");
     assert!(
         dn.contains("crate::model::exp_pf::pf_res_pin()"),
         "res の下げがゲートを読んでいない"
@@ -14910,7 +14936,7 @@ fn t565_res_pin_and_restore_nosync_are_wired() {
     );
 
     // 2. 戻し: リング経由の待たない H2D と、終端の 1 回の待ち。
-    let up_at = fn_body(CUDA_RS, "pub(crate) fn upload_pinned_at(");
+    let up_at = fn_body(cuda_rs(), "pub(crate) fn upload_pinned_at(");
     assert!(
         up_at.contains("restore_defer_on()"),
         "戻しの遅延モードを見ていない"
@@ -14919,7 +14945,7 @@ fn t565_res_pin_and_restore_nosync_are_wired() {
         up_at.contains("upload_pinned_deferred("),
         "遅延の上げ経路が無い"
     );
-    let ring = fn_body(CUDA_RS, "fn upload_pinned_deferred(");
+    let ring = fn_body(cuda_rs(), "fn upload_pinned_deferred(");
     for k in [
         "up_ring_index(",
         "cuMemcpyHtoDAsync (up ring)",
@@ -14928,7 +14954,7 @@ fn t565_res_pin_and_restore_nosync_are_wired() {
         assert!(ring.contains(k), "リングの上げに {k} が無い");
     }
     // 各スレッドのリングを待つのは戻しの終端だけ (戻しの中では待たない)。
-    let flush = fn_body(CUDA_RS, "pub fn restore_defer_flush_thread(");
+    let flush = fn_body(cuda_rs(), "pub fn restore_defer_flush_thread(");
     assert!(flush.contains("event_sync"), "終端でイベントを待っていない");
 
     let rest = fn_body(QWEN_SRC, "fn pf_restore_experts(");
@@ -14960,7 +14986,7 @@ fn t565_res_pin_and_restore_nosync_are_wired() {
         assert!(EXP_PF_SRC.contains(k), "exp_pf に {k} が無い");
     }
     for k in ["fn up_ring_index(", "fn pf_pin_admit("] {
-        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+        assert!(cuda_rs().contains(k), "cuda.rs に {k} が無い");
     }
 }
 
@@ -15101,16 +15127,16 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
         "fn attn_fdec_khx_on() -> bool {",
         "\"DENNO_ATTN_FLASHDEC_KHX\"",
     ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+        assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
     }
     // デバイス連鎖 (attn_launch) と CPU dispatch の両方で選ぶ。
-    let la = fn_body(CUDA_RS, "fn attn_launch(");
+    let la = fn_body(cuda_rs(), "fn attn_launch(");
     assert!(la.contains("fdt2_kernels()"), "attn_launch が第 3 版を選ばない");
     assert!(
         la.contains("let tile_arg = t2_k.is_some() || tile_k.is_some();"),
         "attn_launch の tile 引数の条件が 2 版を見ていない"
     );
-    let fd = fn_body(CUDA_RS, "fn q4_attn_decode_fdec(");
+    let fd = fn_body(cuda_rs(), "fn q4_attn_decode_fdec(");
     assert!(fd.contains("used_t2"), "q4_attn_decode_fdec が第 3 版を数えない");
     assert!(
         fd.contains("if attn_fdec_ilp_on() { fdt2_kernels() } else { None }"),
@@ -15118,7 +15144,7 @@ fn task520_flashdec_two_key_kernel_and_wiring() {
     );
     // 起動 1 行に ilp の状態が出る (lab の env が届いたかの証拠)。
     assert!(
-        CUDA_RS.contains("ilp={} khx={} fdtv=5"),
+        cuda_rs().contains("ilp={} khx={} fdtv=5"),
         "起動 1 行に ilp= / khx= が無い"
     );
 
@@ -15172,6 +15198,6 @@ fn t546_odirect_bounce_is_wired() {
         "exp_pf::read_part_ptr_od_bounce(part, at, dst, len)",
         "exp_pf::note_odb(0, len, 0, 0);",
     ] {
-        assert!(CUDA_RS.contains(s), "cuda.rs に {s} が無い");
+        assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
     }
 }
