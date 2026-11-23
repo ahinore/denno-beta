@@ -9513,6 +9513,52 @@ fn mix_inj2_gate_defaults_on() {
     );
 }
 
+/// task 617: F32 の inject 重みを BF16 に丸めて k 分割 GEMV へ載せる配線。
+///
+/// - ゲート名 (`DENNO_PF_INJ_F32_BF16`) と既定 off
+/// - `pf_weight` の F32 腕が `pf_inj_bf16_shape` を見て `PF_INJ_BF_W` へ BF16 写しを上げる
+/// - 撃った回数 (`inj2_calls=`) を `[pf-mix-kprof]` に出す
+#[test]
+fn pf_inj_f32_bf16_is_wired() {
+    assert!(
+        CUDA_RS.contains("pub const PF_INJ_F32_BF16_ENV: &str = \"DENNO_PF_INJ_F32_BF16\";"),
+        "ゲート名が無い"
+    );
+    let i = CUDA_RS
+        .find("pub(crate) fn pf_inj_f32_bf16_from_value")
+        .expect("pf_inj_f32_bf16_from_value が無い");
+    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    assert!(
+        body.contains("Some(\"1\")") && body.contains("Some(\"yes\")"),
+        "明示的な真値だけ on になっていない: {body}"
+    );
+    assert!(
+        !body.contains("None => true"),
+        "既定が on になっている (値が変わるので既定 off)"
+    );
+    // pf_weight の F32 腕: BF16 写しの表と形の判定。
+    let w = CUDA_RS
+        .find("fn pf_weight(")
+        .expect("pf_weight が無い");
+    let arm: String = CUDA_RS[w..].chars().take(2200).collect();
+    for s in [
+        "pf_inj_f32_bf16_on()",
+        "mix_inj2_on()",
+        "pf_inj_bf16_shape(l.k, l.n)",
+        "PF_INJ_BF_W",
+        "f32_bytes_to_bf16_bytes(l.blocks)",
+        "Some((p, PfWKind::Bf16))",
+    ] {
+        assert!(arm.contains(s), "pf_weight の F32 腕に {s} が無い");
+    }
+    // 発火の計数が台帳に出る。
+    assert!(CUDA_RS.contains("| inj2_calls={inj2}"), "inj2_calls= が無い");
+    assert!(
+        CUDA_RS.contains("if tag == \"inject\" {"),
+        "inject のときだけ数えていない"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // task 195: PLE 注入と router のゲート (既定 off・数値はビット一致)
 // ---------------------------------------------------------------------------
