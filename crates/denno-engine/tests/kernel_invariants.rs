@@ -14756,6 +14756,37 @@ fn t538_staging_disk_inflight_is_counted() {
     assert!(EXP_PF_SRC.contains("SPLIT_WIDE_KB_ENV"));
 }
 
+/// task 637: 広い塊の既定 (16 MiB) が上げスレッド 3 本でも L3 (96 MB) に
+/// 収まること (静的検査)。
+///
+/// task 538 は上げ 2 本のときに 32 MiB を選んだ。task 570 が 3 本にしたので
+/// 32 x 3 = 96 MiB で L3 を埋め切り、task 481 の利得 (DMA が直前の書き込みを
+/// L3 から読む) が消える。lab t637c は 16 MiB で 3,826 cold -9.1% だった。
+#[test]
+fn t637_wide_split_fits_three_up_workers() {
+    const L3_MB: usize = 96;
+    assert_eq!(
+        denno_engine::model::exp_pf::up_workers_from_value(None),
+        3,
+        "上げスレッドの既定が 3 でない (この前提が崩れたら 637 の数字は読めない)"
+    );
+    assert_eq!(
+        denno_engine::model::exp_pf::split_wide_kb_from_value(None),
+        16384,
+        "広い塊の既定が 16 MiB でない"
+    );
+    let live_mib = 3 * denno_engine::model::exp_pf::split_wide_kb_from_value(None) / 1024;
+    assert!(
+        live_mib <= L3_MB * 2 / 3,
+        "同時に生きるバウンス {live_mib} MiB が L3 に余裕を残さない"
+    );
+    // 32 MiB へ戻す道は残す (切り戻し)。
+    assert_eq!(
+        denno_engine::model::exp_pf::split_wide_kb_from_value(Some("32768")),
+        32768
+    );
+}
+
 /// task 530: ステージング写しの切り分けが配線されているか (静的検査)。
 ///
 /// 数値経路を変えるのは 2 つのゲート (`DENNO_PF_PREAD_NC_FIRST` /

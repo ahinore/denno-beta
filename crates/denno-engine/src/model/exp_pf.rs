@@ -2232,13 +2232,33 @@ pub fn up_split_bytes() -> usize {
 /// 0 = off (既定)。64..=262144 KiB。
 pub const SPLIT_WIDE_KB_ENV: &str = "DENNO_PF_SPLIT_WIDE_KB";
 
-/// [`SPLIT_WIDE_KB_ENV`] の既定値 (**32 MiB**、task 538 で採った)。
+/// [`SPLIT_WIDE_KB_ENV`] の既定値 (**16 MiB**、task 637 で 32 MiB から下げた)。
+///
+/// # task 538 で 32 MiB を選んだときとの違い
 ///
 /// lab t538b (3,826 cold): 8 MiB のまま (b/b2 11.80 / 11.50) が 32 MiB で
 /// **9.48 / 9.28**、64 MiB で 8.95、`copy_s` は 10.7 -> 8.3 -> 7.0 s。
 /// 64 MiB は 14k が 13.01 -> 14.09 と逆に振れたので 32 MiB を既定にした。
-/// 0 で従来 (8 MiB 固定)。既定モデルは `src` を持たないので発火しない。
-pub const DEFAULT_SPLIT_WIDE_KB: usize = 32768;
+/// **このとき上げスレッドは 2 本だった** (task 554)。
+///
+/// task 570 が上げスレッドを 3 本にした (既定 3) ので、同時に生きている
+/// バウンスは 3 枚になった。32 MiB x 3 = 96 MiB は 9800X3D の L3 (96 MB) と
+/// 同じ大きさで、task 481 の利得 (DMA が直前に書いた行を L3 から読む) が
+/// 消える。16 MiB x 3 = 48 MiB なら L3 に余裕が残る。
+///
+/// # 実測 (lab t637c、既定モデル、depth8k、PROFILE=1、`x0 b sw8 sw16 b2`)
+///
+/// | COND | 3,826 cold r1/r2 (median) | 14k cold r1 |
+/// | --- | --- | --- |
+/// | b (32 MiB) | 2.08 / 2.10 (2.09) | 5.03 |
+/// | sw8 (8 MiB 固定) | 1.99 / 1.85 (1.92) | 4.71 |
+/// | **sw16 (16 MiB)** | **1.90 / 1.89 (1.895)** | **4.77** |
+/// | b2 (32 MiB) | 2.07 / 2.10 (2.085) | 4.87 |
+///
+/// 3,826 は **-9.1%** (対 b2)、14k は -2.1% (対 b2) / -5.2% (対 b)。
+/// decode 9.8 ms/tok 不変、md5 は全 COND 全 6 文脈 SAME、errors 0。
+/// 0 で従来 (8 MiB 固定)、`=32768` で task 538 の値へ戻せる。
+pub const DEFAULT_SPLIT_WIDE_KB: usize = 16384;
 
 /// [`SPLIT_WIDE_KB_ENV`] の解釈 (純関数)。未設定 / 空 / 解析不能は既定 (off)。
 pub fn split_wide_kb_from_value(v: Option<&str>) -> usize {
@@ -8075,17 +8095,20 @@ mod tests {
 
     /// task 538: 広い塊のゲート (`DENNO_PF_SPLIT_WIDE_KB`) と、グループごとの
     /// 塊の選び方 (`src` を持つグループだけ広げる)。
+    ///
+    /// task 637: 既定を 32 MiB -> 16 MiB にした (上げスレッドが 2 -> 3 本になり、
+    /// 32 MiB x 3 = 96 MiB が L3 と同じ大きさになったため。lab t637c)。
     #[test]
     fn task538_split_wide_gate_truth_table() {
         assert_eq!(SPLIT_WIDE_KB_ENV, "DENNO_PF_SPLIT_WIDE_KB");
-        assert_eq!(DEFAULT_SPLIT_WIDE_KB, 32768, "task 538 で既定 on にした");
-        assert_eq!(split_wide_kb_from_value(None), 32768, "既定 on");
-        assert_eq!(split_wide_kb_from_value(Some("")), 32768);
+        assert_eq!(DEFAULT_SPLIT_WIDE_KB, 16384, "task 637 で 16 MiB にした");
+        assert_eq!(split_wide_kb_from_value(None), 16384, "既定 on");
+        assert_eq!(split_wide_kb_from_value(Some("")), 16384);
         assert_eq!(split_wide_kb_from_value(Some("0")), 0, "0 で従来へ戻る");
         assert_eq!(split_wide_kb_from_value(Some("off")), 0);
         assert_eq!(
             split_wide_kb_from_value(Some("x")),
-            32768,
+            16384,
             "解析不能は既定 (on)"
         );
         assert_eq!(split_wide_kb_from_value(Some("32768")), 32768);
