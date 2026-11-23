@@ -8625,8 +8625,22 @@ fn gdn_scan3_kernel_is_wired() {
         GDN_SCAN3_SRC.contains("const int r = lane * DNO_S3_NS + i;"),
         "scan3 の行の割り当てが lane * NS + i でない"
     );
-    let p = kernel_params(GDN_SCAN3_SRC, "dno_gdn_scan_sig3");
-    assert_eq!(p.len(), 23, "scan3 の引数が 23 本でない: {}", p.len());
+    // 1024 スレッド = 1 SM 1 ブロックなので 64 レジスタが上限。宣言が無いと
+    // ptxas の割り当てが 64 を超えて cuLaunchKernel が error 701 で落ちる (lab t592a)。
+    assert!(
+        GDN_SCAN3_SRC.contains("__launch_bounds__(1024, 1) dno_gdn_scan_sig3("),
+        "scan3 に __launch_bounds__(1024, 1) が無い (error 701 で起動できない)"
+    );
+    // 引数 23 本 (kernel_params は `__global__ void NAME(` の形しか見ないので、
+    // launch_bounds が間に入る scan3 は自分で括弧を開く)。
+    let at = GDN_SCAN3_SRC
+        .find("dno_gdn_scan_sig3(")
+        .expect("scan3 の定義が無い");
+    let params = split_top_args(call_inner(
+        GDN_SCAN3_SRC,
+        at + "dno_gdn_scan_sig3".len(),
+    ));
+    assert_eq!(params.len(), 23, "scan3 の引数が 23 本でない: {}", params.len());
     // ホスト側: 第 2 版より先に選び、block は 8*dk。
     let pick = fn_body(CUDA_RS, "fn gdn_scan_pick(");
     assert!(

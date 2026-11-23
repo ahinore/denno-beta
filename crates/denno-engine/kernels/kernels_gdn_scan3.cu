@@ -20,6 +20,13 @@
 // 前提 (ホスト側で保証する): dk == dv == 128 / d_conv == 4 / cs == 3。
 // それ以外は従来カーネル (`kernels_gdn.ptx` の dno_gdn_scan_sig) を使う。
 //
+// `__launch_bounds__(1024, 1)` は必須 (lab t592a で外したら cuLaunchKernel が
+// error 701 = LAUNCH_OUT_OF_RESOURCES で落ちた): 1024 スレッドのブロックは
+// 1 SM あたり 1 ブロックなので **1 スレッド 64 レジスタが上限**で、これを
+// 宣言しないと ptxas は 64 を超える割り当てをして起動できない。S (16) は
+// ホットなのでレジスタに残り、溢れるのは lane 0 だけが使う conv の窓と
+// ポインタ引数 (1 トークン 1 回) になる。
+//
 // PTX (このコンテナには nvcc が無いので denno-gpu 側で行う):
 //   nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels_gdn_scan3.cu -o kernels_gdn_scan3.ptx
 // まとめて作るなら `kernels/build_ptx.sh gdn_scan3`。
@@ -37,7 +44,7 @@ __device__ __forceinline__ float dno_s3_octet_sum(float v)
     return v;
 }
 
-extern "C" __global__ void dno_gdn_scan_sig3(
+extern "C" __global__ void __launch_bounds__(1024, 1) dno_gdn_scan_sig3(
     const float* __restrict__ qkv,   // [n, conv_dim] (conv 入力 = 投影済み qkv 行)
     const float* __restrict__ z,     // [n, value_dim]
     const float* __restrict__ beta,  // [n, nv]

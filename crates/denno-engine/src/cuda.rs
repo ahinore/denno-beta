@@ -67207,6 +67207,20 @@ fn gdn_scan3_kernel() -> Option<CUfunction> {
                 {
                     return None;
                 }
+                // 1024 スレッドのブロックを積めるか (lab t592a は launch_bounds 無しで
+                // error 701 = LAUNCH_OUT_OF_RESOURCES になった)。積めない実体なら
+                // 起動せずに第 2 版へ落とす (ラッチで decode 経路ごと止めないため)。
+                if let Some(g) = lib.func_get_attribute {
+                    let mut maxthr: c_int = 0;
+                    if g(&mut maxthr, 0, f) == CUDA_SUCCESS && (maxthr as u32) < 8 * 128 {
+                        eprintln!(
+                            "[gdn-scan3] max_threads={maxthr} < {} → 第 2 版 scan へ",
+                            8 * 128
+                        );
+                        return None;
+                    }
+                }
+                log_kernel_attr(lib, f, "dno_gdn_scan_sig3");
                 Some(Scan3Kernel { module, f })
             }
         })
