@@ -5019,8 +5019,17 @@ pub fn stream_copy_rate() -> (u64, u64) {
 //   mmap から写す)。md5 は全 COND で SAME が期待値。
 pub const ER_PAGE_HIT_ENV: &str = "DENNO_PF_ER_PAGE_HIT";
 
-/// [`ER_PAGE_HIT_ENV`] の既定 (lab t609c で勝ったら true へ。測るあいだは off)。
-pub const DEFAULT_ER_PAGE_HIT: bool = false;
+/// [`ER_PAGE_HIT_ENV`] の既定 (**lab t609c で採ったので on**)。切り戻しは `=0`。
+///
+/// 14k cold の壁が baseline の中央値 5,277 ms (5,277 / 5,453 / 5,196 の 3 本) から
+/// **5,053 ms** (5,148 / 4,959 の 2 本) へ **-4.2%** (中央値。平均は -4.8%)。
+/// `gpu_busy` は 4,159/4,143/4,171 対 4,143/4,144 で**不変** (±0.3%) なので、
+/// 差は露出ホスト時間 (`other` の `pf_er` + readahead の join) から出ている。
+/// 3,826 cold は 2.18/2.19/2.14 → 2.18/2.13 ms (中央値 -1.1%、悪化ではない)、
+/// decode 12.1-12.3 ms/tok と短い decode 9.8-9.9 は不変、md5 は全 COND 全 6 文脈
+/// SAME、errors 0。発火の証拠: `er_ph_layers=47`、`pread_MB` 18,465 -> 333、
+/// `ra_ms` 1,068.7 -> 40.2。
+pub const DEFAULT_ER_PAGE_HIT: bool = true;
 
 /// [`ER_PAGE_HIT_ENV`] の解釈 (純関数)。未設定・空は既定、明示的な真値だけ on。
 pub fn er_page_hit_from_value(v: Option<&str>) -> bool {
@@ -6350,8 +6359,14 @@ mod tests {
     /// - 台帳 (`er_ph_layers`) が `[exp-pf-stream]` の末尾に出る (発火の証拠)。
     #[test]
     fn er_page_hit_gate_and_stats() {
-        assert!(!er_page_hit_from_value(None), "未設定の既定は off");
-        assert!(!er_page_hit_from_value(Some("")));
+        // 既定は lab t609c で採ったあと **on** (未設定 / 空は既定)。
+        assert_eq!(
+            er_page_hit_from_value(None),
+            DEFAULT_ER_PAGE_HIT,
+            "未設定は既定に従う"
+        );
+        assert!(er_page_hit_from_value(None), "t609c で既定 on にした");
+        assert!(er_page_hit_from_value(Some(" ")), "空文字は既定");
         for on in ["1", "on", "true", "yes", "ON"] {
             assert!(er_page_hit_from_value(Some(on)), "{on}");
         }
