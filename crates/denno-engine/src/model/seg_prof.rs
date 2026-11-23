@@ -446,15 +446,22 @@ pub fn seg_sum_async_report() -> Option<String> {
 // 数値は同じバイト列を同じ宛先へ送るだけ (丸めも順序も変わらない)。失敗したら
 // `false` を返し、呼び出し側は従来の pageable 同期経路へ丸ごと落ちる。
 
-/// ゲート env。**既定 off** (明示的な真値だけ on)。
+/// ゲート env。**既定 on** (`=0` / `off` / `false` / `no` で従来の pageable 同期へ)。
 pub const SEG_H2D_PIN_ENV: &str = "DENNO_SEG_H2D_PIN";
 
-/// [`SEG_H2D_PIN_ENV`] の解釈 (純関数)。
+/// [`SEG_H2D_PIN_ENV`] の解釈 (純関数)。既定 on、明示的な偽値だけ off。
+///
+/// 既定 on の根拠 (lab t594b、UD-Q4_K_XL、depth8k、同じ run の b / b2 の柵):
+/// 短い decode が 2 ラウンドとも **-3.4% / -2.8%** (22.53/22.67 -> 21.77/22.03 ms の
+/// per-token 和)、experts 段が **4.10 -> 3.75 / 3.82 ms/token (-8.5% / -6.8%)**、
+/// 他の段は動かず (mix 2.15 / ssm 2.71-2.74 / full 0.95 / shared 0.48 / head 0.46)、
+/// md5 は全 6 文脈 SAME、errors 0、発火は `[seg-h2d] calls=6050 fallbacks=0`。
+/// `[seg-prof]` では h2d **8.0 -> 0.0 us/層** (table 0.5 -> 2.2 は pinned へ組む分)。
 pub fn seg_h2d_pin_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        _ => true,
+    }
 }
 
 /// seg prologue の H2D を pinned + 非同期にするか (プロセスで 1 回だけ env を読む)。
@@ -507,18 +514,17 @@ pub fn seg_h2d_report() -> Option<String> {
 mod t594_seg_h2d_tests {
     use super::*;
 
-    /// 明示的な真値だけ on (既定 off・解析不能は off)。
+    /// 既定 on。明示的な偽値だけ off (t594b で採った)。
     #[test]
     fn seg_h2d_pin_truth_table() {
-        assert!(!seg_h2d_pin_from_value(None), "未設定は既定 off");
-        assert!(!seg_h2d_pin_from_value(Some("")));
-        assert!(!seg_h2d_pin_from_value(Some("0")));
+        assert!(seg_h2d_pin_from_value(None), "未設定は既定 on");
+        assert!(seg_h2d_pin_from_value(Some("")), "空も既定 on");
+        assert!(seg_h2d_pin_from_value(Some("x")), "解析不能は既定 on");
+        assert!(!seg_h2d_pin_from_value(Some("0")), "切り戻し");
         assert!(!seg_h2d_pin_from_value(Some("off")));
-        assert!(!seg_h2d_pin_from_value(Some("x")), "解析不能は off");
+        assert!(!seg_h2d_pin_from_value(Some("FALSE")));
+        assert!(!seg_h2d_pin_from_value(Some(" no ")));
         assert!(seg_h2d_pin_from_value(Some("1")));
-        assert!(seg_h2d_pin_from_value(Some(" ON ")));
-        assert!(seg_h2d_pin_from_value(Some("TRUE")));
-        assert!(seg_h2d_pin_from_value(Some("yes")));
     }
 
     /// 台帳は呼んだ分だけ増える (発火の証拠を数えられる)。
