@@ -772,7 +772,7 @@ pub fn stream_lookahead() -> usize {
 /// `c2000_cold` = `9b28e018` / decode 10.4 ms/tok / 3,826 cold 2,110-2,138 ms で
 /// 差 0 (pread を使わない層はワーカー 0 にだけ送る)。
 ///
-/// 1 本あたりの pread 本数は `DENNO_PF_PREAD_THREADS` (32) のままで、2 本は
+/// 1 本あたりの pread 本数は `DENNO_PF_PREAD_THREADS` (task 606 で 32 -> 16) で、2 本は
 /// **1 本の pool を共有する**。2 本に分けた版 (2 x 32 本) は t554a/t554b で
 /// 3,826 が -29%、14k が -19/-25% とさらに速かったが、**既定モデルの 3,826 cold が
 /// 返らなくなった** (t554c/t554d) ので捨てた。
@@ -2311,27 +2311,33 @@ pub fn up_split_wide_chunks() -> u64 {
 /// レイテンシ律速なら本数を増やすと同時に飛ぶ I/O が増える。
 pub const PREAD_THREADS_ENV: &str = "DENNO_PF_PREAD_THREADS";
 
-/// [`PREAD_THREADS_ENV`] の既定値 (32)。task 358 の lab t358b で採った。
+/// [`PREAD_THREADS_ENV`] の既定値 (16)。task 606 で 32 -> 16 にした。
 ///
-/// task 325 は 14 (共有プール) と 32 を比べて「壁時計は動かない」として
-/// 0 のまま残した (当時の 3,826 は 10.3-11.4 s、copy 7.2-7.7 s)。その後の
-/// task 353/357 で PLE と層優先の前処理が速くなり、**prefill の壁時計に
-/// 占める expert の pread (44.4 GB / 98.2 GB) の比率が上がった**ので、
-/// 同じ 32 本をもう一度測った:
+/// # task 358 の 32 が今は濃すぎる理由 (task 606 の lab t606b)
 ///
-/// lab t358b (UD-Q4_K_XL、depth8k、`[exp-pf-stream]` の copy_s と壁時計):
+/// task 358 が 32 を選んだとき (t358b) は、pread のプールは **1 本** だったので
+/// 同時に飛ぶ I/O は 32 本だった。task 558 以降は上げスレッドごとにプールを持つ
+/// (`DENNO_PF_PREAD_POOL_PER_UP`、既定 on) ので、上げ 3 本 x 32 = **96 本**が
+/// 同時に飛ぶ。0.79 MB の読みで 96 本は過剰で、1 グループの barrier が
+/// 「最後の 1 本」を待つ時間が伸びる。さらに **先読み (既定 32 本) の窓が
+/// 写しに食われる**ので、置き場へ入るバイトが減る。
 ///
-/// | cond | 3,826 copy | 3,826 wall | 14k copy | 14k wall |
-/// | --- | --- | --- | --- | --- |
-/// | x0 (14 本) | 10.37 / 9.26 s | 12.81 / 11.54 s | 14.30 s | 30.25 s |
-/// | **32 本** | **8.61 / 7.74 s** | **10.83 / 9.87 s** | **11.84 s** | **25.71 s** |
-/// | 48 本 | 7.41 / 8.58 s | 9.84 / 11.04 s | 14.11 s | 34.65 s |
-/// | b1 (14 本) | 9.96 / 14.12 s | 12.12 / 18.28 s | 14.02 s | 31.18 s |
+/// lab t606b (UD-Q4_K_XL、depth8k、同じ run の b/b2 の柵と対。1 ラウンド 6 COND):
 ///
-/// 3,826 は中央値 12.12 -> 10.35 s (-14.6%)、14k は 30.25 -> 25.71 s (-15.0%)。
-/// 48 本は 3,826 で最速だが 14k で負け (ホストの外乱) なので 32 を採る。
-/// decode は変わらない (a1/a2 の生秒 2.3-2.6 s)。
-pub const DEFAULT_PREAD_THREADS: usize = 32;
+/// | 指標 (14k cold、1 サンプル) | b (32) | t (16) | b2 (32) |
+/// | --- | ---: | ---: | ---: |
+/// | 壁 (ms) | 10,849.3 | **9,570.7** | 10,248.2 |
+/// | experts 段 | 7,332.6 | **6,070.3** | 6,607.6 |
+/// | `copy_s` | 16.74 | **14.05** | 15.20 |
+/// | `ready_s` | 6.31 | **5.41** | 5.77 |
+/// | `nc_miss_MB` (ディスク) | 19,263.1 | **15,191.6** | 17,014.5 |
+/// | `ra_MB` (先読みが置いた) | 16,910.3 | **18,084.8** | 17,821.7 |
+///
+/// 14k は b -11.8% / b2 -6.6%、`gpu_busy` は 3,594.7 / 3,601.6 / 3,601.2 で不変。
+/// 3,826 は柵の内側 (r2: b -3.0% / b2 -1.7%、r1 は b2 が 19.7 s の外れで柵に
+/// 使えない)。decode は 1.44/1.55 対 1.44/1.56 で不変、md5 は cold 2 文脈が
+/// 全 COND SAME。切り戻しは `DENNO_PF_PREAD_THREADS=32` (テストで固定)。
+pub const DEFAULT_PREAD_THREADS: usize = 16;
 
 /// [`PREAD_THREADS_ENV`] の解釈 (純関数)。0..=64 に丸める。`0` = 共有プール。
 pub fn pread_threads_from_value(v: Option<&str>) -> usize {
@@ -2369,7 +2375,7 @@ pub fn pread_threads() -> usize {
 ///
 /// # 何が変わるか
 ///
-/// 上げスレッド `wid` ごとに `DENNO_PF_PREAD_THREADS` (32) 本のプールを持ち、
+/// 上げスレッド `wid` ごとに `DENNO_PF_PREAD_THREADS` (task 606 で 32 -> 16) 本のプールを持ち、
 /// そのスレッドの `par_iter` は自分のプールで回す。2 本なら同時 64 本。
 /// プールは**プロセスで 1 組**だけ作り (上げスレッドの番号で引く)、リクエストを
 /// またいで使い回す。計算スレッドの経路 (番号なし) は従来の共有プールのまま。
@@ -5236,7 +5242,7 @@ pub const DEFAULT_RC_CACHE_MB: usize = 512;
 
 /// `DENNO_PF_RA_THREADS`: 先読みの並列度。**既定 32** (task 602 で 8 -> 32)。
 ///
-/// 窓のあいだディスクを回す本数。コピー側は 32 本 (`DENNO_PF_PREAD_THREADS`) だが、
+/// 窓のあいだディスクを回す本数。コピー側は 16 本 (`DENNO_PF_PREAD_THREADS`、task 606) だが、
 /// t470d の実測 (14 本で 3.2-5.5 GB/s) を見て task 474 は 8 本にしていた。
 ///
 /// # なぜ 32 か (lab t602b、UD-Q4_K_XL、depth8k、8 本の既定 CONDs と対)
@@ -6702,22 +6708,27 @@ mod tests {
         assert_eq!(DEFAULT_PLE_THREADS, 128, "task 419 で 128 にした");
     }
 
-    /// task 325 / 358: `DENNO_PF_PREAD_THREADS` の丸めと既定 (32 本)。
+    /// task 325 / 358 / 606: `DENNO_PF_PREAD_THREADS` の丸めと既定 (16 本)。
     ///
-    /// task 358 で既定を 0 (共有プール 14 本) から 32 本へ変えた (lab t358b:
-    /// 3,826 -14.6%、14k -15.0%)。**`0` は明示的な切り戻し**として 0 を返す
-    /// (未設定・空・解析不能だけが新しい既定へ行く)。
+    /// task 358 で 0 (共有プール 14 本) から 32 本へ変え (lab t358b)、task 606 で
+    /// 16 本へ戻した (lab t606b: 上げ 3 本 x 32 = 96 本は濃すぎる。14k cold
+    /// -6.6 .. -11.8%、3,826 は柵の内側)。**`0` は明示的な切り戻し**として 0 を
+    /// 返す (未設定・空・解析不能だけが新しい既定へ行く)。
     #[test]
     fn pread_threads_rounds_and_defaults() {
-        assert_eq!(pread_threads_from_value(None), 32, "未設定は新しい既定 32");
-        assert_eq!(pread_threads_from_value(Some("")), 32);
+        assert_eq!(pread_threads_from_value(None), 16, "未設定は新しい既定 16");
+        assert_eq!(pread_threads_from_value(Some("")), 16);
         assert_eq!(pread_threads_from_value(Some("0")), 0, "0 = 共有プールへ戻す");
-        assert_eq!(pread_threads_from_value(Some("32")), 32);
+        assert_eq!(
+            pread_threads_from_value(Some("32")),
+            32,
+            "task 606 の切り戻しは =32"
+        );
         assert_eq!(pread_threads_from_value(Some(" 16 ")), 16);
         assert_eq!(pread_threads_from_value(Some("999")), 64, "上限 64");
-        assert_eq!(pread_threads_from_value(Some("x")), 32);
+        assert_eq!(pread_threads_from_value(Some("x")), 16);
         assert_eq!(PREAD_THREADS_ENV, "DENNO_PF_PREAD_THREADS");
-        assert_eq!(DEFAULT_PREAD_THREADS, 32);
+        assert_eq!(DEFAULT_PREAD_THREADS, 16);
     }
 
     /// task 325: 塊に切っても合計は元の長さで、隙間も重なりも無い。
