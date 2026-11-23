@@ -431,6 +431,110 @@ pub fn seg_sum_async_report() -> Option<String> {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// task 594: seg prologue (約 10.8 KB) の H2D を pinned バウンス + 非同期 DMA に
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t594a の `[seg-prof]`、UD-Q4_K_XL、decode):
+// - ホストは 1 層あたり h2d 8.0 us を払っていた (`stage.copy_from`)。
+//   pageable の同期 `cuMemcpyHtoD` で 10.8 KB が 1.3 GB/s しか出ない。
+// - 48 層/token で 0.38 ms/token = 短い decode 12.3 ms の 3.1%。
+// - 同じ層の `sync` は 20 us あり、ホストのミス計算 (65 us) と重ねている
+//   最中に**先頭で 8 us 止まっている**。pinned から同じストリームへ DMA を
+//   出せば、ホストは待たずにミス計算へ進める。
+//
+// 数値は同じバイト列を同じ宛先へ送るだけ (丸めも順序も変わらない)。失敗したら
+// `false` を返し、呼び出し側は従来の pageable 同期経路へ丸ごと落ちる。
+
+/// ゲート env。**既定 off** (明示的な真値だけ on)。
+pub const SEG_H2D_PIN_ENV: &str = "DENNO_SEG_H2D_PIN";
+
+/// [`SEG_H2D_PIN_ENV`] の解釈 (純関数)。
+pub fn seg_h2d_pin_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// seg prologue の H2D を pinned + 非同期にするか (プロセスで 1 回だけ env を読む)。
+pub fn seg_h2d_pin_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| seg_h2d_pin_from_value(std::env::var(SEG_H2D_PIN_ENV).ok().as_deref()))
+}
+
+static SEG_H2D_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEG_H2D_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// 非同期 DMA を出せた回数を 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_h2d_call() {
+    SEG_H2D_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 従来経路へ落ちたことを 1 回積む (cuda 側から呼ぶ)。
+pub fn note_seg_h2d_fallback() {
+    SEG_H2D_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// (発火, 落ちた) の回数。
+pub fn seg_h2d_counts() -> (u64, u64) {
+    (
+        SEG_H2D_CALLS.load(Ordering::Relaxed),
+        SEG_H2D_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// テスト用: 積算を 0 に戻す。
+#[cfg(test)]
+pub fn seg_h2d_reset() {
+    SEG_H2D_CALLS.store(0, Ordering::Relaxed);
+    SEG_H2D_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+/// リクエスト終端の診断行 (ゲート on のときだけ)。`calls` が 0 なら分岐が
+/// 発火していないので採否に使わない。
+pub fn seg_h2d_report() -> Option<String> {
+    if !seg_h2d_pin_on() {
+        return None;
+    }
+    let (calls, fallbacks) = seg_h2d_counts();
+    Some(format!(
+        "[seg-h2d] calls={calls} fallbacks={fallbacks} ({SEG_H2D_PIN_ENV})"
+    ))
+}
+
+#[cfg(test)]
+mod t594_seg_h2d_tests {
+    use super::*;
+
+    /// 明示的な真値だけ on (既定 off・解析不能は off)。
+    #[test]
+    fn seg_h2d_pin_truth_table() {
+        assert!(!seg_h2d_pin_from_value(None), "未設定は既定 off");
+        assert!(!seg_h2d_pin_from_value(Some("")));
+        assert!(!seg_h2d_pin_from_value(Some("0")));
+        assert!(!seg_h2d_pin_from_value(Some("off")));
+        assert!(!seg_h2d_pin_from_value(Some("x")), "解析不能は off");
+        assert!(seg_h2d_pin_from_value(Some("1")));
+        assert!(seg_h2d_pin_from_value(Some(" ON ")));
+        assert!(seg_h2d_pin_from_value(Some("TRUE")));
+        assert!(seg_h2d_pin_from_value(Some("yes")));
+    }
+
+    /// 台帳は呼んだ分だけ増える (発火の証拠を数えられる)。
+    #[test]
+    fn seg_h2d_counters_accumulate() {
+        seg_h2d_reset();
+        assert_eq!(seg_h2d_counts(), (0, 0));
+        note_seg_h2d_call();
+        note_seg_h2d_call();
+        note_seg_h2d_fallback();
+        assert_eq!(seg_h2d_counts(), (2, 1));
+        seg_h2d_reset();
+        assert_eq!(seg_h2d_counts(), (0, 0));
+    }
+}
+
 /// task 534: 8 バイトロード版 (gu8 / dn8) と Q5_1 の 4 バイト版 (dnv4) の起動回数。
 /// task 562: Q4_K の 16 バイト版 (gu16) も同じ台帳に積む。**発火の証拠**。
 static SEG_GU8_CALLS: AtomicU64 = AtomicU64::new(0);

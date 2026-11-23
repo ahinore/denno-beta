@@ -3478,6 +3478,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 if let Some(line) = denno_engine::model::seg_prof::seg_sum_async_report() {
                     eprintln!("{line}");
                 }
+                // task 594: seg prologue の H2D を pinned + 非同期にした回数
+                // (ゲート on のときだけ)。0 なら分岐が通っていない。
+                if let Some(line) = denno_engine::model::seg_prof::seg_h2d_report() {
+                    eprintln!("{line}");
+                }
                 // task 534: 8 バイトロード版 (gu8 / dn8) の起動回数 (ゲート on の
                 // ときだけ)。0 なら新しいカーネルは発火していない。
                 if let Some(line) = denno_engine::model::seg_prof::seg_fast_report() {
