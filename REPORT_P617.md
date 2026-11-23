@@ -12,7 +12,7 @@ ADOPT: yes t617a t617b t617c
 
 branch **`br617`** = 開始時の `int-auto` **`7bc7f90f1`** (merge: br609)。
 br613 は REPORT のみ (コード変更 0 行) なので merge していない。
-終端で int-auto を **`6a8597af0`** へ進めて merge した (§7)。
+終端で int-auto を **`6a8597af0`** -> **`d5a97b487`** へ進めて 2 回 merge した (§7)。
 
 数値はすべて GPU ラボの実測 (`SCENARIO=depth8k`、`PROFILE=1`、
 `MODEL=flash-next-UD-IQ3_XXS`、baseline COND = タスク指定の env
@@ -236,18 +236,23 @@ errors 0。
 
 ## 7. merge とテスト
 
-- 終端で int-auto を `7bc7f90f1` -> **`6a8597af0`** へ進めて merge した
-  (`docs: move the task reports ...` + `origin-main-1123`)。cuda.rs と
-  kernel_invariants.rs は衝突なし、`targets_all` の衝突も無い (どちらの側も
-  カーネルを足していない)。merge 後にテストを回し直した (§下)。
+- 終端で int-auto を **`6a8597af0` -> `d5a97b487` (merge: br592)** と 2 回進めて
+  merge した (1 回目は REPORT の docs 移動 + origin-main-1123、2 回目は br592 の
+  `kernels_gdn_scan3` / `gate_audit`)。cuda.rs と kernel_invariants.rs は衝突なし、
+  `targets_all` の衝突も無い (br592 は gdn_scan3 を足したが `targets_all` の行は
+  別)。**merge のたびにゲートを回し直した** (下の本数は最終値)。
+- 既定 on のゲート台帳 (`gate_audit::DEFAULT_ON_GATES`) には行を足していない。
+  このゲートが使う PTX は `kernels_mix_inj2.ptx` / `dno_mix_inj2_bf16` で、
+  `DENNO_PF_MIX_INJ2` の行が同じ組を持っている (台帳の注記の
+  「同じファイルなら行を分けない」に従う)。PTX が欠ければその行が WARN を出す。
 - この REPORT はリポジトリ直下 (`REPORT_P617.md`)。docs への移動は次の担当に任せる。
 - **最終ツリー (`3dfcf5b85`) をラボで回した (t617c)**: 既定 on で `inj2_calls=672` が
   出て、gpu_busy が off の 4,142.9 / 4,145.5 から 3,965.4 へ落ち、`=0` で md5 が
   旧値に戻る (§3.3)。**merge 後・既定 on のままで採否の数字が再現している。**
 - `cargo test --release -p denno-engine --features cuda --lib -- --test-threads=1`
-  -> **1426 passed / 0 failed / 103 ignored** (`CARGO_TARGET_DIR=/tmp/t617`)
+  -> **1427 passed / 0 failed / 103 ignored** (`CARGO_TARGET_DIR=/tmp/t617`、br592 merge 後)
 - `cargo test --release -p denno-engine --features cuda --test kernel_invariants
-  -- --test-threads=1` -> **154 passed / 0 failed** (新規 1 本)
+  -- --test-threads=1` -> **155 passed / 0 failed** (新規 1 本。br592 の 1 本を含む)
 - cuda feature 無し: `cargo build --workspace --release` rc=0。
   `cargo test --workspace --release -- --test-threads=1` -> **63 本の
   test binary 全部 ok、rc=0** (P613 で落ちていた `denno-server` の
