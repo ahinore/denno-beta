@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy gdn_pf_wy4 exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf exp_k_tc mix_inj3 mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5 gdn_pf_wy6 gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 gemm_sn3 attn_pf2 attn_pf3 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj mix_split mix_inj2 moe_v5_q5k mix_dev2 mix_up mix_down mix_upmix steer gemm_ba225 router225 gdn_pf3 gdn_pf_wy gdn_pf_wy4 exp_iq_tc exp_iq_v3 mix_dev3 seg_k exp_k_pf exp_k_tc mix_inj3 mix_upmix_q8 mix_dn5 mix_dn6 gdn_pf_wy5 gdn_pf_wy6 gdn_pf_wy6p gdn_pf_wy7 gdn_pf_wy7q mix_dn7 mix_up4 attn_dec2 pf_elem attn_dec4 pf_ple attn_pf4 mix_dn8 attn_dec5 sh_gu gdn_scan3 mix_dn7_fm mix_up4_fm mix_upmix_q8_fm)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -237,6 +237,12 @@ spec() {
         # task 437: mix up (silu + up + hc_mixed) の 1 対 = 4 レーン版。
         # 4 レーンの逐次加算で丸め順が変わるので nofmad。
         mix_up4)      echo "kernels_mix_up4.cu|nofmad" ;;
+        # task 640: DENNO_FMAD の効果を PTX で測るための fmad 版 (同じ .cu を
+        # -fmad 既定で作り、ファイル名だけ変える。カーネル名は同じなので
+        # モジュールを分ければ共存する。採否は REPORT_P640 の表)。
+        mix_dn7_fm)   echo "kernels_mix_dn7.cu|fmad" ;;
+        mix_up4_fm)   echo "kernels_mix_up4.cu|fmad" ;;
+        mix_upmix_q8_fm) echo "kernels_mix_upmix_q8.cu|fmad" ;;
         # task 225: prefill の ssm beta/alpha 射影 (F32 重み 2,560 x 48) を
         # 48 行 x 64 トークンのタイルで回す GEMM。出力 1 要素 1 アキュムレータ・
         # k 昇順の明示 __fmaf_rn なので -fmad=false (演算列を読めるようにする)。

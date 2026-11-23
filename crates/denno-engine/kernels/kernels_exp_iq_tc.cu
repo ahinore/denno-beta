@@ -53,6 +53,7 @@
 #include <mma.h>
 #include <cuda_bf16.h>
 #include "kernels_exp_iq_tables.h"
+#include <cuda_fp16.h>
 
 // タイル。値の行にコメントを付けないこと (kernel_invariants が `#define` の
 // 行末までを値として読む)。
@@ -67,26 +68,17 @@
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float dno_tcq_f16(const unsigned char* b)
 {
-    unsigned int h = (unsigned int)b[0] | ((unsigned int)b[1] << 8);
-    unsigned int sign = (h & 0x8000u) << 16;
-    unsigned int exp = (h >> 10) & 0x1fu;
-    unsigned int man = h & 0x3ffu;
-    unsigned int bits;
-    if (exp == 0) {
-        if (man == 0) {
-            bits = sign;
-        } else {
-            int e = -14;
-            while ((man & 0x400u) == 0) { man <<= 1; --e; }
-            man &= 0x3ffu;
-            bits = sign | ((unsigned int)(e + 127) << 23) | (man << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (man << 13);
-    } else {
-        bits = sign | ((exp + 112u) << 23) | (man << 13);
+    // task 640: 手書きのビット展開をハードウェアの cvt.f32.f16 (`__half2float`) に
+    // 置き換えた。f16 -> f32 の拡張は IEEE 754 で一意なので結果は同じ (0 / 非正規化数
+    // を含む全 65536 パターンで旧実装と一致することを cuda.rs の
+    // f16_cvt_exhaustive で確認済み)。NaN と inf だけは旧実装の式をそのまま残す
+    // (ハードウェアは NaN を quiet 化するので、ペイロードの再現性のため)。
+    const unsigned int h = (unsigned int)b[0] | ((unsigned int)b[1] << 8);
+    if ((h & 0x7c00u) == 0x7c00u) {
+        const unsigned int sign = (h & 0x8000u) << 16;
+        return __int_as_float(sign | 0x7f800000u | ((h & 0x3ffu) << 13));
     }
-    return __int_as_float(bits);
+    return __half2float(__ushort_as_half((unsigned short)h));
 }
 
 __device__ __forceinline__ unsigned int dno_tcq_u32(const unsigned char* p)
