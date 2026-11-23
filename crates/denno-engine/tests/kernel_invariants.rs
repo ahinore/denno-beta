@@ -8669,10 +8669,10 @@ fn gdn_scan3_kernel_is_wired() {
         CUDA_RS.contains(r#"if ptx_entry_params(&text, "dno_gdn_scan_sig3") != Some(23)"#),
         "scan3 の ABI 検査が無い"
     );
-    // ゲートは既定 off (丸めが変わるので lab t592a の採否で決める)。
+    // ゲートは lab t592c の採否で既定 on (ssm 段 -2.8%、値は scan2 とビット一致)。
     assert!(
-        CUDA_RS.contains("const GDN_SCAN3_DEFAULT: bool = false;"),
-        "scan3 が既定 on になっている (丸めが変わるので lab の採否が先)"
+        CUDA_RS.contains("const GDN_SCAN3_DEFAULT: bool = true;"),
+        "scan3 が既定 on でない (lab t592c で採否 yes)"
     );
     assert!(
         BUILD_PTX_SH.contains(r#"gdn_scan3)    echo "kernels_gdn_scan3.cu|nofmad" ;;"#),

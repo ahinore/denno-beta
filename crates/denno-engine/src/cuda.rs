@@ -67136,7 +67136,7 @@ fn gdn_scan2_kernel() -> Option<CUfunction> {
 /// (`dk` / `dv` が引数だと展開されず、shared のロード latency が 128 反復ぶん
 /// 露出していた)。和の順序は変えないので**値は第 2 版とビット一致**。
 ///
-/// 既定 off。on のときは第 2 版より優先する (形と PTX が揃えば)。
+/// 既定 on (lab t592c)。on のときは第 2 版より優先する (形と PTX が揃えば)。
 fn gdn_scan3_from_value(v: Option<&str>, default_on: bool) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
@@ -67145,8 +67145,10 @@ fn gdn_scan3_from_value(v: Option<&str>, default_on: bool) -> bool {
     }
 }
 
-/// lab t592a で採否を決めるまで既定 off (丸めが変わるため)。
-const GDN_SCAN3_DEFAULT: bool = false;
+/// lab t592c で採否 yes: ssm 段 2.81-2.82 -> 2.71-2.73 ms/tok (-2.8%、2 ラウンド
+/// 一致、md5 全 COND SAME = 値は scan2 とビット一致、errors 0)。既定 on。
+/// 戻すのは `DENNO_GDN_SCAN3=0` (第 2 版 scan2 へ)。
+const GDN_SCAN3_DEFAULT: bool = true;
 
 pub(crate) fn gdn_scan3_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -68708,23 +68710,35 @@ mod task184_tests {
         assert!(gdn_scan2_on(), "DENNO_GDN_SCAN2 が既定 off に戻っている");
     }
 
-    /// task 592: scan3 の env 解釈 (既定は off) と、既定 off の確認。
+    /// task 592: scan3 の env 解釈 (既定 on、lab t592c で採否 yes) と、
+    /// 明示 off で第 2 版へ戻れること。
     #[test]
     fn gdn_scan3_truth_table() {
-        for raw in [None, Some(""), Some("  "), Some("x"), Some("0"), Some("off"), Some("false"), Some("no")] {
-            assert!(
-                !gdn_scan3_from_value(raw, GDN_SCAN3_DEFAULT),
-                "raw={raw:?} が on になっている"
-            );
-        }
-        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true "), Some("yes")] {
+        // 既定 on のとき、未設定・空・未知は on (= lab の既定と同じ)。
+        for raw in [None, Some(""), Some("  "), Some("x")] {
             assert!(
                 gdn_scan3_from_value(raw, GDN_SCAN3_DEFAULT),
-                "raw={raw:?} が off になっている"
+                "raw={raw:?} が既定 (on) になっていない"
             );
         }
-        assert_eq!(GDN_SCAN3_DEFAULT, false, "scan3 が既定 on に戻っている");
-        assert_eq!(gdn_scan3_from_value(Some("off"), true), false);
+        // 明示 off は既定に関係なく off (切り戻し)。
+        for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
+            for d in [true, false] {
+                assert!(
+                    !gdn_scan3_from_value(raw, d),
+                    "raw={raw:?} default={d} が on になっている"
+                );
+            }
+        }
+        for raw in [Some("1"), Some("on"), Some("TRUE"), Some(" true "), Some("yes")] {
+            for d in [true, false] {
+                assert!(
+                    gdn_scan3_from_value(raw, d),
+                    "raw={raw:?} default={d} が off になっている"
+                );
+            }
+        }
+        assert_eq!(GDN_SCAN3_DEFAULT, true, "scan3 の既定が on から戻っている");
     }
 
     /// 形状の門番: scan2 は dk == dv == 128 のときだけ選ばれる。

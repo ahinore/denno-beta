@@ -255,6 +255,16 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
         path_env: "DENNO_GDN_SCAN2_PTX",
         on: crate::cuda::gdn_scan2_on,
     },
+    // task 592: 同じ scan の第 3 版 (逐次和の定数展開。値は第 2 版とビット一致) を
+    // 既定 on にした (lab t592c: ssm 段 -2.8%)。第 3 版を先に選ぶので、PTX が
+    // 欠けると静かに第 2 版へ落ちる (遅い) = 台帳に載せる。
+    GatePtx {
+        env: "DENNO_GDN_SCAN3",
+        ptx: "kernels_gdn_scan3.ptx",
+        entries: &["dno_gdn_scan_sig3"],
+        path_env: "DENNO_GDN_SCAN3_PTX",
+        on: crate::cuda::gdn_scan3_on,
+    },
     GatePtx {
         env: "DENNO_GDN_PF_FAST",
         ptx: "kernels_gdn_pf.ptx",
