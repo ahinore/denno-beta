@@ -2267,8 +2267,23 @@ fn record_name(body: &Value) -> Result<String, String> {
         .as_object()
         .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
     for k in obj.keys() {
-        if !matches!(k.as_str(), "name") {
-            return Err(format!("未知のフィールド {k:?} (name のみ)"));
+        if !matches!(k.as_str(), "name" | "capture_mode") {
+            return Err(format!(
+                "未知のフィールド {k:?} (name / capture_mode のみ)"
+            ));
+        }
+    }
+    // task 825: `capture_mode` は今は "all" だけ。`last_prompt_token` は
+    // 残差の記録点 (層ループ) に「最後のプロンプトトークンだけ」を選ぶ仕組みが
+    // 要るので、この版では 400 で断る (黙って全部を記録しない)。
+    if let Some(m) = obj.get("capture_mode") {
+        let s = m
+            .as_str()
+            .ok_or_else(|| "capture_mode は文字列".to_string())?;
+        if s != "all" {
+            return Err(format!(
+                "capture_mode {s:?} は未対応 (この版は \"all\" のみ)"
+            ));
         }
     }
     let name = obj
@@ -2276,6 +2291,187 @@ fn record_name(body: &Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "name は文字列".to_string())?;
     Ok(name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// task 825: abliteration の作業台 (analyze / export / import)
+// ---------------------------------------------------------------------------
+
+/// 分析結果の JSON (ビューワの分離チャートがそのまま読む)。
+fn analysis_to_json(a: &steer::Analysis) -> Value {
+    json!({
+        "pos": a.pos,
+        "neg": a.neg,
+        "n_layer": a.layers.len(),
+        "peak_layer": a.peak_layer,
+        "recommended_range": [a.recommended_range.0, a.recommended_range.1],
+        "layers": a
+            .layers
+            .iter()
+            .map(|l| json!({
+                "layer": l.layer,
+                "diff_norm": l.diff_norm,
+                "norm_pos": l.norm_pos,
+                "norm_neg": l.norm_neg,
+                "cos_sim": l.cos,
+                "sep_score": l.sep,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `POST /v1/steer/analyze` の body を検証して分析する。**panic しない**。
+///
+/// `{pos, neg}` (名前 2 つ) か `{terms:[{snapshot,coef}...]}` (符号で A/B に分ける)。
+fn analyze_steer(body: &Value) -> Result<Value, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
+    for k in obj.keys() {
+        if !matches!(k.as_str(), "pos" | "neg" | "terms") {
+            return Err(format!(
+                "未知のフィールド {k:?} (pos / neg / terms のみ)"
+            ));
+        }
+    }
+    let an = if let Some(tv) = obj.get("terms") {
+        let arr = tv
+            .as_array()
+            .ok_or_else(|| "terms は配列".to_string())?;
+        if arr.is_empty() {
+            return Err("terms が空".into());
+        }
+        let mut terms = Vec::with_capacity(arr.len());
+        for (i, t) in arr.iter().enumerate() {
+            let o = t
+                .as_object()
+                .ok_or_else(|| format!("terms[{i}] はオブジェクト"))?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "snapshot" | "coef") {
+                    return Err(format!("terms[{i}]: 未知のフィールド {k:?}"));
+                }
+            }
+            let name = o
+                .get("snapshot")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("terms[{i}].snapshot は文字列"))?;
+            let coef = as_f32(
+                o.get("coef")
+                    .ok_or_else(|| format!("terms[{i}].coef が無い"))?,
+                &format!("terms[{i}].coef"),
+            )?;
+            terms.push(steer::Term {
+                snapshot: name.to_string(),
+                coef,
+            });
+        }
+        steer::analyze_terms(&terms)?
+    } else {
+        let pos = obj
+            .get("pos")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "pos は文字列 (か terms)".to_string())?;
+        let neg = obj
+            .get("neg")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "neg は文字列".to_string())?;
+        steer::analyze(pos, neg)?
+    };
+    Ok(analysis_to_json(&an))
+}
+
+/// `?k=v&...` から 1 つ取る (パーセント復号はしない。名前は A-Z a-z 0-9 _ - のみ)。
+fn query_param(path: &str, key: &str) -> Option<String> {
+    let q = path.split_once('?')?.1;
+    for kv in q.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k == key {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `GET /v1/steer/export` の応答 (本文と Content-Type)。
+fn export_body(path: &str) -> Result<(Vec<u8>, &'static str, String), String> {
+    let name = query_param(path, "name").ok_or_else(|| "name が要る (?name=...)".to_string())?;
+    if name.is_empty() {
+        return Err("name が空".into());
+    }
+    let json_wanted = matches!(query_param(path, "format").as_deref(), Some("json"));
+    if json_wanted {
+        let v = steer::export_json(&name)?;
+        let body = serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?;
+        Ok((
+            body,
+            "application/json",
+            format!("{name}.dnsteer.json"),
+        ))
+    } else {
+        let body = steer::export_raw(&name)?;
+        Ok((
+            body,
+            "application/octet-stream",
+            format!("{name}.{}", steer::FILE_EXT),
+        ))
+    }
+}
+
+/// `POST /v1/steer/import` の本文 (DNSTEER1 そのまま / JSON) を取り込む。
+fn import_steer(body: &[u8], rename: Option<&str>) -> Result<Value, String> {
+    if body.is_empty() {
+        return Err("body が空".into());
+    }
+    let snap = if body.starts_with(steer::FILE_MAGIC.as_bytes()) {
+        steer::import_bytes(body, rename)?
+    } else {
+        let v: Value = serde_json::from_slice(body).map_err(|e| format!("JSON でない: {e}"))?;
+        let renamed = match rename {
+            Some(n) => {
+                let mut v = v;
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("name".into(), json!(n));
+                }
+                v
+            }
+            None => v,
+        };
+        steer::import_json(&renamed)?
+    };
+    let mut out = steer_status_to_json();
+    out["imported"] = json!({
+        "name": snap.name,
+        "tokens": snap.tokens,
+        "created": snap.created,
+        "layers": snap.layers,
+        "n_hc": snap.n_hc,
+        "n_embd": snap.n_embd,
+    });
+    Ok(out)
+}
+
+/// 生のバイト列を返す (ダウンロード用。Content-Disposition 付き)。
+fn send_bytes(
+    stream: &mut TcpStream,
+    status: &str,
+    ctype: &str,
+    filename: &str,
+    body: &[u8],
+) -> Result<()> {
+    head(
+        stream,
+        status,
+        ctype,
+        &format!(
+            "Content-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\n",
+            body.len(),
+            filename
+        ),
+    )?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    Ok(())
 }
 
 /// task 218: `DENNO_STEER_RECORD` の記録を 1 リクエストごとにディスクへ書く。
@@ -2840,6 +3036,30 @@ fn handle_req(
     if req.method == "DELETE" && path == "/v1/steer/apply" {
         steer::clear_apply();
         return send_json(&mut stream, "200 OK", &steer_status_to_json());
+    }
+    // task 825: Abliterate 作業台 (対比の分析 / 持ち出し / 取り込み)。
+    if req.method == "POST" && path == "/v1/steer/analyze" {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
+        };
+        return match analyze_steer(&body) {
+            Ok(v) => send_json(&mut stream, "200 OK", &v),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    if req.method == "GET" && path == "/v1/steer/export" {
+        return match export_body(&req.path) {
+            Ok((body, ctype, filename)) => send_bytes(&mut stream, "200 OK", ctype, &filename, &body),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    if req.method == "POST" && path == "/v1/steer/import" {
+        let rename = query_param(&req.path, "name");
+        return match import_steer(&req.body, rename.as_deref()) {
+            Ok(v) => send_json(&mut stream, "200 OK", &v),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
     }
     if req.method != "POST" || path != "/v1/messages" {
         return send_json(
@@ -3799,5 +4019,197 @@ mod flash_tests {
         assert_eq!(default_rayon_threads(2), 1);
         assert_eq!(default_rayon_threads(1), 1);
         assert_eq!(default_rayon_threads(0), 1);
+    }
+
+    // ---- task 825: analyze / export / import のハンドラ -------------------
+
+    /// steer のグローバル (init / スナップショット) を触るテストの直列化。
+    static STEER825_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 小さな形 (4 層) で A/B の 2 スナップショットを用意する。
+    fn steer825_fixture() -> std::path::PathBuf {
+        let n = {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let dir = std::env::temp_dir().join(format!("denno-cli-825-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = steer::Shape {
+            n_layer: 4,
+            n_hc: 2,
+            n_embd: 3,
+        };
+        steer::init(s, "cli-825");
+        let st = s.stride();
+        for (name, seed) in [("ablit_A", 0.5f32), ("ablit_B", -0.5f32)] {
+            steer::start_record(name).expect("記録開始");
+            for t in 0..2usize {
+                for il in 0..s.n_layer {
+                    let row: Vec<f32> = (0..st)
+                        .map(|i| ((t * st + i) as f32 * 0.125) + seed)
+                        .collect();
+                    steer::acc_host(il, &row);
+                }
+            }
+            steer::stop_record().expect("保存");
+        }
+        dir
+    }
+
+    /// `/v1/steer/analyze` の JSON が層ごとの指標と推奨区間を返す。
+    #[test]
+    fn analyze_handler_reports_per_layer_metrics() {
+        let _g = STEER825_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = steer825_fixture();
+        let v = analyze_steer(&json!({"pos": "ablit_A", "neg": "ablit_B"})).expect("analyze");
+        assert!(serde_json::to_string(&v).is_ok(), "JSON にできない: {v}");
+        assert_eq!(v["pos"], "ablit_A");
+        assert_eq!(v["neg"], "ablit_B");
+        assert_eq!(v["n_layer"], 4);
+        let layers = v["layers"].as_array().expect("layers");
+        assert_eq!(layers.len(), 4);
+        for (i, l) in layers.iter().enumerate() {
+            assert_eq!(l["layer"], i);
+            let sep = l["sep_score"].as_f64().expect("sep_score");
+            assert!((0.0..=1.0).contains(&sep), "sep_score {sep}");
+            let cos = l["cos_sim"].as_f64().expect("cos_sim");
+            assert!((-1.0..=1.0).contains(&cos), "cos_sim {cos}");
+            assert!(l["diff_norm"].as_f64().expect("diff_norm") > 0.0);
+        }
+        let r = v["recommended_range"].as_array().expect("range");
+        assert_eq!(r.len(), 2);
+        let (f, t) = (
+            r[0].as_u64().unwrap() as usize,
+            r[1].as_u64().unwrap() as usize,
+        );
+        assert!(f >= 1 && t > f && t <= 3, "range {f}-{t}");
+        let peak = v["peak_layer"].as_u64().unwrap() as usize;
+        assert!((1..3).contains(&peak), "peak {peak}");
+
+        // terms 形式 (A +1 / B -1) は名前 2 つの分析と同じ数字になる。
+        let w = analyze_steer(&json!({
+            "terms": [
+                {"snapshot": "ablit_A", "coef": 1.0},
+                {"snapshot": "ablit_B", "coef": -1.0},
+            ]
+        }))
+        .expect("analyze terms");
+        assert_eq!(v["layers"], w["layers"]);
+        assert_eq!(v["recommended_range"], w["recommended_range"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 不正な body は Err (panic しない)。
+    #[test]
+    fn analyze_handler_never_panics_on_bad_input() {
+        let _g = STEER825_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = steer825_fixture();
+        for body in [
+            json!(null),
+            json!([1, 2]),
+            json!({}),
+            json!({"pos": "ablit_A"}),
+            json!({"neg": "ablit_B"}),
+            json!({"pos": 1, "neg": 2}),
+            json!({"pos": "ablit_A", "neg": "ablit_B", "bogus": 1}),
+            json!({"pos": "nope", "neg": "ablit_B"}),
+            json!({"pos": "ablit_A", "neg": "nope"}),
+            json!({"terms": []}),
+            json!({"terms": "x"}),
+            json!({"terms": [1]}),
+            json!({"terms": [{"snapshot": "ablit_A"}]}),
+            json!({"terms": [{"snapshot": 1, "coef": 1}]}),
+            json!({"terms": [{"snapshot": "ablit_A", "coef": 1, "x": 0}]}),
+            json!({"terms": [{"snapshot": "ablit_A", "coef": "1"}]}),
+            json!({"terms": [{"snapshot": "ablit_A", "coef": 1}]}),
+            json!({"terms": [{"snapshot": "nope", "coef": 1}, {"snapshot": "ablit_B", "coef": -1}]}),
+        ] {
+            assert!(analyze_steer(&body).is_err(), "通ってしまった: {body}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// export (バイナリ / JSON) と import (同じ本文を戻す) の往復。
+    #[test]
+    fn export_and_import_handlers_round_trip() {
+        let _g = STEER825_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = steer825_fixture();
+        let (body, ctype, fname) =
+            export_body("/v1/steer/export?name=ablit_A").expect("export raw");
+        assert_eq!(ctype, "application/octet-stream");
+        assert_eq!(fname, "ablit_A.dns");
+        assert!(body.starts_with(steer::FILE_MAGIC.as_bytes()));
+
+        // ヘッダ (Content-Disposition と長さ) まで含めて送れる。
+        let (mut srv, mut cli) = loopback();
+        send_bytes(&mut srv, "200 OK", ctype, &fname, &body).expect("send");
+        drop(srv);
+        let resp = read_all(&mut cli);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(
+            resp.contains("Content-Disposition: attachment; filename=\"ablit_A.dns\""),
+            "{resp}"
+        );
+        assert!(resp.contains(&format!("Content-Length: {}", body.len())));
+
+        // 名前を変えて取り込む (ディスク + メモリ)。
+        let out = import_steer(&body, Some("ablit_copy")).expect("import raw");
+        assert_eq!(out["imported"]["name"], "ablit_copy");
+        assert_eq!(out["imported"]["layers"], 4);
+        assert!(out["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "ablit_copy"));
+
+        // JSON (base64) の往復。
+        let (jbody, jctype, jname) =
+            export_body("/v1/steer/export?name=ablit_A&format=json").expect("export json");
+        assert_eq!(jctype, "application/json");
+        assert!(jname.ends_with(".json"), "{jname}");
+        let j: Value = serde_json::from_slice(&jbody).expect("JSON");
+        assert_eq!(j["name"], "ablit_A");
+        assert!(j["data_base64"].as_str().unwrap().len() > 16);
+        let out = import_steer(&jbody, Some("ablit_json")).expect("import json");
+        assert_eq!(out["imported"]["name"], "ablit_json");
+
+        // 不正な入力は Err。
+        assert!(import_steer(b"", None).is_err());
+        assert!(import_steer(b"nope", None).is_err());
+        assert!(import_steer(b"{}", None).is_err());
+        assert!(import_steer(&body, Some("a.b")).is_err(), "名前の検証が効いていない");
+        assert!(export_body("/v1/steer/export").is_err());
+        assert!(export_body("/v1/steer/export?name=").is_err());
+        assert!(export_body("/v1/steer/export?name=nope").is_err());
+        assert!(export_body("/v1/steer/export?name=nope&format=json").is_err());
+
+        // query の読み方 (順序・複数)。
+        assert_eq!(
+            query_param("/v1/steer/export?format=json&name=A", "name").as_deref(),
+            Some("A")
+        );
+        assert_eq!(query_param("/v1/steer/export?name=A", "format"), None);
+        assert_eq!(query_param("/v1/steer/export", "name"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/v1/steer/record` の capture_mode は "all" だけ通す (後方互換)。
+    #[test]
+    fn record_name_accepts_capture_mode_all_only() {
+        assert_eq!(
+            record_name(&json!({"name": "A"})).expect("name だけ"),
+            "A"
+        );
+        assert_eq!(
+            record_name(&json!({"name": "A", "capture_mode": "all"})).expect("all"),
+            "A"
+        );
+        assert!(record_name(&json!({"name": "A", "capture_mode": "last_prompt_token"})).is_err());
+        assert!(record_name(&json!({"name": "A", "capture_mode": 1})).is_err());
+        assert!(record_name(&json!({"name": "A", "bogus": 1})).is_err());
+        assert!(record_name(&json!({})).is_err());
+        assert!(record_name(&json!(null)).is_err());
     }
 }

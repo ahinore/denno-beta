@@ -780,20 +780,7 @@ fn snap_path(dir: &Path, name: &str) -> PathBuf {
 fn save_snapshot(s: &Snapshot) -> Result<(), String> {
     let dir = dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut buf = Vec::with_capacity(s.mean.len() * 4 + 160);
-    buf.extend_from_slice(FILE_MAGIC.as_bytes());
-    buf.push(b'\n');
-    buf.extend_from_slice(format!("name={}\n", s.name).as_bytes());
-    buf.extend_from_slice(format!("tokens={}\n", s.tokens).as_bytes());
-    buf.extend_from_slice(format!("created={}\n", s.created).as_bytes());
-    buf.extend_from_slice(format!("model={}\n", s.model).as_bytes());
-    buf.extend_from_slice(format!("layers={}\n", s.layers).as_bytes());
-    buf.extend_from_slice(format!("n_hc={}\n", s.n_hc).as_bytes());
-    buf.extend_from_slice(format!("n_embd={}\n", s.n_embd).as_bytes());
-    buf.extend_from_slice(b"data\n");
-    for v in &s.mean {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
+    let buf = encode_snapshot(s);
     let path = snap_path(&dir, &s.name);
     let tmp = dir.join(format!(".{}.{}.tmp", s.name, std::process::id()));
     std::fs::write(&tmp, &buf).map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -804,9 +791,14 @@ fn save_snapshot(s: &Snapshot) -> Result<(), String> {
 /// 1 ファイル読む。壊れていれば `Err`。
 pub fn load_file(path: &Path) -> Result<Snapshot, String> {
     let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    decode_snapshot_impl(&path.display().to_string(), &raw)
+}
+
+/// DNSTEER1 の本体を復号する。`label` はエラー文に出す出所。
+fn decode_snapshot_impl(label: &str, raw: &[u8]) -> Result<Snapshot, String> {
     let magic = FILE_MAGIC.as_bytes();
     if raw.len() < magic.len() + 1 || &raw[..magic.len()] != magic || raw[magic.len()] != b'\n' {
-        return Err(format!("{}: 先頭が {FILE_MAGIC} でない", path.display()));
+        return Err(format!("{label}: 先頭が {FILE_MAGIC} でない"));
     }
     // ヘッダは ASCII の行。`data\n` の直後から f32 が並ぶ。
     let mut off = magic.len() + 1;
@@ -822,19 +814,19 @@ pub fn load_file(path: &Path) -> Result<Snapshot, String> {
             .iter()
             .position(|&b| b == b'\n')
             .map(|p| off + p)
-            .ok_or_else(|| format!("{}: ヘッダが終わらない", path.display()))?;
+            .ok_or_else(|| format!("{label}: ヘッダが終わらない"))?;
         let line = std::str::from_utf8(&raw[off..end])
-            .map_err(|_| format!("{}: ヘッダが ASCII でない", path.display()))?;
+            .map_err(|_| format!("{label}: ヘッダが ASCII でない"))?;
         off = end + 1;
         if line == "data" {
             break;
         }
         let (k, v) = line
             .split_once('=')
-            .ok_or_else(|| format!("{}: ヘッダ行 {line:?} に '=' が無い", path.display()))?;
+            .ok_or_else(|| format!("{label}: ヘッダ行 {line:?} に '=' が無い"))?;
         let num = |v: &str| -> Result<u64, String> {
             v.parse::<u64>()
-                .map_err(|_| format!("{}: {k} が数値でない: {v:?}", path.display()))
+                .map_err(|_| format!("{label}: {k} が数値でない: {v:?}"))
         };
         match k {
             "name" => name = v.to_string(),
@@ -844,12 +836,7 @@ pub fn load_file(path: &Path) -> Result<Snapshot, String> {
             "layers" => layers = num(v)? as usize,
             "n_hc" => n_hc = num(v)? as usize,
             "n_embd" => n_embd = num(v)? as usize,
-            other => {
-                return Err(format!(
-                    "{}: 未知のヘッダ {other:?}",
-                    path.display()
-                ))
-            }
+            other => return Err(format!("{label}: 未知のヘッダ {other:?}")),
         }
     }
     let shape = Shape {
@@ -858,14 +845,13 @@ pub fn load_file(path: &Path) -> Result<Snapshot, String> {
         n_embd,
     };
     if !shape.is_valid() {
-        return Err(format!("{}: 形が不正", path.display()));
+        return Err(format!("{label}: 形が不正"));
     }
     let want = shape.len() * 4;
     let have = raw.len() - off;
     if have != want {
         return Err(format!(
-            "{}: 本体の長さが違う ({have} バイト / 期待 {want})",
-            path.display()
+            "{label}: 本体の長さが違う ({have} バイト / 期待 {want})"
         ));
     }
     let mut mean = vec![0.0f32; shape.len()];
@@ -977,6 +963,462 @@ pub fn delete(name: &str) -> Result<(), String> {
         clear_apply();
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// task 825: 対比の分析 (analyze) とエクスポート / インポート
+// ---------------------------------------------------------------------------
+//
+// abliteration の作業台 (`/2d` の Abliterate タブ) が使う:
+//
+// - `analyze`: 2 つの平均 (Set A / Set B) の層ごとの差 `d_l = mu_l(A) - mu_l(B)`
+//   と、その大きさ / 向き / 分離度を出す。分離度が高い層の連続区間を
+//   `recommended_range` として返す (層 0 と最終層は避ける)。
+// - `export` / `import`: 抽出したスナップショットをブラウザへ持ち出し、
+//   再起動後や別のプロセスへ戻せるようにする。形式は既存の DNSTEER1
+//   バイナリ (そのまま / base64) と、`mean` 配列を持つ JSON。
+//
+// 数値: ノルムと内積は f64 で足し、結果だけ f32 に丸める。`cos_sim` は
+// どちらかのノルムが 0 なら 0 (未定義を NaN にしない)。`sep_score` は
+// `||d|| / (||a|| + ||b|| + 1e-12)` で、0..1 に収まる (三角不等式)。
+
+/// 層 1 枚ぶんの対比の指標。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerSep {
+    pub layer: usize,
+    /// `||mu_A - mu_B||`
+    pub diff_norm: f32,
+    /// `||mu_A||`
+    pub norm_pos: f32,
+    /// `||mu_B||`
+    pub norm_neg: f32,
+    /// `cos(mu_A, mu_B)`
+    pub cos: f32,
+    /// `||d|| / (||a|| + ||b|| + eps)` (0..1)
+    pub sep: f32,
+}
+
+/// `analyze` の結果。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Analysis {
+    pub pos: String,
+    pub neg: String,
+    pub layers: Vec<LayerSep>,
+    /// `sep` が最大の層 (推奨区間の中心)。
+    pub peak_layer: usize,
+    /// `[from, to)` (to は含まない)。層 0 と最終層は除く。
+    pub recommended_range: (usize, usize),
+}
+
+/// 層ごとの指標を計算する。`a` と `b` は `[layer][stream][n_embd]` の連続領域。
+pub fn layer_metrics(shape: &Shape, a: &[f32], b: &[f32]) -> Result<Vec<LayerSep>, String> {
+    let st = shape.stride();
+    if !shape.is_valid() || st == 0 {
+        return Err("モデルの形が不正".into());
+    }
+    if a.len() != shape.len() || b.len() != shape.len() {
+        return Err(format!(
+            "ベクトルの長さが違う ({} / {} / 期待 {})",
+            a.len(),
+            b.len(),
+            shape.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(shape.n_layer);
+    for il in 0..shape.n_layer {
+        let base = il * st;
+        let (mut na2, mut nb2, mut dot, mut dn2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for d in 0..st {
+            let x = a[base + d] as f64;
+            let y = b[base + d] as f64;
+            na2 += x * x;
+            nb2 += y * y;
+            dot += x * y;
+            let e = x - y;
+            dn2 += e * e;
+        }
+        let na = na2.sqrt();
+        let nb = nb2.sqrt();
+        let dn = dn2.sqrt();
+        let cos = if na > 0.0 && nb > 0.0 {
+            (dot / (na * nb)).clamp(-1.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        let sep = (dn / (na + nb + 1e-12)) as f32;
+        out.push(LayerSep {
+            layer: il,
+            diff_norm: dn as f32,
+            norm_pos: na as f32,
+            norm_neg: nb as f32,
+            cos,
+            sep,
+        });
+    }
+    Ok(out)
+}
+
+/// 分離の高い層の連続区間 `[from, to)` を選ぶ。
+///
+/// 層 0 と最終層は対象から外す (層 0 の出口はまだ層を通っておらず、最終層は
+/// ヘッドの直前で、ablation の文献でも避けるのが普通)。ピークの半分以上の
+/// 分離が続く範囲を連続窓として広げる。分離が全部 0 なら内部全体を返す。
+pub fn recommended_range(sep: &[f32]) -> (usize, usize) {
+    let n = sep.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    if n < 3 {
+        return (0, n);
+    }
+    let lo = 1usize;
+    let hi = n - 1; // exclusive
+    let mut peak = lo;
+    let mut best = sep[lo];
+    for (i, &v) in sep.iter().enumerate().take(hi).skip(lo) {
+        if v > best {
+            best = v;
+            peak = i;
+        }
+    }
+    if !(best > 0.0) {
+        return (lo, hi);
+    }
+    let thr = best * 0.5;
+    let mut from = peak;
+    while from > lo && sep[from - 1] >= thr {
+        from -= 1;
+    }
+    let mut to = peak + 1;
+    while to < hi && sep[to] >= thr {
+        to += 1;
+    }
+    (from, to)
+}
+
+fn finish_analysis(pos: &str, neg: &str, layers: Vec<LayerSep>) -> Analysis {
+    let seps: Vec<f32> = layers.iter().map(|x| x.sep).collect();
+    let peak = layers
+        .iter()
+        .enumerate()
+        .take(layers.len().saturating_sub(1))
+        .skip(1)
+        .max_by(|a, b| a.1.sep.partial_cmp(&b.1.sep).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    Analysis {
+        pos: pos.to_string(),
+        neg: neg.to_string(),
+        layers,
+        peak_layer: peak,
+        recommended_range: recommended_range(&seps),
+    }
+}
+
+fn find_snapshot(snaps: &[Arc<Snapshot>], name: &str) -> Result<Arc<Snapshot>, String> {
+    snaps
+        .iter()
+        .find(|s| s.name == name)
+        .cloned()
+        .ok_or_else(|| format!("スナップショット {name:?} が無い"))
+}
+
+/// 2 つの名前付きスナップショットの対比を分析する。
+pub fn analyze(pos: &str, neg: &str) -> Result<Analysis, String> {
+    let (shape, _) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
+    let snaps = {
+        let g = snaps_cell().read().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&g)
+    };
+    let a = find_snapshot(&snaps, pos)?;
+    let b = find_snapshot(&snaps, neg)?;
+    if a.layers != shape.n_layer || a.n_hc != shape.n_hc || a.n_embd != shape.n_embd {
+        return Err(format!("スナップショット {pos:?} の形がモデルと違う"));
+    }
+    if b.layers != shape.n_layer || b.n_hc != shape.n_hc || b.n_embd != shape.n_embd {
+        return Err(format!("スナップショット {neg:?} の形がモデルと違う"));
+    }
+    let layers = layer_metrics(&shape, &a.mean, &b.mean)?;
+    Ok(finish_analysis(pos, neg, layers))
+}
+
+/// 任意の項の組 (`coef` の正が A 側、負が B 側) の対比を分析する。
+///
+/// `terms: [{snapshot:"ablit_A",coef:1},{snapshot:"ablit_B",coef:-1}]` を
+/// そのまま渡せる。片側が空ならエラー。
+pub fn analyze_terms(terms: &[Term]) -> Result<Analysis, String> {
+    let (shape, _) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
+    let snaps = {
+        let g = snaps_cell().read().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&g)
+    };
+    let mut a = vec![0.0f32; shape.len()];
+    let mut b = vec![0.0f32; shape.len()];
+    let mut n_pos = 0;
+    let mut n_neg = 0;
+    for t in terms {
+        if !t.coef.is_finite() {
+            return Err(format!("coef が有限でない ({})", t.snapshot));
+        }
+        let s = find_snapshot(&snaps, &t.snapshot)?;
+        if s.layers != shape.n_layer || s.n_hc != shape.n_hc || s.n_embd != shape.n_embd {
+            return Err(format!("スナップショット {:?} の形がモデルと違う", t.snapshot));
+        }
+        if t.coef > 0.0 {
+            n_pos += 1;
+            for (d, x) in a.iter_mut().zip(s.mean.iter()) {
+                *d += t.coef * *x;
+            }
+        } else if t.coef < 0.0 {
+            n_neg += 1;
+            let c = -t.coef;
+            for (d, x) in b.iter_mut().zip(s.mean.iter()) {
+                *d += c * *x;
+            }
+        }
+    }
+    if n_pos == 0 || n_neg == 0 {
+        return Err("正の係数と負の係数の両方が要る (例: A +1, B -1)".into());
+    }
+    let layers = layer_metrics(&shape, &a, &b)?;
+    let pos = terms
+        .iter()
+        .filter(|t| t.coef > 0.0)
+        .map(|t| t.snapshot.clone())
+        .collect::<Vec<_>>()
+        .join("+");
+    let neg = terms
+        .iter()
+        .filter(|t| t.coef < 0.0)
+        .map(|t| t.snapshot.clone())
+        .collect::<Vec<_>>()
+        .join("+");
+    Ok(finish_analysis(&pos, &neg, layers))
+}
+
+/// メモリ上の DNSTEER1 を復号する ([`load_file`] の中身)。
+pub fn decode_snapshot(raw: &[u8]) -> Result<Snapshot, String> {
+    decode_snapshot_impl("<memory>", raw)
+}
+
+/// DNSTEER1 バイナリを組み立てる ([`save_snapshot`] の中身)。
+pub fn encode_snapshot(s: &Snapshot) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(s.mean.len() * 4 + 160);
+    buf.extend_from_slice(FILE_MAGIC.as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(format!("name={}\n", s.name).as_bytes());
+    buf.extend_from_slice(format!("tokens={}\n", s.tokens).as_bytes());
+    buf.extend_from_slice(format!("created={}\n", s.created).as_bytes());
+    buf.extend_from_slice(format!("model={}\n", s.model).as_bytes());
+    buf.extend_from_slice(format!("layers={}\n", s.layers).as_bytes());
+    buf.extend_from_slice(format!("n_hc={}\n", s.n_hc).as_bytes());
+    buf.extend_from_slice(format!("n_embd={}\n", s.n_embd).as_bytes());
+    buf.extend_from_slice(b"data\n");
+    for v in &s.mean {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+/// 名前付きスナップショットの DNSTEER1 バイナリ (ダウンロード用)。
+pub fn export_raw(name: &str) -> Result<Vec<u8>, String> {
+    let snaps = {
+        let g = snaps_cell().read().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&g)
+    };
+    let s = find_snapshot(&snaps, name)?;
+    Ok(encode_snapshot(&s))
+}
+
+/// 名前付きスナップショットの JSON (`mean` を持たず base64 で本体を載せる)。
+pub fn export_json(name: &str) -> Result<serde_json::Value, String> {
+    let snaps = {
+        let g = snaps_cell().read().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&g)
+    };
+    let s = find_snapshot(&snaps, name)?;
+    let raw = encode_snapshot(&s);
+    Ok(serde_json::json!({
+        "name": s.name,
+        "tokens": s.tokens,
+        "created": s.created,
+        "model": s.model,
+        "layers": s.layers,
+        "n_hc": s.n_hc,
+        "n_embd": s.n_embd,
+        "format": FILE_MAGIC,
+        "data_base64": base64_encode(&raw),
+    }))
+}
+
+/// 復号済みのスナップショットを検証して保存する。`rename` で名前を差し替える。
+pub fn import_snapshot(mut s: Snapshot, rename: Option<&str>) -> Result<Snapshot, String> {
+    if let Some(n) = rename {
+        if !n.is_empty() {
+            validate_name(n)?;
+            s.name = n.to_string();
+        }
+    }
+    validate_name(&s.name)?;
+    let (shape, model) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
+    if s.layers != shape.n_layer || s.n_hc != shape.n_hc || s.n_embd != shape.n_embd {
+        return Err(format!(
+            "形が違う ({}x{}x{} / モデル {}x{}x{})",
+            s.layers, s.n_hc, s.n_embd, shape.n_layer, shape.n_hc, shape.n_embd
+        ));
+    }
+    if s.mean.len() != shape.len() {
+        return Err(format!("本体の長さが違う ({} / 期待 {})", s.mean.len(), shape.len()));
+    }
+    if !s.mean.iter().all(|x| x.is_finite()) {
+        return Err("本体に非有限の値が入っている".into());
+    }
+    if !model.is_empty() && !s.model.is_empty() && s.model != model {
+        return Err(format!(
+            "モデル id が違う ({:?} / モデル {:?})",
+            s.model, model
+        ));
+    }
+    if s.model.is_empty() {
+        s.model = model;
+    }
+    save_snapshot(&s)?;
+    push_snapshot(Arc::new(s.clone()));
+    Ok(s)
+}
+
+/// DNSTEER1 バイナリをインポートする。
+pub fn import_bytes(raw: &[u8], rename: Option<&str>) -> Result<Snapshot, String> {
+    let s = decode_snapshot(raw)?;
+    import_snapshot(s, rename)
+}
+
+/// JSON のインポート。`data_base64` (DNSTEER1 の base64) か `mean` 配列を受ける。
+pub fn import_json(v: &serde_json::Value) -> Result<Snapshot, String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
+    let rename = obj.get("name").and_then(|x| x.as_str());
+    if let Some(b64) = obj.get("data_base64") {
+        let s = b64
+            .as_str()
+            .ok_or_else(|| "data_base64 は文字列".to_string())?;
+        let raw = base64_decode(s)?;
+        return import_bytes(&raw, rename);
+    }
+    let num = |k: &str| -> Result<u64, String> {
+        obj.get(k)
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| format!("{k} は 0 以上の整数"))
+    };
+    let layers = num("layers")? as usize;
+    let n_hc = num("n_hc")? as usize;
+    let n_embd = num("n_embd")? as usize;
+    let shape = Shape {
+        n_layer: layers,
+        n_hc,
+        n_embd,
+    };
+    if !shape.is_valid() {
+        return Err("形が不正 (layers / n_hc / n_embd)".into());
+    }
+    let arr = obj
+        .get("mean")
+        .ok_or_else(|| "mean か data_base64 が要る".to_string())?
+        .as_array()
+        .ok_or_else(|| "mean は配列".to_string())?;
+    if arr.len() != shape.len() {
+        return Err(format!("mean の長さが違う ({} / 期待 {})", arr.len(), shape.len()));
+    }
+    let mut mean = Vec::with_capacity(arr.len());
+    for (i, x) in arr.iter().enumerate() {
+        let f = x
+            .as_f64()
+            .ok_or_else(|| format!("mean[{i}] が数値でない"))?;
+        if !f.is_finite() || f.abs() > 1e30 {
+            return Err(format!("mean[{i}] が有限の範囲に無い"));
+        }
+        mean.push(f as f32);
+    }
+    let name = rename.ok_or_else(|| "name が要る".to_string())?;
+    let s = Snapshot {
+        name: name.to_string(),
+        tokens: obj.get("tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        created: obj
+            .get("created")
+            .and_then(|x| x.as_u64())
+            .filter(|&c| c > 0)
+            .unwrap_or_else(now_secs),
+        model: obj
+            .get("model")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        layers,
+        n_hc,
+        n_embd,
+        mean,
+    };
+    import_snapshot(s, None)
+}
+
+/// 標準の base64 (RFC 4648, `+/`, `=` 詰め)。外部 crate を足さないための実装。
+pub fn base64_encode(raw: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((raw.len() + 2) / 3 * 4);
+    for c in raw.chunks(3) {
+        let b0 = c[0] as u32;
+        let b1 = *c.get(1).unwrap_or(&0) as u32;
+        let b2 = *c.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// base64 を復号する。空白は無視し、`=` で終わる。不正は `Err`。
+pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::with_capacity(s.len() * 3 / 4 + 3);
+    for (i, ch) in s.bytes().enumerate() {
+        let v = match ch {
+            b'A'..=b'Z' => ch - b'A',
+            b'a'..=b'z' => ch - b'a' + 26,
+            b'0'..=b'9' => ch - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => {
+                return Err(format!(
+                    "base64 に使えない文字 {:?} (位置 {i})",
+                    ch as char
+                ))
+            }
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    if bits > 4 {
+        return Err("base64 の長さが不正".into());
+    }
+    Ok(out)
 }
 
 fn now_secs() -> u64 {
@@ -1111,6 +1553,7 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// グローバル (env / スナップショット / epoch) を触るテストの直列化。
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1556,5 +1999,314 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- task 825: 対比の分析 / エクスポート / インポート -----------------
+
+    /// 層ごとのノルム・余弦・分離度が手計算と一致する。
+    #[test]
+    fn layer_metrics_match_hand_computation() {
+        let s = Shape {
+            n_layer: 2,
+            n_hc: 1,
+            n_embd: 3,
+        };
+        let a = [3.0f32, 0.0, 0.0, 1.0, 2.0, 2.0];
+        let b = [0.0f32, 4.0, 0.0, 1.0, 2.0, 2.0];
+        let got = layer_metrics(&s, &a, &b).expect("metrics");
+        assert_eq!(got.len(), 2);
+        let l0 = got[0];
+        assert_eq!(l0.layer, 0);
+        assert!((l0.norm_pos - 3.0).abs() < 1e-6, "{}", l0.norm_pos);
+        assert!((l0.norm_neg - 4.0).abs() < 1e-6, "{}", l0.norm_neg);
+        assert!((l0.diff_norm - 5.0).abs() < 1e-6, "{}", l0.diff_norm);
+        assert!(l0.cos.abs() < 1e-6, "直交の余弦が 0 でない: {}", l0.cos);
+        assert!((l0.sep - 5.0 / 7.0).abs() < 1e-6, "{}", l0.sep);
+        let l1 = got[1];
+        assert!(l1.diff_norm.abs() < 1e-6);
+        assert!((l1.cos - 1.0).abs() < 1e-6, "{}", l1.cos);
+        assert!(l1.sep.abs() < 1e-9);
+        // 形が合わないベクトルは Err (panic しない)。
+        assert!(layer_metrics(&s, &a[..5], &b).is_err());
+        assert!(layer_metrics(&s, &a, &b[..5]).is_err());
+    }
+
+    /// 推奨区間はピークを中心に半値以上が続く連続窓で、層 0 と最終層を避ける。
+    #[test]
+    fn recommended_range_is_half_max_window_inside_the_model() {
+        assert_eq!(recommended_range(&[]), (0, 0));
+        assert_eq!(recommended_range(&[0.3]), (0, 1));
+        assert_eq!(recommended_range(&[0.3, 0.4]), (0, 2));
+        // 層 0 が最大でも選ばない。
+        assert_eq!(recommended_range(&[0.9, 0.2, 0.5, 0.45, 0.1]), (2, 4));
+        // 最終層が最大でも選ばない。
+        assert_eq!(recommended_range(&[0.1, 0.3, 0.6, 0.99]), (1, 3));
+        // 分離が全部 0 なら内部全体。
+        assert_eq!(recommended_range(&[0.0, 0.0, 0.0, 0.0, 0.0]), (1, 4));
+        // ピークの左右に半値以上が続く限り広げる。
+        assert_eq!(recommended_range(&[0.0, 0.4, 0.8, 0.5, 0.2, 0.0, 0.0]), (1, 4));
+    }
+
+    /// 2 つのスナップショットの対比 (analyze) が層ごとの指標と推奨区間を返す。
+    #[test]
+    fn analyze_two_snapshots_reports_layers_and_range() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("analyze");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "an-model");
+        // A は [1,1,..] 側、B は [-1,-1,..] 側 (差が層ごとに一定)。
+        let a = rows(&s, 2, 0.5);
+        // B は A の符号反転 (余弦 -1・差ノルム 2||mu|| が手計算で決まる)。
+        let b: Vec<Vec<f32>> = a
+            .iter()
+            .map(|r| r.iter().map(|x| -x).collect())
+            .collect();
+        start_record("A").unwrap();
+        for row in &a {
+            for il in 0..s.n_layer {
+                acc_host(il, row);
+            }
+        }
+        stop_record().unwrap();
+        start_record("B").unwrap();
+        for row in &b {
+            for il in 0..s.n_layer {
+                acc_host(il, row);
+            }
+        }
+        stop_record().unwrap();
+
+        let an = analyze("A", "B").expect("analyze");
+        assert_eq!(an.pos, "A");
+        assert_eq!(an.neg, "B");
+        assert_eq!(an.layers.len(), s.n_layer);
+        for l in &an.layers {
+            assert!(l.diff_norm > 0.0);
+            assert!((l.cos + 1.0).abs() < 1e-5, "逆向きの余弦が -1 でない: {}", l.cos);
+            assert!(l.sep > 0.0 && l.sep <= 1.0, "sep {}", l.sep);
+        }
+        let (f, t) = an.recommended_range;
+        assert!(f >= 1 && t > f && t <= s.n_layer - 1, "range {f}-{t}");
+        assert!(an.peak_layer >= 1 && an.peak_layer < s.n_layer - 1);
+
+        // 同じスナップショット同士は差 0・余弦 1・分離 0。
+        let same = analyze("A", "A").expect("analyze same");
+        for l in &same.layers {
+            assert!(l.diff_norm.abs() < 1e-9);
+            assert!((l.cos - 1.0).abs() < 1e-6);
+            assert!(l.sep.abs() < 1e-9);
+        }
+        assert_eq!(same.recommended_range, (1, s.n_layer - 1));
+
+        // 無い名前は Err (panic しない)。
+        assert!(analyze("A", "nope").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 0 ベクトルのスナップショットでも NaN を出さない (余弦 0 / 分離 0)。
+    #[test]
+    fn analyze_zero_snapshot_yields_zero_cos_and_sep() {
+        let _g = LOCK.lock().unwrap();
+        let s = shape();
+        let zero = vec![0.0f32; s.len()];
+        let nonzero: Vec<f32> = (0..s.len()).map(|i| (i % 5) as f32 + 0.5).collect();
+        let m = layer_metrics(&s, &nonzero, &zero).expect("metrics");
+        for l in &m {
+            assert_eq!(l.cos, 0.0);
+            assert!(l.sep > 0.0);
+            assert!(l.sep.is_finite());
+        }
+        let m = layer_metrics(&s, &zero, &zero).expect("metrics");
+        for l in &m {
+            assert_eq!((l.cos, l.sep, l.diff_norm), (0.0, 0.0, 0.0));
+        }
+    }
+
+    /// terms の対比 (A +1 / B -1) が名前付きの対比と同じ結果になる。
+    #[test]
+    fn analyze_terms_splits_by_sign() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("terms");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "terms-model");
+        for (name, seed) in [("A", 0.5f32), ("B", -0.5)] {
+            let toks = rows(&s, 2, seed);
+            start_record(name).unwrap();
+            for row in &toks {
+                for il in 0..s.n_layer {
+                    acc_host(il, row);
+                }
+            }
+            stop_record().unwrap();
+        }
+        let by_name = analyze("A", "B").expect("by name");
+        let by_terms = analyze_terms(&[
+            Term {
+                snapshot: "A".into(),
+                coef: 1.0,
+            },
+            Term {
+                snapshot: "B".into(),
+                coef: -1.0,
+            },
+        ])
+        .expect("by terms");
+        assert_eq!(by_name.layers, by_terms.layers);
+        assert_eq!(by_name.recommended_range, by_terms.recommended_range);
+        assert_eq!(by_terms.pos, "A");
+        assert_eq!(by_terms.neg, "B");
+        // 片側だけ / coef 0 だけは Err。
+        assert!(analyze_terms(&[Term {
+            snapshot: "A".into(),
+            coef: 1.0,
+        }])
+        .is_err());
+        assert!(analyze_terms(&[
+            Term {
+                snapshot: "A".into(),
+                coef: 0.0
+            },
+            Term {
+                snapshot: "B".into(),
+                coef: -1.0
+            }
+        ])
+        .is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// base64 の往復と不正入力 (外部 crate 無しの実装)。
+    #[test]
+    fn base64_round_trip_and_rejects_garbage() {
+        for raw in [
+            b"".to_vec(),
+            b"f".to_vec(),
+            b"fo".to_vec(),
+            b"foo".to_vec(),
+            b"foobar".to_vec(),
+            vec![0u8, 255, 128, 7, 9, 10, 13],
+        ] {
+            let enc = base64_encode(&raw);
+            assert_eq!(base64_decode(&enc).unwrap(), raw, "enc {enc}");
+        }
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        // 空白は無視。
+        assert_eq!(base64_decode("Zm9v\n").unwrap(), b"foo");
+        assert!(base64_decode("Zm9v!!!!").is_err());
+        assert!(base64_decode("Z").is_err(), "端数のビットを黙って捨てた");
+    }
+
+    /// export → import の往復で値が 1 ビットも変わらない (binary / base64 / JSON)。
+    #[test]
+    fn export_import_round_trip_keeps_bits() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("expimp");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "ei-model");
+        let toks = rows(&s, 3, 0.125);
+        start_record("src").unwrap();
+        for row in &toks {
+            for il in 0..s.n_layer {
+                acc_host(il, row);
+            }
+        }
+        let src = stop_record().unwrap();
+
+        // バイナリ
+        let raw = export_raw("src").expect("export raw");
+        assert!(raw.starts_with(FILE_MAGIC.as_bytes()));
+        let back = import_bytes(&raw, Some("copy")).expect("import raw");
+        assert_eq!(back.name, "copy");
+        assert_eq!(back.mean.len(), src.mean.len());
+        for i in 0..src.mean.len() {
+            assert_eq!(back.mean[i].to_bits(), src.mean[i].to_bits(), "要素 {i}");
+        }
+        assert!(dir.join("copy.dns").exists(), "ディスクに書いていない");
+        assert!(snapshots().iter().any(|x| x.name == "copy"));
+
+        // JSON (base64)
+        let j = export_json("src").expect("export json");
+        assert_eq!(j["name"], "src");
+        assert!(j["data_base64"].as_str().unwrap().len() > 10);
+        assert!(serde_json::to_string(&j).is_ok());
+        let back = import_json(&j).expect("import json");
+        for i in 0..src.mean.len() {
+            assert_eq!(back.mean[i].to_bits(), src.mean[i].to_bits(), "JSON 要素 {i}");
+        }
+
+        // JSON (mean 配列)
+        let j2 = json!({
+            "name": "arr",
+            "layers": s.n_layer,
+            "n_hc": s.n_hc,
+            "n_embd": s.n_embd,
+            "mean": src.mean.iter().map(|x| json!(*x)).collect::<Vec<_>>(),
+        });
+        let back = import_json(&j2).expect("import mean array");
+        assert_eq!(back.name, "arr");
+        for i in 0..src.mean.len() {
+            assert_eq!(back.mean[i].to_bits(), src.mean[i].to_bits());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 壊れた入力は Err (panic しない)。形・名前・モデル id の検証。
+    #[test]
+    fn import_rejects_bad_input() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("badimp");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "bad-model");
+        let toks = rows(&s, 1, 0.0);
+        start_record("A").unwrap();
+        for row in &toks {
+            for il in 0..s.n_layer {
+                acc_host(il, row);
+            }
+        }
+        let good = stop_record().unwrap();
+
+        // 壊れたバイナリ
+        assert!(import_bytes(b"nope", None).is_err());
+        let mut trunc = encode_snapshot(&good);
+        trunc.truncate(trunc.len() - 3);
+        assert!(import_bytes(&trunc, None).is_err());
+        // 形違い
+        let mut other = good.clone();
+        other.layers = 5;
+        other.mean = vec![0.0; 5 * s.n_hc * s.n_embd];
+        assert!(import_snapshot(other, None).is_err());
+        // モデル id 違い
+        let mut other_model = good.clone();
+        other_model.model = "some-other-model".into();
+        assert!(import_snapshot(other_model, None).is_err());
+        // 使えない名前
+        let mut bad_name = good.clone();
+        bad_name.name = "a.b".into();
+        assert!(import_snapshot(bad_name, None).is_err());
+        // 非有限の値
+        let mut nan = good.clone();
+        nan.mean[0] = f32::NAN;
+        assert!(import_snapshot(nan, None).is_err());
+        // JSON の形違い / 壊れた base64 / 未知の形
+        assert!(import_json(&json!({"name": "x"})).is_err());
+        assert!(import_json(&json!({"name": "x", "data_base64": "!!!"})).is_err());
+        assert!(import_json(&json!({
+            "name": "x",
+            "layers": 0,
+            "n_hc": 0,
+            "n_embd": 0,
+            "mean": [],
+        }))
+        .is_err());
+        // 名前の上書きも検証される。
+        let raw = export_raw("A").unwrap();
+        assert!(import_bytes(&raw, Some("a/b")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
