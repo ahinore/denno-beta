@@ -533,6 +533,8 @@ pub async fn chat_completions(
     body: axum::body::Bytes,
 ) -> Result<Response, OaError> {
     check_auth(&state, &headers).map_err(OaError::from)?;
+    // P817: drain 中は新規の生成要求を受けない (/v1/messages と同じ 503)。
+    crate::reject_if_draining(&state).map_err(OaError::from)?;
     let req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| OaError::invalid(format!("invalid request body: {e}")))?;
 

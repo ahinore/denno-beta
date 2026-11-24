@@ -20,10 +20,12 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
+mod lifecycle;
 mod logging;
 mod openai;
 mod scheduler;
 mod stream_asm;
+pub use lifecycle::{Lifecycle, DEFAULT_DRAIN_TIMEOUT_MS};
 pub use logging::{init_serve_logging, NonBlockingStdout};
 pub use scheduler::{
     AdmitFailure, AdmitKind, Job, Limits, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler,
@@ -47,6 +49,10 @@ pub struct EngineInfo {
     pub slots: usize,
     /// モデルの層数
     pub layers: usize,
+    /// P817: `--model-dir` の basename (`/v1/models` の `model_dir`)。
+    /// エンジンはディレクトリを知らないので `from_engine` では空、
+    /// `run` がロード後に埋める。
+    pub model_dir: String,
 }
 
 impl EngineInfo {
@@ -57,6 +63,7 @@ impl EngineInfo {
             quant: e.quant.label().to_string(),
             slots: e.caches.len(),
             layers: e.caches.first().map(|c| c.n_layers()).unwrap_or(0),
+            model_dir: String::new(),
         }
     }
 }
@@ -864,6 +871,9 @@ pub(crate) fn new_tool_id() -> String {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        // P817: readiness。モデルロード済み + ワーカー生存 + drain していない
+        // ときだけ 200 (それ以外は 503)。liveness の /health とは別物。
+        .route("/ready", get(ready))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
         // P805: Anthropic 互換のトークン数見積り (prefill しない)
@@ -925,7 +935,13 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
     let model_name = engine.name.clone();
     let model_id = cfg.model_id.clone();
     // P57: 不変情報をここで 1 回だけ読む (ハンドラはエンジンロックを取らない)
-    let info = EngineInfo::from_engine(&engine);
+    let mut info = EngineInfo::from_engine(&engine);
+    // P817: `/v1/models` の `model_dir` (運用で「どの重みか」を判別するため)。
+    info.model_dir = cfg
+        .model_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     let engine = Arc::new(Mutex::new(engine));
     let state = Arc::new(AppState {
         engine: engine.clone(),
@@ -944,18 +960,128 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         start_telemetry_relay();
     }
 
-    let app = router(state);
+    let app = router(state.clone());
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on http://{}", addr);
-    axum::serve(listener, app).await?;
+    // P817: SIGTERM / SIGINT では即死せず drain する。新規要求は 503 にし、
+    // 進行中の生成を短い上限 (`DENNO_DRAIN_TIMEOUT_MS`、既定 10 s) まで待って
+    // から axum を止める。expert 使用回数もここで書く。
+    axum::serve(listener, app)
+        .with_graceful_shutdown(drain_on_signal(state))
+        .await?;
     Ok(())
+}
+
+/// P817: 停止シグナルを待つ (unix は SIGTERM / SIGINT、それ以外は Ctrl-C)。
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("SIGTERM ハンドラを仕掛けられない: {e}");
+            // 仕掛けられないなら SIGINT だけを待つ
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => tracing::info!("SIGTERM を受けた"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT を受けた"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("Ctrl-C を受けた");
+}
+
+/// P817: graceful drain。シグナルを受けたら
+///
+/// 1. `Lifecycle::begin_drain` — 以後の生成要求は 503 (ハンドラが弾く)
+/// 2. キュー待ち + 進行中が 0 になるのを `drain_timeout()` まで待つ
+/// 3. expert 使用回数を書く (`save_now` は未変更なら何もしない)
+///
+/// をしてから返る。返ると axum の graceful shutdown が走り、受付を止めて
+/// 残りの接続が閉じるのを待つ。
+async fn drain_on_signal(state: Arc<AppState>) {
+    wait_for_shutdown_signal().await;
+    state.scheduler.lifecycle().begin_drain();
+    let timeout = lifecycle::drain_timeout();
+    tracing::info!(
+        "drain 開始: 新規リクエストは 503。進行中の生成を最大 {:.1}s 待つ",
+        timeout.as_secs_f64()
+    );
+    let is_idle = || state.scheduler.pending() == 0 && state.scheduler.in_flight() == 0;
+    let idle = lifecycle::wait_for_idle(
+        is_idle,
+        timeout,
+        std::time::Duration::from_millis(lifecycle::DRAIN_POLL_MS),
+    )
+    .await;
+    if idle {
+        tracing::info!("drain 完了: 進行中の生成は無い");
+    } else {
+        tracing::warn!(
+            "drain 上限 ({:.1}s) 超過: pending={} in_flight={} のまま停止する",
+            timeout.as_secs_f64(),
+            state.scheduler.pending(),
+            state.scheduler.in_flight()
+        );
+    }
+    // expert 使用回数の flush。ファイル書き込みはブロッキングなので
+    // spawn_blocking に逃がす (decode は既に止まっている想定)。
+    match tokio::task::spawn_blocking(denno_engine::model::exp_stats::save_now).await {
+        Ok(Some(line)) => tracing::info!("{line}"),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("expert 使用回数の保存に失敗: {e}"),
+    }
 }
 
 // ---------- ハンドラ ----------
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
+}
+
+/// P817: readiness プローブ。liveness (/health) との違い:
+///
+/// - 200: モデルロード済み・ワーカー生存・drain 中でない (受付可能)
+/// - 503: 起動途中 / drain 中 / ワーカーが死んだ
+///
+/// 認証は /health と同じく要求しない (プローブはトークンを持たない)。
+/// 本文はオーケストレータ向けに理由と現在の負荷を返す (200 のときも同じ形)。
+async fn ready(State(state): State<Arc<AppState>>) -> Response {
+    let lc = state.scheduler.lifecycle();
+    let ok = lc.serves_requests();
+    let status = if ok { "ready" } else if lc.is_draining() { "draining" } else { "loading" };
+    let body = json!({
+        "status": status,
+        "ready": ok,
+        "draining": lc.is_draining(),
+        "model_loaded": lc.is_ready(),
+        "worker_alive": lc.worker_alive(),
+        "model": state.model_name,
+        "context_length": state.info.context,
+        "pending": state.scheduler.pending(),
+        "in_flight": state.scheduler.in_flight(),
+    });
+    let code = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(body)).into_response()
+}
+
+/// P817: drain 中の新規生成要求を 503 (overloaded_error) にする。
+/// 停止の途中で来た要求を**受けない**ことが drain の主目的 — 受けると
+/// 「待ち行列が増え続けて drain が終わらない」状態になる。
+pub(crate) fn reject_if_draining(state: &AppState) -> Result<(), ApiError> {
+    if state.scheduler.lifecycle().is_draining() {
+        return Err(ApiError::overloaded(
+            "server is draining (shutdown signal received); the request was not accepted",
+        ));
+    }
+    Ok(())
 }
 
 async fn models(
@@ -969,6 +1095,8 @@ async fn models(
     // P793: OpenAI クライアントが読む `object` / `owned_by` を足す。既存の
     // Anthropic 側フィールド (type / display_name / context_length / has_more) は
     // **そのまま残す** (両方のクライアントが同じ応答で動く)。
+    // P817: 運用のためのメタデータを足す (context_length / quant / model_dir /
+    // capabilities)。既存クライアントは未知フィールドを無視する。
     Ok(Json(json!({
         "object": "list",
         "data": [{
@@ -979,6 +1107,19 @@ async fn models(
             "created": 0,
             "owned_by": "denno",
             "context_length": state.info.context,
+            "max_context_length": state.info.context,
+            "model_dir": state.info.model_dir,
+            "quant": state.info.quant,
+            "slots": state.info.slots,
+            "layers": state.info.layers,
+            "capabilities": {
+                "anthropic": true,
+                "openai": true,
+                "tools": true,
+                "streaming": true,
+                "count_tokens": true,
+                "telemetry": telem::enabled(),
+            },
         }],
         "has_more": false,
     })))
@@ -1127,6 +1268,8 @@ async fn messages(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
+    // P817: drain 中は新規の生成要求を受けない (503 overloaded_error)。
+    reject_if_draining(&state)?;
     // s148 (Task B10・計測のみ): リクエストの壁時計。COVERAGE 行の分母
     // (「帰属 ms / リクエストの壁時計」) になる。
     // s151 (Task B12): このフックは `/v1/messages` の**同期ハンドラ**にあり、
