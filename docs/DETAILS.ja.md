@@ -18,6 +18,8 @@
 
 `serve-flash` は dense な重みを常駐させ、expert をキャッシュとして扱う。配信経路は意図的に最小で、`/v1/messages` のみ(`/v1/chat/completions` は未実装)、1 リクエストずつ処理し、最長共通接頭辞を再利用する prefix cache を持つ。805 トークンぶん再利用できた続きの会話は 204.7 s → 5.7 s になる。
 
+prefix cache は文脈スロットの列で、`--kv-slots N`(または `DENNO_KV_SLOTS`)で本数を選ぶ。既定 2 は従来の main + aux(長い会話を主に、主よりずっと短い脇リクエストを aux に載せる)で、メモリ量も挙動も変えない。3 以上では全スロットを最長共通接頭辞で照合し、空きが無ければ最終使用が一番古いスロットを追い出す(LRU)。1 スロットあたり GDN 状態 117 MiB + KV 48 KiB/token、トークン上限は `DENNO_KV_SLOT_TOK`(既定はコンテキスト長)。
+
 ## 段ごとの内訳
 
 rtx5090 / UD-IQ3_XXS の段ごとの内訳(温まった状態、`8ae66f334` の 1 つ前の開発ブランチで計測):
@@ -43,6 +45,7 @@ rtx5090 / UD-IQ3_XXS の段ごとの内訳(温まった状態、`8ae66f334` の 
 | `DENNO_STRIP_TOOLS=1` | プロンプトから `tools` 定義を落とす(40 ツールで prompt 6,979 トークンが 842 になる) |
 | `DENNO_MAX_SYSTEM=N` | system プロンプトの先頭 N 文字だけ残す |
 | `DENNO_TELEMETRY`、`DENNO_TELEMETRY_ACT=1`、`DENNO_TELEMETRY_ARCH=1` | テレメトリ(この経路では既定 ON、`0` で無効)/ 層活性 / 構造系フレーム |
+| `DENNO_KV_SLOTS=N`、`DENNO_KV_SLOT_TOK` | 文脈スロット数(既定 2 = 従来の main + aux、3 以上で LCP + LRU) / N スロット経路で 1 スロットが持つトークン上限(既定はコンテキスト長)。CLI は `--kv-slots` |
 
 ## その他のモデル(dense 経路の `serve`)
 
