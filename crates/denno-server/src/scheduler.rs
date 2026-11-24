@@ -136,6 +136,40 @@ pub enum Job {
         enable_thinking: Option<bool>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     },
+    /// P793: OpenAI 互換ストリーミング生成。Anthropic SSE ではなく
+    /// [`RawEvent`] (生の text delta と使用量) を流し、HTTP 側 (openai.rs) が
+    /// `chat.completion.chunk` へ組み直す。エンジン・セッション・KV 経路は
+    /// `Stream` と完全に同一 (アセンブラだけ持たない)。
+    OpenaiStream {
+        system: Option<String>,
+        messages: Vec<ChatMessage>,
+        params: GenParams,
+        tools: Option<serde_json::Value>,
+        constraint: Option<ToolConstraint>,
+        enable_thinking: Option<bool>,
+        events: tokio_mpsc::Sender<RawEvent>,
+    },
+}
+
+/// P793: OpenAI 互換ストリーム用の生イベント。
+///
+/// `/v1/messages` の SSE イベントとは別系統で、`Run` に `raw` チャネルが
+/// 入っているジョブだけがこの型を受信する (それ以外の経路は従来と同一)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawEvent {
+    /// prefill 完了 (KV 取得) 時点の入力トークン数
+    Start { input_tokens: usize },
+    /// detok 済みの text delta (1 トークン分の piece)
+    Delta(String),
+    /// 生成終了。stop_reason は engine の表記 (`end_turn` / `max_tokens` / `stop_sequence`)
+    Done {
+        input_tokens: usize,
+        output_tokens: usize,
+        stop_reason: String,
+        stop_sequence: Option<String>,
+    },
+    /// 生成失敗 (HTTP 側は OpenAI 形式の error イベントへ変換する)
+    Error(String),
 }
 
 /// キュー満杯 (同時受け付け上限超過)。ハンドラは 503 を返す。
@@ -149,6 +183,9 @@ struct Run {
     error: Option<anyhow::Error>,
     respond: Option<oneshot::Sender<Result<ChatOutput>>>,
     events: Option<tokio_mpsc::Sender<Result<Event, Infallible>>>,
+    /// P793: OpenAI 互換ストリームの生イベント送信先 (OpenaiStream のみ Some)。
+    /// Anthropic 経路 (`events`) とは排他で、両方 Some にはならない。
+    raw: Option<tokio_mpsc::Sender<RawEvent>>,
     /// SSE プリアンブル (message_start 等) を送信済みか
     started: bool,
     /// 第27: streaming tool_use の SSE アセンブラ (Stream ジョブのみ Some)。
@@ -183,6 +220,10 @@ impl Run {
     fn client_gone(&self) -> bool {
         if let Some(events) = &self.events {
             return events.is_closed();
+        }
+        // P793: OpenAI ストリームも同じ規約 (応答ボディの drop で受信側が消える)
+        if let Some(raw) = &self.raw {
+            return raw.is_closed();
         }
         if let Some(respond) = &self.respond {
             return respond.is_closed();
@@ -269,6 +310,27 @@ impl Scheduler {
     ) -> Result<(), QueueFull> {
         self.tx
             .try_send((Instant::now(), Job::Stream { system, messages, params, tools, constraint, enable_thinking, events }))
+            .map_err(|_| QueueFull)
+    }
+
+    /// P793: OpenAI 互換ストリーミング生成をキューに入れる。
+    /// セッション・KV・上限の扱いは [`Scheduler::submit_stream`] と同一で、
+    /// 流すイベントだけが [`RawEvent`] (生 delta) になる。
+    pub fn submit_openai_stream(
+        &self,
+        system: Option<String>,
+        messages: Vec<ChatMessage>,
+        params: GenParams,
+        tools: Option<serde_json::Value>,
+        constraint: Option<ToolConstraint>,
+        enable_thinking: Option<bool>,
+        events: tokio_mpsc::Sender<RawEvent>,
+    ) -> Result<(), QueueFull> {
+        self.tx
+            .try_send((
+                Instant::now(),
+                Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, events },
+            ))
             .map_err(|_| QueueFull)
     }
 }
@@ -392,7 +454,9 @@ fn worker(
                     // `blocking_send` が永久ブロックしないよう、有界送信にして
                     // 詰まったらフラグを立てる (打ち切りはステップ境界で行う)。
                     let dead = run.send_dead.clone();
-                    match asm {
+                    // P793: OpenAI ストリームは生 delta をそのまま流す (アセンブラ無し)
+                    let raw = run.raw.clone();
+                    let cb: Box<dyn FnMut(&str) + '_> = match asm {
                         Some(asm) => Box::new(move |delta: &str| {
                             // 第27: block 境界検出付きの SSE 組み立て (tool_use block も流す)
                             asm.push_delta(delta);
@@ -405,11 +469,23 @@ fn worker(
                                 }
                             }
                         }),
-                        None => Box::new(move |_: &str| {
-                            // 非ストリーム (Job::Chat) は送信先が無い → no-op
-                            let _ = (&events, &dead);
-                        }),
-                    }
+                        None => match raw {
+                            Some(raw) => Box::new(move |delta: &str| {
+                                if !send_raw_bounded(
+                                    &raw,
+                                    RawEvent::Delta(delta.to_string()),
+                                    send_timeout,
+                                ) {
+                                    dead.store(true, Ordering::Relaxed);
+                                }
+                            }),
+                            None => Box::new(move |_: &str| {
+                                // 非ストリーム (Job::Chat) は送信先が無い → no-op
+                                let _ = (&events, &dead);
+                            }),
+                        },
+                    };
+                    cb
                 })
                 .collect();
             let mut g = engine.lock().unwrap();
@@ -494,12 +570,15 @@ fn release_run(engine: &Arc<Mutex<Engine>>, run: &mut Run) {
 
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
 fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
-    let (system, messages, params, tools, constraint, enable_thinking, respond, events) = match job {
+    let (system, messages, params, tools, constraint, enable_thinking, respond, events, raw) = match job {
         Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond } => {
-            (system, messages, params, tools, constraint, enable_thinking, Some(respond), None)
+            (system, messages, params, tools, constraint, enable_thinking, Some(respond), None, None)
         }
         Job::Stream { system, messages, params, tools, constraint, enable_thinking, events } => {
-            (system, messages, params, tools, constraint, enable_thinking, None, Some(events))
+            (system, messages, params, tools, constraint, enable_thinking, None, Some(events), None)
+        }
+        Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, events } => {
+            (system, messages, params, tools, constraint, enable_thinking, None, None, Some(events))
         }
     };
     let (sess, error) = {
@@ -516,10 +595,11 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
             Err(e) => (None, Some(e)),
         }
     };
-    // Stream ジョブは SSE アセンブラを持つ (index 0 の text block は admit が開ける)
-    let asm = match respond {
-        Some(_) => None,
-        None => Some(StreamAssembler::new(0)),
+    // Stream ジョブは SSE アセンブラを持つ (index 0 の text block は admit が開ける)。
+    // P793: OpenAI ストリームは生 delta をそのまま流すのでアセンブラを持たない。
+    let asm = match (respond.is_some(), events.is_some()) {
+        (false, true) => Some(StreamAssembler::new(0)),
+        _ => None,
     };
     // s151 (B12): リクエストの壁時計はここで開く (セッションの生成区間 = prefill
     // 開始から完了まで)。計測 OFF は None (クロック読みなし)。
@@ -531,6 +611,7 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
         error,
         respond,
         events,
+        raw,
         started: false,
         asm,
         req_mark,
@@ -813,6 +894,16 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize, send_timeout: 
         // 3. ping
         let _ = send(json!({"type": "ping"}));
     }
+    // P793: OpenAI 互換ストリームのプリアンブル (入力トークン数だけ先に渡す)。
+    // `events` の側とは排他なので、両方送られることはない。
+    if run.raw.is_some() && !run.started {
+        run.started = true;
+        let raw = run.raw.as_ref().unwrap().clone();
+        let input_tokens = run.sess.as_ref().unwrap().input_tokens();
+        if !send_raw_bounded(&raw, RawEvent::Start { input_tokens }, send_timeout) {
+            bail!("sse send failed (client disconnected)");
+        }
+    }
     Ok(())
 }
 
@@ -822,7 +913,7 @@ fn finish_run(mut run: Run, send_timeout: Duration) {
     // SSE でも同じ 1 本で、Run の終端は全経路でここ (または abort) を通る。
     let mark = run.req_mark.take();
     prof::request_end(mark);
-    let Run { sess, respond, events, mut asm, .. } = run;
+    let Run { sess, respond, events, raw, mut asm, .. } = run;
     let Some(sess) = sess else { return };
     let out = sess.into_output();
     if let Some(respond) = respond {
@@ -855,6 +946,20 @@ fn finish_run(mut run: Run, send_timeout: Duration) {
         }));
         // 6. message_stop
         let _ = send(json!({"type": "message_stop"}));
+        return;
+    }
+    // P793: OpenAI 互換ストリームの終端 (使用量 + stop_reason)。
+    if let Some(raw) = raw {
+        let _ = send_raw_bounded(
+            &raw,
+            RawEvent::Done {
+                input_tokens: out.input_tokens,
+                output_tokens: out.output_tokens,
+                stop_reason: out.stop_reason.as_str().to_string(),
+                stop_sequence: out.stop_sequence.clone(),
+            },
+            send_timeout,
+        );
     }
 }
 
@@ -883,6 +988,34 @@ fn send_error(run: &mut Run, e: anyhow::Error, send_timeout: Duration) {
             })),
             send_timeout,
         );
+    } else if let Some(raw) = run.raw.take() {
+        // P793: OpenAI 経路は生イベントで同じ通知をする (HTTP 側が error chunk へ)
+        let _ = send_raw_bounded(&raw, RawEvent::Error(client_msg), send_timeout);
+    }
+}
+
+/// P793: [`send_bounded`] の [`RawEvent`] 版 (OpenAI 互換ストリーム)。
+/// 意味論は同一 — 詰まった受信バッファには timeout まで 1ms sleep で再試行し、
+/// 諦めたら false (= 呼び出し側が Run を打ち切る)。
+fn send_raw_bounded(
+    events: &tokio_mpsc::Sender<RawEvent>,
+    ev: RawEvent,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut pending = ev;
+    loop {
+        match events.try_send(pending) {
+            Ok(()) => return true,
+            Err(TrySendError::Closed(_)) => return false,
+            Err(TrySendError::Full(back)) => {
+                pending = back;
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 

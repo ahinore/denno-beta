@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
 mod logging;
+mod openai;
 mod scheduler;
 mod stream_asm;
 pub use logging::{init_serve_logging, NonBlockingStdout};
@@ -447,7 +448,7 @@ pub fn brief_system(system: Option<String>) -> Option<String> {
 /// s67b: 実効 temperature に serve 側の上限を適用する。
 /// `cap` が None なら要求値をそのまま返す (従来と完全に同一)。
 /// `cap` が Some(c) のときは、未指定 (sampler 既定 1.0) も含めて c で頭打ちにする。
-fn apply_temperature_cap(requested: Option<f32>, cap: Option<f32>) -> Option<f32> {
+pub(crate) fn apply_temperature_cap(requested: Option<f32>, cap: Option<f32>) -> Option<f32> {
     match cap {
         None => requested,
         Some(c) => Some(requested.unwrap_or(1.0).min(c)),
@@ -858,6 +859,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
+        // P793: OpenAI 互換 (同じ Scheduler / chat template / KV prefix cache を通す)
+        .route("/v1/chat/completions", post(openai::chat_completions))
         // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
         // Anthropic 互換 API とは別系統で、互換性には影響しない。
         .route("/v1/telemetry/ws", get(telemetry_ws))
@@ -954,18 +957,25 @@ async fn models(
     // P57: ここで engine.lock() を取らない (旧実装は名前と context のためだけに
     // 取っており、生成中は 200 すら返せなかった)。値は起動時のキャッシュ。
     let name = &state.model_name;
+    // P793: OpenAI クライアントが読む `object` / `owned_by` を足す。既存の
+    // Anthropic 側フィールド (type / display_name / context_length / has_more) は
+    // **そのまま残す** (両方のクライアントが同じ応答で動く)。
     Ok(Json(json!({
+        "object": "list",
         "data": [{
             "id": name,
+            "object": "model",
             "type": "model",
             "display_name": name,
+            "created": 0,
+            "owned_by": "denno",
             "context_length": state.info.context,
         }],
         "has_more": false,
     })))
 }
 
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(key) = &state.api_key else { return Ok(()) };
     let provided = headers
         .get("x-api-key")
