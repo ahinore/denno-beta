@@ -13,22 +13,31 @@ An Anthropic Messages API–compatible LLM server written in Rust. Every inferen
 
 ## Current performance
 
-Qwen3.8-Flash-Next, one request at a time over `/v1/messages`. All values are warm medians, and the output md5 is the same on every run.
+Standard `llama-bench`-style prompt processing (`pp512`, `pp2048`, `pp8192`) and 128-token generation (`tg128` at context depths `d0`, `d2048`, `d8192`), measured one request at a time over `/v1/messages` with `"stream": true` and `temperature: 0` on Qwen3.8-Flash-Next (revision `f5d175de`). All values are warm medians using identical natural-language prompts across machines, with the KV prefix cache flushed (`reuse=0`) before each cold-KV run; `pp` throughput is computed from end-to-end SSE **TTFT** (`input_tokens / TTFT`) and `tg128` from SSE inter-token latency (**TPOT**).
 
-| Machine | Weights | Decode (short chat) | Prefill 3,826 tokens | Prefill 14,018 tokens |
+### Prompt processing (`pp`) and TTFT
+
+| Machine | Weights | `pp512` (tok/s / TTFT) | `pp2048` (tok/s / TTFT) | `pp8192` (tok/s / TTFT) | Turn-2 KV-reuse TTFT (2k / 8k) |
+|---|---|---|---|---|---|
+| RTX 5090 32 GB (`main`) | Q3 (`UD-IQ3_XXS`) | **578 tok/s** (0.89 s) | **1,551 tok/s** (1.32 s) | **2,058 tok/s** (3.98 s) | **0.80 s** / **0.86 s** |
+| RTX 5090 32 GB (`main`) | Q4 (`UD-Q4_K_XL`) | 116 tok/s (4.40 s) | 253 tok/s (8.09 s) | 606 tok/s (13.53 s) | 1.07 s / 0.98 s |
+| Intel Arc Pro B60 24 GB (`arc-port`) | Q3 (`UD-IQ3_XXS`) | 187 tok/s (2.75 s) | 433 tok/s (4.74 s) | 486 tok/s (16.86 s) | 1.26 s / 1.31 s |
+
+### Token generation (`tg128`) and TPOT
+
+| Machine | Weights | `tg128` @ `d0` (tok/s / TPOT) | `tg128` @ `d2048` (tok/s / TPOT) | `tg128` @ `d8192` (tok/s / TPOT) |
 |---|---|---|---|---|
-| RTX 5090 32 GB | Q3 (UD-IQ3_XXS) | **15.3 ms/tok (65 tok/s)** | **2.44 s** | **6.0–6.3 s** |
-| RTX 5090 32 GB | Q4 (UD-Q4_K_XL) | 18.2–19.3 ms/tok (53 tok/s) | 9.2–9.8 s | 25.2–25.9 s |
-| RTX 3080 10 GB | Q3 (UD-IQ3_XXS) | 116 ms/tok (8.6 tok/s) | 9.4 s | 27.3 s |
+| RTX 5090 32 GB (`main`) | Q3 (`UD-IQ3_XXS`) | **107.5 tok/s** (9.30 ms/tok) | **105.2 tok/s** (9.51 ms/tok) | **98.5 tok/s** (10.16 ms/tok) |
+| RTX 5090 32 GB (`main`) | Q4 (`UD-Q4_K_XL`) | 50.0 tok/s (20.0 ms/tok) | 44.9 tok/s (22.3 ms/tok) | 37.6 tok/s (26.6 ms/tok) |
+| Intel Arc Pro B60 24 GB (`arc-port`) | Q3 (`UD-IQ3_XXS`) | 17.1 tok/s (58.6 ms/tok) | 17.2 tok/s (58.2 ms/tok) | 13.3 tok/s (75.4 ms/tok) |
 
-- **RTX 5090:** Ryzen 7 9800X3D, 64 GB RAM, measured 2026-11-17 on `8ae66f334`.
-  - Decode after reading 14k tokens is 16.1–16.5 ms/tok on Q3 and 27–29 ms/tok on Q4.
-  - Q4 is 111 GB and does not fit in RAM, so every prefill reads part of the experts from the SSD.
-- **RTX 3080:** Core i9-13900K, 64 GB RAM, Docker on WSL2 on Windows 11, measured 2026-11-18.
-  - The weights do not all fit in RAM, so timings move a lot with what is left in the page cache. The values are the best warm runs.
-  - The three values are the best runs of different settings; no single setting gets all three (see "GPUs with less VRAM" below).
-  - The build used is a development version newer than `main`.
-- **Intel Arc Pro B60 24 GB:** branch `arc-port` decodes Q3 at 41 ms/tok as of 2026-11-18.
+- **RTX 5090 (`main` `20132ae`):** Ryzen 7 9800X3D, 64 GB RAM, measured 2026-11-24.
+  - On Q3, every run produced bit-identical output md5 across rounds, and longer 14k-token prefills reach ~2,870 tok/s (4.88 s).
+  - Q4 is 111.3 GB and does not fit in 64 GB RAM, so cold expert reads hit the SSD while warm rounds hit RAM/VRAM cache (reaching 62–73 tok/s decode and ~816 tok/s on `pp8192`).
+- **Intel Arc Pro B60 (`arc-port` `451c7f3c1`):** Ryzen 7 8700G, 64 GB RAM, measured 2026-11-24 with `DEVICE_LOST = 0`.
+  - On 24 GB VRAM, ~12.5 GB remains for the expert cache (~6,464 experts). Sustained 128-token generation sees a ~91% VRAM hit rate (58.6 ms/tok), while shorter (~40-token) replies stay mostly resident and reach ~33.6 ms/tok (~30 tok/s).
+  - The 128-token `tg128 @ d0` output md5 (`03d236ba9edc`) matches RTX 5090 Q3 bit-for-bit.
+- **RTX 3080 10 GB (legacy reference, 2026-11-18):** Core i9-13900K, 64 GB RAM, Docker on WSL2 on Windows 11, Q3 (`UD-IQ3_XXS`) best warm runs across separate settings: 8.6 tok/s (116 ms/tok) short decode, 9.4 s for 3,826-token prefill, 27.3 s for 14,018-token prefill (see "GPUs with less VRAM" below).
 - The per-stage breakdown and older measurements are in [docs/DETAILS.en.md](docs/DETAILS.en.md).
 
 ## Usage
@@ -88,7 +97,7 @@ print(c.messages.create(model="qwen3.8-flash-next", max_tokens=256,
 
 - `"stream": true` returns SSE. `GET /v1/models` and `GET /health` are also there.
 - There is no `/v1/chat/completions` yet.
-- Requests are handled one at a time. A continued conversation reuses the earlier read, so the reply starts in about 0.5 s.
+- Requests are handled one at a time. A continued conversation reuses the earlier KV cache, so the reply starts in about 0.8 s on RTX 5090 Q3 (even at 2k–8k context).
 
 ### GPUs with less VRAM (example: RTX 3080 10 GB)
 

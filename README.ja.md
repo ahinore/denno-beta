@@ -13,22 +13,31 @@ Rust で書いた Anthropic Messages API 互換の LLM サーバー。推論カ�
 
 ## 現時点の性能
 
-Qwen3.8-Flash-Next を 1 リクエストずつ `/v1/messages` で計測した値。どれも温まった状態の中央値で、出力の md5 はどの回も同じ。
+`llama-bench` 形式の標準ベンチマーク（プロンプト処理 `pp512` / `pp2048` / `pp8192` と、文脈長 `d0` / `d2048` / `d8192` での 128 トークン生成 `tg128`）を、Qwen3.8-Flash-Next（リビジョン `f5d175de`）に対して `/v1/messages`（`"stream": true`、`temperature: 0`、1 リクエストずつ）で計測した値。全機材で同一の自然言語プロンプトを使い、各回の前に KV プレフィックスキャッシュをフラッシュして `reuse=0` の温まった状態の中央値を取った。`pp` の tok/s は SSE 計測の **TTFT**（`input_tokens / TTFT`）、`tg128` は SSE トークン間隔（**TPOT**）から算出している。
 
-| 機材 | 重み | 生成(短い会話) | prefill 3,826 トークン | prefill 14,018 トークン |
+### プロンプト処理 (`pp`) と TTFT
+
+| 機材 | 重み | `pp512` (tok/s / TTFT) | `pp2048` (tok/s / TTFT) | `pp8192` (tok/s / TTFT) | 2 ターン目 KV 再利用 TTFT (2k / 8k) |
+|---|---|---|---|---|---|
+| RTX 5090 32 GB (`main`) | Q3 (`UD-IQ3_XXS`) | **578 tok/s** (0.89 s) | **1,551 tok/s** (1.32 s) | **2,058 tok/s** (3.98 s) | **0.80 s** / **0.86 s** |
+| RTX 5090 32 GB (`main`) | Q4 (`UD-Q4_K_XL`) | 116 tok/s (4.40 s) | 253 tok/s (8.09 s) | 606 tok/s (13.53 s) | 1.07 s / 0.98 s |
+| Intel Arc Pro B60 24 GB (`arc-port`) | Q3 (`UD-IQ3_XXS`) | 187 tok/s (2.75 s) | 433 tok/s (4.74 s) | 486 tok/s (16.86 s) | 1.26 s / 1.31 s |
+
+### トークン生成 (`tg128`) と TPOT
+
+| 機材 | 重み | `tg128` @ `d0` (tok/s / TPOT) | `tg128` @ `d2048` (tok/s / TPOT) | `tg128` @ `d8192` (tok/s / TPOT) |
 |---|---|---|---|---|
-| RTX 5090 32 GB | Q3(UD-IQ3_XXS) | **15.3 ms/tok(65 tok/s)** | **2.44 s** | **6.0〜6.3 s** |
-| RTX 5090 32 GB | Q4(UD-Q4_K_XL) | 18.2〜19.3 ms/tok(53 tok/s) | 9.2〜9.8 s | 25.2〜25.9 s |
-| RTX 3080 10 GB | Q3(UD-IQ3_XXS) | 116 ms/tok(8.6 tok/s) | 9.4 s | 27.3 s |
+| RTX 5090 32 GB (`main`) | Q3 (`UD-IQ3_XXS`) | **107.5 tok/s** (9.30 ms/tok) | **105.2 tok/s** (9.51 ms/tok) | **98.5 tok/s** (10.16 ms/tok) |
+| RTX 5090 32 GB (`main`) | Q4 (`UD-Q4_K_XL`) | 50.0 tok/s (20.0 ms/tok) | 44.9 tok/s (22.3 ms/tok) | 37.6 tok/s (26.6 ms/tok) |
+| Intel Arc Pro B60 24 GB (`arc-port`) | Q3 (`UD-IQ3_XXS`) | 17.1 tok/s (58.6 ms/tok) | 17.2 tok/s (58.2 ms/tok) | 13.3 tok/s (75.4 ms/tok) |
 
-- **RTX 5090:** Ryzen 7 9800X3D、RAM 64 GB、2026-11-17 に `8ae66f334` で計測。
-  - 14k を読んだあとの生成は、Q3 で 16.1〜16.5 ms/tok、Q4 で 27〜29 ms/tok。
-  - Q4 は 111 GB あって RAM に収まらないので、prefill のたびに expert の一部を SSD から読む。
-- **RTX 3080:** Core i9-13900K、RAM 64 GB、Windows 11 の WSL2 上の Docker で、2026-11-18 に計測。
-  - RAM に全部は載らず、ページキャッシュの残り具合で時間が大きく変わる。表の値は温まったときの最速値。
-  - 3 つの値は別々の設定で出した最速値で、1 つの設定で全部が出るわけではない(下の「VRAM が少ない GPU」を参照)。
-  - 計測に使ったのは `main` より新しい開発版。
-- **Intel Arc Pro B60 24 GB:** ブランチ `arc-port` の 2026-11-18 時点で、Q3 の生成が 41 ms/tok。
+- **RTX 5090（`main` `20132ae`）:** Ryzen 7 9800X3D、RAM 64 GB、2026-11-24 計測。
+  - Q3 は全条件・全ラウンドで出力 md5 が完全一致し、さらに長い 14k トークン級の prefill では約 2,870 tok/s（4.88 s）に達する。
+  - Q4 は 111.3 GB あって 64 GB RAM に収まらないため、冷えた回は SSD 読込が入る一方、キャッシュが温まった回では生成 62〜73 tok/s・`pp8192` 約 816 tok/s まで伸びる。
+- **Intel Arc Pro B60（`arc-port` `451c7f3c1`）:** Ryzen 7 8700G、RAM 64 GB、2026-11-24 計測（`DEVICE_LOST = 0`）。
+  - VRAM 24 GB のうち expert キャッシュに使える枠は約 12.5 GB（約 6,464 本）のため、128 トークン連続生成では VRAM ヒット率が約 91%（58.6 ms/tok）となる。40 トークン前後の短い応答ではキャッシュ内に収まり約 33.6 ms/tok（約 30 tok/s）が出る。
+  - `tg128 @ d0` の 128 トークン出力 md5（`03d236ba9edc`）は RTX 5090 Q3 と 1 ビットの違いもなく完全一致する。
+- **RTX 3080 10 GB（旧条件の参考値、2026-11-18）:** Core i9-13900K、RAM 64 GB、Windows 11 WSL2 上の Docker、Q3（`UD-IQ3_XXS`）の別々設定での最速値：短い生成 8.6 tok/s（116 ms/tok）、prefill 3,826 tok 9.4 s、14,018 tok 27.3 s（下の「VRAM が少ない GPU」を参照）。
 - 段ごとの内訳と以前の計測は [docs/DETAILS.ja.md](docs/DETAILS.ja.md) にある。
 
 ## 使い方
@@ -88,7 +97,7 @@ print(c.messages.create(model="qwen3.8-flash-next", max_tokens=256,
 
 - `"stream": true` にすると SSE で返る。ほかに `GET /v1/models`、`GET /health` がある。
 - `/v1/chat/completions` はまだ無い。
-- リクエストは 1 本ずつ処理する。続きの会話は前回の読み込み結果を使い回すので、応答が始まるまで 0.5 s ほどしかかからない。
+- リクエストは 1 本ずつ処理する。続きの会話は前回の KV キャッシュを使い回すので、RTX 5090 Q3 では 2k〜8k 文脈でも応答開始まで約 0.8 s しかかからない。
 
 ### VRAM が少ない GPU(RTX 3080 10 GB の例)
 
