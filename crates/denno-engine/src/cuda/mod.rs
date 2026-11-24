@@ -2743,6 +2743,40 @@ pub(crate) fn moe_scratch_alloc_bytes(cur: usize, want: usize) -> Option<usize> 
 }
 
 
+/// task 788: 借用ビュー (プールの区画) を掴んだままにしない版。
+///
+/// `DENNO_PF_POOL` の区画は prefill の終端で `cuMemFree` される。スレッド
+/// ローカルの作業域がそのビューを持ち越すと、次のリクエストは解放済みの
+/// 領域へ書く (= CUDA error 700)。借用ビューは容量が足りていても必ず
+/// 確保し直す (所有バッファだけを再利用する)。
+pub(crate) fn moe_scratch_alloc_bytes_borrowed(
+    cur: usize,
+    want: usize,
+    borrowed: bool,
+) -> Option<usize> {
+    if borrowed {
+        Some(want.max(1))
+    } else {
+        moe_scratch_alloc_bytes(cur, want)
+    }
+}
+
+
+/// task 788: 初回の PTX 読み込みの前に current context を用意する。
+///
+/// `cuModuleLoadData` は current context が無いと `CUDA_ERROR_INVALID_CONTEXT`
+/// で失敗する。prefill のローダは失敗した `None` を `OnceLock` に焼き付ける
+/// (二度と試さない) ので、冷えた起動直後の最初のリクエストで context が
+/// 未初期化だと **サーバの寿命ぶん GPU prefill が死ぬ**。
+/// context が用意できないときは false (= 呼び出し側は焼き付けずに諦める)。
+pub(crate) fn ensure_current_for_ptx_load() -> bool {
+    match shared_ctx() {
+        Some(ctx) => ctx.make_current().is_ok(),
+        None => false,
+    }
+}
+
+
 /// `DENNO_MOE_GROUPED_GPU` の値の解釈 (純関数。env を読むのは 1 箇所だけ)。
 pub fn moe_grouped_gpu_from_value(v: Option<&str>) -> bool {
     matches!(v, Some("1") | Some("on") | Some("true"))

@@ -4537,6 +4537,16 @@ impl Qwen4Exp {
 /// 往復の固定費と釣り合わない。境界は task 145 のバッチ mix GPU と同じ 64。
 pub(crate) const PF_RESIDENT_MIN_TOK: usize = 64;
 
+/// task 788: 最初のチャンクで CUDA context を用意するか (純関数)。
+///
+/// `cuModuleLoadData` は current context を要求する。常駐経路に載る大きさ
+/// (>= [`PF_RESIDENT_MIN_TOK`]) の最初のチャンクだけ、PTX を読む前に
+/// `CudaCtx` を作って current にする。境界は常駐経路の判定と同じ 1 か所で決める。
+#[cfg(feature = "cuda")]
+pub(crate) fn pf_init_ctx_first(first_nt: usize) -> bool {
+    first_nt >= Self::PF_RESIDENT_MIN_TOK
+}
+
 /// task 154: 常駐経路を採らなかった理由を 1 回だけ出す (既定は黙って従来経路)。
 #[cfg(feature = "cuda")]
 pub(crate) fn pf_note_decline(reason: &str) {
@@ -6477,6 +6487,20 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let e = self.p.n_embd;
         let n_layer = self.p.n_layer;
         let chunk = chunk.max(1);
+        // task 788: 常駐経路 (>= PF_RESIDENT_MIN_TOK) に載る大きさの最初のチャンクは、
+        // **どの PTX ローダより先に** CUDA context を用意して current にする。
+        // 冷えた起動直後は `shared_ctx()` がまだ None で、prefill の
+        // `cuModuleLoadData` (pf_kernels / tc_gemm_kernels / exp_tc_kernels /
+        // pf_elem_kernels) が CUDA_ERROR_INVALID_CONTEXT で失敗し、その None が
+        // `OnceLock` に焼き付いてサーバの寿命ぶん GPU prefill が死んでいた。
+        // 小さい prefill は従来どおり decode 側の遅延初期化に任せる。
+        #[cfg(feature = "cuda")]
+        {
+            let first = chunk.min(ctx.len().saturating_sub(hist));
+            if Self::pf_init_ctx_first(first) {
+                let _ = crate::cuda::make_current_on_this_thread();
+            }
+        }
         // task 217: 介入設定は **prefill 1 回の先頭で 1 回だけ**読む。
         let iv_cfg = intervene::snapshot();
         let iv = IvView::of(&iv_cfg);
@@ -6845,5 +6869,36 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         prekprof::mark(t_head, prekprof::HEAD);
         // P109: 本体は全位置の形で返す (従来経路は最後の 1 位置だけ)。
         Ok(vec![logits])
+    }
+}
+
+
+#[cfg(all(test, feature = "cuda"))]
+mod p788_tests {
+    use super::*;
+
+    /// task 788 (バグ 1): 冷えた起動直後の最初のリクエストで、どの plen が
+    /// 「PTX を読む前に context を作る」側に入るか。境目は 64。
+    /// 512 / 506 / 64 は入り、63 / 28 は入らない (小さい prefill は従来どおり
+    /// decode 側の遅延初期化に任せる)。
+    #[test]
+    fn pf788_ctx_init_boundary() {
+        for nt in [64usize, 65, 67, 127, 128, 129, 506, 512, 1536, 8192] {
+            assert!(
+                Qwen4Exp::pf_init_ctx_first(nt),
+                "nt={nt} が従来経路に落ちている"
+            );
+        }
+        for nt in [0usize, 1, 28, 63] {
+            assert!(
+                !Qwen4Exp::pf_init_ctx_first(nt),
+                "nt={nt} で context を作っている"
+            );
+        }
+        // 常駐経路の判定と同じ境界であること (2 か所でずれない)。
+        assert!(Qwen4Exp::pf_init_ctx_first(Qwen4Exp::PF_RESIDENT_MIN_TOK));
+        assert!(!Qwen4Exp::pf_init_ctx_first(
+            Qwen4Exp::PF_RESIDENT_MIN_TOK - 1
+        ));
     }
 }

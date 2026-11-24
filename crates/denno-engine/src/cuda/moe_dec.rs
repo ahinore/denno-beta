@@ -236,9 +236,15 @@ impl MoeScratch {
         Self::ensure_tagged(cap, want, crate::mem_audit::TAG_OTHER)
     }
     /// task 149: 台帳のタグ付き [`Self::ensure`]。
+    ///
+    /// task 788: 借用ビュー (プール区画) は容量が足りていても確保し直す
+    /// ([`moe_scratch_alloc_bytes_borrowed`])。
     pub(crate) fn ensure_tagged(cap: &mut Option<DevBuffer>, want: usize, tag: &'static str) -> Result<()> {
-        let cur = cap.as_ref().map(|b| b.bytes()).unwrap_or(0);
-        if let Some(bytes) = moe_scratch_alloc_bytes(cur, want) {
+        let (cur, view) = cap
+            .as_ref()
+            .map(|b| (b.bytes(), b.is_view()))
+            .unwrap_or((0, false));
+        if let Some(bytes) = moe_scratch_alloc_bytes_borrowed(cur, want, view) {
             *cap = Some(DevBuffer::alloc_tagged(bytes, tag)?);
         }
         Ok(())

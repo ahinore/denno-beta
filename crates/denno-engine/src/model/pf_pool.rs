@@ -784,6 +784,42 @@ mod tests {
     }
 
     /// task 265: プールを借りる最小トークン (既定 2,048)。0 / 解析不能は既定。
+    /// task 788 (バグ 2 の前提): plen=64/65/67/127/128/129/512 の shared expert
+    /// の作業域 (`ShX` / `ShGa` / `ShGu` / `ShSh`) が nt ぶん取れ、区画が
+    /// 重ならず total に収まること。
+    ///
+    /// 65 / 67 / 127 / 129 は 16 / 32 / 64 の倍数でない (端数行)。寸法が
+    /// nt に比例していること (切り捨て・切り上げが無いこと) を固定する。
+    #[test]
+    fn small_prefill_shared_regions_cover_nt() {
+        for nt in [64usize, 65, 67, 127, 128, 129, 512] {
+            let mut n = need();
+            n.nt_all = nt;
+            n.tile = nt;
+            n.chunk = nt;
+            let l = layout(&n).unwrap_or_else(|| panic!("nt={nt}: レイアウトが組めない"));
+            assert_eq!(l.unit(R::ShX), nt * n.e * 4, "nt={nt}: ShX");
+            assert_eq!(l.unit(R::ShGa), nt * n.sff * 4, "nt={nt}: ShGa");
+            assert_eq!(l.unit(R::ShGu), nt * n.sff * 4, "nt={nt}: ShGu");
+            assert_eq!(l.unit(R::ShSh), nt * n.e * 4, "nt={nt}: ShSh");
+            let mut spans: Vec<(usize, usize)> = [R::ShX, R::ShGa, R::ShGu, R::ShSh]
+                .iter()
+                .map(|&r| {
+                    let g = l.region(r);
+                    (g.off, g.off.checked_add(g.bytes).expect("区画が溢れる"))
+                })
+                .collect();
+            spans.sort();
+            for w in spans.windows(2) {
+                assert!(w[0].1 <= w[1].0, "nt={nt}: 区画が重なる {w:?}");
+            }
+            assert!(
+                spans.last().expect("4 区画").1 <= l.total,
+                "nt={nt}: 区画が total を超える"
+            );
+        }
+    }
+
     #[test]
     fn min_tok_defaults_and_parses() {
         assert_eq!(pf_pool_min_tok_from_value(None), DEFAULT_POOL_MIN_TOK);

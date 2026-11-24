@@ -1905,6 +1905,11 @@ fn gemm_try_tile_for(
 /// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
 /// (= 二度と試さない)。**current context を張った後に呼ぶこと**。
 pub(crate) fn tc_gemm_kernels() -> Option<&'static TcGemm> {
+    // task 788: current context が無いときは None を焼き付けない (pf_kernels と
+    // 同じ規律)。冷えた起動直後の最初のリクエストで GPU prefill が死ぬのを防ぐ。
+    if TC_GEMM.get().is_none() && !ensure_current_for_ptx_load() {
+        return None;
+    }
     TC_GEMM
         .get_or_init(|| {
             let path = tc_ptx_path();

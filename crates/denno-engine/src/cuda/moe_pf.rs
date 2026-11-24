@@ -3329,6 +3329,11 @@ fn pf_up_run_split(job: &PfUpJob, copy_ns: &mut u64, enq_ns: &mut u64) -> Result
 
 
 pub(crate) fn exp_tc_kernels() -> Option<&'static ExpTcKernels> {
+    // task 788: current context が無いときは None を焼き付けない (pf_kernels と
+    // 同じ規律)。[pf-tc] のログが出ていた経路。
+    if EXP_TC_KERNELS.get().is_none() && !ensure_current_for_ptx_load() {
+        return None;
+    }
     EXP_TC_KERNELS
         .get_or_init(|| {
             let path = exp_tc_ptx_path();

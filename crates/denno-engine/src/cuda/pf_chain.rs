@@ -68,6 +68,26 @@ pub fn pf_scratch_drop() {
 }
 
 
+/// task 788: プールを返す前に、ステージングの借用ビューを落とす。
+///
+/// `PF_STREAM` の `slot[s].buf` は [`pf_stage_alloc`] が `R::Stage` の区画を
+/// 返すことがある。プールの解放後も `cap` が残っていると
+/// [`pf_slot_prepare`] が再利用し、解放済みの領域へ H2D する (error 700)。
+/// 上げ専用スレッドの停止/ join は [pf_stream_release] の仕事なので、ここでは
+/// ビューだけを落とす (呼び出しは prefill の終端)。
+#[cfg(feature = "cuda")]
+pub fn pf_stream_forget_pool_views() {
+    let _ = super::PF_STREAM.try_with(|cell| {
+        let mut st = cell.borrow_mut();
+        for s in st.slot.iter_mut() {
+            if s.buf.as_ref().map(|b| b.is_view()).unwrap_or(false) {
+                *s = PfSlot::new();
+            }
+        }
+    });
+}
+
+
 /// ステージング 1 枚。
 pub(crate) struct PfSlot {
     pub(crate) buf: Option<DevBuffer>,
@@ -441,7 +461,13 @@ pub(crate) fn pf_slot_prepare(
         lens.push(l);
     }
     // 1. 確保 (足りなければこの 1 回だけ広げる)。
-    if st.slot[s].cap < need {
+    // task 788: 借用ビュー (プールの Stage 区画) が残っていたら必ず確保し直す。
+    let slot_is_view = st.slot[s]
+        .buf
+        .as_ref()
+        .map(|b| b.is_view())
+        .unwrap_or(false);
+    if st.slot[s].cap < need || slot_is_view {
         // 使用中のバッファは解放しない: このスロットを読んだ計算の完了を待つ。
         if st.slot[s].used {
             if let Some(ev) = st.slot[s].ev_use.as_ref() {
@@ -1753,8 +1779,15 @@ unsafe impl Sync for PfKernels {}
 
 
 /// カーネル一式を読む (初回だけ。失敗は None を焼き付ける = 二度と試さない)。
+///
+/// task 788: ただし current context が無いときは**焼き付けずに** None を返す。
+/// 冷えた起動直後の最初のリクエストでは `CudaCtx` がまだ無いことがあり、
+/// ここで焼き付けるとサーバの寿命ぶん GPU prefill が死ぬ。
 pub(crate) fn pf_kernels() -> Option<&'static PfKernels> {
     static K: OnceLock<Option<PfKernels>> = OnceLock::new();
+    if K.get().is_none() && !ensure_current_for_ptx_load() {
+        return None;
+    }
     K.get_or_init(|| {
         let mut image = pf_ptx_image()?;
         image.push(0);
@@ -1883,14 +1916,18 @@ pub fn pf_begin(nt: usize, hc: usize, e: usize, lr: usize) -> bool {
     if nt == 0 || hc == 0 || e == 0 || lr == 0 || hc * e > (1 << 20) {
         return false;
     }
-    if pf_kernels().is_none() {
-        return false;
-    }
+    // task 788: context を先に見る (PTX の読み込みは current context が要る)。
+    // 冷えた起動直後は `shared_ctx()` がまだ None なので、ここで初めて作る。
+    // 順序を逆にすると `pf_kernels()` が cuModuleLoadData に失敗し、その
+    // `None` が焼き付いて GPU prefill が二度と立ち上がらない。
     let Some(ctx) = shared_ctx() else {
         return pf_fail("CUDA context が無い");
     };
     if ctx.make_current().is_err() {
         return pf_fail("cuCtxSetCurrent 失敗");
+    }
+    if pf_kernels().is_none() {
+        return false;
     }
     if gemm_bf16_mt_fn(ctx).is_none() && gemm_f32_mt_fn(ctx).is_none() {
         return pf_fail("GEMM カーネルが PTX に無い");
@@ -2220,6 +2257,11 @@ pub fn pf_pool_release() {
     pf_lm_release();
     pf_scratch_drop();
     pf_release();
+    // task 788: プールの区画を指したままのビューを落とす (解放後の再利用 =
+    // error 700)。`PF_DEV` / `PF_SCRATCH` / `PF_LM` は上で落ちているが、
+    // `PF2_DEV` (shared expert の作業域) と `PF_STREAM` (staging) が残っていた。
+    pf2_forget_pool_views();
+    pf_stream_forget_pool_views();
     PF_POOL_LAYOUT.with(|c| *c.borrow_mut() = None);
     let buf = match PF_POOL.lock() {
         Ok(mut g) => g.take(),
@@ -2964,6 +3006,10 @@ fn pf_elem_ptx_path() -> std::path::PathBuf {
 /// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
 pub(crate) fn pf_elem_kernels() -> Option<&'static PfElemKernels> {
     static K: OnceLock<Option<PfElemKernels>> = OnceLock::new();
+    // task 788: context が無いときは焼き付けない (pf_kernels と同じ規律)。
+    if K.get().is_none() && !ensure_current_for_ptx_load() {
+        return None;
+    }
     K.get_or_init(|| {
         let path = pf_elem_ptx_path();
         let mut image = match std::fs::read(&path) {
@@ -3947,6 +3993,10 @@ fn pf2_ptx_path() -> std::path::PathBuf {
 /// **current context を張った後に呼ぶこと**。
 fn pf2_kernels() -> Option<&'static Pf2Kernels> {
     static K: OnceLock<Option<Pf2Kernels>> = OnceLock::new();
+    // task 788: context が無いときは焼き付けない (pf_kernels と同じ規律)。
+    if K.get().is_none() && !ensure_current_for_ptx_load() {
+        return None;
+    }
     K.get_or_init(|| {
         let path = pf2_ptx_path();
         let mut image = match std::fs::read(&path) {
@@ -4041,10 +4091,35 @@ impl Pf2Dev {
 }
 
 
+/// task 788: プールを返す前に、プールの区画を指しているビューだけを落とす。
+///
+/// `PF2_DEV` の `x` / `ga` / `gu` / `sh` は [`ensure_region`] がプールの
+/// `ShX` / `ShGa` / `ShGu` / `ShSh` のビューを入れる。プールを `cuMemFree`
+/// したあとにこれらが残ると、次のリクエスト (プールを借りない短い prefill:
+/// plen=65 など) が解放済みの領域へ書いて CUDA error 700 になる。
+/// 所有している作業域 (`qg` / `q` / `o` など) は残す (VRAM の使い回しは維持)。
+pub(crate) fn pf2_forget_pool_views() {
+    PF2_DEV.with(|cell| {
+        let mut d = cell.borrow_mut();
+        let mut drop_if_view = |s: &mut Option<DevBuffer>| {
+            if s.as_ref().map(|b| b.is_view()).unwrap_or(false) {
+                *s = None;
+            }
+        };
+        drop_if_view(&mut d.x);
+        drop_if_view(&mut d.ga);
+        drop_if_view(&mut d.gu);
+        drop_if_view(&mut d.sh);
+    });
+}
+
+
 /// 必要バイト数まで育てる (grow-only。中身は保証しない)。
 fn pf2_ensure(slot: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
     let need = bytes.max(4);
-    if slot.as_ref().map(|b| b.bytes()).unwrap_or(0) < need {
+    // task 788: 借用ビュー (プール区画) は容量が足りていても確保し直す。
+    let view = slot.as_ref().map(|b| b.is_view()).unwrap_or(false);
+    if view || slot.as_ref().map(|b| b.bytes()).unwrap_or(0) < need {
         *slot = Some(DevBuffer::alloc_tagged(need, crate::mem_audit::TAG_GEMV)?);
     }
     Ok(())
@@ -4398,6 +4473,10 @@ fn pf3_ptx_path() -> std::path::PathBuf {
 /// **current context を張った後に呼ぶこと**。
 fn pf3_kernels() -> Option<&'static Pf3Kernels> {
     static K: OnceLock<Option<Pf3Kernels>> = OnceLock::new();
+    // task 788: context が無いときは焼き付けない (pf_kernels と同じ規律)。
+    if K.get().is_none() && !ensure_current_for_ptx_load() {
+        return None;
+    }
     K.get_or_init(|| {
         let path = pf3_ptx_path();
         let mut image = match std::fs::read(&path) {

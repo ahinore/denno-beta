@@ -8175,6 +8175,48 @@ mod p59_dedup_tests {
         assert_eq!(moe_scratch_alloc_bytes(0, 0), None);
     }
 
+    /// task 788 (バグ 2): 借用ビュー (プール区画) は容量が足りていても確保し直す。
+    ///
+    /// プールは prefill の終端で `cuMemFree` されるので、残ったビューを
+    /// 再利用すると解放済みの領域を触る (CUDA error 700)。
+    #[test]
+    fn moe_scratch_never_reuses_pool_views() {
+        // 借用ビュー: 容量が足りていても want で確保し直す。
+        for (cur, want) in [
+            (1usize << 20, 665_600usize),
+            (665_600, 665_600),
+            (0, 665_600),
+        ] {
+            assert_eq!(
+                moe_scratch_alloc_bytes_borrowed(cur, want, true),
+                Some(want),
+                "借用ビュー cur={cur} want={want} を再利用した"
+            );
+        }
+        // 所有バッファ: 従来どおり grow-only。
+        assert_eq!(moe_scratch_alloc_bytes_borrowed(1 << 20, 665_600, false), None);
+        assert_eq!(moe_scratch_alloc_bytes_borrowed(665_600, 665_600, false), None);
+        assert_eq!(moe_scratch_alloc_bytes_borrowed(100, 665_600, false), Some(665_600));
+        // nt in {64, 65, 67, 127, 128, 129, 512} の shared expert の作業域寸法。
+        let e = 2560usize;
+        let sff = 1024usize;
+        for nt in [64usize, 65, 67, 127, 128, 129, 512] {
+            let sh_x = nt * e * 4;
+            let sh_ga = nt * sff * 4;
+            // 8k prefill (tile=5120) の借用ビューが残っていても、nt の寸法で取り直す。
+            assert_eq!(
+                moe_scratch_alloc_bytes_borrowed(5120 * e * 4, sh_x, true),
+                Some(sh_x),
+                "nt={nt}: ShX を確保し直していない"
+            );
+            assert_eq!(
+                moe_scratch_alloc_bytes_borrowed(5120 * sff * 4, sh_ga, true),
+                Some(sh_ga),
+                "nt={nt}: ShGa を確保し直していない"
+            );
+        }
+    }
+
     #[test]
     fn moe_scratch_alloc_is_monotone_in_want() {
         // 要求サイズが増えると、返るサイズは減らない (単調)。

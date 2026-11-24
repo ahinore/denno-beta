@@ -167,6 +167,15 @@ impl DevBuffer {
     pub(crate) fn alias(&self) -> Self {
         Self::view(self.ptr, self.bytes)
     }
+
+    /// task 788: 非所有ビューか (プールの区画・重み表の行範囲など)。
+    ///
+    /// [`crate::cuda::pf_pool`] の区画は prefill の終端で `cuMemFree` されるので、
+    /// 借用ビューをスレッドローカルに残すと次回のリクエストで解放済みの領域を
+    /// 触る (CUDA error 700)。作業域の再利用判定はこのフラグを見る。
+    pub(crate) fn is_view(&self) -> bool {
+        !self.owned
+    }
     /// task 152 / task 214: `offset` の位置へ pinned staging 経由で H2D する。
     ///
     /// [`from_slice_pinned`] と同じ経路 (ホスト 1 回コピー + `cuMemcpyHtoD`) なので、
@@ -2812,9 +2821,17 @@ impl Scratch {
         Self::ensure_tagged(cap, bytes, crate::mem_audit::TAG_OTHER)
     }
     /// task 149: 台帳のタグ付き [`Self::ensure`]。
+    ///
+    /// task 788: 入っているのが借用ビュー (プール区画) なら容量が足りていても
+    /// 確保し直す。プールは prefill の終端で解放されるため、残ったビューは
+    /// 解放済みの領域を指す (CUDA error 700 の原因)。
     pub(crate) fn ensure_tagged(cap: &mut Option<DevBuffer>, bytes: usize, tag: &'static str) -> Result<()> {
-        if cap.as_ref().map(|b| b.bytes()).unwrap_or(0) < bytes {
-            *cap = Some(DevBuffer::alloc_tagged(bytes, tag)?);
+        let (cur, view) = cap
+            .as_ref()
+            .map(|b| (b.bytes(), b.is_view()))
+            .unwrap_or((0, false));
+        if let Some(want) = moe_scratch_alloc_bytes_borrowed(cur, bytes, view) {
+            *cap = Some(DevBuffer::alloc_tagged(want, tag)?);
         }
         Ok(())
     }
