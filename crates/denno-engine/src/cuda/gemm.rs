@@ -279,7 +279,15 @@ pub(crate) fn gemv_v5_q5k_kernels() -> Option<&'static V5Q5KKernels> {
 
 /// decode GEMV が使うカーネル一式を env から決める (`moe_gemv_dev` と
 /// task 124 の重ね打ち経路で共有する)。優先順は fp16 → v3 → v2。
+///
+/// task 810: `DENNO_Q4_DETERMINISTIC=1` では v2 に固定する。v3 / fp16 は
+/// レーン分割・fp16 dequant で CPU スカラーとビット一致しないので、VRAM ヒットと
+/// CPU ミスが混ざると md5 が揺れる。v2 は「1 行 = 1 スレッドが `i` 昇順に f32 で
+/// 加算」で CPU の `dot_seq` とビット一致する (既存の契約)。
 pub(crate) fn gemv_kernel_mode() -> GemvKernelMode {
+    if crate::model::moe_expert::q4_deterministic_enabled() {
+        return GemvKernelMode::V2;
+    }
     if moe_gemv_fp16_on() {
         GemvKernelMode::Fp16
     } else if moe_gemv_v3_on() {
