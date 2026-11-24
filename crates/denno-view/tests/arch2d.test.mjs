@@ -178,3 +178,44 @@ test('PANEL / ARCH は固定値 (描画とテストで同じ値を使う)', () =
   assert.ok(Object.isFrozen(PANEL) && Object.isFrozen(ARCH));
   assert.equal(PANEL.h, L.panels[0].h);
 });
+
+/// 描いた文字を全部覚える偽 context (task 809 の MTP 強調の確認用)。
+function textCtx() {
+  const texts = [];
+  const noop = () => {};
+  const g = new Proxy({ texts }, {
+    get(t, k) {
+      if (k in t) return t[k];
+      if (k === 'fillText') return (s) => { texts.push(String(s)); };
+      return noop;
+    },
+    set(t, k, v) { t[k] = v; return true; },
+  });
+  return g;
+}
+
+test('drawArch: 投機テレメトリが来ると MTP ブロックを強調し採用率を出す', () => {
+  const st = createMapState(DEFAULT_SHAPE_RAW);
+  const pane = { w: 800, h: 600 };
+  const view = Object.assign({}, fitView(L.mtp, pane, 10), pane);
+  const base = {
+    st, offExp: new Map(), offBlk: new Set(), offStr: new Map(),
+    isSel: () => false, dragKeys: null, hover: null, vramOn: false,
+    gridImage: () => null, focusHybrid: null, dpr: 1,
+  };
+  const g0 = textCtx();
+  drawArch(g0, L, view, Object.assign({}, base, { mtp: null }));
+  assert.ok(g0.texts.includes('MTP Modules'), 'MTP の箱は常に描く');
+  assert.ok(!g0.texts.some((t) => t.startsWith('accept') || t === 'spec telemetry'),
+    'テレメトリが無いときは強調しない');
+
+  const g1 = textCtx();
+  drawArch(g1, L, view, Object.assign({}, base, { mtp: { seen: true, rate: 0.87 } }));
+  assert.ok(g1.texts.includes('MTP Modules'));
+  assert.ok(g1.texts.includes('accept 87%'), '採用率を MTP の下に出す');
+
+  const g2 = textCtx();
+  drawArch(g2, L, view, Object.assign({}, base, { mtp: { seen: true, rate: null } }));
+  assert.ok(g2.texts.includes('spec telemetry'), '数字が無いときは数字を作らない');
+  assert.ok(!g2.texts.some((t) => t.startsWith('accept')));
+});

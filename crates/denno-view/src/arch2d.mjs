@@ -327,7 +327,8 @@ function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a 
 ///   D    — 表示データ:
 ///     st (createMapState), offExp: Map(l→Set), offBlk: Set("l:block"), offStr: Map(l→Set),
 ///     isSel(type, layer, key), dragKeys: Set|null ("e:l:i" など), hover: hit|null,
-///     vramOn, gridImage(l) → 縮小画像 (canvas) | null, focusHybrid: number|null, dpr
+///     vramOn, gridImage(l) → 縮小画像 (canvas) | null, focusHybrid: number|null, dpr,
+///     mtp: {seen, rate}|null (task 809。投機テレメトリが来ている間 MTP を強調)
 export function drawArch(g, layout, view, D) {
   const C = ARCH_COLORS;
   const s = view.s;
@@ -435,6 +436,20 @@ export function drawArch(g, layout, view, D) {
   path([[top.hidFinal.x + top.hidFinal.w / 2, top.hidFinal.y], [top.hidFinal.x + top.hidFinal.w / 2, top.head.y + top.head.h]]);
   box(top.mtp, C.headFill, C.head, 2, 12);
   text('MTP Modules', top.mtp.x + top.mtp.w / 2, top.mtp.y + top.mtp.h / 2, 46, C.head, { align: 'center' });
+  // task 809: 投機 (MTP / speculative) のテレメトリが届いている間は MTP の箱を
+  // 明るい縁と内側の光で強調し、採用率を下に出す。数字がまだ無い (未知 kind だけ)
+  // ときは "spec telemetry" とだけ書く (推測の数字は出さない)。
+  const mtpTele = D.mtp && D.mtp.seen ? D.mtp : null;
+  if (mtpTele) {
+    g.save();
+    g.globalAlpha = 0.22;
+    box(top.mtp, 'rgba(127,227,255,.35)', null, 0, 14);
+    g.restore();
+    box(top.mtp, null, '#7fe3ff', 3.2, 12);
+    const label = mtpTele.rate == null ? 'spec telemetry' : 'accept ' + Math.round(mtpTele.rate * 100) + '%';
+    text(label, top.mtp.x + top.mtp.w / 2, top.mtp.y + top.mtp.h + 44, 34, '#7fe3ff',
+      { align: 'center', bold: true });
+  }
   box(top.head, C.headFill, C.head, 2, 12);
   text('Prediction Head', top.head.x + top.head.w / 2, top.head.y + top.head.h / 2, 50, C.head, { align: 'center' });
   box(top.grFinal, C.grReadFill, C.grRead, 2, 10);
