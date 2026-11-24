@@ -644,11 +644,15 @@ pub fn stats_line() -> Option<String> {
     let (fb, fb_ty, fb_budget, fb_alloc) = crate::model::expert_vram::fallback_breakdown();
     #[cfg(not(feature = "cuda"))]
     let (fb, fb_ty, fb_budget, fb_alloc) = (0u64, 0u64, 0u64, 0u64);
+    // task 794: 載せ替え方針と、頻度ゲートで載せなかった回数 (発火の証拠)。
+    let pol = crate::model::expert_vram::policy_stats()
+        .map(|(p, rej, _)| format!("policy={} adm_rej={rej}", p.as_str()))
+        .unwrap_or_else(|| "policy=-".to_string());
     // task 261: 旧 4 型 (Q4_K / Q5_K / Q5_1 / Q8_0) の層一括経路の当たり外れ。
     let batch_ok = BATCH_OK.load(Ordering::Relaxed);
     let batch_bail = BATCH_BAIL.load(Ordering::Relaxed);
     Some(format!(
-        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} batch_ok={batch_ok} batch_bail={batch_bail} fb={fb}(type={fb_ty} budget={fb_budget} alloc={fb_alloc}) {vram}",
+        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} batch_ok={batch_ok} batch_bail={batch_bail} fb={fb}(type={fb_ty} budget={fb_budget} alloc={fb_alloc}) {pol} {vram}",
         h as f64 / l as f64
     ))
 }

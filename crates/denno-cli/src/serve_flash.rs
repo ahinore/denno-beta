@@ -707,6 +707,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     if let Some(line) = denno_engine::model::exp_iq::stats_line() {
         eprintln!("{line}");
     }
+    // task 794: VRAM expert キャッシュの載せ替え方針と頻度ゲートの発火数
+    // (`DENNO_EXPERT_CACHE_POLICY=tinylfu` のときだけ 1 行)。
+    if let Some(line) = denno_engine::model::expert_vram::policy_line() {
+        eprintln!("{line}");
+    }
     // task 260: ホスト RAM tier の当たり (`DENNO_EXPERT_RAM_MB` のときだけ 1 行)。
     if let Some(line) = denno_engine::model::expert_ram::stats_line() {
         eprintln!("{line}");

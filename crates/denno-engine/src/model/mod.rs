@@ -1,5 +1,6 @@
 //! モデルファミリー抽象とディスパッチ
 
+pub mod cache_policy;
 pub mod devprof;
 pub mod exp_iq;
 pub mod exp_pf;
