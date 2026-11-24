@@ -46,6 +46,29 @@
   .topk .bar-fill { height: 8px; background: var(--acc); }
   .topk .bar-label { width: 60px; color: var(--mut); }
 
+  /* ---- 左: ライブ計器 (task 813) ---- */
+  #rates .rate { border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px;
+                 margin-bottom: 5px; background: var(--panel2); }
+  #rates .rhead { display: flex; justify-content: space-between; align-items: baseline; }
+  #rates .rlabel { font-size: 10px; color: var(--mut); }
+  #rates .rval { font-size: 13px; color: var(--acc); }
+  #rates .rsub { font-size: 9px; color: var(--mut); }
+  #rates svg.spark { display: block; width: 100%; height: 34px; margin-top: 2px; }
+  #rates svg.spark path { fill: none; stroke: var(--acc); stroke-width: 1.4;
+                          stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  #rates .rate.vram svg.spark path { stroke: var(--glow); }
+  #rates .rate.prefill svg.spark path { stroke: var(--warm); }
+  #apis .ep { display: flex; align-items: center; gap: 5px; margin-bottom: 4px; }
+  #apis .epname { width: 74px; color: var(--mut); font-size: 10px; flex: none; }
+  #apis code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; color: #a5d6ff; cursor: text; }
+  #apis .cpy { flex: none; font: inherit; font-size: 10px; padding: 0 6px; cursor: pointer;
+               background: #0f3a4d; color: #9fefff; border: 1px solid #2f8aa8; border-radius: 3px; }
+  #apis pre#curl { margin: 6px 0 4px; padding: 6px; background: #10141a; border: 1px solid var(--line);
+                   border-radius: 5px; font-size: 9.5px; color: #b8c6d6; white-space: pre;
+                   overflow-x: auto; }
+  #apis #copy-note { font-size: 10px; }
+
   /* ---- 右: 層スタック (LayerRun ごとに演算内容を表示) ---- */
   .layer { border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; margin-bottom: 4px;
            background: var(--panel2); transition: box-shadow .2s, border-color .2s; }
@@ -187,6 +210,37 @@
     <div class="var" id="var-token"><h3>chosen token</h3><div class="val" id="val-token">-</div></div>
     <h2 style="margin-top:10px">op timing (last step, ms)</h2>
     <div id="ops" class="muted" style="font-size:11px">-</div>
+    <h2 style="margin-top:10px">live rates <span class="muted" style="font-size:10px" id="rate-span">rolling 90 s</span></h2>
+    <div id="rates">
+      <div class="rate decode" id="rate-decode">
+        <div class="rhead"><span class="rlabel">decode tok/s</span>
+          <span class="rval" id="rate-decode-v">-</span></div>
+        <svg class="spark" id="rate-decode-s" viewBox="0 0 220 34" preserveAspectRatio="none"><path id="rate-decode-p" d=""/></svg>
+        <div class="rsub" id="rate-decode-n">0 samples</div>
+      </div>
+      <div class="rate prefill" id="rate-prefill">
+        <div class="rhead"><span class="rlabel">prefill tok/s</span>
+          <span class="rval" id="rate-prefill-v">-</span></div>
+        <svg class="spark" id="rate-prefill-s" viewBox="0 0 220 34" preserveAspectRatio="none"><path id="rate-prefill-p" d=""/></svg>
+        <div class="rsub" id="rate-prefill-n">0 samples</div>
+      </div>
+      <div class="rate vram" id="rate-vram">
+        <div class="rhead"><span class="rlabel">vram expert hit</span>
+          <span class="rval" id="rate-vram-v">-</span></div>
+        <svg class="spark" id="rate-vram-s" viewBox="0 0 220 34" preserveAspectRatio="none"><path id="rate-vram-p" d=""/></svg>
+        <div class="rsub" id="rate-vram-n">0 samples</div>
+      </div>
+    </div>
+    <h2 style="margin-top:10px">API endpoints</h2>
+    <div id="apis">
+      <div class="ep"><span class="epname">OpenAI</span>
+        <code id="ep-openai">-</code><button class="cpy" data-copy="ep-openai">copy</button></div>
+      <div class="ep"><span class="epname">Anthropic</span>
+        <code id="ep-anthropic">-</code><button class="cpy" data-copy="ep-anthropic">copy</button></div>
+      <pre id="curl">-</pre>
+      <button class="cpy" data-copy="curl">copy curl</button>
+      <span id="copy-note" class="muted"></span>
+    </div>
   </section>
 
   <!-- 中央: 実装コード + denno (LLM Server) フロー / チャット の2ペイン -->
@@ -265,6 +319,21 @@
 <script>
 "use strict";
 // ---------- フレームデコーダ (形式 v1: DNTL + varint + f16) ----------
+const ROLE_NAMES = ["attn", "gdn", "router", "shex", "ple"];   // RoleAct の並び (frames.mjs と同一)
+
+// ---------- ライブ計器への入口 (task 813, /dash.mjs) ----------
+// module は後から評価されるので、それまでのフレームは少量だけ溜めて渡す。
+let dashIn = null;
+const dashQ = [];
+window.__dashAttach = (fn) => {
+  dashIn = fn;
+  for (const [f, t] of dashQ) fn(f, t);
+  dashQ.length = 0;
+};
+function dashSend(f, t) {
+  if (f.kind === "Gap") return;   // 欠落は件数だけ別途出す
+  if (dashIn) dashIn(f, t); else if (dashQ.length < 512) dashQ.push([f, t]);
+}
 function getVarint(buf, p) {
   let v = 0n, shift = 0n;
   for (let i = p; i < buf.length; i++) {
@@ -330,7 +399,43 @@ function decodeFrame(buf) {
       for (let k = 0; k < n; k++) { const op = buf[p++]; ops.push([op, u64()]); }
       return { kind: "LayerRun", layer, ops };
     }
-    default: throw new Error("unknown kind: " + kind);
+    // 12..17 は arch_telemetry / routing のフレーム (task 813 で計器に載せた)。
+    // 形式は crates/denno-telemetry/src/lib.rs の encode に合わせる。
+    case 12: { // LayerAct
+      const layer = u32(), n = u32(); const idx = [], val = [];
+      for (let k = 0; k < n; k++) idx.push(u32());
+      for (let k = 0; k < n; k++) val.push(f16(f16r()));
+      return { kind: "LayerAct", layer, idx, val };
+    }
+    case 13: { // RoleAct (role id は無い。ROLE_NAMES の並びで f16 x 5)
+      const layer = u32();
+      const roles = {};
+      for (const name of ROLE_NAMES) roles[name] = f16(f16r());
+      return { kind: "RoleAct", layer, roles };
+    }
+    case 14: { // ExpertResidency
+      const layer = u32(), n = u32(); const vram = [];
+      for (let k = 0; k < n; k++) vram.push(u32());
+      return { kind: "ExpertResidency", layer, vram };
+    }
+    case 15: { // TierStats
+      return { kind: "TierStats", vramMB: u32(), vramTotalMB: u32(),
+               ramExperts: u32(), ssdReads: u32() };
+    }
+    case 16: { // RouterTopK
+      const layer = u32(), n = u32(); const experts = [], weights = [];
+      for (let k = 0; k < n; k++) experts.push(u32());
+      for (let k = 0; k < n; k++) weights.push(f16(f16r()));
+      return { kind: "RouterTopK", layer, experts, weights };
+    }
+    case 17: { // ExpertSkip
+      const layer = u32(), n = u32(); const experts = [];
+      for (let k = 0; k < n; k++) experts.push(u32());
+      return { kind: "ExpertSkip", layer, experts };
+    }
+    // 未知の kind は中身を読まない (WS 1 メッセージ = 1 フレームなので
+    // 次のフレームへ進めなくても壊れない)。投機テレメトリの検出用に id を残す。
+    default: return { kind: "Unknown", kindId: kind };
   }
 }
 
@@ -1014,6 +1119,7 @@ function connect() {
     if (!(ev.data instanceof ArrayBuffer)) return;
     try {
       const f = decodeFrame(new Uint8Array(ev.data));
+      dashSend(f, performance.now());
       if (f.kind === "Gap") { gapCount += f.lost; gapEl.textContent = `gap: ${gapCount}`; return; }
       // アニメーション系はキュー経由 (pacing)、統計系は即時
       if (f.kind === "LayerRun" || f.kind === "Prefill" || f.kind === "Token" || f.kind === "TopK") {
@@ -1182,6 +1288,91 @@ $("rp-slider").addEventListener("input", (e) => rpScrub(parseInt(e.target.value,
 
 // 旧チャット UI は /3d に統合したため削除 (2026-11-01)
 connect();
+</script>
+
+<!-- task 813: ライブ計器 (decode / prefill / vram のスパークライン) と
+     OpenAI / Anthropic のエンドポイント + curl の案内。
+     数字は dash.mjs が作り、ここは DOM に書くだけ。 -->
+<script type="module">
+import {
+  createDash, noteFrame, step, dashRows, apiEndpoints, curlFor,
+} from "/dash.mjs";
+
+const SPARK = { w: 220, h: 34, pad: 2 };
+const dash = createDash();
+let model = "denno";
+const origin = location.origin;
+function el(id) { return document.getElementById(id); }
+
+function renderEndpoints() {
+  for (const ep of apiEndpoints(origin)) {
+    const c = el("ep-" + ep.id);
+    if (c) { c.textContent = ep.url; c.title = ep.url; }
+  }
+  const pre = el("curl");
+  if (pre) pre.textContent = curlFor("anthropic", origin, model);
+}
+
+window.__dashAttach((f, t) => {
+  if (f.kind === "ServerInfo") {
+    model = f.model_id || f.model || model;
+    renderEndpoints();
+    return;
+  }
+  noteFrame(dash, f, t);
+});
+renderEndpoints();
+
+// 250 ms ごとに窓を締めて再描画する (フレームが来ない間も decode は 0 に落ちる)。
+function draw() {
+  for (const r of dashRows(dash, SPARK)) {
+    const v = el("rate-" + r.key + "-v");
+    if (v) v.textContent = r.text;
+    const p = el("rate-" + r.key + "-p");
+    if (p) p.setAttribute("d", r.path);
+    const n = el("rate-" + r.key + "-n");
+    if (n) n.textContent = r.samples + " samples";
+  }
+  const tv = el("rate-vram-n");
+  if (tv && dash.tier) {
+    tv.textContent = dash.tier.usedMB + "/" + dash.tier.totalMB + " MB · " +
+      dash.series.vram.length + " samples";
+  }
+}
+setInterval(() => { step(dash, performance.now()); draw(); }, 250);
+draw();
+
+async function copyText(text) {
+  const note = el("copy-note");
+  try {
+    await navigator.clipboard.writeText(text);
+    if (note) note.textContent = "copied";
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e2) { ok = false; }
+    ta.remove();
+    if (note) note.textContent = ok ? "copied" : "copy failed";
+  }
+  setTimeout(() => { const n = el("copy-note"); if (n) n.textContent = ""; }, 1200);
+}
+
+for (const b of document.querySelectorAll("#apis .cpy")) {
+  b.addEventListener("click", () => {
+    const target = b.getAttribute("data-copy") || "";
+    if (target.startsWith("ep-")) {
+      copyText(curlFor(target.slice(3), origin, model));
+    } else {
+      const n = el(target);
+      copyText(n ? n.textContent : "");
+    }
+  });
+}
 </script>
 </body>
 </html>

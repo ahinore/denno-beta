@@ -71,6 +71,21 @@
           font:inherit; font-size:11px; padding:0 12px; cursor:pointer; }
   #send:disabled { opacity:.45; cursor:default; }
   #cmeta { padding:0 10px 6px; color:var(--dim); font-size:10px; }
+  /* ---- task 813: カメラブックマークの凡例とトースト ---- */
+  #keys { display:none; left:50%; top:50%; transform:translate(-50%,-50%);
+          background:rgba(4,10,16,.94); border:1px solid #1b4b60; border-radius:8px;
+          box-shadow:0 0 40px rgba(0,190,240,.18); padding:14px 18px; min-width:330px;
+          pointer-events:auto; z-index:20; }
+  #keys.show { display:block; }
+  #keys .kh { color:var(--vram); letter-spacing:.08em; margin-bottom:8px; font-size:12px; }
+  #keys .kh .dim { color:var(--dim); letter-spacing:.04em; }
+  #keys .kr { display:flex; gap:10px; align-items:baseline; line-height:1.7; }
+  #keys .kr b { display:inline-block; min-width:46px; color:#9fefff; font-weight:600; }
+  #keys .kr span { color:#c8dde8; }
+  #keys .kf { margin-top:8px; color:var(--dim); font-size:10px; }
+  #camlabel { left:50%; top:64px; transform:translateX(-50%); color:#9fefff;
+              background:rgba(4,10,16,.8); border:1px solid #123a4c; border-radius:4px;
+              padding:2px 10px; opacity:0; transition:opacity .3s; }
 </style>
 </head>
 <body>
@@ -118,6 +133,12 @@
   <div id="cmeta"></div>
 </div>
 <div id="err"></div>
+<div id="keys" class="panel" role="dialog" aria-label="keyboard shortcuts">
+  <div class="kh">keyboard <span class="dim">— ? で開閉</span></div>
+  <div id="keys-rows"></div>
+  <div class="kf">1-4 でカメラ / f でフライト / space で停止 / c でチャット / ? でこの凡例</div>
+</div>
+<div id="camlabel" class="panel"></div>
 <div id="dump" style="display:none"></div>
 <div id="live_done" style="display:none"></div>
 <script>
@@ -145,6 +166,9 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { decodeFrame, FrameDecodeError } from '/frames.mjs';
+import {
+  bookmarkForKey, bookmarkGoal, legendRows, toggleLegend, isLegendKey, legendFromQuery,
+} from '/keys3d.mjs';
 
 // ===== 実モデルの数 (GGUF ヘッダ実測) =====================================
 const Q = new URLSearchParams(location.search);
@@ -220,6 +244,48 @@ controls.target.copy(center);
 controls.enableDamping = true; controls.dampingFactor = 0.07;
 controls.autoRotate = false; controls.autoRotateSpeed = 0.30;
 controls.minDistance = 8; controls.maxDistance = 380;
+
+// ===== task 813: カメラブックマーク (1-4) と `?` のキーボード凡例 ==========
+// 位置と注視点は keys3d.mjs が持つ。ここは camera / controls に入れるだけ。
+const keyState = { legend: false };
+const keysEl = document.getElementById('keys');
+const camLabelEl = document.getElementById('camlabel');
+(() => {
+  const rows = document.getElementById('keys-rows');
+  if (!rows) return;
+  for (const r of legendRows()) {
+    const d = document.createElement('div');
+    d.className = 'kr';
+    const k = document.createElement('b'); k.textContent = r.key;
+    const s = document.createElement('span'); s.textContent = r.label;
+    d.appendChild(k); d.appendChild(s); rows.appendChild(d);
+  }
+})();
+function setLegend(on) {
+  keyState.legend = !!on;
+  if (keysEl) keysEl.classList.toggle('show', keyState.legend);
+  return keyState.legend;
+}
+function toggleLegendUI() { return setLegend(toggleLegend(keyState)); }
+let camLabelTimer = 0;
+function showCamLabel(text) {
+  if (!camLabelEl) return;
+  camLabelEl.textContent = text;
+  camLabelEl.style.opacity = '1';
+  clearTimeout(camLabelTimer);
+  camLabelTimer = setTimeout(() => { camLabelEl.style.opacity = '0'; }, 1600);
+}
+function applyBookmark(bm) {
+  const goal = bookmarkGoal(bm);
+  if (!goal) return false;
+  if (fly.on) exitFly();      // フライト中なら Orbit に戻してから飛ぶ
+  camera.position.set(goal.pos[0], goal.pos[1], goal.pos[2]);
+  controls.target.set(goal.target[0], goal.target[1], goal.target[2]);
+  controls.update();
+  showCamLabel('camera: ' + bm.name + ' (' + bm.key + ')');
+  return true;
+}
+if (legendFromQuery(Q.get('legend'))) setLegend(true);   // 検証用 ?legend=1
 
 const m4 = new THREE.Matrix4();
 
@@ -869,6 +935,9 @@ window.__animateInputText = animateInputText;
 // ===== 12) フライトモード (WASD + クォータニオンで自由視点) ===============
 // 俯瞰の回転モード (OrbitControls) とは別。f で入る。Esc か f で戻る。
 const fly = { on: false, keys: new Set(), sens: 0.0022, speed: 16, savedTarget: new THREE.Vector3() };
+// 検証用: ?bm=2 で起動時からブックマークの視点にする (fly の初期化後に置く)。
+if (Q.get('bm')) { const b0 = bookmarkForKey(Q.get('bm')); if (b0) applyBookmark(b0); }
+
 const _qy = new THREE.Quaternion(), _qyAxis = new THREE.Vector3(0, 1, 0);
 const _qp = new THREE.Quaternion(), _qxAxis = new THREE.Vector3(1, 0, 0);
 function enterFly() {
@@ -910,6 +979,11 @@ addEventListener('pointermove', (e) => {
 });
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+  // task 813: `?` で凡例、1-4 でカメラブックマーク
+  if (isLegendKey(e)) { toggleLegendUI(); e.preventDefault(); return; }
+  if (e.key === 'Escape' && keyState.legend) { setLegend(false); return; }
+  const bm = bookmarkForKey(e.key);
+  if (bm) { applyBookmark(bm); e.preventDefault(); return; }
   if (e.key === 'f' || e.key === 'F') { fly.on ? exitFly() : enterFly(); e.preventDefault(); return; }
   if (e.key === 'Escape' && fly.on) { exitFly(); return; }
   if (fly.on) fly.keys.add(e.code);
