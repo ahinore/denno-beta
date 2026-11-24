@@ -75,7 +75,15 @@ pub fn seg_layer_from_value(v: Option<&str>) -> bool {
 }
 
 /// 新経路が有効か (プロセスで 1 回だけ env を読む)。
+///
+/// task 810: `DENNO_Q4_DETERMINISTIC=1` では無効。この経路はヒットぶんを
+/// デバイスで和 (`dno_dec_exp_sum`、segment 昇順) してからミスをホストで足すので、
+/// 足し込みの順序が「選択順の逐次」と違う。expert の常駐状態が変わると同じ層でも
+/// 下位ビットが変わるため、決定論モードでは per-expert 経路へ落とす。
 pub fn seg_layer_enabled() -> bool {
+    if crate::model::moe_expert::q4_deterministic_enabled() {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| seg_layer_from_value(std::env::var(SEG_LAYER_ENV).ok().as_deref()))
 }

@@ -551,7 +551,16 @@ pub fn seg_k_from_value(v: Option<&str>) -> bool {
 
 
 /// 高速版 GEMV が有効か (プロセスで 1 回だけ env を読む)。
+///
+/// task 810: `DENNO_Q4_DETERMINISTIC=1` では常に無効。`kernels_seg_k` は
+/// 1 行 = 1 warp の `__shfl_down_sync` 木和で、丸め順が CPU スカラーと違う
+/// (同じ起動形なら決定的だが、CPU ミス expert と混ざると値が揺れる)。
+/// 変わりに旧 `kernels_moe_batch` (1 行 = 1 スレッドの `i` 昇順、CPU とビット一致)
+/// が使われる。
 pub(crate) fn seg_k_enabled() -> bool {
+    if crate::model::moe_expert::q4_deterministic_enabled() {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| seg_k_from_value(std::env::var(SEG_K_ENV).ok().as_deref()))
 }

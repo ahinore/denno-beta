@@ -156,10 +156,90 @@ pub fn q4k_fused_supported() -> bool {
     }
 }
 
+/// `DENNO_Q4_DETERMINISTIC` の値の解釈 (純関数)。**既定 off**。
+///
+/// 真偽の綴りは `1` / `true` / `on` / `yes` (大小文字を問わない) だけを真とする。
+/// 空文字・その他の値は偽 (= 従来どおり融合カーネル)。
+pub fn q4_det_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static Q4_DET_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// task 810: Q4 系 (UD-Q4_K_XL) の expert GEMV を**載っている場所に依らず**
+/// 同じ丸め順にする決定論モード。
+///
+/// # 何が揺れていたか
+///
+/// decode では VRAM に載っている expert は CUDA の順序 (1 行 = 1 スレッドが
+/// `i` 昇順に f32 で `acc += y * x[i]`、`-fmad=false`。`kernels_moe*.cu` の契約)
+/// で、載っていない expert は CPU の AVX2 融合カーネル (8 レーン累積 + `Σ_32 x`
+/// の min 項) で計算される。後者だけが `i` 昇順でないため、ラウンド間で expert の
+/// 常駐状態 (= VRAM / page cache の温まり方) が変わると最下位ビットがずれ、
+/// 同じプロンプトでも md5 が変わる (2026-11-24 の標準ベンチで Q3 = 全ラウンド一致、
+/// Q4 = 不一致だった原因)。
+///
+/// # on で何をするか
+///
+/// 1. CPU: Q4_K / Q5_K の融合カーネル (1 行版と prefill バッチ版) を通さず、
+///    `gemv_scalar_body` (= `dot_seq` の `i` 昇順) にする。CUDA の v2 カーネルは
+///    この順序とビット一致する (`cuda_moe_gemv_v2_bit_exact_vs_cpu` が契約)。
+///    Q5_1 / Q6_K は元からスカラーなので何もしない (Q6_K に CUDA カーネルは無い)。
+/// 2. GPU: GEMV モードを v2 に固定し (`DENNO_GEMV_V3` / `DENNO_GEMV_FP16` を無視)、
+///    warp 木和の高速 seg カーネル (`DENNO_SEG_K`) と層一括の seg 経路
+///    (`DENNO_SEG_LAYER`) を止める。どちらも CPU とビット一致しない経路。
+///    残る per-expert の v2 と層一括の旧カーネル (`kernels_moe_batch.cu`) は
+///    どちらも `i` 昇順で、CPU スカラーとビット一致する。
+///
+/// 既定 off。数値 (下位ビット) が変わるので、A/B と切り戻しのために env で戻せる
+/// ようにしてある。コストは推定で「CPU ミスの GEMV がベクトル化を失う」ぶん。
+pub fn q4_deterministic_enabled() -> bool {
+    #[cfg(test)]
+    match Q4_DET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| q4_det_from_value(std::env::var("DENNO_Q4_DETERMINISTIC").ok().as_deref()))
+}
+
+/// テスト専用: 決定論モードの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_q4_deterministic_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    Q4_DET_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// テスト用: 融合カーネルが実際に発火した回数。
 /// 「テストが緑」= 「融合経路が通った」ではないので、ゲートの通過を数える。
 #[cfg(test)]
 static FUSED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト用: `DENNO_Q4_DETERMINISTIC` が Q4_K / Q5_K をスカラー経路へ落とした回数。
+/// スレッドローカル (テストは 1 本 1 スレッドで、4 行の行列は行並列に入らない)。
+#[cfg(test)]
+thread_local! {
+    static Q4_DET_SCALAR_CALLS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+/// テスト専用: [`Q4_DET_SCALAR_CALLS`] の現在値 (呼び出しスレッド)。
+#[cfg(test)]
+pub(crate) fn q4_det_scalar_calls() -> usize {
+    Q4_DET_SCALAR_CALLS.with(|c| c.get())
+}
 
 /// テスト用: GEMV の**行並列領域**を立てた回数 (行列 1 回 = 1)。
 ///
@@ -1176,7 +1256,11 @@ fn expert_gemv_inner(
         }
     }
 
-    if ty == GgmlType::Q4K && q4k_fused_supported() {
+    // task 810: `DENNO_Q4_DETERMINISTIC=1` では融合カーネルを通さない。
+    // CUDA 側 (v2 / kernels_moe_batch) は `i` 昇順の 1 本アキュムレータで、上の
+    // スカラー経路 (`dot_seq`) とビット一致する。融合カーネルはその順序を変えるので、
+    // VRAM ヒットと CPU ミスが混ざる decode では md5 が揺れる (下の Q5_K も同じ)。
+    if ty == GgmlType::Q4K && q4k_fused_supported() && !q4_deterministic_enabled() {
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
@@ -1244,7 +1328,7 @@ fn expert_gemv_inner(
             return Ok(());
         }
     }
-    if ty == GgmlType::Q5K && q4k_fused_supported() && q5k_fast_enabled() {
+    if ty == GgmlType::Q5K && q4k_fused_supported() && q5k_fast_enabled() && !q4_deterministic_enabled() {
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
@@ -1272,6 +1356,13 @@ fn expert_gemv_inner(
     // 行は独立で、`gemv_scalar_body` は担当チャンクの先頭行から連続で計算する
     // ので、分割しても各要素の値は変わらない (1 行の内積は [`dot_seq`] の
     // k 昇順のまま)。旧実装は 1 スレッドで全行を回していた。
+
+    // task 810: 決定論モードが Q4_K / Q5_K をスカラーへ落としたことを数える
+    // (発火の証拠。緑 = ゲートが効いた、ではない)。
+    #[cfg(test)]
+    if q4_deterministic_enabled() && matches!(ty, GgmlType::Q4K | GgmlType::Q5K) {
+        Q4_DET_SCALAR_CALLS.with(|c| c.set(c.get() + 1));
+    }
 
     crate::model::exp_kprof::bump_kernel(
         crate::model::exp_kprof::PH_DECODE,
@@ -5162,7 +5253,7 @@ fn gemm_rows_disp(
             unsafe { gemm_q5_1_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
-        if fused && ty == GgmlType::Q4K && q4k_fused_supported() {
+        if fused && ty == GgmlType::Q4K && q4k_fused_supported() && !q4_deterministic_enabled() {
             gemm_fused_fired();
             crate::model::exp_kprof::bump_kernel(
                 crate::model::exp_kprof::PH_PREFILL,
@@ -5174,7 +5265,12 @@ fn gemm_rows_disp(
             unsafe { gemm_q4k_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
-        if fused && ty == GgmlType::Q5K && q4k_fused_supported() && q5k_fast_enabled() {
+        if fused
+            && ty == GgmlType::Q5K
+            && q4k_fused_supported()
+            && q5k_fast_enabled()
+            && !q4_deterministic_enabled()
+        {
             gemm_fused_fired();
             crate::model::exp_kprof::bump_kernel(
                 crate::model::exp_kprof::PH_PREFILL,
@@ -9523,6 +9619,164 @@ mod tests {
                 d_st
             );
         }
+    }
+
+    // ---- task 810: Q4 決定論モード (`DENNO_Q4_DETERMINISTIC`) ----------------
+
+    /// env の値の解釈 (既定 off。真にするのは 1/true/on/yes だけ)。
+    #[test]
+    fn q4_deterministic_value_parsing() {
+        for v in [
+            None,
+            Some(""),
+            Some(" "),
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("no"),
+            Some("2"),
+            Some("deterministic"),
+        ] {
+            assert!(!q4_det_from_value(v), "{v:?} を真として読んでいる");
+        }
+        for v in ["1", "true", "on", "yes", " TRUE ", "Yes"] {
+            assert!(q4_det_from_value(Some(v)), "{v} を偽として読んでいる");
+        }
+        // 既定 (env 未設定) は off。テストの上書きが残っていないことも見る。
+        set_q4_deterministic_for_test(None);
+        assert!(!q4_deterministic_enabled(), "既定が on になっている");
+    }
+
+    /// 揺れの再現と修正: 既定では Q4_K / Q5_K の融合カーネルが CPU スカラー
+    /// (= CUDA v2 / kernels_moe_batch とビット一致する順序) と食い違う。
+    /// `DENNO_Q4_DETERMINISTIC=1` では同じ入力・同じ重みで**ビット一致**し、
+    /// 実際にスカラー経路へ落ちたことを数える。
+    ///
+    /// CUDA の無いこのコンテナでは GPU 側を走らせられないので、ここで固定できるのは
+    /// 「CPU の 2 経路のどちらが GPU の契約と同じ順序か」まで。GPU 側の数値一致は
+    /// `cuda_moe_gemv_v2_bit_exact_vs_cpu` (GPU のある環境で走る) が契約。
+    #[test]
+    fn q4_deterministic_routes_q4k_q5k_to_bit_exact_scalar() {
+        let _g = moe_test_lock();
+        if !fused_ready("q4_deterministic_routes_q4k_q5k_to_bit_exact_scalar") {
+            return;
+        }
+        // Q5_K の融合カーネルは env ゲート付きなので、テスト中は明示 on に固定する。
+        set_q5k_fast_for_test(Some(true));
+        for ty in [GgmlType::Q4K, GgmlType::Q5K] {
+            for (n_in, n_out) in [(256usize, 4usize), (PERF_N_IN, 8usize)] {
+                let x = make_x_wide(n_in);
+                let blocks = make_expert(ty, n_in, n_out, 0);
+                let mut scalar = vec![0.0f32; n_out];
+                expert_gemv_scalar(ty, &blocks, n_in, n_out, &x, &mut scalar).unwrap();
+                assert!(
+                    scalar.iter().any(|v| *v != 0.0) && scalar.iter().all(|v| v.is_finite()),
+                    "{ty:?} n_in={n_in}: 参照が縮退している (全 0 / 非有限)"
+                );
+
+                // 既定 (ゲート off): 融合カーネルはスカラーと 1 行以上で食い違う。
+                // ここが揺れの正体 (VRAM ヒットは CUDA 順序 = スカラー順)。
+                set_q4_deterministic_for_test(Some(false));
+                let mut fused = vec![0.0f32; n_out];
+                expert_gemv(ty, &blocks, n_in, n_out, &x, &mut fused).unwrap();
+                let ndiff_off = (0..n_out)
+                    .filter(|&i| fused[i].to_bits() != scalar[i].to_bits())
+                    .count();
+                assert!(
+                    ndiff_off > 0,
+                    "{ty:?} n_in={n_in}: 融合とスカラーが 1 行も違わない = 融合カーネルが \
+                     走っていない (比較が無意味)"
+                );
+
+                // ゲート on: スカラー経路へ落ち、スカラーと 1 bit も違わない。
+                set_q4_deterministic_for_test(Some(true));
+                let before = q4_det_scalar_calls();
+                let mut det = vec![0.0f32; n_out];
+                expert_gemv(ty, &blocks, n_in, n_out, &x, &mut det).unwrap();
+                let fired = q4_det_scalar_calls() - before;
+                set_q4_deterministic_for_test(None);
+                assert!(
+                    fired >= 1,
+                    "{ty:?} n_in={n_in}: 決定論モードがスカラー経路を選んでいない (fired=0)"
+                );
+                for r in 0..n_out {
+                    assert_eq!(
+                        det[r].to_bits(),
+                        scalar[r].to_bits(),
+                        "{ty:?} n_in={n_in} 行 {r}: det={} scalar={}",
+                        det[r],
+                        scalar[r]
+                    );
+                }
+                let _ = ndiff_off;
+            }
+        }
+        set_q5k_fast_for_test(None);
+    }
+
+    /// prefill のバッチ経路も同じゲートでスカラーへ落ち、1 行版のスカラーと
+    /// (トークン, 行) ごとにビット一致すること。
+    #[test]
+    fn q4_deterministic_batch_matches_scalar_per_token() {
+        let _g = moe_test_lock();
+        if !fused_ready("q4_deterministic_batch_matches_scalar_per_token") {
+            return;
+        }
+        set_q5k_fast_for_test(Some(true));
+        let (n_in, n_out, m) = (256usize, 4usize, 3usize);
+        for ty in [GgmlType::Q4K, GgmlType::Q5K] {
+            let blocks = make_expert(ty, n_in, n_out, 0);
+            // トークンごとに違う入力 (同じ入力だと行間の違いを見落とす)
+            let xs: Vec<f32> = (0..m)
+                .flat_map(|t| {
+                    make_x_wide(n_in)
+                        .into_iter()
+                        .map(move |v| v * (1.0 + t as f32 * 0.25))
+                })
+                .collect();
+            let mut want = vec![0.0f32; m * n_out];
+            for t in 0..m {
+                expert_gemv_scalar(
+                    ty,
+                    &blocks,
+                    n_in,
+                    n_out,
+                    &xs[t * n_in..(t + 1) * n_in],
+                    &mut want[t * n_out..(t + 1) * n_out],
+                )
+                .unwrap();
+            }
+
+            // 既定: 融合バッチはスカラーと食い違う (揺れの再現)
+            set_q4_deterministic_for_test(Some(false));
+            let mut fused = vec![0.0f32; m * n_out];
+            expert_gemm_any(ty, &blocks, n_in, n_out, &xs, m, &mut fused).unwrap();
+            let ndiff_off = (0..m * n_out)
+                .filter(|&i| fused[i].to_bits() != want[i].to_bits())
+                .count();
+            assert!(
+                ndiff_off > 0,
+                "{ty:?}: バッチ融合とスカラーが 1 要素も違わない = 融合が走っていない"
+            );
+
+            // ゲート on: ビット一致
+            set_q4_deterministic_for_test(Some(true));
+            let mut det = vec![0.0f32; m * n_out];
+            expert_gemm_any(ty, &blocks, n_in, n_out, &xs, m, &mut det).unwrap();
+            set_q4_deterministic_for_test(None);
+            for i in 0..m * n_out {
+                assert_eq!(
+                    det[i].to_bits(),
+                    want[i].to_bits(),
+                    "{ty:?} 要素 {i} (t={}, r={}): det={} scalar={}",
+                    i / n_out,
+                    i % n_out,
+                    det[i],
+                    want[i]
+                );
+            }
+        }
+        set_q5k_fast_for_test(None);
     }
 
     /// Q8_0 の融合カーネル (attention の投影が Q8_0 なので、こちらのほうが効く)。

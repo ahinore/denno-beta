@@ -1697,6 +1697,44 @@ pub(crate) mod dec_kprof {
     pub(crate) mod tests {
         use super::*;
 
+        /// task 810: `DENNO_Q4_DETERMINISTIC=1` は GPU 側の「CPU とビット一致しない」
+        /// 経路を止める。固定するのは 3 点:
+        ///
+        /// - `gemv_kernel_mode()` が V2 (1 行 = 1 スレッド・`i` 昇順) に固定される
+        /// - warp 木和の高速 seg カーネル (`DENNO_SEG_K`) が無効
+        /// - デバイス和を使う層一括 seg 経路 (`DENNO_SEG_LAYER`) が無効
+        ///
+        /// 前 2 つは「off にすると値が変わる」ことで発火を数える (seg_k の既定は on)。
+        /// GPU は要らない (選択だけのテスト)。
+        #[test]
+        fn q4_deterministic_disables_non_bit_exact_gpu_paths() {
+            use crate::model::moe_expert::{moe_test_lock, set_q4_deterministic_for_test};
+            let _g = moe_test_lock();
+            set_q4_deterministic_for_test(Some(false));
+            let seg_k_off = crate::cuda::moe_dec::seg_k_enabled();
+            let seg_layer_off = crate::model::expert_batch::seg_layer_enabled();
+            set_q4_deterministic_for_test(Some(true));
+            let seg_k_on = crate::cuda::moe_dec::seg_k_enabled();
+            let seg_layer_on = crate::model::expert_batch::seg_layer_enabled();
+            let mode = gemv_kernel_mode();
+            set_q4_deterministic_for_test(None);
+            assert!(
+                matches!(mode, GemvKernelMode::V2),
+                "決定論モードで V2 以外が選ばれた: {mode:?}"
+            );
+            // 既定 (env 未設定) はどちらも on なので、off になったことで発火が分かる。
+            assert!(
+                seg_k_off,
+                "既定で seg_k が off (このテストの前提が崩れている)"
+            );
+            assert!(
+                seg_layer_off,
+                "既定で seg_layer が off (このテストの前提が崩れている)"
+            );
+            assert!(!seg_k_on, "決定論モードで seg_k が止まっていない");
+            assert!(!seg_layer_on, "決定論モードで seg_layer が止まっていない");
+        }
+
         /// env を見ずに on/off を固定する (assert が落ちても戻す)。
         struct Force(Option<bool>);
         impl Force {
