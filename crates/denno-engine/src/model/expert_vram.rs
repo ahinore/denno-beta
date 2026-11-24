@@ -78,6 +78,7 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+use crate::model::cache_policy::{CachePolicy, FreqSketch};
 use crate::model::expert_cache::ExpertKey;
 
 /// `DENNO_EXPERT_VRAM_MB`: expert の VRAM 常駐に使う上限 (MiB)。既定 0 = 無効。
@@ -390,6 +391,8 @@ pub struct VramStats {
     pub pinned_oversize: u64,
     /// H2D したバイト数の累計
     pub upload_bytes: u64,
+    /// task 794: 頻度ゲートで載せなかった回数 (`tinylfu` のときだけ増える)
+    pub admission_rejects: u64,
 }
 
 /// [`VramLru::make_room`] の失敗。上限より大きい 1 本は載せない (静かに切り詰めない)。
@@ -399,6 +402,9 @@ pub struct VramStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LruError {
     TooBig { bytes: usize, cap: usize },
+    /// task 794: 頻度ゲートが「この候補は載せる価値が無い」と判断した。
+    /// 1 本も追い出していない (呼び出し側は CPU 経路へ落ちる)。
+    Rejected { key_freq: u8, victim_freq: u8 },
 }
 
 impl std::fmt::Display for LruError {
@@ -407,6 +413,13 @@ impl std::fmt::Display for LruError {
             LruError::TooBig { bytes, cap } => {
                 write!(f, "1 本 {bytes} B が VRAM 上限 {cap} B を超える")
             }
+            LruError::Rejected {
+                key_freq,
+                victim_freq,
+            } => write!(
+                f,
+                "頻度ゲート: 候補 {key_freq} < 犠牲者 {victim_freq} なので載せない"
+            ),
         }
     }
 }
@@ -421,26 +434,64 @@ struct Slot<V> {
 ///
 /// 通し番号は [`VramLru::get_mut`] と [`VramLru::insert`] で単調増加するので、
 /// 同じ番号の 2 本は存在せず、追い出し対象は常に一意に決まる。
+///
+/// task 794: `policy == TinyLfu` のときは
+///   - 追い出し対象を「推定頻度が最小、同点なら最終使用が最も古い」に変え、
+///   - [`VramLru::make_room_for`] で候補の推定頻度が犠牲者より低ければ載せない
+/// となる (頻度ゲート)。`policy == Lru` (切り戻し) は上の LRU そのままで、
+/// sketch の加算も一切しない。
 pub struct VramLru<K, V> {
     cap_bytes: usize,
     used_bytes: usize,
     /// LRU 管理外の常駐 (prefill のパック済み重み) が借りているバイト数
     pinned_bytes: usize,
     clock: u64,
+    policy: CachePolicy,
+    freq: FreqSketch,
     entries: HashMap<K, Slot<V>>,
     stats: VramStats,
 }
 
 impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
     /// 上限 `cap_bytes` で空の LRU を作る。`cap_bytes == 0` は「何も載せない」。
+    ///
+    /// task 794: ここは env を見ずに **常に LRU** で作る (テストが env に左右され
+    /// ないようにするため)。実経路は [`ExpertVram::init`] が
+    /// `DENNO_EXPERT_CACHE_POLICY` を読んで [`VramLru::with_policy`] を使う。
     pub fn new(cap_bytes: usize) -> Self {
+        VramLru::with_policy(cap_bytes, CachePolicy::Lru)
+    }
+
+    /// task 794: 方針を指定して作る。
+    pub fn with_policy(cap_bytes: usize, policy: CachePolicy) -> Self {
         VramLru {
             cap_bytes,
             used_bytes: 0,
             pinned_bytes: 0,
             clock: 0,
+            policy,
+            freq: FreqSketch::default(),
             entries: HashMap::new(),
             stats: VramStats::default(),
+        }
+    }
+
+    /// task 794: いまの載せ替え方針。
+    pub fn policy(&self) -> CachePolicy {
+        self.policy
+    }
+
+    /// task 794: 頻度 sketch (診断用。`tinylfu` 以外では空のまま)。
+    pub fn freq_sketch(&self) -> &FreqSketch {
+        &self.freq
+    }
+
+    /// 鍵の推定頻度 (0..=15)。`lru` のときは常に 0。
+    pub fn freq_of(&self, key: &K) -> u8 {
+        if self.policy == CachePolicy::TinyLfu {
+            self.freq.estimate(crate::model::cache_policy::key_hash(key))
+        } else {
+            0
         }
     }
 
@@ -486,7 +537,13 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
 
     /// ヒットしたら最終使用を更新して値を返す。ミスは数えない
     /// (ミスは [`VramLru::insert`] で数える)。
+    ///
+    /// task 794: `tinylfu` のときはここで sketch に 1 回加算する (ヒット =
+    /// その expert は「温かい」)。`lru` では何もしない。
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        if self.policy == CachePolicy::TinyLfu {
+            self.freq.record(crate::model::cache_policy::key_hash(key));
+        }
         let slot = self.entries.get_mut(key)?;
         self.clock = self.clock.saturating_add(1);
         slot.last_use = self.clock;
@@ -499,7 +556,25 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
     ///
     /// `bytes + pinned > cap` は [`LruError::TooBig`]。このときは 1 本も追い出さない
     /// (外部予約は LRU からは動かせないので、追い出しても入らない)。
+    ///
+    /// これは「候補の鍵を言わない」版で、頻度ゲートは掛からない (`lru` と同じ)。
+    /// 実経路は [`VramLru::make_room_for`] を使う。
     pub fn make_room(&mut self, bytes: usize) -> Result<Vec<(K, V)>, LruError> {
+        self.make_room_inner(None, bytes)
+    }
+
+    /// task 794: 候補 `key` を載せる余地を作る。`tinylfu` では
+    /// **候補の推定頻度が犠牲者 (今追い出す 1 本) の推定頻度より低ければ、
+    /// 1 本も追い出さずに [`LruError::Rejected`] を返す**。
+    ///
+    /// 頻度はここで 1 回加算する (候補は「ミスして引かれた」= 1 回使われた)。
+    /// 加算は載せる前に行うので、初めての鍵でも推定 1 になり、頻度 1 の
+    /// 犠牲者 (載せただけで二度と使われていない) とは同点 = 載せてよい。
+    pub fn make_room_for(&mut self, key: &K, bytes: usize) -> Result<Vec<(K, V)>, LruError> {
+        self.make_room_inner(Some(key), bytes)
+    }
+
+    fn make_room_inner(&mut self, key: Option<&K>, bytes: usize) -> Result<Vec<(K, V)>, LruError> {
         if bytes + self.pinned_bytes > self.cap_bytes {
             self.stats.oversize += 1;
             return Err(LruError::TooBig {
@@ -507,9 +582,30 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
                 cap: self.cap_bytes,
             });
         }
+        let mut cand_freq = 0u8;
+        if self.policy == CachePolicy::TinyLfu {
+            if let Some(k) = key {
+                let h = crate::model::cache_policy::key_hash(k);
+                self.freq.record(h);
+                cand_freq = self.freq.estimate(h);
+            }
+        }
+        if self.policy == CachePolicy::TinyLfu && self.used_bytes + self.pinned_bytes + bytes > self.cap_bytes
+        {
+            if let Some(victim) = self.victim() {
+                let victim_freq = self.freq_of(&victim);
+                if cand_freq < victim_freq {
+                    self.stats.admission_rejects += 1;
+                    return Err(LruError::Rejected {
+                        key_freq: cand_freq,
+                        victim_freq,
+                    });
+                }
+            }
+        }
         let mut evicted = Vec::new();
         while self.used_bytes + self.pinned_bytes + bytes > self.cap_bytes {
-            let Some(victim) = self.oldest() else {
+            let Some(victim) = self.victim() else {
                 // entries が空なら used_bytes == 0 なので、ここには来ない
                 // (`bytes + pinned <= cap` が前提)。
                 break;
@@ -540,7 +636,7 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         }
         let mut evicted = Vec::new();
         while self.used_bytes + self.pinned_bytes + bytes > self.cap_bytes {
-            let Some(victim) = self.oldest() else {
+            let Some(victim) = self.victim() else {
                 break;
             };
             if let Some(v) = self.remove(&victim) {
@@ -612,17 +708,48 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         Some(slot.value)
     }
 
-    /// 最終使用が最も古い key。
-    fn oldest(&self) -> Option<K> {
-        let mut best: Option<(K, u64)> = None;
+    /// 追い出しの犠牲者。`lru` は「最終使用が最も古い」1 本、`tinylfu` は
+    /// 「推定頻度が最小、同点なら最終使用が最も古い」1 本。
+    ///
+    /// `last_use` は一意なので、同点でも対象は一意に決まる。
+    fn victim(&self) -> Option<K> {
+        let tiny = self.policy == CachePolicy::TinyLfu;
+        let mut best: Option<(K, u8, u64)> = None;
         for (k, s) in self.entries.iter() {
+            let f = if tiny {
+                self.freq.estimate(crate::model::cache_policy::key_hash(k))
+            } else {
+                0
+            };
             match best {
-                None => best = Some((*k, s.last_use)),
-                Some((_, t)) if s.last_use < t => best = Some((*k, s.last_use)),
+                None => best = Some((*k, f, s.last_use)),
+                Some((_, bf, bt)) if f < bf || (f == bf && s.last_use < bt) => {
+                    best = Some((*k, f, s.last_use))
+                }
                 _ => {}
             }
         }
-        best.map(|(k, _)| k)
+        best.map(|(k, _, _)| k)
+    }
+
+    /// 追い出す順 (先頭から) の key 列。`lru` は古い順、`tinylfu` は
+    /// 「頻度が低い順 → 同点は古い順」。テストとログ用。
+    pub fn eviction_order(&self) -> Vec<K> {
+        let tiny = self.policy == CachePolicy::TinyLfu;
+        let mut v: Vec<(K, u8, u64)> = self
+            .entries
+            .iter()
+            .map(|(k, s)| {
+                let f = if tiny {
+                    self.freq.estimate(crate::model::cache_policy::key_hash(k))
+                } else {
+                    0
+                };
+                (*k, f, s.last_use)
+            })
+            .collect();
+        v.sort_by_key(|(_, f, t)| (*f, *t));
+        v.into_iter().map(|(k, _, _)| k).collect()
     }
 
     /// LRU 順 (古い → 新しい) の key 列。テストとログ用。
@@ -648,7 +775,8 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
     pub fn evict_until_free(&mut self, want: usize) -> Vec<(K, V)> {
         let mut out = Vec::new();
         let mut freed = 0usize;
-        for k in self.lru_keys() {
+        // task 794: 順序は [`VramLru::eviction_order`] (`tinylfu` では頻度が低い順)。
+        for k in self.eviction_order() {
             if freed >= want {
                 break;
             }
@@ -1259,9 +1387,27 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 pub use gpu::{
     acquire, acquire_deferred, acquire_host, acquire_soft, cache_usage, check_enabled,
     fallback_breakdown, fallbacks, init, keys, lookup, lookup_many, note_check, peek_many,
-    take_alloc_error, take_check, touch_many, touch_many_count, Acquired, CheckAcc, ExpertDev,
-    ExpertShape,
+    policy, policy_line, policy_stats, take_alloc_error, take_check, touch_many, touch_many_count,
+    Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
+
+/// task 794: CUDA 無しのビルドには VRAM の expert キャッシュが無い (方針は `None`)。
+#[cfg(not(feature = "cuda"))]
+pub fn policy() -> Option<CachePolicy> {
+    None
+}
+
+/// task 794: CUDA 無しのビルドには VRAM の expert キャッシュが無い。
+#[cfg(not(feature = "cuda"))]
+pub fn policy_stats() -> Option<(CachePolicy, u64, u64)> {
+    None
+}
+
+/// task 794: CUDA 無しのビルドには VRAM の expert キャッシュが無い (行を出さない)。
+#[cfg(not(feature = "cuda"))]
+pub fn policy_line() -> Option<String> {
+    None
+}
 
 /// CUDA 無しのビルドには VRAM の expert キャッシュが無い (使用量は `None`)。
 #[cfg(not(feature = "cuda"))]
@@ -1440,6 +1586,9 @@ mod gpu {
     static FB_TYPE: AtomicU64 = AtomicU64::new(0);
     static FB_BUDGET: AtomicU64 = AtomicU64::new(0);
     static FB_ALLOC: AtomicU64 = AtomicU64::new(0);
+    /// task 794: 頻度ゲートで載せなかった回数 (FB_BUDGET とは別。予算では無く
+    /// 「載せる価値が無い」で落ちたぶん)。
+    static FB_ADMISSION: AtomicU64 = AtomicU64::new(0);
     /// 1 本が上限より大きいことを 1 回だけ言うためのラッチ
     static OVERSIZE_LOGGED: AtomicBool = AtomicBool::new(false);
     /// task 152: slab のチャンク確保に失敗したことを 1 回だけ言うためのラッチ
@@ -1479,11 +1628,60 @@ mod gpu {
     }
 
     /// 上限 `cap_bytes` で LRU を作る (プロセスで 1 回)。2 回目以降は無視する。
+    ///
+    /// task 794: 載せ替え方は `DENNO_EXPERT_CACHE_POLICY` で決める
+    /// (既定 `tinylfu`、`lru` で従来に切り戻し)。
     pub fn init(cap_bytes: usize) {
         let _ = ENV_CAP.set(cap_bytes);
         // task 149: 起動時点の実効上限 (カード実容量 - 余裕 - 他の常駐) で作る。
         // 以後も確保のたびに引き直す (`DENNO_VRAM_BUDGET_CARD=0` なら env のまま)。
-        let _ = CACHE.set(Mutex::new(VramLru::new(super::effective_expert_cap(cap_bytes))));
+        let policy = crate::model::cache_policy::policy_from_env();
+        if policy != CachePolicy::Lru {
+            // 発火の証拠を 1 行残す (緑 = 有効とは限らないため)。
+            eprintln!(
+                "[exp-vram] 載せ替え = {} (task 794 の頻度ゲート)",
+                policy.as_str()
+            );
+        }
+        let _ = CACHE.set(Mutex::new(VramLru::with_policy(
+            super::effective_expert_cap(cap_bytes),
+            policy,
+        )));
+    }
+
+    /// task 794: いまの載せ替え方針 (未初期化なら `None`)。
+    pub fn policy() -> Option<CachePolicy> {
+        let g = CACHE.get()?.lock().ok()?;
+        Some(g.policy())
+    }
+
+    /// task 794: `(方針, 頻度ゲートで載せなかった回数, sketch の半減回数)` の診断値。
+    pub fn policy_stats() -> Option<(CachePolicy, u64, u64)> {
+        let g = CACHE.get()?.lock().ok()?;
+        Some((
+            g.policy(),
+            g.stats().admission_rejects,
+            g.freq_sketch().halvings(),
+        ))
+    }
+
+    /// task 794: リクエスト終端に出す 1 行 (載せ替えが `lru` なら出さない)。
+    ///
+    /// 数はプロセス積算。行が出ること = 頻度ゲートが有効、`adm_rej` の増加 =
+    /// 実際に「載せない」判断が起きた回数。
+    pub fn policy_line() -> Option<String> {
+        let g = CACHE.get()?.lock().ok()?;
+        let policy = g.policy();
+        if policy == CachePolicy::Lru {
+            return None;
+        }
+        Some(format!(
+            "[exp-vram] policy={} adm_rej={} age_halvings={} sketch_kib={}",
+            policy.as_str(),
+            g.stats().admission_rejects,
+            g.freq_sketch().halvings(),
+            g.freq_sketch().bytes() >> 10
+        ))
     }
 
     /// `DENNO_EXPERT_VRAM_MB` の生値 (バイト)。実効上限の計算に使う。
@@ -2054,8 +2252,26 @@ mod gpu {
         // task 149: 上限は毎回カードの実情へ合わせ直す (他の常駐が増えていれば
         // その分だけ expert が譲る = 予算を本物にする)。
         refresh_cap(&mut g);
-        let evicted = match g.make_room(want) {
+        // task 794: 候補の鍵を渡す。`tinylfu` では頻度ゲートが掛かり、
+        // 「1 回しか使わない expert が温かい expert を押し出す」のを防ぐ。
+        let evicted = match g.make_room_for(&key, want) {
             Ok(v) => v,
+            Err(LruError::Rejected {
+                key_freq,
+                victim_freq,
+            }) => {
+                // 失敗ではなく方針の判断なので FALLBACKS には足さない
+                // (`fallback_breakdown` の内訳の和 = 合計 を崩さない)。
+                FB_ADMISSION.fetch_add(1, Ordering::Relaxed);
+                static ADM_REJ_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !ADM_REJ_LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        "task794: 頻度ゲートで載せない ({:?} 推定 {key_freq} < 犠牲者 {victim_freq}) → この 1 本は CPU",
+                        key
+                    );
+                }
+                return Ok(None);
+            }
             Err(e) => {
                 if !OVERSIZE_LOGGED.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
@@ -2255,8 +2471,14 @@ mod gpu {
                 want = want.saturating_add(mbytes[i]);
             }
             refresh_cap(&mut g);
-            match g.make_room(want) {
+            // task 794: 背景スレッドの事前上げも頻度ゲートに従う。
+            match g.make_room_for(&key, want) {
                 Ok(v) => drop(v),
+                Err(LruError::Rejected { .. }) => {
+                    // 方針の判断なので FALLBACKS (失敗の合計) には足さない。
+                    FB_ADMISSION.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
                 Err(_) => {
                     FALLBACKS.fetch_add(1, Ordering::Relaxed);
                     FB_BUDGET.fetch_add(1, Ordering::Relaxed);
@@ -3144,5 +3366,195 @@ mod tests {
             n: 2560,
         };
         assert!(bad.bytes().is_err(), "Q4_K の 640 は 256 で割り切れない");
+    }
+
+    // ---- task 794: 頻度ゲート (TinyLFU) の挙動 ----------------------------
+
+    /// 決定的な疑似乱数 (テストで同じトレースを再現する)。
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut z = self.0 ^ (self.0 >> 33);
+            z = z.wrapping_mul(0xff51afd7ed558ccd);
+            z ^= z >> 33;
+            z
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// Zipf(alpha) に従う 0..n の鍵を 1 つ返す (累積分布を毎回引く素朴版)。
+    struct Zipf {
+        cdf: Vec<f64>,
+    }
+    impl Zipf {
+        fn new(n: usize, alpha: f64) -> Self {
+            let mut cdf = Vec::with_capacity(n);
+            let mut acc = 0.0;
+            for i in 1..=n {
+                acc += 1.0 / (i as f64).powf(alpha);
+                cdf.push(acc);
+            }
+            for v in cdf.iter_mut() {
+                *v /= acc;
+            }
+            Zipf { cdf }
+        }
+        fn sample(&self, r: f64) -> u16 {
+            let i = self.cdf.partition_point(|&c| c < r);
+            i.min(self.cdf.len() - 1) as u16
+        }
+    }
+
+    /// 1 本 = 100 バイトの模擬キャッシュでトレースを流す。
+    /// 戻り値は (ヒット数, 載せた本数 = H2D 回数, 頻度ゲートで断った回数)。
+    fn run_trace(policy: CachePolicy, cap_slots: usize, trace: &[u16]) -> (u64, u64, u64) {
+        let mut c: VramLru<u16, ()> = VramLru::with_policy(cap_slots * 100, policy);
+        let (mut hits, mut adm) = (0u64, 0u64);
+        for &k in trace {
+            if c.get_mut(&k).is_some() {
+                hits += 1;
+                continue;
+            }
+            if c.make_room_for(&k, 100).is_ok() {
+                c.insert(k, 100, ());
+                adm += 1;
+            }
+        }
+        (hits, adm, c.stats().admission_rejects)
+    }
+
+    /// Zipf のトレース (純粋) と、prefill の 1 回読みに相当する冷たい鍵を
+    /// 混ぜたトレース。後者は「1 回だけ使う expert が温かい expert を押し出す」
+    /// 状況そのもの。
+    fn zipf_traces(n: usize, len: usize, cold: usize) -> (Vec<u16>, Vec<u16>) {
+        let z = Zipf::new(n, 1.1);
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let mut pure = Vec::with_capacity(len);
+        let mut mixed = Vec::with_capacity(len);
+        let cold_base = n as u16;
+        for i in 0..len {
+            let k = z.sample(rng.unit());
+            pure.push(k);
+            // 4 回に 1 回は「そのトークンだけ引かれる冷たい expert」を挟む
+            if i % 4 == 3 {
+                mixed.push(cold_base + (rng.next() % cold as u64) as u16);
+            } else {
+                mixed.push(k);
+            }
+        }
+        (pure, mixed)
+    }
+
+    /// 純粋な Zipf では、どの予算でも TinyLFU は LRU に負けない。
+    #[test]
+    fn tinylfu_not_worse_than_lru_on_zipf() {
+        let (pure, _) = zipf_traces(512, 120_000, 512);
+        for pct in [20usize, 35, 50] {
+            let cap = 512 * pct / 100;
+            let (hl, al, _) = run_trace(CachePolicy::Lru, cap, &pure);
+            let (ht, at, rej) = run_trace(CachePolicy::TinyLfu, cap, &pure);
+            eprintln!(
+                "zipf pct={pct} cap={cap}: lru hits={hl} adm={al} / tinylfu hits={ht} adm={at} rej={rej}"
+            );
+            assert!(
+                ht * 100 >= hl * 97,
+                "pct={pct}: tinylfu {ht} が lru {hl} より 3% 以上悪い"
+            );
+        }
+    }
+
+    /// 冷たい鍵 (prefill の 1 回読み) が混ざると、頻度ゲートが温かい集合を守る。
+    #[test]
+    fn tinylfu_protects_hot_set_under_cold_pollution() {
+        let (_, mixed) = zipf_traces(512, 120_000, 4096);
+        for pct in [20usize, 35, 50] {
+            let cap = 512 * pct / 100;
+            let (hl, al, _) = run_trace(CachePolicy::Lru, cap, &mixed);
+            let (ht, at, rej) = run_trace(CachePolicy::TinyLfu, cap, &mixed);
+            eprintln!(
+                "mixed pct={pct} cap={cap}: lru hits={hl} adm={al} / tinylfu hits={ht} adm={at} rej={rej}"
+            );
+            assert!(rej > 0, "pct={pct}: 頻度ゲートが 1 回も発火していない");
+            assert!(
+                ht > hl,
+                "pct={pct}: tinylfu のヒット数 {ht} が lru {hl} を上回らない"
+            );
+            assert!(
+                at < al,
+                "pct={pct}: tinylfu の載せ替え {at} が lru {al} より少なくない"
+            );
+        }
+    }
+
+    /// `VramLru::new` (env を見ない方) は従来の LRU で、sketch も空。
+    #[test]
+    fn new_without_policy_is_plain_lru() {
+        let mut c: VramLru<u8, usize> = VramLru::new(300);
+        assert_eq!(c.policy(), CachePolicy::Lru);
+        for i in 0..3u8 {
+            c.make_room(100).unwrap();
+            c.insert(i, 100, i as usize);
+        }
+        c.get_mut(&0);
+        let ev = c.make_room(100).unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].0, 1, "LRU は最終使用が古い 1 を落とす");
+        assert_eq!(c.stats().admission_rejects, 0);
+        assert_eq!(c.freq_sketch().additions(), 0, "lru では sketch に触らない");
+    }
+
+    /// 頻度ゲート: 温かい 1 本は、1 回だけの候補に押し出されない。
+    #[test]
+    fn tinylfu_rejects_one_off_candidate() {
+        let mut c: VramLru<u8, usize> = VramLru::with_policy(300, CachePolicy::TinyLfu);
+        for i in 0..3u8 {
+            c.make_room_for(&i, 100).unwrap();
+            c.insert(i, 100, i as usize);
+        }
+        // 0 を 8 回、1 を 3 回、2 を 5 回使う (推定頻度 9 / 4 / 6 まで上がる)
+        for _ in 0..8 {
+            assert!(c.get_mut(&0).is_some());
+        }
+        for _ in 0..3 {
+            assert!(c.get_mut(&1).is_some());
+        }
+        for _ in 0..5 {
+            assert!(c.get_mut(&2).is_some());
+        }
+        assert_eq!(c.eviction_order(), vec![1, 2, 0], "頻度 4 が先、頻度 9 が最後");
+        // 温かい集合 (推定 4 以上) に、初出の鍵 7 (推定 1) を載せ替えようとすると断る。
+        let err = c.make_room_for(&7, 100).unwrap_err();
+        assert!(
+            matches!(err, LruError::Rejected { key_freq, victim_freq } if key_freq < victim_freq),
+            "{err:?}"
+        );
+        assert_eq!(c.len(), 3, "断ったら 1 本も追い出さない");
+        assert_eq!(c.stats().admission_rejects, 1);
+        assert_eq!(c.used_bytes(), 300);
+        assert!(c.get_mut(&0).is_some(), "温かい 0 は生きている");
+        assert!(c.get_mut(&1).is_some(), "温かい 1 は生きている");
+    }
+
+    /// 追い出しは「頻度が最小 → 同点は古い」順 (LRU と違う順になる例)。
+    #[test]
+    fn tinylfu_victim_is_coldest_not_oldest() {
+        let mut c: VramLru<u8, usize> = VramLru::with_policy(300, CachePolicy::TinyLfu);
+        for i in 0..3u8 {
+            c.make_room_for(&i, 100).unwrap();
+            c.insert(i, 100, i as usize);
+        }
+        // 0 は最古だが 6 回使って温かい。2 は最新だが 1 回しか使っていない。
+        for _ in 0..6 {
+            c.get_mut(&0);
+        }
+        assert_eq!(c.eviction_order(), vec![1, 2, 0], "頻度 1 が先、0 は最後");
+        let ev = c.make_room_for(&5, 100).unwrap();
+        // 断られない (候補 1 >= 犠牲者 1) ので 1 本落ちる。
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].0, 1, "最古ではなく頻度が最小の 1");
+        assert!(c.get_mut(&0).is_some(), "最古でも温かい 0 は残る");
     }
 }
