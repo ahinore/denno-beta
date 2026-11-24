@@ -479,7 +479,7 @@ impl Qwen4ExpDecoder {
         let ctx: Vec<u32> = self.tokens[start..].to_vec();
         q4prof::dmark(q4prof::D_STEP, d_step);
 
-        let logits = self.model.forward_token_at(&ctx, 0, 1, on_layer, roles)?;
+        let logits = self.model.forward_token_at(&ctx, 0, 1, false, on_layer, roles)?;
         // P58: decode 1 トークンぶんの構造テレメトリ (変化した expert 在庫と
         // 100 トークンごとの階層統計)。arch off ならエンジン側で即座に戻る。
         let d_arch = q4prof::dstamp();
@@ -518,7 +518,7 @@ impl Qwen4ExpDecoder {
         crate::cuda::dec_kprof::set_pos(self.tokens.len() as u64);
         let start = self.tokens.len().saturating_sub(win);
         let ctx: Vec<u32> = self.tokens[start..].to_vec();
-        self.model.forward_token_at(&ctx, 0, 1, None, None)
+        self.model.forward_token_at(&ctx, 0, 1, false, None, None)
     }
 
     /// P109: n-gram 投機的デコードの検証ステップ (逐次照合のみ)。

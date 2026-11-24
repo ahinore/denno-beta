@@ -4456,7 +4456,7 @@ impl Qwen4Exp {
                 Some(r) if want => Some(&mut **r),
                 _ => None,
             };
-            logits = self.forward_token_at(&ctx[..=i], i, nt, hook, rr)?;
+            logits = self.forward_token_at(&ctx[..=i], i, nt, true, hook, rr)?;
         }
         Ok(logits)
     }
@@ -4525,7 +4525,7 @@ impl Qwen4Exp {
             let nt = ctx.len() - n_hist;
             let mut out = Vec::with_capacity(nt);
             for i in 0..nt {
-                out.push(self.forward_token_at(&ctx[n_hist..][..=i], i, nt, None, None)?);
+                out.push(self.forward_token_at(&ctx[n_hist..][..=i], i, nt, true, None, None)?);
             }
             Ok(out)
         }
@@ -5210,8 +5210,20 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     Self::pf_bail("ffn の combine に失敗")?;
                 }
                 // task 218: 層の出口の残差をデバイスで加算する (D2H しない)。
-                if steer_rec && !crate::cuda::pf_steer_acc(nt, hc, e, il) {
-                    Self::pf_bail("steer の記録に失敗")?;
+                // task 829: LastPromptToken は最終チャンクの最後の行だけを加算する。
+                if steer_rec {
+                    let last_only = steer::last_only();
+                    let final_chunk = end == ctx.len();
+                    if !last_only || final_chunk {
+                        let ok = if last_only {
+                            crate::cuda::pf_steer_acc_last(nt, hc, e, il)
+                        } else {
+                            crate::cuda::pf_steer_acc(nt, hc, e, il)
+                        };
+                        if !ok {
+                            Self::pf_bail("steer の記録に失敗")?;
+                        }
+                    }
                 }
                 if end == ctx.len() {
                     if let Some(r) = roles.as_deref() {
@@ -5236,7 +5248,14 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
             }
             if steer_rec {
-                steer::note_dev_tokens(nt as u64);
+                // task 829: LastPromptToken は最終チャンクの 1 トークンだけ数える。
+                if steer::last_only() {
+                    if end == ctx.len() {
+                        steer::note_dev_tokens(1);
+                    }
+                } else {
+                    steer::note_dev_tokens(nt as u64);
+                }
             }
             prekprof::mark(t_lay, prekprof::LAYER);
             // 最終チャンクだけ、最終 mixer 用に残差をホストへ戻す。
@@ -6318,11 +6337,26 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 if !crate::cuda::pf_combine_at(base + (start * e * 4) as u64, nt, hc, e) {
                     Self::pf_bail("ffn の combine に失敗")?;
                 }
+                // task 218: このチャンクの残差をデバイスで加算する。
+                // task 829: LastPromptToken は最終チャンクの最後の行だけ。
                 if steer_rec {
-                    if !crate::cuda::pf_steer_acc(nt, hc, e, il) {
-                        Self::pf_bail("steer の記録に失敗")?;
+                    let last_only = steer::last_only();
+                    let final_chunk = end == nt_all;
+                    if !last_only || final_chunk {
+                        let ok = if last_only {
+                            crate::cuda::pf_steer_acc_last(nt, hc, e, il)
+                        } else {
+                            crate::cuda::pf_steer_acc(nt, hc, e, il)
+                        };
+                        if !ok {
+                            Self::pf_bail("steer の記録に失敗")?;
+                        }
+                        if last_only {
+                            steer::note_dev_tokens(1);
+                        } else {
+                            steer::note_dev_tokens(nt as u64);
+                        }
                     }
-                    steer::note_dev_tokens(nt as u64);
                 }
                 if end == nt_all {
                     if let Some(r) = roles.as_deref() {
@@ -6759,9 +6793,10 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
 
                 // task 218: 層の出口 (2 つの combine を終えた後) の残差を記録する。
+                // task 829: LastPromptToken は最終チャンクの最後の行だけ。
                 if steer_rec {
                     let rows: Vec<&[f32]> = (0..nt).map(|t| ress[t].data.as_slice()).collect();
-                    steer::acc_host_rows(il, &rows);
+                    steer::acc_host_rows(il, &rows, end == ctx.len());
                 }
 
                 // P58: 層の役割別活性 (kind 13)。prefill は**最後のチャンクの末尾**

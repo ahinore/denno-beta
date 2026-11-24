@@ -58,7 +58,7 @@ Endpoints added for this (`crates/denno-cli/src/serve_flash.rs`):
 - `GET /v1/steer/export?name=<snap>[&format=json]` — the stored DNSTEER1 snapshot, or the same bytes base64-packed in JSON.
 - `POST /v1/steer/import[?name=<new>]` — a DNSTEER1 body or a JSON payload (`data_base64` or a `mean` array). Shape and model checks match the loader; bad input is a 400.
 
-`POST /v1/steer/record` also accepts `capture_mode`: `"all"` (the default, unchanged) is supported; `"last_prompt_token"` is rejected with a 400 in this version rather than silently recording every token.
+`POST /v1/steer/record` also accepts `capture_mode`: `"all"` (the default, unchanged) averages every recorded token, while `"last_prompt_token"` records only the residual at the final prefill token (`nt - 1`) per layer and ignores the generated decode tokens. Any other value is a 400. `GET /v1/steer` reports the active `capture_mode`. The Abliterate panel defaults its `capture mode` selector to `last_prompt_token` (difference-in-means on the instruction boundary).
 
 ## Telemetry frames
 

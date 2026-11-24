@@ -54,7 +54,7 @@
 //! 内容を保ったまま言い回しが変わる (t218c の `sub`)。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 
 /// スナップショット名に使える最大長。
@@ -65,6 +65,54 @@ pub const FILE_MAGIC: &str = "DNSTEER1";
 pub const FILE_EXT: &str = "dns";
 /// 同時に保持するスナップショット数の上限 (メモリ保護)。
 pub const MAX_SNAPSHOTS: usize = 64;
+
+/// task 829: 記録する残差の取り方。
+///
+/// - [`CaptureMode::All`] は従来どおり「記録したトークン全部の平均」。
+/// - [`CaptureMode::LastPromptToken`] は prefill の最後のトークン (`nt - 1`) の
+///   残差だけを層ごとに記録する (生成中の decode トークンは載せない)。
+///   abliteration の difference-in-means で、指示境界の残差だけを使うためのもの。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// 全トークンの平均 (既定、後方互換)。
+    #[default]
+    All,
+    /// prefill の最後のトークンだけ。
+    LastPromptToken,
+}
+
+impl CaptureMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            CaptureMode::All => "all",
+            CaptureMode::LastPromptToken => "last_prompt_token",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<CaptureMode> {
+        match s {
+            "all" => Some(CaptureMode::All),
+            "last_prompt_token" => Some(CaptureMode::LastPromptToken),
+            _ => None,
+        }
+    }
+
+    /// ホットパス用の 1 バイト表現。
+    fn code(self) -> u8 {
+        match self {
+            CaptureMode::All => 0,
+            CaptureMode::LastPromptToken => 1,
+        }
+    }
+
+    fn from_code(c: u8) -> CaptureMode {
+        if c == 1 {
+            CaptureMode::LastPromptToken
+        } else {
+            CaptureMode::All
+        }
+    }
+}
 
 /// 形 (記録・適用に要る最小限)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -273,6 +321,13 @@ fn rec_cell() -> &'static Mutex<Option<Rec>> {
 
 /// 記録中か (ホットパスの分岐 1 個)。
 static REC_ON: AtomicBool = AtomicBool::new(false);
+
+/// task 829: 記録中の [`CaptureMode`] (`REC_ON` が false のときは無意味)。
+/// ホットパスは `rec_on() && last_only()` の 2 分岐だけ。
+static REC_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// 直近に使った [`CaptureMode`] (記録していないときの `GET /v1/steer` 用)。
+static LAST_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// `DENNO_STEER_RECORD` で始まった記録か (毎リクエスト後に flush する)。
 static REC_ENV: AtomicBool = AtomicBool::new(false);
@@ -495,6 +550,8 @@ struct Rec {
     name: String,
     model: String,
     shape: Shape,
+    /// task 829: 残差の取り方 (`All` なら従来の平均)。
+    mode: CaptureMode,
     /// `[layer][stream][n_embd]`
     sums: Vec<f32>,
     /// 層ごとのトークン数 (通常は全部同じ)。
@@ -506,11 +563,12 @@ struct Rec {
 }
 
 impl Rec {
-    fn new(name: &str, shape: Shape, model: &str) -> Rec {
+    fn new(name: &str, shape: Shape, model: &str, mode: CaptureMode) -> Rec {
         Rec {
             name: name.to_string(),
             model: model.to_string(),
             shape,
+            mode,
             sums: vec![0.0f32; shape.len()],
             counts: vec![0; shape.n_layer],
             dev_tokens: 0,
@@ -551,28 +609,83 @@ pub fn rec_on() -> bool {
     REC_ON.load(Ordering::Relaxed)
 }
 
+/// task 829: 記録中で、かつ「prefill の最後のトークンだけ」の取り方か。
+/// ホットパスは `rec_on()` の内側でこれを見るだけ (AtomicU8 のロード 1 回)。
+#[inline]
+pub fn last_only() -> bool {
+    REC_MODE.load(Ordering::Relaxed) == 1
+}
+
+/// task 829: いまの (記録中でなければ直近の) [`CaptureMode`]。
+pub fn capture_mode() -> CaptureMode {
+    if rec_on() {
+        CaptureMode::from_code(REC_MODE.load(Ordering::Relaxed))
+    } else {
+        CaptureMode::from_code(LAST_MODE.load(Ordering::Relaxed))
+    }
+}
+
 /// ホストの残差を 1 層ぶん記録する (`data` = 1 トークンの `[hc][n_embd]`)。
 ///
 /// decode と非常駐 prefill が呼ぶ。[`rec_on`] が false なら即返る。
+/// [`CaptureMode::LastPromptToken`] では decode のトークンを載せないので、
+/// この入口 (位置を持たない = decode 扱い) では何もしない。
 pub fn acc_host(layer: usize, data: &[f32]) {
     if !rec_on() {
         return;
     }
     let mut g = rec_cell().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(r) = g.as_mut() {
-        r.acc(layer, data);
+        if r.mode == CaptureMode::All {
+            r.acc(layer, data);
+        }
+    }
+}
+
+/// task 829: prefill の 1 トークン (`t` = その prefill 内の位置、`nt` = 全長)。
+///
+/// [`CaptureMode::All`] は [`acc_host`] と同じ (全トークンを足す)。
+/// [`CaptureMode::LastPromptToken`] は `t + 1 == nt` のときだけ記録する。
+pub fn acc_host_prefill(layer: usize, data: &[f32], t: usize, nt: usize) {
+    if !rec_on() {
+        return;
+    }
+    let mut g = rec_cell().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = g.as_mut() {
+        match r.mode {
+            CaptureMode::All => r.acc(layer, data),
+            CaptureMode::LastPromptToken => {
+                if nt > 0 && t + 1 == nt {
+                    r.acc(layer, data);
+                }
+            }
+        }
     }
 }
 
 /// ホストの残差をチャンクぶん (行の配列) 記録する。
-pub fn acc_host_rows(layer: usize, rows: &[&[f32]]) {
+///
+/// [`CaptureMode::LastPromptToken`] では `final_chunk` が真のときだけ、
+/// チャンクの最後の行 (= prefill の最終トークン) を記録する。
+pub fn acc_host_rows(layer: usize, rows: &[&[f32]], final_chunk: bool) {
     if !rec_on() {
         return;
     }
     let mut g = rec_cell().lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = g.as_mut() else { return };
-    for row in rows {
-        r.acc(layer, row);
+    match r.mode {
+        CaptureMode::All => {
+            for row in rows {
+                r.acc(layer, row);
+            }
+        }
+        CaptureMode::LastPromptToken => {
+            if final_chunk {
+                if let Some(row) = rows.last() {
+                    r.acc(layer, row);
+                }
+            }
+        }
     }
 }
 
@@ -621,7 +734,14 @@ fn validate_name(name: &str) -> Result<(), String> {
 }
 
 /// 記録を始める。既に記録中ならエラー (取り違えを防ぐ)。
+///
+/// 従来どおり [`CaptureMode::All`] (全トークンの平均) で始める。
 pub fn start_record(name: &str) -> Result<(String, u64), String> {
+    start_record_mode(name, CaptureMode::All)
+}
+
+/// task 829: [`CaptureMode`] を指定して記録を始める。
+pub fn start_record_mode(name: &str, mode: CaptureMode) -> Result<(String, u64), String> {
     validate_name(name)?;
     let (shape, model) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
     if !shape.is_valid() {
@@ -634,7 +754,9 @@ pub fn start_record(name: &str) -> Result<(String, u64), String> {
             r.name
         ));
     }
-    *g = Some(Rec::new(name, shape, &model));
+    *g = Some(Rec::new(name, shape, &model, mode));
+    REC_MODE.store(mode.code(), Ordering::SeqCst);
+    LAST_MODE.store(mode.code(), Ordering::SeqCst);
     REC_ON.store(true, Ordering::SeqCst);
     // 次の常駐 prefill の入口でデバイスの加算域を 0 にし直す。
     REC_DEV_RESET.store(true, Ordering::SeqCst);
@@ -1540,6 +1662,8 @@ pub fn env_recording() -> bool {
 pub fn reset_for_test() {
     REC_ON.store(false, Ordering::SeqCst);
     REC_ENV.store(false, Ordering::SeqCst);
+    REC_MODE.store(0, Ordering::SeqCst);
+    LAST_MODE.store(0, Ordering::SeqCst);
     *rec_cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
     let epoch = super::intervene::bump_epoch();
     *cur_cell().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Steer::empty(epoch));
@@ -2307,6 +2431,127 @@ mod tests {
         // 名前の上書きも検証される。
         let raw = export_raw("A").unwrap();
         assert!(import_bytes(&raw, Some("a/b")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// task 829: `LastPromptToken` は prefill の最終トークンだけを記録し、
+    /// その後の decode トークンは載せない (全トークン平均ではない)。
+    #[test]
+    fn last_prompt_token_records_only_final_prefill_token() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("lasttok");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "last-model");
+        // prefill 4 トークン + decode 2 トークン (合計 6)。
+        let toks = rows(&s, 6, 0.25);
+        let nt = 4usize;
+
+        start_record_mode("L", CaptureMode::LastPromptToken).expect("記録開始");
+        assert_eq!(capture_mode(), CaptureMode::LastPromptToken);
+        for (t, row) in toks.iter().take(nt).enumerate() {
+            for il in 0..s.n_layer {
+                acc_host_prefill(il, row, t, nt);
+            }
+        }
+        // decode は acc_host (位置なし) — LastPromptToken では捨てる。
+        for row in toks.iter().skip(nt) {
+            for il in 0..s.n_layer {
+                acc_host(il, row);
+            }
+        }
+        let snap = stop_record().expect("保存");
+        assert_eq!(snap.tokens, 1, "最終トークン 1 個だけが数えられる");
+        // 平均 = 最終トークンそのもの (ビット一致)。
+        for il in 0..s.n_layer {
+            for d in 0..s.stride() {
+                let want = toks[nt - 1][d];
+                let got = snap.mean[il * s.stride() + d];
+                assert_eq!(got.to_bits(), want.to_bits(), "層 {il} 要素 {d}");
+            }
+        }
+        // 全トークン平均とは違う (取り違えの検出)。
+        assert_ne!(snap.mean[0].to_bits(), {
+            let sum: f32 = toks.iter().take(nt).map(|r| r[0]).sum();
+            (sum / nt as f32).to_bits()
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// task 829: `All` のホスト経路は prefill / decode のどちらの入口でも
+    /// 従来の「全トークン平均」とビット一致する。
+    #[test]
+    fn all_mode_prefill_matches_previous_mean_bit_for_bit() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("allbit");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "all-model");
+        let toks = rows(&s, 5, -0.75);
+        let nt = 3usize;
+
+        // 従来の入口 (acc_host のみ) で記録。
+        start_record("A").expect("記録開始");
+        for row in &toks {
+            for il in 0..s.n_layer {
+                acc_host(il, row);
+            }
+        }
+        let old = stop_record().expect("保存");
+
+        // prefill は acc_host_prefill、decode は acc_host。
+        start_record("B").expect("記録開始");
+        for (t, row) in toks.iter().take(nt).enumerate() {
+            for il in 0..s.n_layer {
+                acc_host_prefill(il, row, t, nt);
+            }
+        }
+        for row in toks.iter().skip(nt) {
+            for il in 0..s.n_layer {
+                acc_host(il, row);
+            }
+        }
+        let new = stop_record().expect("保存");
+
+        assert_eq!(old.tokens, 5);
+        assert_eq!(new.tokens, 5);
+        for i in 0..old.mean.len() {
+            assert_eq!(old.mean[i].to_bits(), new.mean[i].to_bits(), "要素 {i}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// task 829: チャンク行の入口も `LastPromptToken` では最終チャンクの
+    /// 最後の行だけ、`All` では全部を足す。
+    #[test]
+    fn last_prompt_token_chunk_rows_take_final_row_only() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("chunkrows");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "chunk-model");
+        let toks = rows(&s, 6, 0.5);
+
+        start_record_mode("L", CaptureMode::LastPromptToken).expect("記録開始");
+        // チャンク 0 (t=0..3, 最終でない) は捨てる。
+        let c0: Vec<&[f32]> = toks[0..3].iter().map(|r| r.as_slice()).collect();
+        // チャンク 1 (t=3..6, 最終) の最後の行だけが載る。
+        let c1: Vec<&[f32]> = toks[3..6].iter().map(|r| r.as_slice()).collect();
+        for il in 0..s.n_layer {
+            acc_host_rows(il, &c0, false);
+            acc_host_rows(il, &c1, true);
+        }
+        let last = stop_record().expect("保存");
+        assert_eq!(last.tokens, 1);
+        assert_eq!(last.mean[0].to_bits(), toks[5][0].to_bits());
+
+        start_record("A").expect("記録開始");
+        for il in 0..s.n_layer {
+            acc_host_rows(il, &c0, false);
+            acc_host_rows(il, &c1, true);
+        }
+        let all = stop_record().expect("保存");
+        assert_eq!(all.tokens, 6);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -2482,6 +2482,7 @@ fn steer_status_to_json() -> Value {
     };
     json!({
         "epoch": iv::current_epoch(),
+        "capture_mode": steer::capture_mode().name(),
         "recording": recording,
         "snapshots": snaps,
         "apply": apply,
@@ -2571,8 +2572,11 @@ fn apply_steer(body: &Value) -> Result<Value, String> {
     Ok(steer_status_to_json())
 }
 
-/// `POST /v1/steer/record` の body から名前を取る。
-fn record_name(body: &Value) -> Result<String, String> {
+/// `POST /v1/steer/record` の body から名前と capture_mode を取る。
+///
+/// `capture_mode` は省略時 `"all"`。`"all"` と `"last_prompt_token"` を受け、
+/// それ以外は 400 (未知の値を黙って `all` にしない)。
+fn record_params(body: &Value) -> Result<(String, steer::CaptureMode), String> {
     let obj = body
         .as_object()
         .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
@@ -2583,24 +2587,23 @@ fn record_name(body: &Value) -> Result<String, String> {
             ));
         }
     }
-    // task 825: `capture_mode` は今は "all" だけ。`last_prompt_token` は
-    // 残差の記録点 (層ループ) に「最後のプロンプトトークンだけ」を選ぶ仕組みが
-    // 要るので、この版では 400 で断る (黙って全部を記録しない)。
-    if let Some(m) = obj.get("capture_mode") {
-        let s = m
-            .as_str()
-            .ok_or_else(|| "capture_mode は文字列".to_string())?;
-        if s != "all" {
-            return Err(format!(
-                "capture_mode {s:?} は未対応 (この版は \"all\" のみ)"
-            ));
+    // task 829: `last_prompt_token` は prefill の最終トークンだけを記録する。
+    let mode = match obj.get("capture_mode") {
+        Some(m) => {
+            let s = m
+                .as_str()
+                .ok_or_else(|| "capture_mode は文字列".to_string())?;
+            steer::CaptureMode::parse(s).ok_or_else(|| {
+                format!("未知の capture_mode {s:?} (all / last_prompt_token)")
+            })?
         }
-    }
+        None => steer::CaptureMode::All,
+    };
     let name = obj
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "name は文字列".to_string())?;
-    Ok(name.to_string())
+    Ok((name.to_string(), mode))
 }
 
 // ---------------------------------------------------------------------------
@@ -3348,7 +3351,9 @@ fn handle_req(
             Ok(v) => v,
             Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
         };
-        return match record_name(&body).and_then(|n| steer::start_record(&n)) {
+        return match record_params(&body)
+            .and_then(|(n, m)| steer::start_record_mode(&n, m))
+        {
             Ok(_) => send_json(&mut stream, "200 OK", &steer_status_to_json()),
             Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
         };
@@ -4664,21 +4669,64 @@ mod flash_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `/v1/steer/record` の capture_mode は "all" だけ通す (後方互換)。
+    /// task 829: `/v1/steer/record` は "all" と "last_prompt_token" を受け、
+    /// 未知の値は 400。`GET /v1/steer` は capture_mode を返す。
     #[test]
-    fn record_name_accepts_capture_mode_all_only() {
+    fn record_params_accepts_both_capture_modes() {
         assert_eq!(
-            record_name(&json!({"name": "A"})).expect("name だけ"),
-            "A"
+            record_params(&json!({"name": "A"})).expect("name だけ"),
+            ("A".to_string(), steer::CaptureMode::All)
         );
         assert_eq!(
-            record_name(&json!({"name": "A", "capture_mode": "all"})).expect("all"),
-            "A"
+            record_params(&json!({"name": "A", "capture_mode": "all"})).expect("all"),
+            ("A".to_string(), steer::CaptureMode::All)
         );
-        assert!(record_name(&json!({"name": "A", "capture_mode": "last_prompt_token"})).is_err());
-        assert!(record_name(&json!({"name": "A", "capture_mode": 1})).is_err());
-        assert!(record_name(&json!({"name": "A", "bogus": 1})).is_err());
-        assert!(record_name(&json!({})).is_err());
-        assert!(record_name(&json!(null)).is_err());
+        assert_eq!(
+            record_params(&json!({"name": "A", "capture_mode": "last_prompt_token"}))
+                .expect("last_prompt_token"),
+            ("A".to_string(), steer::CaptureMode::LastPromptToken)
+        );
+        assert!(record_params(&json!({"name": "A", "capture_mode": "bogus"})).is_err());
+        assert!(record_params(&json!({"name": "A", "capture_mode": 1})).is_err());
+        assert!(record_params(&json!({"name": "A", "bogus": 1})).is_err());
+        assert!(record_params(&json!({})).is_err());
+        assert!(record_params(&json!(null)).is_err());
+    }
+
+    /// task 829: 記録中の capture_mode が status に出て、stop 後も直近値が残る。
+    #[test]
+    fn steer_status_exposes_capture_mode() {
+        let _g = STEER825_LOCK.lock().unwrap();
+        let _ = steer825_fixture();
+        steer::start_record_mode("cm_A", steer::CaptureMode::LastPromptToken).expect("記録開始");
+        assert_eq!(
+            steer_status_to_json()["capture_mode"],
+            json!("last_prompt_token")
+        );
+        let st = steer::Shape {
+            n_layer: 4,
+            n_hc: 2,
+            n_embd: 3,
+        };
+        let row = vec![0.5f32; st.stride()];
+        for il in 0..st.n_layer {
+            steer::acc_host_prefill(il, &row, 3, 4);
+        }
+        assert_eq!(steer::rec_status().map(|(_, t)| t), Some(1));
+        // decode のトークン (acc_host) は LastPromptToken では載らない。
+        for il in 0..st.n_layer {
+            steer::acc_host(il, &row);
+        }
+        assert_eq!(steer::rec_status().map(|(_, t)| t), Some(1));
+        let snap = steer::stop_record().expect("保存");
+        assert_eq!(snap.tokens, 1);
+        assert_eq!(
+            steer_status_to_json()["capture_mode"],
+            json!("last_prompt_token")
+        );
+        // 従来どおりの start_record は "all"。
+        steer::start_record("cm_all").expect("記録開始");
+        assert_eq!(steer_status_to_json()["capture_mode"], json!("all"));
+        steer::stop_record().ok();
     }
 }
