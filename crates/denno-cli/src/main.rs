@@ -1,5 +1,6 @@
 //! denno: TensorFold 型の単一バイナリ CLI (pull / models / info / generate / serve)
 
+mod bench;
 mod flash_telemetry;
 mod pull;
 mod serve_flash;
@@ -70,6 +71,52 @@ enum Commands {
         /// (MTP を読まない) 起動する。config.json は同じディレクトリに置く。
         #[arg(long)]
         mtp_path: Option<PathBuf>,
+    },
+    /// P801: 起動中のサーバーに対する再現可能ベンチ (llama-bench 風 pp/tg)。
+    /// プロンプトはサーバーの usage.input_tokens で目標トークン数へ較正する。
+    Bench {
+        /// ベンチ対象のベース URL
+        #[arg(long, default_value = "http://127.0.0.1:8098")]
+        url: String,
+        /// 話す API (anthropic = /v1/messages, openai = /v1/chat/completions)
+        #[arg(long, default_value = "anthropic")]
+        api: String,
+        /// pp (prompt processing) のトークン数。カンマ区切り
+        #[arg(long, value_delimiter = ',', default_value = "512,2048,8192")]
+        pp: Vec<usize>,
+        /// tg (生成) のトークン数
+        #[arg(long, default_value_t = 128)]
+        tg: usize,
+        /// 文脈深さ (プロンプトのトークン数)。カンマ区切り
+        #[arg(long, value_delimiter = ',', default_value = "0,2048,8192")]
+        depths: Vec<usize>,
+        /// 各ケースの反復回数 (中央値を採る)
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+        /// JSON レポートの書き出し先
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Markdown サマリを表示する (既定 on。--json 併用時の明示用)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
+        markdown: bool,
+        /// ラウンド間の KV/prefix cache 押し流しを行わない
+        #[arg(long)]
+        no_flush: bool,
+        /// 押し流しプロンプトのトークン数 (0 = 自動: コンテキスト長 - 64)
+        #[arg(long, default_value_t = 0)]
+        flush_tokens: usize,
+        /// プロンプト生成と較正の基準 seed
+        #[arg(long, default_value_t = 801)]
+        seed: u64,
+        /// 決定論チェックの生成トークン数
+        #[arg(long, default_value_t = 16)]
+        det_tokens: usize,
+        /// turn-2 KV reuse を測る文脈長
+        #[arg(long, default_value_t = 2048)]
+        reuse_depth: usize,
+        /// HTTP 読み取りタイムアウト秒
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
     /// HTTP サーバー起動 (Anthropic Messages API)
     Serve {
@@ -583,6 +630,46 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Bench {
+            url,
+            api,
+            pp,
+            tg,
+            depths,
+            rounds,
+            json,
+            markdown,
+            no_flush,
+            flush_tokens,
+            seed,
+            det_tokens,
+            reuse_depth,
+            timeout,
+        } => {
+            let opts = bench::BenchOptions {
+                url,
+                api: bench::Api::parse(&api)?,
+                pp,
+                tg,
+                depths,
+                rounds,
+                flush: !no_flush,
+                flush_tokens,
+                seed,
+                det_tokens,
+                reuse_depth,
+                timeout_secs: timeout,
+            };
+            let report = bench::run(&opts)?;
+            if markdown {
+                println!("{}", bench::render_markdown(&report));
+            }
+            if let Some(path) = &json {
+                std::fs::write(path, bench::render_json(&report)?)
+                    .with_context(|| format!("write {}", path.display()))?;
+                eprintln!("wrote {}", path.display());
+            }
+        }
         Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens, mtp_path } => {
             serve_flash::run(serve_flash::FlashConfig {
                 dir,
