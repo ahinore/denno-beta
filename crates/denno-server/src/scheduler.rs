@@ -237,8 +237,23 @@ pub struct Scheduler {
     tx: mpsc::SyncSender<(Instant, Job)>,
     /// 現在進行中 (pull 済み未完了) のジョブ数。観測/テスト用
     in_flight: Arc<AtomicUsize>,
+    /// P817: 受付済みでワーカーがまだ pull していないジョブ数。
+    /// graceful drain は「キュー + 進行中」が 0 になるのを待つ。
+    queued: Arc<AtomicUsize>,
+    /// P817: 運用の状態 (`/ready` / drain)。
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
     max_queue: usize,
     limits: Limits,
+}
+
+/// P817: ワーカースレッドの終了を `Lifecycle` へ伝える RAII ガード。
+/// ワーカーは複数の `return` 経路を持つので、Drop で 1 回だけ書く。
+struct WorkerExitGuard(Arc<crate::lifecycle::Lifecycle>);
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        self.0.mark_worker_dead();
+    }
 }
 
 impl Scheduler {
@@ -250,18 +265,48 @@ impl Scheduler {
 
     /// P57: 待ちの上限を指定して起動する (テスト・運用チューニング用)。
     pub fn spawn_with_limits(engine: Arc<Mutex<Engine>>, max_queue: usize, limits: Limits) -> Self {
+        Self::spawn_inner(engine, max_queue, limits, true)
+    }
+
+    /// P817: モデル未ロードの状態で起動する (テストで `/ready` の 503 を踏むため)。
+    /// 通常の起動経路 (`run`) はモデルを読み終えてからワーカーを起動するので
+    /// [`Scheduler::spawn`] を使う。
+    pub fn spawn_not_ready(engine: Arc<Mutex<Engine>>, max_queue: usize) -> Self {
+        Self::spawn_inner(engine, max_queue, Limits::default(), false)
+    }
+
+    fn spawn_inner(
+        engine: Arc<Mutex<Engine>>,
+        max_queue: usize,
+        limits: Limits,
+        ready: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::sync_channel(max_queue.max(1));
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let lifecycle = crate::lifecycle::Lifecycle::new(ready);
         let worker_in_flight = in_flight.clone();
+        let worker_queued = queued.clone();
+        let worker_lifecycle = lifecycle.clone();
         std::thread::Builder::new()
             .name("denno-scheduler".into())
-            .spawn(move || worker(engine, rx, worker_in_flight, limits))
+            .spawn(move || worker(engine, rx, worker_in_flight, worker_queued, worker_lifecycle, limits))
             .expect("scheduler スレッドの起動に失敗");
-        Self { tx, in_flight, max_queue, limits }
+        Self { tx, in_flight, queued, lifecycle, max_queue, limits }
     }
 
     pub fn max_queue(&self) -> usize {
         self.max_queue
+    }
+
+    /// P817: `/ready` と停止経路が読む状態。
+    pub fn lifecycle(&self) -> &Arc<crate::lifecycle::Lifecycle> {
+        &self.lifecycle
+    }
+
+    /// P817: 受付済みでまだ実行が始まっていないジョブ数。
+    pub fn pending(&self) -> usize {
+        self.queued.load(Ordering::SeqCst)
     }
 
     /// P57: 実際に使われている上限 (観測/テスト用)。
@@ -291,10 +336,21 @@ impl Scheduler {
         enable_thinking: Option<bool>,
     ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
         let (respond, rx) = oneshot::channel();
-        self.tx
-            .try_send((Instant::now(), Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond }))
-            .map_err(|_| QueueFull)?;
+        self.enqueue(Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond })?;
         Ok(rx)
+    }
+
+    /// P817: キューへ積む唯一の経路。`queued` の増減をここに閉じ込める
+    /// (drain の待ち判定が取りこぼさないため)。
+    fn enqueue(&self, job: Job) -> Result<(), QueueFull> {
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        match self.tx.try_send((Instant::now(), job)) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.queued.fetch_sub(1, Ordering::SeqCst);
+                Err(QueueFull)
+            }
+        }
     }
 
     /// SSE ストリーミング生成をキューに入れる。満杯なら `QueueFull`。
@@ -308,9 +364,7 @@ impl Scheduler {
         enable_thinking: Option<bool>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     ) -> Result<(), QueueFull> {
-        self.tx
-            .try_send((Instant::now(), Job::Stream { system, messages, params, tools, constraint, enable_thinking, events }))
-            .map_err(|_| QueueFull)
+        self.enqueue(Job::Stream { system, messages, params, tools, constraint, enable_thinking, events })
     }
 
     /// P793: OpenAI 互換ストリーミング生成をキューに入れる。
@@ -326,12 +380,7 @@ impl Scheduler {
         enable_thinking: Option<bool>,
         events: tokio_mpsc::Sender<RawEvent>,
     ) -> Result<(), QueueFull> {
-        self.tx
-            .try_send((
-                Instant::now(),
-                Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, events },
-            ))
-            .map_err(|_| QueueFull)
+        self.enqueue(Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, events })
     }
 }
 
@@ -347,8 +396,13 @@ fn worker(
     engine: Arc<Mutex<Engine>>,
     rx: mpsc::Receiver<(Instant, Job)>,
     in_flight: Arc<AtomicUsize>,
+    queued: Arc<AtomicUsize>,
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
     limits: Limits,
 ) {
+    // P817: このスレッドが終わったら `Lifecycle` に生存=false を書く
+    // (複数の return 経路があるので RAII)。
+    let _exit = WorkerExitGuard(lifecycle);
     // 常駐中 (KV スロット占有中) のセッション群
     let mut active: Vec<Run> = Vec::new();
 
@@ -365,6 +419,10 @@ fn worker(
         if active.is_empty() {
             match rx.recv() {
                 Ok((submitted, job)) => {
+                    // P817: 加算 (in_flight) を減算 (queued) より先に行い、
+                    // drain の待ち判定に 0/0 の窓を作らない。
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    queued.fetch_sub(1, Ordering::SeqCst);
                     admit_job(&engine, job, submitted, &in_flight, &mut active, limits)
                 }
                 Err(_) => return,
@@ -373,6 +431,8 @@ fn worker(
         while active.len() < MAX_ACTIVE_SESSIONS {
             match rx.try_recv() {
                 Ok((submitted, job)) => {
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    queued.fetch_sub(1, Ordering::SeqCst);
                     admit_job(&engine, job, submitted, &in_flight, &mut active, limits)
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -636,7 +696,9 @@ fn admit_job(
     active: &mut Vec<Run>,
     limits: Limits,
 ) {
-    in_flight.fetch_add(1, Ordering::SeqCst);
+    // P817: `in_flight` の加算は呼び出し側 (pull 直後) で `queued` の減算より
+    // **先** に行う。ここで加算すると「queued も in_flight も 0」に見える窓が
+    // でき、drain が進行中のジョブを見落とす。
     let mut run = build_run(engine, job, submitted);
     // P57: キュー待ち + スロット待ちの上限。スロットはまだ取っていないので
     // 解放は不要 (取得済みでも release_run は no-op)。

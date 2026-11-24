@@ -2017,13 +2017,24 @@ fn sse_event(stream: &mut TcpStream, name: &str, data: &Value) -> Result<()> {
 /// task 347: sparkDash (vLLM の reader) が「denno のエンジン」と判別できるように
 /// `/v1/models` の要素へ `owned_by: "denno"` を足す (`DENNO_MODELS_OWNED_BY=0` で
 /// 従来の形に戻る)。他のフィールドは変えない。
-fn get_static(path: &str, name: &str) -> Option<Value> {
+///
+/// task 817: 運用のためのメタデータ (`context_length` / `capabilities`) を足す。
+/// 既存クライアントは未知フィールドを無視する。
+fn get_static(path: &str, name: &str, max_ctx: usize) -> Option<Value> {
     match path {
         "/health" | "/healthz" => Some(json!({"ok": true, "model": name})),
         "/v1/models" => {
             let mut m = json!({
                 "id": name, "object": "model", "type": "model",
-                "display_name": name, "created_at": "2026-10-27T00:00:00Z"
+                "display_name": name, "created_at": "2026-10-27T00:00:00Z",
+                "context_length": max_ctx,
+                "capabilities": {
+                    "anthropic": true,
+                    "openai": true,
+                    "tools": true,
+                    "streaming": true,
+                    "telemetry": telem::enabled(),
+                },
             });
             if metrics::enabled_from_value(std::env::var(metrics::ENV_OWNED_BY).ok().as_deref()) {
                 m["owned_by"] = json!("denno");
@@ -2032,6 +2043,24 @@ fn get_static(path: &str, name: &str) -> Option<Value> {
         }
         _ => None,
     }
+}
+
+/// P817: `GET /ready` の応答 (本文 + HTTP ステータス)。モデルのロードは
+/// listen 前に終わっているので、ready は「drain していない」で決まる。
+/// drain 中は 503 (オーケストレータが新規ルーティングを止める)。
+fn ready_response(name: &str, max_ctx: usize) -> (&'static str, Value) {
+    let draining = is_draining();
+    let in_flight = IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    let body = json!({
+        "status": if draining { "draining" } else { "ready" },
+        "ready": !draining,
+        "draining": draining,
+        "model_loaded": true,
+        "model": name,
+        "context_length": max_ctx,
+        "in_flight": in_flight,
+    });
+    if draining { ("503 Service Unavailable", body) } else { ("200 OK", body) }
 }
 
 /// `GET /v1/telemetry/ws` の Upgrade 要求から `Sec-WebSocket-Key` を取り出す。
@@ -2575,6 +2604,27 @@ pub const EXIT_MODEL_SWITCH: i32 = 75;
 /// 主ループがリクエストの後に見る終了要求 (0 = なし)。
 static EXIT_AFTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// P817: 停止要求 (SIGTERM / SIGINT) を受けたか。立ったら新規の生成要求は
+/// 503 で受けず、進行中の 1 本が終わるのを短い上限まで待ってから終了する。
+static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// P817: いま生成中の要求数 (主ループは 1 本ずつ処理するので 0 / 1)。
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// P817: 停止時に進行中の生成を待つ上限 (ms)。`DENNO_DRAIN_TIMEOUT_MS`
+/// (既定 10 s、0〜600000 にクランプ) で上書きできる。0 は「待たない」。
+fn drain_timeout() -> std::time::Duration {
+    let ms = std::env::var("DENNO_DRAIN_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(10_000)
+        .min(600_000);
+    std::time::Duration::from_millis(ms)
+}
+
+fn is_draining() -> bool {
+    DRAINING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct ModelChoice {
     id: String,
@@ -2894,6 +2944,24 @@ fn handle_req(
     if is_abort_req(&req) {
         return send_abort_reply(&mut stream);
     }
+    // P817: drain 中は新規の要求 (POST) を受けない。GET (プローブ / メトリクス /
+    // 状態の読み出し) は止めない — オーケストレータが /ready を読めなくなる。
+    if is_draining() && req.method != "GET" {
+        return send_json(
+            &mut stream,
+            "503 Service Unavailable",
+            &json!({"type": "error", "error": {
+                "type": "overloaded_error",
+                "message": "server is draining (shutdown signal received); the request was not accepted"
+            }}),
+        );
+    }
+    // P817: readiness。モデルのロードは listen 前に終わっているので、
+    // ここでの判定は「drain していない」。
+    if req.method == "GET" && path == "/ready" {
+        let (status, body) = ready_response(&flash.name, flash.max_ctx);
+        return send_json(&mut stream, status, &body);
+    }
 
     // P51: 推論テレメトリの WebSocket (denno-view の購読先)。101 を返して
     // クライアントを登録し、以後は relay スレッドが書く。推論は待たない。
@@ -2911,7 +2979,7 @@ fn handle_req(
         return flash.telem.accept(stream, r, &key);
     }
     if req.method == "GET" {
-        if let Some(v) = get_static(&path, &flash.name) {
+        if let Some(v) = get_static(&path, &flash.name, flash.max_ctx) {
             return send_json(&mut stream, "200 OK", &v);
         }
     }
@@ -3262,12 +3330,15 @@ fn save_stats_on_stop(why: &str) {
     }
 }
 
-/// task 271: SIGTERM で使用回数を保存してから終了する。
+/// task 271 / task 817: SIGTERM・SIGINT で drain してから使用回数を保存して終了する。
 ///
 /// 既定の SIGTERM はその場でプロセスを殺すので、20 秒ごとの保存の谷間の
-/// 回数が消える。tokio の signal ハンドラ (ハンドラ本体は async-signal-safe な
-/// 書き込みだけ) を専用スレッドで待ち、通常の文脈で [`save_stats_on_stop`] を
-/// 呼んでから終了する。
+/// 回数が消える。task 817 では「進行中の 1 本を打ち切らない」ように、
+/// 1. `DRAINING` を立てる (以後の POST は 503)
+/// 2. `IN_FLIGHT` が 0 になるのを `drain_timeout()` まで待つ
+/// 3. expert 使用回数を保存
+/// の順に行う。tokio の signal ハンドラ本体は async-signal-safe な書き込みだけで、
+/// 待ちと保存は通常の文脈 (このスレッド) で行う。
 #[cfg(unix)]
 fn spawn_sigterm_saver() {
     let _ = std::thread::Builder::new()
@@ -3280,14 +3351,36 @@ fn spawn_sigterm_saver() {
                 return;
             };
             rt.block_on(async {
-                let Ok(mut sig) =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                else {
+                use tokio::signal::unix::{signal, SignalKind};
+                let Ok(mut term) = signal(SignalKind::terminate()) else {
                     return;
                 };
-                sig.recv().await;
-                eprintln!("[flash] SIGTERM: expert 使用回数を保存して終了する");
-                save_stats_on_stop("SIGTERM");
+                let Ok(mut int) = signal(SignalKind::interrupt()) else {
+                    return;
+                };
+                let sig = tokio::select! {
+                    _ = term.recv() => "SIGTERM",
+                    _ = int.recv() => "SIGINT",
+                };
+                DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+                let timeout = drain_timeout();
+                eprintln!(
+                    "[flash] {sig}: drain 開始 (新規 POST は 503、進行中を最大 {:.1}s 待つ)",
+                    timeout.as_secs_f64()
+                );
+                let start = Instant::now();
+                loop {
+                    let n = IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        break;
+                    }
+                    if start.elapsed() >= timeout {
+                        eprintln!("[flash] drain 上限超過: 進行中 {n} 本のまま終了する");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                save_stats_on_stop(sig);
                 std::process::exit(0);
             });
         });
@@ -3737,7 +3830,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             Ok((stream, r, req)) => {
                 let t = Instant::now();
                 // 逐次処理 (モデルは 1 つ、同時リクエストは受けない)
-                if let Err(e) = handle_req(&mut flash, stream, r, req) {
+                // P817: drain は「この 1 本が終わるまで」待つので、処理中を数える。
+                IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let handled = handle_req(&mut flash, stream, r, req);
+                IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = handled {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
@@ -3862,10 +3959,12 @@ mod flash_tests {
     }
 
     /// P51: 従来からの GET 応答はバイト列まで変えない (テレメトリの有無に依らない)。
+    /// task 817: `/v1/models` は運用メタデータを足したので、旧フィールドが
+    /// 残っていることを JSON で確認する (バイト列の固定は /health だけ)。
     #[test]
     fn static_get_responses_are_byte_identical() {
         let (mut srv, mut cli) = loopback();
-        send_json(&mut srv, "200 OK", &get_static("/health", "m").unwrap()).unwrap();
+        send_json(&mut srv, "200 OK", &get_static("/health", "m", 4096).unwrap()).unwrap();
         drop(srv);
         assert_eq!(
             read_all(&mut cli),
@@ -3878,28 +3977,56 @@ mod flash_tests {
         );
 
         let (mut srv, mut cli) = loopback();
-        send_json(&mut srv, "200 OK", &get_static("/v1/models", "m").unwrap()).unwrap();
+        send_json(&mut srv, "200 OK", &get_static("/v1/models", "m", 4096).unwrap()).unwrap();
         drop(srv);
-        // task 347: `owned_by: "denno"` が付く (既定)。他のフィールドは変えない。
-        assert_eq!(
-            read_all(&mut cli),
-            concat!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
-                "Access-Control-Allow-Origin: *\r\nConnection: close\r\n",
-                "Content-Length: 143\r\n\r\n",
-                "{\"data\":[{\"created_at\":\"2026-10-27T00:00:00Z\",\"display_name\":\"m\",",
-                "\"id\":\"m\",\"object\":\"model\",\"owned_by\":\"denno\",\"type\":\"model\"}],",
-                "\"object\":\"list\"}"
-            )
-        );
+        // task 347: `owned_by: "denno"` が付く (既定)。task 817: context_length と
+        // capabilities が付く。既存フィールドは残る。
+        let raw = read_all(&mut cli);
+        let body = raw.split("\r\n\r\n").nth(1).expect("本文が無い");
+        let v: Value = serde_json::from_str(body).expect("JSON ではない");
+        let m = &v["data"][0];
+        assert_eq!(m["id"], "m");
+        assert_eq!(m["object"], "model");
+        assert_eq!(m["type"], "model");
+        assert_eq!(m["display_name"], "m");
+        assert_eq!(m["created_at"], "2026-10-27T00:00:00Z");
+        assert_eq!(m["owned_by"], "denno");
+        assert_eq!(m["context_length"], 4096);
+        assert_eq!(m["capabilities"]["anthropic"], true);
+        assert_eq!(m["capabilities"]["openai"], true);
+        assert_eq!(m["capabilities"]["tools"], true);
+        assert!(m["capabilities"]["telemetry"].is_boolean());
     }
 
     #[test]
     fn static_get_covers_only_the_old_routes() {
-        assert_eq!(get_static("/healthz", "x"), Some(json!({"ok": true, "model": "x"})));
-        assert!(get_static("/", "x").is_none());
-        assert!(get_static("/v1/telemetry/ws", "x").is_none());
-        assert!(get_static("/v1/messages", "x").is_none());
+        assert_eq!(
+            get_static("/healthz", "x", 4096),
+            Some(json!({"ok": true, "model": "x"}))
+        );
+        assert!(get_static("/", "x", 4096).is_none());
+        assert!(get_static("/v1/telemetry/ws", "x", 4096).is_none());
+        assert!(get_static("/v1/messages", "x", 4096).is_none());
+    }
+
+    /// task 817: `/ready` は drain していないとき 200、`DRAINING` が立つと 503。
+    #[test]
+    fn ready_reflects_draining() {
+        // このテストはグローバルな DRAINING を触るので、前後で戻す。
+        DRAINING.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = ready_response("m", 4096);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["draining"], false);
+        assert_eq!(body["context_length"], 4096);
+
+        DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = ready_response("m", 4096);
+        assert_eq!(status, "503 Service Unavailable");
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["draining"], true);
+        assert_eq!(body["status"], "draining");
+        DRAINING.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// task 263: `/v1/experts/stats` の形。env 未設定のテストでは off で、
