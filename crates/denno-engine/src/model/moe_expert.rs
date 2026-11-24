@@ -1372,7 +1372,11 @@ fn expert_gemv_inner(
     );
     // task 117: 静かに classic スカラーに落ちた型を隠さない (型ごとに 1 回だけ
     // stderr に出す。定常状態のコストは relaxed load 1 回)。
-    decode_scalar_fallback_warn(ty);
+    // task 810: 決定論モードの Q4_K / Q5_K は**意図して**スカラーなので警告しない
+    // (lab のエラー数が「フォールバック」行を数えるため。ゲートは呼び出し側が明示)。
+    if !(q4_deterministic_enabled() && matches!(ty, GgmlType::Q4K | GgmlType::Q5K)) {
+        decode_scalar_fallback_warn(ty);
+    }
     for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, 0, |b, o| {
         gemv_scalar_body(ty, rb, b, n_in, o.len(), x, o);
     });
