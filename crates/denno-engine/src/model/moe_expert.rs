@@ -4162,6 +4162,12 @@ unsafe fn gemv_bf16_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
     } else {
         4
     });
+    // 実効の累積器数 (端数行にもそのまま使う)。`ga >= 8` の行グループは下の
+    // 表で `_ =>` の腕に落ちて G=4 / A=2 のカーネルで回るので、端数行も A=2 で
+    // 回さないと「1 行の部分和の区切り」が変わり、行チャンクの割り方 (= スレッド
+    // 数) で値が動く (P808: 6 スレッドで発覚。2560/6=427 行チャンクの端数 3 行が
+    // A=1 になっていた)。
+    let a_eff = if ga >= 8 { 2 } else { a };
     let full = n_out - n_out % ga;
     if full > 0 {
         match (ga, a) {
@@ -4174,14 +4180,15 @@ unsafe fn gemv_bf16_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
             (2, 3) => gemv_bf16_rows_fma_avx2::<2, 3>(bp, n_in, full, x, out, pf),
             (2, _) => gemv_bf16_rows_fma_avx2::<2, 4>(bp, n_in, full, x, out, pf),
             (4, 1) => gemv_bf16_rows_fma_avx2::<4, 1>(bp, n_in, full, x, out, pf),
+            // (4, >=2) と (8, _) の両方がここに落ちる (どちらも G=4 / A=2)。
             _ => gemv_bf16_rows_fma_avx2::<4, 2>(bp, n_in, full, x, out, pf),
         }
     }
     let rest = n_out - full;
     if rest > 0 {
-        // 端数行は 1 行ずつ (G=1。1 行の演算列はグループ内の 1 行と同じなので
-        // 行グループ / チャンクの割り方で値は動かない)。
-        match a {
+        // 端数行は 1 行ずつ。A は full 側の実効値 (`a_eff`) と同じものを使う
+        // (G は 1 行の演算列に影響しないが、A は 1 行の部分和の区切りを変える)。
+        match a_eff {
             1 => gemv_bf16_rows_fma_avx2::<1, 1>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf),
             2 => gemv_bf16_rows_fma_avx2::<1, 2>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf),
             3 => gemv_bf16_rows_fma_avx2::<1, 3>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf),
@@ -15941,6 +15948,76 @@ mod bf16_tests {
             });
             assert_eq!(bits(&got), base, "{threads} スレッドでビット不一致");
         }
+        set_bf16_exact_for_test(None);
+    }
+
+    /// (9) P808: 行チャンクの分割 (= スレッド数) は値に影響しない、を
+    /// **スレッド数の掃引**で確かめる。6 CPU のコンテナで
+    /// `bf16_fma_row_split_bit_identical` が落ちた回帰の再発防止。
+    ///
+    /// 原因は「チャンク末尾の端数行が full 行と違う累積器数 (A) で回っていた」
+    /// こと。A は 1 行の部分和の区切りを変えるので、行チャンクの割り方で値が
+    /// 動く (2560 行 / 6 スレッド = 427 行チャンク → 各チャンク末尾の 3 行)。
+    /// グループ幅 4 (既定) と 8 (端数行が A=1 に落ちていた経路) の両方を見る。
+    #[test]
+    #[cfg(feature = "par")]
+    fn bf16_fma_thread_count_bit_identical() {
+        if !fused_ready("bf16_fma_thread_count_bit_identical") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_bf16_exact_for_test(Some(false));
+        let (k, n) = (640usize, 2560usize); // up 実形
+        let blocks = bf16_rows(k, n);
+        let x = xvec(k);
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        let threads_list = [1usize, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24];
+        let mut tail_legs = 0usize; // チャンク末尾の端数行を踏んだ組合せ数
+        for group in [4usize, 8] {
+            set_bf16_group_for_test(Some(group));
+            set_bf16_pf_for_test(Some(0));
+            // 基準は 1 スレッド = 1 チャンク (端数行なし) の値。
+            let pool1 = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("thread pool");
+            let mut base_v = vec![0.0f32; n];
+            pool1.install(|| {
+                expert_gemv_bf16_min(&blocks, k, n, &x, &mut base_v, 1).unwrap();
+            });
+            let base = bits(&base_v);
+            for threads in threads_list {
+                let rows = n.div_ceil(threads).max(16).min(n);
+                if rows % 4 != 0 && rows < n {
+                    tail_legs += 1;
+                }
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool");
+                let before = ROW_PAR_REGIONS.load(Relaxed);
+                let mut got = vec![0.0f32; n];
+                pool.install(|| {
+                    expert_gemv_bf16_min(&blocks, k, n, &x, &mut got, 1).unwrap();
+                });
+                assert!(
+                    ROW_PAR_REGIONS.load(Relaxed) > before,
+                    "group={group} threads={threads}: 行チャンク並列が発火していない"
+                );
+                assert_eq!(
+                    bits(&got),
+                    base,
+                    "group={group} threads={threads} (rows={rows}) が 1 スレッド版とビット不一致"
+                );
+            }
+            set_bf16_group_for_test(None);
+            set_bf16_pf_for_test(None);
+        }
+        assert!(
+            tail_legs > 0,
+            "チャンク末尾の端数行を踏む組合せが無い (分岐を叩いていない)"
+        );
+        eprintln!("BF16 FMA 行分割: {tail_legs} 組合せがチャンク末尾の端数行を踏んだ");
         set_bf16_exact_for_test(None);
     }
 }

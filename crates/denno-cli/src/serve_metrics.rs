@@ -292,7 +292,7 @@ impl RunningGuard {
 impl Drop for RunningGuard {
     fn drop(&mut self) {
         // 0 未満にしない (二重 drop は無いが、飽和させておく)。
-        let _ = REQUESTS_RUNNING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = REQUESTS_RUNNING.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(1))
         });
     }

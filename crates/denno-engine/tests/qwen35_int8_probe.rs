@@ -3,7 +3,6 @@
 //! 相対 Frobenius 誤差を報告する。GDN 経路のどのテンソルが悪いかを特定。
 
 use denno_engine::gguf::GgufFile;
-use denno_engine::quant::Linear;
 
 #[test]
 #[ignore]

@@ -22,8 +22,6 @@
 //! 同じ `kernels_moe_batch.ptx` (同じ 4 エントリ) なので行を分けない — ファイルが
 //! 欠ければ EXPERT_BATCH の行が WARN を出す。
 
-use std::path::{Path, PathBuf};
-
 /// 1 行 = ゲート 1 本が必要とする PTX。
 #[cfg(feature = "cuda")]
 #[derive(Debug)]
@@ -365,15 +363,17 @@ pub const DEFAULT_ON_GATES: &[GatePtx] = &[
 
 /// `kernels/` の場所 (ビルド時の manifest から)。`DENNO_*_PTX` の差し替えも見る。
 #[cfg(feature = "cuda")]
-fn ptx_path(g: &GatePtx) -> PathBuf {
+fn ptx_path(g: &GatePtx) -> std::path::PathBuf {
     if !g.path_env.is_empty() {
         if let Ok(p) = std::env::var(g.path_env) {
             if !p.is_empty() {
-                return PathBuf::from(p);
+                return std::path::PathBuf::from(p);
             }
         }
     }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels").join(g.ptx)
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("kernels")
+        .join(g.ptx)
 }
 
 /// PTX のテキストにエントリが居るか。PTX は `.visible .entry <name>(` の形。
@@ -480,7 +480,7 @@ mod tests {
     /// 台帳の PTX はツリーに実在し、必要なエントリを持つ (cuda 無しでも読める)。
     #[test]
     fn listed_ptx_exist_with_entries() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
         for g in DEFAULT_ON_GATES {
             // 差し替え env はテストでは使わない (既定のファイルを見る)。
             let path = dir.join(g.ptx);

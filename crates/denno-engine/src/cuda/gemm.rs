@@ -388,7 +388,7 @@ pub(crate) fn gemv_trace_allow() -> bool {
             .unwrap_or(0);
         AtomicUsize::new(n)
     });
-    left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+    left.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         if v == 0 {
             None
         } else {

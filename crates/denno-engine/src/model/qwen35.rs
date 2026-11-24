@@ -3468,7 +3468,6 @@ impl Qwen35 {
             chain_download, chain_linear, chain_q35_fullattn, chain_q35_gdn_scan,
             chain_q35_kv_stage_begin, chain_q35_kv_stage_flush, chain_q35_rope_pi_upload,
             chain_q35_step_reserve, chain_q35_step_reserve_aq, chain_rmsnorm_cached, chain_seg,
-            chain_step_begin,
             chain_step_end, chain_swiglu, chain_upload,
             gpu_attention_enabled, q35_chain_shapes_ok, q35_ch_att_bytes,
             q35_ch_qkv_bytes, q35_fns_available, q35_kv_stage_bytes, CH_ACT, CH_ATT, CH_DOWN,

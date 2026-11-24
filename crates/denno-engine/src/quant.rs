@@ -821,7 +821,7 @@ pub enum Linear {
 /// cuda 無効ビルドにはそのモジュール自体が無いため、回帰テスト用の
 /// 「入口に到達したか」の計数だけをここに集約する。
 pub(crate) mod seam {
-    #[cfg(feature = "cuda")]
+    #[cfg(all(test, feature = "cuda"))]
     pub use crate::cuda::linear_seam_calls;
 
     /// cuda 無効ビルド: GPU 入口が存在しないので常に 0
