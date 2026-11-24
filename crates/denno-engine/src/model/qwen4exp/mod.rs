@@ -4301,6 +4301,8 @@ pub fn plan_experts_from_stats(
         Err(e) => return Some(format!("[exp-plan] off: メタデータを読めない: {e}")),
     };
     let total_bytes = expert_identity_bytes(&f, &p);
+    // task 798: テンソル目録の指紋 (同じ名前 + 同じバイト数でも別リビジョンを弾く)。
+    let fingerprint = exp_stats::fingerprint_tensors(&f);
     // task 268: 本番の「モデルを切り替えた直後の cold start」を lab で作る。
     //
     // ゲート (`DENNO_EXPERT_DROP_CACHE_ON_START=1`) のときだけ、**事前ロードが
@@ -4346,9 +4348,15 @@ pub fn plan_experts_from_stats(
         eprintln!("{return_line}");
     }
     let zeros = |dir: &str| {
-        exp_stats::Counts::zeros(dir, total_bytes, p.n_layer as u32, p.n_expert as u32)
+        exp_stats::Counts::zeros_with_fingerprint(
+            dir,
+            total_bytes,
+            fingerprint,
+            p.n_layer as u32,
+            p.n_expert as u32,
+        )
     };
-    let counts = match exp_stats::load_file(&path, dir_name, total_bytes) {
+    let counts = match exp_stats::load_file(&path, dir_name, total_bytes, fingerprint) {
         Ok(c) => c,
         Err(e) => {
             // 記録は使わないが、このセッションの回数は保存したいので履歴を据える。
@@ -4364,9 +4372,15 @@ pub fn plan_experts_from_stats(
         ));
     }
     exp_stats::install_prior(&counts);
+    // task 798: `DENNO_START_WARM_EXPERTS` は起動時の **page cache warm** の本数上限。
+    // RAM tier / VRAM には積まない (UD 級で 12 GB を RAM に写すと page cache を
+    // 追い出して decode が +63% になった — lab t798b)。プラン自体は切らない。
+    let warm_cap = exp_stats::warm_experts_cap();
     let plan = exp_stats::preload_order(&counts);
     if plan.is_empty() {
-        return Some(format!("[exp-plan] off: 記録が空 (回数 0){return_line}"));
+        return Some(format!(
+            "[exp-plan] off: 記録が空 (回数 0) (warm_experts={warm_cap:?}){return_line}"
+        ));
     }
     let n_plan = plan.len();
 
@@ -4386,6 +4400,62 @@ pub fn plan_experts_from_stats(
                     Ok(_) => "読み口を開けない".to_string(),
                 };
                 return Some(format!("[exp-plan] off: 層 {il}: {msg}"));
+            }
+        }
+    }
+
+    // task 798: 起動時の page cache warm。熱い側から `DENNO_START_WARM_EXPERTS` 本の
+    // expert 範囲を pread して page cache に載せる (mmap はそのまま、RSS は増えない)。
+    //
+    // RAM tier や VRAM に写す方式は UD 級で負ける: 4,000 本 = 11.98 GB を RAM tier に
+    // 写すと page cache を同じだけ追い出し、しかも VRAM のぶんを差し引いた「冷たい側」
+    // が残るので、decode が 12.0 -> 19.5 ms/tok (+63%) になった (lab t798b、UD-Q4_K_XL)。
+    if let Some(n) = warm_cap {
+        if n > 0 {
+            let budget = exp_stats::warm_mb_bytes().unwrap_or(u64::MAX);
+            let mut ranges: Vec<crate::model::start_warm::Range> = Vec::new();
+            let mut used = 0u64;
+            let mut picked = 0usize;
+            for &(layer, expert) in plan.iter().rev().take(n) {
+                let Some((g, u, d)) = layers.get(layer as usize) else {
+                    continue;
+                };
+                let mut got = [(0usize, 0u64, 0u64); 3];
+                let mut ok = true;
+                for (i, w) in [g, u, d].into_iter().enumerate() {
+                    match w.slice_abs(expert as usize) {
+                        Ok((off, len)) => {
+                            if exp_stats::budget_full(used as usize, len, budget as usize) {
+                                ok = false;
+                                break;
+                            }
+                            used = used.saturating_add(len as u64);
+                            got[i] = (w.file, off, len as u64);
+                        }
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                picked += 1;
+                ranges.extend_from_slice(&got);
+            }
+            if !ranges.is_empty() {
+                let rep = crate::model::start_warm::warm(
+                    parts,
+                    &ranges,
+                    crate::model::start_warm::budget_secs(),
+                    crate::model::start_warm::read_threads(),
+                );
+                eprintln!(
+                    "[exp-warm] hot_experts={picked} budget={}MiB {}",
+                    budget >> 20,
+                    rep.line()
+                );
             }
         }
     }
@@ -4608,9 +4678,11 @@ pub fn plan_experts_from_stats(
     });
     Some(format!(
         "[exp-plan] planned={n_plan} uses={total_uses} vram={loaded} experts {}MiB (cover {:.3}){ram_msg} \
-         total cover {cover_total:.3} rest=mmap in {secs:.2}s paused={paused_ms:.0}ms stop={stop:?}{return_line}",
+         total cover {cover_total:.3} rest=mmap in {secs:.2}s paused={paused_ms:.0}ms \
+         warm_cap={warm_cap:?} warm_mb={:?} stop={stop:?}{return_line}",
         vram_bytes >> 20,
-        frac(cov_vram)
+        frac(cov_vram),
+        exp_stats::warm_mb_bytes().map(|b| b >> 20)
     ))
 }
 
