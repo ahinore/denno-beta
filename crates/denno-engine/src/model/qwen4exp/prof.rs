@@ -2,8 +2,6 @@
 //!
 //! task 668: `src/model/qwen4exp.rs` から純粋に切り出した (ロジック変更なし)。
 
-use super::*;
-
 /// task 195: PLE 注入の段ごとの内訳 (`DENNO_PF_PLE_KPROF=1`・既定 off)。
 ///
 /// 台帳の `sub other ple` は「PLE 注入ぜんぶ」の 1 本なので、射影 (GPU f32 GEMM) と
@@ -107,7 +105,9 @@ pub mod pf_ple_kprof {
 /// 独立した軽量なカウンタを置く。GEMV の中ではなく層の区切りで測るため、
 /// 有効化しても各フェーズの内訳は見えるが内側の粒度は無い。
 pub mod q4prof {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(test)]
+    use std::sync::atomic::AtomicBool;
     use std::sync::OnceLock;
 
     pub static PLE: AtomicU64 = AtomicU64::new(0);
@@ -566,7 +566,9 @@ pub mod q4prof {
 /// [`line`] を出して [`reset`] すると「1 トークンぶんの内訳」が 1 行で読める
 /// (`serve_flash::prof_flash_q4` がそうする)。
 pub mod mix_kprof {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(test)]
+    use std::sync::atomic::AtomicBool;
     use std::sync::OnceLock;
 
     /// 区間: grouped RMS 正規化 (入力の整形)。
@@ -1097,7 +1099,9 @@ pub mod mix_kprof {
 /// [attn-kprof] qkv calls=1728 ms=616.4 gpu=1728 (100.0%) | gate calls=1728 ms=118.3 gpu=0 (0.0%) | out calls=1728 ms=362.9 gpu=1728 (100.0%)
 /// ```
 pub mod attn_kprof {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(test)]
+    use std::sync::atomic::AtomicBool;
     use std::sync::OnceLock;
 
     static QKV_CALLS: AtomicU64 = AtomicU64::new(0);

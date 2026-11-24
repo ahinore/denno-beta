@@ -1,7 +1,7 @@
 //! トークナイザ(HF tokenizers) + チャットテンプレート(minijinja)
 
 use crate::engine::ChatMessage;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use tokenizers::Tokenizer;
 
 pub struct DennoTokenizer {

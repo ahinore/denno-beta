@@ -7,7 +7,7 @@
 //! - 全フレームが encode→decode で可逆、チャネル満杯時はドロップして止まらない
 
 use denno_engine::testutil::{dummy_engine, dummy_tokenizer};
-use denno_engine::{ChatMessage, Engine, GenParams};
+use denno_engine::{ChatMessage, GenParams};
 use denno_telemetry::{self as telem, Frame};
 
 fn greedy(max_tokens: usize) -> GenParams {

@@ -7,7 +7,7 @@
 //! 3. 決定論: 同一入力 2 回で bit 一致
 //! 4. キャッシュ連続性: forward(3 トークン)+forward(1) == forward(4) bit 一致
 
-use denno_engine::model::{load_model, Model};
+use denno_engine::model::load_model;
 use denno_engine::quant::QuantMode;
 
 fn bits(v: &[f32]) -> Vec<u32> {

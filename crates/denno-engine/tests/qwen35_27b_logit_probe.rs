@@ -15,7 +15,7 @@
 //! 修正後は 27B も greedy で正答する (本テストは回帰監視として恒久化)。
 
 use denno_engine::engine::ChatMessage;
-use denno_engine::model::{load_model, Model};
+use denno_engine::model::load_model;
 use denno_engine::quant::QuantMode;
 use denno_engine::tokenizer::DennoTokenizer;
 

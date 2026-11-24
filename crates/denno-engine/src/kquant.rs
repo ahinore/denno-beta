@@ -398,8 +398,8 @@ fn dequant_block(ty: GgmlType, x: &[u8], y: &mut [f32]) {
             for j in 0..16 {
                 let xh0 = (((qh >> j) << 4) & 0x10) as u8 as i32;
                 let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
-                let x0 = (((x[8 + j] & 0x0f) as i32) | xh0);
-                let x1 = (((x[8 + j] >> 4) as i32) | xh1);
+                let x0 = ((x[8 + j] & 0x0f) as i32) | xh0;
+                let x1 = ((x[8 + j] >> 4) as i32) | xh1;
                 y[j] = x0 as f32 * d + m;
                 y[j + 16] = x1 as f32 * d + m;
             }

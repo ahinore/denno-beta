@@ -8,7 +8,7 @@
 //! int8 モードで embedding とは別に lm_head 用の量子化コピーを作る
 //! (decode 時の logits matvec も int8 帯域の対象にするため)。
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rayon::prelude::*;
 use std::path::Path;
 
