@@ -1,20 +1,29 @@
-//! P793: OpenAI Chat Completions 互換エンドポイント (`POST /v1/chat/completions`)。
+//! P793/P797: OpenAI Chat Completions 互換エンドポイント (`POST /v1/chat/completions`)。
 //!
 //! `/v1/messages` と **同じ** Scheduler・chat template・KV prefix cache・engine を
 //! 通す。違うのはワイヤ形式だけ:
 //!
-//! - リクエスト: OpenAI の `messages` / `stop` / `stream_options`
+//! - リクエスト: OpenAI の `messages` / `stop` / `stream_options` / `tools` /
+//!   `tool_choice` / `response_format`
 //! - 応答: `chat.completion` (非ストリーム) と `chat.completion.chunk` (SSE)
 //!
 //! 既存の Anthropic 経路 (`/v1/messages`) には一切触らない。ストリームは
 //! scheduler の [`crate::scheduler::RawEvent`] (生 delta) を HTTP 側で
-//! chunk へ組み直す — アセンブラ (tool_use block 分割) は持たない。
+//! chunk へ組み直す。
+//!
+//! P797 (tool calling): ツール定義は engine の [`crate::ToolDef`] へ、履歴の
+//! assistant `tool_calls` / `role="tool"` は `/v1/messages` と同一の
+//! `<tool_call>` / `<tool_response>` テキストへ写す。モデル出力からの抽出は
+//! 既存の [`crate::extract_tool_calls`]、ストリームの block 境界検出は既存の
+//! [`crate::stream_asm::StreamAssembler`] をそのまま使い、そのイベント列を
+//! OpenAI の `delta.tool_calls` へ翻訳する (抽出/組立の意味論を二重実装しない)。
 //!
 //! 対応フィールド (docs/api.md §POST /v1/chat/completions):
-//! `model` / `messages` (system・developer・user・assistant、content は
-//! 文字列 or text part 配列) / `max_tokens` / `max_completion_tokens` /
-//! `temperature` / `top_p` / `stop` (文字列 or 配列) / `stream` /
-//! `stream_options.include_usage`。未知フィールドは無視する (serde 既定)。
+//! `model` / `messages` (system・developer・user・assistant (+ `tool_calls`)・
+//! tool・function、content は文字列 or text part 配列) / `max_tokens` /
+//! `max_completion_tokens` / `temperature` / `top_p` / `stop` (文字列 or 配列) /
+//! `stream` / `stream_options.include_usage` / `tools` / `tool_choice` /
+//! `response_format` (`text` | `json_object`)。未知フィールドは無視する (serde 既定)。
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,16 +33,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use denno_engine::{ChatMessage, GenParams};
+use denno_engine::{ChatMessage, GenParams, ToolConstraint};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::scheduler::RawEvent;
+use crate::stream_asm::StreamAssembler;
 use crate::{
-    apply_temperature_cap, brief_system, check_auth, debug_api_error, resolve_max_tokens, ApiError,
-    AppState, RESPONSE_WAIT_TIMEOUT,
+    apply_temperature_cap, brief_system, check_auth, debug_api_error, extract_tool_calls,
+    parse_tool_choice, resolve_max_tokens, tool_use_to_xml, validate_tools, ApiError, AppState,
+    ExtractedToolCall, ToolChoice, ToolDef, RESPONSE_WAIT_TIMEOUT,
 };
 
 // ---------- エラー (OpenAI 形式) ----------
@@ -124,12 +135,61 @@ where
     })
 }
 
+/// 履歴の assistant `tool_calls[].function`。
+/// `arguments` は OpenAI 仕様では **JSON 文字列**。デンノ拡張として
+/// オブジェクト直書きも受ける (どちらも同じ input へ正規化する)。
+#[derive(Debug, Deserialize)]
+pub struct OaToolCallFunction {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Option<Value>,
+}
+
+/// 履歴の assistant `tool_calls[]` 1 件。
+///
+/// `id` は OpenAI クライアントが `role="tool"` の `tool_call_id` で参照するが、
+/// chat template は id を参照しないため履歴テキストには使わない (受理のみ)。
+#[derive(Debug, Deserialize)]
+pub struct OaToolCall {
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub id: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: OaToolCallFunction,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OaMessage {
     pub role: String,
     /// 文字列 or content parts 配列 (null 許容)
     #[serde(default)]
     pub content: Option<Value>,
+    /// assistant の tool call 履歴 (OpenAI 形式)
+    #[serde(default)]
+    pub tool_calls: Option<Vec<OaToolCall>>,
+    /// role="tool" の応答が指す tool call id (受理するが履歴テキストには使わない)
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tool_call_id: Option<String>,
+}
+
+/// OpenAI の `tools[]` 1 件 (`type="function"` のみ対応)。
+#[derive(Debug, Deserialize)]
+pub struct OaFunctionDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON Schema。未指定は空オブジェクト schema として扱う。
+    #[serde(default)]
+    pub parameters: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OaTool {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: OaFunctionDef,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -151,7 +211,38 @@ pub struct ChatCompletionRequest {
     pub stop: Vec<String>,
     pub stream: Option<bool>,
     pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
+    pub tools: Option<Vec<OaTool>>,
+    pub tool_choice: Option<Value>,
+    /// `{"type": "text" | "json_object"}` (json_schema は未対応で 400)
+    pub response_format: Option<Value>,
 }
+
+/// `response_format` を検証し、モデルへ渡す追加ヒントを返す。
+/// `text` は無変換、`json_object` は「JSON オブジェクトだけを返す」指示を
+/// system へ足す (未指定時はプロンプト不変 = P793 と同一経路)。
+fn response_format_hint(v: &Option<Value>) -> Result<Option<&'static str>, OaError> {
+    let Some(v) = v else { return Ok(None) };
+    let ty = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| {
+            OaError::invalid("response_format: object form requires a string \"type\"")
+                .with_param("response_format.type")
+        })?;
+    match ty {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(JSON_OBJECT_HINT)),
+        other => Err(OaError::invalid(format!(
+            "response_format.type: unsupported value {other:?} (text/json_object)"
+        ))
+        .with_param("response_format.type")),
+    }
+}
+
+/// `response_format: {"type":"json_object"}` のときに system へ足す固定文。
+const JSON_OBJECT_HINT: &str =
+    "Return a single valid JSON object and nothing else (no markdown fences, no prose).";
 
 /// content (文字列 or parts 配列) を 1 本のテキストにする。
 /// text 以外の part (image_url 等) は無視する — モデルはテキスト専用。
@@ -179,19 +270,82 @@ fn content_to_text(v: &Option<Value>) -> String {
     }
 }
 
+/// assistant の `tool_calls[]` 1 件を `<tool_call>` XML テキストへ写す。
+/// (`/v1/messages` の tool_use block と同一形式 — モデルが見る履歴を揃える)
+fn tool_call_to_xml(c: &OaToolCall) -> Result<String, OaError> {
+    if let Some(kind) = &c.kind {
+        if kind != "function" {
+            return Err(OaError::invalid(format!(
+                "tool_calls[].type: unsupported value {kind:?} (function)"
+            )));
+        }
+    }
+    if c.function.name.trim().is_empty() {
+        return Err(OaError::invalid(
+            "tool_calls[].function.name must be a non-empty string",
+        ));
+    }
+    let input = match &c.function.arguments {
+        None | Some(Value::Null) => json!({}),
+        Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => {
+                return Err(OaError::invalid(
+                    "tool_calls[].function.arguments must be a JSON object string",
+                ))
+            }
+            Err(e) => {
+                return Err(OaError::invalid(format!(
+                    "tool_calls[].function.arguments is not valid JSON: {e}"
+                )))
+            }
+        },
+        Some(v) if v.is_object() => v.clone(),
+        Some(_) => {
+            return Err(OaError::invalid(
+                "tool_calls[].function.arguments must be a JSON object string",
+            ))
+        }
+    };
+    Ok(tool_use_to_xml(&c.function.name, &input))
+}
+
 /// OpenAI のメッセージ列を (system, chat_messages) へ写す。
-/// `system` / `developer` は system へ、`tool` / `function` は user の発話として
-/// 履歴へ織り込む (どちらのロールも chat template には存在しないため)。
+///
+/// - `system` / `developer` → system
+/// - assistant の `tool_calls` → 本文の後ろへ `<tool_call>` XML を連結
+///   (`/v1/messages` の tool_use block と同じテキスト)
+/// - `tool` / `function` (実行結果) → user 発話の `<tool_response>` 包み
+///   (`/v1/messages` の tool_result block と同じテキスト)
 fn split_messages(msgs: &[OaMessage]) -> Result<(Option<String>, Vec<ChatMessage>), OaError> {
     let mut system: Vec<String> = Vec::new();
     let mut out = Vec::with_capacity(msgs.len());
     for (i, m) in msgs.iter().enumerate() {
-        let text = content_to_text(&m.content);
+        let mut text = content_to_text(&m.content);
         match m.role.as_str() {
             "system" | "developer" => system.push(text),
             "user" => out.push(ChatMessage { role: "user".to_string(), content: text }),
-            "assistant" => out.push(ChatMessage { role: "assistant".to_string(), content: text }),
-            "tool" | "function" => out.push(ChatMessage { role: "user".to_string(), content: text }),
+            "assistant" => {
+                for (j, c) in m.tool_calls.as_deref().unwrap_or(&[]).iter().enumerate() {
+                    let xml = tool_call_to_xml(c).map_err(|e| {
+                        e.with_param(format!("messages[{i}].tool_calls[{j}]"))
+                    })?;
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&xml);
+                }
+                out.push(ChatMessage { role: "assistant".to_string(), content: text });
+            }
+            "tool" | "function" => {
+                // 公式テンプレートの tool 応答形式 (Anthropic 経路の tool_result と同一)。
+                // `tool_call_id` は受理するが、テンプレートは id を参照しないため使わない。
+                out.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!("<tool_response>\n{text}\n</tool_response>"),
+                });
+            }
             other => {
                 return Err(OaError::invalid(format!(
                     "messages[{i}].role: unsupported role {other:?} \
@@ -203,6 +357,105 @@ fn split_messages(msgs: &[OaMessage]) -> Result<(Option<String>, Vec<ChatMessage
     }
     let system = if system.is_empty() { None } else { Some(system.join("\n")) };
     Ok((system, out))
+}
+
+/// OpenAI の `tools[]` を engine の [`ToolDef`] 列へ写す。
+fn map_tools(tools: &Option<Vec<OaTool>>) -> Result<Vec<ToolDef>, OaError> {
+    let Some(tools) = tools else { return Ok(Vec::new()) };
+    let mut out = Vec::with_capacity(tools.len());
+    for (i, t) in tools.iter().enumerate() {
+        if let Some(kind) = &t.kind {
+            if kind != "function" {
+                return Err(OaError::invalid(format!(
+                    "tools[{i}].type: unsupported value {kind:?} (function)"
+                ))
+                .with_param(format!("tools[{i}].type")));
+            }
+        }
+        let input_schema = match &t.function.parameters {
+            None | Some(Value::Null) => json!({"type": "object", "properties": {}}),
+            Some(v) if v.is_object() => v.clone(),
+            Some(_) => {
+                return Err(OaError::invalid(format!(
+                    "tools[{i}].function.parameters must be a JSON object"
+                ))
+                .with_param(format!("tools[{i}].function.parameters")))
+            }
+        };
+        out.push(ToolDef {
+            name: t.function.name.clone(),
+            description: t.function.description.clone(),
+            input_schema,
+        });
+    }
+    Ok(out)
+}
+
+/// OpenAI の `tool_choice` を既存の [`parse_tool_choice`] が読む形へ正規化する。
+///
+/// - `"auto"` / `"none"` → そのまま
+/// - `"required"` → `"any"` (拘束デコードを有効にする)
+/// - `{"type":"function","function":{"name":..}}` → `{"type":"tool","name":..}`
+fn oa_tool_choice_value(v: &Option<Value>) -> Result<Option<Value>, OaError> {
+    let Some(v) = v else { return Ok(None) };
+    let normalized = match v {
+        Value::String(s) => match s.as_str() {
+            "auto" => json!("auto"),
+            "none" => json!("none"),
+            "required" => json!("any"),
+            other => {
+                return Err(OaError::invalid(format!(
+                    "tool_choice: unsupported value {other:?} (auto/none/required)"
+                ))
+                .with_param("tool_choice"))
+            }
+        },
+        Value::Object(m) => {
+            let ty = m
+                .get("type")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| {
+                    OaError::invalid("tool_choice: object form requires a string \"type\"")
+                        .with_param("tool_choice")
+                })?;
+            match ty {
+                "auto" | "none" => json!(ty),
+                "required" | "any" => json!("any"),
+                "function" => {
+                    let name = m
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .ok_or_else(|| {
+                            OaError::invalid(
+                                "tool_choice: {\"type\":\"function\"} requires a string function.name",
+                            )
+                            .with_param("tool_choice")
+                        })?;
+                    if name.is_empty() {
+                        return Err(OaError::invalid(
+                            "tool_choice: function.name must be non-empty",
+                        )
+                        .with_param("tool_choice"));
+                    }
+                    json!({"type": "tool", "name": name})
+                }
+                other => {
+                    return Err(OaError::invalid(format!(
+                        "tool_choice.type: unsupported value {other:?} (auto/none/required/function)"
+                    ))
+                    .with_param("tool_choice"))
+                }
+            }
+        }
+        _ => {
+            return Err(OaError::invalid(
+                "tool_choice must be a string (auto/none/required) or an object",
+            )
+            .with_param("tool_choice"))
+        }
+    };
+    Ok(Some(normalized))
 }
 
 /// engine の stop_reason → OpenAI の finish_reason。
@@ -220,11 +473,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn hex24() -> String {
+    let mut rng = rand::thread_rng();
+    (0..24).map(|_| format!("{:x}", rng.gen::<u8>() % 16)).collect()
+}
+
 /// `chatcmpl-` + 24hex (msg id と同じ乱数経路)。
 fn new_chatcmpl_id() -> String {
-    let mut rng = rand::thread_rng();
-    let id: String = (0..24).map(|_| format!("{:x}", rng.gen::<u8>() % 16)).collect();
-    format!("chatcmpl-{id}")
+    format!("chatcmpl-{}", hex24())
+}
+
+/// tool call の id (OpenAI の `call_` + 24hex)。
+fn new_call_id() -> String {
+    format!("call_{}", hex24())
 }
 
 fn usage_json(input_tokens: usize, output_tokens: usize) -> Value {
@@ -233,6 +494,35 @@ fn usage_json(input_tokens: usize, output_tokens: usize) -> Value {
         "completion_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     })
+}
+
+/// 非ストリーム応答の `message`。tool call があれば `tool_calls` を足し、
+/// 本文が空なら `content: null` (OpenAI 仕様の tool call 応答と同じ)。
+fn completion_message(text: &str, calls: &[ExtractedToolCall]) -> Value {
+    let content = if calls.is_empty() || !text.is_empty() {
+        Value::String(text.to_string())
+    } else {
+        Value::Null
+    };
+    let mut m = json!({"role": "assistant", "content": content});
+    if !calls.is_empty() {
+        let arr: Vec<Value> = calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": new_call_id(),
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": serde_json::to_string(&c.input)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                })
+            })
+            .collect();
+        m["tool_calls"] = Value::Array(arr);
+    }
+    m
 }
 
 // ---------- ハンドラ ----------
@@ -266,8 +556,41 @@ pub async fn chat_completions(
         );
     }
 
+    // tools / tool_choice: /v1/messages と同じ検証規則を通す
+    let tool_defs = map_tools(&req.tools)?;
+    if req.tool_choice.is_some() && tool_defs.is_empty() {
+        return Err(OaError::invalid("tool_choice is only allowed when tools are provided")
+            .with_param("tool_choice"));
+    }
+    let tool_choice = parse_tool_choice(&oa_tool_choice_value(&req.tool_choice)?)
+        .map_err(OaError::from)?;
+    let tools_json = validate_tools(&tool_defs).map_err(OaError::from)?;
+    if let ToolChoice::Named(n) = &tool_choice {
+        if !tool_defs.iter().any(|t| &t.name == n) {
+            return Err(OaError::invalid(format!(
+                "tool_choice: tool {n:?} is not defined in tools"
+            ))
+            .with_param("tool_choice"));
+        }
+    }
+    let tools_active = !tool_defs.is_empty() && tool_choice != ToolChoice::None;
+    let tools_for_prompt = if tools_active { Some(tools_json) } else { None };
+    let tool_constraint = match &tool_choice {
+        ToolChoice::Any => Some(ToolConstraint {
+            names: tool_defs.iter().map(|t| t.name.clone()).collect(),
+        }),
+        ToolChoice::Named(n) => Some(ToolConstraint { names: vec![n.clone()] }),
+        ToolChoice::Auto | ToolChoice::None => None,
+    };
+
     // /v1/messages と同じ既定 (thinking = brief) を適用し、同一会話で同一出力にする。
-    let system = brief_system(system);
+    let mut system = brief_system(system);
+    if let Some(hint) = response_format_hint(&req.response_format)? {
+        system = Some(match system {
+            Some(s) => format!("{s}\n\n{hint}"),
+            None => hint.to_string(),
+        });
+    }
     let enable_thinking = Some(false);
     let params = GenParams {
         max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
@@ -283,11 +606,29 @@ pub async fn chat_completions(
     };
 
     if req.stream.unwrap_or(false) {
-        stream_response(state, system, chat_messages, params, req.stream_options).await
+        stream_response(
+            state,
+            system,
+            chat_messages,
+            params,
+            req.stream_options,
+            tools_for_prompt,
+            tool_constraint,
+            enable_thinking,
+            tools_active,
+        )
+        .await
     } else {
         let rx = state
             .scheduler
-            .submit_chat(system, chat_messages, params, None, None, enable_thinking)
+            .submit_chat(
+                system,
+                chat_messages,
+                params,
+                tools_for_prompt,
+                tool_constraint,
+                enable_thinking,
+            )
             .map_err(|_| queue_full(&state))?;
         let output = match tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await {
             Ok(Ok(Ok(out))) => out,
@@ -311,6 +652,19 @@ pub async fn chat_completions(
                 ))
             }
         };
+        // tools 有効時だけ抽出する (none / 未指定なら本文は P793 と同一)
+        let mut text = output.text;
+        let mut calls: Vec<ExtractedToolCall> = Vec::new();
+        if tools_active {
+            let (clean, extracted) = extract_tool_calls(&text);
+            text = clean;
+            calls = extracted;
+        }
+        let finish = if calls.is_empty() {
+            finish_reason(output.stop_reason.as_str())
+        } else {
+            "tool_calls"
+        };
         let created = now_secs();
         Ok(Json(json!({
             "id": new_chatcmpl_id(),
@@ -319,9 +673,9 @@ pub async fn chat_completions(
             "model": state.model_name,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": output.text},
+                "message": completion_message(&text, &calls),
                 "logprobs": Value::Null,
-                "finish_reason": finish_reason(output.stop_reason.as_str()),
+                "finish_reason": finish,
             }],
             "usage": usage_json(output.input_tokens, output.output_tokens),
         }))
@@ -340,19 +694,79 @@ fn queue_full(state: &AppState) -> OaError {
     )
 }
 
+/// 1 個の delta chunk を送る。送信失敗 (クライアント切断) は false。
+async fn send_delta_chunk(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: Value,
+) -> bool {
+    let chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "logprobs": Value::Null,
+            "finish_reason": Value::Null,
+        }],
+    });
+    tx.send(Ok(sse_data(&chunk))).await.is_ok()
+}
+
+/// [`StreamAssembler`] のイベント列を OpenAI の delta へ翻訳する。
+///
+/// - text_delta → `{"content": ...}`
+/// - tool_use start → `{"tool_calls":[{"index":n,"id":..,"type":"function",
+///   "function":{"name":..,"arguments":""}}]}`
+/// - input_json_delta → `{"tool_calls":[{"index":n,"function":{"arguments":..}}]}`
+///
+/// tool call の index は送出順 (0 始まり)。id は start の 1 回だけ載せる。
+struct OaToolDeltaTranslator {
+    /// 送出済み tool call 数 (= 次に割り当てる index)
+    emitted: usize,
+    /// open 中の tool_use の block index → OpenAI の tool index
+    open: Option<usize>,
+}
+
+impl OaToolDeltaTranslator {
+    fn new() -> Self {
+        Self { emitted: 0, open: None }
+    }
+}
+
 /// SSE 応答。scheduler の生イベントを OpenAI chunk へ組み直す。
+///
+/// `assemble_tools` が true のときだけ [`StreamAssembler`] を通す
+/// (`<tool_call>` block の検出と分割到着の境界処理を既存実装へ委ねる)。
+#[allow(clippy::too_many_arguments)]
 async fn stream_response(
     state: Arc<AppState>,
     system: Option<String>,
     chat_messages: Vec<ChatMessage>,
     params: GenParams,
     stream_options: Option<StreamOptions>,
+    tools: Option<Value>,
+    constraint: Option<ToolConstraint>,
+    enable_thinking: Option<bool>,
+    assemble_tools: bool,
 ) -> Result<Response, OaError> {
     let include_usage = stream_options.map(|o| o.include_usage).unwrap_or(false);
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<RawEvent>(64);
     state
         .scheduler
-        .submit_openai_stream(system, chat_messages, params, None, None, Some(false), raw_tx)
+        .submit_openai_stream(
+            system,
+            chat_messages,
+            params,
+            tools,
+            constraint,
+            enable_thinking,
+            raw_tx,
+        )
         .map_err(|_| queue_full(&state))?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
@@ -378,6 +792,9 @@ async fn stream_response(
         }
         let mut reason = "stop";
         let (mut input_tokens, mut output_tokens) = (0usize, 0usize);
+        // tools 有効時のみ (P797): block 境界検出は既存アセンブラに任せる
+        let mut asm = if assemble_tools { Some(StreamAssembler::new(0)) } else { None };
+        let mut tr = OaToolDeltaTranslator::new();
         while let Some(ev) = raw_rx.recv().await {
             match ev {
                 RawEvent::Start { input_tokens: n } => input_tokens = n,
@@ -385,20 +802,68 @@ async fn stream_response(
                     if text.is_empty() {
                         continue;
                     }
-                    let chunk = json!({
-                        "id": id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": text},
-                            "logprobs": Value::Null,
-                            "finish_reason": Value::Null,
-                        }],
-                    });
-                    if tx.send(Ok(sse_data(&chunk))).await.is_err() {
-                        return;
+                    match asm.as_mut() {
+                        None => {
+                            if !send_delta_chunk(&tx, &id, created, &model, json!({"content": text}))
+                                .await
+                            {
+                                return;
+                            }
+                        }
+                        Some(asm) => {
+                            asm.push_delta(&text);
+                            for e in asm.take_events() {
+                                let delta = match e["type"].as_str() {
+                                    Some("content_block_start")
+                                        if e["content_block"]["type"] == "tool_use" =>
+                                    {
+                                        let idx = tr.emitted;
+                                        tr.emitted += 1;
+                                        tr.open = Some(idx);
+                                        Some(json!({"tool_calls": [{
+                                            "index": idx,
+                                            "id": new_call_id(),
+                                            "type": "function",
+                                            "function": {
+                                                "name": e["content_block"]["name"]
+                                                    .as_str()
+                                                    .unwrap_or_default(),
+                                                "arguments": "",
+                                            },
+                                        }]}))
+                                    }
+                                    Some("content_block_delta")
+                                        if e["delta"]["type"] == "input_json_delta" =>
+                                    {
+                                        let idx = tr.open.unwrap_or(tr.emitted.saturating_sub(1));
+                                        Some(json!({"tool_calls": [{
+                                            "index": idx,
+                                            "function": {
+                                                "arguments": e["delta"]["partial_json"]
+                                                    .as_str()
+                                                    .unwrap_or_default(),
+                                            },
+                                        }]}))
+                                    }
+                                    Some("content_block_delta")
+                                        if e["delta"]["type"] == "text_delta" =>
+                                    {
+                                        let t = e["delta"]["text"].as_str().unwrap_or_default();
+                                        if t.is_empty() {
+                                            None
+                                        } else {
+                                            Some(json!({"content": t}))
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(d) = delta {
+                                    if !send_delta_chunk(&tx, &id, created, &model, d).await {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 RawEvent::Done { input_tokens: i, output_tokens: o, stop_reason, .. } => {
@@ -414,6 +879,23 @@ async fn stream_response(
                     let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                     return;
                 }
+            }
+        }
+        // 残り (ホールドされていた末尾テキスト / 未完結 block) を流し切る
+        if let Some(asm) = asm.as_mut() {
+            asm.finish();
+            for e in asm.take_events() {
+                if e["type"] == "content_block_delta" && e["delta"]["type"] == "text_delta" {
+                    let t = e["delta"]["text"].as_str().unwrap_or_default();
+                    if !t.is_empty()
+                        && !send_delta_chunk(&tx, &id, created, &model, json!({"content": t})).await
+                    {
+                        return;
+                    }
+                }
+            }
+            if asm.blocks_emitted() > 0 {
+                reason = "tool_calls";
             }
         }
         // 最終 chunk (finish_reason)

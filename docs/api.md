@@ -51,14 +51,16 @@ chat template・KV prefix cache・engine を通る (違うのはワイヤ形式�
 | フィールド | 対応 |
 | --- | --- |
 | `model` (任意) | serve 時の `--name`。不一致は 404 (`error.type = invalid_request_error`)。空/未指定は受理 |
-| `messages` (必須) | role は `system` / `developer` / `user` / `assistant` / `tool` / `function`。`system`・`developer` は system プロンプトへ、`tool`・`function` は user 発話として履歴へ織り込む。未知の role は 400 (`param = messages[i].role`)。空配列は 400 |
+| `messages` (必須) | role は `system` / `developer` / `user` / `assistant` / `tool` / `function`。`system`・`developer` は system プロンプトへ、`tool`・`function` は `<tool_response>...</tool_response>` を包んだ user 発話として履歴へ織り込む。assistant の `tool_calls[]` は本文の後ろへ `<tool_call>` XML として連結 (`/v1/messages` の tool_use block と同一テキスト)。未知の role は 400 (`param = messages[i].role`)。空配列は 400 |
 | `content` | 文字列 or content parts 配列 (`{"type":"text","text":...}` / `"input_text"`)。text 以外 (image_url 等) は無視。null は空文字 |
 | `max_tokens` / `max_completion_tokens` | `max_tokens` 優先。未指定は 1024、明示は上限 4096 で clamp (どちらも `/v1/messages` と同一) |
 | `temperature` / `top_p` | 対応 (`--temperature-cap` のクランプも同一) |
 | `stop` | 文字列 or 文字列配列 (空文字は無視) |
 | `stream` | true で SSE |
 | `stream_options.include_usage` | true で最終 usage chunk (choices が空の chunk) を追加 |
-| その他 | 未知フィールドは無視 (serde 既定)。`tools` は未対応 (受け流すだけ) |
+| `tools` / `tool_choice` | P797: OpenAI 形式 (`{"type":"function","function":{name,description,parameters}}`) を受理し、chat template の `tools` 変数へ渡す。`tool_choice` は `auto`/`none`/`required`/`{"type":"function","function":{"name":...}}` (詳細は下の「OpenAI tool calling」) |
+| `response_format` | `{"type":"text"}` (無変換) / `{"type":"json_object"}` (JSON オブジェクトのみ返す指示を system へ追加)。それ以外の type は 400 (`param = response_format.type`) |
+| その他 | 未知フィールドは無視 (serde 既定) |
 
 応答 (非ストリーミング):
 
@@ -78,7 +80,54 @@ chat template・KV prefix cache・engine を通る (違うのはワイヤ形式�
 }
 ```
 
-`finish_reason`: `stop` (`end_turn` / `stop_sequence`) / `length` (`max_tokens`)。
+`finish_reason`: `stop` (`end_turn` / `stop_sequence`) / `length` (`max_tokens`) /
+`tool_calls` (tool call を返したとき)。
+
+### OpenAI tool calling (P797)
+
+`tools` を指定すると、モデル出力中の `<tool_call>` block を抽出して OpenAI 形式の
+`tool_calls` として返す (`/v1/messages` の tool_use と同じ抽出器)。
+
+非ストリーミング応答の `message`:
+
+```json
+{
+  "role": "assistant",
+  "content": "Checking.",
+  "tool_calls": [{
+    "id": "call_1a2b...",
+    "type": "function",
+    "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}
+  }]
+}
+```
+
+- `arguments` は JSON オブジェクトの **文字列** (`/v1/messages` の `input` と同じ値)
+- block を除去した残りテキストは `content` に入る (残らなければ `null`)
+- `finish_reason` は `tool_calls`
+
+ストリーミングでは `delta.tool_calls` を OpenAI 仕様どおりに流す:
+
+```
+data: {...,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_...","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+data: {...,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Tokyo\"}"}}]},"finish_reason":null}]}
+data: {...,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+```
+
+`index` は tool call の通し番号 (0 始まり)。`id`/`type`/`function.name` は
+その call の最初の chunk にだけ載り、`function.arguments` は増分だけを載せる
+(クライアントは連結して JSON にする)。tool call を含むストリームでは
+`finish_reason` が `tool_calls` になる。
+
+- `tool_choice`: `auto` (既定) / `none` (モデルへ非公開・抽出もしない) /
+  `required` (= `/v1/messages` の `any`。tool_call block までの拘束デコード) /
+  `{"type":"function","function":{"name":"..."}}` (= `{"type":"tool","name":...}`)。
+  未定義の名前は 400、`tools` 無しでの `tool_choice` は 400 (`param = tool_choice`)
+- 履歴の `assistant.tool_calls[]` は `<tool_call>` XML、`role="tool"` の
+  `content` は `<tool_response>` 包みでプロンプトへ入る (モデルから見ると
+  `/v1/messages` の tool_use / tool_result と同じ形)。`arguments` が JSON
+  オブジェクトの文字列でない履歴は 400 (`param = messages[i].tool_calls[j]`)
+- `tool_call_id` は受理するが chat template は参照しない (対応検証はしない)
 
 ストリーミング (`stream: true`)。`event:` 行は付けず `data:` 行だけを流し、
 最後に `data: [DONE]` で終わる:
