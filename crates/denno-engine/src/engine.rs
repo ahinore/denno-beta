@@ -93,14 +93,37 @@ impl StopReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ChatOutput {
     pub text: String,
     pub stop_reason: StopReason,
     pub stop_sequence: Option<String>,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// P805: prefix cache から再利用した KV のトークン数 (= prompt のうち
+    /// prefill を省いた先頭長)。Anthropic の `usage.cache_read_input_tokens`。
+    pub cache_read_input_tokens: usize,
+    /// P805: このリクエストで新規に prefill したトークン数
+    /// (`input_tokens - cache_read_input_tokens`)。Anthropic の
+    /// `usage.cache_creation_input_tokens` 相当 (キャッシュへの書き込み量の近似)。
+    pub cache_creation_input_tokens: usize,
 }
+
+/// P805: 等値は **生成結果** の一致を意味する。`cache_*` は prefix cache の
+/// 再利用状況 (単独実行 / バッチ実行 / ターン順) で変わる会計値なので、
+/// 「同じ入力なら同じ出力」を検証する既存テストの比較からは除く。
+/// 会計値そのものはサーバーの `usage` を HTTP ワイヤで検証する。
+impl PartialEq for ChatOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.stop_reason == other.stop_reason
+            && self.stop_sequence == other.stop_sequence
+            && self.input_tokens == other.input_tokens
+            && self.output_tokens == other.output_tokens
+    }
+}
+
+impl Eq for ChatOutput {}
 
 pub struct Engine {
     pub model: Box<dyn Model>,
@@ -294,7 +317,15 @@ impl ChatSession {
             stop_sequence: self.stop_sequence,
             input_tokens: self.input_tokens,
             output_tokens: self.generated.len(),
+            cache_read_input_tokens: self.lcp,
+            cache_creation_input_tokens: self.input_tokens.saturating_sub(self.lcp),
         }
+    }
+
+    /// P805: prefill で prefix cache から再利用した先頭トークン数。
+    /// (ストリーミングの `message_start.usage` を組み立てるために使う)
+    pub fn reused_prefix_tokens(&self) -> usize {
+        self.lcp
     }
 }
 
@@ -802,6 +833,25 @@ impl Engine {
     /// P58-4: slot の予約トークン数 (観測用の読み取りのみ)。
     pub fn slot_reserved(&self, slot: usize) -> usize {
         self.slot_reserved[slot]
+    }
+
+    /// P805: プロンプトのトークン数を数えるだけ (prefill / KV には触れない)。
+    ///
+    /// `begin_chat_with_tools` と **同じ描画 + トークン化**を通すので、値は
+    /// 生成時の `ChatSession::input_tokens()` と一致する
+    /// (`/v1/messages/count_tokens` 用)。max_tokens / コンテキスト長の検査は
+    /// しない (数えること自体は常に成立する)。
+    pub fn count_prompt_tokens(
+        &self,
+        system: Option<&str>,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
+    ) -> Result<usize> {
+        let prompt = self
+            .tok
+            .apply_chat_template(system, messages, tools, enable_thinking)?;
+        Ok(self.tok.encode(&prompt)?.len())
     }
 
     /// P4 ステッパ: リクエスト状態を準備する (トークン化 + max_tokens クランプ +
@@ -3140,6 +3190,36 @@ mod tests {
                 "logits[{i}]: cold {a} vs prefix cache 再利用 {b} (ビット不一致)"
             );
         }
+    }
+
+    /// P805: `ChatOutput` の cache 会計値が prefix 再利用を反映する。
+    /// 1 回目は full prefill (read=0)、2 回目 (同一 prompt) は read>0 で
+    /// read + creation == input_tokens。
+    #[test]
+    fn cache_metrics_fields_track_prefix_reuse() {
+        let mut e = dummy_engine("m", None).unwrap();
+        let p = params(4);
+        let run = |e: &mut Engine| -> ChatOutput {
+            let mut s = e.begin_chat(None, &msgs("t0"), &p).unwrap();
+            e.install_session(&mut s).unwrap();
+            while !e.step_chat(&mut s, &mut |_| {}).unwrap() {}
+            e.release_session(&mut s);
+            s.into_output()
+        };
+        let first = run(&mut e);
+        assert_eq!(first.cache_read_input_tokens, 0, "1 回目は full prefill");
+        assert_eq!(first.cache_creation_input_tokens, first.input_tokens);
+
+        let second = run(&mut e);
+        assert!(
+            second.cache_read_input_tokens > 0,
+            "2 回目で prefix を再利用していない: {second:?}"
+        );
+        assert_eq!(
+            second.cache_read_input_tokens + second.cache_creation_input_tokens,
+            second.input_tokens
+        );
+        assert_eq!(first.text, second.text);
     }
 
     /// P4-4 (b): 容量境界は panic ではなくきれいなエラー。
