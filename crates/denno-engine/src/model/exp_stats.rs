@@ -67,6 +67,35 @@
 //! 譲った) で載せた。起動の `load ok` は 2.5 -> 2.8 秒 (+0.3 秒)。
 //! 記録に無い 14k プロンプトには効かない (その prefill 自体が作業集合を積む)。
 //!
+//! # task 798: 明示の warm プロファイルと起動時の本数・バイト上限
+//!
+//! 既存の経路 (使用回数 → 起動プラン) はそのままに、運用側から 3 つだけ
+//! 口を出す。どれも未設定なら従来と 1 バイトも変わらない (既定 off)。
+//!
+//! - `DENNO_EXPERT_WARM_FILE` ([`WARM_FILE_ENV`]): warm プロファイルの明示パス。
+//!   `DENNO_EXPERT_IQ_STATS_FILE` / `DENNO_EXPERT_STATS_DIR` より優先する
+//!   (IQ ゲートも要らない)。別ホストで作った履歴を配る用。
+//! - `DENNO_START_WARM_EXPERTS` ([`WARM_EXPERTS_ENV`]): 起動時に **page cache** を
+//!   温める expert の本数 (熱い側から N 本、`0`/未設定で何もしない。既存の
+//!   起動プラン (VRAM → RAM) はどちらでもそのまま動く)。
+//!   RAM tier / VRAM には積まない。UD-Q4_K_XL で 4,000 本 (11.98 GB) を RAM tier に
+//!   写したら page cache を追い出して decode が 12.0 -> 19.5 ms/tok (+63%) になった
+//!   (lab t798b)。pread で page を載せるだけなら RSS は増えない。
+//! - `DENNO_START_WARM_MB` ([`WARM_MB_ENV`]): その warm で読むバイト上限 (MiB)。
+//!   RAM 59 GiB の機械で expert が 100 GB 級のときの読み過ぎを止める。
+//!
+//! 本数・バイトの上限はどちらも**起動時の 1 パスだけ**に効く (走行中の
+//! 再調整 `rebalance_once` は使用回数に追従したまま)。
+//!
+//! # task 798: 指紋 (モデルの同一性の 3 つ目)
+//!
+//! 版 1 の同一性は (ディレクトリ名, expert 合計バイト) で、量子型の取り違えは
+//! 防げるが「同じサイズの別リビジョン」は防げない。版 2 はテンソル目録
+//! (名前・量子型・次元) の FNV-1a 64 を `fingerprint` として持ち、読むときに
+//! 一致を要求する。指紋 0 のファイル (版 1) は従来どおり (名前, バイト) だけで
+//! 判定する (古い履歴を捨てない)。**一度も warm していないモデルで
+//! プロファイルを読むことはない** (版・形・同一性のいずれかが違えば fail closed)。
+//!
 //! # 既定
 //!
 //! `DENNO_EXPERT_IQ_STATS_FILE` か `DENNO_EXPERT_STATS_DIR` が未設定なら、
@@ -116,11 +145,43 @@ pub const PREFILL_STRIDE: usize = 8;
 /// 合わせ、既定は 2,000 MiB。
 pub const PRELOAD_RESERVE_MB_ENV: &str = "DENNO_EXPERT_IQ_PRELOAD_RESERVE_MB";
 
+/// task 798: warm プロファイルの明示パス (最優先)。
+///
+/// `DENNO_EXPERT_IQ_STATS_FILE` より先に見る。IQ ゲートも要らない
+/// (RAM tier だけの構成や、別ホストで作った履歴を配る用途)。
+pub const WARM_FILE_ENV: &str = "DENNO_EXPERT_WARM_FILE";
+
+/// task 798: 起動時に page cache を温める expert の本数 (`DENNO_START_WARM_EXPERTS`)。
+///
+/// 使用回数の多い側から N 本。`0` と未設定は warm しない (既存の起動プラン
+/// = VRAM tier → RAM tier はそのまま動く。この env は追加の 1 手だけ)。
+/// RAM tier / VRAM には積まない (lab t798b で RAM tier 版は +63% だった)。
+pub const WARM_EXPERTS_ENV: &str = "DENNO_START_WARM_EXPERTS";
+
+/// task 798: 起動時の warm で読むバイト上限 (`DENNO_START_WARM_MB`、MiB)。
+///
+/// 未設定は無制限 (熱い側から N 本ぶん全部)。
+pub const WARM_MB_ENV: &str = "DENNO_START_WARM_MB";
+
+/// [`WARM_EXPERTS_ENV`] の上限 (これを超える値は丸める)。
+///
+/// UD-Q4_K_XL でも 48 層 x 512 本 = 24,576 本なので、1 M 本あれば実質無制限。
+/// 桁の打ち間違い (10^9 など) で確保を試みないための柵。
+pub const MAX_WARM_EXPERTS: usize = 1 << 20;
+
+/// [`WARM_MB_ENV`] の上限 (MiB)。1 TiB。桁の打ち間違い用の柵。
+pub const MAX_WARM_MB: u64 = 1 << 20;
+
 /// [`PRELOAD_RESERVE_MB_ENV`] の既定値。
 pub const DEFAULT_PRELOAD_RESERVE_MB: usize = 2000;
 
 /// 形式の版。読む側は一致しなければ事前ロードしない。
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// 版 2 は `expert_bytes` の後ろに `fingerprint: u64` を持つ (task 798)。
+pub const FORMAT_VERSION: u32 = 2;
+
+/// 版 1 (指紋なし) のファイルも読む (古い履歴を捨てない)。
+pub const LEGACY_FORMAT_VERSION: u32 = 1;
 
 /// ファイル先頭の識別子 (8 バイト)。
 pub const MAGIC: [u8; 8] = *b"DNNOEXPS";
@@ -160,6 +221,41 @@ pub fn preload_reserve_bytes() -> usize {
     })
 }
 
+/// task 798: [`WARM_EXPERTS_ENV`] の解釈 (純関数)。
+///
+/// 未設定・空・非数は `None` (上限なし = 従来)。`0` は `Some(0)` (起動時に
+/// 載せない)。[`MAX_WARM_EXPERTS`] を超える値は丸める。
+pub fn warm_experts_from_value(v: Option<&str>) -> Option<usize> {
+    let s = v.map(str::trim).filter(|s| !s.is_empty())?;
+    let n = s.parse::<u64>().ok()?;
+    Some(n.min(MAX_WARM_EXPERTS as u64) as usize)
+}
+
+/// task 798: [`WARM_MB_ENV`] の解釈 (純関数)。
+///
+/// 未設定・空・非数は `None` (上限なし)。`0` は `Some(0)` (RAM tier へ
+/// 1 本も入れない)。[`MAX_WARM_MB`] を超える値は丸める。
+pub fn warm_mb_from_value(v: Option<&str>) -> Option<u64> {
+    let s = v.map(str::trim).filter(|s| !s.is_empty())?;
+    let n = s.parse::<u64>().ok()?;
+    Some(n.min(MAX_WARM_MB))
+}
+
+/// 起動時に載せる本数の上限 (env を 1 回だけ読む)。
+pub fn warm_experts_cap() -> Option<usize> {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| warm_experts_from_value(std::env::var(WARM_EXPERTS_ENV).ok().as_deref()))
+}
+
+/// 起動時に RAM tier へ入れるバイト上限 (env を 1 回だけ読む)。
+pub fn warm_mb_bytes() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        warm_mb_from_value(std::env::var(WARM_MB_ENV).ok().as_deref())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+    })
+}
+
 /// 有効条件 (純関数): IQ ゲートが on かつ記録先が設定されていること。
 ///
 /// どちらか欠けたら `None` = この機能は丸ごと off (数える分岐も通らない)。
@@ -194,21 +290,26 @@ pub fn stats_file_name(dir: &str, expert_bytes: u64) -> String {
     }
 }
 
-/// task 263: 記録先を決める (純関数)。
+/// task 263/798: 記録先を決める (純関数)。task 798 で warm の明示パスが最優先。
 ///
-/// 1. `DENNO_EXPERT_IQ_STATS_FILE` (明示パス) があればそれ。ただし従来どおり
+/// 1. `DENNO_EXPERT_WARM_FILE` (明示パス) があればそれ。IQ ゲートも要らない。
+/// 2. `DENNO_EXPERT_IQ_STATS_FILE` (明示パス) があればそれ。ただし従来どおり
 ///    `DENNO_EXPERT_IQ_GPU=1` が前提。
-/// 2. 無ければ `DENNO_EXPERT_STATS_DIR` + [`stats_file_name`]。こちらは
+/// 3. 無ければ `DENNO_EXPERT_STATS_DIR` + [`stats_file_name`]。こちらは
 ///    数える・保存するだけなので IQ ゲートを要らない (RAM tier だけ使う
 ///    構成でも履歴を貯められる)。
-/// 3. どちらも無ければ `None` (機能 off)。
+/// 4. どれも無ければ `None` (機能 off)。
 pub fn resolve_stats_path(
+    warm: Option<&str>,
     file: Option<&str>,
     dir: Option<&str>,
     model_dir: &str,
     expert_bytes: u64,
     iq_gpu: bool,
 ) -> Option<PathBuf> {
+    if let Some(p) = stats_file_from_value(warm) {
+        return Some(p);
+    }
     if let Some(p) = gate(iq_gpu, file) {
         return Some(p);
     }
@@ -236,9 +337,11 @@ fn path_slot() -> &'static std::sync::RwLock<Option<PathBuf>> {
 /// 何度呼んでも最後の値が勝つ (モデルの切り替えはプロセス再起動なので
 /// 実際には 1 回)。
 pub fn configure(model_dir: &str, expert_bytes: u64) -> Option<PathBuf> {
+    let warm = std::env::var(WARM_FILE_ENV).ok();
     let file = std::env::var(STATS_FILE_ENV).ok();
     let dir = std::env::var(STATS_DIR_ENV).ok();
     let p = resolve_stats_path(
+        warm.as_deref(),
         file.as_deref(),
         dir.as_deref(),
         model_dir,
@@ -436,6 +539,8 @@ pub struct Counts {
     pub dir: String,
     /// 全層の expert 3 行列の合計バイト数 (同一性の 2 つ目)
     pub expert_bytes: u64,
+    /// task 798: テンソル目録の指紋 (同一性の 3 つ目)。版 1 のファイルは 0。
+    pub fingerprint: u64,
     pub n_layer: u32,
     pub n_expert: u32,
     /// `[layer * n_expert + expert]` の回数
@@ -443,15 +548,29 @@ pub struct Counts {
 }
 
 impl Counts {
-    /// 0 で埋めたカウンタ (ファイルが無いときの代わり)。
+    /// 0 で埋めたカウンタ (ファイルが無いときの代わり)。指紋は 0。
     pub fn zeros(dir: &str, expert_bytes: u64, n_layer: u32, n_expert: u32) -> Self {
         Self {
             dir: dir.to_string(),
             expert_bytes,
+            fingerprint: 0,
             n_layer,
             n_expert,
             cells: vec![0; n_layer as usize * n_expert as usize],
         }
+    }
+
+    /// task 798: 指紋つきの 0 カウンタ (保存で指紋を落とさないため)。
+    pub fn zeros_with_fingerprint(
+        dir: &str,
+        expert_bytes: u64,
+        fingerprint: u64,
+        n_layer: u32,
+        n_expert: u32,
+    ) -> Self {
+        let mut c = Self::zeros(dir, expert_bytes, n_layer, n_expert);
+        c.fingerprint = fingerprint;
+        c
     }
 
     /// 回数 `> 0` のセルを `(層, expert)` で引く。範囲外は `None`。
@@ -470,10 +589,10 @@ impl Counts {
     }
 }
 
-/// ファイルへ書くバイト列 (版 1)。
+/// ファイルへ書くバイト列 (版 2、指紋つき)。
 pub fn encode(c: &Counts) -> Vec<u8> {
     let dir = c.dir.as_bytes();
-    let mut out = Vec::with_capacity(24 + dir.len() + 8 + c.cells.len() * 4);
+    let mut out = Vec::with_capacity(32 + dir.len() + 8 + c.cells.len() * 4);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&c.n_layer.to_le_bytes());
@@ -481,6 +600,7 @@ pub fn encode(c: &Counts) -> Vec<u8> {
     out.extend_from_slice(&(dir.len() as u32).to_le_bytes());
     out.extend_from_slice(dir);
     out.extend_from_slice(&c.expert_bytes.to_le_bytes());
+    out.extend_from_slice(&c.fingerprint.to_le_bytes());
     for v in &c.cells {
         out.extend_from_slice(&v.to_le_bytes());
     }
@@ -500,6 +620,9 @@ fn take_u64(b: &[u8], at: usize) -> Option<u64> {
 }
 
 /// バイト列を読む。形式・版・長さのどれかが違えば 1 行の理由を返す。
+///
+/// 版 2 は `expert_bytes` の後ろに `fingerprint: u64` を持つ。版 1 は指紋が
+/// 無いので 0 として読む (同一性の判定は従来どおり名前 + バイトだけで行う)。
 pub fn decode(b: &[u8]) -> Result<Counts, String> {
     if b.len() < 24 {
         return Err(format!("短すぎる ({} バイト < ヘッダ 24)", b.len()));
@@ -508,9 +631,9 @@ pub fn decode(b: &[u8]) -> Result<Counts, String> {
         return Err("識別子が違う (このファイルは expert 使用回数ではない)".to_string());
     }
     let version = take_u32(b, 8).ok_or("版が読めない")?;
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
         return Err(format!(
-            "版が違う ({version} != {FORMAT_VERSION})"
+            "版が違う ({version} != {FORMAT_VERSION}、受理する旧版は {LEGACY_FORMAT_VERSION})"
         ));
     }
     let n_layer = take_u32(b, 12).ok_or("n_layer が読めない")?;
@@ -522,10 +645,15 @@ pub fn decode(b: &[u8]) -> Result<Counts, String> {
         .ok_or("ディレクトリ名の長さがファイル長を超える")?;
     let dir = String::from_utf8_lossy(&b[24..dir_end]).to_string();
     let expert_bytes = take_u64(b, dir_end).ok_or("expert_bytes が読めない")?;
+    let (fingerprint, body) = if version >= 2 {
+        let fp = take_u64(b, dir_end + 8).ok_or("指紋が読めない")?;
+        (fp, dir_end + 16)
+    } else {
+        (0u64, dir_end + 8)
+    };
     let n_cells = (n_layer as usize)
         .checked_mul(n_expert as usize)
         .ok_or("セル数が溢れる")?;
-    let body = dir_end + 8;
     let want = body
         .checked_add(n_cells.saturating_mul(4))
         .ok_or("ファイル長が溢れる")?;
@@ -542,21 +670,37 @@ pub fn decode(b: &[u8]) -> Result<Counts, String> {
     Ok(Counts {
         dir,
         expert_bytes,
+        fingerprint,
         n_layer,
         n_expert,
         cells,
     })
 }
 
-/// 記録したモデルと目の前のモデルが同じか。
+/// 記録したモデルと目の前のモデルが同じか (名前と expert 合計バイト)。
 pub fn identity_matches(c: &Counts, dir: &str, expert_bytes: u64) -> bool {
     c.dir == dir && c.expert_bytes == expert_bytes
 }
 
-/// ファイルを読んで同一性を確かめる。
+/// task 798: 指紋が一致するか。版 1 のファイル (指紋 0) は判定しない。
+pub fn fingerprint_matches(c: &Counts, fingerprint: u64) -> bool {
+    c.fingerprint == 0 || c.fingerprint == fingerprint
+}
+
+/// task 798: 名前・バイト・指紋の 3 つで同一性を見る。
+pub fn identity_ok(c: &Counts, dir: &str, expert_bytes: u64, fingerprint: u64) -> bool {
+    identity_matches(c, dir, expert_bytes) && fingerprint_matches(c, fingerprint)
+}
+
+/// ファイルを読んで同一性を確かめる (task 798 で指紋も見る)。
 ///
 /// 失敗はすべて `Err` (呼び出し側は事前ロードをしない)。理由は 1 行。
-pub fn load_file(path: &Path, dir: &str, expert_bytes: u64) -> Result<Counts, String> {
+pub fn load_file(
+    path: &Path,
+    dir: &str,
+    expert_bytes: u64,
+    fingerprint: u64,
+) -> Result<Counts, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{} が読めない: {e}", path.display()))?;
     let c = decode(&bytes)?;
     if !identity_matches(&c, dir, expert_bytes) {
@@ -565,6 +709,12 @@ pub fn load_file(path: &Path, dir: &str, expert_bytes: u64) -> Result<Counts, St
             c.dir,
             c.expert_bytes as f64 / 1e9,
             expert_bytes as f64 / 1e9
+        ));
+    }
+    if !fingerprint_matches(&c, fingerprint) {
+        return Err(format!(
+            "別のリビジョンの記録 (指紋 {:016x} / 今回 {:016x})",
+            c.fingerprint, fingerprint
         ));
     }
     Ok(c)
@@ -649,6 +799,66 @@ pub fn fits(used: u64, want: u64, target: u64) -> bool {
     !budget_full(used as usize, want as usize, target as usize)
 }
 
+// ---------------------------------------------------------------------------
+// task 798: テンソル目録の指紋 (モデルの同一性の 3 つ目)
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64 の初期値。
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64 の素数。
+pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv_bytes(mut h: u64, b: &[u8]) -> u64 {
+    for &x in b {
+        h ^= x as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+fn fnv_u64(mut h: u64, v: u64) -> u64 {
+    for x in v.to_le_bytes() {
+        h ^= x as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// テンソル目録 `(名前, 量子型名, 次元)` の指紋 (純関数)。
+///
+/// **順序に依存する** (GGUF のファイル内順 = [`crate::gguf::GgufFile::tensor_order`])。
+/// 名前・型・次元のどれかが 1 つでも変われば別の値になる。バイト列 (= 重みの値)
+/// は見ない: 同じ目録で重みだけ差し替えたリビジョンは区別できないが、量子型の
+/// 取り違えとテンソルの増減・改名・次元変更は捕まえられる。
+pub fn inventory_fingerprint<'a, I>(items: I) -> u64
+where
+    I: IntoIterator<Item = (&'a str, &'a str, Vec<u64>)>,
+{
+    let mut h = FNV_OFFSET;
+    for (name, ty, ne) in items {
+        h = fnv_bytes(h, name.as_bytes());
+        h = fnv_bytes(h, ty.as_bytes());
+        h = fnv_u64(h, ne.len() as u64);
+        for d in ne {
+            h = fnv_u64(h, d);
+        }
+    }
+    h
+}
+
+/// GGUF のテンソル目録から指紋を作る (起動時に 1 回)。
+pub fn fingerprint_tensors(f: &crate::gguf::GgufFile) -> u64 {
+    let items: Vec<(&str, &str, Vec<u64>)> = f
+        .tensor_order
+        .iter()
+        .map(|name| match f.tensors.get(name) {
+            Some(t) => (name.as_str(), t.ty.name(), t.dims.to_vec()),
+            None => (name.as_str(), "?", Vec::new()),
+        })
+        .collect();
+    inventory_fingerprint(items)
+}
+
 /// task 263: plan (回数の昇順) を VRAM / RAM / mmap に割る (純関数)。
 ///
 /// `sizes[i]` は `plan[i]` の 1 本ぶんのバイト数。回数の多い側 (末尾) から
@@ -690,6 +900,8 @@ pub fn split_plan(sizes: &[u64], vram_target: u64, ram_budget: u64) -> (usize, u
 struct SaveState {
     dir: String,
     expert_bytes: u64,
+    /// task 798: テンソル目録の指紋 (保存に載せる)
+    fingerprint: u64,
     n_layer: u32,
     n_expert: u32,
     /// 前回までに保存した回数 (次回の保存で 1/2 に減衰させる)
@@ -705,6 +917,7 @@ fn state() -> &'static Mutex<SaveState> {
         Mutex::new(SaveState {
             dir: String::new(),
             expert_bytes: 0,
+            fingerprint: 0,
             n_layer: 0,
             n_expert: 0,
             prior: Vec::new(),
@@ -717,11 +930,19 @@ fn state() -> &'static Mutex<SaveState> {
 ///
 /// 事前ロードをしない条件 (ファイル無し・壊れている・別モデル) でも呼ぶ。
 /// 保存だけは続けたいため。task 263: ここで記録先も決める ([`configure`])。
-pub fn set_identity(dir: &str, expert_bytes: u64, n_layer: usize, n_expert: usize) -> Option<PathBuf> {
+/// task 798: テンソル目録の指紋も覚える (保存ファイルに載る)。
+pub fn set_identity(
+    dir: &str,
+    expert_bytes: u64,
+    fingerprint: u64,
+    n_layer: usize,
+    n_expert: usize,
+) -> Option<PathBuf> {
     let path = configure(dir, expert_bytes);
     if let Ok(mut s) = state().lock() {
         s.dir = dir.to_string();
         s.expert_bytes = expert_bytes;
+        s.fingerprint = fingerprint;
         s.n_layer = n_layer as u32;
         s.n_expert = n_expert as u32;
     }
@@ -733,10 +954,16 @@ pub fn set_identity(dir: &str, expert_bytes: u64, n_layer: usize, n_expert: usiz
 /// ここで過去ぶんを 1/2 にする (起動 1 回 = 減衰 1 回)。順位は変わらないが、
 /// これから積む今回のセッションの重みが相対的に上がる。何度も再起動すると
 /// 2^-N で古い履歴は消えていく。
+///
+/// task 798: 記録の指紋が 0 (版 1 か、空の代用カウンタ) なら
+/// [`set_identity`] が入れた指紋を消さない。
 pub fn install_prior(c: &Counts) {
     if let Ok(mut s) = state().lock() {
         s.dir = c.dir.clone();
         s.expert_bytes = c.expert_bytes;
+        if c.fingerprint != 0 {
+            s.fingerprint = c.fingerprint;
+        }
         s.n_layer = c.n_layer;
         s.n_expert = c.n_expert;
         s.prior = c.cells.iter().map(|v| v >> DECAY_SHIFT).collect();
@@ -753,6 +980,7 @@ pub fn prior_counts() -> Option<Counts> {
     Some(Counts {
         dir: s.dir.clone(),
         expert_bytes: s.expert_bytes,
+        fingerprint: s.fingerprint,
         n_layer: s.n_layer,
         n_expert: s.n_expert,
         cells: s.prior.clone(),
@@ -785,6 +1013,7 @@ pub fn save_now() -> Option<String> {
     let c = Counts {
         dir: s.dir.clone(),
         expert_bytes: s.expert_bytes,
+        fingerprint: s.fingerprint,
         n_layer: n_layer as u32,
         n_expert: n_expert as u32,
         cells: merged.clone(),
@@ -848,6 +1077,7 @@ pub fn current_counts() -> Option<Counts> {
     Some(Counts {
         dir: s.dir.clone(),
         expert_bytes: s.expert_bytes,
+        fingerprint: s.fingerprint,
         n_layer,
         n_expert,
         cells,
@@ -961,13 +1191,83 @@ mod tests {
         c
     }
 
-    /// 書き出しと読み戻しが一致する (版・次元・同一性つき)。
+    /// 書き出しと読み戻しが一致する (版・次元・同一性・指紋つき)。
     #[test]
     fn encode_decode_roundtrip() {
-        let c = sample();
+        let mut c = sample();
+        c.fingerprint = 0x1122_3344_5566_7788;
         let b = encode(&c);
         assert_eq!(decode(&b).expect("読める"), c);
-        assert_eq!(b.len(), 24 + "swift15-abl".len() + 8 + 6 * 4);
+        assert_eq!(b.len(), 24 + "swift15-abl".len() + 8 + 8 + 6 * 4);
+        // 版は 2
+        assert_eq!(u32::from_le_bytes([b[8], b[9], b[10], b[11]]), FORMAT_VERSION);
+    }
+
+    /// task 798: 版 1 のファイル (指紋なし) も読める。指紋は 0 になる。
+    #[test]
+    fn decode_accepts_legacy_version_one() {
+        let c = sample();
+        // 版 1 のバイト列を手で組む (指紋フィールドが無い)。
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC);
+        b.extend_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
+        b.extend_from_slice(&c.n_layer.to_le_bytes());
+        b.extend_from_slice(&c.n_expert.to_le_bytes());
+        b.extend_from_slice(&(c.dir.len() as u32).to_le_bytes());
+        b.extend_from_slice(c.dir.as_bytes());
+        b.extend_from_slice(&c.expert_bytes.to_le_bytes());
+        for v in &c.cells {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        let got = decode(&b).expect("版 1 が読めない");
+        assert_eq!(got.dir, c.dir);
+        assert_eq!(got.cells, c.cells);
+        assert_eq!(got.fingerprint, 0);
+        // 指紋 0 の記録はどの指紋でも通す (従来どおり名前 + バイトだけで判定)。
+        assert!(fingerprint_matches(&got, 0x1234_5678));
+        // 版 3 は拒否 (将来の形式を黙って読まない)。
+        let mut bad = b.clone();
+        bad[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode(&bad).unwrap_err().contains("版"));
+    }
+
+    /// task 798: 指紋が違えば別リビジョンとして落ちる。同じなら通る。
+    #[test]
+    fn fingerprint_rejects_other_revision() {
+        let mut c = sample();
+        c.fingerprint = 0xdead_beef_0000_0001;
+        assert!(fingerprint_matches(&c, 0xdead_beef_0000_0001));
+        assert!(!fingerprint_matches(&c, 0xdead_beef_0000_0002));
+        assert!(identity_ok(&c, "swift15-abl", 12_345, 0xdead_beef_0000_0001));
+        assert!(!identity_ok(&c, "swift15-abl", 12_345, 0xdead_beef_0000_0002));
+        // 名前が違えば指紋が同じでも落ちる
+        assert!(!identity_ok(&c, "swift15", 12_345, 0xdead_beef_0000_0001));
+    }
+
+    /// task 798: 指紋は目録の名前・型・次元に依存する (順序も見る)。
+    #[test]
+    fn inventory_fingerprint_is_deterministic_and_sensitive() {
+        let a = vec![
+            ("blk.0.ffn_gate_exps.weight", "Q4_K", vec![2560u64, 512]),
+            ("blk.0.ffn_down_exps.weight", "Q5_1", vec![640, 512]),
+        ];
+        let base = inventory_fingerprint(a.clone());
+        assert_eq!(base, inventory_fingerprint(a.clone()));
+        assert_ne!(base, FNV_OFFSET);
+        // 量子型が 1 つ違う (同じ次元・同じサイズ) → 別の指紋
+        let mut b = a.clone();
+        b[0].1 = "Q5_K";
+        assert_ne!(base, inventory_fingerprint(b));
+        // 次元が違う
+        let mut c2 = a.clone();
+        c2[1].2 = vec![640, 511];
+        assert_ne!(base, inventory_fingerprint(c2));
+        // 順序が違う
+        let mut d = a.clone();
+        d.reverse();
+        assert_ne!(base, inventory_fingerprint(d));
+        // 空の目録は初期値のまま (決定的)
+        assert_eq!(inventory_fingerprint(Vec::new()), FNV_OFFSET);
     }
 
     /// 壊れたファイル・別版・別長はすべて理由つきで落ちる (fail closed)。
@@ -981,9 +1281,9 @@ mod tests {
         let mut bad = b.clone();
         bad[0] = b'X';
         assert!(decode(&bad).unwrap_err().contains("識別子"));
-        // 版
+        // 版 (受理しない番号)
         let mut bad = b.clone();
-        bad[8..12].copy_from_slice(&2u32.to_le_bytes());
+        bad[8..12].copy_from_slice(&99u32.to_le_bytes());
         assert!(decode(&bad).unwrap_err().contains("版"));
         // 長さ (1 セル足りない)
         assert!(decode(&b[..b.len() - 4]).unwrap_err().contains("長さ"));
@@ -1100,25 +1400,52 @@ mod tests {
         assert!(n.len() <= "dnnoexps-".len() + 80 + "-7.bin".len(), "{n}");
     }
 
-    /// task 263: 明示ファイル > ディレクトリ > off の優先順。
+    /// task 263/798: warm の明示ファイル > 明示ファイル > ディレクトリ > off。
     #[test]
     fn resolve_path_prefers_explicit_file() {
+        // task 798: warm の明示パスが最優先 (IQ ゲートも要らない)
+        assert_eq!(
+            resolve_stats_path(Some("/w.bin"), Some("/tmp/s.bin"), Some("/d"), "m", 1, false),
+            Some(PathBuf::from("/w.bin"))
+        );
         // 明示ファイルは IQ ゲートが要る (従来どおり)
         assert_eq!(
-            resolve_stats_path(Some("/tmp/s.bin"), Some("/d"), "m", 1, true),
+            resolve_stats_path(None, Some("/tmp/s.bin"), Some("/d"), "m", 1, true),
             Some(PathBuf::from("/tmp/s.bin"))
         );
         assert_eq!(
-            resolve_stats_path(Some("/tmp/s.bin"), Some("/d"), "m", 1, false),
+            resolve_stats_path(None, Some("/tmp/s.bin"), Some("/d"), "m", 1, false),
             Some(PathBuf::from("/d").join(stats_file_name("m", 1)))
         );
         // ファイルが無ければディレクトリ + モデル名 (IQ ゲート不要)
         assert_eq!(
-            resolve_stats_path(None, Some(" /d "), "m", 1, false),
+            resolve_stats_path(None, None, Some(" /d "), "m", 1, false),
             Some(PathBuf::from("/d").join("dnnoexps-m-1.bin"))
         );
-        assert_eq!(resolve_stats_path(None, Some("  "), "m", 1, true), None);
-        assert_eq!(resolve_stats_path(None, None, "m", 1, true), None);
+        assert_eq!(resolve_stats_path(None, None, Some("  "), "m", 1, true), None);
+        assert_eq!(resolve_stats_path(None, None, None, "m", 1, true), None);
+    }
+
+    /// task 798: 起動時の本数・バイト上限の解釈と丸め。
+    #[test]
+    fn warm_limits_parse_and_clamp() {
+        // 本数: 未設定・空・非数は上限なし
+        assert_eq!(warm_experts_from_value(None), None);
+        assert_eq!(warm_experts_from_value(Some("")), None);
+        assert_eq!(warm_experts_from_value(Some("  ")), None);
+        assert_eq!(warm_experts_from_value(Some("x")), None);
+        // 0 は「載せない」
+        assert_eq!(warm_experts_from_value(Some("0")), Some(0));
+        assert_eq!(warm_experts_from_value(Some(" 4000 ")), Some(4000));
+        // 桁の打ち間違いは MAX に丸める
+        assert_eq!(warm_experts_from_value(Some("99999999999")), Some(MAX_WARM_EXPERTS));
+        // バイト: 未設定・空・非数は上限なし、0 は「1 本も入れない」
+        assert_eq!(warm_mb_from_value(None), None);
+        assert_eq!(warm_mb_from_value(Some("")), None);
+        assert_eq!(warm_mb_from_value(Some("z")), None);
+        assert_eq!(warm_mb_from_value(Some("0")), Some(0));
+        assert_eq!(warm_mb_from_value(Some("14336")), Some(14336));
+        assert_eq!(warm_mb_from_value(Some("99999999999")), Some(MAX_WARM_MB));
     }
 
     /// task 263: 覆う割合はキーの重複を 1 回だけ数える。
@@ -1192,11 +1519,18 @@ mod tests {
         let p = dir.join("s.bin");
         let c = sample();
         save_atomic(&p, &c).expect("保存");
-        let got = load_file(&p, "swift15-abl", 12_345).expect("読める");
+        let got = load_file(&p, "swift15-abl", 12_345, 0).expect("読める");
         assert_eq!(got, c);
         // 別モデルとしては読めない
-        let e = load_file(&p, "swift15-abl", 999).unwrap_err();
+        let e = load_file(&p, "swift15-abl", 999, 0).unwrap_err();
         assert!(e.contains("別のモデル"), "{e}");
+        // task 798: 指紋つきで保存したファイルは、別の指紋では読めない
+        let mut c = sample();
+        c.fingerprint = 0xabcd_ef01_2345_6789;
+        save_atomic(&p, &c).expect("保存");
+        let e = load_file(&p, "swift15-abl", 12_345, 0xabcd_ef01_2345_678a).unwrap_err();
+        assert!(e.contains("別のリビジョン"), "{e}");
+        load_file(&p, "swift15-abl", 12_345, 0xabcd_ef01_2345_6789).expect("同じ指紋なら読める");
         // 一時ファイルは残っていない
         let left: Vec<_> = std::fs::read_dir(&dir)
             .expect("dir")

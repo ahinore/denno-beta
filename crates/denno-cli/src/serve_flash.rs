@@ -3420,6 +3420,7 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let n_layer;
     let n_expert;
     let expert_bytes;
+    let fingerprint;
     let shape;
     {
         let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
@@ -3436,6 +3437,9 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         n_expert = p.n_expert;
         // task 146: 使用回数ファイルのモデル同一性 (全層の expert 3 行列の合計バイト)。
         expert_bytes = denno_engine::model::qwen4exp::expert_identity_bytes(&f, &p);
+        // task 798: テンソル目録の指紋。同じ名前 + 同じバイト数でも別リビジョンの
+        // プロファイルは読まない (保存ファイルにも載る)。
+        fingerprint = denno_engine::model::exp_stats::fingerprint_tensors(&f);
         // task 243: 冷えた page cache を起動時に温める (expert 行列だけ)。
         // 最初のリクエストが SSD から読み直すぶん (lab 実測で約 14 s) を
         // `listening` の前に前払いする。数値経路には触らない。
@@ -3568,18 +3572,26 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let stats_path =
-        denno_engine::model::exp_stats::set_identity(&model_dir_name, expert_bytes, n_layer, n_expert);
+    let stats_path = denno_engine::model::exp_stats::set_identity(
+        &model_dir_name,
+        expert_bytes,
+        fingerprint,
+        n_layer,
+        n_expert,
+    );
     let _stats_guard = if denno_engine::model::exp_stats::enabled() {
         eprintln!(
-            "[exp-stats] on file={} (iq_gpu={} vram={} ram={})",
+            "[exp-stats] on file={} (iq_gpu={} vram={} ram={} fp={:016x} warm_experts={} warm_mb={})",
             stats_path
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             u8::from(denno_engine::model::exp_iq::iq_gpu_enabled()),
             std::env::var("DENNO_EXPERT_VRAM_MB").unwrap_or_default(),
-            std::env::var("DENNO_EXPERT_RAM_MB").unwrap_or_default()
+            std::env::var("DENNO_EXPERT_RAM_MB").unwrap_or_default(),
+            fingerprint,
+            std::env::var(denno_engine::model::exp_stats::WARM_EXPERTS_ENV).unwrap_or_default(),
+            std::env::var(denno_engine::model::exp_stats::WARM_MB_ENV).unwrap_or_default()
         );
         // 起動プラン: 回数の多い順に VRAM tier → RAM tier。decode 中は譲り、
         // 走行中は RAM tier を回数に追従させる (低優先度)。

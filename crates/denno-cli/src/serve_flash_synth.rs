@@ -1988,7 +1988,7 @@ fn model_select_saves_expert_stats() {
     let sdir = TempDir::new("flash-select-stats-dir");
     std::env::remove_var(exp_stats::STATS_FILE_ENV);
     std::env::set_var(exp_stats::STATS_DIR_ENV, sdir.path("stats"));
-    exp_stats::set_identity("modelA", 3_072_000, 2, 4);
+    exp_stats::set_identity("modelA", 3_072_000, 0, 2, 4);
     let path = exp_stats::stats_path().expect("記録先が決まらない");
     exp_stats::install_prior(&exp_stats::Counts::zeros("modelA", 3_072_000, 2, 4));
     exp_stats::observe_layer(2, 4, 1, &[0, 3, 3]);
@@ -2001,7 +2001,7 @@ fn model_select_saves_expert_stats() {
         "切り替えで使用回数が書かれていない: {}",
         path.display()
     );
-    let saved = exp_stats::load_file(&path, "modelA", 3_072_000).expect("保存したファイルが読める");
+    let saved = exp_stats::load_file(&path, "modelA", 3_072_000, 0).expect("保存したファイルが読める");
     assert_eq!(saved.get(1, 0), Some(1), "層 1 expert 0 の回数");
     assert_eq!(saved.get(1, 3), Some(2), "層 1 expert 3 の回数");
     assert!(!exp_stats::dirty(), "保存したのに dirty のまま");
@@ -2051,7 +2051,7 @@ fn sigterm_saves_stats_before_exit() {
         .map(|e| e.path())
         .find(|p| p.extension().map(|x| x == "bin").unwrap_or(false))
         .expect("保存ファイルが無い");
-    let c = denno_engine::model::exp_stats::load_file(&path, "sigterm", 3_072_000)
+    let c = denno_engine::model::exp_stats::load_file(&path, "sigterm", 3_072_000, 0)
         .expect("保存ファイルが読める");
     assert_eq!(c.get(1, 0), Some(1), "層 1 expert 0 の回数");
     assert_eq!(c.get(1, 3), Some(2), "層 1 expert 3 の回数");
@@ -2073,7 +2073,7 @@ fn sigterm_child_saves_and_exits() {
     };
     std::env::remove_var(exp_stats::STATS_FILE_ENV);
     std::env::set_var(exp_stats::STATS_DIR_ENV, &dir);
-    exp_stats::set_identity("sigterm", 3_072_000, 2, 4);
+    exp_stats::set_identity("sigterm", 3_072_000, 0, 2, 4);
     exp_stats::install_prior(&exp_stats::Counts::zeros("sigterm", 3_072_000, 2, 4));
     exp_stats::observe_layer(2, 4, 1, &[0, 3, 3]);
     assert!(exp_stats::dirty(), "数えたのに dirty でない");
