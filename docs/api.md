@@ -41,6 +41,74 @@ Anthropic Messages API 互換。対応フィールド:
 
 `stop_reason`: `end_turn` / `max_tokens` / `stop_sequence` / `tool_use`(tools 使用時)
 
+## POST /v1/chat/completions (OpenAI 互換)
+
+P793: OpenAI Chat Completions API 互換の経路。`/v1/messages` と**同じ** Scheduler・
+chat template・KV prefix cache・engine を通る (違うのはワイヤ形式だけ)。既定の
+`thinking` も `/v1/messages` と同じ (`brief` = 思考無効 + 短答誘導文) なので、
+同じ会話を両方へ投げると本文・usage は一致する。
+
+| フィールド | 対応 |
+| --- | --- |
+| `model` (任意) | serve 時の `--name`。不一致は 404 (`error.type = invalid_request_error`)。空/未指定は受理 |
+| `messages` (必須) | role は `system` / `developer` / `user` / `assistant` / `tool` / `function`。`system`・`developer` は system プロンプトへ、`tool`・`function` は user 発話として履歴へ織り込む。未知の role は 400 (`param = messages[i].role`)。空配列は 400 |
+| `content` | 文字列 or content parts 配列 (`{"type":"text","text":...}` / `"input_text"`)。text 以外 (image_url 等) は無視。null は空文字 |
+| `max_tokens` / `max_completion_tokens` | `max_tokens` 優先。未指定は 1024、明示は上限 4096 で clamp (どちらも `/v1/messages` と同一) |
+| `temperature` / `top_p` | 対応 (`--temperature-cap` のクランプも同一) |
+| `stop` | 文字列 or 文字列配列 (空文字は無視) |
+| `stream` | true で SSE |
+| `stream_options.include_usage` | true で最終 usage chunk (choices が空の chunk) を追加 |
+| その他 | 未知フィールドは無視 (serde 既定)。`tools` は未対応 (受け流すだけ) |
+
+応答 (非ストリーミング):
+
+```json
+{
+  "id": "chatcmpl-1a2b...",
+  "object": "chat.completion",
+  "created": 1763900000,
+  "model": "denno-test",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "..."},
+    "logprobs": null,
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46}
+}
+```
+
+`finish_reason`: `stop` (`end_turn` / `stop_sequence`) / `length` (`max_tokens`)。
+
+ストリーミング (`stream: true`)。`event:` 行は付けず `data:` 行だけを流し、
+最後に `data: [DONE]` で終わる:
+
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"denno-test","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"..."},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}
+
+data: [DONE]
+```
+
+(usage chunk は `stream_options.include_usage: true` のときだけ。それ以外の chunk に
+`usage` は入らない。) keep-alive は SSE コメント行 (`: ping`) で送るため、
+`data:` を JSON として読むクライアントには見えない。生成中のクライアント切断は
+scheduler の切断スイープで検知し、KV スロットを解放する (後続リクエストは通る)。
+
+エラーは OpenAI 形式:
+
+```json
+{"error": {"message": "...", "type": "invalid_request_error", "param": "messages", "code": null}}
+```
+
+400 = リクエスト不正 (本文/role/messages)。404 = 未知モデル。503 = キュー溢れ。
+500 = engine 側の失敗。
+
 ## tool use (tools / tool_choice)
 
 Anthropic 形式のツール定義を chat template の `tools` 変数 (Qwen/HF 形式へ変換) で
@@ -237,7 +305,10 @@ tools + stream の場合、生成中の `<tool_call>` block は block 単位で�
 
 ## その他
 
-- `GET /v1/models`: serve 中のモデルID と context_length。各要素に `"owned_by": "denno"` が付く (task 347。`DENNO_MODELS_OWNED_BY=0` で従来の形)
+- `GET /v1/models`: serve 中のモデルID と context_length。P793 から OpenAI 形式
+  (`{"object":"list","data":[{"id","object":"model","created","owned_by":"denno"}]}`) の
+  フィールドも併記する (既存の `type` / `display_name` / `context_length` / `has_more` は
+  そのまま — Anthropic 側クライアントも同じ応答で動く)
 - `GET /health`: `{"status": "ok"}`
 
 ## GET /metrics (Prometheus)
