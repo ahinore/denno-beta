@@ -65,6 +65,11 @@ enum Commands {
         /// 1 リクエストの生成上限 (max_tokens 未指定時の既定でもある)
         #[arg(long, default_value_t = 512)]
         max_tokens: usize,
+        /// task 796: MTP (nextn) head の safetensors。未指定なら
+        /// 環境変数 `DENNO_MTP_PATH` を見る。どちらも無ければ従来どおり
+        /// (MTP を読まない) 起動する。config.json は同じディレクトリに置く。
+        #[arg(long)]
+        mtp_path: Option<PathBuf>,
     },
     /// HTTP サーバー起動 (Anthropic Messages API)
     Serve {
@@ -578,7 +583,7 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens } => {
+        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens, mtp_path } => {
             serve_flash::run(serve_flash::FlashConfig {
                 dir,
                 host,
@@ -586,6 +591,7 @@ fn main() -> Result<()> {
                 max_ctx,
                 name: name.unwrap_or_else(|| "qwen3.8-flash-next".to_string()),
                 max_tokens,
+                mtp_path,
             })?;
         }
         Commands::Pull { repo } => {

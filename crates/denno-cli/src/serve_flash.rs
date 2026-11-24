@@ -88,6 +88,9 @@ pub struct FlashConfig {
     pub name: String,
     /// 既定の生成上限 (リクエストの max_tokens が無いとき)
     pub max_tokens: usize,
+    /// task 796: MTP (nextn) head の safetensors。`None` かつ
+    /// `DENNO_MTP_PATH` 未設定なら MTP を読まない (既定起動は不変)。
+    pub mtp_path: Option<PathBuf>,
 }
 
 fn shards(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -3360,6 +3363,39 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     spawn_sigterm_saver();
     // task 119b: プールの初回使用 (モデル読み込み) の前に既定スレッド数を決める。
     ensure_rayon_pool();
+    // task 796: MTP (nextn) head のロード。`--mtp-path` か `DENNO_MTP_PATH` が
+    // あるときだけ読む (どちらも無ければ従来どおり読まない = 既定起動は不変)。
+    // ここでは safetensors の検証と f32 展開までで、decode ループへの
+    // draft 統合は次のタスク (`MtpModel::draft` が入口)。
+    let _mtp = {
+        let path = cfg
+            .mtp_path
+            .clone()
+            .or_else(denno_engine::model::mtp::path_from_env);
+        match path {
+            Some(p) => {
+                let t = Instant::now();
+                let m = denno_engine::model::mtp::MtpModel::open(&p)
+                    .with_context(|| format!("MTP 重み {} を読めない", p.display()))?;
+                eprintln!(
+                    "[flash] mtp: {} tensors, {:.1} MB, host f32 {:.0} MB, {:.2} s ({})",
+                    m.tensor_count(),
+                    m.file_bytes() as f64 / 1e6,
+                    m.host_f32_bytes() as f64 / 1e6,
+                    t.elapsed().as_secs_f64(),
+                    p.display()
+                );
+                Some(m)
+            }
+            None => {
+                eprintln!(
+                    "[flash] mtp: off (--mtp-path / {} 未設定)",
+                    denno_engine::model::mtp::MTP_PATH_ENV
+                );
+                None
+            }
+        }
+    };
     // task 361: ミス経路の行幅 (`DENNO_EXP_MISS_ROWS`、既定 16) を起動時に 1 行で出す。
     eprintln!(
         "[flash] exp miss rows: {} (DENNO_EXP_MISS_ROWS)",
