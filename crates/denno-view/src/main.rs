@@ -243,6 +243,8 @@ fn build_router(app: AppState) -> Router {
         .route("/arch2d.mjs", get(arch2d_mjs))
         .route("/nodes2d.mjs", get(nodes2d_mjs))
         .route("/hud2d.mjs", get(hud2d_mjs))
+        .route("/dash.mjs", get(dash_mjs))
+        .route("/keys3d.mjs", get(keys3d_mjs))
         .route("/vendor/*path", get(vendor))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
@@ -544,6 +546,18 @@ async fn nodes2d_mjs() -> axum::response::Response {
 /// GET /hud2d.mjs — /2d のライブ性能 HUD とプリセット (task 809)。DOM 非依存。
 async fn hud2d_mjs() -> axum::response::Response {
     js_response(include_str!("hud2d.mjs"))
+}
+
+/// GET /dash.mjs — / のライブ計器 (decode / prefill / vram) と API 案内
+/// (task 813)。DOM 非依存。
+async fn dash_mjs() -> axum::response::Response {
+    js_response(include_str!("dash.mjs"))
+}
+
+/// GET /keys3d.mjs — /3d のカメラブックマークとキーボード凡例 (task 813)。
+/// DOM 非依存。
+async fn keys3d_mjs() -> axum::response::Response {
+    js_response(include_str!("keys3d.mjs"))
 }
 
 /// GET /frames.mjs — 3D ビューアが import するフレームデコーダ。
@@ -888,6 +902,46 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("upstream unreachable"));
+    }
+
+    /// task 813: / は dash.mjs、/3d は keys3d.mjs を読み、両モジュールが
+    /// text/javascript で配信される。
+    #[tokio::test]
+    async fn dashboard_and_viewer3d_modules_are_served() {
+        let base = serve(build_router(test_state("http://127.0.0.1:1"))).await;
+        let c = reqwest::Client::new();
+
+        let r = c.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let html = r.text().await.unwrap();
+        assert!(html.contains("/dash.mjs"), "/ が dash.mjs を読んでいない");
+        assert!(html.contains("id=\"rates\""), "スパークラインの器が無い");
+        assert!(html.contains("id=\"ep-openai\""), "OpenAI の URL 欄が無い");
+        assert!(html.contains("id=\"ep-anthropic\""), "Anthropic の URL 欄が無い");
+
+        let r = c.get(format!("{base}/3d")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let html3 = r.text().await.unwrap();
+        assert!(html3.contains("/keys3d.mjs"), "/3d が keys3d.mjs を読んでいない");
+        assert!(html3.contains("id=\"keys-rows\""), "凡例の行が無い");
+
+        for (p, needle) in [
+            ("/dash.mjs", "export function createDash("),
+            ("/keys3d.mjs", "export function bookmarkForKey("),
+        ] {
+            let r = c.get(format!("{base}{p}")).send().await.unwrap();
+            assert_eq!(r.status(), 200, "GET {p}");
+            assert!(
+                r.headers()
+                    .get("content-type")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/javascript"),
+                "{p} の content-type"
+            );
+            assert!(r.text().await.unwrap().contains(needle), "{p}");
+        }
     }
 
     /// GET /capture.bin の応答実体。ルート登録そのものはテストしない
