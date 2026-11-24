@@ -696,7 +696,10 @@ impl InMessage {
 /// tool_use block を公式テンプレート (Qwen3.5) がモデルに出力させる
 /// `<tool_call>` XML 形式へ変換する (履歴織り込み用。モデル自身の出力と同一形式)。
 /// 非文字列値は tojson 相当の JSON 直列化、文字列値は raw のまま (公式テンプレート準拠)。
-fn tool_use_to_xml(name: &str, input: &serde_json::Value) -> String {
+///
+/// P797: OpenAI 経路 (openai.rs) の assistant `tool_calls` 履歴もこの形式へ写す
+/// (モデルが見る履歴を `/v1/messages` と同一にするため crate 内に公開)。
+pub(crate) fn tool_use_to_xml(name: &str, input: &serde_json::Value) -> String {
     let mut s = format!("<tool_call>\n<function={name}>\n");
     if let Some(obj) = input.as_object() {
         for (k, v) in obj {
