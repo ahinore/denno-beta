@@ -5117,7 +5117,7 @@ impl Qwen4Exp {
     /// (`ple.ngram` の窓は末尾 3 個 = 現在 + 直前 2)。PLE が無いモデルでは
     /// 末尾しか使わない。
     pub fn forward_token(&mut self, ctx: &[u32]) -> Result<Vec<f32>> {
-        self.forward_token_at(ctx, 0, 1, None, None)
+        self.forward_token_at(ctx, 0, 1, false, None, None)
     }
 
     /// [`Qwen4Exp::forward_token`] の層ごとフック付き版。
@@ -5129,7 +5129,7 @@ impl Qwen4Exp {
         F: FnMut(usize, &[f32]) -> Result<()>,
     {
         let mut hook = |o: &LayerOut<'_>| -> Result<()> { on_layer(o.il, o.res) };
-        self.forward_token_at(ctx, 0, 1, Some(&mut hook), None)
+        self.forward_token_at(ctx, 0, 1, false, Some(&mut hook), None)
     }
 
     /// P53: 層の出口観測フック付きの 1 トークン forward。
@@ -5161,7 +5161,7 @@ impl Qwen4Exp {
             on_layer(o);
             Ok(())
         };
-        self.forward_token_at(ctx, 0, 1, Some(&mut hook), roles)
+        self.forward_token_at(ctx, 0, 1, false, Some(&mut hook), roles)
     }
 
     /// head (`output`) の GEMV を 1 回だけ回し、`DENNO_HEAD_PROF` の区間を積む。
@@ -5213,6 +5213,7 @@ impl Qwen4Exp {
         ctx: &[u32],
         t: usize,
         nt: usize,
+        is_prefill: bool,
         mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         mut roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
@@ -5299,7 +5300,13 @@ impl Qwen4Exp {
                 iv,
             )?;
             if steer_rec {
-                steer::acc_host(il, &res.data);
+                // task 829: prefill は位置付きで渡す (LastPromptToken は最終トークンだけ)。
+                // decode (`is_prefill = false`) は acc_host 側で LastPromptToken のとき捨てる。
+                if is_prefill {
+                    steer::acc_host_prefill(il, &res.data, t, nt);
+                } else {
+                    steer::acc_host(il, &res.data);
+                }
             }
             if let Some(h) = on_layer.as_deref_mut() {
                 // task 155: 層の出口 (`LayerOut` の組み立てと `on_layer`) を `loop` 行に。

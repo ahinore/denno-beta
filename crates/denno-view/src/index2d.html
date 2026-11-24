@@ -385,6 +385,11 @@
       <div class="small dim">1 行 1 プロンプト。A = 消したい向き、B = 残したい向き (符号は A +1 / B -1)。</div>
       <label class="f">Set A (positive)<textarea id="ab-a" rows="3" placeholder="prompts (A) — one per line"></textarea></label>
       <label class="f">Set B (negative)<textarea id="ab-b" rows="3" placeholder="prompts (B) — one per line"></textarea></label>
+      <label class="f">capture mode
+        <select id="ab-mode">
+          <option value="last_prompt_token" selected>last_prompt_token (prefill の最終トークンだけ)</option>
+          <option value="all">all (全プロンプトトークンの平均)</option>
+        </select></label>
       <div class="row2">
         <button id="ab-load" class="b" title="サンプルを入れる (A: 拒否しそうな題、B: 無害な題)">load sample</button>
         <button id="ab-clearset" class="b">clear sets</button>
@@ -459,9 +464,10 @@ import {
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
   toggleItem, addItem, removeItem, selectionItems, wallHitTest,
   wallItemsInRect, wallLayout, hasItem,
-  ABLIT_A, ABLIT_B, ablitApplyBody, ablitChart, ablitCompareRows, ablitExportName,
-  ablitExportUrl, ablitImportBody, ablitLayerAt, ablitRange, ablitRangeFromDrag,
-  ablitSepScores, ablitSummary, parsePromptList,
+  ABLIT_A, ABLIT_B, ABLIT_CAPTURE_MODE, CAPTURE_MODES, ablitApplyBody, ablitChart,
+  ablitCompareRows, ablitExportName, ablitExportUrl, ablitImportBody, ablitLayerAt,
+  ablitRange, ablitRangeFromDrag, ablitRecordBody, ablitSepScores, ablitSummary,
+  parsePromptList,
 } from '/view2d.mjs';
 import {
   archLayout, archHitTest, archItemsInRect, archNodeRect, drawArch, fitView, gridPixels,
@@ -1474,7 +1480,15 @@ async function captureAblitSets() {
   const done = [];
   try {
     for (const [label, name, list] of [['A', ABLIT_A, A], ['B', ABLIT_B, B]]) {
-      const r = await api('POST', '/v1/steer/record', { name });
+      // task 829: capture mode は画面のセレクタ (既定 last_prompt_token)。
+      let recBody;
+      try {
+        recBody = ablitRecordBody(name, $('ab-mode').value || ABLIT_CAPTURE_MODE);
+      } catch (e) {
+        ablitErr('record ' + name + ' → ' + ((e && e.message) ? e.message : String(e)));
+        break;
+      }
+      const r = await api('POST', '/v1/steer/record', recBody);
       if (r.status !== 200) {
         ablitErr('record ' + name + ' → ' + r.status + ' ' + errText(r));
         break;

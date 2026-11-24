@@ -1042,6 +1042,29 @@ export const ABLIT_B = 'ablit_B';
 export const ABLIT_ALPHA_MIN = 0;
 export const ABLIT_ALPHA_MAX = 2;
 
+// ---- 残差の取り方 (task 829) --------------------------------------------
+//
+// `POST /v1/steer/record` の `capture_mode`。`all` は全プロンプトトークンの
+// 平均 (従来)、`last_prompt_token` は prefill の最終トークンだけ。
+// Abliterate タブの既定は `last_prompt_token` (difference-in-means の信号が濃い)。
+
+/// 実 API が受ける値 (これ以外は 400)。
+export const CAPTURE_MODES = ['all', 'last_prompt_token'];
+/// Abliterate タブの既定。
+export const ABLIT_CAPTURE_MODE = 'last_prompt_token';
+
+/// `/v1/steer/record` の本文。name と capture_mode を実 API の規則で検証する。
+export function ablitRecordBody(name, captureMode) {
+  const s = typeof name === 'string' ? name : '';
+  if (!s) throw new Error('name: required');
+  if (!NAME_RE.test(s)) throw new Error('name: A-Z a-z 0-9 _ - only, at most 64 chars');
+  const m = captureMode == null ? ABLIT_CAPTURE_MODE : String(captureMode);
+  if (CAPTURE_MODES.indexOf(m) < 0) {
+    throw new Error('capture_mode: ' + CAPTURE_MODES.join(' / ') + ' (got ' + m + ')');
+  }
+  return { name: s, capture_mode: m };
+}
+
 /// テキストエリアの改行区切り → プロンプトの配列 (空行は捨てる)。
 export function parsePromptList(text, opts = {}) {
   if (typeof text !== 'string') return [];
@@ -1434,6 +1457,8 @@ export function createMockStore(shape, opts = {}) {
     snapshots: [],
     apply: null,
     tokens: 0,
+    // task 829: 直近に使った capture_mode (実 API の GET /v1/steer と同じ)。
+    last_capture_mode: 'all',
     // 実 API の main 文脈のトークン数 (GET / DELETE /v1/cache)。
     ctx_tokens: 0,
   };
@@ -1507,6 +1532,7 @@ export function createMockStore(shape, opts = {}) {
   function status() {
     return {
       epoch: st.epoch,
+      capture_mode: st.recording ? st.recording.capture_mode : st.last_capture_mode,
       recording: jsonClone(st.recording),
       snapshots: jsonClone(st.snapshots),
       apply: jsonClone(st.apply),
@@ -1657,13 +1683,21 @@ export function createMockStore(shape, opts = {}) {
       if (m === 'POST' && p === '/v1/steer/record') {
         if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'body must be an object');
         for (const k of Object.keys(body)) {
-          if (k !== 'name') return err(400, 'unknown field ' + JSON.stringify(k) + ' (name only)');
+          if (k !== 'name' && k !== 'capture_mode') {
+            return err(400, 'unknown field ' + JSON.stringify(k) + ' (name / capture_mode only)');
+          }
         }
         const name = typeof body.name === 'string' ? body.name : '';
         if (!name) return err(400, 'name is required');
         if (!NAME_RE.test(name)) return err(400, 'name: A-Z a-z 0-9 _ - only, at most 64 chars');
+        // task 829: 未知の capture_mode は実 API と同じく 400 (黙って all にしない)。
+        const cm = body.capture_mode == null ? 'all' : body.capture_mode;
+        if (typeof cm !== 'string' || CAPTURE_MODES.indexOf(cm) < 0) {
+          return err(400, 'capture_mode: ' + CAPTURE_MODES.join(' / ') + ' (got ' + JSON.stringify(cm) + ')');
+        }
         if (st.recording) return err(400, 'already recording: ' + st.recording.name);
-        st.recording = { name, tokens: 0, created: now() };
+        st.last_capture_mode = cm;
+        st.recording = { name, tokens: 0, created: now(), capture_mode: cm };
         return { status: 200, body: status() };
       }
       if (m === 'POST' && p === '/v1/steer/record/stop') {

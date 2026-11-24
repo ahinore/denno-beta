@@ -449,7 +449,7 @@ test('モック店: 記録 → snapshot → 削除 → apply / clear (実 API �
 
   // GET /v1/steer は epoch も返す (実 API。intervene と共有)。
   assert.deepEqual(m.handle('GET', '/v1/steer').body,
-    { epoch: 0, recording: null, snapshots: [], apply: null });
+    { epoch: 0, capture_mode: 'all', recording: null, snapshots: [], apply: null });
   assert.equal(m.handle('POST', '/v1/steer/record/stop').status, 400, '記録していないのに stop (実 API は 400)');
   assert.equal(m.handle('POST', '/v1/steer/record', {}).status, 400, '名前なし');
   assert.equal(m.handle('POST', '/v1/steer/record', { name: 'a b' }).status, 400, '使えない文字');
@@ -461,7 +461,7 @@ test('モック店: 記録 → snapshot → 削除 → apply / clear (実 API �
   m.tick(3);
   assert.equal(m.handle('GET', '/v1/steer').body.recording.tokens, 3);
   assert.deepEqual(m.handle('GET', '/v1/steer').body.recording,
-    { name: 'A', tokens: 3, created: 1762732800 });
+    { name: 'A', tokens: 3, created: 1762732800, capture_mode: 'all' });
 
   // stop の応答は status + saved (実 API と同じ)。snapshot.layers は層数 (数値)。
   const snap = m.handle('POST', '/v1/steer/record/stop');

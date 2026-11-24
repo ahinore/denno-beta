@@ -7,11 +7,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  ABLIT_A, ABLIT_B, ABLIT_ALPHA_MAX, DEFAULT_SHAPE_RAW,
+  ABLIT_A, ABLIT_B, ABLIT_ALPHA_MAX, ABLIT_CAPTURE_MODE, CAPTURE_MODES, DEFAULT_SHAPE_RAW,
   ablitApplyBody, ablitChart, ablitCompareRows, ablitExportName, ablitExportUrl,
   ablitHybridValue, ablitImportBody, ablitLayerAt, ablitRange, ablitRangeFromDrag,
-  ablitRecommendedRange, ablitSepScores, ablitSummary, createMockStore, parsePromptList,
-  steerApplyBody,
+  ablitRecommendedRange, ablitRecordBody, ablitSepScores, ablitSummary, createMockStore,
+  parsePromptList, steerApplyBody,
 } from '../src/view2d.mjs';
 import { archLayout, drawArch, fitView } from '../src/arch2d.mjs';
 
@@ -240,6 +240,56 @@ test('モック: analyze / export / import が実 API の検証規則で答え�
   // 名前は query で上書きできる (実 API と同じ)。
   const im2 = m.handle('POST', '/v1/steer/import?name=ablit_q', { name: 'ignored', layers: 8 });
   assert.equal(im2.body.imported.name, 'ablit_q');
+});
+
+test('ablitRecordBody / CAPTURE_MODES: capture mode の本文と検証 (task 829)', () => {
+  assert.deepEqual(CAPTURE_MODES, ['all', 'last_prompt_token']);
+  assert.equal(ABLIT_CAPTURE_MODE, 'last_prompt_token');
+  // 省略時は画面の既定 (last_prompt_token)。
+  assert.deepEqual(ablitRecordBody('ablit_A'), { name: 'ablit_A', capture_mode: 'last_prompt_token' });
+  assert.deepEqual(ablitRecordBody('ablit_B', 'all'), { name: 'ablit_B', capture_mode: 'all' });
+  assert.deepEqual(ablitRecordBody('ablit_B', 'last_prompt_token'),
+    { name: 'ablit_B', capture_mode: 'last_prompt_token' });
+  assert.throws(() => ablitRecordBody('', 'all'), /name/);
+  assert.throws(() => ablitRecordBody('a b', 'all'), /name/);
+  assert.throws(() => ablitRecordBody('a'.repeat(65), 'all'), /name/);
+  assert.throws(() => ablitRecordBody('ablit_A', 'bogus'), /capture_mode/);
+  assert.throws(() => ablitRecordBody('ablit_A', 'ALL'), /capture_mode/);
+});
+
+test('モック: record が capture_mode を受け、status が返し、未知の値は 400 (task 829)', () => {
+  const m = createMockStore({ layers: 8, n_expert: 8, n_expert_used: 2, n_hc: 1, n_embd: 16 },
+    { now: () => 1762732800 });
+  // 記録前は "all" (実 API の既定と同じ)。
+  assert.equal(m.handle('GET', '/v1/steer').body.capture_mode, 'all');
+
+  const r = m.handle('POST', '/v1/steer/record', ablitRecordBody('ablit_A'));
+  assert.equal(r.status, 200);
+  assert.equal(r.body.capture_mode, 'last_prompt_token');
+  assert.equal(r.body.recording.capture_mode, 'last_prompt_token');
+  assert.equal(m.handle('GET', '/v1/steer').body.capture_mode, 'last_prompt_token');
+  m.tick(1);
+  const stp = m.handle('POST', '/v1/steer/record/stop');
+  assert.equal(stp.status, 200);
+  // stop 後も直近の値が残る (実 API と同じ)。
+  assert.equal(m.handle('GET', '/v1/steer').body.capture_mode, 'last_prompt_token');
+
+  // "all" も通り、省略時は all。
+  assert.equal(m.handle('POST', '/v1/steer/record', { name: 'ablit_B' }).status, 200);
+  assert.equal(m.handle('GET', '/v1/steer').body.capture_mode, 'all');
+  m.tick(1);
+  m.handle('POST', '/v1/steer/record/stop');
+  assert.equal(m.handle('POST', '/v1/steer/record',
+    { name: 'ablit_B', capture_mode: 'all' }).status, 200);
+  m.handle('POST', '/v1/steer/record/stop');
+
+  // 不正は 400 (黙って all にしない)。
+  assert.equal(m.handle('POST', '/v1/steer/record',
+    { name: 'ablit_A', capture_mode: 'bogus' }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/record',
+    { name: 'ablit_A', capture_mode: 1 }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/record',
+    { name: 'ablit_A', capture_mode: 'last_prompt_token', x: 1 }).status, 400);
 });
 
 /// 描画は呼んだ命令を数えるだけの偽 context。

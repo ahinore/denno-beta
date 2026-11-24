@@ -8149,6 +8149,21 @@ pub fn pf_steer_acc_reset() -> bool {
 /// task 218: 1 層ぶん加算する (`res` は `[nt][hc][e]` = 直前に pf_combine が
 /// 書いた残差)。
 pub fn pf_steer_acc(nt: usize, hc: usize, e: usize, layer: usize) -> bool {
+    pf_steer_acc_from(nt, hc, e, layer, 0)
+}
+
+/// task 829: `[nt][hc][e]` のうち最後の 1 行 (`nt - 1`) だけを加算する。
+///
+/// 同じカーネルを `nt = 1` で、行の先頭ポインタをずらして当てる
+/// (新しい PTX は要らない。値は `pf_steer_acc(1, ...)` を最後の行に当てたのと同じ)。
+pub fn pf_steer_acc_last(nt: usize, hc: usize, e: usize, layer: usize) -> bool {
+    if nt == 0 {
+        return true;
+    }
+    pf_steer_acc_from(1, hc, e, layer, nt - 1)
+}
+
+fn pf_steer_acc_from(nt: usize, hc: usize, e: usize, layer: usize, row0: usize) -> bool {
     if nt == 0 {
         return true;
     }
@@ -8172,7 +8187,7 @@ pub fn pf_steer_acc(nt: usize, hc: usize, e: usize, layer: usize) -> bool {
                 return pf_fail("steer acc: 残差の作業域が無い");
             };
             let stride = hc * e;
-            let (mut pres, mut pacc) = (res.ptr(), acc.ptr());
+            let (mut pres, mut pacc) = (res.ptr() + (row0 * stride * 4) as u64, acc.ptr());
             let (mut nt_c, mut hc_c, mut e_c, mut l_c) =
                 (nt as i32, hc as i32, e as i32, layer as i32);
             let grid = (stride.div_ceil(256) as u32, 1, 1);

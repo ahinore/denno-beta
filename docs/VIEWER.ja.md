@@ -58,7 +58,7 @@ mixer: kind == "qsa" and layer % 8 == 3; moe: layer in [5, 9, 17]
 - `GET /v1/steer/export?name=<snap>[&format=json]` — 保存済みの DNSTEER1 スナップショット、または同じバイト列を base64 にした JSON。
 - `POST /v1/steer/import[?name=<new>]` — DNSTEER1 の本文か、`data_base64` / `mean` 配列を持つ JSON。形とモデル id の検証はローダと同じで、不正は 400。
 
-`POST /v1/steer/record` は `capture_mode` も受ける。`"all"` (既定、従来どおり) は通り、`"last_prompt_token"` はこの版では 400 で断る (黙って全トークンを記録しない)。
+`POST /v1/steer/record` は `capture_mode` も受ける。`"all"` (既定、従来どおり) は全トークンの平均、`"last_prompt_token"` は prefill の最終トークン (`nt - 1`) の残差だけを層ごとに記録し、生成中の decode トークンは載せない。それ以外の値は 400。`GET /v1/steer` は現在の `capture_mode` を返す。Abliterate パネルの `capture mode` セレクタの既定は `last_prompt_token` (指示境界での difference-in-means)。
 
 ## テレメトリのフレーム
 
