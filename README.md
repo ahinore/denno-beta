@@ -99,6 +99,27 @@ print(c.messages.create(model="qwen3.8-flash-next", max_tokens=256,
 - There is no `/v1/chat/completions` yet.
 - Requests are handled one at a time. A continued conversation reuses the earlier KV cache, so the reply starts in about 0.8 s on RTX 5090 Q3 (even at 2k–8k context).
 
+### 4. Inspect inference with the 2D viewer (`denno-view`)
+
+![denno-view 2D viewer](docs/assets/denno_2d.png)
+
+`serve-flash` enables telemetry by default (add `DENNO_TELEMETRY_ACT=1 DENNO_TELEMETRY_ARCH=1` to stream per-layer activations and full architecture metadata). Start `denno-view` in another terminal and open `/2d`:
+
+```bash
+VIEW_UPSTREAM=ws://127.0.0.1:8098/v1/telemetry/ws \
+  cargo run --release -p denno-view
+# Open http://localhost:8093/2d (3D view: /3d, dashboard: /)
+```
+
+- **Chat (left):** built-in chat proxied through `/chat` directly to the server (no CORS setup needed).
+- **Architecture diagram (center):** live 48-layer Qwen3.8-Flash-Next topology (48-layer column, 12 hybrid blocks, 4 residual streams, GDN/QSA mixers, router, shared expert, and 512 experts per layer). Scroll to zoom, drag to pan, double-click to focus a component, press `0` to fit all, click or Shift+drag to select (`wall` switches to the layer tile view).
+- **Nodes tree & selector (right-center):** browse `Hybrid block → Layer → residual / mixer / MoE → expert` or select nodes with expressions such as:
+  ```text
+  expert: count == 0 and layer >= 40
+  expert: rate > 0.05 | top 5 by count per layer
+  ```
+- **Intervention, steering & state (right):** toggle selected experts or blocks off/on live (`/v1/intervene`), record and apply activation steering (`/v1/steer`), and monitor KV cache and VRAM expert residency. See [docs/VIEWER.en.md](docs/VIEWER.en.md) for the full selector syntax and 3D view.
+
 ### GPUs with less VRAM (example: RTX 3080 10 GB)
 
 - Replace `compute_90` in `crates/denno-engine/kernels/build_ptx.sh` with your GPU's value (`compute_86` for a 3080) and rebuild the PTX.

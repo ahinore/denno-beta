@@ -99,6 +99,27 @@ print(c.messages.create(model="qwen3.8-flash-next", max_tokens=256,
 - `/v1/chat/completions` はまだ無い。
 - リクエストは 1 本ずつ処理する。続きの会話は前回の KV キャッシュを使い回すので、RTX 5090 Q3 では 2k〜8k 文脈でも応答開始まで約 0.8 s しかかからない。
 
+### 4. 2D ビューア（`denno-view`）で推論を見る・介入する
+
+![denno-view 2D ビューア](docs/assets/denno_2d.png)
+
+`serve-flash` はテレメトリ既定 ON（活性値と構成図をすべて流す場合は起動時に `DENNO_TELEMETRY_ACT=1 DENNO_TELEMETRY_ARCH=1` を付ける）。別ターミナルで `denno-view` を起動し、ブラウザで `/2d` を開く。
+
+```bash
+VIEW_UPSTREAM=ws://127.0.0.1:8098/v1/telemetry/ws \
+  cargo run --release -p denno-view
+# ブラウザで http://localhost:8093/2d を開く（3D は /3d、ダッシュボードは /）
+```
+
+- **チャット（左）:** `/chat` 経由でサーバーへ中継する内蔵チャット（CORS 設定不要）。会話を流しながら右側の構成図がリアルタイムに光る。
+- **構成図（中央）:** Qwen3.8-Flash-Next の 48 層・12 Hybrid block・4 残差ストリーム・GDN/QSA・router・512 expert を実構造どおりに配置。ホイールで拡大縮小、ドラッグで移動、ダブルクリックで寄る、`0` で全体表示、クリック / Shift+ドラッグで選択（`wall` で従来の層タイル表示）。
+- **ノードツリーと選択式（中右）:** `Hybrid block → 層 → residual / mixer / MoE → expert` のツリーや選択式で対象を絞り込める。
+  ```text
+  expert: count == 0 and layer >= 40
+  expert: rate > 0.05 | top 5 by count per layer
+  ```
+- **介入・ステアリング・状態（右）:** 選んだ expert やブロックを推論中に `switch off / on` で切り替える介入（`/v1/intervene`）、活性スナップショットの記録・適用によるステアリング（`/v1/steer`）、KV キャッシュと VRAM 上の expert 常駐状況の確認ができる。選択式の全仕様や 3D ビュー（`/3d`）は [docs/VIEWER.ja.md](docs/VIEWER.ja.md) を参照。
+
 ### VRAM が少ない GPU(RTX 3080 10 GB の例)
 
 - `crates/denno-engine/kernels/build_ptx.sh` の `compute_90` を自分の GPU の値(3080 なら `compute_86`)に替えて PTX を作り直す。
