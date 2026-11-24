@@ -864,6 +864,8 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize, send_timeout: 
         let events = run.events.as_ref().unwrap();
         let model = engine.lock().unwrap().name.clone();
         let input_tokens = run.sess.as_ref().unwrap().input_tokens();
+        // P805: prefix cache から再利用した長さ (Anthropic 互換 usage)。
+        let reused = run.sess.as_ref().unwrap().reused_prefix_tokens();
         let send = |v: serde_json::Value| -> bool {
             send_bounded(events, to_event(&v), send_timeout)
         };
@@ -878,7 +880,12 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize, send_timeout: 
                 "content": [],
                 "stop_reason": serde_json::Value::Null,
                 "stop_sequence": serde_json::Value::Null,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": reused,
+                    "cache_creation_input_tokens": input_tokens.saturating_sub(reused),
+                },
             }
         })) {
             bail!("sse send failed (client disconnected)");

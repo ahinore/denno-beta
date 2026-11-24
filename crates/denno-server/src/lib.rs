@@ -239,6 +239,10 @@ pub const DEFAULT_MAX_TOKENS: usize = 1024;
 /// する (無期限より短ければよい、という設計)。
 pub const RESPONSE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
+/// P805: `count_tokens` がエンジンロックを待つ上限。生成中 (ワーカーが Mutex を
+/// ほぼ連続保持) でも制御プレーンを永久にブロックしないための上限。
+pub const COUNT_TOKENS_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// s53: 明示指定時の上限 (clamp)。既定 (1024) とは独立。
 pub const MAX_TOKENS_CLAMP: usize = 4096;
 
@@ -862,6 +866,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
+        // P805: Anthropic 互換のトークン数見積り (prefill しない)
+        .route("/v1/messages/count_tokens", post(count_tokens))
         // P793: OpenAI 互換 (同じ Scheduler / chat template / KV prefix cache を通す)
         .route("/v1/chat/completions", post(openai::chat_completions))
         // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
@@ -995,33 +1001,24 @@ pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Ap
     }
 }
 
-async fn messages(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Response, ApiError> {
-    check_auth(&state, &headers)?;
-    // s148 (Task B10・計測のみ): リクエストの壁時計。COVERAGE 行の分母
-    // (「帰属 ms / リクエストの壁時計」) になる。
-    // s151 (Task B12): このフックは `/v1/messages` の**同期ハンドラ**にあり、
-    // ストリーミング (本番の serve 経路はほぼ SSE) はレスポンス本体を返した時点で
-    // 戻るため、生成が終わった時点の壁時計になっていなかった (`requests 0`)。
-    // 実際の計上は scheduler の Run (prefill 開始 → セッション完了) が
-    // `request_begin` / `request_end` で行う — ここでは二重計上しない。
-    let resp = messages_inner(state, headers, body).await;
-    resp
+/// P805: `/v1/messages` と `/v1/messages/count_tokens` が共有する
+/// リクエスト正規化の結果 (chat template へ渡す形)。
+///
+/// 両エンドポイントが **同じ関数** を通ることで、`count_tokens` の値が
+/// 生成時の `input_tokens` と一致することを構造的に保証する。
+pub(crate) struct PreparedChat {
+    pub system: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub params: GenParams,
+    pub tools_for_prompt: Option<serde_json::Value>,
+    pub tool_constraint: Option<ToolConstraint>,
+    pub enable_thinking: Option<bool>,
+    pub tools_active: bool,
 }
 
-/// s148: [`messages`] の本体 (リクエスト壁時計の計測を外したもの)。
-async fn messages_inner(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Response, ApiError> {
-    let req: MessagesRequest = serde_json::from_slice(&body).map_err(|e| {
-        ApiError::invalid_request(format!("invalid request body: {}", e))
-    })?;
-
+/// Anthropic Messages リクエストを検証し、chat template に渡す形へ正規化する。
+/// 不正は 400 (`ApiError::invalid_request`)、未知モデルは 404。
+fn prepare_chat(state: &AppState, req: &MessagesRequest) -> Result<PreparedChat, ApiError> {
     if req.model != state.model_name {
         return Err(ApiError::not_found(format!(
             "model: {} not found",
@@ -1070,7 +1067,7 @@ async fn messages_inner(
     };
 
     let mut tool_use_ids = HashSet::new();
-    let mut chat_messages = Vec::with_capacity(req.messages.len());
+    let mut messages = Vec::with_capacity(req.messages.len());
     for m in &req.messages {
         if m.role != "user" && m.role != "assistant" {
             return Err(ApiError::invalid_request(format!(
@@ -1078,7 +1075,7 @@ async fn messages_inner(
                 m.role
             )));
         }
-        chat_messages.push(ChatMessage {
+        messages.push(ChatMessage {
             role: m.role.clone(),
             content: m.to_text(&mut tool_use_ids)?,
         });
@@ -1099,7 +1096,7 @@ async fn messages_inner(
     // s39: max_tokens / max_completion_tokens の未指定時は既定上限 (DEFAULT_MAX_TOKENS)
     // を適用する。明示指定は尊重。数値経路への影響は無い (設定値の既定適用のみ)。
     // s56: 反復抑止の追加パラメータ検証 (不正値は 400。未指定 = 無効 = ビット不変)
-    let anti = parse_anti_repetition(&req)?;
+    let anti = parse_anti_repetition(req)?;
     let params = GenParams {
         max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
         temperature: apply_temperature_cap(req.temperature, state.temperature_cap),
@@ -1112,6 +1109,53 @@ async fn messages_inner(
         presence_penalty: anti.presence,
         no_repeat_ngram_size: anti.no_repeat_ngram_size,
     };
+
+    Ok(PreparedChat {
+        system,
+        messages,
+        params,
+        tools_for_prompt,
+        tool_constraint,
+        enable_thinking,
+        tools_active,
+    })
+}
+
+async fn messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    check_auth(&state, &headers)?;
+    // s148 (Task B10・計測のみ): リクエストの壁時計。COVERAGE 行の分母
+    // (「帰属 ms / リクエストの壁時計」) になる。
+    // s151 (Task B12): このフックは `/v1/messages` の**同期ハンドラ**にあり、
+    // ストリーミング (本番の serve 経路はほぼ SSE) はレスポンス本体を返した時点で
+    // 戻るため、生成が終わった時点の壁時計になっていなかった (`requests 0`)。
+    // 実際の計上は scheduler の Run (prefill 開始 → セッション完了) が
+    // `request_begin` / `request_end` で行う — ここでは二重計上しない。
+    let resp = messages_inner(state, headers, body).await;
+    resp
+}
+
+/// s148: [`messages`] の本体 (リクエスト壁時計の計測を外したもの)。
+async fn messages_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let req: MessagesRequest = serde_json::from_slice(&body).map_err(|e| {
+        ApiError::invalid_request(format!("invalid request body: {}", e))
+    })?;
+    let PreparedChat {
+        system,
+        messages: chat_messages,
+        params,
+        tools_for_prompt,
+        tool_constraint,
+        enable_thinking,
+        tools_active,
+    } = prepare_chat(&state, &req)?;
 
     if req.stream.unwrap_or(false) {
         // 第27: tools + stream を許可。SSE アセンブラ (stream_asm) が delta ストリームの
@@ -1176,6 +1220,58 @@ async fn messages_inner(
     }
 }
 
+/// P805: `POST /v1/messages/count_tokens`。
+///
+/// Anthropic 互換の `{"input_tokens": N}` を返す。生成経路と同じ正規化
+/// ([`prepare_chat`]) と同じトークナイザを使うが、**prefill も KV も触らない**
+/// (`Engine::count_prompt_tokens`)。Claude Code は送信前にこの端点を叩く。
+async fn count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let req: MessagesRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::invalid_request(format!("invalid request body: {}", e)))?;
+    let prepared = prepare_chat(&state, &req)?;
+    let engine = state.engine.clone();
+    let n = tokio::task::spawn_blocking(move || -> Result<usize, ApiError> {
+        // P57 と同じ理由でハンドラは生成の直列化に巻き込まない。ロックが
+        // 取れない間は短い間隔で再試行し、上限を超えたら 503 で返す
+        // (無応答にしない)。
+        let deadline = std::time::Instant::now() + COUNT_TOKENS_LOCK_TIMEOUT;
+        loop {
+            match engine.try_lock() {
+                Ok(g) => {
+                    return g
+                        .count_prompt_tokens(
+                            prepared.system.as_deref(),
+                            &prepared.messages,
+                            prepared.tools_for_prompt.as_ref(),
+                            prepared.enable_thinking,
+                        )
+                        .map_err(ApiError::from_anyhow)
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ApiError::overloaded(format!(
+                            "engine is busy; count_tokens gave up after {:.1}s (retry later)",
+                            COUNT_TOKENS_LOCK_TIMEOUT.as_secs_f64()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(ApiError::api("engine lock poisoned"))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| ApiError::api(format!("count_tokens task failed: {e}")))??;
+    Ok(Json(json!({ "input_tokens": n })))
+}
+
 /// キュー満杯時の 503 エラー (Anthropic 流 overloaded_error)
 fn queue_full_error(state: &AppState) -> impl Fn(QueueFull) -> ApiError + '_ {
     move |_| {
@@ -1221,6 +1317,10 @@ fn message_json(
         "usage": {
             "input_tokens": out.input_tokens,
             "output_tokens": out.output_tokens,
+            // P805: KV prefix 再利用の内訳 (Anthropic 互換)。
+            // cache_read = 再利用した先頭トークン数、cache_creation = 新規 prefill 分。
+            "cache_read_input_tokens": out.cache_read_input_tokens,
+            "cache_creation_input_tokens": out.cache_creation_input_tokens,
         }
     })
 }
@@ -1360,6 +1460,8 @@ mod tool_tests {
             stop_sequence: None,
             input_tokens: 10,
             output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 10,
         }
     }
 

@@ -10,7 +10,7 @@ Anthropic Messages API 互換。対応フィールド:
 | `max_tokens` (任意) | 生成上限。未指定時 1024 (s53) / 明示時は上限 4096 で clamp (s53)。`0` は「prefill のみ」として 0 のまま尊重。prompt+max_tokens が context 超過なら 400 |
 | `max_completion_tokens` | s39: OpenAI chat completions 互換の別名。`max_tokens` 未指定時のみ使う (両方指定時は `max_tokens` 優先)。clamp・既定は同上 |
 | `messages` (必須) | role は user/assistant。content は文字列 or `[{type:"text",...}]` |
-| `system` | 文字列 or textブロック配列 |
+| `system` | 文字列 or textブロック配列。ブロックの `cache_control` (P805) は受理して無視する |
 | `temperature` | 0 で greedy |
 | `top_p`, `top_k` | 対応 |
 | `stop_sequences` | 生成テキスト中の最も早い出現で打ち切り |
@@ -35,11 +35,33 @@ Anthropic Messages API 互換。対応フィールド:
   "content": [{"type": "text", "text": "..."}],
   "stop_reason": "end_turn",
   "stop_sequence": null,
-  "usage": {"input_tokens": 12, "output_tokens": 34}
+  "usage": {"input_tokens": 12, "output_tokens": 34,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 12}
 }
 ```
 
 `stop_reason`: `end_turn` / `max_tokens` / `stop_sequence` / `tool_use`(tools 使用時)
+
+`usage.cache_*` は P805: KV prefix cache の再利用量。`cache_read_input_tokens` は
+prefill を省いた先頭トークン数、`cache_creation_input_tokens` は新規に prefill した
+トークン数 (`input_tokens = cache_read + cache_creation`)。SSE では
+`message_start.message.usage` に同じ 3 値が入る。
+
+## POST /v1/messages/count_tokens
+
+P805: Anthropic 互換のトークン数見積り。生成と同じ正規化 (system / tools /
+`thinking` の既定)・同じトークナイザで数え、**prefill も KV 消費もしない**。
+
+リクエストは `/v1/messages` と同じ形 (`model` / `messages` 必須、`system` /
+`tools` / `tool_choice` / `thinking` は任意)。`max_tokens` 等は無視される。
+
+```json
+{"input_tokens": 128}
+```
+
+値は同じ本文の `/v1/messages` が返す `usage.input_tokens` と一致する。
+不正な本文は 400、未知モデルは 404。生成中でエンジンロックが 10 秒取れない
+場合は 503 overloaded_error。
 
 ## POST /v1/chat/completions (OpenAI 互換)
 
