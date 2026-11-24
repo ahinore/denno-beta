@@ -104,6 +104,15 @@
              overflow:hidden; white-space:nowrap; }
   #mapstat b { color:#7fa4b8; font-weight:400; }
 
+  /* task 809: ライブ性能の HUD 帯 (ttft / tok/s / vram hit / kv reuse / mtp) */
+  #hud { height:19px; display:flex; align-items:center; gap:14px; padding:0 2px;
+         font-size:10px; color:var(--dim); white-space:nowrap; overflow:hidden; }
+  #hud .hk { margin-right:3px; }
+  #hud b { color:#9fefff; font-weight:500; font-variant-numeric:tabular-nums; }
+  #hud #hud-mtp.on { color:#7fe3ff; }
+  #hud .sp { flex:1; }
+  #hudnote { color:#38505f; font-size:9.5px; overflow:hidden; text-overflow:ellipsis; }
+
   /* task 235: チャット / 操作列を 1 クリックで畳む (地図に場所を渡す) */
   main.hide-chat { --cw:0px; }
   main.hide-chat #chatpane { display:none; }
@@ -251,6 +260,15 @@
       </div>
     </div>
     <div id="mapwrap"><canvas id="map"></canvas></div>
+    <div id="hud" title="ライブ性能: ttft / 出力 tok/s / expert の VRAM ヒット率 / 次のターンで使い回す KV / 投機の採用率">
+      <span><span class="hk">ttft</span><b id="hud-ttft">-</b></span>
+      <span><span class="hk">tok/s</span><b id="hud-rate">-</b></span>
+      <span><span class="hk">vram hit</span><b id="hud-vram">-</b></span>
+      <span><span class="hk">kv reuse</span><b id="hud-kv">-</b></span>
+      <span><span class="hk">mtp accept</span><b id="hud-mtp">-</b></span>
+      <span class="sp"></span>
+      <span id="hudnote"></span>
+    </div>
     <div id="mapstat">
       <span>grid <b id="gridstat">-</b></span>
       <span>cell <b id="cellstat">-</b></span>
@@ -347,6 +365,21 @@
       <div id="applyinfo" class="small dim" style="margin-top:4px"></div>
     </div>
 
+    <div class="box" id="presetbox">
+      <h2>preset <span class="dim">checked · selector · steering</span></h2>
+      <div class="row2">
+        <input id="preset-name" type="text" placeholder="preset name (A-Z a-z 0-9 _ -)">
+        <button id="preset-export" class="b" title="チェック中のノード / 選択式 / off の設定 / ステアリングを JSON で保存">export</button>
+      </div>
+      <label class="f">import preset (.json)<input id="preset-file" type="file" accept=".json,application/json"></label>
+      <div class="row2">
+        <button id="preset-apply" class="b go" disabled title="読み込んだプリセットの介入 (off) をサーバーへ送り、選択と選択式を画面に戻す">apply loaded</button>
+        <button id="preset-clear" class="b" title="読み込んだプリセットの表示だけを消す (サーバーの状態はそのまま)">clear loaded</button>
+      </div>
+      <div id="preset-info" class="small dim" style="margin-top:4px">loaded: -</div>
+      <div id="preset-err" class="err"></div>
+    </div>
+
     <div class="box" id="ablitbox">
       <h2>abliterate <span class="dim">A/B → project</span></h2>
       <div class="small dim">1 行 1 プロンプト。A = 消したい向き、B = 残したい向き (符号は A +1 / B -1)。</div>
@@ -438,6 +471,11 @@ import {
   buildTree, visibleRows, ancestorIds, nodeCheckState, nodeItems, createEnv, runDsl,
   dslSummary, DslError,
 } from '/nodes2d.mjs';
+import {
+  buildPreset, createHud, hudBeginRequest, hudEndRequest, hudFields,
+  hudOnCache, hudOnFrame, hudOnRawKind, hudOnStats, hudOnToken, hudText,
+  parsePreset, presetFileName, presetSummary, validateInterveneBody,
+} from '/hud2d.mjs';
 
 const $ = (id) => document.getElementById(id);
 const Q = new URLSearchParams(location.search);
@@ -455,6 +493,9 @@ let colourMode = 'token';              // 'token' | 'accum' | 'ablit'
 let ablit = { analysis: null, range: [0, 0], chart: null, drag: null, busy: false, cancel: false };
 let ablitScores = [];                  // 層ごとの分離スコア (0..1、色モード用)
 let terms = new Map();                 // snapshot name -> coef
+// task 809: ライブ性能の HUD。イベントは hud2d.mjs の状態機械に渡すだけ。
+let hud = createHud();
+let loadedPreset = null;               // 直前に読み込んだプリセット (まだ apply していない)
 let hover = null;
 let drag = null;                       // {x0,y0,x1,y1,add,items}
 let offExp = new Map();                // layer -> Set(expert)
@@ -608,6 +649,7 @@ async function probeLive(first) {
 
 async function boot() {
   rebuild(shape);                 // 既定の形で枠を描く (live が返ったら差し替え)
+  renderHud();
   setViewMode(viewMode);
   $('lfrom').max = String(shape.layers);
   $('lto').max = String(shape.layers);
@@ -906,6 +948,174 @@ function renderState() {
   treeDirty = true;
   gridDirty = true;
 }
+
+// ---- ライブ性能の HUD (task 809) -----------------------------------------
+// hud2d.mjs の状態機械をそのまま書き出す。数字はここで作らない。
+let lastHudAt = 0;
+function renderHud() {
+  const by = Object.create(null);
+  for (const f of hudFields(hud)) by[f.key] = f.value;
+  $('hud-ttft').textContent = by.ttft;
+  $('hud-rate').textContent = by.rate;
+  $('hud-vram').textContent = by.vram;
+  $('hud-kv').textContent = by.kv;
+  const m = $('hud-mtp');
+  m.textContent = by.mtp;
+  m.className = hud.mtp.seen ? 'on' : '';
+  $('hudnote').textContent = hud.reqActive
+    ? 'generating…'
+    : (hud.lastSecs == null ? '' : 'last ' + hud.lastSecs.toFixed(2) + ' s');
+}
+
+// ---- プリセット (task 809) ----------------------------------------------
+// チェック中のノード (選択) / 選択式 (DSL) / off の設定 / ステアリングの 4 つを
+// 1 つの JSON にして保存し、読み込みで画面に戻してからサーバーへ送る。
+function setSelectionFromBody(body) {
+  clearSel(sel);
+  for (const it of selectionItems(selectionFromBody(body))) addItem(sel, it);
+}
+
+function currentSteer() {
+  const chosen = [];
+  for (const s of steer.snapshots) {
+    if (terms.has(s.name)) chosen.push({ snapshot: s.name, coef: Number(terms.get(s.name)) });
+  }
+  return {
+    terms: chosen,
+    layers: [Number($('lfrom').value), Number($('lto').value)],
+    alpha: Number($('alpha').value),
+    mode: $('smode').value,
+  };
+}
+
+function setSteerWidgets(st) {
+  if (!st) {
+    terms = new Map();
+    renderSteer();
+    return;
+  }
+  terms = new Map((st.terms || []).map((t) => [t.snapshot, Number(t.coef)]));
+  $('lfrom').value = String(st.layers[0]);
+  $('lto').value = String(st.layers[1]);
+  $('alpha').value = String(st.alpha);
+  $('smode').value = st.mode;
+  renderSteer();
+}
+
+function presetFromUi() {
+  return buildPreset({
+    name: $('preset-name').value.trim() || 'preset',
+    selector: $('dsl').value,
+    checked: selectionToBody(sel),
+    intervene: {
+      experts_off: applied.experts_off,
+      blocks_off: applied.blocks_off,
+      streams_off: applied.streams_off,
+    },
+    steer: currentSteer(),
+    shape: {
+      layers: shape.layers, n_expert: shape.n_expert,
+      n_expert_used: shape.n_expert_used, n_hc: shape.n_hc, n_embd: shape.n_embd,
+    },
+  });
+}
+
+$('preset-export').addEventListener('click', () => {
+  $('preset-err').textContent = '';
+  let preset;
+  try {
+    preset = presetFromUi();
+  } catch (e) {
+    $('preset-err').textContent = (e && e.message) || String(e);
+    return;
+  }
+  const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = presetFileName(preset.name);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  $('preset-info').textContent = 'exported: ' + presetSummary(preset);
+});
+
+$('preset-file').addEventListener('change', async () => {
+  const file = $('preset-file').files && $('preset-file').files[0];
+  if (!file) return;
+  $('preset-err').textContent = '';
+  try {
+    const text = await file.text();
+    loadedPreset = parsePreset(text, { defaultName: file.name.replace(/\.[^.]+$/, '') });
+    $('preset-name').value = loadedPreset.name;
+    $('dsl').value = loadedPreset.selector;
+    setSelectionFromBody(loadedPreset.checked);
+    setSteerWidgets(loadedPreset.steer);
+    evalDsl();
+    renderState();
+    dirty = true;
+    const warn = loadedPreset.shape.layers !== shape.layers
+      ? ' · layers ' + loadedPreset.shape.layers + ' ≠ いまのモデル ' + shape.layers + ' (apply 不可)'
+      : '';
+    $('preset-info').textContent = 'loaded: ' + presetSummary(loadedPreset) + warn;
+    if (loadedPreset.shape.layers === shape.layers) $('preset-apply').disabled = false;
+    else $('preset-apply').disabled = true;
+  } catch (e) {
+    loadedPreset = null;
+    $('preset-apply').disabled = true;
+    $('preset-err').textContent = (e && e.message) || String(e);
+  }
+  $('preset-file').value = '';
+});
+
+$('preset-apply').addEventListener('click', async () => {
+  $('preset-err').textContent = '';
+  if (!loadedPreset) { $('preset-err').textContent = 'no preset loaded'; return; }
+  if (loadedPreset.shape.layers !== shape.layers) {
+    $('preset-err').textContent = 'preset の層数 ' + loadedPreset.shape.layers +
+      ' がいまのモデル ' + shape.layers + ' と違う';
+    return;
+  }
+  let body;
+  try {
+    body = validateInterveneBody(loadedPreset.intervene, shape);
+  } catch (e) {
+    $('preset-err').textContent = (e && e.message) || String(e);
+    return;
+  }
+  const empty = !body.experts_off.length && !body.blocks_off.length && !body.streams_off.length;
+  if (empty) {
+    const r = await api('DELETE', '/v1/intervene');
+    if (r.status !== 200) { $('preset-err').textContent = 'DELETE /v1/intervene → ' + r.status; return; }
+    await refreshAll('preset (clear)');
+  } else if (!(await postIntervene(body))) {
+    return;
+  }
+  if (loadedPreset.steer) {
+    const missing = loadedPreset.steer.terms
+      .filter((t) => !steer.snapshots.some((s) => s.name === t.snapshot))
+      .map((t) => t.snapshot);
+    if (missing.length) {
+      $('preset-err').textContent = 'steer は戻せない (無い snapshot: ' + missing.join(',') + ')';
+    } else {
+      const r = await api('POST', '/v1/steer/apply', loadedPreset.steer);
+      if (r.status !== 200) $('preset-err').textContent = 'steer → ' + r.status + ' ' + errText(r);
+      else await refreshAll('preset steering');
+    }
+  }
+  clearSel(sel);
+  renderState();
+  dirty = true;
+  $('preset-info').textContent = 'applied: ' + presetSummary(loadedPreset);
+});
+
+$('preset-clear').addEventListener('click', () => {
+  loadedPreset = null;
+  $('preset-apply').disabled = true;
+  $('preset-file').value = '';
+  $('preset-info').textContent = 'loaded: -';
+  $('preset-err').textContent = '';
+});
 
 // ---- 介入の操作 ---------------------------------------------------------
 async function postIntervene(body) {
@@ -1626,8 +1836,11 @@ function renderCtx(body) {
 
 async function refreshCtx() {
   const r = mock ? mock.handle('GET', '/v1/cache') : await apiQuiet('/v1/cache');
-  if (r.status === 200 && r.body && typeof r.body === 'object') renderCtx(r.body);
-  else { $('kv-main').textContent = '? (' + r.status + ')'; $('kv-aux').textContent = '?'; }
+  if (r.status === 200 && r.body && typeof r.body === 'object') {
+    renderCtx(r.body);
+    // task 809: 次のターンで使い回す main 文脈のトークンを HUD に出す。
+    if (hudOnCache(hud, r.body)) renderHud();
+  } else { $('kv-main').textContent = '? (' + r.status + ')'; $('kv-aux').textContent = '?'; }
 }
 
 // task 271: expert の tier (VRAM / RAM / mmap) の本数と MB、直前のリクエストの
@@ -1647,6 +1860,8 @@ async function refreshExperts() {
   $('ex-ram').textContent = expertTierText(v.rows[1]);
   $('ex-mmap').textContent = expertTierText(v.rows[2]);
   $('ex-cov').textContent = expertCoverageText(v.coverage);
+  // task 809: 直前のリクエストの VRAM expert ヒット率を HUD に出す。
+  if (hudOnStats(hud, v)) renderHud();
   const saved = v.savedUnix == null
     ? 'not saved yet'
     : 'saved ' + new Date(v.savedUnix * 1000).toLocaleTimeString('ja-JP', { hour12: false });
@@ -1736,6 +1951,8 @@ function drawArchView() {
     focusHybrid: focusHybridOf(hover),
     // task 825: ablit 色モードでは 48 層の柱と 12 Hybrid block を分離スコアで塗る。
     ablit: colourMode === 'ablit' && ablitScores.length ? { scores: ablitScores } : null,
+    // task 809: 投機テレメトリが来ている間は MTP の箱を強調する。
+    mtp: hud.mtp.seen ? { seen: true, rate: hud.mtp.rate } : null,
   });
   if (drag && drag.active && drag.select) {
     const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
@@ -2384,7 +2601,17 @@ function connectWs() {
       try {
         r = decodeFrame(buf, off);
       } catch (e) {
-        if (e instanceof FrameDecodeError) $('wsstat').textContent = 'decode error: ' + e.message;
+        if (e instanceof FrameDecodeError) {
+          // task 809: 未来の kind (>= 18) は投機/MTP のテレメトリとして
+          // 「来ている」ことだけ記録する (payload は読めない)。
+          if (hudOnRawKind(hud, e.kindId)) {
+            renderHud();
+            dirty = true;
+            $('wsstat').textContent = 'spec telemetry (kind ' + e.kindId + ')';
+          } else {
+            $('wsstat').textContent = 'decode error: ' + e.message;
+          }
+        }
         break;
       }
       off = r.next;
@@ -2402,6 +2629,11 @@ function handleFrame(f) {
   frameCount++;
   lastKind = f.kind;
   if (st.onFrame(f)) dirty = true;
+  // task 809: 投機 / MTP のフレームが来たら HUD と構成図の強調を更新する。
+  if (hudOnFrame(hud, f)) {
+    renderHud();
+    dirty = true;
+  }
   if (f.kind === 'Token') {
     $('tokstat').textContent = String(st.token);
     if (mock) {
@@ -2527,6 +2759,9 @@ function addLine(cls, text) {
 
 async function runStream(node, baseAcc) {
   const t0 = performance.now();
+  // task 809: 1 リクエスト = HUD の 1 窓。TTFT は最初の差分で確定する。
+  hudBeginRequest(hud, t0);
+  renderHud();
   let acc = baseAcc, usage = null, err = null, stop = null;
   try {
     const body = { model: 'denno', max_tokens: CHAT_LIMITS.max_tokens_default || 4096,
@@ -2556,6 +2791,9 @@ async function runStream(node, baseAcc) {
           acc += j.delta.text;
           node.textContent = acc;
           chatEl.log.scrollTop = chatEl.log.scrollHeight;
+          // 差分 1 つ ≈ 1 トークン。終了時に usage.output_tokens で数え直す。
+          hudOnToken(hud, performance.now());
+          if (performance.now() - lastHudAt > 100) { renderHud(); lastHudAt = performance.now(); }
         } else if (j.type === 'message_delta') {
           if (j.usage) usage = j.usage;
           if (j.delta && j.delta.stop_reason) stop = j.delta.stop_reason;
@@ -2567,6 +2805,8 @@ async function runStream(node, baseAcc) {
   } catch (e) {
     err = (e && e.message) ? e.message : String(e);
   }
+  hudEndRequest(hud, performance.now(), usage && usage.output_tokens);
+  renderHud();
   return { acc, usage, err, stop, secs: (performance.now() - t0) / 1000 };
 }
 
@@ -2719,6 +2959,21 @@ window.__view2d = {
   refreshCtx: () => refreshCtx(),
   api,
   pushFrame: (f) => handleFrame(f),
+  // task 809: 性能 HUD とプリセット
+  hud: () => hud,
+  hudText: () => hudText(hud),
+  renderHud: () => renderHud(),
+  pushSpec: (frame) => { const ok = hudOnFrame(hud, frame); renderHud(); dirty = true; return ok; },
+  preset: () => loadedPreset,
+  presetFromUi: () => presetFromUi(),
+  exportPreset: () => $('preset-export').click(),
+  loadPreset: (text) => {
+    const file = $('preset-file');
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'preset.json', { type: 'application/json' }));
+    file.files = dt.files;
+    file.dispatchEvent(new Event('change'));
+  },
   // 構成図 / ツリー / 選択式
   arch: () => arch,
   view: () => Object.assign({}, view),

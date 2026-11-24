@@ -242,6 +242,7 @@ fn build_router(app: AppState) -> Router {
         .route("/view2d.mjs", get(view2d_mjs))
         .route("/arch2d.mjs", get(arch2d_mjs))
         .route("/nodes2d.mjs", get(nodes2d_mjs))
+        .route("/hud2d.mjs", get(hud2d_mjs))
         .route("/vendor/*path", get(vendor))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
@@ -540,6 +541,11 @@ async fn nodes2d_mjs() -> axum::response::Response {
     js_response(include_str!("nodes2d.mjs"))
 }
 
+/// GET /hud2d.mjs — /2d のライブ性能 HUD とプリセット (task 809)。DOM 非依存。
+async fn hud2d_mjs() -> axum::response::Response {
+    js_response(include_str!("hud2d.mjs"))
+}
+
 /// GET /frames.mjs — 3D ビューアが import するフレームデコーダ。
 /// 形式の正は `denno-telemetry` の v1 (この JS はその写し。DOM 非依存)。
 async fn frames_mjs() -> axum::response::Response {
@@ -820,6 +826,13 @@ mod tests {
         assert!(html.contains("denno 2D"), "page title missing");
         assert!(html.contains("/view2d.mjs"), "/2d must import the module");
         assert!(html.contains("id=\"map\""), "canvas missing");
+        // task 809: ライブ性能の HUD 帯とプリセットの操作
+        for id in [
+            "hud", "hud-ttft", "hud-rate", "hud-vram", "hud-kv", "hud-mtp",
+            "preset-name", "preset-export", "preset-file", "preset-apply",
+        ] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "missing #{id}");
+        }
 
         let r = c.get(format!("{base}/view2d.mjs")).send().await.unwrap();
         assert_eq!(r.status(), 200);
@@ -838,6 +851,7 @@ mod tests {
         for (p, needle) in [
             ("/arch2d.mjs", "export function archLayout"),
             ("/nodes2d.mjs", "export function runDsl"),
+            ("/hud2d.mjs", "export function createHud"),
         ] {
             assert!(html.contains(p), "/2d must import {p}");
             let r = c.get(format!("{base}{p}")).send().await.unwrap();
