@@ -10,9 +10,10 @@
 //! (serve_flash.rs から `#[cfg(test)] #[path] mod flash_synth;` で include)。
 
 use super::{
-    aux_ctx_enabled, aux_ctx_max_tok, aux_ctx_ratio, echo_matches, model_reuse_enabled, pick_ctx,
-    prefix_miss_line, prefix_splice_enabled, CtxPick, Flash, GenReq, ModelShape, TEST_BUILD_COUNT,
-    TEST_FAIL_STEP, TEST_LAST_PICK, TEST_LAST_REUSE,
+    aux_ctx_enabled, aux_ctx_max_tok, aux_ctx_ratio, echo_matches, kv_slot_max_tok, kv_slots_from,
+    model_reuse_enabled, pick_ctx, pick_slot_n, prefix_miss_line, prefix_splice_enabled, CtxPick,
+    Flash, GenReq, ModelShape, SlotMeta, SlotPick, TEST_BUILD_COUNT, TEST_FAIL_STEP,
+    TEST_LAST_PICK, TEST_LAST_REUSE,
 };
 use crate::flash_telemetry::Telemetry;
 use denno_engine::model::intervene as iv;
@@ -649,6 +650,11 @@ fn synth_tensors(layers: usize) -> Vec<TensorSpec> {
 
 /// 合成 GGUF (モデル + トークナイザ) を書いて `Flash` を組む。
 fn build_flash(dir: &TempDir) -> Flash {
+    build_flash_n(dir, 2)
+}
+
+/// P812: スロット数を指定して組む (既定は 2 = 従来の main + aux)。
+fn build_flash_n(dir: &TempDir, n_slots: usize) -> Flash {
     let mut kvs = synth_kvs(DEFAULT_LAYERS);
     kvs.extend(tok_kvs());
     let path = dir.path("flash.gguf");
@@ -693,8 +699,8 @@ fn build_flash(dir: &TempDir) -> Flash {
             ple_layers: vec![2],
         },
         dec: None,
-        cache: None,
-        aux: None,
+        slots: (0..n_slots).map(|_| super::KvSlot::empty()).collect(),
+        tick: 0,
         telem,
     }
 }
@@ -770,7 +776,7 @@ fn disconnect_caches_consistent_decoder() {
         "emit のエラーがそのまま返っていない: {err}"
     );
     assert_eq!(builds() - b0, 1, "最初のリクエストで build_model が 1 回");
-    let c = flash.cache.as_ref().expect("emit 失敗なのに cache が空");
+    let c = flash.main_ctx().expect("emit 失敗なのに cache が空");
     assert_eq!(c.toks, c.state.tokens(), "toks が decoder 状態と不一致");
     assert_eq!(
         c.toks.len(),
@@ -784,7 +790,7 @@ fn disconnect_caches_consistent_decoder() {
     let mut flash2 = build_flash(&dir2);
     let err2 = flash2.generate(&gen_req("hi"), fail_at(3)).err().expect("generate が失敗するはず");
     assert!(err2.to_string().contains("emit failed (test injection"), "err={err2}");
-    let c2 = flash2.cache.as_ref().expect("emit 失敗なのに cache が空");
+    let c2 = flash2.main_ctx().expect("emit 失敗なのに cache が空");
     assert_eq!(c2.toks, c2.state.tokens());
     assert_eq!(
         c2.toks.len(),
@@ -804,7 +810,7 @@ fn disconnect_then_other_prompt_reuses_model_without_rebuild() {
     let dir = TempDir::new("flash-disc-b");
     let mut flash = build_flash(&dir);
     flash.generate(&gen_req("hi"), fail_at(2)).err().expect("generate が失敗するはず");
-    assert!(flash.cache.is_some(), "切断後に cache が空");
+    assert!(flash.main_ctx().is_some(), "切断後に cache が空");
 
     let b1 = builds();
     let g2 = flash.generate(&gen_req("yo"), no_emit).expect("generate 2");
@@ -840,7 +846,7 @@ fn disconnect_then_extended_prompt_reuses_prefix() {
     let mut flash = build_flash(&dir);
     flash.generate(&gen_req("hi"), fail_at(2)).err().expect("generate が失敗するはず");
     let plen = prompt_toks(&flash, "hi").len();
-    let stored = flash.cache.as_ref().expect("cache").toks.clone();
+    let stored = flash.main_ctx().expect("cache").toks.clone();
     assert_eq!(stored.len(), plen + 1, "プロンプト + 成功差分 1 (tab)");
 
     // 保存した生成部を decode し、2 倍にして延長 (保存列 + 1 トークぶん長い)。
@@ -892,7 +898,7 @@ fn engine_failure_drops_decoder_and_rebuilds() {
     let err = flash.generate(&gen_req("hi"), no_emit).err().expect("generate が失敗するはず");
     TEST_FAIL_STEP.store(false, Ordering::Relaxed);
     assert!(err.to_string().contains("test: step 失敗を注入"), "err={err}");
-    assert!(flash.cache.is_none(), "engine 失敗なのに cache が残った");
+    assert!(flash.main_ctx().is_none(), "engine 失敗なのに cache が残った");
 
     // 次のリクエストは組み直す (cache が無いので build_model が走る)。
     let b1 = builds();
@@ -916,7 +922,7 @@ fn gate_off_disconnect_keeps_old_behaviour() {
     let mut flash = build_flash(&dir);
     let err = flash.generate(&gen_req("hi"), fail_at(2)).err().expect("generate が失敗するはず");
     assert!(err.to_string().contains("emit failed (test injection"), "err={err}");
-    assert!(flash.cache.is_none(), "gate off で切断 cache が残った");
+    assert!(flash.main_ctx().is_none(), "gate off で切断 cache が残った");
 
     // 従来どおり次のリクエストで組み直す。
     let b1 = builds();
@@ -1093,7 +1099,7 @@ fn trimmed_assistant_tail_keeps_reuse_by_splice() {
     let g1 = flash.generate(&gen_req("hi"), no_emit).expect("generate 1");
     assert_eq!(g1.text, "\t\t\t\t\t\t", "合成モデルの決定列 (tab 6 個)");
 
-    let c1 = flash.cache.as_ref().expect("cache").toks.clone();
+    let c1 = flash.main_ctx().expect("cache").toks.clone();
     assert_eq!(c1.len(), g1.n_prompt + 6, "プロンプト + 生成 6");
     let echo = g1.text.clone();
     assert_eq!(echo.trim(), "", "この再現には末尾が空白の生成が要る");
@@ -1132,7 +1138,7 @@ fn trimmed_assistant_tail_keeps_reuse_by_splice() {
     assert_eq!(g2.text, "\t\t\t\t\t\t", "2 ターン目の出力");
 
     // 3 ターン目: splice の続きでもう一度 splice できること。
-    let c2len = flash.cache.as_ref().expect("cache").toks.len();
+    let c2len = flash.main_ctx().expect("cache").toks.len();
     let req3 = gen_req_msgs(&[
         ("user", "hi"),
         ("assistant", &echo),
@@ -1230,7 +1236,7 @@ fn six_turn_conversation_reuses_prefix_in_serve() {
             assert_eq!(reuse, cache_len, "turn{} で前置きを全長再利用していない", i + 1);
         }
         assert_eq!(g.text, "\t\t\t\t\t\t", "合成モデルの決定列 (tab 6 個)");
-        cache_len = flash.cache.as_ref().expect("cache").toks.len();
+        cache_len = flash.main_ctx().expect("cache").toks.len();
         msgs.push(("assistant".to_string(), g.text));
     }
     // モデルの組み直しは最初の 1 回だけ。
@@ -1418,8 +1424,8 @@ fn long_ctx_survives_side_request() {
     // 1. 長い会話 A。
     let g1 = flash.generate(&gen_req(LONG_A), no_emit).expect("A");
     assert_eq!(g1.text, "\t\t\t\t\t\t", "合成モデルの決定列");
-    let a_len = flash.cache.as_ref().expect("A が cache に無い").toks.len();
-    let a_toks = flash.cache.as_ref().expect("A").toks.clone();
+    let a_len = flash.main_ctx().expect("A が cache に無い").toks.len();
+    let a_toks = flash.main_ctx().expect("A").toks.clone();
     assert!(a_len > 80, "A が短すぎる ({a_len})");
 
     // 2. 短い脇リクエスト B。主の文脈は残る。
@@ -1430,11 +1436,11 @@ fn long_ctx_survives_side_request() {
         0,
         "B が A の前置きを再利用した"
     );
-    assert!(flash.aux.is_some(), "B の文脈が残っていない");
-    let b_len = flash.aux.as_ref().expect("B").toks.len();
-    let b_toks = flash.aux.as_ref().expect("B").toks.clone();
+    assert!(flash.aux_ctx().is_some(), "B の文脈が残っていない");
+    let b_len = flash.aux_ctx().expect("B").toks.len();
+    let b_toks = flash.aux_ctx().expect("B").toks.clone();
     assert_eq!(
-        flash.cache.as_ref().expect("A が消えた").toks,
+        flash.main_ctx().expect("A が消えた").toks,
         a_toks,
         "B が A の文脈を書き換えた"
     );
@@ -1447,12 +1453,12 @@ fn long_ctx_survives_side_request() {
     assert_eq!(g3.text, "\t\t\t\t\t\t", "A の続きの出力が変わった");
     // B はそのまま残っている (A の続きが B を潰していない)。
     assert_eq!(
-        flash.aux.as_ref().expect("A の続きで B が消えた").toks,
+        flash.aux_ctx().expect("A の続きで B が消えた").toks,
         b_toks,
         "A の続きが B の文脈を書き換えた"
     );
     // A の続きを食ったあとの主の文脈 (B の繰り返しはこれを書き換えない)。
-    let a2_toks = flash.cache.as_ref().expect("A ext が cache に無い").toks.clone();
+    let a2_toks = flash.main_ctx().expect("A ext が cache に無い").toks.clone();
     assert!(a2_toks.len() > a_len, "A の続きが主の文脈を延ばしていない");
 
     // 4. B の繰り返し → また脇に載り、同じ出力になる。
@@ -1467,7 +1473,7 @@ fn long_ctx_survives_side_request() {
     assert_eq!(g4.text, g2.text, "B の出力が繰り返しで変わった");
     assert!(b_len > 0);
     assert_eq!(
-        flash.cache.as_ref().expect("A が消えた").toks,
+        flash.main_ctx().expect("A が消えた").toks,
         a2_toks,
         "B の繰り返しが A の文脈を書き換えた"
     );
@@ -1484,7 +1490,7 @@ fn long_ctx_survives_side_request() {
         CtxPick::Main,
         "ゲート off で脇の文脈を使った"
     );
-    assert!(off.aux.is_none(), "ゲート off で脇の文脈を作った");
+    assert!(off.aux_ctx().is_none(), "ゲート off で脇の文脈を作った");
     // off では B が主の文脈を置き換える (task 206 の症状そのもの)。
     let o3 = off.generate(&a_ext_req(&o1.text), no_emit).expect("A ext off");
     assert_eq!(
@@ -1536,7 +1542,7 @@ fn disconnect_in_side_request_keeps_main_ctx() {
     let mut flash = build_flash(&dir);
     flash.max_ctx = 512;
     let g1 = flash.generate(&gen_req(LONG_A), no_emit).expect("A");
-    let a_toks = flash.cache.as_ref().expect("A").toks.clone();
+    let a_toks = flash.main_ctx().expect("A").toks.clone();
 
     // B の 1 個目の差分で切断 → 脇の文脈に途中まで残る。主は無傷。
     let err = flash
@@ -1545,9 +1551,9 @@ fn disconnect_in_side_request_keeps_main_ctx() {
         .expect("切断で失敗するはず");
     assert!(err.to_string().contains("emit failed (test injection"));
     assert_eq!(last_pick(), CtxPick::Aux, "B が脇に載っていない");
-    assert!(flash.aux.is_some(), "切断した B の文脈が残っていない");
+    assert!(flash.aux_ctx().is_some(), "切断した B の文脈が残っていない");
     assert_eq!(
-        flash.cache.as_ref().expect("A が消えた").toks,
+        flash.main_ctx().expect("A が消えた").toks,
         a_toks,
         "切断した B が A の文脈を書き換えた"
     );
@@ -1588,9 +1594,9 @@ fn aux_ctx_evicted_at_memory_limit() {
     .expect("GenReq");
     flash.generate(&small, no_emit).expect("small");
     assert_eq!(last_pick(), CtxPick::Aux, "上限内の短い要求が脇に載らない");
-    assert!(flash.aux.is_some(), "上限内の短い要求が保存されていない");
+    assert!(flash.aux_ctx().is_some(), "上限内の短い要求が保存されていない");
     assert_eq!(
-        flash.cache.as_ref().expect("A").toks.len() > 200,
+        flash.main_ctx().expect("A").toks.len() > 200,
         true,
         "主の文脈が置き換わった"
     );
@@ -1601,7 +1607,7 @@ fn aux_ctx_evicted_at_memory_limit() {
         CtxPick::MainAfterEvict,
         "容量超過で脇を捨てていない"
     );
-    assert!(flash.aux.is_none(), "容量超過なのに脇の文脈が残った");
+    assert!(flash.aux_ctx().is_none(), "容量超過なのに脇の文脈が残った");
     std::env::remove_var("DENNO_FLASH_AUX_CTX");
     std::env::remove_var("DENNO_FLASH_AUX_TOK");
 }
@@ -1745,8 +1751,8 @@ fn intervene_epoch_invalidates_both_contexts() {
     // 長い A (主の文脈) → 短い B (脇の文脈)。
     flash.generate(&gen_req(LONG_A), no_emit).expect("A");
     flash.generate(&side_b_req(), no_emit).expect("B");
-    assert!(flash.cache.is_some(), "主の文脈が無い");
-    assert!(flash.aux.is_some(), "脇の文脈が無い");
+    assert!(flash.main_ctx().is_some(), "主の文脈が無い");
+    assert!(flash.aux_ctx().is_some(), "脇の文脈が無い");
     // 同じ epoch なら捨てない。
     assert_eq!(flash.drop_stale_ctx(e0), 0, "同じ epoch で文脈を捨てた");
 
@@ -1758,7 +1764,7 @@ fn intervene_epoch_invalidates_both_contexts() {
         2,
         "main と aux の両方が無効化されていない"
     );
-    assert!(flash.cache.is_none() && flash.aux.is_none());
+    assert!(flash.main_ctx().is_none() && flash.aux_ctx().is_none());
 
     // 実経路: 次のリクエストは前置きを再利用しない (full prefill)。
     flash.generate(&gen_req(LONG_A), no_emit).expect("A2");
@@ -1795,8 +1801,8 @@ fn cache_http_get_delete_drops_both_contexts() {
 
     flash.generate(&gen_req(LONG_A), no_emit).expect("A");
     flash.generate(&side_b_req(), no_emit).expect("B");
-    let main_tok = flash.cache.as_ref().expect("主の文脈が無い").toks.len();
-    let aux_tok = flash.aux.as_ref().expect("脇の文脈が無い").toks.len();
+    let main_tok = flash.main_ctx().expect("主の文脈が無い").toks.len();
+    let aux_tok = flash.aux_ctx().expect("脇の文脈が無い").toks.len();
 
     let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/cache", ""));
     let v = http_json(&resp);
@@ -1810,7 +1816,7 @@ fn cache_http_get_delete_drops_both_contexts() {
     assert_eq!(v["dropped"], 2);
     assert_eq!(v["dropped_tokens"], main_tok + aux_tok);
     assert!(v["main"].is_null() && v["aux"].is_null(), "{v}");
-    assert!(flash.cache.is_none() && flash.aux.is_none());
+    assert!(flash.main_ctx().is_none() && flash.aux_ctx().is_none());
     // 介入 epoch は動かさない
     assert_eq!(iv::current_epoch(), e0, "cache clear で epoch が動いた");
 
@@ -1878,7 +1884,7 @@ fn abort_stops_generation_and_is_not_carried_over() {
     assert!(accepted, "生成中の停止要求が受け付けられない");
     assert!(out.n_out <= 2, "停止要求のあとも生成が続いた: {} トークン", out.n_out);
     assert_eq!(out.stop_reason, "end_turn");
-    assert!(flash.cache.is_some(), "止めた生成の文脈が残っていない");
+    assert!(flash.main_ctx().is_some(), "止めた生成の文脈が残っていない");
 
     // 次の生成は普通に最後まで走る (要求は持ち越さない)
     let again = flash.generate(&long(24), no_emit).expect("again");
@@ -2360,4 +2366,305 @@ fn metrics_endpoint_counts_match_reply_usage() {
     let resp = http_roundtrip(&mut flash, &http_req("GET", "/v1/models", ""));
     let v = http_json(&resp);
     assert_eq!(v["data"][0]["owned_by"], "denno", "{v}");
+}
+
+// ---------------------------------------------------------------------------
+// P812: N スロット LRU prefix cache
+// ---------------------------------------------------------------------------
+
+/// P812: `--kv-slots` / `DENNO_KV_SLOTS` と `DENNO_KV_SLOT_TOK` の読み方。
+#[test]
+fn kv_slots_truth_table() {
+    assert_eq!(kv_slots_from(None), 2, "既定は従来の main + aux");
+    assert_eq!(kv_slots_from(Some("1")), 1);
+    assert_eq!(kv_slots_from(Some("4")), 4);
+    assert_eq!(kv_slots_from(Some(" 8 ")), 8);
+    assert_eq!(kv_slots_from(Some("0")), 2, "0 は既定に落とす");
+    assert_eq!(kv_slots_from(Some("9")), 2, "上限超えは既定に落とす");
+    assert_eq!(kv_slots_from(Some("x")), 2, "typo は既定に落とす");
+    assert_eq!(kv_slot_max_tok(None, 4096), 4096, "既定はコンテキスト長まで");
+    assert_eq!(kv_slot_max_tok(Some("512"), 4096), 512);
+    assert_eq!(kv_slot_max_tok(Some("0"), 4096), 4096, "0 は上限なし");
+    assert_eq!(kv_slot_max_tok(Some("99999"), 4096), 4096, "max_ctx で頭打ち");
+    assert_eq!(kv_slot_max_tok(Some("x"), 4096), 4096, "typo は既定");
+}
+
+/// P812: スロット選択の規約 (最長の延長可能 → 空き → LRU)。
+#[test]
+fn pick_slot_n_rules() {
+    let empty = |u: u64| SlotMeta {
+        len: None,
+        lcp: 0,
+        used_at: u,
+        splice: false,
+    };
+    let full = |n: usize, lcp: usize, u: u64| SlotMeta {
+        len: Some(n),
+        lcp,
+        used_at: u,
+        splice: false,
+    };
+    let spliced = |n: usize, lcp: usize, u: u64| SlotMeta {
+        len: Some(n),
+        lcp,
+        used_at: u,
+        splice: true,
+    };
+    // 延長できる 1 本 → それを使う。
+    assert_eq!(
+        pick_slot_n(100, &[full(90, 90, 1), empty(0)]),
+        SlotPick::Reuse(0)
+    );
+    // 延長できる中で最長を選ぶ。
+    assert_eq!(
+        pick_slot_n(100, &[full(10, 10, 2), full(90, 90, 1)]),
+        SlotPick::Reuse(1)
+    );
+    // 同じ長さなら最近使った方。
+    assert_eq!(
+        pick_slot_n(100, &[full(50, 50, 3), full(50, 50, 7)]),
+        SlotPick::Reuse(1)
+    );
+    // 部分一致は再利用しない (KV は縮められない) → 空きへ。
+    assert_eq!(
+        pick_slot_n(20, &[full(50, 3, 1), empty(0)]),
+        SlotPick::Fresh(1)
+    );
+    // キャッシュがプロンプトより長い (= 前置きではない) → 空きへ。
+    assert_eq!(
+        pick_slot_n(10, &[full(20, 10, 1), empty(0)]),
+        SlotPick::Fresh(1)
+    );
+    // 満杯なら最終使用が一番古いスロット。
+    assert_eq!(
+        pick_slot_n(5, &[full(50, 1, 9), full(50, 2, 2), full(50, 3, 4)]),
+        SlotPick::Evict(1)
+    );
+    // 空きが複数あれば最小 index。
+    assert_eq!(
+        pick_slot_n(5, &[empty(0), empty(0), empty(0)]),
+        SlotPick::Fresh(0)
+    );
+    // 延長できないが splice で継げる → そのスロット (末尾空白の食い残し)。
+    assert_eq!(
+        pick_slot_n(60, &[spliced(39, 35, 1), empty(0)]),
+        SlotPick::Reuse(0)
+    );
+    // splice 可が複数なら共通前置きが長い方。
+    assert_eq!(
+        pick_slot_n(60, &[spliced(39, 20, 9), spliced(45, 35, 1)]),
+        SlotPick::Reuse(1)
+    );
+    // 延長できる方が splice より優先。
+    assert_eq!(
+        pick_slot_n(100, &[spliced(39, 35, 9), full(50, 50, 1)]),
+        SlotPick::Reuse(1)
+    );
+    // splice 不可の部分一致は捨てる (空きへ)。
+    assert_eq!(
+        pick_slot_n(60, & [full(39, 35, 9), empty(0)]),
+        SlotPick::Fresh(1)
+    );
+}
+
+/// P812: system 付きの会話 1 ターン。
+fn conv_req(sys: &str, hist: &[(String, String)]) -> GenReq {
+    let msgs: Vec<serde_json::Value> = hist
+        .iter()
+        .map(|(r, c)| serde_json::json!({"role": r, "content": c}))
+        .collect();
+    GenReq::from_json(
+        &serde_json::json!({
+            "system": sys,
+            "messages": msgs,
+            "max_tokens": 4,
+            "temperature": 0.0,
+        }),
+        4,
+    )
+    .expect("conv_req")
+}
+
+/// 会話のプロンプト (テンプレート済み)。
+fn conv_prompt(flash: &Flash, sys: &str, hist: &[(String, String)]) -> Vec<u32> {
+    flash
+        .tok
+        .encode_messages(Some(sys), hist, None, false)
+        .expect("encode_messages")
+}
+
+/// この前置きを持つスロットの index (0 本か 1 本のはず)。
+fn slot_of(flash: &Flash, prompt: &[u32]) -> Vec<usize> {
+    flash
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.ctx.as_ref().is_some_and(|c| c.toks.starts_with(prompt)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// P812 (1)(2)(3): `--kv-slots 4` で 4 本の会話を交互に回す。
+///
+/// - どのターンも自分の会話の前置きを全長再利用し、reuse が 0 にならない。
+/// - 4 本の文脈は別スロットに残り、互いのトークン列を汚さない
+///   (system が違うので前置きの先頭から別。混線すれば slot_of が 2 本以上になる)。
+/// - 出力は新規構築の full prefill と一致する。
+#[test]
+fn kv_slots_four_interleaved_conversations_reuse() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::remove_var("DENNO_KV_SLOT_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+
+    const N: usize = 4;
+    let dir = TempDir::new("flash-kv4");
+    let mut flash = build_flash_n(&dir, 4);
+    flash.max_ctx = 512;
+    assert_eq!(flash.slots.len(), 4, "スロット数");
+
+    let mut hist: Vec<Vec<(String, String)>> = vec![Vec::new(); N];
+    let mut last_len = [0usize; N];
+    // 会話ごとに一意な前置き (system が違うので先頭から別)。スロットの持ち主の判定に使う。
+    let mut first_prompt: Vec<Vec<u32>> = vec![Vec::new(); N];
+    for turn in 0..3 {
+        for i in 0..N {
+            let sys = format!("sys{i}");
+            hist[i].push(("user".to_string(), format!("c{i}t{turn}")));
+            if turn == 0 {
+                first_prompt[i] = conv_prompt(&flash, &sys, &hist[i]);
+            }
+            let g = flash
+                .generate(&conv_req(&sys, &hist[i]), no_emit)
+                .expect("generate");
+            let reuse = TEST_LAST_REUSE.load(Ordering::Relaxed);
+            if turn == 0 {
+                assert_eq!(reuse, 0, "c{i}: 1 ターン目で reuse した");
+            } else {
+                assert_eq!(
+                    reuse, last_len[i],
+                    "c{i} turn{turn}: 自分の前置きを全長再利用していない (reuse={reuse}, want={})",
+                    last_len[i]
+                );
+                assert!(reuse > 0, "c{i} turn{turn}: reuse が 0");
+            }
+            // 保存された文脈はこの会話のものだけ (他のスロットに同じ前置きは無い)。
+            let owners = slot_of(&flash, &first_prompt[i]);
+            assert_eq!(
+                owners.len(),
+                1,
+                "c{i} turn{turn}: 前置きを持つスロットが {owners:?}"
+            );
+            let c = flash.slots[owners[0]].ctx.as_ref().expect("ctx");
+            assert!(
+                c.toks.starts_with(&first_prompt[i]),
+                "c{i} turn{turn}: スロットのトークン列が前置きで始まらない"
+            );
+            assert!(
+                c.toks.len() >= first_prompt[i].len(),
+                "c{i} turn{turn}: 生成分が入っていない"
+            );
+            last_len[i] = c.toks.len();
+            assert_eq!(g.text, "\t\t\t\t", "合成モデルの決定列");
+            hist[i].push(("assistant".to_string(), g.text));
+        }
+    }
+    // 4 本とも残っている (追い出しは起きない)。
+    assert_eq!(
+        flash.slots.iter().filter(|s| s.ctx.is_some()).count(),
+        4,
+        "4 スロットあるのに文脈が 4 本残っていない"
+    );
+    // 全スロットのトークン列は互いに異なる (混線していない)。
+    let mut seen: Vec<Vec<u32>> = Vec::new();
+    for s in &flash.slots {
+        let toks = s.ctx.as_ref().expect("ctx").toks.clone();
+        assert!(!seen.contains(&toks), "同じトークン列のスロットが 2 本ある");
+        seen.push(toks);
+    }
+    // 最後のターンの出力は新規構築の full prefill と同じ。
+    for i in 0..N {
+        let sys = format!("sys{i}");
+        let dir2 = TempDir::new(&format!("flash-kv4-fresh{i}"));
+        let mut fresh = build_flash(&dir2);
+        fresh.max_ctx = 512;
+        let a = flash.generate(&conv_req(&sys, &hist[i]), no_emit).expect("again");
+        let b = fresh.generate(&conv_req(&sys, &hist[i]), no_emit).expect("fresh");
+        assert_eq!(a.text, b.text, "c{i}: 再利用経路と新規構築で出力が違う");
+    }
+}
+
+/// P812: `--kv-slots 4` で 5 本目の会話が LRU (一番古いスロット) を追い出す。
+#[test]
+fn kv_slots_evicts_least_recently_used() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::remove_var("DENNO_KV_SLOT_TOK");
+
+    let dir = TempDir::new("flash-kv4-lru");
+    let mut flash = build_flash_n(&dir, 4);
+    flash.max_ctx = 512;
+
+    let mut hist: Vec<Vec<(String, String)>> = Vec::new();
+    let mut prompts: Vec<Vec<u32>> = Vec::new();
+    for i in 0..5 {
+        let sys = format!("lru{i}");
+        let h = vec![("user".to_string(), format!("q{i}"))];
+        prompts.push(conv_prompt(&flash, &sys, &h));
+        let g = flash.generate(&conv_req(&sys, &h), no_emit).expect("generate");
+        let mut h = h;
+        h.push(("assistant".to_string(), g.text));
+        hist.push(h);
+    }
+    // 最初の会話は追い出され、4 本目 (index 4) が古いスロットに入っている。
+    assert!(
+        slot_of(&flash, &prompts[0]).is_empty(),
+        "5 本目で一番古い文脈が追い出されていない"
+    );
+    assert_eq!(
+        slot_of(&flash, &prompts[4]),
+        vec![0],
+        "5 本目が空いた (一番古い) スロット 0 に入っていない"
+    );
+    // 残っている会話は続きを再利用できる。
+    let mut h1 = hist[1].clone();
+    h1.push(("user".to_string(), "next".to_string()));
+    flash
+        .generate(&conv_req("lru1", &h1), no_emit)
+        .expect("lru1 ext");
+    let reuse1 = TEST_LAST_REUSE.load(Ordering::Relaxed);
+    assert!(reuse1 > 0, "生き残った会話が再利用できない (reuse={reuse1})");
+    // 追い出された会話は reuse 0 (full prefill) に戻る。
+    let mut h0 = hist[0].clone();
+    h0.push(("user".to_string(), "next".to_string()));
+    flash
+        .generate(&conv_req("lru0", &h0), no_emit)
+        .expect("lru0 ext");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "追い出された会話を再利用した"
+    );
+}
+
+/// P812: 既定 (`--kv-slots` 未指定) は従来の 2 スロットで、`/v1/cache` の
+/// 返す形も main / aux を保つ。
+#[test]
+fn kv_slots_default_two_keeps_legacy_shape() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_KV_SLOTS");
+    std::env::remove_var("DENNO_KV_SLOT_TOK");
+
+    let dir = TempDir::new("flash-kv2-default");
+    let mut flash = build_flash(&dir);
+    assert_eq!(flash.slots.len(), 2, "既定は 2 スロット");
+    let g = flash.generate(&gen_req("hi"), no_emit).expect("generate");
+    assert!(g.n_out > 0);
+    let v = flash.ctx_json();
+    assert_eq!(v["n_slots"], 2);
+    assert_eq!(v["slots"].as_array().map(|a| a.len()), Some(2));
+    assert!(v["main"]["tokens"].as_u64().unwrap_or(0) > 0, "{v}");
+    assert!(v["aux"].is_null(), "{v}");
 }

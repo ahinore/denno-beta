@@ -91,6 +91,9 @@ pub struct FlashConfig {
     /// task 796: MTP (nextn) head の safetensors。`None` かつ
     /// `DENNO_MTP_PATH` 未設定なら MTP を読まない (既定起動は不変)。
     pub mtp_path: Option<PathBuf>,
+    /// P812: 文脈スロット数 (`--kv-slots` / `DENNO_KV_SLOTS`、既定 2)。
+    /// 2 は従来の main + aux と同じ、3 以上は LCP 一致 + LRU の汎用経路。
+    pub kv_slots: Option<usize>,
 }
 
 fn shards(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -433,6 +436,126 @@ fn aux_ctx_ratio(v: Option<&str>) -> usize {
     v.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(4)
 }
 
+/// P812: 文脈スロットの上限 (これ以上は端数を切る)。
+pub const KV_SLOTS_MAX: usize = 8;
+
+/// P812: `--kv-slots` / `DENNO_KV_SLOTS` の値からスロット数を決める
+/// (純関数。真偽表テスト `kv_slots_truth_table` が規約を固定する)。
+///
+/// 既定は 2 (従来の main + aux とメモリ量・挙動が同じ)。`1` で単一スロット、
+/// `3..=8` で N スロット LRU。0・typo・上限超えは既定 2 に落とす (黙って
+/// メモリを食わないため)。`DENNO_KV_SLOTS` より CLI 引数が優先。
+fn kv_slots_from(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) if (1..=KV_SLOTS_MAX).contains(&n) => n,
+        _ => 2,
+    }
+}
+
+/// P812: N スロット経路で 1 スロットが持てるトークン数の上限
+/// (`DENNO_KV_SLOT_TOK`。0 / 未設定 / typo は「コンテキスト長まで」)。
+///
+/// メモリの目安は 1 スロットあたり GDN 状態 117 MiB + KV 48 KiB/token。
+fn kv_slot_max_tok(v: Option<&str>, max_ctx: usize) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) if n >= 8 => n.min(max_ctx),
+        _ => max_ctx,
+    }
+}
+
+/// P812: N スロット選択の入力 (1 スロットぶん)。
+///
+/// `len` は文脈のトークン数 (空きスロットは `None`)、`lcp` は今回のプロンプト
+/// との共通前置き長、`used_at` は最終使用時刻 (単調増加。大きいほど新しい)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotMeta {
+    len: Option<usize>,
+    lcp: usize,
+    used_at: u64,
+    /// P812: 途中までの一致でも splice (task 131) で継げる文脈か。
+    /// assistant の末尾空白が `|trim` で落ちるため、延長できないことが多い。
+    splice: bool,
+}
+
+/// P812: どのスロットに載せるか (スロット数 ≥ 3 の汎用経路)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotPick {
+    /// そのまま延長できる (キャッシュ全体がプロンプトの前置き)。
+    Reuse(usize),
+    /// 空きスロット (idx) に載せる。
+    Fresh(usize),
+    /// 一番古いスロット (idx) を捨てて載せる (LRU)。
+    Evict(usize),
+}
+
+impl SlotPick {
+    fn idx(self) -> usize {
+        match self {
+            SlotPick::Reuse(i) | SlotPick::Fresh(i) | SlotPick::Evict(i) => i,
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            SlotPick::Reuse(i) => format!("reuse{i}"),
+            SlotPick::Fresh(i) => format!("fresh{i}"),
+            SlotPick::Evict(i) => format!("evict{i}"),
+        }
+    }
+}
+
+/// P812: N スロットから 1 つ選ぶ純関数 (テストが規約を固定する)。
+///
+/// 優先順:
+/// 1. キャッシュ全体がプロンプトの前置きになっているスロットのうち最長
+///    (同じ長さなら最近使ったもの)。部分一致はそのままでは再利用できない
+///    (KV は縮められず、GDN は畳み込み履歴を持つ) — task 206 と同じ規約。
+/// 2. 1 が無く、splice (task 131) で継げるスロットがあれば、共通前置きが
+///    一番長いもの (assistant の末尾空白が `|trim` で落ちるぶんだけずれる)。
+/// 3. 空きスロット (最小 index)。
+/// 4. 全部埋まっていれば最終使用が一番古いスロット (LRU。同値は最小 index)。
+fn pick_slot_n(prompt_len: usize, slots: &[SlotMeta]) -> SlotPick {
+    let mut best: Option<(usize, usize, u64)> = None;
+    let mut splice_best: Option<(usize, usize, u64)> = None;
+    for (i, s) in slots.iter().enumerate() {
+        let Some(n) = s.len else { continue };
+        let extendable = n <= prompt_len && s.lcp == n;
+        if extendable {
+            let better = match best {
+                None => true,
+                Some((bn, _, bu)) => n > bn || (n == bn && s.used_at >= bu),
+            };
+            if better {
+                best = Some((n, i, s.used_at));
+            }
+        } else if s.splice && s.lcp > 0 {
+            let better = match splice_best {
+                None => true,
+                Some((bl, _, bu)) => s.lcp > bl || (s.lcp == bl && s.used_at >= bu),
+            };
+            if better {
+                splice_best = Some((s.lcp, i, s.used_at));
+            }
+        }
+    }
+    if let Some((_, i, _)) = best {
+        return SlotPick::Reuse(i);
+    }
+    if let Some((_, i, _)) = splice_best {
+        return SlotPick::Reuse(i);
+    }
+    if let Some((i, _)) = slots.iter().enumerate().find(|(_, s)| s.len.is_none()) {
+        return SlotPick::Fresh(i);
+    }
+    let mut victim = 0usize;
+    for (i, s) in slots.iter().enumerate() {
+        if s.used_at < slots[victim].used_at {
+            victim = i;
+        }
+    }
+    SlotPick::Evict(victim)
+}
+
 /// task 206: どの文脈に載せるかを決める (純関数。テストが規約を固定する)。
 ///
 /// 引数は `(トークン数, 共通前置き長)`。規則は優先順に:
@@ -550,6 +673,25 @@ fn echo_matches(tok: &GgufTokenizer, gen: &[u32], echo: &str) -> bool {
     echo.trim() == gen_text.trim()
 }
 
+/// P812: 1 つの文脈スロット。
+///
+/// スロット 0 が従来の「主」(長い会話)、スロット 1 が従来の「aux」に当たる
+/// (スロット数 2 のときは挙動も従来どおり)。`used_at` は LRU 用の最終使用時刻で、
+/// 0 は「未使用」。
+struct KvSlot {
+    ctx: Option<Cached>,
+    used_at: u64,
+}
+
+impl KvSlot {
+    fn empty() -> Self {
+        KvSlot {
+            ctx: None,
+            used_at: 0,
+        }
+    }
+}
+
 struct Flash {
     parts: Vec<PathBuf>,
     max_ctx: usize,
@@ -563,10 +705,13 @@ struct Flash {
     /// P118/task 206: 重みを持つ decoder。リクエストの間は系列状態が空。
     /// `DENNO_FLASH_MODEL_REUSE=0` でも成功したリクエストのあとは残す (今日と同じ)。
     dec: Option<Qwen4ExpDecoder>,
-    /// 主の文脈 (長い会話)。
-    cache: Option<Cached>,
-    /// task 206: 短い脇リクエスト専用の小さな文脈。主の文脈を壊さないために持つ。
-    aux: Option<Cached>,
+    /// P812: 文脈スロット列。`slots[0]` が主、`slots[1]` が脇 (スロット数 2 の
+    /// ときは task 206 と同じ)。3 本以上では LCP 一致 + LRU で選ぶ。
+    /// 各スロットの系列状態 (KV / GDN / PLE conv) は move でしか出入りしないので、
+    /// スロット間に共有は無い。
+    slots: Vec<KvSlot>,
+    /// P812: LRU の論理時計 (スロットを使うたびに 1 進める)。
+    tick: u64,
     /// P51: 推論テレメトリの送出先 (`DENNO_TELEMETRY=0` で無効)。
     telem: Telemetry,
 }
@@ -958,29 +1103,37 @@ impl Flash {
     /// 場合や別の会話は必ず full prefill に落ちる。
     ///
     /// 返り値は `c.toks ++ prompt[i..]`。`None` のとき呼び出し側は full prefill。
-    fn splice_prompt(&self, c: &Cached, req: &GenReq, prompt: &[u32]) -> Result<Option<Vec<u32>>> {
+    /// task 131 / P812: この文脈に splice で継げるリクエストか (安い判定)。
+    ///
+    /// 前回のメッセージ列がそのまま前置きで、その直後に assistant の返送があり、
+    /// 返送本文が実際に食った生成トークンの復号と同じときだけ真。
+    fn splice_compatible(&self, c: &Cached, req: &GenReq) -> bool {
         if !c.from_render || c.prompt_len > c.toks.len() || c.req.cont || req.cont {
-            return Ok(None);
+            return false;
         }
         if c.req.system != req.system
             || c.req.tools != req.tools
             || c.req.enable_thinking != req.enable_thinking
         {
+            return false;
+        }
+        let n = c.req.messages.len();
+        if req.messages.len() <= n || req.messages[..n] != c.req.messages[..] {
+            return false;
+        }
+        let (role, text) = &req.messages[n];
+        if role != "assistant" {
+            return false;
+        }
+        echo_matches(&self.tok, &c.toks[c.prompt_len..], text)
+    }
+
+    fn splice_prompt(&self, c: &Cached, req: &GenReq, prompt: &[u32]) -> Result<Option<Vec<u32>>> {
+        if !self.splice_compatible(c, req) {
             return Ok(None);
         }
         // 前回のメッセージ列がそのまま前置きで、その直後に assistant の返送がある。
         let n = c.req.messages.len();
-        if req.messages.len() <= n || req.messages[..n] != c.req.messages[..] {
-            return Ok(None);
-        }
-        let (role, text) = &req.messages[n];
-        if role != "assistant" {
-            return Ok(None);
-        }
-        // 実際に食った生成トークンの復号と、返送された本文が同じ会話のときだけ。
-        if !echo_matches(&self.tok, &c.toks[c.prompt_len..], text) {
-            return Ok(None);
-        }
         // 1. 描画済みプロンプトをキャッシュに整列する (空白の吸収だけを許す)。
         //    整列できれば、食うのは描画の食い残しだけになり、前置きが描画と
         //    対応していることも検証できる。何ターン前の assistant の末尾空白でも
@@ -1060,27 +1213,73 @@ impl Flash {
         Ok(logits)
     }
 
-    /// task 206: decoder の系列状態を抜き出して、行き先の文脈へ保存する。
+    /// P812: スロットの文脈を借用で見る (`i == 0` が従来の主、`1` が脇)。
+    fn slot_ctx(&self, i: usize) -> Option<&Cached> {
+        self.slots.get(i).and_then(|s| s.ctx.as_ref())
+    }
+
+    /// P812: 従来の「主の文脈」(スロット 0)。
+    fn main_ctx(&self) -> Option<&Cached> {
+        self.slot_ctx(0)
+    }
+
+    /// P812: 従来の「脇の文脈」(スロット 1。スロット数 1 なら常に None)。
+    fn aux_ctx(&self) -> Option<&Cached> {
+        self.slot_ctx(1)
+    }
+
+    /// P812: スロットから系列状態を取り出す (move)。LRU の最終使用時刻を進める。
+    fn take_slot(&mut self, i: usize) -> Option<Cached> {
+        self.tick += 1;
+        let t = self.tick;
+        self.slots.get_mut(i).and_then(|s| {
+            s.used_at = t;
+            s.ctx.take()
+        })
+    }
+
+    /// P812: スロットの文脈を捨てる (空になる)。
+    fn drop_slot(&mut self, i: usize) {
+        if let Some(s) = self.slots.get_mut(i) {
+            s.ctx = None;
+        }
+    }
+
+    /// P812: 全スロットの文脈を捨てる (decoder の系列状態は別)。
+    fn drop_all_ctx(&mut self) {
+        for s in &mut self.slots {
+            s.ctx = None;
+        }
+    }
+
+    /// P812: いま持っている文脈の本数とトークン数の合計 (ログ / ビューワ用)。
+    fn ctx_totals(&self) -> (usize, usize) {
+        self.slots
+            .iter()
+            .filter_map(|s| s.ctx.as_ref())
+            .fold((0, 0), |(n, t), c| (n + 1, t + c.toks.len()))
+    }
+
+    /// task 206 / P812: decoder の系列状態を抜き出して、行き先のスロットへ保存する。
     ///
-    /// 取り出しは move (コピーしない)。上限 (`DENNO_FLASH_AUX_TOK`) を超えた
-    /// 脇の文脈は保存しない = その場で捨てる。系列状態を差し替えられない
+    /// 取り出しは move (コピーしない)。`max_tok` を超えた文脈は保存しない =
+    /// その場で捨てる (メモリ上限での追い出し)。系列状態を差し替えられない
     /// モデル (QSA 有効) では文脈を残さず、decoder を空に戻す。
     #[allow(clippy::too_many_arguments)]
     fn save_ctx(
         &mut self,
         dec: &mut Qwen4ExpDecoder,
-        dest: CtxPick,
+        dest: usize,
         logits: Vec<f32>,
         n_prompt: usize,
         from_render: bool,
         req: CachedReq,
-        aux_max_tok: usize,
+        max_tok: usize,
         epoch: u64,
     ) {
         let Some(state) = dec.take_seq_state() else {
             dec.reset();
-            self.cache = None;
-            self.aux = None;
+            self.drop_all_ctx();
             return;
         };
         let toks = state.tokens().to_vec();
@@ -1093,48 +1292,55 @@ impl Flash {
             from_render,
             req,
         };
-        match dest {
-            CtxPick::Aux if c.toks.len() <= aux_max_tok => self.aux = Some(c),
-            CtxPick::Aux => self.aux = None,
-            _ => self.cache = Some(c),
+        if c.toks.len() > max_tok || dest >= self.slots.len() {
+            self.drop_slot(dest.min(self.slots.len().saturating_sub(1)));
+            return;
         }
+        self.tick += 1;
+        let t = self.tick;
+        let s = &mut self.slots[dest];
+        s.used_at = t;
+        s.ctx = Some(c);
     }
 
-    /// task 217: 介入 epoch が違う文脈を捨てる (main と aux の両方)。
+    /// task 217 / P812: 介入 epoch が違う文脈を捨てる (全スロット)。
     ///
     /// prefix cache の状態は「その設定で計算したモデル」の状態なので、
     /// 設定が変わったら再利用してはいけない。戻り値は捨てた本数。
     fn drop_stale_ctx(&mut self, epoch: u64) -> usize {
         let mut n = 0;
-        if self.cache.as_ref().is_some_and(|c| c.epoch != epoch) {
-            self.cache = None;
-            n += 1;
-        }
-        if self.aux.as_ref().is_some_and(|c| c.epoch != epoch) {
-            self.aux = None;
-            n += 1;
+        for s in &mut self.slots {
+            if s.ctx.as_ref().is_some_and(|c| c.epoch != epoch) {
+                s.ctx = None;
+                n += 1;
+            }
         }
         n
     }
 
-    /// ビューワ用: いま持っている文脈 (main / aux) のトークン数と epoch。
+    /// ビューワ用: いま持っている文脈 (main / aux / 全スロット) のトークン数と epoch。
     /// 文脈 = full attention の KV と GDN の再帰状態・conv 履歴・PLE conv 履歴。
     /// 残差 stream そのものはトークンごとに作り直すので、リクエストの間には残らない。
     fn ctx_json(&self) -> Value {
-        let one = |c: &Option<Cached>| match c {
+        let one = |c: Option<&Cached>| match c {
             Some(c) => json!({"tokens": c.toks.len(), "epoch": c.epoch}),
             None => Value::Null,
         };
-        json!({"main": one(&self.cache), "aux": one(&self.aux)})
+        let all: Vec<Value> = self.slots.iter().map(|s| one(s.ctx.as_ref())).collect();
+        json!({
+            "main": one(self.main_ctx()),
+            "aux": one(self.aux_ctx()),
+            "n_slots": self.slots.len(),
+            "slots": all,
+        })
     }
 
-    /// ビューワ用: 文脈 (main / aux) を両方捨て、decoder の系列状態も空に戻す。
+    /// ビューワ用: 文脈 (全スロット) を捨て、decoder の系列状態も空に戻す。
     /// 次のリクエストは前置きを再利用せず、最初から prefill する。
     /// 介入 epoch は動かさない (介入の設定は変えていないので)。
     fn clear_ctx(&mut self) -> Value {
-        let tokens = self.cache.as_ref().map_or(0, |c| c.toks.len())
-            + self.aux.as_ref().map_or(0, |c| c.toks.len());
-        let n = usize::from(self.cache.take().is_some()) + usize::from(self.aux.take().is_some());
+        let (n, tokens) = self.ctx_totals();
+        self.drop_all_ctx();
         if let Some(d) = self.dec.as_mut() {
             d.reset();
         }
@@ -1248,44 +1454,119 @@ impl Flash {
             .as_ref()
             .map(|d| d.seq_state_supported())
             .unwrap_or(true);
-        let aux_on = aux_on && swap_ok;
-        // task 206: どの文脈に載せるか。前置きの一致はトークン列そのもので見る。
-        let lcp_main = self.cache.as_ref().map(|c| first_mismatch(&c.toks, &prompt));
-        let lcp_aux = self.aux.as_ref().map(|c| first_mismatch(&c.toks, &prompt));
-        let pick = pick_ctx(
-            prompt.len(),
-            self.cache
-                .as_ref()
-                .map(|c| (c.toks.len(), lcp_main.unwrap_or(0))),
-            self.aux
-                .as_ref()
-                .map(|c| (c.toks.len(), lcp_aux.unwrap_or(0))),
-            aux_on,
-            aux_max_tok,
-            aux_ratio,
-        );
-        // task 206 (3): 次のターンが実際にどこまで一致したかを毎回 1 行残す。
-        // 前置きの途中 (時刻など) が変わっていれば `main=8988/5` のように出る。
-        if aux_on {
-            eprintln!(
-                "[flash] ctx: main={} aux={} pick={} plen={}",
-                ctx_len_lcp(self.cache.as_ref(), lcp_main),
-                ctx_len_lcp(self.aux.as_ref(), lcp_aux),
-                pick.name(),
-                prompt.len()
+        let aux_on = aux_on && swap_ok && self.slots.len() > 1;
+        // P812: スロット数 2 までは従来の task 206 の選び方 (main + aux) をそのまま
+        // 使う (既定 --kv-slots 2 の挙動・メモリ量を変えないため)。3 本以上では
+        // LCP 一致 + LRU の汎用経路。
+        let n_slots = self.slots.len();
+        let legacy_pick = if n_slots <= 2 {
+            let lcp_main = self.main_ctx().map(|c| first_mismatch(&c.toks, &prompt));
+            let lcp_aux = self.aux_ctx().map(|c| first_mismatch(&c.toks, &prompt));
+            let pick = pick_ctx(
+                prompt.len(),
+                self.main_ctx().map(|c| (c.toks.len(), lcp_main.unwrap_or(0))),
+                self.aux_ctx().map(|c| (c.toks.len(), lcp_aux.unwrap_or(0))),
+                aux_on,
+                aux_max_tok,
+                aux_ratio,
             );
-        }
-        #[cfg(test)]
-        TEST_LAST_PICK.store(pick as u8, std::sync::atomic::Ordering::Relaxed);
-        if pick == CtxPick::MainAfterEvict {
-            // 脇の容量を超える短いリクエスト: 脇を捨ててから主へ (メモリ上限)。
-            self.aux = None;
-        }
+            // task 206 (3): 次のターンが実際にどこまで一致したかを毎回 1 行残す。
+            // 前置きの途中 (時刻など) が変わっていれば `main=8988/5` のように出る。
+            if aux_on {
+                eprintln!(
+                    "[flash] ctx: main={} aux={} pick={} plen={}",
+                    ctx_len_lcp(self.main_ctx(), lcp_main),
+                    ctx_len_lcp(self.aux_ctx(), lcp_aux),
+                    pick.name(),
+                    prompt.len()
+                );
+            }
+            if pick == CtxPick::MainAfterEvict {
+                // 脇の容量を超える短いリクエスト: 脇を捨ててから主へ (メモリ上限)。
+                self.drop_slot(1);
+            }
+            #[cfg(test)]
+            TEST_LAST_PICK.store(pick as u8, std::sync::atomic::Ordering::Relaxed);
+            Some(pick)
+        } else {
+            None
+        };
+        // P812: 使用スロット。legacy 経路では 0 (主) / 1 (脇)。
+        let mut dest_slot = match legacy_pick {
+            Some(CtxPick::Aux) => 1,
+            Some(_) => 0,
+            None => 0,
+        };
+        let mut src: Option<Cached> = match legacy_pick {
+            Some(CtxPick::Main | CtxPick::MainAfterEvict) => self.take_slot(0),
+            Some(CtxPick::Aux) => self.take_slot(1),
+            Some(CtxPick::Fresh) => None,
+            None => {
+                // 汎用経路: 全スロットの共通前置き長を見て 1 本選ぶ。
+                let metas: Vec<SlotMeta> = self
+                    .slots
+                    .iter()
+                    .map(|s| SlotMeta {
+                        len: s.ctx.as_ref().map(|c| c.toks.len()),
+                        lcp: s
+                            .ctx
+                            .as_ref()
+                            .map(|c| first_mismatch(&c.toks, &prompt))
+                            .unwrap_or(0),
+                        used_at: s.used_at,
+                        splice: splice_on
+                            && prompt_from_render
+                            && s.ctx
+                                .as_ref()
+                                .is_some_and(|c| self.splice_compatible(c, req)),
+                    })
+                    .collect();
+                let sp = pick_slot_n(prompt.len(), &metas);
+                dest_slot = sp.idx();
+                eprintln!(
+                    "[flash] ctx: slots=[{}] pick={} plen={}",
+                    metas
+                        .iter()
+                        .map(|m| match m.len {
+                            Some(n) => format!("{n}/{}", m.lcp),
+                            None => "-".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    sp.name(),
+                    prompt.len()
+                );
+                match sp {
+                    SlotPick::Reuse(i) => self.take_slot(i),
+                    SlotPick::Fresh(i) => {
+                        // 空きスロット (念のため残っていれば捨てる)。
+                        self.drop_slot(i);
+                        None
+                    }
+                    SlotPick::Evict(i) => {
+                        let old = self.take_slot(i).map(|c| c.toks.len());
+                        if let Some(n) = old {
+                            eprintln!(
+                                "[flash] slot {i}: LRU 追い出し ({} tok, スロット {n_slots} 本)",
+                                n
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+        };
         let mut reused = 0usize;
-        let mut src: Option<Cached> = match pick {
-            CtxPick::Main | CtxPick::MainAfterEvict => self.cache.take(),
-            CtxPick::Aux => self.aux.take(),
-            CtxPick::Fresh => None,
+        // P812: 保存先スロットのトークン上限。従来の脇 (スロット 1) は
+        // `DENNO_FLASH_AUX_TOK`、主はコンテキスト長、N スロット経路は
+        // `DENNO_KV_SLOT_TOK` (既定 = コンテキスト長)。
+        let save_max_tok = match legacy_pick {
+            Some(CtxPick::Aux) => aux_max_tok,
+            Some(_) => self.max_ctx,
+            None => kv_slot_max_tok(
+                std::env::var("DENNO_KV_SLOT_TOK").ok().as_deref(),
+                self.max_ctx,
+            ),
         };
         // キャッシュ全体がプロンプトの前置きなら、そのまま延長できる。
         let mut extend = src
@@ -1321,8 +1602,7 @@ impl Flash {
                     "[flash] 系列状態を差し替えられない (DENNO_QSA=1) ので prefix cache を使わない"
                 );
             }
-            self.cache = None;
-            self.aux = None;
+            self.drop_all_ctx();
             drop(src.take());
             extend = false;
             spliced = None;
@@ -1831,27 +2111,21 @@ impl Flash {
         //   挙動を保つ)。
         // - Engine: 半端に進んだ decoder は信用しない。従来どおり捨てる
         //   (cache は None のまま = 次のリクエストで組み直す)。
-        let dest = if pick == CtxPick::Aux {
-            CtxPick::Aux
-        } else {
-            CtxPick::Main
-        };
         if let Some(GenFail::Client(e)) = failed {
             if model_reuse {
                 self.save_ctx(
                     &mut dec,
-                    dest,
+                    dest_slot,
                     logits,
                     n_prompt,
                     prompt_from_render,
                     req_sig.clone(),
-                    aux_max_tok,
+                    save_max_tok,
                     iv_epoch,
                 );
                 self.dec = Some(dec);
             } else {
-                self.cache = None;
-                self.aux = None;
+                self.drop_all_ctx();
                 self.dec = None;
             }
             return Err(e);
@@ -1859,8 +2133,7 @@ impl Flash {
         if let Some(GenFail::Engine(e)) = failed {
             // 半端に進んだ decoder は信用しない: モデルごと捨てて次で組み直す。
             // (他の文脈も一緒に捨てる。task 123 の従来の後始末と同じ。)
-            self.cache = None;
-            self.aux = None;
+            self.drop_all_ctx();
             self.dec = None;
             return Err(e);
         }
@@ -1873,12 +2146,12 @@ impl Flash {
         }
         self.save_ctx(
             &mut dec,
-            dest,
+            dest_slot,
             logits,
             n_prompt,
             prompt_from_render,
             req_sig,
-            aux_max_tok,
+            save_max_tok,
             iv_epoch,
         );
         self.dec = Some(dec);
@@ -3648,6 +3921,10 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
 
     // P51: 推論テレメトリ (denno-view が購読する WS)。既定で有効で、
     // `DENNO_TELEMETRY=0` のときだけ無効。無効時はチャネルもスレッドも作らない。
+    // P812: 文脈スロット数 (CLI 引数 > `DENNO_KV_SLOTS` > 既定 2)。
+    let kv_slots = cfg
+        .kv_slots
+        .unwrap_or_else(|| kv_slots_from(std::env::var("DENNO_KV_SLOTS").ok().as_deref()));
     let telem_on = std::env::var("DENNO_TELEMETRY").ok().as_deref() != Some("0");
     // エンジン側の emit() も同じ判定にする (未設定なら有効、ここでは off のみ無効)。
     denno_telemetry::set_enabled(telem_on);
@@ -3661,7 +3938,7 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default(),
             quant: "gguf".into(),
-            slots: 1,
+            slots: kv_slots as u32,
             context: cfg.max_ctx as u32,
             layers: n_layer as u32,
         },
@@ -3695,6 +3972,17 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         }
     );
 
+    // P812: 文脈スロット数 (CLI 引数 > `DENNO_KV_SLOTS` > 既定 2)。
+    // スロット 1 本あたりのメモリ目安 (GDN 状態 117 MiB + KV 48 KiB/token)。
+    if kv_slots > 2 {
+        eprintln!(
+            "[flash] kv-slots={kv_slots} (LCP + LRU)。追加 {} 本ぶんのメモリ目安: GDN 状態 {} MiB + KV {} MiB (max_ctx={})",
+            kv_slots - 2,
+            (kv_slots - 2) * 117,
+            (kv_slots - 2) * cfg.max_ctx * 48 / 1024,
+            cfg.max_ctx
+        );
+    }
     let mut flash = Flash {
         parts,
         max_ctx: cfg.max_ctx,
@@ -3704,8 +3992,8 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         batch,
         shape,
         dec: None,
-        cache: None,
-        aux: None,
+        slots: (0..kv_slots).map(|_| KvSlot::empty()).collect(),
+        tick: 0,
         telem: telemetry,
     };
     // 起動時に 1 回組んで、読めないならここで落とす
@@ -3765,11 +4053,12 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 // 確保の内訳を 1 表だけ出す (1 本目と長い文脈の最初の 1 回)。
                 // `DENNO_SCRATCH_FREE=0` / `DENNO_Q4_PROFILE` なしでは何もしない。
                 let ctx_tokens = flash
-                    .cache
-                    .as_ref()
+                    .slots
+                    .iter()
+                    .filter_map(|s| s.ctx.as_ref())
                     .map(|c| c.toks.len())
-                    .unwrap_or(0)
-                    .max(flash.aux.as_ref().map(|c| c.toks.len()).unwrap_or(0));
+                    .max()
+                    .unwrap_or(0);
                 denno_engine::mem_audit::request_boundary(ctx_tokens, 4096);
                 // P-pf-arena: 重み登録の成否をリクエスト単位で 1 行 (登録を試みた
                 // ときだけ)。GPU_BROKEN のラッチはプロセス寿命なので reset しない。

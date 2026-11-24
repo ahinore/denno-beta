@@ -71,6 +71,11 @@ enum Commands {
         /// (MTP を読まない) 起動する。config.json は同じディレクトリに置く。
         #[arg(long)]
         mtp_path: Option<PathBuf>,
+        /// P812: 文脈 (KV / GDN) スロット数。既定 2 (従来の main + aux)。
+        /// 3 以上で LCP 一致 + LRU の汎用 prefix cache。未指定なら
+        /// 環境変数 `DENNO_KV_SLOTS`、それも無ければ 2。
+        #[arg(long)]
+        kv_slots: Option<usize>,
     },
     /// P801: 起動中のサーバーに対する再現可能ベンチ (llama-bench 風 pp/tg)。
     /// プロンプトはサーバーの usage.input_tokens で目標トークン数へ較正する。
@@ -670,7 +675,7 @@ fn main() -> Result<()> {
                 eprintln!("wrote {}", path.display());
             }
         }
-        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens, mtp_path } => {
+        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens, mtp_path, kv_slots } => {
             serve_flash::run(serve_flash::FlashConfig {
                 dir,
                 host,
@@ -679,6 +684,7 @@ fn main() -> Result<()> {
                 name: name.unwrap_or_else(|| "qwen3.8-flash-next".to_string()),
                 max_tokens,
                 mtp_path,
+                kv_slots,
             })?;
         }
         Commands::Pull { repo } => {
