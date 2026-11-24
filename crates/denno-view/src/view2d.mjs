@@ -1029,7 +1029,244 @@ export function steerSummary(apply) {
   return parts.join(' · ') + ' · ' + apply.mode + ' · α ' + apply.alpha + ' · layers ' + layers;
 }
 
+// ---- abliteration の作業台 (task 825) ------------------------------------
+//
+// `/2d` の Abliterate タブの純ロジック。サーバーの `/v1/steer/analyze` が返す
+// 層ごとの指標を、分離チャート・色モード・適用本文・比較表示に落とす。
+// どれも DOM に触らない (node --test から直接呼ぶ)。
+
+/// 対比に使うスナップショット名 (画面の既定)。
+export const ABLIT_A = 'ablit_A';
+export const ABLIT_B = 'ablit_B';
+/// alpha スライダの範囲。
+export const ABLIT_ALPHA_MIN = 0;
+export const ABLIT_ALPHA_MAX = 2;
+
+/// テキストエリアの改行区切り → プロンプトの配列 (空行は捨てる)。
+export function parsePromptList(text, opts = {}) {
+  if (typeof text !== 'string') return [];
+  const max = Math.max(1, intOr(opts.max, 512));
+  const out = [];
+  for (const line of text.split(/\r?\n/)) {
+    const p = line.trim();
+    if (!p) continue;
+    out.push(p);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/// 分析結果 → 層ごとの分離スコア (0..1)。足りない層は 0。
+export function ablitSepScores(analysis, nLayers) {
+  const n = Math.max(0, intOr(nLayers, 0));
+  const out = new Array(n).fill(0);
+  const arr = analysis && Array.isArray(analysis.layers) ? analysis.layers : [];
+  for (const l of arr) {
+    const i = intOr(l && l.layer, -1);
+    if (i < 0 || i >= out.length) continue;
+    const v = Number(l.sep_score);
+    out[i] = Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
+  }
+  return out;
+}
+
+/// 分離スコアの配列 → 推奨区間 `[from, to)`。
+/// engine の `steer::recommended_range` と同じ規則 (層 0 と最終層を避け、
+/// ピークの半値以上が続く連続窓)。
+export function ablitRecommendedRange(seps) {
+  const arr = Array.isArray(seps) ? seps : [];
+  const n = arr.length;
+  if (!n) return [0, 0];
+  if (n < 3) return [0, n];
+  const lo = 1;
+  const hi = n - 1;
+  let peak = lo;
+  let best = Number(arr[lo]) || 0;
+  for (let i = lo; i < hi; i++) {
+    const v = Number(arr[i]) || 0;
+    if (v > best) { best = v; peak = i; }
+  }
+  if (!(best > 0)) return [lo, hi];
+  const thr = best * 0.5;
+  let from = peak;
+  while (from > lo && (Number(arr[from - 1]) || 0) >= thr) from--;
+  let to = peak + 1;
+  while (to < hi && (Number(arr[to]) || 0) >= thr) to++;
+  return [from, to];
+}
+
+/// 分析結果の推奨区間 (層数で丸める)。
+export function ablitRange(analysis, nLayers) {
+  const n = Math.max(0, intOr(nLayers, 0));
+  const r = analysis && Array.isArray(analysis.recommended_range) ? analysis.recommended_range : null;
+  if (!r || r.length !== 2) return [0, n];
+  let f = Math.max(0, Math.min(n, intOr(r[0], 0)));
+  const t = Math.max(f, Math.min(n, intOr(r[1], 0)));
+  return [f, t];
+}
+
+/// 分離チャートのバー (層の数だけ)。`value` は 0..1 の生値、`h` は max で正規化。
+export function ablitChart(analysis, rect, range, nLayers) {
+  const n = Math.max(0, intOr(nLayers, 0));
+  const R = rect && typeof rect === 'object' ? rect : { x: 0, y: 0, w: 1, h: 1 };
+  const vals = ablitSepScores(analysis, n);
+  const max = vals.reduce((a, v) => Math.max(a, v), 0);
+  const rr = Array.isArray(range) ? range : ablitRange(analysis, n);
+  const from = intOr(rr[0], 0);
+  const to = intOr(rr[1], 0);
+  const step = n > 0 ? R.w / n : 0;
+  const gap = Math.min(2, step * 0.25);
+  const bw = Math.max(1, step - gap);
+  const peak = intOr(analysis && analysis.peak_layer, -1);
+  const bars = vals.map((v, i) => {
+    const h = max > 0 ? Math.max(v > 0 ? 1 : 0, (v / max) * R.h) : 0;
+    return {
+      layer: i,
+      x: R.x + i * step,
+      y: R.y + R.h - h,
+      w: bw,
+      h,
+      value: v,
+      selected: i >= from && i < to,
+      peak: i === peak,
+    };
+  });
+  return { bars, max, range: [from, to], n };
+}
+
+/// チャート上の x 座標 → 層 index。外は null。
+export function ablitLayerAt(chart, x) {
+  if (!chart || !Array.isArray(chart.bars) || !chart.bars.length) return null;
+  const b0 = chart.bars[0];
+  const bN = chart.bars[chart.bars.length - 1];
+  const x0 = b0.x;
+  const x1 = bN.x + bN.w;
+  if (x < x0 || x > x1 || x1 <= x0) return null;
+  const idx = Math.floor((x - x0) / ((x1 - x0) / chart.bars.length));
+  return Math.max(0, Math.min(chart.bars.length - 1, idx));
+}
+
+/// ドラッグ選択 (anchor → いまの層) → `[from, to)`。同じ層なら 1 層。
+export function ablitRangeFromDrag(anchor, layer) {
+  const a = Math.max(0, intOr(anchor, 0));
+  const b = Math.max(0, intOr(layer, 0));
+  return [Math.min(a, b), Math.max(a, b) + 1];
+}
+
+/// ワンクリック適用の本文 (A +1 / B -1 / project)。
+export function ablitApplyBody(range, alpha, opts = {}) {
+  const nLayers = Math.max(0, intOr(opts.nLayers, 0));
+  const r = Array.isArray(range) ? range : [];
+  if (r.length !== 2) throw new Error('range: [from, to] required');
+  const from = intOr(r[0], -1);
+  const to = intOr(r[1], -1);
+  if (from < 0 || to < 0) throw new Error('range: from/to must be >= 0');
+  if (from >= to) throw new Error('range: from must be < to (空の範囲は掛けない)');
+  if (nLayers > 0 && to > nLayers) throw new Error('range: to must be <= ' + nLayers);
+  const a = alpha == null ? 1 : Number(alpha);
+  if (!Number.isFinite(a)) throw new Error('alpha: must be a finite number');
+  if (a < ABLIT_ALPHA_MIN || a > ABLIT_ALPHA_MAX) {
+    throw new Error('alpha: ' + ABLIT_ALPHA_MIN + ' .. ' + ABLIT_ALPHA_MAX + ' (got ' + a + ')');
+  }
+  return steerApplyBody({
+    terms: [
+      { snapshot: opts.a || ABLIT_A, coef: 1 },
+      { snapshot: opts.b || ABLIT_B, coef: -1 },
+    ],
+    layers: [from, to],
+    alpha: a,
+    mode: 'project',
+  }, { nLayers });
+}
+
+/// Hybrid block (4 層) の分離スコア = その 4 層の平均。
+export function ablitHybridValue(scores, hybrid, per = 4) {
+  const arr = Array.isArray(scores) ? scores : [];
+  const p = Math.max(1, intOr(per, 4));
+  const h = intOr(hybrid, -1);
+  if (h < 0) return 0;
+  let s = 0;
+  let n = 0;
+  for (let l = h * p; l < (h + 1) * p && l < arr.length; l++) {
+    s += Number(arr[l]) || 0;
+    n++;
+  }
+  return n ? s / n : 0;
+}
+
+/// エクスポートの URL とファイル名 (ブラウザのダウンロード用)。
+export function ablitExportUrl(name, format) {
+  const q = '?name=' + encodeURIComponent(String(name || ''));
+  return '/api/v1/steer/export' + q + (format === 'json' ? '&format=json' : '');
+}
+
+export function ablitExportName(name, format) {
+  const n = String(name || 'snapshot');
+  return format === 'json' ? n + '.dnsteer.json' : n + '.dns';
+}
+
+/// 取り込む JSON テキストの検証 (実 API の `import_json` と同じ規則)。不正は例外。
+export function ablitImportBody(text) {
+  if (typeof text !== 'string' || !text.trim()) throw new Error('file is empty');
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch (e) {
+    throw new Error('not JSON: ' + ((e && e.message) ? e.message : String(e)));
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('JSON must be an object');
+  if (v.data_base64 == null) {
+    if (!Array.isArray(v.mean)) throw new Error('mean or data_base64 required');
+    const layers = intOr(v.layers, 0);
+    const nHc = intOr(v.n_hc, 0);
+    const nEmbd = intOr(v.n_embd, 0);
+    if (!(layers > 0 && nHc > 0 && nEmbd > 0)) throw new Error('layers / n_hc / n_embd required');
+    if (v.mean.length !== layers * nHc * nEmbd) throw new Error('mean length mismatch');
+  } else if (typeof v.data_base64 !== 'string') {
+    throw new Error('data_base64 must be a string');
+  }
+  if (v.name != null && !NAME_RE.test(String(v.name))) {
+    throw new Error('name: A-Z a-z 0-9 _ - only');
+  }
+  return v;
+}
+
+/// 分離チャートの 1 行要約 ("peak layer 21 · sep 0.433 · range 12-30")。
+export function ablitSummary(analysis) {
+  if (!analysis || !Array.isArray(analysis.layers) || !analysis.layers.length) return '';
+  const n = analysis.layers.length;
+  const rr = ablitRange(analysis, n);
+  const pk = intOr(analysis.peak_layer, -1);
+  const row = pk >= 0 && pk < n ? analysis.layers.find((l) => intOr(l && l.layer, -1) === pk) : null;
+  const sep = row ? Number(row.sep_score) : NaN;
+  return 'peak layer ' + pk + (Number.isFinite(sep) ? ' · sep ' + sep.toFixed(3) : '') +
+    ' · range ' + rr[0] + '-' + rr[1];
+}
+
+/// A/B の比較の行 (OFF と ON を並べる)。長すぎる出力は末尾を落とす。
+export function ablitCompareRows(offText, onText, opts = {}) {
+  const max = Math.max(16, intOr(opts.max, 4000));
+  const cut = (t) => {
+    const s = typeof t === 'string' ? t : '';
+    return s.length > max ? s.slice(0, max) + '…' : s;
+  };
+  return [
+    { label: 'OFF', text: cut(offText) },
+    { label: 'ON', text: cut(onText) },
+  ];
+}
+
 // ---- モック店 (shape が 404 のとき) ---------------------------------------
+
+/// 名前 → 32 bit の決定的な種 (モックの合成スコア用)。
+function hashName(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h;
+}
 
 /// モックモードの合成テレメトリ (task 235)。サーバー無しでも壁を動かして
 /// 目で確認できるように、1 トークン分のフレームを決定的に作る。
@@ -1181,6 +1418,9 @@ export function expertCoverageText(cov) {
 /// - ステアリングのエラーは全部 400 (実 API は 404/409 を使わない)。
 /// - 同名 snapshot は上書きできる (engine の `push_snapshot` が名前で置換する)。
 /// - snapshot の `layers` は層数 (数値)。apply の `layers` は `[from, to)` の配列。
+///
+/// task 825: `/v1/steer/analyze` / `export` / `import` も受ける。分析は
+/// エンジンを持たないので、名前から決定的に作った山を返す (形だけ実 API と同じ)。
 export function createMockStore(shape, opts = {}) {
   const s = normaliseShape(shape || DEFAULT_SHAPE_RAW);
   // 実 API の `created` は UNIX 秒 (engine の `now_secs`)。ISO 文字列ではない。
@@ -1497,6 +1737,94 @@ export function createMockStore(shape, opts = {}) {
       if (m === 'DELETE' && p === '/v1/steer/apply') {
         clearApply();
         return { status: 200, body: status() };
+      }
+      // task 825: Abliterate 作業台 (analyze / export / import)。
+      // モックはエンジンを持たないので、層ごとの分離スコアは名前から
+      // 決定的に作り、形と検証規則だけ実 API に合わせる。
+      const qi = p.indexOf('?');
+      const bare = qi < 0 ? p : p.slice(0, qi);
+      const q = new URLSearchParams(qi < 0 ? '' : p.slice(qi + 1));
+      if (m === 'POST' && bare === '/v1/steer/analyze') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'body must be an object');
+        for (const k of Object.keys(body)) {
+          if (['pos', 'neg', 'terms'].indexOf(k) < 0) {
+            return err(400, 'unknown field ' + JSON.stringify(k) + ' (pos / neg / terms only)');
+          }
+        }
+        let names;
+        if (body.terms != null) {
+          if (!Array.isArray(body.terms) || body.terms.length === 0) return err(400, 'terms must be a non-empty array');
+          let np = 0;
+          let nn = 0;
+          for (let i = 0; i < body.terms.length; i++) {
+            const t = body.terms[i];
+            if (!t || typeof t !== 'object' || Array.isArray(t)) return err(400, 'terms[' + i + '] must be an object');
+            for (const k of Object.keys(t)) {
+              if (['snapshot', 'coef'].indexOf(k) < 0) return err(400, 'terms[' + i + ']: unknown field ' + JSON.stringify(k));
+            }
+            if (typeof t.snapshot !== 'string' || !t.snapshot) return err(400, 'terms[' + i + '].snapshot must be a string');
+            if (!Number.isFinite(Number(t.coef))) return err(400, 'terms[' + i + '].coef must be a finite number');
+            if (Number(t.coef) > 0) np++;
+            else if (Number(t.coef) < 0) nn++;
+          }
+          if (!np || !nn) return err(400, 'both a positive and a negative coef are required');
+          names = body.terms.map((t) => t.snapshot);
+        } else {
+          if (typeof body.pos !== 'string' || typeof body.neg !== 'string') return err(400, 'pos and neg must be strings');
+          names = [body.pos, body.neg];
+        }
+        for (const n of names) {
+          if (!st.snapshots.some((x) => x.name === n)) return err(400, 'no such snapshot: ' + n);
+        }
+        const seed = hashName(names.join('|'));
+        const peak = 2 + (seed % Math.max(1, s.layers - 4));
+        const layers = [];
+        for (let l = 0; l < s.layers; l++) {
+          const v = 0.15 + 0.7 * Math.exp(-((l - peak) * (l - peak)) / 18);
+          layers.push({
+            layer: l, diff_norm: Math.round(v * 10000) / 1000,
+            norm_pos: 9, norm_neg: 8.5, cos_sim: -0.2 - v * 0.3, sep_score: v,
+          });
+        }
+        const rr = ablitRecommendedRange(layers.map((x) => x.sep_score));
+        return {
+          status: 200,
+          body: {
+            pos: names[0], neg: names[names.length - 1], n_layer: s.layers,
+            peak_layer: peak, recommended_range: rr, layers,
+          },
+        };
+      }
+      if (m === 'GET' && bare === '/v1/steer/export') {
+        const name = q.get('name') || '';
+        const snap = st.snapshots.find((x) => x.name === name);
+        if (!snap) return err(400, name ? 'no such snapshot: ' + name : 'name is required (?name=...)');
+        if (q.get('format') === 'json') {
+          return {
+            status: 200,
+            body: {
+              name: snap.name, tokens: snap.tokens, created: snap.created,
+              model: 'mock', layers: s.layers, n_hc: s.n_hc, n_embd: s.n_embd,
+              format: 'DNSTEER1', data_base64: 'bW9jaw==',
+            },
+          };
+        }
+        return { status: 200, body: { name: snap.name, tokens: snap.tokens, format: 'DNSTEER1', data_base64: 'bW9jaw==' } };
+      }
+      if (m === 'POST' && bare === '/v1/steer/import') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'body must be a JSON object');
+        const name = q.get('name') || body.name;
+        if (typeof name !== 'string' || !NAME_RE.test(name)) return err(400, 'name: A-Z a-z 0-9 _ - only, at most 64 chars');
+        const layers = body.layers == null ? s.layers : Number(body.layers);
+        if (layers !== s.layers) return err(400, 'layers: expected ' + s.layers);
+        const snap = { name, tokens: Number(body.tokens) || 0, created: now(), layers };
+        const i = st.snapshots.findIndex((x) => x.name === name);
+        if (i >= 0) st.snapshots[i] = snap;
+        else st.snapshots.push(snap);
+        st.snapshots.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        const out = status();
+        out.imported = jsonClone(snap);
+        return { status: 200, body: out };
       }
       return { status: 404, body: apiError('not found: ' + m + ' ' + p) };
     },

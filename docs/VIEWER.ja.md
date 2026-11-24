@@ -40,6 +40,26 @@ mixer: kind == "qsa" and layer % 8 == 3; moe: layer in [5, 9, 17]
 
 `denno-view` の環境変数: `VIEW_UPSTREAM`(既定 `ws://127.0.0.1:8080/v1/telemetry/ws`)、`VIEW_PORT`(既定 8093)、`VIEW_RECORD`(フレームをファイルに追記)、`VIEW_REPLAY`(記録を `/replay` で配信)、`VIEW_CAPTURE`(連結フレーム列を `/capture.bin` で配信)、`VIEW_TOKENIZER`(トークン文字表示用の tokenizer.json)。`/chat` は上流のサーバーへ中継するので、内蔵チャットに CORS 設定は要らない。
 
+## Abliterate の作業台 (`/2d` の右パネル)
+
+右の操作列にある `abliterate` の箱が、方向 ablation の A/B 対比の作業台。残差ストリームのステアリング (crates/denno-engine/src/model/steer.rs) と `/v1/steer` の上に載っている。
+
+1. 2 つのプロンプト集合を貼る (1 行 1 プロンプト)。A が消したい向き、B が残したい向き。`load sample` で小さな例が入る。
+2. `capture A & B` が `ablit_A` → `ablit_B` の順に記録する。各プロンプトの前に KV を捨ててプロンプト全体を prefill させ、`/chat` を `max_tokens: 1, temperature: 0` で流し、集合ごとに記録を止めて、最後に `/v1/steer/analyze` を呼ぶ。進み具合は `A 3/8…` のように出て、`cancel` はプロンプトの切れ目で止める (そこまでの記録は保存される)。
+3. 分離チャートは層ごとの `sep_score = ||mu_A - mu_B|| / (||mu_A|| + ||mu_B|| + 1e-12)`。チャートをクリック / ドラッグすると層の範囲 `[from, to)` が決まる。`use recommended` はピークの半値以上が続く連続窓 (層 0 と最終層は除く) を選ぶ。
+4. `apply abliteration` が `POST /v1/steer/apply` を `terms: [{ablit_A, +1}, {ablit_B, -1}]`、`mode: "project"`、選んだ層と `alpha` (0.0–2.0、刻み 0.05、既定 1.0) で送る。`reset / clear` は `DELETE /v1/steer/apply`。
+5. `compare off vs on` は同じテストプロンプトを、ステアリング無しで 1 回、いまの範囲を掛けて 1 回流し、2 つの答えを並べる。比較のあとは元の適用状態に戻す。
+6. `colour: ablit` (ヘッダの `ablit` チップも同じ) で、48 層の柱と 12 個の Hybrid block を層ごとの分離スコアで塗る。
+7. `download .dns` / `download .json` は `GET /v1/steer/export?name=ablit_A` を取る (DNSTEER1 のバイナリ、または本体を base64 で載せた JSON)。`import` はそのファイルを `POST /v1/steer/import` へ送る (`.dns` は `application/octet-stream`、JSON は向きの JSON として)。
+
+このために足した API (crates/denno-cli/src/serve_flash.rs):
+
+- `POST /v1/steer/analyze` — 本文は `{pos, neg}` か `{terms:[{snapshot,coef}...]}` (正の係数が A 側、負が B 側)。返りは `{pos, neg, n_layer, peak_layer, recommended_range:[from,to], layers:[{layer, diff_norm, norm_pos, norm_neg, cos_sim, sep_score}]}`。
+- `GET /v1/steer/export?name=<snap>[&format=json]` — 保存済みの DNSTEER1 スナップショット、または同じバイト列を base64 にした JSON。
+- `POST /v1/steer/import[?name=<new>]` — DNSTEER1 の本文か、`data_base64` / `mean` 配列を持つ JSON。形とモデル id の検証はローダと同じで、不正は 400。
+
+`POST /v1/steer/record` は `capture_mode` も受ける。`"all"` (既定、従来どおり) は通り、`"last_prompt_token"` はこの版では 400 で断る (黙って全トークンを記録しない)。
+
 ## テレメトリのフレーム
 
 `DNTL` マジック + version 1 バイト + kind 1 バイト + varint の payload。kind 番号はブランチを跨いで固定で、退役した番号は再利用しない。

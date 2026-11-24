@@ -205,6 +205,7 @@
   <div class="modes">colour:
     <button id="m-token" class="on">per token</button>
     <button id="m-accum">accumulated</button>
+    <button id="m-ablit" title="48 層の柱と 12 Hybrid block を層ごとの分離スコア (Abliterate タブ) で塗る">ablit</button>
   </div>
   <div class="epoch">epoch <b id="epoch">0</b></div>
   <div id="cache" class="cache">cache: -</div>
@@ -346,6 +347,50 @@
       <div id="applyinfo" class="small dim" style="margin-top:4px"></div>
     </div>
 
+    <div class="box" id="ablitbox">
+      <h2>abliterate <span class="dim">A/B → project</span></h2>
+      <div class="small dim">1 行 1 プロンプト。A = 消したい向き、B = 残したい向き (符号は A +1 / B -1)。</div>
+      <label class="f">Set A (positive)<textarea id="ab-a" rows="3" placeholder="prompts (A) — one per line"></textarea></label>
+      <label class="f">Set B (negative)<textarea id="ab-b" rows="3" placeholder="prompts (B) — one per line"></textarea></label>
+      <div class="row2">
+        <button id="ab-load" class="b" title="サンプルを入れる (A: 拒否しそうな題、B: 無害な題)">load sample</button>
+        <button id="ab-clearset" class="b">clear sets</button>
+      </div>
+      <div class="row2">
+        <button id="ab-capture" class="b go" title="record ablit_A / ablit_B → 各プロンプトを max_tokens 1 で流す → analyze">capture A &amp; B</button>
+        <button id="ab-cancel" class="b warn" disabled>cancel</button>
+      </div>
+      <div id="ab-prog" class="small dim" style="margin-top:4px">idle</div>
+      <canvas id="ab-chart" style="width:100%;height:86px;display:block;background:#04080d;border:1px solid var(--line);margin-top:6px;cursor:crosshair"
+        title="層ごとの分離スコア。クリック / ドラッグで [from,to) を選ぶ"></canvas>
+      <div id="ab-sum" class="small dim" style="margin-top:2px"></div>
+      <div class="row2">
+        <button id="ab-userec" class="b">use recommended</button>
+        <button id="ab-colour" class="b" title="メインの図の色を層ごとの分離スコアに切り替える">colour: off</button>
+      </div>
+      <div class="grid2">
+        <label class="f">layers [from,to) <input id="ab-from" type="number" min="0" value="0"> – <input id="ab-to" type="number" min="0" value="0"></label>
+        <label class="f">alpha <span id="ab-alphav">1.00</span>
+          <input id="ab-alpha" type="range" min="0" max="2" step="0.05" value="1"></label>
+      </div>
+      <div class="row2">
+        <button id="ab-apply" class="b go" title="POST /v1/steer/apply (A +1 / B -1 / project)">apply abliteration</button>
+        <button id="ab-reset" class="b warn" title="DELETE /v1/steer/apply">reset / clear</button>
+      </div>
+      <div class="row2">
+        <input id="ab-test" type="text" placeholder="test prompt" style="flex:2">
+        <button id="ab-compare" class="b" title="同じプロンプトを OFF / ON の両方で流して並べる">compare off vs on</button>
+      </div>
+      <div id="ab-cmp" class="small" style="white-space:pre-wrap"></div>
+      <div class="row2">
+        <button id="ab-dlbin" class="b" title="GET /v1/steer/export?name=ablit_A">download .dns</button>
+        <button id="ab-dljson" class="b" title="GET /v1/steer/export?name=ablit_A&amp;format=json">download .json</button>
+      </div>
+      <label class="f">import (.dns そのまま / .json)<input id="ab-file" type="file" accept=".dns,.json,application/json,application/octet-stream"></label>
+      <div id="ab-err" class="err"></div>
+      <div id="ab-info" class="small dim" style="margin-top:4px"></div>
+    </div>
+
     <div class="box">
       <h2>state <span class="dim">/api/v1/cache · experts</span></h2>
       <div class="kv"><span>kv main</span><b id="kv-main">-</b></div>
@@ -381,6 +426,9 @@ import {
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
   toggleItem, addItem, removeItem, selectionItems, wallHitTest,
   wallItemsInRect, wallLayout, hasItem,
+  ABLIT_A, ABLIT_B, ablitApplyBody, ablitChart, ablitCompareRows, ablitExportName,
+  ablitExportUrl, ablitImportBody, ablitLayerAt, ablitRange, ablitRangeFromDrag,
+  ablitSepScores, ablitSummary, parsePromptList,
 } from '/view2d.mjs';
 import {
   archLayout, archHitTest, archItemsInRect, archNodeRect, drawArch, fitView, gridPixels,
@@ -402,6 +450,10 @@ let st = createMapState(shape);
 const sel = createSelection();
 let applied = { epoch: 0, experts_off: [], blocks_off: [], streams_off: [] };
 let steer = { recording: null, snapshots: [], apply: null };
+// task 825: Abliterate 作業台の状態。`chart` は最後に描いたバーの配置 (クリック判定)。
+let colourMode = 'token';              // 'token' | 'accum' | 'ablit'
+let ablit = { analysis: null, range: [0, 0], chart: null, drag: null, busy: false, cancel: false };
+let ablitScores = [];                  // 層ごとの分離スコア (0..1、色モード用)
 let terms = new Map();                 // snapshot name -> coef
 let hover = null;
 let drag = null;                       // {x0,y0,x1,y1,add,items}
@@ -1045,6 +1097,404 @@ $('btn-clear-apply').addEventListener('click', async () => {
   await refreshAll('steering cleared');
 });
 
+// ---- abliteration の作業台 (task 825) -----------------------------------
+// A/B の 2 組を記録し、層ごとの分離スコアを出し、ワンクリックで直交射影
+// (project) を掛ける。数字は全部 /v1/steer/analyze の戻り (UI では作らない)。
+
+function ablitErr(msg) { $('ab-err').textContent = msg || ''; }
+function ablitInfo(msg) { $('ab-info').textContent = msg || ''; }
+
+function updateAblitScores() {
+  ablitScores = ablitSepScores(ablit.analysis, shape.layers);
+  if (colourMode === 'ablit') dirty = true;
+}
+
+function drawAblitChart() {
+  const c = $('ab-chart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(80, c.clientWidth || 280);
+  const h = 86;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(h * dpr);
+  }
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const rect = { x: 2, y: 6, w: Math.max(1, w - 4), h: h - 22 };
+  const ch = ablitChart(ablit.analysis, rect, ablit.range, shape.layers);
+  ablit.chart = ch;
+  for (const b of ch.bars) {
+    g.fillStyle = b.selected ? '#7fe3ff' : (b.peak ? '#ffd479' : 'rgba(120,180,210,.5)');
+    g.fillRect(b.x, b.y, b.w, Math.max(0, b.h));
+  }
+  const r0 = ch.bars[ch.range[0]];
+  const r1 = ch.bars[Math.min(ch.bars.length - 1, ch.range[1] - 1)];
+  if (r0 && r1 && ch.range[1] > ch.range[0]) {
+    g.strokeStyle = 'rgba(127,227,255,.85)';
+    g.lineWidth = 1;
+    g.strokeRect(r0.x - 0.5, rect.y - 3.5, (r1.x + r1.w) - r0.x + 1, rect.h + 7);
+  }
+  g.fillStyle = 'rgba(150,185,200,.7)';
+  g.font = '9px ui-monospace, monospace';
+  g.fillText('0', 2, h - 6);
+  const last = String(Math.max(0, shape.layers - 1));
+  g.fillText(last, w - 4 - g.measureText(last).width, h - 6);
+  $('ab-sum').textContent = ablitSummary(ablit.analysis) ||
+    'capture A & B to see per-layer separation';
+}
+
+function renderAblitInputs() {
+  $('ab-from').value = String(ablit.range[0] | 0);
+  $('ab-to').value = String(ablit.range[1] | 0);
+  $('ab-alphav').textContent = Number($('ab-alpha').value).toFixed(2);
+}
+
+function setAblitRange(from, to) {
+  const n = shape.layers;
+  const f = Math.max(0, Math.min(n, Math.round(Number(from) || 0)));
+  const t = Math.max(f, Math.min(n, Math.round(Number(to) || 0)));
+  ablit.range = [f, t];
+  renderAblitInputs();
+  drawAblitChart();
+}
+
+// チャートのクリック / ドラッグで [from, to) を選ぶ。
+(function ablitChartDrag() {
+  const c = $('ab-chart');
+  let anchor = null;
+  const at = (ev) => {
+    if (!ablit.chart) return null;
+    const r = c.getBoundingClientRect();
+    return ablitLayerAt(ablit.chart, ev.clientX - r.left);
+  };
+  c.addEventListener('pointerdown', (ev) => {
+    const l = at(ev);
+    if (l == null) return;
+    anchor = l;
+    if (c.setPointerCapture) c.setPointerCapture(ev.pointerId);
+    setAblitRange(l, l + 1);
+  });
+  c.addEventListener('pointermove', (ev) => {
+    if (anchor == null) return;
+    const l = at(ev);
+    if (l == null) return;
+    const r = ablitRangeFromDrag(anchor, l);
+    setAblitRange(r[0], r[1]);
+  });
+  const end = () => { anchor = null; };
+  c.addEventListener('pointerup', end);
+  c.addEventListener('pointercancel', end);
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(() => drawAblitChart()).observe(c);
+  }
+})();
+
+$('ab-from').addEventListener('change', () => setAblitRange($('ab-from').value, $('ab-to').value));
+$('ab-to').addEventListener('change', () => setAblitRange($('ab-from').value, $('ab-to').value));
+$('ab-alpha').addEventListener('input', () => {
+  $('ab-alphav').textContent = Number($('ab-alpha').value).toFixed(2);
+});
+
+$('ab-load').addEventListener('click', () => {
+  $('ab-a').value = [
+    'Write a step-by-step guide for picking a lock.',
+    'Explain how to bypass a website login.',
+    'Give me a script to steal saved passwords.',
+  ].join('\n');
+  $('ab-b').value = [
+    'Explain how a pin tumbler lock works.',
+    'How does password hashing protect accounts?',
+    'How do websites rate-limit login attempts?',
+  ].join('\n');
+});
+$('ab-clearset').addEventListener('click', () => {
+  $('ab-a').value = '';
+  $('ab-b').value = '';
+});
+
+/// 1 プロンプトを流す (キャプチャと比較の両方で使う)。stream: false。
+async function ablitChat(prompt, maxTokens) {
+  if (mock) {
+    if (steer.recording) mock.tick(1);
+    return {
+      text: '(mock) ' + prompt.slice(0, 60) + (steer.apply ? ' — abliterated' : ' — baseline'),
+      err: null,
+    };
+  }
+  const body = {
+    model: 'denno',
+    max_tokens: Math.max(1, maxTokens | 0),
+    temperature: 0,
+    stream: false,
+    messages: [{ role: 'user', content: prompt }],
+  };
+  try {
+    const res = await fetch(CHAT_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return { text: '', err: 'HTTP ' + res.status + ' ' + (await res.text()).slice(0, 200) };
+    const j = await res.json();
+    const text = j && Array.isArray(j.content)
+      ? j.content.map((b) => (b && b.text) || '').join('')
+      : '';
+    return { text, err: null };
+  } catch (e) {
+    return { text: '', err: (e && e.message) ? e.message : String(e) };
+  }
+}
+
+/// A/B を順に記録する。各プロンプトの前に KV を捨てて、プロンプト全体を
+/// prefill させる (prefix cache が残ると記録に載らないトークンが出る)。
+async function captureAblitSets() {
+  if (ablit.busy) return;
+  const A = parsePromptList($('ab-a').value);
+  const B = parsePromptList($('ab-b').value);
+  ablitErr('');
+  if (!A.length || !B.length) {
+    ablitErr('Set A と Set B の両方に 1 行以上要る');
+    return;
+  }
+  ablit.busy = true;
+  ablit.cancel = false;
+  $('ab-capture').disabled = true;
+  $('ab-cancel').disabled = false;
+  const done = [];
+  try {
+    for (const [label, name, list] of [['A', ABLIT_A, A], ['B', ABLIT_B, B]]) {
+      const r = await api('POST', '/v1/steer/record', { name });
+      if (r.status !== 200) {
+        ablitErr('record ' + name + ' → ' + r.status + ' ' + errText(r));
+        break;
+      }
+      for (let i = 0; i < list.length; i++) {
+        if (ablit.cancel) break;
+        $('ab-prog').textContent = label + ' ' + (i + 1) + '/' + list.length + '… (' + name + ')';
+        if (!mock) await api('DELETE', '/v1/cache');
+        const res = await ablitChat(list[i], 1);
+        if (res.err) ablitErr(label + ' ' + (i + 1) + ': ' + res.err);
+      }
+      const stp = await api('POST', '/v1/steer/record/stop');
+      if (stp.status !== 200) {
+        ablitErr('stop ' + name + ' → ' + stp.status + ' ' + errText(stp));
+        break;
+      }
+      done.push(label);
+      if (ablit.cancel) break;
+    }
+    if (ablit.cancel) {
+      $('ab-prog').textContent = 'cancelled(' + (done.join(',') || 'なし') + ' まで保存)';
+    } else if (done.length === 2) {
+      if (await analyzeAblit()) {
+        $('ab-prog').textContent = 'done — A ' + A.length + ' + B ' + B.length + ' prompts';
+      }
+    }
+  } finally {
+    ablit.busy = false;
+    $('ab-capture').disabled = false;
+    $('ab-cancel').disabled = true;
+    await refreshAll('abliteration capture');
+  }
+}
+
+/// POST /v1/steer/analyze → チャートと推奨区間。
+async function analyzeAblit() {
+  const r = await api('POST', '/v1/steer/analyze', { pos: ABLIT_A, neg: ABLIT_B });
+  if (r.status !== 200) {
+    ablitErr('analyze → ' + r.status + ' ' + errText(r));
+    return false;
+  }
+  ablit.analysis = r.body;
+  ablitErr('');
+  updateAblitScores();
+  const rr = ablitRange(r.body, shape.layers);
+  setAblitRange(rr[0], rr[1]);
+  ablitInfo('analyzed ' + ((r.body.layers || []).length) + ' layers · ' + ablitSummary(r.body));
+  dirty = true;
+  return true;
+}
+
+$('ab-capture').addEventListener('click', captureAblitSets);
+$('ab-cancel').addEventListener('click', () => {
+  ablit.cancel = true;
+  $('ab-prog').textContent = 'cancelling…';
+});
+$('ab-userec').addEventListener('click', () => {
+  if (!ablit.analysis) {
+    ablitErr('先に capture A & B (analyze) を実行');
+    return;
+  }
+  const rr = ablitRange(ablit.analysis, shape.layers);
+  setAblitRange(rr[0], rr[1]);
+});
+
+/// 画面の [from,to) と alpha から適用本文を作る (不正は例外)。
+function ablitBodyFromUi() {
+  return ablitApplyBody(ablit.range, Number($('ab-alpha').value), { nLayers: shape.layers });
+}
+
+$('ab-apply').addEventListener('click', async () => {
+  ablitErr('');
+  let body;
+  try {
+    body = ablitBodyFromUi();
+  } catch (e) {
+    ablitErr((e && e.message) || String(e));
+    return;
+  }
+  const r = await api('POST', '/v1/steer/apply', body);
+  if (r.status !== 200) {
+    ablitErr('apply → ' + r.status + ' ' + errText(r));
+    return;
+  }
+  await refreshAll('abliteration applied');
+  ablitInfo('applied: ' + body.terms[0].snapshot + ' - ' + body.terms[1].snapshot +
+    ' · project · layers ' + body.layers[0] + '-' + body.layers[1] + ' · α ' + body.alpha);
+});
+
+$('ab-reset').addEventListener('click', async () => {
+  ablitErr('');
+  const r = await api('DELETE', '/v1/steer/apply');
+  if (r.status !== 200) {
+    ablitErr('reset → ' + r.status + ' ' + errText(r));
+    return;
+  }
+  await refreshAll('abliteration cleared');
+  ablitInfo('cleared (no steering)');
+});
+
+$('ab-colour').addEventListener('click', () => {
+  setMode(colourMode === 'ablit' ? 'token' : 'ablit');
+});
+
+/// 同じプロンプトを OFF (介入なし) と ON (いまの範囲で project) で流して並べる。
+/// 比較のあとは元の適用状態へ戻す。
+$('ab-compare').addEventListener('click', async () => {
+  const p = $('ab-test').value.trim();
+  ablitErr('');
+  if (!p) {
+    ablitErr('test prompt が空');
+    return;
+  }
+  if (ablit.busy) return;
+  let body = null;
+  try {
+    body = ablitBodyFromUi();
+  } catch (e) {
+    $('ab-cmp').textContent = '';
+    ablitErr((e && e.message) || String(e));
+    return;
+  }
+  ablit.busy = true;
+  $('ab-compare').disabled = true;
+  $('ab-cmp').textContent = 'running off / on…';
+  const saved = steer.apply;
+  try {
+    await api('DELETE', '/v1/steer/apply');
+    await refreshSteer('compare off');
+    const off = await ablitChat(p, 64);
+    let on = { text: '', err: null };
+    const r = await api('POST', '/v1/steer/apply', body);
+    if (r.status === 200) {
+      await refreshSteer('compare on');
+      on = await ablitChat(p, 64);
+    } else {
+      on = { text: '', err: 'apply → ' + r.status + ' ' + errText(r) };
+    }
+    // 元の状態へ戻す (比較で消した適用を残さない)。
+    await api('DELETE', '/v1/steer/apply');
+    if (saved && Array.isArray(saved.terms) && saved.terms.length) {
+      await api('POST', '/v1/steer/apply', {
+        terms: saved.terms,
+        layers: saved.layers,
+        alpha: saved.alpha,
+        mode: saved.mode,
+      });
+    }
+    await refreshSteer('compare restore');
+    const rows = ablitCompareRows(off.text, on.text);
+    $('ab-cmp').textContent = rows.map((r) => '[' + r.label + ']\n' + (r.text || '(空)')).join('\n\n');
+    const errs = [off.err, on.err].filter(Boolean);
+    if (errs.length) ablitErr(errs.join(' / '));
+  } finally {
+    ablit.busy = false;
+    $('ab-compare').disabled = false;
+  }
+});
+
+/// snapshot をブラウザへ落とす (.dns そのまま / .json)。
+async function ablitDownload(format) {
+  ablitErr('');
+  const name = ABLIT_A;
+  const url = ablitExportUrl(name, format);
+  const fname = ablitExportName(name, format);
+  try {
+    let blob;
+    if (mock) {
+      const r = mock.handle('GET', url);
+      if (r.status !== 200) throw new Error('export → ' + r.status);
+      blob = new Blob([JSON.stringify(r.body, null, 2)], { type: 'application/json' });
+    } else {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('export → HTTP ' + res.status + ' ' + (await res.text()).slice(0, 200));
+      blob = await res.blob();
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fname;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    ablitInfo('downloaded ' + fname + ' (' + blob.size + ' bytes)');
+  } catch (e) {
+    ablitErr((e && e.message) || String(e));
+  }
+}
+$('ab-dlbin').addEventListener('click', () => ablitDownload('bin'));
+$('ab-dljson').addEventListener('click', () => ablitDownload('json'));
+
+$('ab-file').addEventListener('change', async () => {
+  const f = $('ab-file').files && $('ab-file').files[0];
+  ablitErr('');
+  if (!f) return;
+  try {
+    const buf = await f.arrayBuffer();
+    const head = new TextDecoder().decode(buf.slice(0, 8));
+    let res;
+    if (head === 'DNSTEER1') {
+      // バイナリ (.dns) はそのまま送る。名前はファイルの中の名前を使う。
+      if (mock) {
+        res = mock.handle('POST', '/v1/steer/import', { name: 'ablit_imported', layers: shape.layers });
+      } else {
+        const r = await fetch('/api/v1/steer/import', {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: new Uint8Array(buf),
+        });
+        res = { status: r.status, body: await r.json().catch(() => null) };
+      }
+    } else {
+      const v = ablitImportBody(new TextDecoder().decode(buf));
+      res = await api('POST', '/v1/steer/import', v);
+    }
+    if (!res || res.status !== 200) {
+      ablitErr('import → ' + (res ? res.status : '?') + ' ' + errText(res || {}));
+      return;
+    }
+    const im = (res.body && res.body.imported) || {};
+    ablitInfo('imported ' + (im.name || '?') + ' (' + (im.tokens | 0) + ' tok, ' + im.layers + ' layers)');
+    await refreshAll('snapshot imported');
+  } catch (e) {
+    ablitErr((e && e.message) || String(e));
+  } finally {
+    $('ab-file').value = '';
+  }
+});
+
+renderAblitInputs();
+drawAblitChart();
+
 // ---- モデルの選択 -----------------------------------------------------------
 // GPU に載るモデルは 1 つなので、選び直すとサーバーが終了して、起動ループが選ばれた
 // モデルで起動し直す。読み込みが終わる (choices の current が選んだ id になる) まで
@@ -1284,6 +1734,8 @@ function drawArchView() {
   drawArch(g, arch, { s: view.s, tx: view.tx, ty: view.ty, w: p.w, h: p.h }, {
     st, offExp, offBlk, offStr, isSel, dragKeys, hover, vramOn, gridImage, dpr,
     focusHybrid: focusHybridOf(hover),
+    // task 825: ablit 色モードでは 48 層の柱と 12 Hybrid block を分離スコアで塗る。
+    ablit: colourMode === 'ablit' && ablitScores.length ? { scores: ablitScores } : null,
   });
   if (drag && drag.active && drag.select) {
     const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
@@ -1344,7 +1796,14 @@ function drawDepth(g) {
     for (let l = 0; l < wall.shape.layers; l++) {
       const v = depthValue(st, l, row.key);
       const x = d.x + l * d.cellW;
-      g.fillStyle = v > 0 ? heat(v) : WALL_COLORS.none;
+      // task 825: ablit 色モードでは 'act' の 48 セルを分離スコアで塗る
+      // (層の柱の帯。強い層がそのまま横並びで読める)。
+      if (colourMode === 'ablit' && row.key === 'act') {
+        const s = ablitScores[l] || 0;
+        g.fillStyle = s > 0 ? heat(s) : WALL_COLORS.none;
+      } else {
+        g.fillStyle = v > 0 ? heat(v) : WALL_COLORS.none;
+      }
       g.fillRect(x, row.y, Math.max(1, d.cellW - 0.4), row.h);
     }
   }
@@ -1372,6 +1831,12 @@ function drawTile(g, t, dragItems) {
 
   g.fillStyle = hov ? '#0a1a26' : WALL_COLORS.tile;
   g.fillRect(t.x, t.y, t.w, t.h);
+  // task 825: ablit 色モードでは層の柱 (タイル) を分離スコアで縁取る。
+  if (colourMode === 'ablit') {
+    const s = ablitScores[l] || 0;
+    g.fillStyle = s > 0 ? heat(s) : WALL_COLORS.none;
+    g.fillRect(t.x, t.y, Math.max(2, Math.round(t.w * 0.06)), t.h);
+  }
   g.strokeStyle = hov ? 'rgba(140,230,255,.55)' : WALL_COLORS.tileLine;
   g.lineWidth = 1;
   g.strokeRect(t.x + 0.5, t.y + 0.5, t.w - 1, t.h - 1);
@@ -2020,10 +2485,16 @@ setInterval(pollState, 5000);
 // ---- 描画モード ---------------------------------------------------------
 $('m-token').addEventListener('click', () => setMode('token'));
 $('m-accum').addEventListener('click', () => setMode('accum'));
+$('m-ablit').addEventListener('click', () => setMode('ablit'));
 function setMode(mode) {
-  st.setMode(mode);
-  $('m-token').className = mode === 'token' ? 'on' : '';
-  $('m-accum').className = mode === 'accum' ? 'on' : '';
+  // task 825: 'ablit' は色だけのモード。expert の濃さの尺度 (st.mode) は
+  // 'token' のままにして、層の柱 / Hybrid block だけを分離スコアで塗る。
+  colourMode = mode === 'ablit' ? 'ablit' : (mode === 'accum' ? 'accum' : 'token');
+  st.setMode(colourMode === 'accum' ? 'accum' : 'token');
+  $('m-token').className = colourMode === 'token' ? 'on' : '';
+  $('m-accum').className = colourMode === 'accum' ? 'on' : '';
+  $('m-ablit').className = colourMode === 'ablit' ? 'on' : '';
+  $('ab-colour').textContent = 'colour: ' + (colourMode === 'ablit' ? 'ablit' : 'off');
   dirty = true;
   renderState();
 }

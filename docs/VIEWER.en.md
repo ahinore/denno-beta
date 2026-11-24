@@ -40,6 +40,26 @@ An expression is `[types:] condition [| top N by expr [per layer|hybrid]] [| lim
 
 `denno-view` environment variables: `VIEW_UPSTREAM` (default `ws://127.0.0.1:8080/v1/telemetry/ws`), `VIEW_PORT` (default 8093), `VIEW_RECORD` (append frames to a file), `VIEW_REPLAY` (serve a recording at `/replay`), `VIEW_CAPTURE` (serve a captured frame stream at `/capture.bin`), `VIEW_TOKENIZER` (tokenizer.json for token text). Its `/chat` endpoint proxies to the upstream server, so the built-in chat box needs no CORS setup.
 
+## Abliteration workbench (`/2d` → Abliterate)
+
+The `abliterate` box in the right-hand control pane is the A/B contrast workbench for directional ablation. It builds on the residual-stream steering engine (`crates/denno-engine/src/model/steer.rs`) and the `/v1/steer` endpoints.
+
+1. Paste two prompt sets (one prompt per line): Set A is the direction you want to remove, B the one you want to keep. `load sample` fills a small pair.
+2. `capture A & B` records `ablit_A`, then `ablit_B`: it clears the KV cache before every prompt so the whole prompt is prefilled, runs each prompt through `/chat` with `max_tokens: 1, temperature: 0`, stops the recording after each set, and finally calls `/v1/steer/analyze`. The progress line shows `A 3/8…` and `cancel` stops between prompts (the partial set is still saved).
+3. The separation chart shows `sep_score = ||mu_A - mu_B|| / (||mu_A|| + ||mu_B|| + 1e-12)` for every layer. Click or drag on the chart to pick the layer range `[from, to)`, or press `use recommended` (the contiguous half-max window around the peak, excluding layer 0 and the final layer).
+4. `apply abliteration` sends `POST /v1/steer/apply` with `terms: [{ablit_A, +1}, {ablit_B, -1}]`, `mode: "project"`, the chosen layers and `alpha` (0.0 – 2.0, step 0.05, default 1.0). `reset / clear` sends `DELETE /v1/steer/apply`.
+5. `compare off vs on` runs one test prompt with no steering, then with the current range applied, and shows both answers side by side. The previous steering state is restored afterwards.
+6. `colour: ablit` (also the `ablit` chip in the header) paints the 48-layer column and the 12 hybrid blocks by per-layer separation.
+7. `download .dns` / `download .json` fetch `GET /v1/steer/export?name=ablit_A` (binary DNSTEER1 or JSON with a base64 body). The `import` field posts the file back to `POST /v1/steer/import`: a `.dns` file is sent as `application/octet-stream`, a JSON file as a JSON direction payload.
+
+Endpoints added for this (`crates/denno-cli/src/serve_flash.rs`):
+
+- `POST /v1/steer/analyze` — body `{pos, neg}` or `{terms:[{snapshot,coef}...]}` (positive coefficients form the A side, negative the B side). Returns `{pos, neg, n_layer, peak_layer, recommended_range:[from,to], layers:[{layer, diff_norm, norm_pos, norm_neg, cos_sim, sep_score}]}`.
+- `GET /v1/steer/export?name=<snap>[&format=json]` — the stored DNSTEER1 snapshot, or the same bytes base64-packed in JSON.
+- `POST /v1/steer/import[?name=<new>]` — a DNSTEER1 body or a JSON payload (`data_base64` or a `mean` array). Shape and model checks match the loader; bad input is a 400.
+
+`POST /v1/steer/record` also accepts `capture_mode`: `"all"` (the default, unchanged) is supported; `"last_prompt_token"` is rejected with a 400 in this version rather than silently recording every token.
+
 ## Telemetry frames
 
 `DNTL` magic, 1-byte version, 1-byte kind, then a varint-packed payload. Kind numbers are stable across branches; retired numbers are not reused.

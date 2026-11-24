@@ -340,6 +340,25 @@ export function drawArch(g, layout, view, D) {
   g.setTransform(dpr * s, 0, 0, dpr * s, dpr * view.tx, dpr * view.ty);
   g.lineJoin = 'round';
 
+  // task 825: ablit 色モード (層 / Hybrid block を分離スコアで塗る)。
+  const ABLIT = D.ablit && Array.isArray(D.ablit.scores) ? D.ablit : null;
+  const ablitMax = ABLIT
+    ? ABLIT.scores.reduce((a, v) => Math.max(a, Number(v) || 0), 0)
+    : 0;
+  const ablitNorm = (v) => (ablitMax > 0 ? Math.max(0, Math.min(1, v / ablitMax)) : 0);
+  const ablitValue = (l) => (ABLIT ? ablitNorm(Number(ABLIT.scores[l]) || 0) : null);
+  const ablitHybrid = (h) => {
+    if (!ABLIT) return null;
+    const per = 4;
+    let sum = 0;
+    let n = 0;
+    for (let l = h * per; l < (h + 1) * per && l < ABLIT.scores.length; l++) {
+      sum += Number(ABLIT.scores[l]) || 0;
+      n++;
+    }
+    return n ? ablitNorm(sum / n) : 0;
+  };
+
   const showText = (size) => size * s >= 6;
   const text = (str, x, y, size, color, opts = {}) => {
     if (!showText(size)) return;
@@ -463,7 +482,17 @@ export function drawArch(g, layout, view, D) {
     const qsa = c.kind === 'attn';
     const v = streamValue(roleOf(l));
     const hot = hov && hov.layer === l;
-    box(c, qsa ? C.qsaPanel : C.gdnPanel, hot ? '#cfefff' : (qsa ? C.qsa : C.gdn), hot ? 3 : 2, 8);
+    // task 825: ablit 色モードでは 48 層の柱を層ごとの分離スコアで塗る。
+    const av = D.ablit ? ablitValue(l) : null;
+    const fill = av != null ? heat(av) : (qsa ? C.qsaPanel : C.gdnPanel);
+    box(c, fill, hot ? '#cfefff' : (qsa ? C.qsa : C.gdn), hot ? 3 : 2, 8);
+    if (av != null) {
+      // 分離の強い層の柱は白い内枠で目立たせる (色だけだと暗い背景で沈む)。
+      g.save();
+      g.globalAlpha = 0.35 + 0.5 * av;
+      box({ x: c.x + 2, y: c.y + 2, w: c.w - 4, h: c.h - 4 }, null, '#dff4ff', 1.2, 6);
+      g.restore();
+    }
     glow(c, v);
     // 中で切ってあるものがあれば左端に赤い帯
     const anyOff = (D.offExp && D.offExp.get(l) && D.offExp.get(l).size) ||
@@ -494,6 +523,15 @@ export function drawArch(g, layout, view, D) {
   for (const B of top.blocks) {
     if (!visible(B)) continue;
     const focus = D.focusHybrid === B.hybrid;
+    // task 825: ablit 色モードでは 12 個の Hybrid block を 4 層の平均で塗る。
+    const bv = ablitHybrid(B.hybrid);
+    if (bv != null) {
+      g.save();
+      g.globalAlpha = 0.20 + 0.45 * bv;
+      g.fillStyle = heat(bv);
+      g.fillRect(B.x, B.y, B.w, B.h);
+      g.restore();
+    }
     dashed(B, focus ? '#9fdcff' : C.dash, 12, focus ? 2.6 : 1.8, 18);
     text('Hybrid block ' + B.hybrid + '  ·  layers ' + B.first + '–' + B.last,
       B.x + ARCH.blockPad, B.y + ARCH.blockTitle / 2 + 4, 40, C.text, { bold: true });
