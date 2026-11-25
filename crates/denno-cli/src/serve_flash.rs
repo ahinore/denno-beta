@@ -980,6 +980,13 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::gpu_report::pf_pin_reset();
+    // task 822: prefill の天井 (計算 vs ディスク) を 1 行で出す
+    // (`DENNO_PF_ROOFLINE=1` のときだけ。off は何もしない)。
+    // q4prof のゲートとは独立に出す (`DENNO_Q4_PROFILE` を立てなくても読める)。
+    if let Some(line) = denno_engine::model::qwen4exp::roofline::take_line(tag) {
+        eprintln!("{line}");
+    }
+    denno_engine::model::qwen4exp::roofline::reset();
     if !q4prof::enabled() {
         return;
     }
