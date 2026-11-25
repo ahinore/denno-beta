@@ -142,6 +142,35 @@ paths:
                 $ref: '#/components/schemas/ModelList'
         '401':
           $ref: '#/components/responses/AnthropicUnauthorized'
+  /v1/models/{id}:
+    get:
+      tags: [openai, anthropic]
+      summary: Retrieve one model
+      operationId: getModel
+      x-denno-impl: engine
+      description: |
+        Returns the same model object as one entry of `/v1/models` `data[]`
+        when `{id}` is the canonical model name or a registered alias
+        (`aliases[]` of the listing). Any other id is a clean OpenAI-style
+        404. Same authentication as the rest of `/v1`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Canonical model name or a registered alias.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The requested model
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '401':
+          $ref: '#/components/responses/OpenAIUnauthorized'
+        '404':
+          $ref: '#/components/responses/OpenAINotFound'
   /v1/messages:
     post:
       tags: [anthropic]

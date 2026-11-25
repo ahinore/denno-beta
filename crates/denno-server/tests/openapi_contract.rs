@@ -115,14 +115,28 @@ fn parse_spec() -> Vec<(Op, String)> {
     out
 }
 
+/// axum の `:id` を OpenAPI の `{id}` に直す (セグメント単位)。
+fn normalize_params(path: &str) -> String {
+    path.split('/')
+        .map(|seg| match seg.strip_prefix(':') {
+            Some(name) => format!("{{{name}}}"),
+            None => seg.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `denno-server::router` が登録しているルートをソースから数える。
+///
+/// axum 0.7 のパスパラメータは `:id` だが、仕様書 (OpenAPI) は `{id}` と
+/// 書くので、ここで正規化して比較できるようにする (task 961)。
 fn parse_router_source() -> Vec<Op> {
     let mut out = Vec::new();
     for line in ROUTER_SRC.lines() {
         let t = line.trim();
         let Some(rest) = t.strip_prefix(".route(\"") else { continue };
         let Some(end) = rest.find('"') else { continue };
-        let path = &rest[..end];
+        let path = normalize_params(&rest[..end]);
         let tail = &rest[end + 1..];
         let method = if tail.contains("get(") {
             "GET"
@@ -135,7 +149,7 @@ fn parse_router_source() -> Vec<Op> {
         } else {
             panic!("未知のメソッド種別: {t}")
         };
-        out.push(Op::new(method, path));
+        out.push(Op::new(method, path.as_str()));
     }
     assert!(!out.is_empty(), "router() の .route(...) を 1 つも読めない");
     out
@@ -168,6 +182,9 @@ fn app() -> Router {
 ///   ステータスを書いてあることを別途確認する。
 struct Probe {
     op: Op,
+    /// 実際に投げる URI。`op.path` がテンプレート (`{id}`) のときだけ
+    /// ここに具体値 (`/v1/models/denno-test`) を書く。
+    uri: &'static str,
     body: Option<&'static str>,
     status: u16,
     /// 応答の Content-Type に含まれるべき文字列。
@@ -178,23 +195,27 @@ fn probes() -> Vec<Probe> {
     let valid_msg = r#"{"model":"denno-test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#;
     vec![
         // 運用 (認証不要)
-        Probe { op: Op::new("GET", "/health"), body: None, status: 200, content_type: "application/json" },
-        Probe { op: Op::new("GET", "/ready"), body: None, status: 200, content_type: "application/json" },
-        Probe { op: Op::new("GET", "/metrics"), body: None, status: 200, content_type: "text/plain" },
+        Probe { op: Op::new("GET", "/health"), uri: "/health", body: None, status: 200, content_type: "application/json" },
+        Probe { op: Op::new("GET", "/ready"), uri: "/ready", body: None, status: 200, content_type: "application/json" },
+        Probe { op: Op::new("GET", "/metrics"), uri: "/metrics", body: None, status: 200, content_type: "text/plain" },
         // Anthropic / OpenAI / Ollama。空ボディは 400 (ルートが生きたまま
         // 本文検証で弾かれる) を仕様の 400 と突き合わせる。
-        Probe { op: Op::new("GET", "/v1/models"), body: None, status: 200, content_type: "application/json" },
-        Probe { op: Op::new("POST", "/v1/messages"), body: Some(""), status: 400, content_type: "application/json" },
-        Probe { op: Op::new("POST", "/v1/messages"), body: Some(valid_msg), status: 200, content_type: "application/json" },
-        Probe { op: Op::new("POST", "/v1/messages/count_tokens"), body: Some(""), status: 400, content_type: "application/json" },
-        Probe { op: Op::new("POST", "/v1/chat/completions"), body: Some(""), status: 400, content_type: "application/json" },
-        Probe { op: Op::new("POST", "/v1/completions"), body: Some(""), status: 400, content_type: "application/json" },
-        Probe { op: Op::new("GET", "/api/tags"), body: None, status: 200, content_type: "application/json" },
-        Probe { op: Op::new("GET", "/api/version"), body: None, status: 200, content_type: "application/json" },
-        Probe { op: Op::new("POST", "/api/chat"), body: Some(""), status: 400, content_type: "application/json" },
-        Probe { op: Op::new("POST", "/api/generate"), body: Some(""), status: 400, content_type: "application/json" },
+        Probe { op: Op::new("GET", "/v1/models"), uri: "/v1/models", body: None, status: 200, content_type: "application/json" },
+        // task 961: `/v1/models/{id}` は 200 (canonical 名) と 404 (未知の id)
+        // の両方を仕様に書いているので、同じ operation を 2 回投げる。
+        Probe { op: Op::new("GET", "/v1/models/{id}"), uri: "/v1/models/denno-test", body: None, status: 200, content_type: "application/json" },
+        Probe { op: Op::new("GET", "/v1/models/{id}"), uri: "/v1/models/nope", body: None, status: 404, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/v1/messages"), uri: "/v1/messages", body: Some(""), status: 400, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/v1/messages"), uri: "/v1/messages", body: Some(valid_msg), status: 200, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/v1/messages/count_tokens"), uri: "/v1/messages/count_tokens", body: Some(""), status: 400, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/v1/chat/completions"), uri: "/v1/chat/completions", body: Some(""), status: 400, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/v1/completions"), uri: "/v1/completions", body: Some(""), status: 400, content_type: "application/json" },
+        Probe { op: Op::new("GET", "/api/tags"), uri: "/api/tags", body: None, status: 200, content_type: "application/json" },
+        Probe { op: Op::new("GET", "/api/version"), uri: "/api/version", body: None, status: 200, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/api/chat"), uri: "/api/chat", body: Some(""), status: 400, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/api/generate"), uri: "/api/generate", body: Some(""), status: 400, content_type: "application/json" },
         // アップグレードヘッダ無しの WS は 400。
-        Probe { op: Op::new("GET", "/v1/telemetry/ws"), body: None, status: 400, content_type: "text/plain" },
+        Probe { op: Op::new("GET", "/v1/telemetry/ws"), uri: "/v1/telemetry/ws", body: None, status: 400, content_type: "text/plain" },
     ]
 }
 
@@ -258,7 +279,7 @@ async fn every_documented_engine_route_answers_as_specified() {
     assert_eq!(spec_ops, probe_ops, "仕様の engine operation とこのテストの対応表がずれている");
 
     for p in &probes {
-        let mut req = Request::builder().method(p.op.method.as_str()).uri(p.op.path.as_str());
+        let mut req = Request::builder().method(p.op.method.as_str()).uri(p.uri);
         let body = match p.body {
             None => Body::empty(),
             Some(b) => {
@@ -402,6 +423,7 @@ fn probe_table_covers_expected_engine_routes() {
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/models",
+        "/v1/models/{id}",
         "/api/tags",
         "/api/chat",
         "/api/generate",
