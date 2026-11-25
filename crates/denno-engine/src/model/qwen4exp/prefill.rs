@@ -2925,6 +2925,9 @@ pub(crate) fn moe_ffn_quant_batch_full(
     // task 246: 末尾トークンの選択を控える (prefill の終端で LRU を温め直すため)。
     // ゲート off なら `note_tail_selection` が即座に戻る。
     crate::model::exp_pf::note_tail_selection(lw.il, nt, k, &sels);
+    // task 862: page hint 用に、この層・このチャンクの選択を数える
+    // (`DENNO_EXPERT_PAGE_HINT` のときだけ。off は atomic load 1 回)。
+    crate::model::exp_page_hint::note_selection(lw.il, nt, k, &sels);
     // P56: RouterTopK は**チャンク末尾の 1 トークンだけ**送る。
     //
     // 理由: 全トークンを送ると 1 プロンプトで nt × n_layer 枚 (512 トークン ×
@@ -3921,6 +3924,9 @@ pub(crate) fn moe_ffn_quant_batch_lm_dev_at(
         );
     }
     mark(1);
+    // task 862: page hint 用に、この層・このチャンクの選択を数える
+    // (`DENNO_EXPERT_PAGE_HINT` のときだけ。off は atomic load 1 回)。
+    crate::model::exp_page_hint::note_selection(lw.il, nt, k, &sels);
     if emit_last {
         let tail = (nt - 1) * k;
         emit_router_topk(lw.il, &sels[tail..tail + k], &weights[tail..tail + k]);
@@ -4358,6 +4364,9 @@ impl Qwen4Exp {
     ) -> Result<Vec<f32>> {
         // P78: 層の外の区間計測の分母 (prefill 回数とトークン数)。
         prekprof::note_prefill(ctx.len());
+        // task 862: page hint の追跡を始める (`DENNO_EXPERT_PAGE_HINT`、既定 off)。
+        // off では atomic load 1 回で戻る。短いプロンプトは追跡しない。
+        crate::model::exp_page_hint::begin_prefill(ctx.len());
         // task 145: prefill の台帳。全体の壁時計を 1 本で測り、層の中の区間
         // (mix / attn / router / shared / experts) は内側のガードで積む。
         // `other` は「全体 − 名前付き区間の和」の残差として `line_prefill` が出す。
@@ -4398,6 +4407,12 @@ impl Qwen4Exp {
         }
         // P58: 1 リクエスト 1 回の階層統計 (prefill 終了時)。arch off なら即座に戻る。
         self.arch_emit_prefill_done();
+        // task 862: prefill の終端で、冷たい expert 範囲のページを落として
+        // decode の温かい集合を読み直す (`DENNO_EXPERT_PAGE_HINT`、既定 off)。
+        self.pf_page_hint();
+        if let Some(line) = crate::model::exp_page_hint::finish_prefill() {
+            eprintln!("{line}");
+        }
         Ok(logits)
     }
 

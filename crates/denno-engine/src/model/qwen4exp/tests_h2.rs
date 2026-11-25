@@ -324,6 +324,31 @@
         }
 
 
+        /// task 862: page hint の追跡が **prefill の実経路** から呼ばれているか。
+        ///
+        /// ゲートを足しただけ (緑だが分岐が無い) を防ぐため、prefill を 1 回回して
+        /// 追跡したトークン数と選択の本数を数える。ここは配線の確認だけで、
+        /// 落とす / 戻すの効果は `page_hint_drops_cold_expert_pages` が見る。
+        #[test]
+        fn page_hint_hook_is_wired_into_prefill() {
+            use crate::model::exp_page_hint as ph;
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2_page_hint");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            let ctx: Vec<u32> = (0..8u32).map(|i| i % VOCAB as u32).collect();
+            ph::reset_for_tests();
+            ph::set_enabled_for_tests(Some(true));
+            ph::begin_prefill(4096);
+            m.forward_prefill_batch(&ctx, 4).expect("バッチ prefill");
+            let tok = ph::tracked_tokens();
+            let _ = ph::take_plan();
+            ph::set_enabled_for_tests(None);
+            ph::reset_for_tests();
+            assert_eq!(tok, ctx.len(), "prefill の全トークンが層 0 で数えられる");
+        }
+
         /// task 172 の 3 本は task 181 (lab t181b) で**既定 on**にした
         /// (3 本 + 小さい N + ミラー + D2H の組で cold prefill -8.9% / -9.4%)。
         #[test]

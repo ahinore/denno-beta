@@ -2086,6 +2086,23 @@ impl ExpertW {
         }))
     }
 
+    /// task 862: テンソル先頭の写像と、写像内でのテンソル先頭オフセット。
+    ///
+    /// ヒープ実体 (テスト経路) では `None`。page hint はこの 2 つと
+    /// [`ExpertW::expert_stride`] から expert の絶対範囲を出す。
+    fn map_base(&self) -> Option<(std::sync::Arc<memmap2::Mmap>, usize)> {
+        self.blocks
+            .mapping()
+            .map(|(map, base, _)| (std::sync::Arc::clone(map), base))
+    }
+
+    /// task 862: 1 expert あたりのバイト数 (テンソル内の stride)。
+    fn expert_stride(&self) -> Result<usize> {
+        ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, 0)
+            .map(|s| s.len)
+            .map_err(|err| one(format!("{}: {err}", self.name)))
+    }
+
     /// expert `e` の**ファイル内絶対オフセット**とバイト数 (キャッシュ経路用)。
     ///
     /// mmap 経路の [`ExpertW::slice`] と同じ [`ExpertSlice`] を使うので、
@@ -2293,6 +2310,104 @@ fn matrix_w(l: &LayerW, m: ExpertMatrix) -> &ExpertW {
         ExpertMatrix::Gate => &l.gate_exps,
         ExpertMatrix::Up => &l.up_exps,
         ExpertMatrix::Down => &l.down_exps,
+    }
+}
+
+/// task 862: expert テンソルの写像 → 読み口を page hint に登録する。
+///
+/// `DENNO_EXPERT_PAGE_HINT` の経路は `posix_fadvise(2)` に fd が要るが、
+/// `memmap2::Mmap` は fd を持たない。パートごとに 1 本だけ開いて覚える
+/// (既定 off でも開くだけで、syscall は投げない)。
+fn register_expert_maps(f: &GgufFile, layers: &[LayerW]) {
+    for l in layers {
+        for w in [&l.gate_exps, &l.up_exps, &l.down_exps] {
+            let Some((map, _)) = w.map_base() else {
+                continue;
+            };
+            let Some(path) = f.path_at(w.file) else {
+                continue;
+            };
+            crate::model::exp_page_hint::register_map(&map, path);
+        }
+    }
+}
+
+/// task 862: [`crate::model::exp_page_hint::take_plan`] の計画を実行する。
+///
+/// 1. cold: `madvise(MADV_DONTNEED)` + `posix_fadvise(POSIX_FADV_DONTNEED)` で
+///    page cache から落とす。
+/// 2. warm: 常駐していない範囲だけ `madvise(MADV_WILLNEED)` で読み直す。
+///
+/// 連続する expert id は 1 回の syscall にまとめる (stride 一定なので範囲が連続する)。
+/// 失敗しても数値は変わらない (統計の `failed` に数えるだけ)。
+fn page_hint_apply(layers: &[LayerW]) {
+    let plan = crate::model::exp_page_hint::take_plan();
+    if plan.is_empty() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    for (layer, ids) in &plan.cold {
+        page_hint_runs(layers, *layer, ids, true);
+    }
+    if crate::model::exp_page_hint::willneed_on() {
+        for (layer, ids) in &plan.warm {
+            page_hint_runs(layers, *layer, ids, false);
+        }
+    }
+    crate::model::exp_page_hint::add_flush_ms(t0.elapsed().as_secs_f64() * 1e3);
+}
+
+/// task 862: 層 `layer` の `ids` (昇順) を連続する塊ごとに 1 回の syscall にする。
+///
+/// `drop` が真ならページを落とし、偽なら `MADV_WILLNEED` を投げる。
+/// gate / up / down を別々に回す (テンソル境界をまたがない)。
+fn page_hint_runs(layers: &[LayerW], layer: usize, ids: &[u16], drop: bool) {
+    use crate::model::exp_page_hint::{add_drop_stats, add_warm_stats, drop_range};
+    let Some(lw) = layers.get(layer) else {
+        return;
+    };
+    for w in [&lw.gate_exps, &lw.up_exps, &lw.down_exps] {
+        let Some((map, base)) = w.map_base() else {
+            continue;
+        };
+        let Ok(stride) = w.expert_stride() else {
+            continue;
+        };
+        let mut i = 0;
+        while i < ids.len() {
+            let first = ids[i] as usize;
+            let mut j = i + 1;
+            while j < ids.len() && ids[j] as usize == ids[j - 1] as usize + 1 {
+                j += 1;
+            }
+            let n = j - i;
+            let off = base + first * stride;
+            let len = n.saturating_mul(stride);
+            if !drop && crate::model::exp_page_hint::warm_budget_exhausted() {
+                // 読み直しの上限 (`DENNO_EXPERT_PAGE_HINT_WARM_MB`) に達した。
+                return;
+            }
+            if drop {
+                let out = drop_range(&map, off, len);
+                add_drop_stats(out, n as u64);
+            } else {
+                // 常駐していれば投げない (`mincore(2)`)。落ちている範囲だけ読む。
+                let ptr = unsafe { map.as_ptr().add(off) } as usize;
+                let out = match unsafe { crate::model::exp_pf::range_resident(ptr, len) } {
+                    Some(true) => crate::model::exp_page_hint::DropOutcome::Skipped,
+                    _ => {
+                        let n = crate::model::exp_page_hint::willneed_range(&map, off, len);
+                        if n == 0 {
+                            crate::model::exp_page_hint::DropOutcome::Failed
+                        } else {
+                            crate::model::exp_page_hint::DropOutcome::Warmed(n)
+                        }
+                    }
+                };
+                add_warm_stats(out);
+            }
+            i = j;
+        }
     }
 }
 
@@ -5121,6 +5236,10 @@ impl Qwen4Exp {
 
         // P-MOE-G1: expert キャッシュ (既定 OFF。`DENNO_EXPERT_CACHE_MB` > 0 で構築)。
         let expert_cache = build_expert_caches(f, &layers)?;
+        // task 862: page hint (`DENNO_EXPERT_PAGE_HINT`) が fadvise を投げられる
+        // ように、expert テンソルの写像 → 読み口を登録する (既定 off でも登録だけ
+        // する。開くのはパート数ぶんだけで、モデルの寿命いっぱい使い回す)。
+        register_expert_maps(f, &layers);
         // task 260/263: ホスト RAM tier (`DENNO_EXPERT_RAM_MB`)。**作成と充填は
         // 背景の起動プラン**が行う (ここで確保すると `/v1/models` が遅れる)。
         // ここでは診断用の mmap 範囲を覚えるだけ。
@@ -5137,6 +5256,14 @@ impl Qwen4Exp {
             expert_cache,
             arch_emit: ArchEmit::default(),
         })
+    }
+
+    /// task 862: prefill の終端で、冷たい expert 範囲のページを落とし、
+    /// decode の温かい集合のうち prefill に追い出されたものを読み直す。
+    ///
+    /// 中身は [`page_hint_apply`] (テストが同じ経路を単層で回せるように分けてある)。
+    pub(crate) fn pf_page_hint(&self) {
+        page_hint_apply(&self.layers);
     }
 
     /// PLE の conv 履歴を消す (系列の切れ目で呼ぶ)。

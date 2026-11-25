@@ -1204,6 +1204,12 @@ pub(crate) fn moe_ffn_quant_impl(
     // task 266: 次のトークンの先読み用に、この層の選択を記録する
     // (ゲート off では atomic load 1 回。値には触れない)。
     crate::model::exp_prefetch::note_sel(lw.il, &sel);
+    // task 862: decode の選択を page hint の「温かい作業集合」に足す
+    // (`DENNO_EXPERT_PAGE_HINT` のときだけ。off は atomic load 1 回)。
+    // 逐次 prefill もこの関数を通るので、prefill の中では数えない。
+    if !prefill::in_prefill_seq() {
+        crate::model::exp_page_hint::note_decode(lw.il, &sel);
+    }
 
     // task 850: 層間の共起表を更新し、層 L+1 の予測 expert を背景スレッドへ渡す
     // (`DENNO_EXPERT_MARKOV_PREFETCH=1` のときだけ。off は atomic load 1 回)。
