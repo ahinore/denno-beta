@@ -199,6 +199,13 @@ enum Commands {
         /// HTTP 読み取りタイムアウト秒
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// P897: 2 つの JSON レポートを比較して差分表を出す (ベンチは実行しない)。
+        /// 使い方: --compare base.json new.json
+        #[arg(long, num_args = 2, value_names = ["BASE", "NEW"])]
+        compare: Option<Vec<PathBuf>>,
+        /// P897: --compare 時に、この % を超える悪化を退行とみなし非 0 で終わる
+        #[arg(long)]
+        fail_on_regress_pct: Option<f64>,
     },
     /// HTTP サーバー起動 (Anthropic Messages API)
     Serve {
@@ -785,7 +792,30 @@ fn main() -> Result<()> {
             det_tokens,
             reuse_depth,
             timeout,
+            compare,
+            fail_on_regress_pct,
         } => {
+            // P897: --compare はベンチを実行せずに 2 つのレポートを比べる。
+            if let Some(paths) = &compare {
+                if paths.len() != 2 {
+                    bail!("--compare needs exactly 2 paths (BASE NEW)");
+                }
+                let out = bench::run_compare(&paths[0], &paths[1], fail_on_regress_pct)?;
+                if markdown {
+                    print!("{}", out.markdown);
+                }
+                let color = std::env::var_os("NO_COLOR").is_none();
+                print!("{}", bench::render_compare_ansi(&out, color));
+                if out.exit_fail {
+                    bail!(
+                        "bench compare: {} regression(s), {} missing, determinism {:?}",
+                        out.regressions,
+                        out.missing,
+                        out.determinism_match
+                    );
+                }
+                return Ok(());
+            }
             let opts = bench::BenchOptions {
                 url,
                 api: bench::Api::parse(&api)?,

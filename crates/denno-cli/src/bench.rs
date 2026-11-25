@@ -17,7 +17,7 @@
 //! prefix cache を押し流す (ベストエフォート。`--no-flush` で無効化)。
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,7 +29,8 @@ const INSTRUCTION: &str = "\n\nContinue with a clear, detailed explanation of th
 // 統計
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Stats {
     pub n: usize,
     pub mean: f64,
@@ -807,61 +808,96 @@ impl Default for BenchOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PpRow {
     pub pp_tokens: usize,
     pub depth: usize,
+    #[serde(default)]
     pub total_tokens: usize,
+    #[serde(default)]
     pub ttft_ms: f64,
+    #[serde(default)]
     pub pp_tok_s: f64,
+    #[serde(default)]
     pub ttft_runs_ms: Vec<f64>,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TgRow {
     pub depth: usize,
+    #[serde(default)]
     pub gen_tokens: usize,
+    #[serde(default)]
     pub prompt_tokens: usize,
+    #[serde(default)]
     pub ttft_ms: f64,
+    #[serde(default)]
     pub tpot_ms: Stats,
+    #[serde(default)]
     pub itl_ms: Stats,
+    #[serde(default)]
     pub tg_tok_s: f64,
+    #[serde(default)]
     pub runs_tok_s: Vec<f64>,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Determinism {
+    #[serde(default)]
     pub tokens: usize,
+    #[serde(default)]
     pub gen_tokens: usize,
+    #[serde(default)]
     pub md5: String,
+    #[serde(default)]
     pub verified: bool,
+    #[serde(default)]
     pub round_md5: Vec<String>,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Turn2 {
+    #[serde(default)]
     pub depth: usize,
+    #[serde(default)]
     pub cold_ttft_ms: f64,
+    #[serde(default)]
     pub reuse_ttft_ms: f64,
+    #[serde(default)]
     pub speedup: f64,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchReport {
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub api: String,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub context_length: Option<usize>,
+    #[serde(default)]
     pub rounds: usize,
+    #[serde(default)]
     pub created_unix: u64,
+    #[serde(default)]
     pub pp: Vec<PpRow>,
+    #[serde(default)]
     pub tg: Vec<TgRow>,
+    #[serde(default)]
     pub turn2: Option<Turn2>,
+    #[serde(default)]
     pub determinism: Option<Determinism>,
+    #[serde(default)]
     pub errors: Vec<String>,
 }
 
@@ -1289,6 +1325,366 @@ pub fn render_markdown(report: &BenchReport) -> String {
         for e in &report.errors {
             s.push_str(&format!("- {e}\n"));
         }
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// P897: --compare — 2 つの JSON レポートの差分と退行検出
+// ---------------------------------------------------------------------------
+
+/// JSON レポート文字列を読む (古い/部分的なレポートも既定値で受ける)。
+pub fn parse_report_json(text: &str) -> Result<BenchReport> {
+    serde_json::from_str(text).context("parse bench JSON report")
+}
+
+/// JSON レポートファイルを読む。
+pub fn load_report_file(path: &std::path::Path) -> Result<BenchReport> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    parse_report_json(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+/// 変化率 (%)。基準が 0 か非有限なら None (比較不能)。
+pub fn pct_delta(base: f64, new: f64) -> Option<f64> {
+    if !base.is_finite() || !new.is_finite() || base == 0.0 {
+        return None;
+    }
+    Some((new - base) / base * 100.0)
+}
+
+/// 1 行の判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// 退行 (改善方向に対して delta <= -threshold)
+    Regress,
+    /// 改善 (delta >= +threshold)
+    Improve,
+    /// 閾値内 (ノイズ)
+    Flat,
+    /// 片方のレポートにしか無い
+    Missing,
+    /// 値が無い/0 で比較不能
+    NoValue,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Regress => "REGRESS",
+            Verdict::Improve => "improve",
+            Verdict::Flat => "ok",
+            Verdict::Missing => "missing",
+            Verdict::NoValue => "-",
+        }
+    }
+}
+
+/// 比較表の 1 行。退行判定の向きは `mk_row` の `higher_is_better` で決める。
+#[derive(Debug, Clone)]
+pub struct CompareRow {
+    pub case: String,
+    pub metric: String,
+    pub base: Option<f64>,
+    pub new: Option<f64>,
+    pub delta_pct: Option<f64>,
+    pub verdict: Verdict,
+}
+
+/// 比較結果。`exit_fail` が true なら CLI は非 0 で終わる。
+#[derive(Debug, Clone)]
+pub struct CompareOutcome {
+    pub markdown: String,
+    pub rows: Vec<CompareRow>,
+    pub turn2: Option<CompareRow>,
+    pub determinism_match: Option<bool>,
+    pub base_md5: Option<String>,
+    pub new_md5: Option<String>,
+    pub regressions: usize,
+    pub missing: usize,
+    pub exit_fail: bool,
+}
+
+/// 1 行を組み立てる。`threshold` は退行とみなす % (絶対値)。
+fn mk_row(
+    case: String,
+    metric: &str,
+    base: Option<f64>,
+    new: Option<f64>,
+    higher_is_better: bool,
+    threshold: Option<f64>,
+) -> CompareRow {
+    let delta_pct = match (base, new) {
+        (Some(b), Some(n)) => pct_delta(b, n),
+        _ => None,
+    };
+    let verdict = match (base, new) {
+        (None, None) => Verdict::NoValue,
+        (None, Some(_)) | (Some(_), None) => Verdict::Missing,
+        (Some(_), Some(_)) => match delta_pct {
+            None => Verdict::NoValue,
+            Some(d) => {
+                let signed = if higher_is_better { d } else { -d };
+                match threshold {
+                    Some(t) if signed <= -t => Verdict::Regress,
+                    Some(t) if signed >= t => Verdict::Improve,
+                    Some(_) => Verdict::Flat,
+                    None => Verdict::Flat,
+                }
+            }
+        },
+    };
+    CompareRow {
+        case,
+        metric: metric.to_string(),
+        base,
+        new,
+        delta_pct,
+        verdict,
+    }
+}
+
+fn fmt_val(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x.is_finite() => format!("{x:.3}"),
+        _ => "-".to_string(),
+    }
+}
+
+fn fmt_delta(d: Option<f64>) -> String {
+    match d {
+        Some(x) if x.is_finite() => {
+            if x > 0.0 {
+                format!("+{x:.2}%")
+            } else {
+                format!("{x:.2}%")
+            }
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn find_pp<'a>(r: &'a BenchReport, pp: usize, depth: usize) -> Option<&'a PpRow> {
+    r.pp.iter().find(|x| x.pp_tokens == pp && x.depth == depth)
+}
+
+fn find_tg<'a>(r: &'a BenchReport, gen: usize, depth: usize) -> Option<&'a TgRow> {
+    r.tg
+        .iter()
+        .find(|x| x.gen_tokens == gen && x.depth == depth)
+}
+
+/// 2 つのレポートを比較し、Markdown 表と判定を返す。
+///
+/// `threshold_pct` は退行とみなす % (None = 判定せず差分だけ出す)。
+/// md5 決定論の不一致は閾値に関係なく `exit_fail` にする。
+pub fn compare_reports(
+    base: &BenchReport,
+    new: &BenchReport,
+    threshold_pct: Option<f64>,
+) -> CompareOutcome {
+    let threshold = threshold_pct.map(|t| t.abs());
+    let mut rows: Vec<CompareRow> = Vec::new();
+
+    // ---- pp: base の並び順を保ち、new にしか無いケースを後ろに足す ----
+    for b in &base.pp {
+        let n = find_pp(new, b.pp_tokens, b.depth);
+        let case = format!("pp{} @ d{}", b.pp_tokens, b.depth);
+        rows.push(mk_row(
+            case,
+            "pp_tok_s",
+            Some(b.pp_tok_s),
+            n.map(|x| x.pp_tok_s),
+            true,
+            threshold,
+        ));
+    }
+    for n in &new.pp {
+        if find_pp(base, n.pp_tokens, n.depth).is_none() {
+            rows.push(mk_row(
+                format!("pp{} @ d{}", n.pp_tokens, n.depth),
+                "pp_tok_s",
+                None,
+                Some(n.pp_tok_s),
+                true,
+                threshold,
+            ));
+        }
+    }
+
+    // ---- tg ----
+    for b in &base.tg {
+        let n = find_tg(new, b.gen_tokens, b.depth);
+        rows.push(mk_row(
+            format!("tg{} @ d{}", b.gen_tokens, b.depth),
+            "tg_tok_s",
+            Some(b.tg_tok_s),
+            n.map(|x| x.tg_tok_s),
+            true,
+            threshold,
+        ));
+    }
+    for n in &new.tg {
+        if find_tg(base, n.gen_tokens, n.depth).is_none() {
+            rows.push(mk_row(
+                format!("tg{} @ d{}", n.gen_tokens, n.depth),
+                "tg_tok_s",
+                None,
+                Some(n.tg_tok_s),
+                true,
+                threshold,
+            ));
+        }
+    }
+
+    // ---- turn-2 KV reuse (speedup は大きいほど良い) ----
+    let turn2 = {
+        let b = base.turn2.as_ref().filter(|t| t.error.is_none());
+        let n = new.turn2.as_ref().filter(|t| t.error.is_none());
+        let depth = b.map(|t| t.depth).or(n.map(|t| t.depth)).unwrap_or(0);
+        mk_row(
+            format!("turn-2 KV reuse @ d{depth}"),
+            "speedup",
+            b.map(|t| t.speedup),
+            n.map(|t| t.speedup),
+            true,
+            threshold,
+        )
+    };
+
+    // ---- determinism md5 ----
+    let (det_match, base_md5, new_md5) = {
+        let b = base.determinism.as_ref().filter(|d| d.error.is_none());
+        let n = new.determinism.as_ref().filter(|d| d.error.is_none());
+        let bm = b.map(|d| d.md5.clone());
+        let nm = n.map(|d| d.md5.clone());
+        let m = match (&bm, &nm) {
+            (Some(x), Some(y)) => Some(x == y),
+            _ => None,
+        };
+        (m, bm, nm)
+    };
+
+    let regressions = rows
+        .iter()
+        .chain(std::iter::once(&turn2))
+        .filter(|r| r.verdict == Verdict::Regress)
+        .count();
+    let missing = rows
+        .iter()
+        .chain(std::iter::once(&turn2))
+        .filter(|r| r.verdict == Verdict::Missing)
+        .count();
+
+    let exit_fail = regressions > 0 || det_match == Some(false);
+
+    // ---- Markdown ----
+    let mut s = String::new();
+    s.push_str("### denno bench compare\n\n");
+    s.push_str(&format!(
+        "- base: `{}` {} (rounds={})\n- new: `{}` {} (rounds={})\n",
+        base.model, base.url, base.rounds, new.model, new.url, new.rounds
+    ));
+    if base.model != new.model {
+        s.push_str("- warning: model differs between base and new\n");
+    }
+    s.push('\n');
+    s.push_str("| test | metric | base | new | delta | status |\n");
+    s.push_str("|---|---|---|---|---|---|\n");
+    for r in &rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            r.case,
+            r.metric,
+            fmt_val(r.base),
+            fmt_val(r.new),
+            fmt_delta(r.delta_pct),
+            r.verdict.label()
+        ));
+    }
+    s.push('\n');
+    s.push_str("| check | base | new | delta | status |\n");
+    s.push_str("|---|---|---|---|---|\n");
+    s.push_str(&format!(
+        "| {} | {} | {} | {} | {} |\n",
+        turn2.case,
+        fmt_val(turn2.base),
+        fmt_val(turn2.new),
+        fmt_delta(turn2.delta_pct),
+        turn2.verdict.label()
+    ));
+    let det_cell = match det_match {
+        Some(true) => "MATCH".to_string(),
+        Some(false) => "MISMATCH".to_string(),
+        None => "missing".to_string(),
+    };
+    s.push_str(&format!(
+        "| determinism md5 | {} | {} | - | {} |\n",
+        base_md5.as_deref().unwrap_or("-"),
+        new_md5.as_deref().unwrap_or("-"),
+        det_cell
+    ));
+    s.push('\n');
+    let th = match threshold {
+        Some(t) => format!("regression threshold: {t:.2}%"),
+        None => "regression threshold: none (delta only)".to_string(),
+    };
+    s.push_str(&format!(
+        "{th}; regressions: {regressions}, missing: {missing}\n"
+    ));
+
+    CompareOutcome {
+        markdown: s,
+        rows,
+        turn2: Some(turn2),
+        determinism_match: det_match,
+        base_md5,
+        new_md5,
+        regressions,
+        missing,
+        exit_fail,
+    }
+}
+
+/// ファイル 2 つを読んで比較する。
+pub fn run_compare(
+    base_path: &std::path::Path,
+    new_path: &std::path::Path,
+    threshold_pct: Option<f64>,
+) -> Result<CompareOutcome> {
+    let base = load_report_file(base_path)?;
+    let new = load_report_file(new_path)?;
+    Ok(compare_reports(&base, &new, threshold_pct))
+}
+
+/// 端末向けの短い ANSI 要約 (`--no-color` 時は呼ばない)。
+pub fn render_compare_ansi(outcome: &CompareOutcome, color: bool) -> String {
+    let (red, green, yellow, reset) = if color {
+        ("\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+    let mut s = String::new();
+    for r in outcome.rows.iter().chain(outcome.turn2.iter()) {
+        if r.verdict != Verdict::Regress {
+            continue;
+        }
+        s.push_str(&format!(
+            "{red}REGRESS{reset} {} {} {} -> {} ({})\n",
+            r.case,
+            r.metric,
+            fmt_val(r.base),
+            fmt_val(r.new),
+            fmt_delta(r.delta_pct)
+        ));
+    }
+    match outcome.determinism_match {
+        Some(true) => s.push_str(&format!("{green}determinism{reset} md5 MATCH\n")),
+        Some(false) => s.push_str(&format!(
+            "{red}determinism{reset} md5 MISMATCH ({} vs {})\n",
+            outcome.base_md5.as_deref().unwrap_or("-"),
+            outcome.new_md5.as_deref().unwrap_or("-")
+        )),
+        None => s.push_str(&format!("{yellow}determinism{reset} missing in one report\n")),
     }
     s
 }
@@ -1806,6 +2202,234 @@ mod tests {
         assert_eq!(o.text, "mock0 ");
         assert_eq!(o.output_tokens, 1);
         assert_eq!(o.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    // ---- P897: --compare ----
+
+    /// 比較テスト用のレポート。`pp` / `tg` は (tokens, depth, tok_s)。
+    fn rep(
+        pp: &[(usize, usize, f64)],
+        tg: &[(usize, usize, f64)],
+        turn2_speedup: Option<f64>,
+        md5: Option<&str>,
+    ) -> BenchReport {
+        BenchReport {
+            url: "http://127.0.0.1:1".to_string(),
+            api: "anthropic".to_string(),
+            model: "m".to_string(),
+            context_length: Some(32768),
+            rounds: 3,
+            created_unix: 1,
+            pp: pp
+                .iter()
+                .map(|&(p, d, s)| PpRow {
+                    pp_tokens: p,
+                    depth: d,
+                    total_tokens: p + d,
+                    ttft_ms: 1000.0 / s,
+                    pp_tok_s: s,
+                    ttft_runs_ms: vec![1000.0 / s],
+                    error: None,
+                })
+                .collect(),
+            tg: tg
+                .iter()
+                .map(|&(g, d, s)| TgRow {
+                    depth: d,
+                    gen_tokens: g,
+                    prompt_tokens: d,
+                    ttft_ms: 1.0,
+                    tpot_ms: Stats::from_slice(&[1000.0 / s]),
+                    itl_ms: Stats::from_slice(&[1000.0 / s]),
+                    tg_tok_s: s,
+                    runs_tok_s: vec![s],
+                    error: None,
+                })
+                .collect(),
+            turn2: turn2_speedup.map(|sp| Turn2 {
+                depth: 2048,
+                cold_ttft_ms: 1000.0,
+                reuse_ttft_ms: 1000.0 / sp,
+                speedup: sp,
+                error: None,
+            }),
+            determinism: md5.map(|h| Determinism {
+                tokens: 64,
+                gen_tokens: 16,
+                md5: h.to_string(),
+                verified: true,
+                round_md5: vec![h.to_string(), h.to_string()],
+                error: None,
+            }),
+            errors: Vec::new(),
+        }
+    }
+
+    const H1: &str = "0123456789abcdef0123456789abcdef";
+    const H2: &str = "ffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn compare_json_roundtrip_and_partial_defaults() {
+        let r = rep(&[(512, 0, 1234.5)], &[(128, 0, 45.25)], Some(2.5), Some(H1));
+        let json = render_json(&r).unwrap();
+        let back = parse_report_json(&json).expect("parse own json");
+        assert_eq!(back.pp.len(), 1);
+        assert!((back.pp[0].pp_tok_s - 1234.5).abs() < 1e-9);
+        assert!((back.tg[0].tg_tok_s - 45.25).abs() < 1e-9);
+        assert_eq!(back.determinism.unwrap().md5, H1);
+
+        // 古い/手書きの最小 JSON も既定値で受ける。
+        let minimal = r#"{"model":"old","pp":[{"pp_tokens":512,"depth":0,"pp_tok_s":900.0}]}"#;
+        let m = parse_report_json(minimal).expect("parse minimal");
+        assert_eq!(m.model, "old");
+        assert_eq!(m.pp.len(), 1);
+        assert_eq!(m.pp[0].total_tokens, 0);
+        assert!(m.tg.is_empty() && m.turn2.is_none() && m.determinism.is_none());
+
+        // 壊れた JSON はエラー (パニックしない)。
+        assert!(parse_report_json("{not json").is_err());
+    }
+
+    #[test]
+    fn pct_delta_math() {
+        assert_eq!(pct_delta(100.0, 110.0), Some(10.0));
+        assert_eq!(pct_delta(100.0, 80.0), Some(-20.0));
+        assert_eq!(pct_delta(200.0, 200.0), Some(0.0));
+        assert_eq!(pct_delta(0.0, 5.0), None);
+        assert_eq!(pct_delta(f64::NAN, 5.0), None);
+        assert_eq!(pct_delta(5.0, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn compare_identical_reports_is_clean() {
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let b = a.clone();
+        let out = compare_reports(&a, &b, Some(5.0));
+        assert_eq!(out.regressions, 0);
+        assert_eq!(out.missing, 0);
+        assert_eq!(out.determinism_match, Some(true));
+        assert!(!out.exit_fail);
+        assert!(out.markdown.contains("| MATCH |"));
+        assert!(out.markdown.contains("regressions: 0"));
+        assert!(out.rows.iter().all(|r| r.verdict == Verdict::Flat));
+    }
+
+    #[test]
+    fn compare_flags_regression_beyond_threshold() {
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let b = rep(&[(512, 0, 800.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let out = compare_reports(&a, &b, Some(5.0));
+        assert_eq!(out.regressions, 1);
+        assert!(out.exit_fail);
+        let row = &out.rows[0];
+        assert_eq!(row.verdict, Verdict::Regress);
+        assert!((row.delta_pct.unwrap() + 20.0).abs() < 1e-9);
+        assert!(out.markdown.contains("| REGRESS |"));
+
+        // 閾値内は退行にしない。
+        let c = rep(&[(512, 0, 970.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let out2 = compare_reports(&a, &c, Some(5.0));
+        assert_eq!(out2.regressions, 0);
+        assert!(!out2.exit_fail);
+        assert_eq!(out2.rows[0].verdict, Verdict::Flat);
+
+        // 改善方向は improve。
+        let d = rep(&[(512, 0, 1200.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let out3 = compare_reports(&a, &d, Some(5.0));
+        assert_eq!(out3.rows[0].verdict, Verdict::Improve);
+        assert_eq!(out3.regressions, 0);
+    }
+
+    #[test]
+    fn compare_without_threshold_reports_delta_only() {
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let b = rep(&[(512, 0, 100.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let out = compare_reports(&a, &b, None);
+        assert_eq!(out.regressions, 0);
+        assert!(!out.exit_fail);
+        assert_eq!(out.rows[0].verdict, Verdict::Flat);
+        assert!((out.rows[0].delta_pct.unwrap() + 90.0).abs() < 1e-9);
+        assert!(out.markdown.contains("-90.00%"));
+        assert!(out.markdown.contains("threshold: none"));
+    }
+
+    #[test]
+    fn compare_determinism_mismatch_fails() {
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let b = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H2));
+        let out = compare_reports(&a, &b, None);
+        assert_eq!(out.determinism_match, Some(false));
+        assert!(out.exit_fail, "md5 mismatch must fail even with no threshold");
+        assert!(out.markdown.contains("| MISMATCH |"));
+        let ansi = render_compare_ansi(&out, false);
+        assert!(ansi.contains("MISMATCH"));
+        assert!(!ansi.contains("\x1b["));
+    }
+
+    #[test]
+    fn compare_handles_mismatched_case_sets() {
+        // new にしか無い pp 行、base にしか無い tg 行。
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let b = rep(
+            &[(512, 0, 1000.0), (2048, 4096, 300.0)],
+            &[],
+            None,
+            Some(H1),
+        );
+        let out = compare_reports(&a, &b, Some(5.0));
+        assert_eq!(out.missing, 3, "extra pp row + missing tg row + missing turn2");
+        assert_eq!(out.regressions, 0);
+        assert!(!out.exit_fail, "missing rows are reported, not regressions");
+        let extra = out.rows.iter().find(|r| r.case == "pp2048 @ d4096").unwrap();
+        assert_eq!(extra.verdict, Verdict::Missing);
+        assert!(extra.base.is_none() && extra.new == Some(300.0));
+        let tg = out.rows.iter().find(|r| r.case == "tg128 @ d0").unwrap();
+        assert_eq!(tg.verdict, Verdict::Missing);
+        assert_eq!(out.determinism_match, Some(true));
+        assert_eq!(out.turn2.as_ref().unwrap().verdict, Verdict::Missing);
+        assert!(out.markdown.contains("| missing |"));
+    }
+
+    #[test]
+    fn compare_turn2_regression_is_counted() {
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(3.0), Some(H1));
+        let b = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(1.5), Some(H1));
+        let out = compare_reports(&a, &b, Some(10.0));
+        let t2 = out.turn2.as_ref().unwrap();
+        assert_eq!(t2.verdict, Verdict::Regress);
+        assert_eq!(out.regressions, 1);
+        assert!(out.exit_fail);
+        let ansi = render_compare_ansi(&out, true);
+        assert!(ansi.contains("turn-2 KV reuse"));
+        assert!(ansi.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn run_compare_reads_files_from_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "denno-compare-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.json");
+        let new = dir.join("new.json");
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let b = rep(&[(512, 0, 700.0)], &[(128, 0, 50.0)], Some(2.0), Some(H2));
+        std::fs::write(&base, render_json(&a).unwrap()).unwrap();
+        std::fs::write(&new, render_json(&b).unwrap()).unwrap();
+
+        let out = run_compare(&base, &new, Some(5.0)).expect("compare files");
+        assert_eq!(out.regressions, 1);
+        assert_eq!(out.determinism_match, Some(false));
+        assert!(out.exit_fail);
+
+        let missing = run_compare(&dir.join("nope.json"), &new, None);
+        assert!(missing.is_err(), "missing file must be an error");
+
+        std::fs::remove_file(&base).ok();
+        std::fs::remove_file(&new).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 }
 
