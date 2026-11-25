@@ -670,6 +670,20 @@ impl Qwen4ExpParams {
     pub fn n_ssm_layers(&self) -> usize {
         self.n_layer - self.n_full_attn_layers()
     }
+
+    /// task 854: 文脈が 1 トークン伸びるごとに KV キャッシュが増えるバイト数。
+    ///
+    /// full attention 層だけが文脈長に比例する (ssm 層の状態は層あたり固定長)。
+    /// ホスト側の `AttnCache` は f32 の K + V を持つので、その形で見積る
+    /// (`DENNO_EXPERT_VRAM_DYNAMIC` の上限計算にだけ使う。数値経路は触らない)。
+    pub fn kv_bytes_per_token(&self) -> usize {
+        let row = self
+            .n_head_kv
+            .saturating_mul(self.n_embd_head_k.saturating_add(self.n_embd_head_v));
+        self.n_full_attn_layers()
+            .saturating_mul(row)
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
 }
 
 // ---------------------------------------------------------------------------

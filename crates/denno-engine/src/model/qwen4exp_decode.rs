@@ -174,6 +174,8 @@ impl Qwen4ExpDecoder {
     pub fn reset(&mut self) {
         self.tokens.clear();
         self.model.reset();
+        // task 854: 文脈が 0 に戻ったので expert プールの上限も戻す (既定 off)。
+        crate::model::expert_vram::note_context(0, self.model.p.kv_bytes_per_token());
     }
 
     /// task 206: 系列状態の差し替えに対応しているか
@@ -190,6 +192,8 @@ impl Qwen4ExpDecoder {
     pub fn take_seq_state(&mut self) -> Option<DecoderSeqState> {
         let model = self.model.seq_state_take()?;
         let tokens = std::mem::take(&mut self.tokens);
+        // task 854: 文脈を手放したので expert プールの上限を戻す (既定 off)。
+        crate::model::expert_vram::note_context(0, self.model.p.kv_bytes_per_token());
         Some(DecoderSeqState { tokens, model })
     }
 
@@ -198,6 +202,11 @@ impl Qwen4ExpDecoder {
     pub fn put_seq_state(&mut self, st: DecoderSeqState) -> Result<()> {
         self.model.seq_state_put(st.model)?;
         self.tokens = st.tokens;
+        // task 854: 戻した文脈長で expert プールを見直す (既定 off)。
+        crate::model::expert_vram::note_context(
+            self.tokens.len(),
+            self.model.p.kv_bytes_per_token(),
+        );
         Ok(())
     }
 
@@ -280,6 +289,11 @@ impl Qwen4ExpDecoder {
         if !batch {
             return self.prefill(prompt);
         }
+        // task 854: prefill で伸びる先の文脈長で expert プールを見直す (既定 off)。
+        crate::model::expert_vram::note_context(
+            self.tokens.len().saturating_add(prompt.len()),
+            self.model.p.kv_bytes_per_token(),
+        );
         let logits = self.model.forward_prefill_with(prompt, true)?;
         self.tokens.extend_from_slice(prompt);
         Ok(logits)
@@ -346,6 +360,11 @@ impl Qwen4ExpDecoder {
             self.model.arch_emit_prefill_done();
             return Ok(logits);
         }
+        // task 854: prefill で伸びる先の文脈長で expert プールを見直す (既定 off)。
+        crate::model::expert_vram::note_context(
+            self.tokens.len().saturating_add(prompt.len()),
+            self.model.p.kv_bytes_per_token(),
+        );
         let logits = self.model.forward_prefill_tapped_roles(prompt, true, tokens, on_layer, roles)?;
         self.tokens.extend_from_slice(prompt);
         Ok(logits)
@@ -470,6 +489,12 @@ impl Qwen4ExpDecoder {
         // task 132: step の入口 (push と窓の組み立て) を層の外として測る。
         let d_step = q4prof::dstamp();
         self.tokens.push(token);
+        // task 854: 文脈が伸びたぶん expert プールの上限を見直す
+        // (`DENNO_EXPERT_VRAM_DYNAMIC` が off なら即座に戻る)。
+        crate::model::expert_vram::note_context(
+            self.tokens.len(),
+            self.model.p.kv_bytes_per_token(),
+        );
         // task 177: 診断 (`DENNO_GDN_DEC_KPROF`) 用の絶対位置 (prompt + 生成の通し)。
         #[cfg(feature = "cuda")]
         crate::cuda::dec_kprof::set_pos(self.tokens.len() as u64);
