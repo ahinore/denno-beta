@@ -5485,7 +5485,14 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         if !crate::model::pf_pool::pf_pool_big_on() {
             return (base, cap, false, reserve);
         }
-        let big_cap = crate::model::pf_pool::pf_pool_big_bytes();
+        // task 878: free-only 計画では上限を実空きだけから決め、expert の LRU は
+        // 追い出し候補に数えない (既定 off)。
+        let free_only = crate::model::pf_pool::pf_pool_big_free_on();
+        let big_cap = if free_only {
+            crate::model::pf_pool::pf_pool_big_free_bytes()
+        } else {
+            crate::model::pf_pool::pf_pool_big_bytes()
+        };
         if big_cap <= cap {
             return (base, cap, false, reserve);
         }
@@ -5504,15 +5511,20 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // prefill の後半の数 MiB の確保が断片化で落ちる (lab t286c の
         // UD-Q4_K_XL 14k: 空き 3 MiB で 3 MiB の確保が error 2)。
         let free = crate::cuda::dev_mem_mb().map(|(f, _)| (f as usize) << 20);
-        let evictable = crate::model::expert_vram::resident_bytes().min(big_cap);
+        let evictable = if free_only {
+            0
+        } else {
+            crate::model::expert_vram::resident_bytes().min(big_cap)
+        };
         let budget = crate::model::pf_pool::pool_budget(big_cap, free, evictable, reserve);
         eprintln!(
-            "[pf-pool-big] 上限 (実空き {} MiB + 追い出せる expert {} MiB - 余白 {} MiB = {} MiB / 固定上限 {} MiB)",
+            "[pf-pool-big] 上限 (実空き {} MiB + 追い出せる expert {} MiB - 余白 {} MiB = {} MiB / 固定上限 {} MiB{})",
             free.map(|b| b >> 20).unwrap_or(0),
             evictable >> 20,
             reserve >> 20,
             budget >> 20,
-            big_cap >> 20
+            big_cap >> 20,
+            if free_only { " / free-only" } else { "" }
         );
         match crate::model::pf_pool::choose_big(&base, budget, max_chunk) {
             Some((c, t, l)) if c != base.chunk || t != base.tile => {

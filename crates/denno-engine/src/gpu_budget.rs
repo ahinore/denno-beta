@@ -956,6 +956,33 @@ mod tests {
         assert_eq!(a.staging_peak, (2560 + 248_320) * 4);
     }
 
+    /// task 878: Qwen3.8-Flash-Next の実形 (12 full 層 × kv_dim 512 =
+    /// 49,152 B/token) で 16k / 32k / 64k のホスト KV を見る。
+    ///
+    /// 64k の 3,072 MiB は lab t878a の起動行 `kv=3072 MiB (host, max_ctx 比例)`
+    /// と一致する (max_ctx=65536)。
+    #[test]
+    fn kv_host_at_16k_32k_and_64k_matches_the_lab_line() {
+        let totals = WeightTotals::default();
+        let mib_of = |ctx: usize| mib(flash_budget(totals, 12, 512, ctx, false).kv_host_max);
+        assert_eq!(mib_of(8_192), 384);
+        assert_eq!(mib_of(16_384), 768);
+        assert_eq!(mib_of(24_576), 1152);
+        assert_eq!(mib_of(32_768), 1536);
+        assert_eq!(mib_of(65_536), 3072, "lab t878a の起動行と同じ値");
+        // 1 トークンあたりは文脈長に依らない (層数 × kv_dim × 2 × 4)。
+        let per_tok = 12 * 512 * 2 * 4;
+        assert_eq!(per_tok, 49_152);
+        for ctx in [8_192usize, 16_384, 32_768, 65_536] {
+            assert_eq!(
+                flash_budget(totals, 12, 512, ctx, false).kv_host_max,
+                (ctx * per_tok) as u64
+            );
+        }
+        // 2 スロット (主 + 脇) が 32k を保持しても 3 GiB。ホスト RAM 59 GiB に収まる。
+        assert_eq!(2 * 1536, 3072);
+    }
+
     #[test]
     fn q4_model_reports_one_arena_chunk() {
         let totals = WeightTotals {

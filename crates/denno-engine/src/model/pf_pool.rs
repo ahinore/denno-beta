@@ -530,6 +530,46 @@ pub const PF_POOL_BIG_CHUNK_ENV: &str = "DENNO_PF_POOL_BIG_CHUNK";
 /// [`PF_POOL_BIG_CHUNK_ENV`] の既定 (トークン)。
 pub const DEFAULT_BIG_CHUNK: usize = 2047;
 
+/// `DENNO_PF_POOL_BIG_FREE=1`: 大きい計画の上限を**実空きだけ**から決める
+/// (task 878、既定 off)。
+///
+/// # なぜ要るか
+///
+/// `DEFAULT_POOL_BIG_MB` (4,864 MiB) は 14k の 1 パスに合わせた値で、16k を
+/// 超えると必ず 2 パス以上になる。2 パスは expert 重みの H2D / pread が
+/// パス数倍になるので、cold prefill の壁時計がそのまま伸びる。
+///
+/// lab t878a (MODEL=flash-next-UD-Q4_K_XL、gen、実測) では:
+///
+/// | 文脈 | 固定上限 4,864 | 実空き - 余白 |
+/// | --- | ---: | ---: |
+/// | 10,816 tok (1 パス / 作業域 3,388 MiB) | 4,864 | 22,739 |
+/// | 22,758 tok (2 パス / 作業域 4,200 MiB) | 4,864 | 22,739 |
+///
+/// 空きは 22.7 GiB も余っているのに固定上限が 2 パスを強制していた。
+///
+/// # 何をするか
+///
+/// on では上限を `min(PF_POOL_BIG_FREE_MB, 実空き - 余白)` にする。**追い出せる
+/// expert を足さない**のが要点で、expert の LRU を削ってまで作業域を広げない
+/// (確保できたとしても prefill 後の decode ヒット率を落とす。task 420 / 286c)。
+/// 空いているカードでは 1 パス、混んでいるカードでは従来どおり複数パスになる。
+///
+/// 既定 off。`DENNO_PF_POOL_BIG_FREE=0` と書いても off のまま (明示的な真値だけ on)。
+pub const PF_POOL_BIG_FREE_ENV: &str = "DENNO_PF_POOL_BIG_FREE";
+
+/// [`PF_POOL_BIG_FREE_ENV`] の既定 (off)。
+pub const DEFAULT_PF_POOL_BIG_FREE: bool = false;
+
+/// `DENNO_PF_POOL_BIG_FREE_MB`: free-only 計画の固定上限 (MiB、既定 16,384)。
+///
+/// 32,768 トークンの 1 パス (タイル = 全トークン) が収まる大きさ。
+/// 実空きがこれを超えても、ここで止める (断片化の余裕を残す)。
+pub const PF_POOL_BIG_FREE_MB_ENV: &str = "DENNO_PF_POOL_BIG_FREE_MB";
+
+/// [`PF_POOL_BIG_FREE_MB_ENV`] の既定 (MiB)。
+pub const DEFAULT_POOL_BIG_FREE_MB: usize = 16_384;
+
 /// チャンクの上限 (これ以上は連鎖の形が未確認)。
 pub const MAX_BIG_CHUNK: usize = 4096;
 
@@ -590,6 +630,42 @@ pub fn pf_pool_big_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         pf_pool_big_mb_from_value(std::env::var(PF_POOL_BIG_MB_ENV).ok().as_deref()) << 20
+    })
+}
+
+/// [`PF_POOL_BIG_FREE_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn pf_pool_big_free_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// free-only 計画を使うか (プロセスで 1 回だけ env を読む)。
+pub fn pf_pool_big_free_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_pool_big_free_from_value(std::env::var(PF_POOL_BIG_FREE_ENV).ok().as_deref())
+    })
+}
+
+/// [`PF_POOL_BIG_FREE_MB_ENV`] の解釈 (純関数)。0 / 解析不能は既定。
+pub fn pf_pool_big_free_mb_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_POOL_BIG_FREE_MB),
+        None => DEFAULT_POOL_BIG_FREE_MB,
+    }
+}
+
+/// free-only 計画の固定上限 (バイト)。env はプロセスで 1 回だけ読む。
+pub fn pf_pool_big_free_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        pf_pool_big_free_mb_from_value(std::env::var(PF_POOL_BIG_FREE_MB_ENV).ok().as_deref()) << 20
     })
 }
 
@@ -1043,6 +1119,102 @@ mod tests {
         // 上限を 1,536 に落とすと、1 パスのままチャンクは従来のまま。
         let c1536 = choose_big(&n, DEFAULT_POOL_BIG_MB << 20, 1536).expect("1 パス");
         assert_eq!((c1536.0, c1536.1), (1536, 14018));
+    }
+
+    /// task 878: free-only のゲートは**明示的な真値だけ** on (既定 off)。
+    #[test]
+    fn big_free_gate_reads_only_explicit_true() {
+        for v in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(!pf_pool_big_free_from_value(v), "{v:?} は off");
+        }
+        for v in [Some("1"), Some("on"), Some("true"), Some("yes"), Some(" ON ")] {
+            assert!(pf_pool_big_free_from_value(v), "{v:?} は on");
+        }
+        assert!(!DEFAULT_PF_POOL_BIG_FREE, "既定は off");
+    }
+
+    /// task 878: free-only の上限 env は 0 / 解析不能で既定。
+    #[test]
+    fn big_free_mb_default_on_zero_or_garbage() {
+        assert_eq!(pf_pool_big_free_mb_from_value(None), DEFAULT_POOL_BIG_FREE_MB);
+        assert_eq!(pf_pool_big_free_mb_from_value(Some("0")), DEFAULT_POOL_BIG_FREE_MB);
+        assert_eq!(pf_pool_big_free_mb_from_value(Some("x")), DEFAULT_POOL_BIG_FREE_MB);
+        assert_eq!(pf_pool_big_free_mb_from_value(Some("8192")), 8192);
+        assert_eq!(DEFAULT_POOL_BIG_FREE_MB, 16_384);
+    }
+
+    /// task 878: evictable を 0 にすると「実空き - 余白」までしか借りない
+    /// (= expert の LRU を削ってまで作業域を広げない)。
+    #[test]
+    fn free_only_budget_never_counts_experts() {
+        let free = Some(22_739usize << 20);
+        let evictable = 8_000usize << 20;
+        let reserve = 3_072usize << 20;
+        let with_experts = pool_budget(DEFAULT_POOL_BIG_MB << 20, free, evictable, reserve);
+        let free_only = pool_budget(DEFAULT_POOL_BIG_FREE_MB << 20, free, 0, reserve);
+        // 従来は固定上限 4,864 MiB で止まる。
+        assert_eq!(with_experts, DEFAULT_POOL_BIG_MB << 20);
+        // free-only は実空き - 余白 (19,667 MiB) と固定上限 16,384 MiB の小さい方。
+        assert_eq!(free_only, DEFAULT_POOL_BIG_FREE_MB << 20);
+        assert!(free_only > with_experts, "free-only のほうが広い: {free_only} vs {with_experts}");
+        // 実空きが固定上限に満たなければ、実空き - 余白までしか借りない。
+        assert_eq!(
+            pool_budget(DEFAULT_POOL_BIG_FREE_MB << 20, Some(10_000 << 20), 0, reserve),
+            (10_000 - 3_072) << 20,
+            "実空き 10,000 - 余白 3,072 = 6,928 MiB"
+        );
+        // 実空きが読めないときは固定上限 (従来と同じ fail-open)。
+        assert_eq!(
+            pool_budget(DEFAULT_POOL_BIG_FREE_MB << 20, None, 0, reserve),
+            DEFAULT_POOL_BIG_FREE_MB << 20
+        );
+        // 混んでいるカードでは free-only でも増えない (余白を割らない)。
+        let tight = pool_budget(DEFAULT_POOL_BIG_FREE_MB << 20, Some(2_000 << 20), 0, reserve);
+        assert_eq!(tight, 0, "空きが余白未満なら借りない");
+    }
+
+    fn need_nt(nt: usize) -> Need {
+        Need {
+            nt_all: nt,
+            tile: 5_120,
+            ..need()
+        }
+    }
+
+    /// task 878: 16k / 32k のタイルと作業域の不変条件。
+    ///
+    /// - 既定の固定上限 (4,864 MiB) では 16k で 1 パスに届かない (= 2 パス以上)。
+    ///   lab t878a の 22,758 tok が 2 パス / 作業域 4,200 MiB だったのと同じ形。
+    /// - free-only の 16,384 MiB なら 16k も 32k も 1 パスに収まる。
+    /// - 作業域は上限を超えない (超えるなら `choose_big` は別の組を返す)。
+    #[test]
+    fn big_plan_at_16k_and_32k() {
+        let cap_def = DEFAULT_POOL_BIG_MB << 20;
+        let cap_free = DEFAULT_POOL_BIG_FREE_MB << 20;
+        // 16k: 既定ではタイルが全トークンに上がらない。
+        let tight = choose_big(&need_nt(16_384), cap_def, DEFAULT_BIG_CHUNK).expect("収まる");
+        assert!(tight.1 < 16_384, "既定で 1 パスに上がってはいけない: {}", tight.1);
+        assert!(16_384usize.div_ceil(tight.1) >= 2);
+        // 16k: free-only なら 1 パス。
+        let k16 = choose_big(&need_nt(16_384), cap_free, DEFAULT_BIG_CHUNK).expect("1 パス");
+        assert_eq!(k16.1, 16_384, "16k は 1 パス");
+        assert!(k16.2.total <= cap_free);
+        assert!(k16.2.total > cap_def, "既定の上限では収まらない大きさ: {}", k16.2.total);
+        // 32k: free-only でも 1 パスで、上限 16 GiB に収まる。
+        let k32 = choose_big(&need_nt(32_768), cap_free, DEFAULT_BIG_CHUNK).expect("1 パス");
+        assert_eq!(k32.1, 32_768, "32k も 1 パス");
+        assert!(k32.2.total <= cap_free, "32k の作業域 {} B", k32.2.total);
+        // 作業域は文脈長に対して単調 (32k > 16k)、かつ 2 倍未満。
+        assert!(k32.2.total > k16.2.total);
+        assert!(k32.2.total < k16.2.total * 2);
+        // 32,768 は max_ctx の上限側 (65,536 の半分)。既定の上限では 2 パス以上。
+        let k32_def = choose_big(&need_nt(32_768), cap_def, DEFAULT_BIG_CHUNK).expect("収まる");
+        assert!(
+            32_768usize.div_ceil(k32_def.1) >= 2,
+            "既定は 32k で複数パス: タイル {}",
+            k32_def.1
+        );
+        assert!(k32_def.2.total <= cap_def);
     }
 
     /// 3,826 の大きい形 (チャンク 1,913) も既定のプールに収まる。
