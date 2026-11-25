@@ -40,6 +40,10 @@ mixer: kind == "qsa" and layer % 8 == 3; moe: layer in [5, 9, 17]
 
 `denno-view` の環境変数: `VIEW_UPSTREAM`(既定 `ws://127.0.0.1:8080/v1/telemetry/ws`)、`VIEW_PORT`(既定 8093)、`VIEW_RECORD`(フレームをファイルに追記)、`VIEW_REPLAY`(記録を `/replay` で配信)、`VIEW_CAPTURE`(連結フレーム列を `/capture.bin` で配信)、`VIEW_TOKENIZER`(トークン文字表示用の tokenizer.json)。`/chat` は上流のサーバーへ中継するので、内蔵チャットに CORS 設定は要らない。
 
+### 層のドリルダウン (task 857)
+
+層の箱(左の列)か右の層パネルをクリックすると、その層のドリルダウンが地図の左下に開く。中身は、その層の router が選んだ top-k の expert id とゲート重み(生値。棒は最大値で正規化)、VRAM hit / CPU miss のバッジ(`ExpertResidency` が来ていないときは `?`、介入で切った expert は `skip`)、直近 16 トークンの出現頻度のスパークライン(当たったトークンが縦棒)。`×` か Esc で閉じ、別の層を押すとその層に切り替わる。層の壁(`wall`)でも層をクリックすれば同じものが開く。hit / miss は `DENNO_EXPERT_GPU=1` で expert が VRAM に載っているときに意味を持つ(`DENNO_EXPERT_VRAM_MB>0`)。数字がまだ無いときは「RouterTopK 待ち」「ExpertResidency 待ち」とだけ出し、推測の値は出さない。
+
 ## Abliterate の作業台 (`/2d` の右パネル)
 
 右の操作列にある `abliterate` の箱が、方向 ablation の A/B 対比の作業台。残差ストリームのステアリング (crates/denno-engine/src/model/steer.rs) と `/v1/steer` の上に載っている。

@@ -203,6 +203,30 @@
   .topbar.chosen .bar i { background:#ffc44d; }
   .topbar .pv { width:42px; text-align:right; color:#8fb4c8; font-variant-numeric:tabular-nums; }
   .err { color:#ff6b86; font-size:10.5px; white-space:pre-wrap; }
+  /* task 857: 層ドリルダウン (層の箱 / 層パネルをクリックで開く) */
+  .drill { position:absolute; left:10px; bottom:10px; width:318px; max-height:calc(100% - 20px);
+           overflow-y:auto; z-index:15; background:rgba(4,12,18,.95); border:1px solid #1b4b60;
+           border-radius:5px; padding:6px 8px; box-shadow:0 6px 22px rgba(0,0,0,.55); }
+  .drill .dh { display:flex; align-items:center; gap:6px; font-size:11px; margin-bottom:3px; }
+  .drill .dh b { color:#9fefff; font-weight:600; }
+  .drill .dh .sp { flex:1; }
+  .drill .dx { background:none; border:none; color:#5b7280; font:inherit; font-size:13px;
+               cursor:pointer; padding:0 2px; line-height:1; }
+  .drill .dx:hover { color:#ff8a94; }
+  .drill .dsum { font-size:10px; color:#5b7280; margin-bottom:4px; }
+  .drill .dnote { font-size:10px; color:#7fa4b8; margin-top:4px; }
+  .drill .er { display:flex; align-items:center; gap:4px; height:17px; font-size:10px; }
+  .drill .er .id { width:44px; color:#cfeaf7; font-variant-numeric:tabular-nums; }
+  .drill .er .bg { flex:1; min-width:24px; height:7px; background:#0a1a24; border-radius:2px; overflow:hidden; }
+  .drill .er .bg i { display:block; height:100%; background:#2f8aa8; }
+  .drill .er .wv { width:50px; text-align:right; color:#8fb4c8; font-variant-numeric:tabular-nums; }
+  .drill .er .hb { width:34px; text-align:center; font-size:9px; border-radius:2px; flex:none; }
+  .drill .er .hb.vram { color:#3fe08a; border:1px solid #1d5f4a; }
+  .drill .er .hb.cpu { color:#ff8a94; border:1px solid #6b2a33; }
+  .drill .er .hb.unk { color:#5b7280; border:1px solid #22333f; }
+  .drill .er .hb.skip { color:#ffc44d; border:1px solid #7a5a12; }
+  .drill .er svg { flex:none; display:block; }
+  .drill .er.sel { outline:1px solid #ffffff; border-radius:2px; }
   .reqlog { font-size:9.5px; color:var(--dim); max-height:150px; overflow-y:auto;
             display:flex; flex-direction:column; gap:1px; }
   .reqlog .q { color:#7fa4b8; }
@@ -271,7 +295,16 @@
         <label title="thin dot = expert stays in VRAM"><input id="cb-vram" type="checkbox">vram</label>
       </div>
     </div>
-    <div id="mapwrap"><canvas id="map"></canvas></div>
+    <div id="mapwrap"><canvas id="map"></canvas>
+      <div id="drill" class="drill" hidden>
+        <div class="dh"><b id="drill-title">layer -</b><span id="drill-sub" class="dim"></span>
+          <span class="sp"></span>
+          <button id="drill-close" class="dx" title="閉じる (Esc)">×</button></div>
+        <div id="drill-sum" class="dsum"></div>
+        <div id="drill-body"></div>
+        <div id="drill-note" class="dnote"></div>
+      </div>
+    </div>
     <div id="hud" title="ライブ性能: ttft / 出力 tok/s / expert の VRAM ヒット率 / 次のターンで使い回す KV / 投機の採用率">
       <span><span class="hk">ttft</span><b id="hud-ttft">-</b></span>
       <span><span class="hk">tok/s</span><b id="hud-rate">-</b></span>
@@ -515,10 +548,11 @@ import {
   ablitStackBody, ablitStackSummary, ablitSummary,
   parsePromptList,
   TOPK_HISTORY_MAX, entropyBits, entropyColor, topkBarRows, topkPush, topkSummary,
+  EXPERT_FREQ_WINDOW,
 } from '/view2d.mjs';
 import {
   archLayout, archHitTest, archItemsInRect, archNodeRect, drawArch, fitView, gridPixels,
-  toWorld, zoomAt,
+  toWorld, zoomAt, expertDrilldown, drillSparkBars, DRILL_COLORS,
 } from '/arch2d.mjs';
 import {
   buildTree, visibleRows, ancestorIds, nodeCheckState, nodeItems, createEnv, runDsl,
@@ -835,6 +869,10 @@ function fitCanvas() {
 function rebuild(next) {
   shape = normaliseShape(next);
   st = createMapState(shape, { mode: st ? st.mode : 'token' });
+  // task 857: 層の数が変わるので、開いているドリルダウンは閉じる。
+  drillLayer = null;
+  drillDirty = false;
+  $('drill').hidden = true;
   $('shapeline').textContent = shape.layers + 'L · ' + shape.n_expert + 'e top-' +
     shape.n_expert_used + ' · ' + shape.n_hc + 'hc';
   buildScale();
@@ -2291,6 +2329,12 @@ function tick(now) {
     renderTree();
     lastTreeRender = now;
   }
+  // task 857: ドリルダウンは 4 Hz で描き直す (1 トークンで 48 層ぶん
+  // RouterTopK が来るので、フレームごとに DOM を壊さない)。
+  if (drillLayer != null && drillDirty && now - lastDrillRender > 250) {
+    renderDrill();
+    lastDrillRender = now;
+  }
   if (!dirty || !wall) return;
   dirty = false;
   if (viewMode === 'arch') drawArchView();
@@ -2663,12 +2707,110 @@ function archUp() {
   } else if (d.hit) {
     const h = d.hit;
     if (h.type === 'expert' || h.type === 'block' || h.type === 'stream') toggleItem(sel, h);
-    else if (h.type === 'column') { focusRect(arch.panels[h.layer]); revealNode('L' + h.layer); }
+    else if (h.type === 'column') { focusRect(arch.panels[h.layer]); revealNode('L' + h.layer); openDrill(h.layer); }
+    else if (h.type === 'panel') openDrill(h.layer);
     else if (h.type === 'hybrid') { focusRect(arch.blocks[h.hybrid]); revealNode('H' + h.hybrid); }
   }
   renderState();
   dirty = true;
 }
+
+// ---- task 857: 層ドリルダウン -------------------------------------------
+// 層の箱 (column) か層パネルをクリックすると、その層の router が選んだ
+// expert・ゲート重み・VRAM hit / CPU miss・直近トークンの頻度を重ねて出す。
+// 閉じるのは × か Esc。別の層を押すとその層に切り替わる。
+let drillLayer = null;        // 開いている層 (null = 閉)
+let drillDirty = false;
+let lastDrillRender = 0;
+
+function closeDrill() {
+  if (drillLayer == null) return;
+  drillLayer = null;
+  drillDirty = false;
+  $('drill').hidden = true;
+  dirty = true;
+}
+
+function openDrill(layer) {
+  const l = Math.trunc(Number(layer));
+  if (!(l >= 0 && l < shape.layers)) return;
+  drillLayer = l;
+  $('drill').hidden = false;
+  lastDrillRender = performance.now();
+  renderDrill();
+}
+
+/// expert 1 行の頻度スパークライン (0/1 の棒)。hit/miss の色で塗る。
+function drillSparkSvg(row, w, h) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width', String(w));
+  svg.setAttribute('height', String(h));
+  const color = row.hit === 'vram' ? DRILL_COLORS.vram
+    : row.hit === 'cpu' ? DRILL_COLORS.cpu : DRILL_COLORS.bar;
+  const bars = drillSparkBars(row.values, w, h);
+  for (const b of bars) {
+    const r = document.createElementNS(NS, 'rect');
+    r.setAttribute('x', b.x.toFixed(2));
+    r.setAttribute('y', b.y.toFixed(2));
+    r.setAttribute('width', b.w.toFixed(2));
+    r.setAttribute('height', Math.max(1, b.h).toFixed(2));
+    r.setAttribute('fill', color);
+    svg.appendChild(r);
+  }
+  return svg;
+}
+
+function renderDrill() {
+  drillDirty = false;
+  const box = $('drill');
+  if (drillLayer == null) { box.hidden = true; return; }
+  const d = expertDrilldown(st, shape, drillLayer, { window: EXPERT_FREQ_WINDOW });
+  if (!d) { closeDrill(); return; }
+  $('drill-title').textContent = 'layer ' + d.layer + ' · ' + (d.kind === 'attn' ? 'QSA' : 'GDN');
+  $('drill-sub').textContent = 'top-' + d.n_used + ' / ' + d.n_expert + ' · tok ' + d.tokens;
+  const bits = [];
+  if (d.n_used) bits.push('Σw ' + d.experts.reduce((a, r) => a + r.weight, 0).toFixed(2));
+  if (d.residency) bits.push('VRAM ' + d.hitVram + ' / CPU ' + d.hitCpu);
+  bits.push('窓 ' + d.window + ' tok');
+  $('drill-sum').textContent = bits.join(' · ');
+  const body = $('drill-body');
+  body.textContent = '';
+  let maxW = 0;
+  for (const r of d.experts) if (r.weight > maxW) maxW = r.weight;
+  for (const r of d.experts) {
+    const line = document.createElement('div');
+    line.className = 'er';
+    const id = document.createElement('span');
+    id.className = 'id';
+    id.textContent = 'e ' + r.id;
+    id.title = 'expert ' + r.id + ' · 活性 ' + r.count + 'x · ' + Math.round(r.share * 100) + '% of top-k';
+    const bar = document.createElement('span');
+    bar.className = 'bg';
+    const fill = document.createElement('i');
+    fill.style.width = ((maxW > 0 ? r.weight / maxW : 0) * 100).toFixed(1) + '%';
+    bar.appendChild(fill);
+    const wv = document.createElement('span');
+    wv.className = 'wv';
+    wv.textContent = r.weight.toFixed(3);
+    const hb = document.createElement('span');
+    if (r.skipped) { hb.className = 'hb skip'; hb.textContent = 'skip'; hb.title = 'router が選んだが介入で切った'; }
+    else if (r.hit === 'vram') { hb.className = 'hb vram'; hb.textContent = 'VRAM'; hb.title = 'expert の重みが VRAM に常駐 (GPU hit)'; }
+    else if (r.hit === 'cpu') { hb.className = 'hb cpu'; hb.textContent = 'CPU'; hb.title = 'VRAM に無く CPU / SSD から読む (miss)'; }
+    else { hb.className = 'hb unk'; hb.textContent = '?'; hb.title = 'ExpertResidency が来ていないので不明'; }
+    line.append(id, bar, wv, hb, drillSparkSvg(r, 64, 12));
+    body.appendChild(line);
+  }
+  if (!d.experts.length) {
+    const empty = document.createElement('div');
+    empty.className = 'dnote';
+    empty.textContent = 'まだ選択が無い';
+    body.appendChild(empty);
+  }
+  $('drill-note').textContent = d.note;
+}
+
+$('drill-close').addEventListener('click', () => closeDrill());
 
 canvas.addEventListener('wheel', (ev) => {
   if (viewMode !== 'arch') return;
@@ -2742,6 +2884,8 @@ canvas.addEventListener('pointerup', () => {
   } else if (d.hit && d.hit.type !== 'depth') {
     // クリック: expert / ブロック / stream を選択 (深さの帯は選択しない)
     toggleItem(sel, d.hit);
+    // task 857: 層のドリルダウンも開く (wall 表示でも同じ)
+    if (d.hit.layer != null) openDrill(d.hit.layer);
   } else if (!d.hit) {
     clearSel(sel);
   }
@@ -3101,6 +3245,9 @@ function handleFrame(f) {
   frameCount++;
   lastKind = f.kind;
   if (st.onFrame(f)) dirty = true;
+  // task 857: 開いているドリルダウンは次の描画で追いつかせる (4 Hz)。
+  if (drillLayer != null && (f.kind === 'RouterTopK' || f.kind === 'ExpertResidency' ||
+      f.kind === 'ExpertSkip' || f.kind === 'Token')) drillDirty = true;
   // task 809: 投機 / MTP のフレームが来たら HUD と構成図の強調を更新する。
   if (hudOnFrame(hud, f)) {
     renderHud();
@@ -3393,7 +3540,7 @@ function setBusy(on) {
 
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
-  if (e.key === 'Escape') { clearSel(sel); renderState(); dirty = true; }
+  if (e.key === 'Escape') { closeDrill(); clearSel(sel); renderState(); dirty = true; }
   if (viewMode === 'arch' && arch) {
     if (e.key === '0') focusRect(arch.bounds, 16);
     else if (e.key === '+' || e.key === '=') zoomBy(1.5);
@@ -3422,6 +3569,11 @@ window.__view2d = {
   epoch: () => ({ seen: epochSeen, resets: epochResets, last: lastReset }),
   refreshAll: (why) => refreshAll(why || 'manual'),
   setMode,
+  // task 857: 層ドリルダウンの検証用フック
+  openDrill: (l) => { openDrill(l); return drillLayer; },
+  closeDrill: () => { closeDrill(); return drillLayer; },
+  drill: () => (drillLayer == null ? null : expertDrilldown(st, shape, drillLayer, { window: EXPERT_FREQ_WINDOW })),
+  drillLayer: () => drillLayer,
   select: (items) => { for (const it of items) addItem(sel, it); renderState(); dirty = true; },
   offSelected: () => $('btn-off').click(),
   onSelected: () => $('btn-on').click(),
