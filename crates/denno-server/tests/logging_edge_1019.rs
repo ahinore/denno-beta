@@ -3,8 +3,8 @@
 //! 対象 API (crates/denno-server/src/logging.rs を全読して確認した公開面):
 //! - `NonBlockingStdout::spawn_with(sink, capacity)` / `spawn()` / `dropped()`
 //! - `MakeWriter for NonBlockingStdout` → `LogWriter::write` (非ブロッキング)
-//! - `access_log_line(method, path, status, duration_ms)` / `set_access_log_json` /
-//!   `access_log_json`
+//! - `access_log_line(method, path, status, duration_ms, request_id)` /
+//!   `set_access_log_json` / `access_log_json`
 //!
 //! `logging.rs` はテキスト整形を自前で行わない (整形は tracing-subscriber の fmt
 //! レイヤ、本モジュールはバイト列のパススルーと有界キューだけを担う)。したがって
@@ -13,11 +13,18 @@
 //!   (b) 1 イベント = 1 write = 1 行 (インターリーブしないこと)
 //! である。JSON 側は `access_log_line` が serde_json で 1 行に直列化する。
 //!
-//! Request-ID とヘッダ (Authorization 等) の redaction は **本モジュールには
-//! 実装が無い** (grep で確認: request_id / redact / Authorization の参照ゼロ)。
-//! アクセスログは `log_requests` ミドルウェアが method / path / status /
-//! duration だけを渡すため、ヘッダ値がログに混入する経路自体が存在しない。
-//! この「未対応 = 固定フィールド集合」をテストで固定する。
+//! task 911 で `request_id` が 5 番目の引数として追加され、JSON 行にも
+//! `request_id` フィールドが載る。ただしリクエスト ID の無害化
+//! (`sanitize_request_id`) はミドルウェア側 (`lib.rs`) の責務で、本モジュールは
+//! 受け取った文字列を serde_json でそのまま直列化するだけ。したがってここでは
+//!   (a) JSON のフィールド集合が `ts_ms` / `method` / `path` / `status` /
+//!       `duration_ms` / `request_id` の 6 個ちょうどであること
+//!   (b) `path` と `request_id` の引用符・制御文字・非 ASCII が JSON として
+//!       正しくエスケープされ、往復で元の値に戻ること
+//!   (c) ヘッダ値 (Authorization 等) が独立したフィールドとして漏れないこと
+//! を固定する。ヘッダ redaction 自体は本モジュールには実装が無い
+//! (アクセスログは method / path / status / duration / request_id しか受け取らず、
+//! ヘッダ値をログに渡す経路そのものが存在しない)。
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -133,13 +140,14 @@ fn lossy(buf: &[u8]) -> String {
 
 // ---------- JSON アクセスログ ----------
 
-/// 制御文字・引用符・改行・非 ASCII を含んでも 1 行の妥当な JSON になり、
-/// 各フィールドが元の値へ完全に復元されること。
+/// 制御文字・引用符・改行・非 ASCII を `path` と `request_id` の両方に含んでも
+/// 1 行の妥当な JSON になり、各フィールドが元の値へ完全に復元されること。
 #[test]
 fn json_access_log_escapes_control_quotes_newlines_and_non_ascii() {
     let method = "GE\"T";
-    let path = "/v1/messages?q=\"a\"\\b\nc\td\re\u{1b}[31m\u{7}日本語/é";
-    let line = access_log_line(method, path, 418, 1234.5);
+    let path = "/v1/messages?q=\"a\" \\b\nc\td\re\u{1b}[31m\u{7}日本語/é";
+    let request_id = "rid-\"q\"\\z\n\t\u{1b}\u{7}\u{0}日本語é";
+    let line = access_log_line(method, path, 418, 1234.5, request_id);
 
     // 1 行 JSON: 生の改行・制御文字を含まない (すべてエスケープされる)
     assert!(!line.contains('\n'), "生の改行が残っている: {line:?}");
@@ -155,23 +163,25 @@ fn json_access_log_escapes_control_quotes_newlines_and_non_ascii() {
     let v: serde_json::Value = serde_json::from_str(&line).expect("JSON として読めない");
     assert_eq!(v["method"], method);
     assert_eq!(v["path"], path, "パスが往復で一致しない");
+    assert_eq!(v["request_id"], request_id, "request_id が往復で一致しない");
     assert_eq!(v["status"], 418);
     assert!((v["duration_ms"].as_f64().unwrap() - 1234.5).abs() < 1e-9);
     assert!(v["ts_ms"].as_u64().unwrap() > 0);
+    // エスケープされたことが生バイト列でも確認できる (二重引用符とバックスラッシュ)
+    assert!(line.contains("\\\""), "引用符がエスケープされていない: {line}");
+    assert!(line.contains("\\\\"), "バックスラッシュがエスケープされていない: {line}");
 }
 
-/// Request-ID / ヘッダ redaction は未実装なので、アクセスログは固定の 5 フィールド
-/// だけを持つ。Authorization らしき文字列を path に混ぜても「値」に閉じ込められ、
-/// 追加フィールド (request_id / authorization / headers) にはならないこと。
+/// JSON アクセスログは 6 フィールドちょうど (`ts_ms` / `method` / `path` /
+/// `status` / `duration_ms` / `request_id`) を持ち、ヘッダ値が独立したフィールド
+/// (authorization / headers / api_key / cookie) として漏れないこと。
+/// Authorization らしき文字列を path に混ぜても「値」に閉じ込められること。
 #[test]
-fn json_access_log_has_fixed_fields_and_no_request_id_or_header_leak() {
-    let secret = "Authorization: Bearer sk-test-0123456789";
-    let line = access_log_line(
-        "POST",
-        &format!("/v1/messages?x={secret}"),
-        200,
-        0.0,
-    );
+fn json_access_log_has_exact_fields_and_no_header_leak() {
+    let secret = "Authorization: Bearer sk-live-not-a-real-key";
+    let path = format!("/v1/messages?x={secret}");
+    let request_id = "req-abc123";
+    let line = access_log_line("POST", &path, 200, 0.0, request_id);
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
     let obj = v.as_object().expect("JSON オブジェクトでない");
 
@@ -179,15 +189,35 @@ fn json_access_log_has_fixed_fields_and_no_request_id_or_header_leak() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["duration_ms", "method", "path", "status", "ts_ms"],
-        "フィールド集合が変わった (request_id/ヘッダ漏えいの余地): {keys:?}"
+        vec!["duration_ms", "method", "path", "request_id", "status", "ts_ms"],
+        "フィールド集合が変わった (ヘッダ漏えいの余地): {keys:?}"
     );
-    for forbidden in ["request_id", "authorization", "headers", "api_key", "cookie"] {
+    for forbidden in [
+        "authorization",
+        "headers",
+        "api_key",
+        "cookie",
+        "x-request-id",
+        "body",
+    ] {
         assert!(!obj.contains_key(forbidden), "禁止フィールド {forbidden} が存在する");
     }
-    // 秘密らしき文字列は path の値の中だけに現れ、独立した値としては現れない
-    assert_eq!(v["path"], format!("/v1/messages?x={secret}"));
-    assert_eq!(line.matches("sk-test-0123456789").count(), 1);
+    // 秘密らしき文字列は path の値の中だけに現れる
+    assert_eq!(v["path"], path);
+    assert_eq!(v["request_id"], request_id);
+    for (k, val) in obj {
+        if k == "path" {
+            continue;
+        }
+        if let Some(s) = val.as_str() {
+            assert!(!s.contains("Bearer"), "秘密がフィールド {k} に漏れた: {s:?}");
+        }
+    }
+    assert_eq!(
+        line.matches("Bearer").count(),
+        1,
+        "秘密が path 以外にも現れている: {line}"
+    );
 }
 
 // ---------- テキスト (パススルー) ----------
@@ -358,9 +388,13 @@ fn concurrent_access_log_calls_do_not_panic() {
                 for i in 0..200 {
                     denno_server::set_access_log_json(i % 2 == 0 || t % 2 == 0);
                     let _ = denno_server::access_log_json();
-                    let line = access_log_line("GET", &format!("/p/{t}/{i}\n\t\"日本語\""), 200, 0.5);
+                    let path = format!("/p/{t}/{i}\n\t\"日本語\"");
+                    let request_id = format!("rid-{t}-{i}\"q\"");
+                    let line = access_log_line("GET", &path, 200, 0.5, &request_id);
                     let v: serde_json::Value = serde_json::from_str(&line).expect("JSON 不正");
                     assert_eq!(v["method"], "GET");
+                    assert_eq!(v["path"], path);
+                    assert_eq!(v["request_id"], request_id);
                 }
             })
         })
