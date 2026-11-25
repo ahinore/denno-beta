@@ -81,7 +81,7 @@ chat template・KV prefix cache・engine を通る (違うのはワイヤ形式�
 | `stream` | true で SSE |
 | `stream_options.include_usage` | true で最終 usage chunk (choices が空の chunk) を追加 |
 | `tools` / `tool_choice` | P797: OpenAI 形式 (`{"type":"function","function":{name,description,parameters}}`) を受理し、chat template の `tools` 変数へ渡す。`tool_choice` は `auto`/`none`/`required`/`{"type":"function","function":{"name":...}}` (詳細は下の「OpenAI tool calling」) |
-| `response_format` | `{"type":"text"}` (無変換) / `{"type":"json_object"}` (JSON オブジェクトのみ返す指示を system へ追加)。それ以外の type は 400 (`param = response_format.type`) |
+| `response_format` | `{"type":"text"}` (無変換) / `{"type":"json_object"}` (JSON オブジェクトのみ返す指示を system へ追加) / `{"type":"json_schema", ...}` (P837: スキーマ指示。下の「Structured Outputs」)。それ以外の type は 400 (`param = response_format.type`) |
 | その他 | 未知フィールドは無視 (serde 既定) |
 
 応答 (非ストリーミング):
@@ -179,6 +179,116 @@ scheduler の切断スイープで検知し、KV スロットを解放する (�
 
 400 = リクエスト不正 (本文/role/messages)。404 = 未知モデル。503 = キュー溢れ。
 500 = engine 側の失敗。
+
+### Structured Outputs (`response_format: json_schema`, P837)
+
+`response_format` に `json_schema` を渡すと、スキーマを検証したうえで
+**スキーマ本文を system プロンプトへ埋め込んで** モデルに JSON を書かせる。
+
+```json
+{
+  "model": "denno-test",
+  "messages": [{"role": "user", "content": "Tokyo の天気は?"}],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "weather",
+      "description": "weather answer",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}, "temp_c": {"type": "number"}},
+        "required": ["city", "temp_c"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+検証 (失敗は 400、`error.type = invalid_request_error`、
+`error.param` は `response_format.json_schema`):
+
+- `json_schema` はオブジェクト。`name` は必須・非空文字列。`description` は文字列。
+  `strict` は真偽値。`schema` は必須で、JSON オブジェクトまたは真偽値。
+- `schema` は 16 KiB 以内、ネストは 16 段以内。
+- `$ref` は **常に 400** (参照解決の機構を持たず、解決せずに渡すと意味が変わるため)。
+- `type` は `object` / `array` / `string` / `number` / `integer` / `boolean` / `null` の
+  文字列のみ (型の配列形式は非対応)。
+
+`strict: true` の追加制約 (満たさなければ **400**。黙って制約を捨てない):
+
+- `oneOf` / `anyOf` / `allOf` / `not` / `if` / `then` / `else` /
+  `patternProperties` / `$defs` / `definitions` / `prefixItems` /
+  `unevaluatedProperties` / `unevaluatedItems` / `dependentSchemas` は非対応。
+- `type: "object"` かつ `properties` を持つノードは `additionalProperties: false` と、
+  全 property を列挙した `required` を要求する (OpenAI の strict と同じ規則)。
+
+`strict` が false / 未指定なら上記キーワードは **受理して無視する**
+(スキーマ JSON はそのままプロンプトへ渡るが、このサーバーは検査も保証もしない)。
+
+**保証の範囲 (重要)**: この経路は **トークンレベルの拘束デコードを行わない**。
+engine の拘束デコード (`toolmask.rs`) は `<tool_call>` XML スキャフォールド専用で、
+任意の JSON Schema から許容トークン集合を組む機構は無い。したがって
+「スキーマに適合した JSON が必ず出る」ことは保証しない — プロンプト指示と
+リクエスト時のスキーマ検査までを行う。生成結果の再検証 (自動リトライ) もしない。
+`json_object` / `text` の挙動は P797 から不変で、`/v1/messages` には影響しない。
+
+## POST /v1/completions (OpenAI 旧 Completions, P837)
+
+chat template を **通さない** raw prompt の続き生成。IDE の補完 / FIM や
+評価ハーネスのように、役割ラベルを足したくないクライアント向け。
+scheduler・KV prefix cache・サンプラ・usage の数え方は chat 経路と同一で、
+違うのは「プロンプトの組み立て (テンプレート無し)」と「ワイヤ形式」だけ。
+
+| フィールド | 対応 |
+| --- | --- |
+| `model` (任意) | serve 時の `--name`。不一致は 404 |
+| `prompt` (必須) | 文字列 or 1 要素の文字列配列。空文字は 400。2 要素以上 (batch) は 400 (`param = prompt`)、トークン ID 配列は 400 (`param = prompt` / `prompt[0]`) |
+| `max_tokens` / `max_completion_tokens` | `max_tokens` 優先。未指定は 1024、上限 4096 で clamp (chat と同じ) |
+| `temperature` / `top_p` | 対応 (`--temperature-cap` のクランプも同一) |
+| `stop` | 文字列 or 文字列配列 (空文字は無視)。打ち切った stop 列は `text` に含めない |
+| `stream` | true で SSE |
+| `stream_options.include_usage` | true で最終 usage chunk (choices が空) を追加 |
+| `echo` | true なら `text` の先頭にプロンプト自身を付ける (SSE では最初の chunk) |
+| その他 | 未知フィールドは無視 (serde 既定) |
+
+非ストリーミング応答:
+
+```json
+{
+  "id": "cmpl-1a2b3c4d5e6f7a8b9c0d1e2f",
+  "object": "text_completion",
+  "created": 1763900000,
+  "model": "denno-test",
+  "choices": [{
+    "text": " ...",
+    "index": 0,
+    "logprobs": null,
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46}
+}
+```
+
+`finish_reason` は `stop` (`end_turn` / `stop_sequence`) か `length` (`max_tokens`)。
+
+SSE (`stream: true`)。`event:` 行は付けず `data:` 行だけを流し、最後に
+`data: [DONE]` で終わる:
+
+```
+data: {"id":"cmpl-...","object":"text_completion","created":...,"model":"denno-test","choices":[{"text":" ...","index":0,"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"cmpl-...","object":"text_completion",...,"choices":[{"text":"","index":0,"logprobs":null,"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+(usage chunk は `stream_options.include_usage: true` のときだけ、最終 chunk の後ろに
+`choices: []` で入る。`echo: true` のときはプロンプトが最初の chunk の `text` になる。)
+
+エラーは chat 経路と同じ OpenAI 形式。400 = リクエスト不正 (prompt/model 以外の
+型不正を含む)。404 = 未知モデル。503 = キュー溢れ。500 = engine 側の失敗。
 
 ## tool use (tools / tool_choice)
 

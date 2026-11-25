@@ -912,6 +912,31 @@ impl Engine {
             None
         };
 
+        self.build_session(prompt_ids, gen_prompt_start, params, constraint)
+    }
+
+    /// P837: raw prompt 完成 (OpenAI `/v1/completions` 経路)。
+    ///
+    /// chat template を **適用せず**、渡されたテキストをそのままトークン化する
+    /// (役割ラベルを足さない = 生の continuation を生成する)。セッション構築
+    /// (max_tokens のクランプ・サンプラ・stop 列) は chat 経路と同一の
+    /// [`Engine::build_session`] を通す。tools / 拘束デコード / prefix cache の
+    /// base 境界は無し (gen_prompt_start = None)。
+    pub fn begin_completion(&self, prompt: &str, params: &GenParams) -> Result<ChatSession> {
+        let prompt_ids = self.tok.encode(prompt)?;
+        self.build_session(prompt_ids, None, params, None)
+    }
+
+    /// chat / completion 共通のセッション組み立て (トークン化済みプロンプトから
+    /// `ChatSession` を作る。KV には触れない)。P837 で
+    /// [`Engine::begin_chat_with_tools`] から切り出した (経路は同一)。
+    fn build_session(
+        &self,
+        prompt_ids: Vec<u32>,
+        gen_prompt_start: Option<usize>,
+        params: &GenParams,
+        constraint: Option<&crate::toolmask::ToolConstraint>,
+    ) -> Result<ChatSession> {
         let max_tokens = params.max_tokens;
         // Hermes 等のクライアントは context_length から大きな max_tokens (例: 65535) を
         // 送ってくることがある。Anthropic API なら 400 を返す場面だが、このサーバーは
