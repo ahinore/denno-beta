@@ -1,6 +1,7 @@
 //! denno: TensorFold 型の単一バイナリ CLI (pull / models / info / generate / serve)
 
 mod bench;
+mod chat;
 mod flash_telemetry;
 mod pull;
 mod serve_flash;
@@ -87,6 +88,32 @@ enum Commands {
         /// 未指定なら環境変数 `DENNO_AUTO_CONFIG`。
         #[arg(long)]
         vram_budget: Option<String>,
+    },
+    /// task 861: 起動中のサーバーと話す対話 REPL (`/help` で一覧)。
+    Chat {
+        /// ベース URL
+        #[arg(long, default_value = "http://127.0.0.1:8098")]
+        url: String,
+        /// 話す API (anthropic = /v1/messages, openai = /v1/chat/completions)
+        #[arg(long, default_value = "anthropic")]
+        api: String,
+        /// system プロンプト
+        #[arg(long)]
+        system: Option<String>,
+        /// 1 ターンの生成上限
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+        /// モデル ID (未指定なら GET /v1/models の先頭)
+        #[arg(long)]
+        model: Option<String>,
+        /// x-api-key / Bearer で送る API キー (サーバーが要求する場合)
+        #[arg(long)]
+        api_key: Option<String>,
+        /// HTTP 読み取りタイムアウト秒
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
     /// P801: 起動中のサーバーに対する再現可能ベンチ (llama-bench 風 pp/tg)。
     /// プロンプトはサーバーの usage.input_tokens で目標トークン数へ較正する。
@@ -685,6 +712,27 @@ fn main() -> Result<()> {
                     .with_context(|| format!("write {}", path.display()))?;
                 eprintln!("wrote {}", path.display());
             }
+        }
+        Commands::Chat {
+            url,
+            api,
+            system,
+            max_tokens,
+            temperature,
+            model,
+            api_key,
+            timeout,
+        } => {
+            chat::run(chat::ChatOptions {
+                url,
+                api: bench::Api::parse(&api)?,
+                system,
+                max_tokens,
+                temperature,
+                timeout_secs: timeout,
+                model,
+                api_key,
+            })?;
         }
         Commands::ServeFlash {
             dir,
