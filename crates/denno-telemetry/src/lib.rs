@@ -306,6 +306,97 @@ pub enum Frame {
     ExpertSkip { layer: u16, experts: Vec<u16> },
 }
 
+/// ペイロードの境界検査付き読み取りカーソル。
+///
+/// [`Frame::decode`] は信頼できない入力を扱う。index の直参照 (`p[i]`) や
+/// スライス範囲 (`p[i..i+n]`) は切り詰め入力で panic するため、デコード経路の
+/// 読み取りは全てここを通す (必ず `Result` を返し、panic しない)。
+struct Cursor<'a> {
+    p: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(p: &'a [u8]) -> Self {
+        Self { p, i: 0 }
+    }
+
+    fn pos(&self) -> usize {
+        self.i
+    }
+
+    fn len(&self) -> usize {
+        self.p.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.p.len().saturating_sub(self.i)
+    }
+
+    /// `n` バイト読み進める。足りなければ `Err` (確保はしない)。
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .i
+            .checked_add(n)
+            .ok_or_else(|| "length overflow".to_string())?;
+        if end > self.p.len() {
+            return Err(format!(
+                "truncated: need {n} bytes at {} / {}",
+                self.i,
+                self.p.len()
+            ));
+        }
+        let s = &self.p[self.i..end];
+        self.i = end;
+        Ok(s)
+    }
+
+    fn byte(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16le(&mut self) -> Result<u16, String> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        let tail = self
+            .p
+            .get(self.i..)
+            .ok_or_else(|| "cursor out of range".to_string())?;
+        let (v, n) = get_varint_u32(tail)?;
+        self.i += n;
+        Ok(v)
+    }
+
+    fn u64(&mut self) -> Result<u64, String> {
+        let tail = self
+            .p
+            .get(self.i..)
+            .ok_or_else(|| "cursor out of range".to_string())?;
+        let (v, n) = get_varint_u64(tail)?;
+        self.i += n;
+        Ok(v)
+    }
+
+    /// 要素数を読む。1 要素が最低 `min_elem` バイトなので、残りバイト数から
+    /// 上限を決めて**過大な count を先に弾く** (`Vec::with_capacity(huge)` の
+    /// 確保で落ちないため)。`min_elem == 0` は上限無し (呼び出し側の責務)。
+    fn count(&mut self, min_elem: usize) -> Result<usize, String> {
+        let n = self.u32()? as usize;
+        if min_elem > 0 {
+            if n > self.remaining() / min_elem {
+                return Err(format!(
+                    "count {n} が残り {} バイトに対して大きすぎる",
+                    self.remaining()
+                ));
+            }
+        }
+        Ok(n)
+    }
+}
+
 impl Frame {
     pub fn kind(&self) -> u8 {
         match self {
@@ -382,11 +473,15 @@ impl Frame {
                 }
             }
             Frame::KvUsage { busy, t_lens } => {
-                put_varint_u32(&mut b, busy.len() as u32);
-                for &x in busy {
+                // ワイヤ形式は busy の本数だけを書く (t_lens は同じ本数を前提)。
+                // 長さが食い違うフレームでも encode → decode が壊れないよう、
+                // 短い方に合わせて両方を同じ本数だけ書く。
+                let n = busy.len().min(t_lens.len());
+                put_varint_u32(&mut b, n as u32);
+                for &x in &busy[..n] {
                     b.push(x as u8);
                 }
-                for &t in t_lens {
+                for &t in &t_lens[..n] {
                     put_varint_u32(&mut b, t);
                 }
             }
@@ -412,12 +507,16 @@ impl Frame {
                 }
             }
             Frame::LayerAct { layer, idx, val } => {
+                // idx と val は同じ本数 (decode は idx の本数で両方を読む)。
+                // 食い違いは短い方に合わせる (以前は val を全部書いていて、
+                // 長さが違うフレームが decode できなかった)。
+                let n = idx.len().min(val.len());
                 put_varint_u32(&mut b, *layer as u32);
-                put_varint_u32(&mut b, idx.len() as u32);
-                for &i in idx {
+                put_varint_u32(&mut b, n as u32);
+                for &i in &idx[..n] {
                     put_varint_u32(&mut b, i);
                 }
-                for &v in val {
+                for &v in &val[..n] {
                     b.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -441,13 +540,16 @@ impl Frame {
                 put_varint_u32(&mut b, *ssd_reads);
             }
             Frame::RouterTopK { layer, experts, weights } => {
+                // expert と重みは同じ本数 (decode は experts の本数で両方を読む)。
+                // 食い違いは短い方に合わせる。
+                let n = experts.len().min(weights.len());
                 put_varint_u32(&mut b, *layer as u32);
-                put_varint_u32(&mut b, experts.len() as u32);
-                for &e in experts {
+                put_varint_u32(&mut b, n as u32);
+                for &e in &experts[..n] {
                     put_varint_u32(&mut b, e as u32);
                 }
                 // 重みは experts と同じ本数を f16 ビット (2B, LE) で並べる。
-                for &w in weights {
+                for &w in &weights[..n] {
                     b.extend_from_slice(&w.to_le_bytes());
                 }
             }
@@ -463,6 +565,10 @@ impl Frame {
     }
 
     /// WS メッセージ 1 個 (= フレーム 1 個) をデコードする。
+    ///
+    /// 入力は信頼できない (ネットワーク / 壊れたファイル) 前提。切り詰め・
+    /// 過大な count・範囲外の index は全て `Err` を返し、**panic しない**
+    /// (読み取りは [`Cursor`] 経由で境界検査する)。
     pub fn decode(buf: &[u8]) -> Result<Frame, String> {
         if buf.len() < 6 || buf[..4] != MAGIC {
             return Err("bad magic".into());
@@ -471,145 +577,128 @@ impl Frame {
             return Err(format!("unsupported version: {}", buf[4]));
         }
         let k = buf[5];
-        let p = &buf[6..];
-        let mut i = 0usize;
-        let u32v = |p: &[u8], i: &mut usize| -> Result<u32, String> {
-            let (v, n) = get_varint_u32(&p[*i..])?;
-            *i += n;
-            Ok(v)
-        };
-        let u64v = |p: &[u8], i: &mut usize| -> Result<u64, String> {
-            let (v, n) = get_varint_u64(&p[*i..])?;
-            *i += n;
-            Ok(v)
-        };
+        let mut c = Cursor::new(&buf[6..]);
         let f = match k {
             kind::SERVER_INFO => {
-                let n = u32v(p, &mut i)? as usize;
-                let model = String::from_utf8(p[i..i + n].to_vec()).map_err(|e| e.to_string())?;
-                i += n;
-                let nid = u32v(p, &mut i)? as usize;
-                let model_id = String::from_utf8(p[i..i + nid].to_vec()).map_err(|e| e.to_string())?;
-                i += nid;
-                let n2 = u32v(p, &mut i)? as usize;
-                let quant = String::from_utf8(p[i..i + n2].to_vec()).map_err(|e| e.to_string())?;
-                i += n2;
-                let slots = u32v(p, &mut i)?;
-                let context = u32v(p, &mut i)?;
-                let layers = u32v(p, &mut i)?;
+                let n = c.u32()? as usize;
+                let model = String::from_utf8(c.take(n)?.to_vec()).map_err(|e| e.to_string())?;
+                let nid = c.u32()? as usize;
+                let model_id = String::from_utf8(c.take(nid)?.to_vec()).map_err(|e| e.to_string())?;
+                let n2 = c.u32()? as usize;
+                let quant = String::from_utf8(c.take(n2)?.to_vec()).map_err(|e| e.to_string())?;
+                let slots = c.u32()?;
+                let context = c.u32()?;
+                let layers = c.u32()?;
                 Frame::ServerInfo { model, model_id, quant, slots, context, layers }
             }
             kind::SESSION_ADMIT => {
-                let session = u32v(p, &mut i)?;
-                let slot = u32v(p, &mut i)?;
-                let prompt_tokens = u32v(p, &mut i)?;
+                let session = c.u32()?;
+                let slot = c.u32()?;
+                let prompt_tokens = c.u32()?;
                 Frame::SessionAdmit { session, slot, prompt_tokens }
             }
             kind::SESSION_DONE => {
-                let session = u32v(p, &mut i)?;
-                let reason = p[i];
-                i += 1;
-                let output_tokens = u32v(p, &mut i)?;
+                let session = c.u32()?;
+                let reason = c.byte()?;
+                let output_tokens = c.u32()?;
                 Frame::SessionDone { session, reason, output_tokens }
             }
             kind::PREFILL => {
-                let session = u32v(p, &mut i)?;
-                let prompt_tokens = u32v(p, &mut i)?;
-                let ns = u64v(p, &mut i)?;
-                let n = u32v(p, &mut i)? as usize;
+                let session = c.u32()?;
+                let prompt_tokens = c.u32()?;
+                let ns = c.u64()?;
+                // token は varint (最低 1B)
+                let n = c.count(1)?;
                 let mut tokens = Vec::with_capacity(n);
                 for _ in 0..n {
-                    tokens.push(u32v(p, &mut i)?);
+                    tokens.push(c.u32()?);
                 }
                 Frame::Prefill { session, prompt_tokens, ns, tokens }
             }
             kind::TOKEN => {
-                let session = u32v(p, &mut i)?;
-                let token = u32v(p, &mut i)?;
-                let pos = u32v(p, &mut i)?;
+                let session = c.u32()?;
+                let token = c.u32()?;
+                let pos = c.u32()?;
                 Frame::Token { session, token, pos }
             }
             kind::STEP => {
-                let width = u32v(p, &mut i)?;
-                let ns = u64v(p, &mut i)?;
+                let width = c.u32()?;
+                let ns = c.u64()?;
                 Frame::Step { width, ns }
             }
             kind::OP_SUMMARY => {
-                let n = u32v(p, &mut i)? as usize;
+                // 1 要素 = op (1B) + ns varint (最低 1B)
+                let n = c.count(2)?;
                 let mut ops = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let op = p[i];
-                    i += 1;
-                    let ns = u64v(p, &mut i)?;
+                    let op = c.byte()?;
+                    let ns = c.u64()?;
                     ops.push((op, ns));
                 }
                 Frame::OpSummary { ops }
             }
             kind::KV_USAGE => {
-                let n = u32v(p, &mut i)? as usize;
+                // 1 要素 = busy (1B) + t_len varint (最低 1B)
+                let n = c.count(2)?;
                 let mut busy = Vec::with_capacity(n);
                 for _ in 0..n {
-                    busy.push(p[i] != 0);
-                    i += 1;
+                    busy.push(c.byte()? != 0);
                 }
                 let mut t_lens = Vec::with_capacity(n);
                 for _ in 0..n {
-                    t_lens.push(u32v(p, &mut i)?);
+                    t_lens.push(c.u32()?);
                 }
                 Frame::KvUsage { busy, t_lens }
             }
             kind::GAP => {
-                let lost = u32v(p, &mut i)?;
+                let lost = c.u32()?;
                 Frame::Gap { lost }
             }
             kind::TOP_K => {
-                let session = u32v(p, &mut i)?;
-                let chosen = u32v(p, &mut i)?;
-                let entropy_f16 = u16::from_le_bytes([p[i], p[i + 1]]);
-                i += 2;
-                let n = u32v(p, &mut i)? as usize;
+                let session = c.u32()?;
+                let chosen = c.u32()?;
+                let entropy_f16 = c.u16le()?;
+                // 1 要素 = id varint (最低 1B) + 確率 (2B)
+                let n = c.count(3)?;
                 let mut entries = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let id = u32v(p, &mut i)?;
-                    let pb = [p[i], p[i + 1]];
-                    i += 2;
-                    entries.push((id, u16::from_le_bytes(pb)));
+                    let id = c.u32()?;
+                    let p = c.u16le()?;
+                    entries.push((id, p));
                 }
                 Frame::TopK { session, chosen, entropy_f16, entries }
             }
             kind::LAYER_RUN => {
-                let layer = u32v(p, &mut i)? as u16;
-                let n = u32v(p, &mut i)? as usize;
+                let layer = c.u32()? as u16;
+                // 1 要素 = op (1B) + ns varint (最低 1B)
+                let n = c.count(2)?;
                 let mut ops = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let op = p[i];
-                    i += 1;
-                    let ns = u64v(p, &mut i)?;
+                    let op = c.byte()?;
+                    let ns = c.u64()?;
                     ops.push((op, ns));
                 }
                 Frame::LayerRun { layer, ops }
             }
             kind::LAYER_ACT => {
-                let layer = u32v(p, &mut i)? as u16;
-                let n = u32v(p, &mut i)? as usize;
+                let layer = c.u32()? as u16;
+                // 1 要素 = idx varint (最低 1B) + val f16 (2B)
+                let n = c.count(3)?;
                 let mut idx = Vec::with_capacity(n);
                 for _ in 0..n {
-                    idx.push(u32v(p, &mut i)?);
+                    idx.push(c.u32()?);
                 }
                 let mut val = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let vb = [p[i], p[i + 1]];
-                    i += 2;
-                    val.push(u16::from_le_bytes(vb));
+                    val.push(c.u16le()?);
                 }
                 Frame::LayerAct { layer, idx, val }
             }
             kind::ROLE_ACT => {
-                let layer = u32v(p, &mut i)? as u16;
+                let layer = c.u32()? as u16;
                 let mut v = [0u16; 5];
                 for slot in v.iter_mut() {
-                    *slot = u16::from_le_bytes([p[i], p[i + 1]]);
-                    i += 2;
+                    *slot = c.u16le()?;
                 }
                 Frame::RoleAct {
                     layer,
@@ -621,27 +710,32 @@ impl Frame {
                 }
             }
             kind::EXPERT_RESIDENCY => {
-                let layer = u32v(p, &mut i)? as u16;
-                let n = u32v(p, &mut i)? as usize;
+                let layer = c.u32()? as u16;
+                let n = c.count(1)?;
                 let mut in_vram = Vec::with_capacity(n);
                 for _ in 0..n {
-                    in_vram.push(u32v(p, &mut i)? as u16);
+                    let e = c.u32()?;
+                    if e > u16::MAX as u32 {
+                        return Err(format!("expert_residency: expert index {e} が u16 を超える"));
+                    }
+                    in_vram.push(e as u16);
                 }
                 Frame::ExpertResidency { layer, in_vram }
             }
             kind::TIER_STATS => {
-                let vram_used_mb = u32v(p, &mut i)?;
-                let vram_total_mb = u32v(p, &mut i)?;
-                let ram_experts = u32v(p, &mut i)?;
-                let ssd_reads = u32v(p, &mut i)?;
+                let vram_used_mb = c.u32()?;
+                let vram_total_mb = c.u32()?;
+                let ram_experts = c.u32()?;
+                let ssd_reads = c.u32()?;
                 Frame::TierStats { vram_used_mb, vram_total_mb, ram_experts, ssd_reads }
             }
             kind::ROUTER_TOPK => {
-                let layer = u32v(p, &mut i)? as u16;
-                let n = u32v(p, &mut i)? as usize;
+                let layer = c.u32()? as u16;
+                // 1 要素 = expert varint (最低 1B) + 重み (2B)
+                let n = c.count(3)?;
                 let mut experts = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let e = u32v(p, &mut i)?;
+                    let e = c.u32()?;
                     if e > u16::MAX as u32 {
                         return Err(format!("router_topk: expert index {e} が u16 を超える"));
                     }
@@ -649,25 +743,20 @@ impl Frame {
                 }
                 let mut weights = Vec::with_capacity(n);
                 for _ in 0..n {
-                    // 途中で切れたペイロードで panic しない (index の範囲を先に見る)。
-                    if i + 2 > p.len() {
-                        return Err(format!(
-                            "router_topk: weights が途中で切れている ({i}/{})",
-                            p.len()
-                        ));
-                    }
-                    let wb = [p[i], p[i + 1]];
-                    i += 2;
-                    weights.push(u16::from_le_bytes(wb));
+                    // 途中で切れたペイロードで panic しない (境界は Cursor が見る)。
+                    let w = c
+                        .u16le()
+                        .map_err(|e| format!("router_topk: weights が途中で切れている ({e})"))?;
+                    weights.push(w);
                 }
                 Frame::RouterTopK { layer, experts, weights }
             }
             kind::EXPERT_SKIP => {
-                let layer = u32v(p, &mut i)? as u16;
-                let n = u32v(p, &mut i)? as usize;
+                let layer = c.u32()? as u16;
+                let n = c.count(1)?;
                 let mut experts = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let e = u32v(p, &mut i)?;
+                    let e = c.u32()?;
                     if e > u16::MAX as u32 {
                         return Err(format!("expert_skip: expert index {e} が u16 を超える"));
                     }
@@ -677,8 +766,8 @@ impl Frame {
             }
             other => return Err(format!("unknown kind: {other}")),
         };
-        if i != p.len() {
-            return Err(format!("trailing bytes: {} / {}", i, p.len()));
+        if c.pos() != c.len() {
+            return Err(format!("trailing bytes: {} / {}", c.pos(), c.len()));
         }
         Ok(f)
     }
@@ -973,10 +1062,11 @@ pub fn rms(x: &[f32]) -> f32 {
 ///
 /// - 最大が 0 (全部 0 / 負) なら 5 値とも 0
 /// - 戻り値は 0..1 に収まる (最大の役割がちょうど 1.0)
+/// - NaN / Inf は「値なし」として 0 に落とす (0/0 や NaN をビューアに流さない)
 pub fn normalize_roles(roles: [f32; 5]) -> [f32; 5] {
     let mut max = 0.0f32;
     for v in roles {
-        if v > max {
+        if v.is_finite() && v > max {
             max = v;
         }
     }
@@ -985,7 +1075,11 @@ pub fn normalize_roles(roles: [f32; 5]) -> [f32; 5] {
     }
     let mut out = [0.0f32; 5];
     for (o, v) in out.iter_mut().zip(roles) {
-        *o = (v / max).clamp(0.0, 1.0);
+        *o = if v.is_finite() {
+            (v / max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
     }
     out
 }
@@ -1095,6 +1189,11 @@ pub fn layer_act_frame(layer: u16, x: &[f32], k: usize, scratch: &mut Vec<(f32, 
     if k > 0 {
         scratch.reserve(x.len());
         for (i, &v) in x.iter().enumerate() {
+            // NaN / Inf は活性として送らない (f16 にすると NaN ビットになり、
+            // 正規化も Inf/Inf = NaN になる)。
+            if !v.is_finite() {
+                continue;
+            }
             let a = v.abs();
             if a > max {
                 max = a;
@@ -1160,6 +1259,158 @@ pub fn expert_skip_frame(layer: u16, skipped: &[usize]) -> Option<Frame> {
         .map(|&e| e.min(u16::MAX as usize) as u16)
         .collect();
     Some(Frame::ExpertSkip { layer, experts })
+}
+
+// ---------- 層単位のローリング統計 (task 914) ----------
+
+/// 1 層ぶんの窓内統計。窓が空 (`count == 0`) のとき min/max/mean は 0。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LayerWindowStats {
+    /// 窓に入っているサンプル数 (≤ 窓長)
+    pub count: usize,
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+}
+
+#[derive(Debug, Clone)]
+struct LayerSlot {
+    /// リングバッファ。長さは窓長で固定。
+    buf: Vec<f32>,
+    /// 次に書く位置。
+    next: usize,
+    /// 有効なサンプル数 (≤ buf.len())。
+    filled: usize,
+    /// 非有限値として捨てた回数。
+    rejected: u64,
+}
+
+impl LayerSlot {
+    fn new(window: usize) -> Self {
+        Self { buf: vec![0.0; window], next: 0, filled: 0, rejected: 0 }
+    }
+
+    fn push(&mut self, v: f32) {
+        self.buf[self.next] = v;
+        self.next = (self.next + 1) % self.buf.len();
+        if self.filled < self.buf.len() {
+            self.filled += 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.next = 0;
+        self.filled = 0;
+    }
+}
+
+/// 層ごとの直近 `window` サンプルの count / min / max / mean を保つ。
+///
+/// - メモリは構築時に `n_layers * window` 個の f32 で**固定**。push しても
+///   増えない (層数も窓長も後から変わらないので unbounded にならない)。
+/// - NaN / ±Inf は記録せず、その層の [`RollingLayerStats::rejected`] を増やす。
+/// - 範囲外の層 index は `push` が `false`、`stats` が `None`。
+/// - `mean` は f64 で合計して f32 に落とす (長時間の f32 累積誤差を避ける)。
+#[derive(Debug, Clone)]
+pub struct RollingLayerStats {
+    n_layers: usize,
+    window: usize,
+    slots: Vec<LayerSlot>,
+}
+
+impl RollingLayerStats {
+    /// 層数 `n_layers`、窓長 `window` で作る。`window == 0` は 1 に切り上げる。
+    pub fn new(n_layers: usize, window: usize) -> Self {
+        let window = window.max(1);
+        Self {
+            n_layers,
+            window,
+            slots: (0..n_layers).map(|_| LayerSlot::new(window)).collect(),
+        }
+    }
+
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// サンプルを 1 個足す。層が範囲外、または値が非有限なら記録せず `false`。
+    pub fn push(&mut self, layer: u16, v: f32) -> bool {
+        let Some(slot) = self.slots.get_mut(layer as usize) else {
+            return false;
+        };
+        if !v.is_finite() {
+            slot.rejected = slot.rejected.saturating_add(1);
+            return false;
+        }
+        slot.push(v);
+        true
+    }
+
+    /// 複数サンプルを足し、受け付けた個数を返す (非有限は捨てる)。
+    pub fn push_slice(&mut self, layer: u16, values: &[f32]) -> usize {
+        values.iter().filter(|&&v| self.push(layer, v)).count()
+    }
+
+    /// 窓内統計。層が範囲外なら `None`。空の窓は count 0 / min=max=mean=0。
+    pub fn stats(&self, layer: u16) -> Option<LayerWindowStats> {
+        let slot = self.slots.get(layer as usize)?;
+        if slot.filled == 0 {
+            return Some(LayerWindowStats::default());
+        }
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        for &v in &slot.buf[..slot.filled] {
+            min = min.min(v);
+            max = max.max(v);
+            sum += v as f64;
+        }
+        Some(LayerWindowStats {
+            count: slot.filled,
+            min,
+            max,
+            mean: (sum / slot.filled as f64) as f32,
+        })
+    }
+
+    /// その層で非有限値として捨てた回数。層が範囲外なら `None`。
+    pub fn rejected(&self, layer: u16) -> Option<u64> {
+        self.slots.get(layer as usize).map(|s| s.rejected)
+    }
+
+    /// 全層の非有限棄却回数の合計。
+    pub fn rejected_total(&self) -> u64 {
+        self.slots.iter().map(|s| s.rejected).sum()
+    }
+
+    /// 1 層だけ空にする (拒否カウンタも戻す)。層が範囲外なら `false`。
+    pub fn reset_layer(&mut self, layer: u16) -> bool {
+        match self.slots.get_mut(layer as usize) {
+            Some(slot) => {
+                slot.clear();
+                slot.rejected = 0;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 全層を空にする。
+    pub fn reset(&mut self) {
+        for slot in &mut self.slots {
+            slot.clear();
+            slot.rejected = 0;
+        }
+    }
+
+    /// 保持しているサンプル数の合計 (メモリ上限の確認用)。
+    pub fn total_samples(&self) -> usize {
+        self.slots.iter().map(|s| s.filled).sum()
+    }
 }
 
 /// 消費側: 1 フレームを受信 (タイムアウト付き)。サーバーの WS 転送タスクが使う。
@@ -1248,6 +1499,9 @@ pub fn topk_softmax(logits: &[f32], k: usize) -> TopK {
         t += e * (l - max);
     }
     let entropy = (s.ln() - t / s).max(0.0);
+    // 非有限 logits (NaN / ±Inf) が混じると s / t が NaN になり得る。
+    // テレメトリは「読める値」だけを出すので、非有限は 0 に落とす。
+    let entropy = if entropy.is_finite() { entropy } else { 0.0 };
     // top-k 選択 (logit 降順、同点は id 昇順)。
     // 全ソートは語彙全体 (約 25 万) の間接比較になり、毎トークンで数 ms かかる。
     // 上位 k 件を保つだけの 1 パス走査にすると比較関数が同じなので結果は全ソートと同一。
@@ -1279,7 +1533,11 @@ pub fn topk_softmax(logits: &[f32], k: usize) -> TopK {
     }
     let entries = best
         .into_iter()
-        .map(|(i, l)| (i, ((l - max).exp() / s).max(0.0)))
+        .map(|(i, l)| {
+            let p = (l - max).exp() / s;
+            // NaN / Inf の確率は送らない (ビューアの棒グラフが壊れる)。
+            (i, if p.is_finite() { p.max(0.0) } else { 0.0 })
+        })
         .collect();
     TopK { chosen: 0, entropy, entries }
 }
