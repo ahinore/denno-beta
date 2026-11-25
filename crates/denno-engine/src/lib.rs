@@ -19,6 +19,7 @@ pub mod ple;
 pub mod prefix_cache;
 pub mod prof;
 pub mod quant;
+pub mod quant_matrix;
 pub mod sampler;
 pub mod spec_ngram;
 pub mod tensor;

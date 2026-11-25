@@ -638,12 +638,14 @@ pub(crate) fn gemv_batch_inner(
 ) -> Result<()> {
     let (k, n) = (w.k(), w.n());
     match w.ty() {
-        GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => {
+        // task 858: GPU GEMM を試す型は [`crate::quant_matrix::DENSE_GPU`] が唯一の
+        // 定義 (decode の GEMV と同じ 4 型)。表とここがずれると、GPU を試みて必ず
+        // 落ちる (= 静かに CPU へ戻る) か、逆に回せない型を投げることになる。
+        // `DENNO_GPU_GEMM=0` で切れる。false なら CPU バッチへ落ちる。
+        // cfg は `gpu_gemm_into` 側に閉じている (`cuda` feature 無しでは常に false)。
+        ty if crate::quant_matrix::dense_gpu_supported(ty) => {
             // P-PF-GB: prefill のバッチ投影は GPU GEMM を先に試す。
             // 数値契約は prefill のみ解除済み (FMA 融合 + 加算順が違う)。
-            // `DENNO_GPU_GEMM=0` で切れる。false なら CPU バッチへ落ちる。
-            // P39: cfg は `gpu_gemm_into` 側に閉じている (`cuda` feature 無しでは
-            // 常に false を返す) ので、ここに cfg は要らない。
             if !cpu_only && gpu_gemm_into(w, xs, nt, outs) {
                 #[cfg(test)]
                 GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

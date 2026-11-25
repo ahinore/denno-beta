@@ -4010,6 +4010,51 @@ pub(crate) mod tests {
                         la[lane] = acc;
                     }
                 }
+                // task 858: Q5_K の v3 カーネル (kernels_moe_v3.cu の
+                // dno_gemv_q5k_v3) を写した腕。ミラーから抜けていたため、
+                // Q5_K だけ「型ごとの数値パリティ」が無かった。
+                // Q5_K に fp16 カーネルは無い (`gemv_fp16_ty_ok` が false)。
+                T::Q5K => {
+                    assert!(!fp16, "Q5_K の fp16 カーネルは無い");
+                    let seg = n_in / lanes;
+                    for lane in 0..lanes {
+                        let mut acc = 0f32;
+                        let lo = lane * seg;
+                        let hi = lo + seg;
+                        let b0 = lo >> 8;
+                        let b1 = (hi - 1) >> 8;
+                        for b in b0..=b1 {
+                            let bstart = b << 8;
+                            let blk = &rowp[b * 176..b * 176 + 176];
+                            let d_bits = u16::from(blk[0]) | (u16::from(blk[1]) << 8);
+                            let dmin_bits = u16::from(blk[2]) | (u16::from(blk[3]) << 8);
+                            let s0 = if lo > bstart { (lo - bstart) >> 5 } else { 0 };
+                            let s1 = if hi < bstart + 256 {
+                                (hi - bstart + 31) >> 5
+                            } else {
+                                8
+                            };
+                            for s in s0..s1 {
+                                let e = s << 5;
+                                let qoff = 48 + ((e >> 6) << 5);
+                                let sh = if e & 32 != 0 { 4u32 } else { 0u32 };
+                                let (sc, mn) = mirror_scale_min_k4(s, &blk[4..]);
+                                let mut xv = [0f32; 32];
+                                xv.copy_from_slice(&x[bstart + e..bstart + e + 32]);
+                                let ds32 = fp16_bits_to_f32(d_bits) * sc as f32;
+                                let ms32 = fp16_bits_to_f32(dmin_bits) * mn as f32;
+                                for l in 0..32 {
+                                    let hi_bit = ((u32::from(blk[16 + l]) >> s) & 1) << 4;
+                                    let v =
+                                        ((u32::from(blk[qoff + l]) >> sh) & 0x0f) + hi_bit;
+                                    let yv = ds32 * v as f32 - ms32;
+                                    acc += yv * xv[l];
+                                }
+                            }
+                        }
+                        la[lane] = acc;
+                    }
+                }
                 _ => unreachable!("fp16 / v3 ミラーの対象外の型 {ty:?}"),
             }
             // moe_fp16_reduce / moe_v3_reduce と同じ (offset 1 → lanes==4 なら offset 2)
@@ -4101,6 +4146,95 @@ pub(crate) mod tests {
             );
         }
     }
+
+    /// task 858: GPU decode GEMV の 4 型すべてで、カーネルの演算列ミラー (v3 =
+    /// レーン分割 + レーン間 reduce) が **f64 の真値** に対して数値方針
+    /// (絶対 1e-4 + 相対 1e-5) に入ることと、CPU の逐次参照との余弦が
+    /// 1 に十分近いことを固定する。
+    ///
+    /// 実機の `cuda_moe_gemv_v2_bit_exact_vs_cpu` (GPU 必須・#[ignore]) は
+    /// v2 カーネルのビット一致を見る。こちらは GPU 無しで回る側: 型ごとの
+    /// デコード (索引) とレーン分割の丸めが、型を足した / 変えたときに
+    /// 崩れていないことを見る。重みのスケールは f16 の 1/16 (0x2C00) にして
+    /// 和の大きさを抑え、丸めの上限で落ちないようにする (d の値そのものは
+    /// デコードの一般性に影響しない)。
+    #[test]
+    fn dense_quant_gemv_mirror_within_numeric_policy() {
+        use crate::kquant::GgmlType as T;
+        let cos = |a: &[f32], b: &[f32]| -> f64 {
+            let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for (x, y) in a.iter().zip(b.iter()) {
+                d += f64::from(*x) * f64::from(*y);
+                na += f64::from(*x) * f64::from(*x);
+                nb += f64::from(*y) * f64::from(*y);
+            }
+            d / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE)
+        };
+        for ty in crate::quant_matrix::DENSE_GPU {
+            let (n_in, n_out) = (512usize, 13usize);
+            let rb = gguf_row_bytes(*ty, n_in).expect("row_bytes");
+            let blk = ty.blck_size();
+            let mut w = vec![0u8; rb * n_out];
+            let mut s = 987654321u32;
+            for r in 0..n_out {
+                let row = &mut w[r * rb..(r + 1) * rb];
+                for b in 0..(n_in / blk) {
+                    let base = b * ty.type_size();
+                    // d (と Q4_K/Q5_K の dmin, Q5_1 の m) = f16 の 1/16
+                    row[base] = 0x00;
+                    row[base + 1] = 0x2c;
+                    if ty.type_size() >= 4 && !matches!(ty, T::Q8_0) {
+                        row[base + 2] = 0x00;
+                        row[base + 3] = 0x2c;
+                    }
+                    for i in 4..ty.type_size() {
+                        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        row[base + i] = (s >> 16) as u8;
+                    }
+                }
+            }
+            let x = pseudo_random(n_in, 11);
+            let mut cpu = vec![0f32; n_out];
+            crate::model::moe_expert::expert_gemv_scalar(*ty, &w, n_in, n_out, &x, &mut cpu)
+                .expect("cpu 参照");
+            // f64 の真値 (デコードは CPU 参照と同じ f32 値、和だけ f64)。
+            let mut truth = vec![0f64; n_out];
+            let mut rowf = vec![0f32; n_in];
+            for r in 0..n_out {
+                crate::kquant::dequant_row_into(*ty, &w[r * rb..(r + 1) * rb], &mut rowf);
+                let mut acc = 0f64;
+                for i in 0..n_in {
+                    acc += f64::from(rowf[i]) * f64::from(x[i]);
+                }
+                truth[r] = acc;
+            }
+            let got = mirror_gemv(*ty, &w, n_in, n_out, &x, false);
+            let mut worst = 0f64;
+            for r in 0..n_out {
+                let tol = 1e-4 + 1e-5 * truth[r].abs();
+                let d = (f64::from(got[r]) - truth[r]).abs();
+                if d > tol {
+                    eprintln!(
+                        "[quant-matrix] {ty:?} r={r} got={} truth={} abs={d:e} tol={tol:e}",
+                        got[r], truth[r]
+                    );
+                }
+                assert!(
+                    d <= tol,
+                    "{ty:?} r={r}: ミラーと真値の差 {d:e} が方針 {tol:e} を超えた"
+                );
+                worst = worst.max(d);
+            }
+            let c = cos(&got, &cpu);
+            println!(
+                "[quant-matrix] {ty:?} k={n_in} n={n_out}: max|mirror-truth|={worst:e} \
+                 max|truth|={:e} cos(mirror,cpu)={c:.15}",
+                truth.iter().fold(0f64, |m, v| m.max(v.abs()))
+            );
+            assert!(c > 1.0 - 1e-12, "{ty:?}: 余弦 {c:.15} が 1 から離れすぎ");
+        }
+    }
+
 
     /// task 108: `DENNO_GEMV_FP16` の真理値表と fp16 対応型 (GPU 無しで回る)。
     #[test]

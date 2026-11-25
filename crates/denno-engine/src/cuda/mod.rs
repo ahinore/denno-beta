@@ -56,7 +56,7 @@ mod gemm;
 pub(crate) mod h2d;
 mod mix;
 mod moe_dec;
-mod moe_pf;
+pub(crate) mod moe_pf;
 mod pf_chain;
 #[cfg(test)] mod tests;
 
@@ -6106,10 +6106,15 @@ pub(crate) struct GgufWRef {
 }
 
 
-/// GGUF ブロック 1 行のバイト数。expert GEMV が扱う 4 型だけ `Some`。
+/// GGUF ブロック 1 行のバイト数。GPU の GEMV / GEMM が扱う 4 型だけ `Some`。
+///
+/// 型の一覧は [`crate::quant_matrix::DENSE_GPU`] が唯一の定義 (task 858)。
+/// decode の GEMV・prefill の GEMM・expert の VRAM 常駐が**共通で** ここを通るので、
+/// 表とここがずれると「GPU を試みて必ず落ちる」経路になる
+/// (`quant_matrix::tests::dense_gpu_table_matches_cuda_dispatch` が固定する)。
 pub(crate) fn gguf_row_bytes(ty: crate::kquant::GgmlType, k: usize) -> Option<usize> {
     use crate::kquant::GgmlType as T;
-    if k == 0 || k % ty.blck_size() != 0 {
+    if k == 0 || k % ty.blck_size() != 0 || !crate::quant_matrix::dense_gpu_supported(ty) {
         return None;
     }
     Some(match ty {
