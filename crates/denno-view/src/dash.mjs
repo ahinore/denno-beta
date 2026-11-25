@@ -302,6 +302,151 @@ export function latencyRow(d, opts = {}) {
   };
 }
 
+/// ---- task 969: レイテンシの分位点 / フィルタ / メトリクスの書き出し ------
+
+/// 見る分位点 (パーセント)。画面のバッジも書き出しもこの並びを使う。
+export const PERCENTILES = Object.freeze([50, 95, 99]);
+
+/// 書き出す行の列。CSV のヘッダでもある。
+export const EXPORT_COLUMNS = Object.freeze(['metric', 'value', 'samples', 'session', 'model']);
+
+/// フィルタに使うキー。指定が空なら「全部」。
+export const FILTER_KEYS = Object.freeze(['session', 'model']);
+
+/// 線形補間 (R-7 / numpy 既定) の分位点。p は 0..100 に丸める。
+/// 非有限値は落とし、1 本も残らなければ null。並べ替えはコピーで行う。
+export function percentile(values, p) {
+  const vals = (Array.isArray(values) ? values : []).filter((v) => Number.isFinite(v));
+  if (!vals.length) return null;
+  const q = Number(p);
+  if (!Number.isFinite(q)) return null;
+  const clamped = q < 0 ? 0 : q > 100 ? 100 : q;
+  const sorted = vals.slice().sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0];
+  const h = (sorted.length - 1) * clamped / 100;
+  const lo = Math.floor(h);
+  const hi = Math.ceil(h);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (h - lo);
+}
+
+/// 値の配列 → p50 / p95 / p99 (+ 件数 / 最小 / 最大)。空は全部 null。
+export function latencyPercentiles(values) {
+  const vals = (Array.isArray(values) ? values : []).filter((v) => Number.isFinite(v));
+  const out = { p50: null, p95: null, p99: null, count: vals.length, min: null, max: null };
+  if (!vals.length) return out;
+  out.p50 = percentile(vals, 50);
+  out.p95 = percentile(vals, 95);
+  out.p99 = percentile(vals, 99);
+  out.min = Math.min(...vals);
+  out.max = Math.max(...vals);
+  return out;
+}
+
+/// 画面の Latency Summary バッジ。数字はここで作り、画面は text を書くだけ。
+export function latencySummary(d, opts = {}) {
+  const ring = d && d.latencyRing;
+  const values = ring && Array.isArray(ring.values) ? ring.values : [];
+  const p = latencyPercentiles(values);
+  const ms = (v) => (v === null ? '-' : fmtRate(v) + (opts.unit === false ? '' : ' ms'));
+  return {
+    p50: p.p50,
+    p95: p.p95,
+    p99: p.p99,
+    count: p.count,
+    text: PERCENTILES.map((q) => 'p' + q + ' ' + ms(p['p' + q])).join(' · '),
+  };
+}
+
+/// 1 項目がフィルタに合うか。filter は { session, model } の完全一致 (AND)。
+/// 空文字・null・未指定の条件は「全部」。項目側に値が無ければ落とす。
+export function matchesFilter(item, filter = {}) {
+  if (!item || typeof item !== 'object') return false;
+  const f = filter && typeof filter === 'object' ? filter : {};
+  for (const key of FILTER_KEYS) {
+    const want = f[key] == null ? '' : String(f[key]).trim();
+    if (!want) continue;
+    const have = item[key] == null ? '' : String(item[key]).trim();
+    if (have !== want) return false;
+  }
+  return true;
+}
+
+/// 配列をフィルタで絞る。配列でなければ空。
+export function filterItems(items, filter = {}) {
+  if (!Array.isArray(items)) return [];
+  return items.filter((it) => matchesFilter(it, filter));
+}
+
+const r3 = (x) => Math.round(x * 1000) / 1000;
+
+/// ダッシュボードの現在値を書き出し用の行にする。
+/// meta の session / model は各行に載せる (フィルタはこの 2 列で見る)。
+export function metricsRows(d, meta = {}) {
+  const src = d || createDash();
+  const m = meta && typeof meta === 'object' ? meta : {};
+  const session = m.session == null ? '' : String(m.session);
+  const model = m.model == null ? '' : String(m.model);
+  const rows = [];
+  for (const key of SERIES_KEYS) {
+    const values = src.series[key] || [];
+    const last = values.length ? values[values.length - 1] : null;
+    rows.push({
+      metric: key,
+      value: Number.isFinite(last) ? r3(last) : null,
+      samples: values.length,
+      session,
+      model,
+    });
+  }
+  const ring = src.latencyRing;
+  const p = latencyPercentiles(ring && Array.isArray(ring.values) ? ring.values : []);
+  for (const q of PERCENTILES) {
+    const v = p['p' + q];
+    rows.push({
+      metric: 'latency_p' + q,
+      value: v === null ? null : r3(v),
+      samples: p.count,
+      session,
+      model,
+    });
+  }
+  return rows;
+}
+
+/// CSV の 1 セル。null/未定義は空、非有限数も空、区切り・引用・改行を含む
+/// 文字列は "..." で包み、内側の " は "" にする。
+export function csvCell(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : '';
+  const s = String(v);
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+/// 行の配列 → CSV (ヘッダ 1 行 + 改行は \n)。列は差し替えられる。
+export function toCsv(rows, columns = EXPORT_COLUMNS) {
+  const cols = Array.isArray(columns) && columns.length ? columns : EXPORT_COLUMNS;
+  const lines = [cols.join(',')];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    lines.push(cols.map((c) => csvCell(row ? row[c] : null)).join(','));
+  }
+  return lines.join('\n');
+}
+
+/// opts: { session, model, filter, columns }。filter は session / model で絞る。
+export function metricsCsv(d, opts = {}) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const rows = filterItems(metricsRows(d, o), o.filter);
+  return toCsv(rows, o.columns);
+}
+
+/// 同じ行を JSON で返す (schema + metrics)。
+export function metricsJson(d, opts = {}) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const rows = filterItems(metricsRows(d, o), o.filter);
+  return JSON.stringify({ schema: DASH_SCHEMA, metrics: rows }, null, 2);
+}
+
 /// KV / VRAM の利用量を「詰まった棒 + 割合」の 1 行にする。
 /// used/total が壊れている (null, total<=0, used<0) ときは空の棒と '-'。
 export function gaugeBar(used, total, opts = {}) {

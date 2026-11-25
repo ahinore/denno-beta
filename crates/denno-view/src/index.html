@@ -67,6 +67,16 @@
   #util svg.lspark { display: block; width: 100%; height: 20px; margin-top: 2px; }
   #util svg.lspark path { fill: none; stroke: var(--warm); stroke-width: 1.2;
                           stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  /* ---- 左: Latency Summary / フィルタ / 書き出し (task 969) ---- */
+  #util .latbadge { font-size: 10px; color: var(--acc); margin-top: 3px; }
+  #util .flt { display: flex; gap: 4px; margin-top: 5px; }
+  #util .flt input { flex: 1; min-width: 0; font: inherit; font-size: 10px; padding: 1px 4px;
+                     background: var(--panel2); color: var(--fg);
+                     border: 1px solid var(--line); border-radius: 3px; }
+  #util .exp { display: flex; gap: 5px; margin-top: 4px; }
+  #util .exp button { font: inherit; font-size: 10px; padding: 1px 7px; cursor: pointer;
+                      background: #0f3a4d; color: #9fefff; border: 1px solid #2f8aa8;
+                      border-radius: 3px; }
   #apis .ep { display: flex; align-items: center; gap: 5px; margin-bottom: 4px; }
   #apis .epname { width: 74px; color: var(--mut); font-size: 10px; flex: none; }
   #apis code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -247,6 +257,15 @@
       <div class="urow"><span class="ulabel">VRAM</span><span class="ubar vram" id="util-vram">-</span></div>
       <div class="urow"><span class="ulabel">latency</span><span class="uval" id="util-lat">-</span></div>
       <svg class="lspark" id="lat-spark" viewBox="0 0 220 20" preserveAspectRatio="none"><path id="lat-spark-p" d=""/></svg>
+      <div class="latbadge" id="lat-summary">p50 - · p95 - · p99 -</div>
+      <div class="flt">
+        <input id="flt-session" type="text" placeholder="session" autocomplete="off">
+        <input id="flt-model" type="text" placeholder="model" autocomplete="off">
+      </div>
+      <div class="exp">
+        <button id="export-json" type="button">Export JSON</button>
+        <button id="export-csv" type="button">Export CSV</button>
+      </div>
     </div>
     <h2 style="margin-top:10px">API endpoints</h2>
     <div id="apis">
@@ -1314,12 +1333,14 @@ connect();
 import {
   createDash, noteFrame, step, dashRows, apiEndpoints, curlFor,
   kvGauge, vramGauge, latencyRow, quickNav,
+  latencySummary, metricsCsv, metricsJson,
 } from "/dash.mjs";
 
 const SPARK = { w: 220, h: 34, pad: 2 };
 const LAT = { w: 220, h: 20, pad: 2 };
 const dash = createDash();
 let model = "denno";
+let session = "";
 const origin = location.origin;
 function el(id) { return document.getElementById(id); }
 
@@ -1335,6 +1356,7 @@ function renderEndpoints() {
 window.__dashAttach((f, t) => {
   if (f.kind === "ServerInfo") {
     model = f.model_id || f.model || model;
+    session = f.session_id || f.session || session;
     renderEndpoints();
     return;
   }
@@ -1369,6 +1391,10 @@ function draw() {
   if (late) late.textContent = lat.text;
   const latp = el("lat-spark-p");
   if (latp) latp.setAttribute("d", lat.path);
+  // task 969: p50 / p95 / p99 のバッジ (数字は dash.mjs が作る)。
+  const sum = latencySummary(dash);
+  const sume = el("lat-summary");
+  if (sume) sume.textContent = sum.text;
 }
 setInterval(() => { step(dash, performance.now()); draw(); }, 250);
 draw();
@@ -1418,6 +1444,45 @@ for (const b of document.querySelectorAll("#apis .cpy")) {
       copyText(n ? n.textContent : "");
     }
   });
+}
+
+// task 969: 現在のメトリクスを JSON / CSV で落とす (外部 CDN 無し、Blob だけ)。
+// フィルタの欄は session / model の完全一致で書き出す行を絞る (空なら全部)。
+function exportFilter() {
+  const s = el("flt-session");
+  const m = el("flt-model");
+  return {
+    session: s ? s.value.trim() : "",
+    model: m ? m.value.trim() : "",
+  };
+}
+
+function downloadText(name, text, mime) {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function exportMetrics(kind) {
+  const filter = exportFilter();
+  const opts = { session: session || filter.session, model: model || filter.model, filter };
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  if (kind === "json") {
+    downloadText("denno-metrics-" + stamp + ".json", metricsJson(dash, opts), "application/json");
+  } else {
+    downloadText("denno-metrics-" + stamp + ".csv", metricsCsv(dash, opts), "text/csv");
+  }
+}
+
+for (const [id, kind] of [["export-json", "json"], ["export-csv", "csv"]]) {
+  const b = el(id);
+  if (b) b.addEventListener("click", () => exportMetrics(kind));
 }
 </script>
 </body>
