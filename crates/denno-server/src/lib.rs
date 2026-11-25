@@ -28,6 +28,9 @@ pub mod metrics;
 /// P837: OpenAI Structured Outputs のスキーマ検証 (`response_format: json_schema`)。
 pub mod json_schema;
 mod openai;
+
+/// task 931: 任意オプトインのレート制限 (env 未設定なら無効)。
+pub mod ratelimit;
 // P841: Ollama 互換 facade (`/api/tags` / `/api/version` / `/api/chat` / `/api/generate`)
 mod ollama;
 mod scheduler;
@@ -967,8 +970,25 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// task 916: CORS 設定を明示してルーターを組む。
+///
+/// task 931: レート制限は env (`DENNO_RATE_LIMIT_RPM` / `DENNO_RATE_LIMIT_BURST`)
+/// から解決する。明示的に差し替えたいときは [`router_with_rate_limit`] を使う。
 pub fn router_with_cors(state: Arc<AppState>, cors: CorsConfig) -> Router {
+    router_with_rate_limit(state, cors, ratelimit::RateLimiter::from_env())
+}
+
+/// task 931: レート制限器を明示してルーターを組む。
+///
+/// 層の順序は外側から `log_requests` → レート制限 → CORS → ルート。429 も
+/// CORS ヘッダと `x-request-id` を伴って返る (プリフライトは CORS 層が先に
+/// 204 を返すのでトークンを消費しない)。
+pub fn router_with_rate_limit(
+    state: Arc<AppState>,
+    cors: CorsConfig,
+    limiter: ratelimit::RateLimiter,
+) -> Router {
     let cors = Arc::new(cors);
+    let limiter = Arc::new(limiter);
     Router::new()
         .route("/health", get(health))
         // P877: Prometheus のスクレイプ先 (認証は /health と同じく不要)。
@@ -1004,6 +1024,12 @@ pub fn router_with_cors(state: Arc<AppState>, cors: CorsConfig) -> Router {
         // 下の log_requests / CORS の層がこの 2 つにも掛かる。
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        // task 931: レート制限。CORS 層より内側 (コード上は先) に置くことで、
+        // 429 にも Allow-Origin などの CORS ヘッダが付く。
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let limiter = limiter.clone();
+            async move { rate_limit_middleware(limiter, req, next).await }
+        }))
         .layer(axum::middleware::from_fn(move |req, next| {
             let cors = cors.clone();
             async move { cors_middleware(cors, req, next).await }
@@ -1247,6 +1273,23 @@ fn openai_error_response(status: StatusCode, code: &str, message: String) -> Res
     (status, Json(body)).into_response()
 }
 
+
+/// task 931: 推論エンドポイントのレート制限層。
+///
+/// 無効時 (既定) は何もせず素通しする。有効時も /health / /ready / /metrics と
+/// 推論以外のパス、OPTIONS (プリフライト) は消費しない。
+async fn rate_limit_middleware(
+    limiter: Arc<ratelimit::RateLimiter>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if limiter.is_enabled() && req.method() != axum::http::Method::OPTIONS {
+        if let ratelimit::Decision::Deny { retry_after_secs } = limiter.check(req.uri().path()) {
+            return ratelimit::too_many_requests_response(retry_after_secs);
+        }
+    }
+    next.run(req).await
+}
 
 async fn log_requests(
     req: axum::extract::Request,
