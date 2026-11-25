@@ -867,6 +867,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     if let Some(line) = denno_engine::model::expert_vram::policy_line() {
         eprintln!("{line}");
     }
+    // task 830: P45 ゲートの判定内訳 (ゲートが在るときだけ 1 行)。
+    // `bypass_gpu` が増えて `cpu` が 0 なら、TinyLFU の下で降格が起きていない。
+    if let Some(line) = denno_engine::model::qwen4exp::expert_gate_line() {
+        eprintln!("{line}");
+    }
     // task 260: ホスト RAM tier の当たり (`DENNO_EXPERT_RAM_MB` のときだけ 1 行)。
     if let Some(line) = denno_engine::model::expert_ram::stats_line() {
         eprintln!("{line}");

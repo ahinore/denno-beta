@@ -3575,6 +3575,12 @@ impl Qwen4Exp {
     }
 }
 
+/// task 830: リクエスト終端の P45 ゲートの 1 行 (ゲートが無ければ `None`)。
+/// 迂回が効いている証拠は `bypass_gpu` が増えて `cpu` が 0 のままであること。
+pub fn expert_gate_line() -> Option<String> {
+    moe::expert_gate_line()
+}
+
 /// [`expert_gate_decide`] の本体。ゲートを引数で受けるので、env を触らずに
 /// 「冷えたゲート → CPU」「温まったゲート → GPU」「見積り不能 → CPU」を通せる。
 fn gate_decide(
