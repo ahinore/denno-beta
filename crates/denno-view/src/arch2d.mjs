@@ -45,9 +45,45 @@ export const ARCH = Object.freeze({
 
 function rect(x, y, w, h) { return { x, y, w, h }; }
 
+function finiteNum(v, d) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+
+/// 層が 0 の形 (テレメトリの ServerInfo が layers=0 を返した場合) 用の空 shape。
+/// normaliseShape は layers が正でないと例外にするので、構成図だけは
+/// 「何も置かない」で通す (view2d の契約は変えない)。
+const EMPTY_SHAPE = Object.freeze({
+  layers: 0, layer_kinds: Object.freeze([]), n_expert: 1, n_expert_used: 1,
+  n_hc: 1, n_embd: 1, ple_layers: Object.freeze([]),
+});
+
+function layoutShape(raw) {
+  try {
+    return normaliseShape(raw);
+  } catch (e) {
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) &&
+        raw.layers !== undefined && raw.layers !== null && Number(raw.layers) === 0) {
+      return EMPTY_SHAPE;
+    }
+    throw e;
+  }
+}
+
+function emptyLayout() {
+  const z = () => rect(0, 0, 0, 0);
+  return {
+    shape: EMPTY_SHAPE, width: 0, height: 0, bounds: z(),
+    blocks: [], panels: [], column: [], groups: [], step: 0,
+    grid: z(), mtp: z(), grFinal: z(), hidFinal: z(), head: z(),
+    vocab: z(), ngram: z(), input: { x: 0, y: 0 }, colTop: 0,
+  };
+}
+
 /// 形 → 構成図の配置 (世界座標)。
 export function archLayout(shape) {
-  const s = normaliseShape(shape);
+  const s = layoutShape(shape);
+  if (s.layers === 0) return emptyLayout();
   const A = ARCH, P = PANEL;
   const L = s.layers;
   const nh = Math.ceil(L / HYBRID_SIZE);
@@ -149,9 +185,11 @@ function panelGeom(s, l, x, y) {
   };
 }
 
-/// 残差の箱の中の stream i の円 (中心と半径)。
+/// 残差の箱の中の stream i の円 (中心と半径)。n が 0 / 非有限でも割り算で
+/// NaN や Infinity を返さない (壊れた shape でも描画を止めない)。
 export function streamCircle(box, i, n) {
-  const w = box.w / n;
+  const cnt = Number.isFinite(Number(n)) && n > 0 ? Math.floor(n) : 1;
+  const w = box.w / cnt;
   return { cx: box.x + (i + 0.5) * w, cy: box.y + box.h / 2, r: Math.min(box.h * 0.32, w * 0.34) };
 }
 
@@ -290,21 +328,39 @@ export function archNodeRect(layout, id) {
 
 // ---- 拡大縮小 ----------------------------------------------------------------
 
-/// 矩形を pane に収める view。
+/// 矩形を pane に収める view。pane / r の値が欠けていても (0x0・NaN) 有限を返す。
 export function fitView(r, pane, margin = 16) {
-  const w = Math.max(1, pane.w - 2 * margin), h = Math.max(1, pane.h - 2 * margin);
-  const s = Math.min(w / Math.max(1, r.w), h / Math.max(1, r.h));
-  return { s, tx: pane.w / 2 - (r.x + r.w / 2) * s, ty: pane.h / 2 - (r.y + r.h / 2) * s };
+  const pw = finiteNum(pane && pane.w, 0), ph = finiteNum(pane && pane.h, 0);
+  const m = finiteNum(margin, 0);
+  const w = Math.max(1, pw - 2 * m), h = Math.max(1, ph - 2 * m);
+  const rw = Math.max(1, finiteNum(r && r.w, 0)), rh = Math.max(1, finiteNum(r && r.h, 0));
+  const rx = finiteNum(r && r.x, 0), ry = finiteNum(r && r.y, 0);
+  const s = Math.min(w / rw, h / rh);
+  return { s, tx: pw / 2 - (rx + rw / 2) * s, ty: ph / 2 - (ry + rh / 2) * s };
 }
 
 /// 画面の点 (sx, sy) を固定して factor 倍する。s は [minS, maxS] に収める。
+/// view.s が 0 / 非有限・factor が NaN でも NaN を返さない。
 export function zoomAt(v, factor, sx, sy, minS = 0.005, maxS = 16) {
-  const s = Math.max(minS, Math.min(maxS, v.s * factor));
-  const k = s / v.s;
-  return { s, tx: sx - (sx - v.tx) * k, ty: sy - (sy - v.ty) * k };
+  const cur = finiteNum(v && v.s, 0);
+  const base = cur > 0 ? cur : 1;
+  const f = finiteNum(factor, 1);
+  const lo = finiteNum(minS, 0.005), hi = finiteNum(maxS, 16);
+  const s = Math.max(lo, Math.min(hi, base * f));
+  const k = s / base;
+  const px = finiteNum(sx, 0), py = finiteNum(sy, 0);
+  const tx = finiteNum(v && v.tx, 0), ty = finiteNum(v && v.ty, 0);
+  return { s, tx: px - (px - tx) * k, ty: py - (py - ty) * k };
 }
 
-export function toWorld(v, sx, sy) { return { x: (sx - v.tx) / v.s, y: (sy - v.ty) / v.s }; }
+/// 画面 → 世界。s が 0 / 非有限の退化 view では原点を返す (NaN を広げない)。
+export function toWorld(v, sx, sy) {
+  const s = finiteNum(v && v.s, 0);
+  const tx = finiteNum(v && v.tx, 0), ty = finiteNum(v && v.ty, 0);
+  const px = finiteNum(sx, 0), py = finiteNum(sy, 0);
+  if (!(s > 0)) return { x: 0, y: 0 };
+  return { x: (px - tx) / s, y: (py - ty) / s };
+}
 
 // ---- 描画 -------------------------------------------------------------------
 
@@ -331,22 +387,31 @@ function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a 
 ///     mtp: {seen, rate}|null (task 809。投機テレメトリが来ている間 MTP を強調)
 export function drawArch(g, layout, view, D) {
   const C = ARCH_COLORS;
-  const s = view.s;
+  const s = finiteNum(view && view.s, 0);
+  if (!(s > 0)) return;                          // 退化した view (s=0 / NaN) は描かない
   const dpr = D.dpr || 1;
-  const vis = { x: -view.tx / s, y: -view.ty / s, w: view.w / s, h: view.h / s };
+  const vw = finiteNum(view.w, 0), vh = finiteNum(view.h, 0);
+  const vtx = finiteNum(view.tx, 0), vty = finiteNum(view.ty, 0);
+  const vis = { x: -vtx / s, y: -vty / s, w: vw / s, h: vh / s };
   const px = (n) => n / s;                       // 画面 n px を世界の長さに
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.fillStyle = C.bg;
-  g.fillRect(0, 0, view.w, view.h);
-  g.setTransform(dpr * s, 0, 0, dpr * s, dpr * view.tx, dpr * view.ty);
+  g.fillRect(0, 0, vw, vh);
+  g.setTransform(dpr * s, 0, 0, dpr * s, dpr * vtx, dpr * vty);
   g.lineJoin = 'round';
+  // 0 層の形: 背景だけ描いて画面座標に戻す (列が無いので以下の配置を触らない)。
+  if (!layout.column || !layout.column.length) {
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return;
+  }
 
   // task 825: ablit 色モード (層 / Hybrid block を分離スコアで塗る)。
   const ABLIT = D.ablit && Array.isArray(D.ablit.scores) ? D.ablit : null;
   const ablitMax = ABLIT
     ? ABLIT.scores.reduce((a, v) => Math.max(a, Number(v) || 0), 0)
     : 0;
-  const ablitNorm = (v) => (ablitMax > 0 ? Math.max(0, Math.min(1, v / ablitMax)) : 0);
+  const ablitNorm = (v) => (Number.isFinite(ablitMax) && ablitMax > 0
+    ? Math.max(0, Math.min(1, finiteNum(v, 0) / ablitMax)) : 0);
   const ablitValue = (l) => (ABLIT ? ablitNorm(Number(ABLIT.scores[l]) || 0) : null);
   const ablitHybrid = (h) => {
     if (!ABLIT) return null;
@@ -737,7 +802,9 @@ export function drawArch(g, layout, view, D) {
 
 /// 層 l の expert 格子を 1 セル = 1 画素の RGBA に書く (縮小表示用)。
 export function gridPixels(layout, st, l, out, offE, moeOff) {
-  const gd = layout.panels[l].grid;
+  const p = layout.panels && layout.panels[l];
+  if (!p || !st || !st.experts || !st.experts[l] || !st.skip || !st.skip[l]) return out;
+  const gd = p.grid;
   const arr = st.experts[l];
   let scale = 1;
   if (st.mode === 'accum') { for (let i = 0; i < gd.n; i++) if (arr[i] > scale) scale = arr[i]; }
