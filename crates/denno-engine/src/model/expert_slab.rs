@@ -31,16 +31,24 @@
 //! スロットの再利用・チャンクの追加・形の分離を検証できる
 //! (`expert_slab::tests`)。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// `DENNO_EXPERT_SLAB`: slab 経路のゲート (`1` / `true` / `on` / `yes` で on)。
 pub const SLAB_ENV: &str = "DENNO_EXPERT_SLAB";
 /// `DENNO_EXPERT_SLAB_MB`: 1 チャンクの大きさ (MiB)。既定 [`DEFAULT_CHUNK_MB`]。
 pub const SLAB_CHUNK_MB_ENV: &str = "DENNO_EXPERT_SLAB_MB";
+/// task 882: 空いた**大きい**スロットを小さい expert に使い回すか
+/// (`DENNO_EXPERT_SLAB_REUSE`)。既定 off ([`SLAB_REUSE_DEFAULT`])。
+pub const SLAB_REUSE_ENV: &str = "DENNO_EXPERT_SLAB_REUSE";
+/// task 882: 使い回しで許す余りの上限 (要求バイト数の %)。既定 50%。
+pub const SLAB_REUSE_SLACK_PCT_ENV: &str = "DENNO_EXPERT_SLAB_REUSE_SLACK_PCT";
 /// 1 チャンクの既定の大きさ (MiB)。expert 1 本は約 2 MB なので 128 本ぶん。
 pub const DEFAULT_CHUNK_MB: usize = 256;
 /// スロットの開始オフセットを合わせる単位 (バイト)。
 pub const SLOT_ALIGN: usize = 256;
+/// [`SLAB_REUSE_SLACK_PCT_ENV`] の既定値 (余りは要求の 50% まで)。
+pub const DEFAULT_SLACK_PCT: usize = 50;
 
 /// [`SLAB_ENV`] の解釈 (純関数)。明示的な真値だけ on。
 pub fn slab_from_value(v: Option<&str>, default_on: bool) -> bool {
@@ -78,6 +86,60 @@ pub fn chunk_bytes() -> usize {
     *B.get_or_init(|| {
         chunk_mb_from_value(std::env::var(SLAB_CHUNK_MB_ENV).ok().as_deref()) << 20
     })
+}
+
+/// task 882: 使い回しの既定値 (**off**)。lab での採否が出るまで既定経路は変えない。
+pub const SLAB_REUSE_DEFAULT: bool = false;
+
+/// task 882: 大きいスロットの余りを使い回すか ([`SLAB_REUSE_ENV`])。
+pub fn reuse_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        slab_from_value(
+            std::env::var(SLAB_REUSE_ENV).ok().as_deref(),
+            SLAB_REUSE_DEFAULT,
+        )
+    })
+}
+
+/// [`SLAB_REUSE_SLACK_PCT_ENV`] を % で読む (0 は「余りを使わない」、不正値は既定)。
+pub fn slack_pct_from_value(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n <= 100)
+            .unwrap_or(DEFAULT_SLACK_PCT),
+        None => DEFAULT_SLACK_PCT,
+    }
+}
+
+/// 使い回しで許す余りの上限 (バイト)。
+pub fn slack_pct() -> usize {
+    static P: OnceLock<usize> = OnceLock::new();
+    *P.get_or_init(|| slack_pct_from_value(std::env::var(SLAB_REUSE_SLACK_PCT_ENV).ok().as_deref()))
+}
+
+/// task 882: 容量 `capacity` のスロットを `need` バイトの expert に使い回してよいか (純関数)。
+///
+/// 条件は 2 つだけ。
+/// - `capacity >= need` (当然)。
+/// - 余りが要求の `pct` % 以内。余りが大きいスロットを小さい expert に渡すと、
+///   その expert が空くまで**大きい expert が入る場所**を潰す (外部断片化の作り直し)。
+///   余りを要求に対して比例で縛れば、潰す量は常に「その expert の 1 本未満 + α」に収まる。
+///
+/// `pct = 0` は完全一致だけを許す (使い回し無しと同じ)。
+pub fn slack_ok_with(capacity: usize, need: usize, pct: usize) -> bool {
+    if capacity < need || need == 0 {
+        return false;
+    }
+    let room = need.saturating_mul(pct) / 100;
+    capacity - need <= room
+}
+
+/// 既定の余り上限で [`slack_ok_with`] を呼ぶ。
+pub fn slack_ok(capacity: usize, need: usize) -> bool {
+    slack_ok_with(capacity, need, slack_pct())
 }
 
 /// `n` を [`SLOT_ALIGN`] の倍数へ切り上げる (0 は 0 のまま)。
@@ -173,8 +235,14 @@ impl<H> Drop for SlabSlot<H> {
 }
 
 /// チャンクの集まり。`slot_bytes` が同じものだけを共有する。
+///
+/// task 882: [`Slab::alloc_sized`] では「要求より少し大きい空きスロット」も使う
+/// (余りの上限は [`slack_ok`])。チャンクの容量は確保時の `slot_bytes` のまま
+/// 動かないので、使い回しで**新しいバイトは 1 バイトも増えない**。
 pub struct Slab<H> {
     chunks: Mutex<Vec<Arc<Chunk<H>>>>,
+    /// task 882: 余りを使い回した回数 (診断用)。
+    slack_hits: AtomicU64,
 }
 
 impl<H> Default for Slab<H> {
@@ -187,6 +255,7 @@ impl<H> Slab<H> {
     pub fn new() -> Self {
         Slab {
             chunks: Mutex::new(Vec::new()),
+            slack_hits: AtomicU64::new(0),
         }
     }
 
@@ -249,6 +318,93 @@ impl<H> Slab<H> {
             chunks.push(Arc::clone(&chunk));
         }
         Ok(SlabSlot { chunk, idx })
+    }
+
+    /// task 882: `slot_bytes` のスロットを 1 つ返す。完全一致の空きが無ければ、
+    /// 余りが [`slack_ok`] の範囲の**大きいスロット**も使う (in-place の使い回し)。
+    ///
+    /// 大きいスロットを渡された expert は、その先頭から `slot_bytes` だけを書く
+    /// (`SlabSlot::offset()` は容量単位で進む)。チャンクの容量は確保時の値のまま
+    /// 動かないので、使い回しでデバイスメモリは 1 バイトも増えない。
+    ///
+    /// best fit: 条件を満たす中で**一番小さい**容量のチャンクを選ぶ (余りが最小 =
+    /// 大きい expert の入る場所を一番潰さない)。同着はチャンク表の順 (決定的)。
+    pub fn alloc_sized(
+        &self,
+        slot_bytes: usize,
+        make: impl FnOnce(usize) -> anyhow::Result<H>,
+    ) -> anyhow::Result<SlabSlot<H>> {
+        if slot_bytes == 0 {
+            anyhow::bail!("slab: slot_bytes = 0");
+        }
+        {
+            let chunks = self
+                .chunks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("slab: チャンク表のロックが poisoned"))?;
+            let mut best: Option<&Arc<Chunk<H>>> = None;
+            for c in chunks.iter() {
+                if !slack_ok(c.slot_bytes, slot_bytes) {
+                    continue;
+                }
+                let empty = c
+                    .free
+                    .lock()
+                    .map(|f| f.is_empty())
+                    .unwrap_or(true);
+                if empty {
+                    continue;
+                }
+                if best.map_or(true, |b| c.slot_bytes < b.slot_bytes) {
+                    best = Some(c);
+                }
+            }
+            if let Some(c) = best {
+                let mut free = c
+                    .free
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("slab: 空きリストのロックが poisoned"))?;
+                if let Some(idx) = free.pop() {
+                    if c.slot_bytes != slot_bytes {
+                        self.slack_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(SlabSlot {
+                        chunk: Arc::clone(c),
+                        idx,
+                    });
+                }
+            }
+        }
+        // 空きが無い: チャンクを新しく作る (従来経路と同じ)。
+        self.alloc(slot_bytes, make)
+    }
+
+    /// task 882: 余りを使い回した回数 (診断用)。
+    pub fn slack_hits(&self) -> u64 {
+        self.slack_hits.load(Ordering::Relaxed)
+    }
+
+    /// task 882: 断片化の指標 `(チャンク数, 確保バイト, 使用中の容量, 空きスロットの容量)`。
+    ///
+    /// `使用中の容量` は「空きスロットが 1 本も無いチャンク」を除いたぶんも含む
+    /// (スロットの容量単位)。`確保 - 使用` が、いま LRU に入っていないが
+    /// slab が抱えたままのバイト数 (= 内部断片化 + 空きスロット)。
+    pub fn usage(&self) -> (usize, usize, usize, usize) {
+        let chunks = match self.chunks.lock() {
+            Ok(c) => c,
+            Err(_) => return (0, 0, 0, 0),
+        };
+        let mut allocated = 0usize;
+        let mut used = 0usize;
+        let mut idle = 0usize;
+        for c in chunks.iter() {
+            let cap = c.slot_bytes.saturating_mul(c.n_slots);
+            let u = c.used();
+            allocated = allocated.saturating_add(cap);
+            used = used.saturating_add(c.slot_bytes.saturating_mul(u));
+            idle = idle.saturating_add(cap.saturating_sub(c.slot_bytes.saturating_mul(u)));
+        }
+        (chunks.len(), allocated, used, idle)
     }
 
     /// チャンク数 (診断用)。
@@ -331,8 +487,25 @@ mod gpu {
     }
 
     /// `slot_bytes` のスロットを 1 つ確保する (チャンクは `TAG_EXPERTS` で計上)。
+    ///
+    /// task 882: `DENNO_EXPERT_SLAB_REUSE` が on なら、余りが上限内の空きスロット
+    /// も使う ([`Slab::alloc_sized`])。off は従来どおり容量の完全一致だけ。
     pub fn alloc_slot(slot_bytes: usize) -> anyhow::Result<SlabSlot<DevBuffer>> {
-        slab().alloc(slot_bytes, DevBuffer::slab_chunk)
+        if reuse_enabled() {
+            slab().alloc_sized(slot_bytes, DevBuffer::slab_chunk)
+        } else {
+            slab().alloc(slot_bytes, DevBuffer::slab_chunk)
+        }
+    }
+
+    /// task 882: 余りを使い回した回数 (診断用)。
+    pub fn slack_hits() -> u64 {
+        slab().slack_hits()
+    }
+
+    /// task 882: 断片化の指標 `(チャンク数, 確保バイト, 使用容量, 空き容量)`。
+    pub fn usage() -> (usize, usize, usize, usize) {
+        slab().usage()
     }
 
     /// 空チャンクを落として `need` バイトまで実メモリを返す。
@@ -374,6 +547,30 @@ pub fn stats() -> (usize, usize, usize) {
     #[cfg(not(feature = "cuda"))]
     {
         (0, 0, 0)
+    }
+}
+
+/// task 882: 余りを使い回した回数 (cuda 無しは 0)。
+pub fn slack_hits() -> u64 {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::slack_hits()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
+/// task 882: 断片化の指標 `(チャンク数, 確保バイト, 使用容量, 空き容量)` (cuda 無しは 0)。
+pub fn usage() -> (usize, usize, usize, usize) {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::usage()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        (0, 0, 0, 0)
     }
 }
 
@@ -867,6 +1064,215 @@ mod tests {
         assert_eq!(*holder.borrow().first().unwrap(), 7);
     }
 
+    /// task 882: 余りの上限は要求に対して比例的 (2 倍スロットは不可)。
+    #[test]
+    fn slack_ok_is_proportional_to_the_request() {
+        let mib = 1usize << 20;
+        assert!(slack_ok_with(3 * mib, 3 * mib, 50), "完全一致");
+        assert!(slack_ok_with(3 * mib, 2 * mib, 50), "余り 1 MiB = 要求の 50%");
+        assert!(
+            !slack_ok_with(3 * mib, 2 * mib - 2, 50),
+            "50% を超える (整数の切り捨て込み)"
+        );
+        assert!(!slack_ok_with(2 * mib, 1 * mib, 50), "2 倍のスロットは使わない");
+        assert!(!slack_ok_with(mib, 2 * mib, 50), "容量 < 要求");
+        assert!(!slack_ok_with(2 * mib, 0, 50), "0 バイトは対象外");
+        // pct = 0 は完全一致だけ。
+        assert!(!slack_ok_with(3 * mib, 2 * mib, 0));
+        assert!(slack_ok_with(3 * mib, 3 * mib, 0));
+        // 100% なら 2 倍まで。
+        assert!(slack_ok_with(4 * mib, 2 * mib, 100));
+        assert!(!slack_ok_with(4 * mib + 256, 2 * mib, 100));
+        // 0 除算・オーバーフローしない。
+        assert!(slack_ok_with(usize::MAX, usize::MAX, 50));
+        assert!(!slack_ok_with(usize::MAX, usize::MAX / 2, 50));
+    }
+
+    /// task 882: 空いた大きいスロットを、余りの範囲の小さい expert が使う。
+    #[test]
+    fn alloc_sized_reuses_a_bigger_free_slot() {
+        let s: Slab<u32> = Slab::new();
+        let made = std::cell::Cell::new(0u32);
+        let mut mk = |_: usize| {
+            made.set(made.get() + 1);
+            Ok(made.get())
+        };
+        let mib = 1usize << 20;
+        let big = s.alloc(3 * mib, &mut mk).unwrap();
+        let big_idx = big.idx();
+        let chunk_after_big = s.allocated_bytes();
+        assert_eq!(made.get(), 1);
+        drop(big);
+        // 2 MiB は 3 MiB スロットの余り 1 MiB = 50% なので入る (チャンクを作らない)。
+        let small = s.alloc_sized(2 * mib, &mut mk).unwrap();
+        assert_eq!(made.get(), 1, "新しいチャンクを作らない");
+        assert_eq!(small.idx(), big_idx, "返したスロットそのもの");
+        assert_eq!(small.slot_bytes(), 3 * mib, "容量はチャンクの値");
+        assert_eq!(s.allocated_bytes(), chunk_after_big, "バイトは増えない");
+        assert_eq!(s.slack_hits(), 1);
+        drop(small);
+        // 1 MiB は 3 MiB に対して余りが 200% なので使い回さない。
+        let tiny = s.alloc_sized(1 * mib, &mut mk).unwrap();
+        assert_eq!(made.get(), 2, "余りが大きすぎるので別チャンク");
+        assert_eq!(tiny.slot_bytes(), 1 * mib);
+        assert_eq!(s.slack_hits(), 1);
+        drop(tiny);
+        // 完全一致は余り扱いしない (slack_hits を増やさない)。
+        let a = s.alloc_sized(3 * mib, &mut mk).unwrap();
+        let b = s.alloc_sized(3 * mib, &mut mk).unwrap();
+        drop((a, b));
+        let c = s.alloc_sized(3 * mib, &mut mk).unwrap();
+        assert_eq!(c.slot_bytes(), 3 * mib);
+        assert_eq!(s.slack_hits(), 1);
+    }
+
+    /// task 882: best fit (条件を満たす中で一番小さい容量) を選ぶ。
+    #[test]
+    fn alloc_sized_picks_the_smallest_fitting_capacity() {
+        let s: Slab<u32> = Slab::new();
+        let made = std::cell::Cell::new(0u32);
+        let mut mk = |_: usize| {
+            made.set(made.get() + 1);
+            Ok(made.get())
+        };
+        let mib = 1usize << 20;
+        let a = s.alloc(4 * mib, &mut mk).unwrap();
+        let b = s.alloc(5 * mib, &mut mk).unwrap();
+        let (a_idx, b_idx) = (a.idx(), b.idx());
+        drop((a, b));
+        // 3 MiB: 4 MiB は余り 33% (可)、5 MiB は余り 66% (不可) → 4 MiB を選ぶ。
+        let x = s.alloc_sized(3 * mib, &mut mk).unwrap();
+        assert_eq!(x.slot_bytes(), 4 * mib);
+        assert_eq!(x.idx(), a_idx);
+        drop(x);
+        // 2 MiB: 4 MiB (余り 100%) も 5 MiB (150%) も不可 → 新チャンク。
+        let y = s.alloc_sized(2 * mib, &mut mk).unwrap();
+        assert_eq!(y.slot_bytes(), 2 * mib);
+        assert_eq!(made.get(), 3);
+        assert!(b_idx < 5 * mib, "既存チャンクの番号は使われていない");
+        drop(y);
+        // 使い回しを切った alloc は大きいスロットを絶対に使わない。
+        let z = s.alloc(3 * mib, &mut mk).unwrap();
+        assert_eq!(z.slot_bytes(), 3 * mib, "alloc は完全一致だけ");
+        assert_eq!(made.get(), 4);
+    }
+
+    /// task 882: 混合サイズの出し入れ 50,000 回で、確保バイトの山が有界・漏れゼロ。
+    ///
+    /// 実機の混合量子化 (IQ2_S / IQ3_XXS / IQ4_NL / Q4_K / IQ4_XS / Q5_1) の
+    /// expert 1 本のバイト数に近い 6 種類を、決定的な LCG で引く。作業集合が
+    /// 予算 (`budget`) を超えたら一番古い 1 本を落とす (LRU と同じ)。
+    ///
+    /// 見るもの:
+    /// - 山 (peak 確保バイト) が「作業集合 + チャンク 2 本」に収まる。
+    /// - 使い回し on では、サイズの種類だけチャンクが増える経路 (off) より
+    ///   確保バイトが小さい。
+    /// - 全部落として `release_empty` すると確保バイトが 0 になる (漏れゼロ)。
+    #[test]
+    fn mixed_size_churn_stays_bounded_and_leaks_nothing() {
+        let sizes: [usize; 6] = [
+            2_621_440, // IQ2_S
+            2_752_512, // IQ3_XXS
+            2_949_120, // IQ4_NL
+            3_072_000, // Q4_K
+            3_145_728, // IQ4_XS
+            3_407_872, // Q5_1
+        ];
+        // 作業集合は「1 クラスあたりチャンク 2 本ぶん」にして、クラスが
+        // 1 チャンクに収まらない (使い回しが効く) 状態にする。
+        let budget = 12 * (DEFAULT_CHUNK_MB << 20);
+        let chunk = DEFAULT_CHUNK_MB << 20;
+        let steps = 50_000usize;
+
+        let run = |reuse: bool| -> (u64, usize, usize, usize) {
+            let s: Slab<u32> = Slab::new();
+            let made = std::cell::Cell::new(0u64);
+            let mut live: Vec<(usize, SlabSlot<u32>)> = Vec::new();
+            let mut live_bytes = 0usize;
+            let mut peak_alloc = 0usize;
+            let mut peak_live = 0usize;
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            for _ in 0..steps {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let need = sizes[((rng >> 33) as usize) % sizes.len()];
+                while live_bytes + need > budget && !live.is_empty() {
+                    let (b, slot) = live.remove(0);
+                    live_bytes -= b;
+                    drop(slot);
+                }
+                let mk = |bytes: usize| {
+                    assert_eq!(bytes % SLOT_ALIGN, 0, "チャンクはスロットの整数倍");
+                    made.set(made.get() + 1);
+                    Ok(made.get() as u32)
+                };
+                let slot = if reuse {
+                    s.alloc_sized(need, mk)
+                } else {
+                    s.alloc(need, mk)
+                }
+                .expect("確保できる");
+                assert!(slot.slot_bytes() >= need, "容量が要求より小さい");
+                assert_eq!(slot.offset() % SLOT_ALIGN, 0);
+                live_bytes += need;
+                live.push((need, slot));
+                peak_live = peak_live.max(live_bytes);
+                peak_alloc = peak_alloc.max(s.allocated_bytes());
+            }
+            let hits = s.slack_hits();
+            for (_, slot) in live.drain(..) {
+                drop(slot);
+            }
+            let freed = s.release_empty(usize::MAX);
+            let (chunks, allocated, used, idle) = s.usage();
+            assert_eq!(allocated, 0, "漏れ: 確保バイトが {} 残った", allocated);
+            assert_eq!(used, 0);
+            assert_eq!(idle, 0);
+            assert_eq!(chunks, 0, "空チャンクが残った");
+            assert!(freed > 0, "解放したバイトが 0");
+            (hits, made.get() as usize, peak_alloc, peak_live)
+        };
+
+        let (hits_off, made_off, peak_off, peak_live) = run(false);
+        let (hits_on, made_on, peak_on, peak_live_on) = run(true);
+        assert_eq!(peak_live, peak_live_on, "同じ作業集合");
+        // 使い回し off は「サイズの種類だけ」チャンクが増える (これが断片化の正体)。
+        assert_eq!(hits_off, 0);
+        assert!(made_off >= sizes.len(), "off は種類ぶんのチャンク: {made_off}");
+        assert!(
+            peak_off > peak_live + chunk / 2,
+            "off はクラスごとの端数チャンクを抱える: {} vs {}+{}",
+            peak_off,
+            peak_live,
+            chunk / 2
+        );
+        // on は余りを使ってチャンクを共有するので、山も作成数も小さい。
+        assert!(hits_on > 0, "使い回しが 1 回も発火していない (テストが分岐を通っていない)");
+        assert!(
+            made_on < made_off,
+            "チャンク作成数が減っていない: on={made_on} off={made_off}"
+        );
+        assert!(
+            peak_on < peak_off,
+            "山が減っていない: on={peak_on} off={peak_off}"
+        );
+        assert!(
+            peak_on <= peak_live + sizes.len() * chunk,
+            "山が作業集合 + クラス数ぶんのチャンクを超えた: {} vs {}+{}",
+            peak_on,
+            peak_live,
+            sizes.len() * chunk
+        );
+        assert!(
+            peak_off <= peak_live + sizes.len() * chunk,
+            "off の山も同じ上限に収まる: {} vs {}+{}",
+            peak_off,
+            peak_live,
+            sizes.len() * chunk
+        );
+    }
+
     #[test]
     fn env_parsing() {
         assert!(slab_from_value(Some("1"), false));
@@ -878,5 +1284,17 @@ mod tests {
         assert_eq!(chunk_mb_from_value(Some("0")), DEFAULT_CHUNK_MB);
         assert_eq!(chunk_mb_from_value(Some("x")), DEFAULT_CHUNK_MB);
         assert_eq!(chunk_mb_from_value(None), DEFAULT_CHUNK_MB);
+        // task 882: 余りの上限 (0..=100 だけ受け、他は既定)。
+        assert_eq!(slack_pct_from_value(Some("0")), 0);
+        assert_eq!(slack_pct_from_value(Some("25")), 25);
+        assert_eq!(slack_pct_from_value(Some("100")), 100);
+        assert_eq!(slack_pct_from_value(Some("101")), DEFAULT_SLACK_PCT);
+        assert_eq!(slack_pct_from_value(Some("-1")), DEFAULT_SLACK_PCT);
+        assert_eq!(slack_pct_from_value(Some("x")), DEFAULT_SLACK_PCT);
+        assert_eq!(slack_pct_from_value(None), DEFAULT_SLACK_PCT);
+        // 使い回しのゲートは明示的な真値だけ on、既定は off。
+        assert!(!slab_from_value(None, SLAB_REUSE_DEFAULT));
+        assert!(slab_from_value(Some("1"), SLAB_REUSE_DEFAULT));
+        assert!(!slab_from_value(Some("0"), true));
     }
 }

@@ -2826,6 +2826,11 @@ mod gpu {
         let mut bufs: Option<ExpertBufs> = None;
         // task 152: slab のスロットを 1 本だけ用意して使い回す (再試行でも同じ場所)。
         // チャンクの確保に失敗したら per-expert 確保へ落ちる (このトークンだけ遅い)。
+        //
+        // task 882: `DENNO_EXPERT_SLAB_REUSE=1` のときは、`alloc_slot` が
+        // 「容量が足りて余りが上限内の空きスロット」も使う (サイズの種類だけ
+        // 256 MiB チャンクが増える断片化を抑える)。数値は変わらない
+        // (スロットの先頭から同じ 3 行列を同じ順で書く)。
         let (slot_bytes, offs) = if crate::model::expert_slab::slab_enabled() {
             let (offs, slot_bytes) =
                 crate::model::expert_slab::slot_layout([mbytes[0], mbytes[1], mbytes[2]]);
