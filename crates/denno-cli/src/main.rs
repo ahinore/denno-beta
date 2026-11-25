@@ -6,6 +6,7 @@ mod chat;
 mod config;
 mod doctor;
 mod flash_telemetry;
+mod inspect;
 mod pull;
 mod serve_flash;
 
@@ -275,6 +276,18 @@ enum Commands {
         /// (localhost / 127.0.0.1 / [::1]) の任意ポートだけを許可する。
         #[arg(long, value_name = "ORIGINS")]
         cors_origin: Option<String>,
+    },
+    /// task 921: GGUF のヘッダだけを読み、アーキ情報 / 量子型ヒストグラム /
+    /// VRAM 見積りを表示する (重みは読まない)。
+    Inspect {
+        /// 単一 or 分割 GGUF の 1 パート (分割は各パートのヘッダを見る)
+        path: PathBuf,
+        /// 機械可読な JSON で出力する
+        #[arg(long)]
+        json: bool,
+        /// dense + expert キャッシュ見積りで expert に許す MiB (既定 4096)
+        #[arg(long, default_value_t = inspect::DEFAULT_EXPERT_CACHE_MIB)]
+        expert_cache_mib: u64,
     },
     /// task 881: 環境とハードウェアの自己診断 (CPU SIMD / RAM / CUDA /
     /// Level Zero / GGUF の欠け)。GPU は実行しない (存在と /proc だけ見る)。
@@ -1039,6 +1052,9 @@ fn main() -> Result<()> {
             let dir = model_dir(&repo);
             pull::pull(&repo, &dir)?;
             println!("done: {}", dir.display());
+        }
+        Commands::Inspect { path, json, expert_cache_mib } => {
+            inspect::run(&path, json, expert_cache_mib)?;
         }
         Commands::Doctor { dir, json } => {
             doctor::run(dir.as_deref(), json)?;
