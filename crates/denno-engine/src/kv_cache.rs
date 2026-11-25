@@ -98,6 +98,20 @@ impl KvCache {
         }
     }
 
+    /// 層 `layer` が GDN 状態スロットを持つか (task 870: ディスクスナップ
+    /// ショットのヘッダ検証用。確保・コピーをせずに判定する)。
+    pub fn has_gdn_slot(&self, layer: usize) -> bool {
+        self.gdn.get(layer).map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// GDN 状態スロットの `(conv_len, ssm_len)`。スロットが無ければ `None`
+    /// (task 870: スナップショットの形状検証用。クローンしない)。
+    pub fn gdn_slot_len(&self, layer: usize) -> Option<(usize, usize)> {
+        self.gdn
+            .get(layer)
+            .and_then(|g| g.as_ref().map(|(c, s)| (c.len(), s.len())))
+    }
+
     /// GPU KV ミラーのキー (P17g)
     pub fn kv_id(&self) -> u64 {
         self.id

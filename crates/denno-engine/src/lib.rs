@@ -12,6 +12,7 @@ pub mod gpu_budget;
 pub mod kquant;
 pub mod kquant_tables;
 pub mod kv_cache;
+pub mod kv_snapshot;
 pub mod load;
 pub mod mem_audit;
 pub mod model;
