@@ -94,6 +94,10 @@ pub struct FlashConfig {
     /// P812: 文脈スロット数 (`--kv-slots` / `DENNO_KV_SLOTS`、既定 2)。
     /// 2 は従来の main + aux と同じ、3 以上は LCP 一致 + LRU の汎用経路。
     pub kv_slots: Option<usize>,
+    /// P818: `--vram-budget` の生値 (`auto` か MiB の数値)。`None` なら
+    /// `DENNO_AUTO_CONFIG` を見る。auto は起動時に VRAM / RAM を引き、
+    /// 未設定の `DENNO_*` だけを計画値で埋める。
+    pub vram_budget: Option<String>,
 }
 
 fn shards(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -3725,6 +3729,55 @@ fn spawn_acceptor(listener: TcpListener) -> std::sync::mpsc::Receiver<std::io::R
     rx
 }
 
+/// P818: `--vram-budget auto` / `DENNO_AUTO_CONFIG=1` の本体。
+///
+/// カードの総 VRAM とホスト RAM、モデルのファイル長、expert の量子型から
+/// `denno_engine::auto_config::plan_gpu_config` で計画を組み、**未設定の
+/// `DENNO_*` だけ**を埋める。明示 env は 1 つも触らない。
+///
+/// モデルを組む前に呼ぶ (expert の常駐予算は構築時に 1 度だけ読まれる)。
+fn apply_auto_config(
+    budget: Option<&str>,
+    parts: &[PathBuf],
+    f: &GgufFile,
+) -> Result<String> {
+    use denno_engine::auto_config as ac;
+    let req = budget
+        .and_then(ac::VramBudget::parse)
+        .unwrap_or(ac::VramBudget::Auto);
+    let vram = match req.vram_mb() {
+        Some(n) => n,
+        None => ac::probe_vram_mb().ok_or_else(|| {
+            anyhow::anyhow!(
+                "VRAM を検出できない (cuda feature 無し / libcuda 無し)。\
+                 `--vram-budget <MiB>` で総 VRAM を明示できる"
+            )
+        })?,
+    };
+    let ram = ac::host_ram_mb();
+    let model_bytes = ac::sum_model_bytes(
+        parts
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len()),
+    );
+    let types = f
+        .tensor_order
+        .iter()
+        .filter(|n| denno_engine::gpu_budget::is_expert_weight(n))
+        .filter_map(|n| f.tensors.get(n).map(|t| t.ty));
+    // expert が無いモデルでも dense 側の予算は要るので Q4 とみなす
+    // (dense の推定割合が小さくなる側 = expert 枠を多めに取る)。
+    let quant = ac::quant_from_expert_types(types).unwrap_or(ac::ModelQuant::Q4);
+    let plan = ac::plan_gpu_config(vram, ram, model_bytes, quant);
+    let (applied, kept) = ac::apply_env_pairs(&ac::plan_env_pairs(&plan));
+    let mut line = ac::plan_line(&plan, &applied, &kept);
+    if let Some((maj, min)) = ac::probe_sm() {
+        line.push_str(&format!(" device=sm{maj}.{min}"));
+    }
+    Ok(line)
+}
+
 pub fn run(cfg: FlashConfig) -> Result<()> {
     // task 347: `/metrics` のゲート (既定 on) と、`model_name` ラベルの材料。
     metrics::init_from_env();
@@ -3839,6 +3892,20 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 denno_engine::gpu_budget::budget_line_with_parts(&b, parts.len())
             ),
             Err(e) => eprintln!("[flash] vram budget: 全パートを数えられない: {e:#}"),
+        }
+        // P818: `--vram-budget auto` / `DENNO_AUTO_CONFIG=1`。未設定の
+        // `DENNO_*` だけを計画値で埋める (明示 env は上書きしない)。
+        // モデルを組む前 = expert の予算が読まれる前に適用する。
+        if denno_engine::auto_config::auto_requested(
+            cfg.vram_budget.as_deref(),
+            std::env::var(denno_engine::auto_config::AUTO_ENV)
+                .ok()
+                .as_deref(),
+        ) {
+            match apply_auto_config(cfg.vram_budget.as_deref(), &parts, &f) {
+                Ok(line) => eprintln!("{line}"),
+                Err(e) => eprintln!("[auto-config] skip: {e:#}"),
+            }
         }
         n_layer = p.n_layer;
         n_expert = p.n_expert;

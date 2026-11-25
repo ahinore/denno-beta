@@ -76,6 +76,12 @@ enum Commands {
         /// 環境変数 `DENNO_KV_SLOTS`、それも無ければ 2。
         #[arg(long)]
         kv_slots: Option<usize>,
+        /// P818: カードの VRAM から `DENNO_*` の既定を選ぶ。`auto` で起動時に
+        /// VRAM / RAM / モデルサイズを引き、未設定の env だけを埋める
+        /// (明示 env は常に勝つ)。数値 (MiB) を渡すと総 VRAM を上書きする。
+        /// 未指定なら環境変数 `DENNO_AUTO_CONFIG`。
+        #[arg(long)]
+        vram_budget: Option<String>,
     },
     /// P801: 起動中のサーバーに対する再現可能ベンチ (llama-bench 風 pp/tg)。
     /// プロンプトはサーバーの usage.input_tokens で目標トークン数へ較正する。
@@ -675,7 +681,7 @@ fn main() -> Result<()> {
                 eprintln!("wrote {}", path.display());
             }
         }
-        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens, mtp_path, kv_slots } => {
+        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens, mtp_path, kv_slots, vram_budget } => {
             serve_flash::run(serve_flash::FlashConfig {
                 dir,
                 host,
@@ -685,6 +691,7 @@ fn main() -> Result<()> {
                 max_tokens,
                 mtp_path,
                 kv_slots,
+                vram_budget,
             })?;
         }
         Commands::Pull { repo } => {

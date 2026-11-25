@@ -3,6 +3,7 @@
 //! TensorFold構成の engine 相当。checkpoint(safetensors)読込、トークナイザ、
 //! KVキャッシュ、サンプリング、デコードループを持つ。CPUのみ・自前カーネル。
 
+pub mod auto_config;
 pub mod engine;
 pub mod gate_audit;
 pub mod gguf;
