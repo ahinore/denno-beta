@@ -964,6 +964,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // ときだけ 200 (それ以外は 503)。liveness の /health とは別物。
         .route("/ready", get(ready))
         .route("/v1/models", get(models))
+        // task 901: `GET /v1/models/:id`。ルート登録は `openai::models_router`
+        // (仕様書 docs/openapi.yaml がこのパスをまだ持たないため、task 893 の
+        // 契約テストが読む lib.rs の `.route("...")` 行を増やさない)。
+        .merge(openai::models_router())
         .route("/v1/messages", post(messages))
         // P805: Anthropic 互換のトークン数見積り (prefill しない)
         .route("/v1/messages/count_tokens", post(count_tokens))
@@ -1081,6 +1085,8 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
+    // task 901: `/v1/models` の `created` に重みディレクトリの mtime を使う。
+    openai::register_model_dir(&cfg.model_dir);
     let engine = Arc::new(Mutex::new(engine));
     // P873: キュー深度とリクエスト期限を解決する (CLI > env > 既定)。
     let queue_depth = resolve_max_queue_depth(cfg.max_queue_depth, cfg.max_queue);
@@ -1257,37 +1263,11 @@ async fn models(
     check_auth(&state, &headers)?;
     // P57: ここで engine.lock() を取らない (旧実装は名前と context のためだけに
     // 取っており、生成中は 200 すら返せなかった)。値は起動時のキャッシュ。
-    let name = &state.model_name;
-    // P793: OpenAI クライアントが読む `object` / `owned_by` を足す。既存の
-    // Anthropic 側フィールド (type / display_name / context_length / has_more) は
-    // **そのまま残す** (両方のクライアントが同じ応答で動く)。
-    // P817: 運用のためのメタデータを足す (context_length / quant / model_dir /
-    // capabilities)。既存クライアントは未知フィールドを無視する。
+    // P793/P817/task 901: model object の組立は `openai::model_object` に
+    // 集約した (`/v1/models/:id` と同じ本文を使う)。
     Ok(Json(json!({
         "object": "list",
-        "data": [{
-            "id": name,
-            "object": "model",
-            "type": "model",
-            "display_name": name,
-            "created": 0,
-            "owned_by": "denno",
-            "context_length": state.info.context,
-            "max_context_length": state.info.context,
-            "model_dir": state.info.model_dir,
-            "quant": state.info.quant,
-            "slots": state.info.slots,
-            "layers": state.info.layers,
-            "capabilities": {
-                "anthropic": true,
-                "openai": true,
-                "ollama": true,
-                "tools": true,
-                "streaming": true,
-                "count_tokens": true,
-                "telemetry": telem::enabled(),
-            },
-        }],
+        "data": [openai::model_object(&state)],
         "has_more": false,
     })))
 }
@@ -1327,7 +1307,8 @@ pub(crate) struct PreparedChat {
 /// Anthropic Messages リクエストを検証し、chat template に渡す形へ正規化する。
 /// 不正は 400 (`ApiError::invalid_request`)、未知モデルは 404。
 fn prepare_chat(state: &AppState, req: &MessagesRequest) -> Result<PreparedChat, ApiError> {
-    if req.model != state.model_name {
+    // task 901: 登録別名 (canonical 名以外) も同じモデルとして受ける。
+    if !openai::model_matches(state, &req.model) {
         return Err(ApiError::not_found(format!(
             "model: {} not found",
             req.model
