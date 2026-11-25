@@ -156,7 +156,8 @@ class Reader {
   }
   u64() { return this.u32max53(); }
   u32max53() {
-    // ns 用。2^53 までは Number で厳密。
+    // ns 用。2^53 までは Number で厳密。それを超える値は丸めが入るので
+    // 「壊れたフレーム」として弾く (黙って精度を落とさない)。
     let v = 0, shift = 0, n = 0;
     for (;;) {
       this.need(1);
@@ -166,6 +167,9 @@ class Reader {
       if ((b & 0x80) === 0) break;
       shift += 7;
       if (shift > 63) throw new FrameDecodeError('varint too long', [], this.start, false);
+    }
+    if (v > Number.MAX_SAFE_INTEGER) {
+      throw new FrameDecodeError('varint overflows safe integer', [], this.start, false);
     }
     return v;
   }
@@ -188,7 +192,8 @@ class Reader {
 export function decodeFrame(bytes, offset = 0) {
   const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   const off = Number(offset);
-  if (!Number.isFinite(off) || off < 0) {
+  // 端数・非数・負値の offset は読む前にはじく (buf[1.5] は undefined になる)。
+  if (!Number.isInteger(off) || off < 0) {
     throw new FrameDecodeError('bad offset: ' + offset, [], 0, false);
   }
   if (buf.length - off < 6) {
@@ -203,7 +208,15 @@ export function decodeFrame(bytes, offset = 0) {
   const kind = buf[off + 5];
   const r = new Reader(buf, off + 6);
   r.start = off;             // エラー位置はフレーム先頭で報告する
-  const frame = decodePayload(kind, r);
+  let frame;
+  try {
+    frame = decodePayload(kind, r);
+  } catch (e) {
+    // ペイロード側のどの失敗も FrameDecodeError に正規化する
+    // (呼び手は例外の型だけで分岐できる)。
+    if (e instanceof FrameDecodeError) throw e;
+    throw new FrameDecodeError('corrupt frame: ' + (e && e.message ? e.message : e), [], off, false);
+  }
   const next = r.p;
   return { frame, next };
 }
@@ -300,7 +313,8 @@ function decodePayload(kind, r) {
       };
     default: {
       // 長さが分からないので後続には進めない (lib.rs の decode も未知 kind は Err)。
-      const e = new FrameDecodeError('unknown kind: ' + kind, [], r.p - 1, false);
+      // offset は kind バイトではなくフレーム先頭 (呼び手が切り分けに使う)。
+      const e = new FrameDecodeError('unknown kind: ' + kind, [], r.start, false);
       e.kindId = kind;
       throw e;
     }
