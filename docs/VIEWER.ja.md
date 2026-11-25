@@ -136,6 +136,14 @@ mixer: kind == "qsa" and layer % 8 == 3; moe: layer in [5, 9, 17]
 
 層の箱(左の列)か右の層パネルをクリックすると、その層のドリルダウンが地図の左下に開く。中身は、その層の router が選んだ top-k の expert id とゲート重み(生値。棒は最大値で正規化)、VRAM hit / CPU miss のバッジ(`ExpertResidency` が来ていないときは `?`、介入で切った expert は `skip`)、直近 16 トークンの出現頻度のスパークライン(当たったトークンが縦棒)。`×` か Esc で閉じ、別の層を押すとその層に切り替わる。層の壁(`wall`)でも層をクリックすれば同じものが開く。hit / miss は `DENNO_EXPERT_GPU=1` で expert が VRAM に載っているときに意味を持つ(`DENNO_EXPERT_VRAM_MB>0`)。数字がまだ無いときは「RouterTopK 待ち」「ExpertResidency 待ち」とだけ出し、推測の値は出さない。
 
+### トレースの記録とオフライン再生 (task 885)
+
+右の操作列の `trace` の箱が、地図が描いているテレメトリそのものを記録する。`record` で新しいバッファに記録を始め、`stop` で止め (バッファは残る)、`export` で `trace-<UTC の時刻>.denno-trace.json` としてダウンロードする。`load trace` でそのファイルを読み戻すと地図が再生に切り替わり、`back to live` でライブに戻る。サーバーには何も送らず、推論の挙動も変えない。バッファは最大 2,048 フレームで、溢れたら古いものから落とす。ボタンの下の行に、上限に対するフレーム数・JSON のおおよその大きさ (KB)・トークン数・落とした数が出るので、使用量は有界で目に見える。`record` を押すまで記録は始まらない。
+
+トレースの形は `{schema: "denno-trace", version: 1, created_at, shape, tokens, dropped, frames[]}`。`frames` に入るのは地図に要る kind だけ (`ServerInfo` / `Prefill` / `Token` / `Step` / `TopK` / `RoleAct` / `LayerAct` / `ExpertResidency` / `TierStats` / `RouterTopK` / `ExpertSkip` / `Gap`) で、数値は素の数に正規化し、配列は上限で切る (`LayerAct` は 128 組、その他は 256 要素)。だからファイルは小さく、そのまま渡しても安全。壊れたファイルは理由つきで断る (`schema` / `version` / `layers` が無い / 未知のフレーム kind / 2,048 フレーム超)。`layers` か `n_expert` がライブのモデルと違うトレースも、地図の寸法が合わなくなるので読み込まない。
+
+再生はトークン単位。シークバーは各 `Token` フレームと、その後に続くフレームの区間に対応していて、ドラッグ (または `-` / `+`、← / →) すると、そのトークンまでのフレームを新しい地図の状態に流し直す。だから色は記録が見た値そのままになる。token probs の帯もトレースから作り直す。ファイルに無いテレメトリは推測しない (記録が届いていない層は空のまま)。JSON は `crates/denno-view/src/view2d.mjs` の `traceSerialize` が作り、`traceParse` / `traceValidate` が読む。直列化・スキーマ検証・シークは `node --test crates/denno-view/tests/trace2d.test.mjs` が見る。
+
 ## Abliterate の作業台 (`/2d` の右パネル)
 
 右の操作列にある `abliterate` の箱が、方向 ablation の A/B 対比の作業台。残差ストリームのステアリング (crates/denno-engine/src/model/steer.rs) と `/v1/steer` の上に載っている。
