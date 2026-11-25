@@ -25,6 +25,8 @@ mod logging;
 /// P837: OpenAI Structured Outputs のスキーマ検証 (`response_format: json_schema`)。
 pub mod json_schema;
 mod openai;
+// P841: Ollama 互換 facade (`/api/tags` / `/api/version` / `/api/chat` / `/api/generate`)
+mod ollama;
 mod scheduler;
 mod stream_asm;
 pub use lifecycle::{Lifecycle, DEFAULT_DRAIN_TIMEOUT_MS};
@@ -884,6 +886,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(openai::chat_completions))
         // P837: OpenAI 旧 Completions (chat template を通さない raw prompt)
         .route("/v1/completions", post(openai::completions))
+        // P841: Ollama 互換 (NDJSON。同じ Scheduler / chat template / KV を通す)
+        .route("/api/tags", get(ollama::tags))
+        .route("/api/version", get(ollama::version))
+        .route("/api/chat", post(ollama::chat))
+        .route("/api/generate", post(ollama::generate))
         // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
         // Anthropic 互換 API とは別系統で、互換性には影響しない。
         .route("/v1/telemetry/ws", get(telemetry_ws))
@@ -1119,6 +1126,7 @@ async fn models(
             "capabilities": {
                 "anthropic": true,
                 "openai": true,
+                "ollama": true,
                 "tools": true,
                 "streaming": true,
                 "count_tokens": true,
