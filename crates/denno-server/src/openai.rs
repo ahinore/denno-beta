@@ -403,10 +403,13 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub model: String,
     pub messages: Vec<OaMessage>,
-    pub max_tokens: Option<usize>,
-    pub max_completion_tokens: Option<usize>,
+    /// 生成上限。負値は 400 (P966: param 名付き invalid_request_error にするため i64 で受ける)
+    pub max_tokens: Option<i64>,
+    pub max_completion_tokens: Option<i64>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// P966: 候補数。OpenAI 既定は 1。このサーバーは 1 のみ対応 (他は 400)。
+    pub n: Option<i64>,
     #[serde(default, deserialize_with = "de_stop")]
     pub stop: Vec<String>,
     pub stream: Option<bool>,
@@ -714,6 +717,96 @@ fn with_usage_slot(mut chunk: Value, include_usage: bool) -> Value {
     chunk
 }
 
+// ---------- P966: OpenAI サンプリングパラメータの範囲検証 ----------
+//
+// 範囲外の値は黙って素通しせず、パラメータ名付きの 400 invalid_request_error で
+// 返す (chat / completions の両経路で同じ規則)。未指定はすべて従来の既定のまま。
+
+/// `temperature` の上限 (OpenAI 仕様は 0..=2)。
+const MAX_TEMPERATURE: f32 = 2.0;
+
+/// `temperature` を検証し、serve 側上限 ([`apply_temperature_cap`]) を適用した
+/// 実効値を返す。非有限 (NaN/inf)・負値・上限超は 400。serve 側の cap が設定されて
+/// いる場合は、cap で丸めた実効値に対して上限判定する (cap の既存の意味を保つ)。
+fn check_temperature(requested: Option<f32>, cap: Option<f32>) -> Result<Option<f32>, OaError> {
+    let Some(t) = requested else { return Ok(None) };
+    if !t.is_finite() {
+        return Err(OaError::invalid(
+            "temperature: must be a finite number (got NaN or infinity)",
+        )
+        .with_param("temperature"));
+    }
+    if t < 0.0 {
+        return Err(OaError::invalid(format!(
+            "temperature: {t} is out of range (0..={MAX_TEMPERATURE})"
+        ))
+        .with_param("temperature"));
+    }
+    let eff = apply_temperature_cap(Some(t), cap);
+    if let Some(e) = eff {
+        if e > MAX_TEMPERATURE {
+            return Err(OaError::invalid(format!(
+                "temperature: {t} is out of range (0..={MAX_TEMPERATURE})"
+            ))
+            .with_param("temperature"));
+        }
+    }
+    Ok(eff)
+}
+
+/// `top_p` は (0, 1] のみ受理する (OpenAI の nucleus sampling 範囲)。
+fn check_top_p(requested: Option<f32>) -> Result<Option<f32>, OaError> {
+    let Some(p) = requested else { return Ok(None) };
+    if !p.is_finite() {
+        return Err(
+            OaError::invalid("top_p: must be a finite number (got NaN or infinity)")
+                .with_param("top_p"),
+        );
+    }
+    if !(p > 0.0 && p <= 1.0) {
+        return Err(OaError::invalid(format!("top_p: {p} is out of range (0, 1]"))
+            .with_param("top_p"));
+    }
+    Ok(Some(p))
+}
+
+/// `n` は 1 のみ対応 (複数候補の生成は未実装)。未指定は既定 1。
+fn check_n(n: Option<i64>) -> Result<(), OaError> {
+    match n {
+        None | Some(1) => Ok(()),
+        Some(n) => Err(OaError::invalid(format!(
+            "n: only n=1 is supported (got {n})"
+        ))
+        .with_param("n")),
+    }
+}
+
+/// `max_tokens` / `max_completion_tokens` の負値は 400 (param 名付き)。
+/// 上限超過は従来どおり [`resolve_max_tokens`] が clamp する。
+fn check_max_tokens(
+    max_tokens: Option<i64>,
+    max_completion_tokens: Option<i64>,
+) -> Result<(), OaError> {
+    for (v, name) in [
+        (max_tokens, "max_tokens"),
+        (max_completion_tokens, "max_completion_tokens"),
+    ] {
+        if let Some(v) = v {
+            if v < 0 {
+                return Err(
+                    OaError::invalid(format!("{name}: {v} must be >= 0")).with_param(name)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 検証済みの i64 カウントを [`resolve_max_tokens`] の入力 (usize) へ。
+fn count_to_usize(v: Option<i64>) -> Option<usize> {
+    v.map(|x| x as usize)
+}
+
 // ---------- P869: logprobs / seed ----------
 
 /// `logprobs` / `top_logprobs` を検証し、エンジンへの記録要求
@@ -824,6 +917,11 @@ pub async fn chat_completions(
         return Err(OaError::invalid("messages: at least one message is required")
             .with_param("messages"));
     }
+    // P966: サンプリング系パラメータの範囲検証 (順序固定 = 決定的な 400)
+    check_n(req.n)?;
+    check_max_tokens(req.max_tokens, req.max_completion_tokens)?;
+    let temperature = check_temperature(req.temperature, state.temperature_cap)?;
+    let top_p = check_top_p(req.top_p)?;
     let (system, chat_messages) = split_messages(&req.messages)?;
     if chat_messages.is_empty() {
         return Err(
@@ -871,9 +969,12 @@ pub async fn chat_completions(
     }
     let enable_thinking = Some(false);
     let params = GenParams {
-        max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
-        temperature: apply_temperature_cap(req.temperature, state.temperature_cap),
-        top_p: req.top_p,
+        max_tokens: resolve_max_tokens(
+            count_to_usize(req.max_tokens),
+            count_to_usize(req.max_completion_tokens),
+        ),
+        temperature,
+        top_p,
         top_k: None,
         stop_sequences: req.stop.clone(),
         seed: req.seed.map(|s| s as u64),
@@ -1318,10 +1419,13 @@ pub struct CompletionRequest {
     pub model: String,
     /// 文字列 or 1 要素の文字列配列。複数プロンプト (batch) とトークン ID 配列は 400。
     pub prompt: Value,
-    pub max_tokens: Option<usize>,
-    pub max_completion_tokens: Option<usize>,
+    /// 生成上限。負値は 400 (P966: param 名付き invalid_request_error にするため i64 で受ける)
+    pub max_tokens: Option<i64>,
+    pub max_completion_tokens: Option<i64>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// P966: 候補数。OpenAI 既定は 1。このサーバーは 1 のみ対応 (他は 400)。
+    pub n: Option<i64>,
     #[serde(default, deserialize_with = "de_stop")]
     pub stop: Vec<String>,
     pub stream: Option<bool>,
@@ -1430,11 +1534,20 @@ pub async fn completions(
     }
     let prompt = normalize_prompt(&req.prompt)?;
 
+    // P966: chat 経路と同じサンプリングパラメータ検証 (順序固定)
+    check_n(req.n)?;
+    check_max_tokens(req.max_tokens, req.max_completion_tokens)?;
+    let temperature = check_temperature(req.temperature, state.temperature_cap)?;
+    let top_p = check_top_p(req.top_p)?;
+
     // chat 経路と同じ既定 (max_tokens クランプ・temperature 上限・反復抑止の既定値)
     let params = GenParams {
-        max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
-        temperature: apply_temperature_cap(req.temperature, state.temperature_cap),
-        top_p: req.top_p,
+        max_tokens: resolve_max_tokens(
+            count_to_usize(req.max_tokens),
+            count_to_usize(req.max_completion_tokens),
+        ),
+        temperature,
+        top_p,
         top_k: None,
         stop_sequences: req.stop.clone(),
         seed: None,
