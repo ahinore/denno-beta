@@ -136,6 +136,9 @@ pub struct ServeConfig {
     pub repetition_penalty: Option<f32>,
     /// s67b: temperature の上限 (None = クランプ無し)。運用では 0.7 程度を指定する。
     pub temperature_cap: Option<f32>,
+    /// task 916: CORS の許可オリジン。None = `DENNO_CORS_ORIGIN` → 既定
+    /// (ループバックのみ)。`*` またはカンマ区切りのオリジン一覧。
+    pub cors_origin: Option<String>,
 }
 
 // ---------- Anthropic 形式エラー ----------
@@ -956,6 +959,15 @@ pub(crate) fn new_tool_id() -> String {
 // ---------- ルーター ----------
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // task 916: 既定は「ループバック (localhost / 127.0.0.1 / [::1]) の任意ポート」
+    // だけを許可する。既存のローカルブラウザからのアクセスはそのまま通り、
+    // 任意の外部オリジンは開かない。
+    router_with_cors(state, CorsConfig::default())
+}
+
+/// task 916: CORS 設定を明示してルーターを組む。
+pub fn router_with_cors(state: Arc<AppState>, cors: CorsConfig) -> Router {
+    let cors = Arc::new(cors);
     Router::new()
         .route("/health", get(health))
         // P877: Prometheus のスクレイプ先 (認証は /health と同じく不要)。
@@ -983,9 +995,254 @@ pub fn router(state: Arc<AppState>) -> Router {
         // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
         // Anthropic 互換 API とは別系統で、互換性には影響しない。
         .route("/v1/telemetry/ws", get(telemetry_ws))
+        // task 916: 未知ルート (404) と未対応メソッド (405) も空ボディではなく
+        // OpenAI 形式の JSON 封筒で返す。`.layer()` より前に置くことで、
+        // 下の log_requests / CORS の層がこの 2 つにも掛かる。
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let cors = cors.clone();
+            async move { cors_middleware(cors, req, next).await }
+        }))
         .layer(axum::middleware::from_fn(log_requests))
         .with_state(state)
 }
+
+// ---------- task 916: CORS ----------
+
+/// `DENNO_CORS_ORIGIN` の env 名。
+pub const CORS_ORIGIN_ENV: &str = "DENNO_CORS_ORIGIN";
+
+/// プリフライトで許可するメソッド。
+const CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
+
+/// `Access-Control-Request-Headers` が無いときのプリフライト応答に入れる
+/// 許可ヘッダ (denno の API が実際に読むもの)。
+const CORS_ALLOW_HEADERS: &str =
+    "content-type, x-api-key, authorization, anthropic-version, x-request-id";
+
+/// プリフライト結果のキャッシュ秒数。
+const CORS_MAX_AGE_SECS: &str = "86400";
+
+/// 非ストリーミング応答で JS から読ませるヘッダ (task 911 の計測ヘッダ)。
+const CORS_EXPOSE_HEADERS: &str = "x-request-id, x-denno-ttft-ms, x-denno-decode-tps";
+
+/// task 916: CORS の解決結果。
+///
+/// 既定 ([`Default`]) は「ループバックの任意ポートだけ許可」。サーバは
+/// 127.0.0.1 で待ち受けるのが既定なので、ローカルブラウザ (denno-view など)
+/// からのアクセスはそのままで、外部オリジンへはヘッダを出さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorsConfig {
+    /// `*`: 任意オリジンを許可する (`Access-Control-Allow-Origin: *`)。
+    pub allow_any: bool,
+    /// 明示許可するオリジン (小文字・末尾スラッシュ無しに正規化済み)。
+    pub origins: Vec<String>,
+    /// `http(s)://localhost` / `127.0.0.1` / `[::1]` を任意ポートで許可する。
+    pub allow_loopback: bool,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self { allow_any: false, origins: Vec::new(), allow_loopback: true }
+    }
+}
+
+impl CorsConfig {
+    /// この設定で `origin` を許可するか。
+    pub fn allows(&self, origin: &str) -> bool {
+        if self.allow_any {
+            return true;
+        }
+        let o = normalize_origin(origin);
+        if self.origins.iter().any(|x| x == &o) {
+            return true;
+        }
+        self.allow_loopback && is_loopback_origin(&o)
+    }
+}
+
+/// オリジン文字列の比較用正規化 (小文字化 + 末尾スラッシュ除去)。
+/// `<scheme>://<host>` の scheme / host は ASCII 大文字小文字を区別しない。
+fn normalize_origin(origin: &str) -> String {
+    origin.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// `scheme://host[:port]` から見てループバックのオリジンか。
+/// `http`/`https` 以外の scheme と、ホストがループバック名でないものは false。
+fn is_loopback_origin(normalized: &str) -> bool {
+    let Some(rest) = normalized
+        .strip_prefix("http://")
+        .or_else(|| normalized.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if let Some(port) = rest.strip_prefix("[::1]") {
+        return port.is_empty() || is_port_suffix(port);
+    }
+    match rest.rsplit_once(':') {
+        Some((host, port)) => matches!(host, "localhost" | "127.0.0.1") && is_valid_port(port),
+        None => matches!(rest, "localhost" | "127.0.0.1"),
+    }
+}
+
+fn is_port_suffix(s: &str) -> bool {
+    s.strip_prefix(':').is_some_and(is_valid_port)
+}
+
+fn is_valid_port(p: &str) -> bool {
+    !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit())
+}
+
+/// task 916: CORS 設定を解決する。優先順は CLI (`--cors-origin`) > env。
+///
+/// - 未指定 / 空: 既定 (ループバックのみ許可)
+/// - `*`: 任意オリジン
+/// - カンマ区切り: その一覧だけを許可 (ループバック既定は無効化される。
+///   明示した一覧にループバックを入れれば従来どおりローカルからも使える)
+pub fn resolve_cors_origin(cli: Option<&str>) -> CorsConfig {
+    let raw = match cli {
+        Some(s) => Some(s.to_string()),
+        None => std::env::var(CORS_ORIGIN_ENV).ok(),
+    };
+    parse_cors_origin(raw.as_deref())
+}
+
+/// [`resolve_cors_origin`] の純関数部分 (テスト用)。
+pub fn parse_cors_origin(raw: Option<&str>) -> CorsConfig {
+    let Some(raw) = raw else { return CorsConfig::default() };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return CorsConfig::default();
+    }
+    let mut allow_any = false;
+    let mut origins = Vec::new();
+    for part in raw.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p == "*" {
+            allow_any = true;
+        } else {
+            origins.push(normalize_origin(p));
+        }
+    }
+    if !allow_any && origins.is_empty() {
+        return CorsConfig::default();
+    }
+    CorsConfig { allow_any, origins, allow_loopback: false }
+}
+
+/// task 916: CORS を適用する層。プリフライト (`OPTIONS` +
+/// `Access-Control-Request-Method`) は here で完結させ、通常のリクエストは
+/// `Access-Control-Allow-Origin` を足してから内側へ渡す。
+async fn cors_middleware(
+    cfg: Arc<CorsConfig>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::header;
+    use axum::http::Method;
+
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let allowed_origin = match &origin {
+        Some(o) if cfg.allows(o) => Some(o.clone()),
+        _ => None,
+    };
+
+    let is_preflight = req.method() == Method::OPTIONS
+        && req.headers().contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+    if is_preflight {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        if allowed_origin.is_some() || cfg.allow_any {
+            let h = resp.headers_mut();
+            let value = if cfg.allow_any {
+                "*".to_string()
+            } else {
+                allowed_origin.clone().unwrap_or_default()
+            };
+            set_cors_header(h, header::ACCESS_CONTROL_ALLOW_ORIGIN, &value);
+            set_cors_header(h, header::ACCESS_CONTROL_ALLOW_METHODS, CORS_ALLOW_METHODS);
+            let requested = req
+                .headers()
+                .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(CORS_ALLOW_HEADERS);
+            set_cors_header(h, header::ACCESS_CONTROL_ALLOW_HEADERS, requested);
+            set_cors_header(h, header::ACCESS_CONTROL_MAX_AGE, CORS_MAX_AGE_SECS);
+            if !cfg.allow_any {
+                set_cors_header(h, header::VARY, "Origin");
+            }
+        }
+        return resp;
+    }
+
+    let mut resp = next.run(req).await;
+    if allowed_origin.is_some() || cfg.allow_any {
+        let value = if cfg.allow_any {
+            "*".to_string()
+        } else {
+            allowed_origin.unwrap_or_default()
+        };
+        let h = resp.headers_mut();
+        set_cors_header(h, header::ACCESS_CONTROL_ALLOW_ORIGIN, &value);
+        set_cors_header(h, header::ACCESS_CONTROL_EXPOSE_HEADERS, CORS_EXPOSE_HEADERS);
+        if !cfg.allow_any {
+            set_cors_header(h, header::VARY, "Origin");
+        }
+    }
+    resp
+}
+
+fn set_cors_header(
+    headers: &mut axum::http::HeaderMap,
+    name: axum::http::header::HeaderName,
+    value: &str,
+) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(value) {
+        headers.insert(name, v);
+    }
+}
+
+/// task 916: 未知ルートの 404 (OpenAI 形式の JSON 封筒)。
+async fn route_not_found(req: axum::extract::Request) -> Response {
+    let path = req.uri().path().to_string();
+    openai_error_response(
+        StatusCode::NOT_FOUND,
+        "unknown_route",
+        format!("Unknown route: {} {}", req.method(), path),
+    )
+}
+
+/// task 916: 既知ルートへの未対応メソッド (405)。
+async fn method_not_allowed(req: axum::extract::Request) -> Response {
+    let path = req.uri().path().to_string();
+    openai_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        format!("Method {} not allowed for {}", req.method(), path),
+    )
+}
+
+/// OpenAI 互換のエラー封筒
+/// `{"error":{"message","type","param","code"}}` を組み立てる。
+fn openai_error_response(status: StatusCode, code: &str, message: String) -> Response {
+    let body = json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": null,
+            "code": code,
+        }
+    });
+    (status, Json(body)).into_response()
+}
+
 
 async fn log_requests(
     req: axum::extract::Request,
@@ -1271,7 +1528,19 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         start_telemetry_relay();
     }
 
-    let app = router(state.clone());
+    // task 916: CORS の許可オリジンを解決する (CLI > env > ループバック既定)。
+    let cors = resolve_cors_origin(cfg.cors_origin.as_deref());
+    tracing::info!(
+        "cors: {}",
+        if cors.allow_any {
+            "* (any origin)".to_string()
+        } else if cors.allow_loopback {
+            "loopback only".to_string()
+        } else {
+            format!("allowlist {:?}", cors.origins)
+        }
+    );
+    let app = router_with_cors(state.clone(), cors);
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on http://{}", addr);

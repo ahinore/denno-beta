@@ -269,6 +269,12 @@ enum Commands {
         /// `status` / `duration_ms`)。
         #[arg(long, default_value = "text", value_parser = ["text", "json"])]
         log_format: String,
+        /// task 916: CORS の許可オリジン。`*` (任意) またはカンマ区切りの
+        /// オリジン一覧 (例 `https://app.example.com,http://localhost:5173`)。
+        /// 未指定時は DENNO_CORS_ORIGIN、それも無ければループバック
+        /// (localhost / 127.0.0.1 / [::1]) の任意ポートだけを許可する。
+        #[arg(long, value_name = "ORIGINS")]
+        cors_origin: Option<String>,
     },
     /// task 881: 環境とハードウェアの自己診断 (CPU SIMD / RAM / CUDA /
     /// Level Zero / GGUF の欠け)。GPU は実行しない (存在と /proc だけ見る)。
@@ -1161,7 +1167,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap, log_format: _log_format } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap, log_format: _log_format, cors_origin } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -1183,6 +1189,7 @@ fn main() -> Result<()> {
                 request_timeout_secs,
                 repetition_penalty,
                 temperature_cap,
+                cors_origin,
             }))?;
         }
     }
@@ -1193,6 +1200,37 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// task 916: `serve --cors-origin` の受け取り。未指定は None (env / 既定へ)。
+    #[test]
+    fn serve_cors_origin_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["denno", "serve", "repo/x"]).unwrap();
+        match cli.command {
+            Commands::Serve { cors_origin, .. } => assert_eq!(cors_origin, None),
+            _ => panic!("serve でない"),
+        }
+        let cli = Cli::try_parse_from([
+            "denno",
+            "serve",
+            "repo/x",
+            "--cors-origin",
+            "https://a.example,http://localhost:5173",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { cors_origin, .. } => assert_eq!(
+                cors_origin.as_deref(),
+                Some("https://a.example,http://localhost:5173")
+            ),
+            _ => panic!("serve でない"),
+        }
+        let cli =
+            Cli::try_parse_from(["denno", "serve", "repo/x", "--cors-origin", "*"]).unwrap();
+        match cli.command {
+            Commands::Serve { cors_origin, .. } => assert_eq!(cors_origin.as_deref(), Some("*")),
+            _ => panic!("serve でない"),
+        }
+    }
 
     /// s164 (K5): テスト用 GGUF メタデータ値 (最小の書き手用)
     enum GgufMeta<'a> {
