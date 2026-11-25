@@ -3077,6 +3077,16 @@ pub(crate) fn moe_ffn_quant_batch_full(
     }
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
+    // task 822: 天井の切り分け用に、選択 expert の積和回数と壁時計を積む
+    // (`DENNO_PF_ROOFLINE` のときだけ。off は分岐 1 回)。
+    if !skip_routed {
+        crate::model::qwen4exp::roofline::note(
+            lw.il,
+            nt,
+            nt as u64 * k as u64 * 3 * e as u64 * ff as u64,
+            t_experts.elapsed().as_nanos() as u64,
+        );
+    }
     moe_sub_add(1, t_experts.elapsed());
     // 区間を閉じる (shared の時間を experts に二重計上しない)。
     drop(_l_experts);

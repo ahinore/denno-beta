@@ -61,6 +61,8 @@ mod mix;
 mod moe;
 mod prefill;
 mod prof;
+/// task 822: prefill の天井 (計算 vs ディスク) の 1 行診断。
+pub mod roofline;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
