@@ -811,6 +811,8 @@ function paintTokens() {
 // ===== 11) 出力の候補 (Prediction Head) と、チャット<->3D の飛翔 ==========
 // TopK フレームは serve_flash がサンプリング前の分布から top-8 を作って送る
 // (Frame::TopK、確率は f16)。chosen がそのステップで選ばれた id。
+// task 853: この frame は既定 off。候補を出すには serve-flash に
+// `DENNO_TELEMETRY_TOPK=1` を渡す (/2d の token probs 欄も同じゲート)。
 const CANDN = 8;
 const candInst = new THREE.InstancedMesh(
   new THREE.BoxGeometry(0.95, 1, 0.95),

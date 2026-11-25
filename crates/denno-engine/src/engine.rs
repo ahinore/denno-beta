@@ -1184,17 +1184,20 @@ impl Engine {
         }
         if telem::enabled() {
             telem::emit(Frame::Token { session: sess.id, token: next, pos: sess.generated.len() as u32 });
-            let tk = telem::topk_softmax(&sess.logits, 8);
-            telem::emit(Frame::TopK {
-                session: sess.id,
-                chosen: next,
-                entropy_f16: telem::f32_to_f16_bits(tk.entropy),
-                entries: tk
-                    .entries
-                    .iter()
-                    .map(|&(id, p)| (id, telem::f32_to_f16_bits(p)))
-                    .collect(),
-            });
+            // task 853: top-k / エントロピーは既定 off (`DENNO_TELEMETRY_TOPK=1`)。
+            if telem::topk_telemetry_enabled() {
+                let tk = telem::topk_softmax(&sess.logits, 8);
+                telem::emit(Frame::TopK {
+                    session: sess.id,
+                    chosen: next,
+                    entropy_f16: telem::f32_to_f16_bits(tk.entropy),
+                    entries: tk
+                        .entries
+                        .iter()
+                        .map(|&(id, p)| (id, telem::f32_to_f16_bits(p)))
+                        .collect(),
+                });
+            }
         }
 
         if self.model.eos_ids().contains(&next) {
@@ -1470,17 +1473,20 @@ impl Engine {
                     token: next,
                     pos: sess.generated.len() as u32,
                 });
-                let tk = telem::topk_softmax(&sess.logits, 8);
-                telem::emit(Frame::TopK {
-                    session: sess.id,
-                    chosen: next,
-                    entropy_f16: telem::f32_to_f16_bits(tk.entropy),
-                    entries: tk
-                        .entries
-                        .iter()
-                        .map(|&(id, p)| (id, telem::f32_to_f16_bits(p)))
-                        .collect(),
-                });
+                // task 853: top-k / エントロピーは既定 off (`DENNO_TELEMETRY_TOPK=1`)。
+                if telem::topk_telemetry_enabled() {
+                    let tk = telem::topk_softmax(&sess.logits, 8);
+                    telem::emit(Frame::TopK {
+                        session: sess.id,
+                        chosen: next,
+                        entropy_f16: telem::f32_to_f16_bits(tk.entropy),
+                        entries: tk
+                            .entries
+                            .iter()
+                            .map(|&(id, p)| (id, telem::f32_to_f16_bits(p)))
+                            .collect(),
+                    });
+                }
             }
 
             // s154 (Task B15): `sl_step_other` の child `sl_so_stream` = detok /

@@ -45,6 +45,7 @@ rtx5090 / UD-IQ3_XXS の段ごとの内訳(温まった状態、`8ae66f334` の 
 | `DENNO_STRIP_TOOLS=1` | プロンプトから `tools` 定義を落とす(40 ツールで prompt 6,979 トークンが 842 になる) |
 | `DENNO_MAX_SYSTEM=N` | system プロンプトの先頭 N 文字だけ残す |
 | `DENNO_TELEMETRY`、`DENNO_TELEMETRY_ACT=1`、`DENNO_TELEMETRY_ARCH=1` | テレメトリ(この経路では既定 ON、`0` で無効)/ 層活性 / 構造系フレーム |
+| `DENNO_TELEMETRY_TOPK=1` | sampler 直前の top-8 (id・確率・エントロピー) を TopK フレームで送る(既定 OFF。/2d の token probs 欄と 3D の候補表示に必要) |
 | `DENNO_KV_SLOTS=N`、`DENNO_KV_SLOT_TOK` | 文脈スロット数(既定 2 = 従来の main + aux、3 以上で LCP + LRU) / N スロット経路で 1 スロットが持つトークン上限(既定はコンテキスト長)。CLI は `--kv-slots` |
 
 ## その他のモデル(dense 経路の `serve`)
