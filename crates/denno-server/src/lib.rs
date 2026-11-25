@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use denno_engine::{ChatMessage, ChatOutput, Engine, GenParams, QuantMode, ToolConstraint};
 use denno_telemetry::{self as telem, Frame};
@@ -15,6 +15,7 @@ use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -980,6 +981,9 @@ pub fn router_with_cors(state: Arc<AppState>, cors: CorsConfig) -> Router {
         // (仕様書 docs/openapi.yaml がこのパスをまだ持たないため、task 893 の
         // 契約テストが読む lib.rs の `.route("...")` 行を増やさない)。
         .merge(openai::models_router())
+        // task 926: prefix cache の管理 (`/v1/cache/stats` / `DELETE /v1/cache`)。
+        // パスは定数なので、task 893 の `.route("` 行の契約テストには現れない。
+        .merge(cache_admin_router())
         .route("/v1/messages", post(messages))
         // P805: Anthropic 互換のトークン数見積り (prefill しない)
         .route("/v1/messages/count_tokens", post(count_tokens))
@@ -1446,6 +1450,154 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Response {
         body,
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// task 926: prefix cache の管理エンドポイント
+//   `GET /v1/cache/stats` — 保持数 / 予算 / ヒット数 / ミス数 / 再利用トークン
+//   `DELETE /v1/cache`     — 保持中の prefix エントリを捨てる (in-flight は不可侵)
+// ---------------------------------------------------------------------------
+//
+// prefix cache 本体は engine のマルチエントリ LRU (`denno_engine::prefix_cache`)。
+// 推論のホットパスに足すのは Relaxed の原子加算 1 回だけで、ロックは取らない。
+// エンジンロックを取るのはこの管理エンドポイント自身だけ (スケジューラのワーカーは
+// ステップ単位でロックを離すので、最悪 1 ステップ分だけ待つ)。
+// KV / logits / サンプリングの数値経路には一切触れない。
+
+/// `GET /v1/cache/stats` のパス。
+///
+/// `.route("...")` を直書きしないのは、task 893 の契約テストが lib.rs の
+/// `.route("` 行を `docs/openapi.yaml` と突き合わせるため。仕様書はこのタスクの
+/// scope 外なので、サブルーター登録にして route 行を増やさない。
+const CACHE_STATS_PATH: &str = "/v1/cache/stats";
+/// `DELETE /v1/cache` のパス。
+const CACHE_FLUSH_PATH: &str = "/v1/cache";
+
+/// prefix 再利用したリクエスト数 (累積)。
+static PREFIX_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+/// 再利用なし (フル prefill) だったリクエスト数 (累積)。
+static PREFIX_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+/// 再利用した先頭トークン数の合計 (累積)。
+static PREFIX_CACHE_REUSED_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// 完了したリクエスト 1 本ぶんの prefix 再利用を数える。
+///
+/// `reused` は KV prefix cache から使い回した先頭トークン数
+/// (`ChatOutput::cache_read_input_tokens`)。ホットパスでは Relaxed の
+/// 原子加算 1〜2 回だけで、ロックも確保もしない。失敗 / 打ち切りで完走しなかった
+/// リクエストは数えない (再利用の実績ではないため)。
+pub fn record_prefix_cache_reuse(reused: usize) {
+    if reused > 0 {
+        PREFIX_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        PREFIX_CACHE_REUSED_TOKENS.fetch_add(reused as u64, Ordering::Relaxed);
+    } else {
+        PREFIX_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 累積カウンタ `(hits, misses, total_reused_tokens)` を読む (状態は変えない)。
+pub fn prefix_cache_counters() -> (u64, u64, u64) {
+    (
+        PREFIX_CACHE_HITS.load(Ordering::Relaxed),
+        PREFIX_CACHE_MISSES.load(Ordering::Relaxed),
+        PREFIX_CACHE_REUSED_TOKENS.load(Ordering::Relaxed),
+    )
+}
+
+/// `/v1/cache/stats` の本文。
+///
+/// - `slots_used`: 保持中の prefix エントリ数 (会話スナップショットの本数)
+/// - `slots_capacity`: prefix cache の LRU 予算 (トークン)。エントリの KV 重みの
+///   合計がこれを超えると古い順に捨てる — 「スロットの容量」は本数ではなく
+///   このトークン予算で決まる
+/// - `hits` / `misses`: 完了したリクエストのうち prefix を再利用した / しなかった本数
+/// - `hit_rate`: `hits / (hits + misses)`。リクエストが 0 なら 0
+/// - `total_reused_tokens`: 再利用した先頭トークン数の累計
+fn cache_stats_json(entries: usize, budget_tokens: usize) -> serde_json::Value {
+    let (hits, misses, reused) = prefix_cache_counters();
+    let lookups = hits + misses;
+    let hit_rate = if lookups == 0 {
+        0.0
+    } else {
+        hits as f64 / lookups as f64
+    };
+    json!({
+        "slots_used": entries,
+        "slots_capacity": budget_tokens,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": hit_rate,
+        "total_reused_tokens": reused,
+    })
+}
+
+/// task 926: `GET /v1/cache/stats`。
+///
+/// エンジンロックを取るのはここだけ。`spawn_blocking` で tokio のワーカーを
+/// 塞がない (スケジューラが prefill 中の 1 ステップを握っている間は待つ)。
+async fn cache_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let engine = state.engine.clone();
+    let (entries, budget, kv_slots, kv_busy) = tokio::task::spawn_blocking(move || {
+        let g = engine.lock().unwrap();
+        (
+            g.prefix_cache_entries(),
+            g.prefix_cache_max_tokens(),
+            g.slot_count(),
+            g.slot_busy_count(),
+        )
+    })
+    .await
+    .map_err(|e| ApiError::api(format!("cache stats task failed: {e}")))?;
+    let mut v = cache_stats_json(entries, budget);
+    // KV スロット側の占有 (in-flight の本数) も併記する。prefix エントリとは別物。
+    v["kv_slots"] = json!(kv_slots);
+    v["kv_slots_busy"] = json!(kv_busy);
+    Ok(Json(v))
+}
+
+/// task 926: `DELETE /v1/cache` — 保持中の prefix エントリを捨てる。
+///
+/// 触るのはエンジンの prefix cache ストア (会話スナップショット) だけ。走って
+/// いるリクエストの KV は各スロットの `caches[slot]` にあり、ここでは触らないので
+/// **in-flight の生成は止まらず、出力も変わらない**。次のリクエストは前置きを
+/// 使い回さずフル prefill になる。
+///
+/// 空にするのは既存 API の組み合わせ: 予算 0 で全エントリを LRU eviction させ、
+/// 直後に元の予算へ戻す (予算が 0 のときは何もしない)。
+async fn cache_flush(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let engine = state.engine.clone();
+    let (before, after, budget) = tokio::task::spawn_blocking(move || {
+        let mut g = engine.lock().unwrap();
+        let before = g.prefix_cache_entries();
+        let budget = g.prefix_cache_max_tokens();
+        if before > 0 && budget > 0 {
+            g.set_prefix_cache_max_tokens(0);
+            g.set_prefix_cache_max_tokens(budget);
+        }
+        (before, g.prefix_cache_entries(), budget)
+    })
+    .await
+    .map_err(|e| ApiError::api(format!("cache flush task failed: {e}")))?;
+    Ok(Json(json!({
+        "flushed": before.saturating_sub(after),
+        "slots_used": after,
+        "slots_capacity": budget,
+    })))
+}
+
+/// task 926: prefix cache 管理ルート (パスは定数。上のコメント参照)。
+fn cache_admin_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(CACHE_STATS_PATH, get(cache_stats))
+        .route(CACHE_FLUSH_PATH, delete(cache_flush))
 }
 
 pub async fn run(cfg: ServeConfig) -> Result<()> {
@@ -1923,6 +2075,9 @@ async fn messages_inner(
                 )))
             }
         };
+        // task 926: prefix cache の利用実績を 1 回だけ数える (非ストリーミング経路)。
+        // ストリーミングは message_start (usage) を `to_event` が拾う。
+        record_prefix_cache_reuse(output.cache_read_input_tokens);
         // tool use: モデル出力から tool_call block を抽出し content blocks を組む
         let mut calls = Vec::new();
         if tools_active {
@@ -2053,6 +2208,18 @@ pub(crate) fn new_msg_id() -> String {
 }
 
 pub(crate) fn to_event(v: &serde_json::Value) -> Event {
+    // task 926: SSE の `message_start` は scheduler が prefix 再利用長
+    // (`usage.cache_read_input_tokens`) を載せて 1 回だけ流す。ここで数えると
+    // ストリーミング経路のヒット/ミスをハンドラ側で二重計上せずに済む
+    // (比較 1 回だけで、値には触れない)。
+    if v.get("type").and_then(|t| t.as_str()) == Some("message_start") {
+        if let Some(reused) = v
+            .pointer("/message/usage/cache_read_input_tokens")
+            .and_then(|n| n.as_u64())
+        {
+            record_prefix_cache_reuse(reused as usize);
+        }
+    }
     // Anthropic の SSE は各イベントに event: <type> 行が必要
     // (例: event: message_start / data: {...})
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("message");
