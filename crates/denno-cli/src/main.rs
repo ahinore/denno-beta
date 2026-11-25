@@ -3,6 +3,7 @@
 mod abliterate;
 mod bench;
 mod chat;
+mod config;
 mod doctor;
 mod flash_telemetry;
 mod pull;
@@ -53,22 +54,25 @@ enum Commands {
     /// Qwen3.8-Flash-Next (arch qwen4exp) の最小サーバー。
     /// 27B 用の `serve` とは別経路 (Engine 実装を持たない別アーキのため)。
     ServeFlash {
-        /// 分割 GGUF のあるディレクトリ
+        /// 分割 GGUF のあるディレクトリ (未指定なら `DENNO_FLASH_DIR` /
+        /// 設定ファイルの `dir`)
         #[arg(long)]
-        dir: PathBuf,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long, default_value_t = 8098)]
-        port: u16,
-        /// コンテキスト長 (KV / GDN 状態の容量)
-        #[arg(long, default_value_t = 4096)]
-        max_ctx: usize,
-        /// クライアントに広告するモデルID
+        dir: Option<PathBuf>,
+        /// 待ち受けアドレス (既定 127.0.0.1)
+        #[arg(long)]
+        host: Option<String>,
+        /// 待ち受けポート (既定 8098)
+        #[arg(long)]
+        port: Option<u16>,
+        /// コンテキスト長 (KV / GDN 状態の容量、既定 4096)
+        #[arg(long)]
+        max_ctx: Option<usize>,
+        /// クライアントに広告するモデルID (既定 qwen3.8-flash-next)
         #[arg(long)]
         name: Option<String>,
-        /// 1 リクエストの生成上限 (max_tokens 未指定時の既定でもある)
-        #[arg(long, default_value_t = 512)]
-        max_tokens: usize,
+        /// 1 リクエストの生成上限 (max_tokens 未指定時の既定でもある。既定 512)
+        #[arg(long)]
+        max_tokens: Option<usize>,
         /// task 796: MTP (nextn) head の safetensors。未指定なら
         /// 環境変数 `DENNO_MTP_PATH` を見る。どちらも無ければ従来どおり
         /// (MTP を読まない) 起動する。config.json は同じディレクトリに置く。
@@ -90,6 +94,13 @@ enum Commands {
         /// 未指定なら環境変数 `DENNO_AUTO_CONFIG`。
         #[arg(long)]
         vram_budget: Option<String>,
+        /// task 906: TOML 設定ファイル。解決順は
+        /// CLI 引数 > `DENNO_*` 環境変数 > 設定ファイル > 既定値。
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// task 906: 解決結果を表示して終了する (サーバーは起動しない)。
+        #[arg(long)]
+        print_config: bool,
     },
     /// task 861: 起動中のサーバーと話す対話 REPL (`/help` で一覧)。
     Chat {
@@ -734,6 +745,124 @@ pub fn model_dir(repo: &str) -> PathBuf {
     cache_root().join(format!("models--{}", repo.replace('/', "--")))
 }
 
+/// task 906: 設定ファイル経路は文字列で値を持つため、パスは UTF-8 だけ受ける。
+fn flash_cfg_path(v: PathBuf, key: &str) -> Result<String> {
+    v.into_os_string().into_string().map_err(|p| {
+        anyhow::anyhow!(
+            "`{key}` のパスが UTF-8 でない ({:?})。--config 経由の設定は UTF-8 のパスだけ扱う",
+            p
+        )
+    })
+}
+
+/// task 906: `serve-flash` の設定を CLI 明示値 > `DENNO_*` > 設定ファイル > 既定値
+/// の順で解決する。`--print-config` のときは表示して `Ok(None)` を返す。
+#[allow(clippy::too_many_arguments)]
+fn resolve_flash_config(
+    dir: Option<PathBuf>,
+    host: Option<String>,
+    port: Option<u16>,
+    max_ctx: Option<usize>,
+    name: Option<String>,
+    max_tokens: Option<usize>,
+    mtp_path: Option<PathBuf>,
+    kv_slots: Option<usize>,
+    steer_recipe: Option<PathBuf>,
+    vram_budget: Option<String>,
+    config_path: Option<PathBuf>,
+    print_config: bool,
+) -> Result<Option<serve_flash::FlashConfig>> {
+    // clap の既定値は使っていない (Option) ので、ここに入るのは明示値だけ。
+    let mut cli_vals: Vec<(&'static str, String)> = Vec::new();
+    if let Some(v) = dir {
+        cli_vals.push(("dir", flash_cfg_path(v, "dir")?));
+    }
+    if let Some(v) = host {
+        cli_vals.push(("host", v));
+    }
+    if let Some(v) = port {
+        cli_vals.push(("port", v.to_string()));
+    }
+    if let Some(v) = max_ctx {
+        cli_vals.push(("max_ctx", v.to_string()));
+    }
+    if let Some(v) = name {
+        cli_vals.push(("name", v));
+    }
+    if let Some(v) = max_tokens {
+        cli_vals.push(("max_tokens", v.to_string()));
+    }
+    if let Some(v) = mtp_path {
+        cli_vals.push(("mtp_path", flash_cfg_path(v, "mtp_path")?));
+    }
+    if let Some(v) = kv_slots {
+        cli_vals.push(("kv_slots", v.to_string()));
+    }
+    if let Some(v) = steer_recipe {
+        cli_vals.push(("steer_recipe", flash_cfg_path(v, "steer_recipe")?));
+    }
+    if let Some(v) = vram_budget {
+        cli_vals.push(("vram_budget", v));
+    }
+
+    let file = match &config_path {
+        Some(p) => Some(config::load(p).map_err(|e| anyhow::anyhow!("{e}"))?),
+        None => None,
+    };
+    let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let resolved = config::resolve(&cli_vals, &env, file.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if print_config {
+        print!("{}", resolved.render());
+        return Ok(None);
+    }
+
+    let dir = resolved.path("dir").ok_or_else(|| {
+        anyhow::anyhow!(
+            "`dir` が決まらない: --dir <path>、環境変数 DENNO_FLASH_DIR、\
+             設定ファイルの `dir = \"...\"` のどれかを指定する"
+        )
+    })?;
+    let host = resolved
+        .string("host")
+        .ok_or_else(|| anyhow::anyhow!("`host` の既定値が無い (config.rs の SPEC を確認)"))?;
+    let port = resolved
+        .u16("port")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("`port` の既定値が無い (config.rs の SPEC を確認)"))?;
+    let max_ctx = resolved
+        .usize("max_ctx")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("`max_ctx` の既定値が無い (config.rs の SPEC を確認)"))?;
+    let max_tokens = resolved
+        .usize("max_tokens")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("`max_tokens` の既定値が無い (config.rs の SPEC を確認)"))?;
+    let name = resolved
+        .string("name")
+        .ok_or_else(|| anyhow::anyhow!("`name` の既定値が無い (config.rs の SPEC を確認)"))?;
+    // 0 は従来の `DENNO_KV_SLOTS=0` と同じ「未指定」。serve_flash 側で
+    // 既定 2 に落ちるよう None に正規化する。
+    let kv_slots = match resolved.usize("kv_slots").map_err(|e| anyhow::anyhow!("{e}"))? {
+        Some(0) => None,
+        other => other,
+    };
+
+    Ok(Some(serve_flash::FlashConfig {
+        dir,
+        host,
+        port,
+        max_ctx,
+        name,
+        max_tokens,
+        mtp_path: resolved.path("mtp_path"),
+        kv_slots,
+        steer_recipe: resolved.path("steer_recipe"),
+        vram_budget: resolved.string("vram_budget"),
+    }))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // s44: serve のみ非同期ロギングを使う (logging.rs — stdout 消費者の凍結で
@@ -878,19 +1007,27 @@ fn main() -> Result<()> {
             kv_slots,
             steer_recipe,
             vram_budget,
+            config,
+            print_config,
         } => {
-            serve_flash::run(serve_flash::FlashConfig {
+            // task 906: CLI 明示値 > DENNO_* > 設定ファイル > 既定値。
+            // --print-config のときはここで表示して終わる (サーバーは起動しない)。
+            if let Some(cfg) = resolve_flash_config(
                 dir,
                 host,
                 port,
                 max_ctx,
-                name: name.unwrap_or_else(|| "qwen3.8-flash-next".to_string()),
+                name,
                 max_tokens,
                 mtp_path,
                 kv_slots,
                 steer_recipe,
                 vram_budget,
-            })?;
+                config,
+                print_config,
+            )? {
+                serve_flash::run(cfg)?;
+            }
         }
         Commands::Pull { repo } => {
             let dir = model_dir(&repo);
