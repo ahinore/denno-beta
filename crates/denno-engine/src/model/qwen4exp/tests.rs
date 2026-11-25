@@ -858,9 +858,9 @@
         crate::model::exp_markov::set_enabled_for_tests(Some(true));
         let _ = crate::model::exp_markov::stats_line();
         let (l0, p0, pred0, _h0, sub0) = crate::model::exp_markov::test_counters();
-        // 2 トークン x 2 層。1 トークン目で 0 -> 1 の遷移が入り、2 トークン目の
-        // 層 0 のルータ直後には予測が出る。
-        for _ in 0..2 {
+        // 8 トークン x 2 層 (後継の信頼フィルタが min_count=3 なので、
+        // 4 トークン目から予測が出る)。
+        for _ in 0..8 {
             with_markov_next(Some(&lw1), || {
                 moe_ffn_quant_with(&p, &lw0, &x, None, false, Route::Cpu)
             })
@@ -872,9 +872,9 @@
         }
         let (l1, p1, pred1, _h1, sub1) = crate::model::exp_markov::test_counters();
         crate::model::exp_markov::set_enabled_for_tests(None);
-        assert_eq!(l1 - l0, 4, "層の観測回数が 2 トークン x 2 層でない");
+        assert_eq!(l1 - l0, 16, "層の観測回数が 8 トークン x 2 層でない");
         assert!(p1 > p0, "層間の遷移が 1 本も数えられていない");
-        assert!(pred1 > pred0, "予測が出ていない (2 トークン目)");
+        assert!(pred1 > pred0, "予測が出ていない (8 トークン目)");
         assert!(sub1 > sub0, "予測 expert を背景スレッドへ積んでいない");
     }
 

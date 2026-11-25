@@ -39,13 +39,24 @@ pub const TOPK_ENV: &str = "DENNO_EXPERT_MARKOV_TOPK";
 pub const MAX_ENV: &str = "DENNO_EXPERT_MARKOV_MAX";
 /// `DENNO_EXPERT_MARKOV_MAX_ENTRIES`: テーブルのエントリ上限 (既定 131072)。
 pub const CAP_ENV: &str = "DENNO_EXPERT_MARKOV_MAX_ENTRIES";
+/// `DENNO_EXPERT_MARKOV_MIN_SHARE`: 後継の採用に要る遷移シェア (パーミル、既定 500 = 50%)。
+///
+/// 外れた先読みはディスクを空回りさせるだけなので、精度の低い予測は積まない
+/// (lab t850a: フィルタ無しの的中率は 23-28% で、短い decode が +45% 遅れた)。
+pub const SHARE_ENV: &str = "DENNO_EXPERT_MARKOV_MIN_SHARE";
+/// `DENNO_EXPERT_MARKOV_MIN_COUNT`: 後継の採用に要る最小カウント (既定 4)。
+pub const MIN_COUNT_ENV: &str = "DENNO_EXPERT_MARKOV_MIN_COUNT";
 
 /// 1 キーあたりの後継枠のハード上限 (Slot は 4 バイトなので 8 枠 = 32 バイト/キー)。
 pub const MAX_SLOTS: usize = 8;
 /// 後継枠の既定値。
 pub const DEFAULT_SLOTS: usize = 4;
 /// 1 層で積む予測本数の既定値。
-pub const DEFAULT_MAX: usize = 24;
+pub const DEFAULT_MAX: usize = 8;
+/// 後継の採用に要るシェア (パーミル) の既定値。
+pub const DEFAULT_MIN_SHARE_PM: usize = 150;
+/// 後継の採用に要る最小カウントの既定値。
+pub const DEFAULT_MIN_COUNT: usize = 3;
 /// エントリ上限の既定値 (4 枠 x 4 バイト = 16 バイト/キー x 131072 = 2 MiB)。
 pub const DEFAULT_CAP: usize = 131_072;
 
@@ -104,6 +115,18 @@ pub fn max_per_layer() -> usize {
     *N.get_or_init(|| usize_env(MAX_ENV, DEFAULT_MAX))
 }
 
+/// 後継の採用に要る遷移シェア (パーミル)。
+fn min_share_pm() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| usize_env(SHARE_ENV, DEFAULT_MIN_SHARE_PM).min(1000))
+}
+
+/// 後継の採用に要る最小カウント。
+fn min_count() -> u16 {
+    static N: OnceLock<u16> = OnceLock::new();
+    *N.get_or_init(|| usize_env(MIN_COUNT_ENV, DEFAULT_MIN_COUNT).min(u16::MAX as usize) as u16)
+}
+
 /// エントリ上限。
 fn cap_entries() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
@@ -129,6 +152,8 @@ struct Table {
     cap: usize,
     /// `rows * slots`。`row = layer * n_expert + expert` (層優先)。
     data: Vec<Slot>,
+    /// 行ごとの遷移総数 (シェア = c / tot の分母)。
+    tot: Vec<u16>,
 }
 
 impl Table {
@@ -140,6 +165,7 @@ impl Table {
             slots,
             cap: cap.max(1),
             data: vec![Slot::default(); rows * slots],
+            tot: vec![0; rows],
         }
     }
 
@@ -172,6 +198,7 @@ impl Table {
                 let b = to * next.slots;
                 next.data[b..b + self.slots]
                     .copy_from_slice(&self.data[a..a + self.slots]);
+                next.tot[to] = self.tot[from];
             }
         }
         *self = next;
@@ -185,6 +212,7 @@ impl Table {
         let Some(i) = self.row(layer, prev_e) else {
             return;
         };
+        self.tot[i] = self.tot[i].saturating_add(1);
         let base = i * self.slots;
         let seg = &mut self.data[base..base + self.slots];
         if let Some(s) = seg.iter_mut().find(|s| s.c > 0 && s.e == next_e as u16) {
@@ -213,20 +241,30 @@ impl Table {
     }
 
     /// `sel` の各 expert の後継をスコア (カウント和) 降順・同点 id 昇順で返す。
+    ///
+    /// 精度優先: シェア (`c / tot`) が `min_share_pm` 未満、またはカウントが
+    /// `min_count` 未満の後継は捨てる (外れた先読みはディスクを空回りさせるだけ)。
     fn predict(&self, layer: usize, sel: &[usize], max: usize) -> Vec<u16> {
         if max == 0 {
             return Vec::new();
         }
+        let min_c = min_count();
+        let min_pm = min_share_pm() as u64;
         let mut acc: Vec<(u32, u16)> = Vec::with_capacity(sel.len() * self.slots);
         for &e in sel {
             let Some(i) = self.row(layer, e) else {
                 continue;
             };
+            let tot = self.tot[i] as u64;
             let base = i * self.slots;
             for s in &self.data[base..base + self.slots] {
-                if s.c > 0 {
-                    acc.push((s.c as u32, s.e));
+                if s.c == 0 || s.c < min_c {
+                    continue;
                 }
+                if tot == 0 || s.c as u64 * 1000 < min_pm * tot {
+                    continue;
+                }
+                acc.push((s.c as u32, s.e));
             }
         }
         if acc.is_empty() {
@@ -425,6 +463,12 @@ pub fn stats_reset() {
     }
 }
 
+/// 記録したトークン数 (層 0 を見た回数)。VRAM 常駐の写しをトークン単位で
+/// 使い回すための番号。
+pub fn token_index() -> u64 {
+    TOKENS.load(Ordering::Relaxed)
+}
+
 /// テスト専用: `(layers, pairs, pred, hits, sub)` の現在値。
 #[cfg(test)]
 pub fn test_counters() -> (u64, u64, u64, u64, u64) {
@@ -494,7 +538,7 @@ mod tests {
         let succ = |e: usize| (2 * e + 1) % ne;
         let mut hit = 0u64;
         let mut total = 0u64;
-        for tok in 0..60usize {
+        for tok in 0..400usize {
             // トークンごとに層 0 の選択を変える (多様性を作る)。
             let mut sel: Vec<usize> = (0..k).map(|i| (tok * 3 + i * 5) % ne).collect();
             sel.sort_unstable();
@@ -503,7 +547,7 @@ mod tests {
                 if layer + 1 < n_layer {
                     let preds = predict(layer, &sel, 8);
                     note_prediction(layer + 1, &preds);
-                    if tok >= 30 {
+                    if tok >= 300 {
                         // 後継の真値が予測集合に入っているか。
                         for &e in &sel {
                             total += 1;
@@ -625,10 +669,13 @@ mod tests {
     fn prediction_order_is_deterministic() {
         let _g = guard();
         let mut t = Table::new(2, 8, 4, 1024);
-        t.update(0, 1, 5);
-        t.update(0, 1, 3);
-        t.update(0, 2, 5);
-        t.update(0, 2, 7);
+        // 各キー 5 回ずつ (min_count=4 を満たし、シェアは 500 パーミル)。
+        for _ in 0..5 {
+            t.update(0, 1, 5);
+            t.update(0, 1, 3);
+            t.update(0, 2, 5);
+            t.update(0, 2, 7);
+        }
         let a = t.predict(0, &[1, 2], 4);
         let b = t.predict(0, &[1, 2], 4);
         assert_eq!(a, b);
@@ -641,10 +688,31 @@ mod tests {
     fn growth_preserves_counts() {
         let _g = guard();
         let mut t = Table::new(1, 2, 2, 1024);
-        t.update(0, 0, 1);
-        t.update(0, 0, 1);
+        for _ in 0..5 {
+            t.update(0, 0, 1);
+        }
         t.grow_to(3, 16);
         assert!(t.n_layer >= 3 && t.n_expert >= 16);
         assert_eq!(t.predict(0, &[0], 2), vec![1]);
+    }
+
+    /// 精度フィルタ: シェアが閾値未満・カウントが小さい後継は予測に載せない。
+    #[test]
+    fn low_confidence_successors_are_dropped() {
+        let _g = guard();
+        let mut t = Table::new(1, 4, 4, 1024);
+        // キー 0: 後継 1 が 3 回 / 後継 2 が 20 回 (シェア 13% < 15%、カウントは足りる)。
+        for _ in 0..3 {
+            t.update(0, 0, 1);
+        }
+        for _ in 0..20 {
+            t.update(0, 0, 2);
+        }
+        assert_eq!(t.predict(0, &[0], 4), vec![2], "シェア 13% の後継が残った");
+        // キー 1: 後継 3 が 2 回だけ (min_count=3 未満)。
+        for _ in 0..2 {
+            t.update(0, 1, 3);
+        }
+        assert!(t.predict(0, &[1], 4).is_empty(), "少数派を通した");
     }
 }

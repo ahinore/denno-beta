@@ -3853,6 +3853,11 @@ thread_local! {
     /// [`with_markov_next`] のクロージャの寿命に閉じた生ポインタを 1 本だけ
     /// TLS に置き、その中でだけ読む (外へは出さない。Drop で必ず消す)。
     static MARKOV_NEXT: std::cell::Cell<*const LayerW> = const { std::cell::Cell::new(std::ptr::null()) };
+
+    /// 直近に作った「VRAM 常駐の写し」と、そのときのトークン番号。
+    static MARKOV_RESIDENT: std::cell::RefCell<
+        Option<(u64, std::rc::Rc<std::collections::HashSet<(u16, u16)>>)>,
+    > = std::cell::RefCell::new(None);
 }
 
 /// TLS の後始末 (パニック時も消えるようにガードで持つ)。
@@ -3902,10 +3907,26 @@ pub(crate) fn markov_note_and_prefetch(layer: usize, sel: &[usize]) {
         return;
     }
     crate::model::exp_markov::note_prediction(layer + 1, &preds);
-    let resident: std::collections::HashSet<(u16, u16)> = expert_vram::resident_keys()
-        .into_iter()
-        .map(|k| (k.layer, k.expert))
-        .collect();
+    // VRAM 常駐の写しは 1 トークン 1 回だけ作る (層ごとに LRU のロックを取ると
+    // H2D の経路と取り合いになる。lab t850a の decode 退行の一因)。
+    let tok = crate::model::exp_markov::token_index();
+    let resident = MARKOV_RESIDENT.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.as_ref() {
+            Some((t, set)) if *t == tok => std::rc::Rc::clone(set),
+            _ => {
+                let set: std::rc::Rc<std::collections::HashSet<(u16, u16)>> =
+                    std::rc::Rc::new(
+                        expert_vram::resident_keys()
+                            .into_iter()
+                            .map(|k| (k.layer, k.expert))
+                            .collect(),
+                    );
+                *b = Some((tok, std::rc::Rc::clone(&set)));
+                set
+            }
+        }
+    });
     let mut jobs: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::new();
     let (mut n_res, mut n_nopart) = (0u64, 0u64);
     for eid in preds {
