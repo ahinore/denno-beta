@@ -277,6 +277,11 @@ enum Commands {
         /// (localhost / 127.0.0.1 / [::1]) の任意ポートだけを許可する。
         #[arg(long, value_name = "ORIGINS")]
         cors_origin: Option<String>,
+        /// task 946: HTTP リクエストボディの上限 (MiB)。上限を超えると
+        /// 413 + JSON エラー封筒で返す。未指定時は DENNO_MAX_BODY_MB、
+        /// それも無ければ 16 MiB。
+        #[arg(long, value_name = "MB", value_parser = clap::value_parser!(u64).range(1..))]
+        max_body_mb: Option<u64>,
     },
     /// task 921: GGUF のヘッダだけを読み、アーキ情報 / 量子型ヒストグラム /
     /// VRAM 見積りを表示する (重みは読まない)。
@@ -1210,7 +1215,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap, log_format: _log_format, cors_origin } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap, log_format: _log_format, cors_origin, max_body_mb } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -1233,6 +1238,7 @@ fn main() -> Result<()> {
                 repetition_penalty,
                 temperature_cap,
                 cors_origin,
+                max_body_mb,
             }))?;
         }
     }
@@ -1273,6 +1279,27 @@ mod tests {
             Commands::Serve { cors_origin, .. } => assert_eq!(cors_origin.as_deref(), Some("*")),
             _ => panic!("serve でない"),
         }
+    }
+
+    /// task 946: `serve --max-body-mb` の受け取り。未指定は None (env / 既定へ)。
+    /// 0 は clap の range で拒否する。
+    #[test]
+    fn serve_max_body_mb_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["denno", "serve", "repo/x"]).unwrap();
+        match cli.command {
+            Commands::Serve { max_body_mb, .. } => assert_eq!(max_body_mb, None),
+            _ => panic!("serve でない"),
+        }
+        let cli =
+            Cli::try_parse_from(["denno", "serve", "repo/x", "--max-body-mb", "64"]).unwrap();
+        match cli.command {
+            Commands::Serve { max_body_mb, .. } => assert_eq!(max_body_mb, Some(64)),
+            _ => panic!("serve でない"),
+        }
+        assert!(
+            Cli::try_parse_from(["denno", "serve", "repo/x", "--max-body-mb", "0"]).is_err(),
+            "--max-body-mb 0 は拒否するべき"
+        );
     }
 
     /// s164 (K5): テスト用 GGUF メタデータ値 (最小の書き手用)
