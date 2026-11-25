@@ -290,6 +290,108 @@ data: [DONE]
 エラーは chat 経路と同じ OpenAI 形式。400 = リクエスト不正 (prompt/model 以外の
 型不正を含む)。404 = 未知モデル。503 = キュー溢れ。500 = engine 側の失敗。
 
+## Ollama 互換 API (P841)
+
+Open WebUI / Continue.dev / Zed / Obsidian Copilot などの Ollama クライアントが
+base URL を差し替えるだけで繋がる facade。`/v1/messages` / `/v1/chat/completions` と
+**同じ** Scheduler・chat template・KV prefix cache・切断 abort を通る (エンジン・
+数値経路の変更は無い)。違うのはワイヤ形式だけ。
+
+認証は他経路と同じ (`--api-key` 指定時は `x-api-key` か `Authorization: Bearer`)。
+
+### GET /api/tags
+
+```json
+{"models": [{
+  "name": "denno-test", "model": "denno-test",
+  "modified_at": "2026-11-25T12:34:56Z", "size": 0,
+  "digest": "<64 hex>",
+  "details": {"parent_model": "", "format": "gguf", "family": "denno",
+              "families": ["denno"], "parameter_size": "",
+              "quantization_level": "<quant label>"}
+}]}
+```
+
+`size` は 0、`digest` はモデル名から作る決定論的な表示用識別子 (重みのハッシュ
+ではない — Ollama クライアントは表示にしか使わない)。
+
+### GET /api/version
+
+`{"version": "0.1.0-denno"}`
+
+### POST /api/chat
+
+| フィールド | 対応 |
+| --- | --- |
+| `model` (任意) | serve 時の `--name`。不一致は 404 |
+| `messages` (必須) | `role` は `system` / `user` / `assistant` (それ以外は 400)。`content` は文字列 or text part 配列。tools (`tool` ロール / `tool_calls`) は非対応 |
+| `stream` (任意) | **未指定は true** (Ollama の既定)。false で単一 JSON |
+| `options.temperature` / `options.top_p` | 対応 (`--temperature-cap` のクランプも同一) |
+| `options.num_predict` | 生成上限。正値のみ採用し、未指定と同じく既定 1024 / 上限 4096 で clamp。負値 (-1 / -2) と 0 は「未指定」扱い |
+| `options.stop` | 文字列 or 文字列配列 |
+| その他 | 未知フィールド (`options.num_ctx` / `seed` / `images` 等) は無視 |
+
+thinking の既定は `/v1/messages` と同じ (brief + `enable_thinking=false`) なので、
+同じ会話なら本文・トークン数が `/v1/messages` と一致する。
+
+非ストリーミング (`stream: false`):
+
+```json
+{"model": "denno-test", "created_at": "2026-11-25T12:34:56Z",
+ "message": {"role": "assistant", "content": " ..."},
+ "done": true, "done_reason": "stop",
+ "total_duration": 12345678, "load_duration": 0,
+ "prompt_eval_count": 12, "prompt_eval_duration": 0,
+ "eval_count": 34, "eval_duration": 12345678}
+```
+
+ストリーミング (既定): `Content-Type: application/x-ndjson`。1 行 1 JSON で、
+`done: false` の行を連結した `message.content` が非ストリーミング本文と一致する。
+最終行だけ `done: true` + `done_reason` / `prompt_eval_count` / `eval_count` /
+`total_duration` を持つ。
+
+```
+{"model":"denno-test","created_at":"...","message":{"role":"assistant","content":" ..."},"done":false}
+{"model":"denno-test","created_at":"...","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",...}
+```
+
+### POST /api/generate
+
+| フィールド | 対応 |
+| --- | --- |
+| `model` (任意) | 同上 (不一致は 404) |
+| `prompt` (必須) | 空文字は 400 |
+| `system` (任意) | `raw: false` のとき system として chat template に渡す |
+| `raw` (任意) | true なら chat template を通さない (`/v1/completions` と同じ raw 経路。`system` は無視) |
+| `stream` (任意) | 未指定は true。false で単一 JSON |
+| `options.*` | `/api/chat` と同じ |
+
+`raw: false` は `system` + user(= `prompt`) の chat 経路なので、同じ入力なら
+`/api/chat` と同じ本文になる。ストリーミング行は `message` の代わりに
+`"response": "<delta>"` を持つ:
+
+```
+{"model":"denno-test","created_at":"...","response":" ...","done":false}
+{"model":"denno-test","created_at":"...","response":"","done":true,"done_reason":"stop",...}
+```
+
+### 時刻・時間・切断
+
+- `created_at` は UTC の RFC3339 (秒精度)。1 本の応答内では同じ値
+- 時間はナノ秒。engine から prefill / decode の内訳は取れないので
+  `prompt_eval_duration` / `load_duration` は 0、`eval_duration` は
+  `total_duration` と同じ値で近似する (**推定値**。0 除算を避けるため)
+- ストリーミングの応答ボディは scheduler の生イベントを直接包むので、
+  クライアント切断で受信端が落ち、生成は次のステップ境界で打ち切られて
+  KV スロットが解放される (既存の切断経路と同一)
+- `done_reason` は `stop` (`end_turn` / `stop_sequence`) か `length` (`max_tokens`)
+
+### エラー
+
+Ollama 形式の `{"error": "..."}`。400 = リクエスト不正 (messages 空 / prompt 空 /
+未知 role / 型不正)、404 = 未知モデル、503 = キュー溢れまたは drain 中、
+500 = engine 側の失敗。ステータスの分類は他経路と同じ。
+
 ## tool use (tools / tool_choice)
 
 Anthropic 形式のツール定義を chat template の `tools` 変数 (Qwen/HF 形式へ変換) で
