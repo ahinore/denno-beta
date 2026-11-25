@@ -65,4 +65,4 @@ jobs:
           cargo run --release --bin denno -- pull Qwen/Qwen3-0.6B
 
       - name: Run exactness tests (ignored)
-        run: cargo test --release --workspace -- --ignored
+        run: cargo test --release --workspace -- --ignored --test-threads=1
