@@ -2307,6 +2307,43 @@
         );
     }
 
+    /// task 830: TinyLFU の下では P45 のヒット率降格を使わない (迂回)。
+    ///
+    /// 同じ「ヒット率 0.3」でも、迂回ありは GPU・なしは CPU。迂回が実際に
+    /// 効いたことは判定の計数 (`bypass_gpu` が増え `cpu` が 0) で確かめる。
+    #[test]
+    fn gate_decide_bypass_survives_tinylfu_low_hit_rate() {
+        let mk = |bypass: bool| {
+            let mut g = expert_vram::ExpertGate::new(expert_vram::GateConfig::default())
+                .with_bypass(bypass);
+            for _ in 0..expert_vram::GATE_WINDOW_TOKENS {
+                g.record(3, 10); // 1 トークン = 全 10 本中 3 本ヒット
+            }
+            std::sync::Mutex::new(g)
+        };
+        let legacy = mk(false);
+        let tinylfu = mk(true);
+        assert_eq!(
+            gate_decide(Some(&legacy), 0, 2, Some(1024)),
+            expert_vram::GateDecision::Cpu,
+            "迂回なし (従来) はヒット率 0.3 で CPU に倒れる"
+        );
+        assert_eq!(
+            gate_decide(Some(&tinylfu), 0, 2, Some(1024)),
+            expert_vram::GateDecision::Gpu,
+            "tinylfu の迂回が効いていない (当たっている expert も CPU に落ちる)"
+        );
+        // 発火の証拠: 迂回の計数だけが増える
+        let (gpu, cpu, probe, bypass) = tinylfu.lock().expect("gate").decision_counts();
+        assert_eq!((gpu, cpu, probe, bypass), (0, 0, 0, 1));
+        // 見積り不能はゲートと同じく fail-safe で CPU のまま
+        assert_eq!(
+            gate_decide(Some(&tinylfu), 0, 2, None),
+            expert_vram::GateDecision::Cpu,
+            "迂回で fail-safe まで外れた"
+        );
+    }
+
     #[test]
     fn moe_par_gate_value_parsing() {
         // DENNO_MOE_PAR の解釈 (既定 1)。env を触らずに純粋関数だけを見る。

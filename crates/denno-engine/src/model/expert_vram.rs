@@ -182,6 +182,41 @@ pub fn min_hit_from_value(v: Option<&str>) -> f32 {
     }
 }
 
+/// task 830: `DENNO_EXPERT_GATE_TINYLFU` — 載せ替えが `tinylfu` のとき、P45 の
+/// ヒット率ゲート (トークン単位で CPU へ降格) を迂回するか。既定 on。
+///
+/// # なぜ迂回するか (lab t794a / t794b)
+///
+/// TinyLFU は「1 回しか使われない expert を載せない」ことで温かい集合を守る。
+/// 載せない判断はそのままヒット率の分母に入るので、**thrash していなくても**
+/// ヒット率は 0.5 を割る (観測した 1 サンプル = 全層の選択 expert のうち VRAM に
+/// 載っていた割合)。P45 は LRU 時代の「低ヒット率 = 積み直しの損」を前提にした
+/// 降格なので、TinyLFU の下では当たっている expert まで CPU に落とすだけになる。
+/// 実測 (Q4_K_XL 14k / VRAM 14000 MiB): `MIN_HIT=0.5` で 27.3 ms/tok、
+/// `MIN_HIT=0` で 16.5 ms/tok (同じ木・同じ予算)。
+///
+/// `lru` (切り戻し用) では従来どおりゲートを掛ける。
+pub const EXPERT_GATE_TINYLFU_ENV: &str = "DENNO_EXPERT_GATE_TINYLFU";
+
+/// [`EXPERT_GATE_TINYLFU_ENV`] の解釈 (純粋関数)。未設定・空・その他は on。
+///
+/// - `0` / `off` / `false` / `no` → false (従来どおり P45 を掛ける)
+/// - それ以外 → true (TinyLFU のときは降格しない)
+pub fn gate_bypass_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        _ => true,
+    }
+}
+
+/// task 830: ゲートを迂回してよいか (純粋関数)。
+///
+/// 迂回するのは「`min_hit` が効いていて (= 0 でなく)、載せ替えが `lru` でない」
+/// ときだけ。`lru` では従来の P45 がそのまま要る (積み直しの損を避ける門)。
+pub fn gate_bypass(min_hit: f32, policy: CachePolicy, env: Option<&str>) -> bool {
+    min_hit > 0.0 && policy != CachePolicy::Lru && gate_bypass_from_value(env)
+}
+
 /// ゲートの判定。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GateDecision {
@@ -240,6 +275,8 @@ impl Default for GateConfig {
 /// ヒット率は「いま GPU に戻したらどれだけ当たるか」をそのまま表す。
 pub struct ExpertGate {
     cfg: GateConfig,
+    /// task 830: TinyLFU のときは降格しない (常に GPU)。
+    bypass: bool,
     /// 直近のヒット率 (トークンごとの 0..1) のリングバッファ
     samples: Vec<f32>,
     next: usize,
@@ -253,6 +290,11 @@ pub struct ExpertGate {
     /// いまのトークンの実測 (層ぶんを足して、次のトークンの先頭で 1 サンプルにする)
     acc_hits: u32,
     acc_lookups: u32,
+    /// task 830: 判定の内訳 (リクエスト終端の 1 行で読む)。
+    tok_gpu: u64,
+    tok_cpu: u64,
+    tok_probe: u64,
+    tok_bypass: u64,
 }
 
 impl ExpertGate {
@@ -261,6 +303,7 @@ impl ExpertGate {
         let window = cfg.window.max(1);
         ExpertGate {
             cfg: GateConfig { window, ..cfg },
+            bypass: false,
             samples: vec![0.0; window],
             next: 0,
             filled: 0,
@@ -270,7 +313,24 @@ impl ExpertGate {
             cur: None,
             acc_hits: 0,
             acc_lookups: 0,
+            tok_gpu: 0,
+            tok_cpu: 0,
+            tok_probe: 0,
+            tok_bypass: 0,
         }
+    }
+
+    /// task 830: ヒット率での降格を使わない (TinyLFU のとき)。
+    ///
+    /// サンプルは従来どおり溜めるので、診断のヒット率はそのまま読める。
+    pub fn with_bypass(mut self, bypass: bool) -> Self {
+        self.bypass = bypass;
+        self
+    }
+
+    /// 迂回が有効か (診断用)。
+    pub fn bypass(&self) -> bool {
+        self.bypass
     }
 
     pub fn cfg(&self) -> GateConfig {
@@ -344,31 +404,80 @@ impl ExpertGate {
     fn decide_token(&mut self, h2d_bytes: Option<u64>) -> GateDecision {
         // 1. `DENNO_EXPERT_GPU_MIN_HIT=0` はゲート無効 = P39 までと同じ挙動。
         if self.cfg.min_hit <= 0.0 {
+            self.tok_gpu += 1;
             return GateDecision::Gpu;
         }
         // 2. ミス時に積む量が読めないなら GPU にしない (fail-safe)。
         if h2d_bytes.is_none() {
+            self.tok_cpu += 1;
             return GateDecision::Cpu;
         }
-        // 3. 直近のヒット率で決める。まだ 1 本も測っていない (起動直後) も CPU。
-        let warm = self.hit_rate().is_some_and(|r| r >= self.cfg.min_hit);
-        if warm {
+        // 3. task 830: TinyLFU は「載せない」で thrash を防ぐので、その下の
+        //    ヒット率は構造的に低い。ここで降格すると、当たっている expert まで
+        //    CPU で計算し直すだけになる (lab t794a 対 t794b: 27.3 対 16.5 ms/tok)。
+        if self.bypass {
+            self.tok_bypass += 1;
             self.cpu_streak = 0;
             return GateDecision::Gpu;
         }
-        // 4. 低いままなら probe_every トークンに 1 回だけ測り直す。
+        // 4. 直近のヒット率で決める。まだ 1 本も測っていない (起動直後) も CPU。
+        let warm = self.hit_rate().is_some_and(|r| r >= self.cfg.min_hit);
+        if warm {
+            self.cpu_streak = 0;
+            self.tok_gpu += 1;
+            return GateDecision::Gpu;
+        }
+        // 5. 低いままなら probe_every トークンに 1 回だけ測り直す。
         self.cpu_streak = self.cpu_streak.saturating_add(1);
         if self.cpu_streak >= self.cfg.probe_every.max(1) {
             self.cpu_streak = 0;
             self.probes += 1;
+            self.tok_probe += 1;
             return GateDecision::Probe;
         }
+        self.tok_cpu += 1;
         GateDecision::Cpu
     }
 
     /// probe した回数 (診断用)。
     pub fn probes(&self) -> u64 {
         self.probes
+    }
+
+    /// task 830: 判定の内訳 `(gpu, cpu, probe, bypass)`。迂回が効いていると
+    /// `bypass` だけが増え、`cpu` は 0 のままになる。
+    pub fn decision_counts(&self) -> (u64, u64, u64, u64) {
+        (self.tok_gpu, self.tok_cpu, self.tok_probe, self.tok_bypass)
+    }
+
+    /// task 830: 内訳を 0 に戻す (リクエスト終端で 1 行出したあと)。
+    pub fn reset_decision_counts(&mut self) {
+        self.tok_gpu = 0;
+        self.tok_cpu = 0;
+        self.tok_probe = 0;
+        self.tok_bypass = 0;
+    }
+
+    /// task 830: リクエスト終端の 1 行。`hit` は直近ウィンドウのヒット率、
+    /// `tok` はこのリクエストで出した判定の内訳。迂回が効いている証拠は
+    /// `bypass` が増えて `cpu` が 0 のままであること。
+    pub fn stats_line(&self) -> String {
+        let (gpu, cpu, probe, bypass) = self.decision_counts();
+        let hit = match self.hit_rate() {
+            Some(r) => format!("{r:.3}"),
+            None => "-".to_string(),
+        };
+        format!(
+            "[exp-gate] min_hit={:.2} bypass={} hit={} samples={} tok gpu={} cpu={} probe={} bypass_gpu={}",
+            self.cfg.min_hit,
+            u8::from(self.bypass),
+            hit,
+            self.filled,
+            gpu,
+            cpu,
+            probe,
+            bypass
+        )
     }
 }
 
@@ -3315,6 +3424,84 @@ mod tests {
         assert_eq!(g.probes(), 1);
         assert_eq!(g.decide(0, Some(8)), GateDecision::Probe);
         assert_eq!(g.probes(), 2);
+    }
+
+    /// task 830: `DENNO_EXPERT_GATE_TINYLFU` の解釈と、迂回の条件。
+    #[test]
+    fn gate_bypass_parsing() {
+        // 未設定・空・数値以外は既定 on
+        assert!(gate_bypass_from_value(None), "未設定は既定 on");
+        assert!(gate_bypass_from_value(Some("")), "空は「未設定」と同じ");
+        assert!(gate_bypass_from_value(Some("1")));
+        assert!(gate_bypass_from_value(Some("yes")));
+        // 明示 off だけ従来
+        for v in ["0", "off", "false", "no", " OFF "] {
+            assert!(!gate_bypass_from_value(Some(v)), "{v}");
+        }
+        // lru は迂回しない (P45 は LRU 時代の門。切り戻しでそのまま要る)
+        assert!(!gate_bypass(0.5, CachePolicy::Lru, None), "lru は従来どおり");
+        assert!(gate_bypass(0.5, CachePolicy::TinyLfu, None), "tinylfu は迂回");
+        assert!(
+            !gate_bypass(0.5, CachePolicy::TinyLfu, Some("0")),
+            "env で切り戻せる"
+        );
+        // min_hit 0 は「常に GPU」なので、迂回の出番は無い (ゲート自体が無効)
+        assert!(!gate_bypass(0.0, CachePolicy::TinyLfu, None));
+    }
+
+    /// task 830: TinyLFU の下の低ヒット率 (0.3) で、迂回が有ると GPU 固定・
+    /// 無いと CPU に落ちる。迂回の計数が増えることも見る (発火の証拠)。
+    #[test]
+    fn gate_bypass_keeps_gpu_at_tinylfu_hit_rate() {
+        let feed = |bypass: bool| {
+            let mut g = ExpertGate::new(GateConfig {
+                min_hit: 0.5,
+                window: 64,
+                probe_every: 8,
+            })
+            .with_bypass(bypass);
+            for _ in 0..GATE_WINDOW_TOKENS {
+                g.record(3, 10); // 1 サンプル = ヒット率 0.3 (TinyLFU の典型)
+                g.decide(0, Some(4096));
+            }
+            g
+        };
+        // 従来 (迂回なし): ヒット率 0.3 < 0.5 で CPU に倒れ、8 トークンに 1 回だけ probe
+        let legacy = feed(false);
+        assert_eq!(legacy.hit_rate(), Some(0.3));
+        let (gpu, cpu, probe, bypass) = legacy.decision_counts();
+        assert_eq!(
+            (gpu, cpu, probe, bypass),
+            (0, 56, 8, 0),
+            "従来は CPU に倒れる (64 トークン中 56 が CPU / 8 が probe)"
+        );
+        // 迂回あり: 同じヒット率でも GPU のまま。サンプルは溜まる (診断用)
+        let mut tinylfu = feed(true);
+        assert_eq!(tinylfu.hit_rate(), Some(0.3), "ヒット率の計測は続く");
+        assert_eq!(tinylfu.samples(), GATE_WINDOW_TOKENS);
+        let (gpu, cpu, probe, bypass) = tinylfu.decision_counts();
+        assert_eq!((gpu, cpu, probe, bypass), (0, 0, 0, 64), "迂回が全てのトークンで効く");
+        // さらに 100 トークン回しても CPU / probe は 0 のまま
+        for _ in 0..100 {
+            tinylfu.record(0, 10);
+            assert_eq!(tinylfu.decide(0, Some(4096)), GateDecision::Gpu);
+        }
+        let (_, cpu, probe, bypass) = tinylfu.decision_counts();
+        assert_eq!((cpu, probe, bypass), (0, 0, 164));
+        let line = tinylfu.stats_line();
+        assert!(line.contains("bypass=1"), "{line}");
+        assert!(line.contains("bypass_gpu=164"), "{line}");
+        // 内訳はリクエスト終端で 0 に戻る
+        tinylfu.reset_decision_counts();
+        assert_eq!(tinylfu.decision_counts(), (0, 0, 0, 0));
+    }
+
+    /// task 830: 迂回していても「積む量が読めない」は fail-safe で CPU のまま。
+    #[test]
+    fn gate_bypass_keeps_unknown_h2d_cpu() {
+        let mut g = ExpertGate::new(GateConfig::default()).with_bypass(true);
+        assert_eq!(g.decide(0, None), GateDecision::Cpu, "見積り不能は CPU");
+        assert_eq!(g.decide(0, Some(1)), GateDecision::Gpu);
     }
 
     /// task 268: 事前ロードのバイト数が K 系 / legacy 型でも求まること。

@@ -284,14 +284,46 @@ pub(crate) fn expert_gate() -> Option<&'static std::sync::Mutex<expert_vram::Exp
         if min_hit <= 0.0 {
             return None;
         }
-        Some(std::sync::Mutex::new(expert_vram::ExpertGate::new(
-            expert_vram::GateConfig {
+        // task 830: 載せ替えが tinylfu なら、頻度ゲート自身が「冷たい expert を
+        // 載せない」ことで thrash を防いでいる。その下のヒット率は構造的に
+        // 0.5 を割るので、P45 の降格は当たっている expert まで CPU に落とすだけ
+        // (lab t794a 27.3 対 t794b 16.5 ms/tok)。既定で迂回する。
+        let policy = expert_vram::policy()
+            .unwrap_or_else(crate::model::cache_policy::policy_from_env);
+        let bypass = expert_vram::gate_bypass(
+            min_hit,
+            policy,
+            std::env::var(expert_vram::EXPERT_GATE_TINYLFU_ENV)
+                .ok()
+                .as_deref(),
+        );
+        if bypass {
+            eprintln!(
+                "[flash] expert GPU gate: 載せ替え {} なので P45 のヒット率降格を使わない \
+                 (常時 GPU。DENNO_EXPERT_GATE_TINYLFU=0 で従来に戻る)",
+                policy.as_str()
+            );
+        }
+        Some(std::sync::Mutex::new(
+            expert_vram::ExpertGate::new(expert_vram::GateConfig {
                 min_hit,
                 ..Default::default()
-            },
-        )))
+            })
+            .with_bypass(bypass),
+        ))
     })
     .as_ref()
+}
+
+/// task 830: リクエスト終端の 1 行 (ゲートが無ければ `None`)。
+///
+/// 内訳を 0 に戻すので、リクエスト単位の数として読める。
+pub(crate) fn expert_gate_line() -> Option<String> {
+    let g = expert_gate()?;
+    let mut s = g.lock().ok()?;
+    let line = s.stats_line();
+    s.reset_decision_counts();
+    Some(line)
 }
 
 /// expert 1 本 (gate / up / down) を VRAM へ積むときのバイト数。
