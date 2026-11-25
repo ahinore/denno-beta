@@ -17,6 +17,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
@@ -771,6 +772,828 @@ impl Frame {
         }
         Ok(f)
     }
+}
+
+// ---------- NDJSON トレース (task 954) ----------
+//
+// トレースを 1 行 1 フレームの JSON (NDJSON) で書き出し / 読み戻す。依存は
+// std のみ。書き出しは `Frame` の全フィールドを過不足なく含み、読み戻しは
+// 壊れた行・切り詰め行・不正な JSON を panic せずに行番号付きで報告する。
+//
+// 形式 (1 行 = 1 オブジェクト、キー順は固定で決定的):
+//
+// ```text
+// {"kind":"token","session":1,"token":42,"pos":7}
+// {"kind":"layer_run","layer":3,"ops":[[4,1200],[5,900]]}
+// ```
+//
+// 数値は 10 進の整数で書く (u64 の ns も f64 を経由しないため精度が落ちない)。
+
+/// NDJSON の壊れた行。行番号は 1 始まり。読み飛ばしても読者は止まらない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NdjsonError {
+    /// 1 始まりの行番号
+    pub line: u64,
+    /// 何が壊れていたか
+    pub message: String,
+}
+
+impl std::fmt::Display for NdjsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}: {}", self.line, self.message)
+    }
+}
+
+impl std::error::Error for NdjsonError {}
+
+/// kind バイト → NDJSON の `kind` 文字列。未知の kind は `None`。
+pub fn ndjson_kind_name(k: u8) -> Option<&'static str> {
+    Some(match k {
+        kind::SERVER_INFO => "server_info",
+        kind::SESSION_ADMIT => "session_admit",
+        kind::SESSION_DONE => "session_done",
+        kind::PREFILL => "prefill",
+        kind::TOKEN => "token",
+        kind::STEP => "step",
+        kind::OP_SUMMARY => "op_summary",
+        kind::KV_USAGE => "kv_usage",
+        kind::GAP => "gap",
+        kind::TOP_K => "top_k",
+        kind::LAYER_RUN => "layer_run",
+        kind::LAYER_ACT => "layer_act",
+        kind::ROLE_ACT => "role_act",
+        kind::EXPERT_RESIDENCY => "expert_residency",
+        kind::TIER_STATS => "tier_stats",
+        kind::ROUTER_TOPK => "router_topk",
+        kind::EXPERT_SKIP => "expert_skip",
+        _ => return None,
+    })
+}
+
+/// NDJSON の `kind` 文字列 → kind バイト。
+pub fn ndjson_kind_from_name(name: &str) -> Option<u8> {
+    Some(match name {
+        "server_info" => kind::SERVER_INFO,
+        "session_admit" => kind::SESSION_ADMIT,
+        "session_done" => kind::SESSION_DONE,
+        "prefill" => kind::PREFILL,
+        "token" => kind::TOKEN,
+        "step" => kind::STEP,
+        "op_summary" => kind::OP_SUMMARY,
+        "kv_usage" => kind::KV_USAGE,
+        "gap" => kind::GAP,
+        "top_k" => kind::TOP_K,
+        "layer_run" => kind::LAYER_RUN,
+        "layer_act" => kind::LAYER_ACT,
+        "role_act" => kind::ROLE_ACT,
+        "expert_residency" => kind::EXPERT_RESIDENCY,
+        "tier_stats" => kind::TIER_STATS,
+        "router_topk" => kind::ROUTER_TOPK,
+        "expert_skip" => kind::EXPERT_SKIP,
+        _ => return None,
+    })
+}
+
+/// 文字列を JSON 文字列リテラルとして `out` に足す (引用符込み)。
+fn push_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// フレーム 1 個を 1 行の JSON (改行なし) にする。
+pub fn frame_to_ndjson(frame: &Frame) -> String {
+    let mut s = String::with_capacity(64);
+    s.push('{');
+    s.push_str("\"kind\":");
+    push_json_str(&mut s, ndjson_kind_name(frame.kind()).unwrap_or("unknown"));
+    match frame {
+        Frame::ServerInfo { model, model_id, quant, slots, context, layers } => {
+            s.push_str(",\"model\":"); push_json_str(&mut s, model);
+            s.push_str(",\"model_id\":"); push_json_str(&mut s, model_id);
+            s.push_str(",\"quant\":"); push_json_str(&mut s, quant);
+            s.push_str(",\"slots\":"); s.push_str(&slots.to_string());
+            s.push_str(",\"context\":"); s.push_str(&context.to_string());
+            s.push_str(",\"layers\":"); s.push_str(&layers.to_string());
+        }
+        Frame::SessionAdmit { session, slot, prompt_tokens } => {
+            s.push_str(",\"session\":"); s.push_str(&session.to_string());
+            s.push_str(",\"slot\":"); s.push_str(&slot.to_string());
+            s.push_str(",\"prompt_tokens\":"); s.push_str(&prompt_tokens.to_string());
+        }
+        Frame::SessionDone { session, reason, output_tokens } => {
+            s.push_str(",\"session\":"); s.push_str(&session.to_string());
+            s.push_str(",\"reason\":"); s.push_str(&reason.to_string());
+            s.push_str(",\"output_tokens\":"); s.push_str(&output_tokens.to_string());
+        }
+        Frame::Prefill { session, prompt_tokens, ns, tokens } => {
+            s.push_str(",\"session\":"); s.push_str(&session.to_string());
+            s.push_str(",\"prompt_tokens\":"); s.push_str(&prompt_tokens.to_string());
+            s.push_str(",\"ns\":"); s.push_str(&ns.to_string());
+            s.push_str(",\"tokens\":[");
+            for (i, t) in tokens.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&t.to_string());
+            }
+            s.push(']');
+        }
+        Frame::Token { session, token, pos } => {
+            s.push_str(",\"session\":"); s.push_str(&session.to_string());
+            s.push_str(",\"token\":"); s.push_str(&token.to_string());
+            s.push_str(",\"pos\":"); s.push_str(&pos.to_string());
+        }
+        Frame::Step { width, ns } => {
+            s.push_str(",\"width\":"); s.push_str(&width.to_string());
+            s.push_str(",\"ns\":"); s.push_str(&ns.to_string());
+        }
+        Frame::OpSummary { ops } => {
+            s.push_str(",\"ops\":[");
+            for (i, (op, ns)) in ops.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push('[');
+                s.push_str(&op.to_string());
+                s.push(',');
+                s.push_str(&ns.to_string());
+                s.push(']');
+            }
+            s.push(']');
+        }
+        Frame::KvUsage { busy, t_lens } => {
+            s.push_str(",\"busy\":[");
+            for (i, b) in busy.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(if *b { "true" } else { "false" });
+            }
+            s.push_str("],\"t_lens\":[");
+            for (i, t) in t_lens.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&t.to_string());
+            }
+            s.push(']');
+        }
+        Frame::Gap { lost } => {
+            s.push_str(",\"lost\":"); s.push_str(&lost.to_string());
+        }
+        Frame::TopK { session, chosen, entropy_f16, entries } => {
+            s.push_str(",\"session\":"); s.push_str(&session.to_string());
+            s.push_str(",\"chosen\":"); s.push_str(&chosen.to_string());
+            s.push_str(",\"entropy_f16\":"); s.push_str(&entropy_f16.to_string());
+            s.push_str(",\"entries\":[");
+            for (i, (id, p)) in entries.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push('[');
+                s.push_str(&id.to_string());
+                s.push(',');
+                s.push_str(&p.to_string());
+                s.push(']');
+            }
+            s.push(']');
+        }
+        Frame::LayerRun { layer, ops } => {
+            s.push_str(",\"layer\":"); s.push_str(&layer.to_string());
+            s.push_str(",\"ops\":[");
+            for (i, (op, ns)) in ops.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push('[');
+                s.push_str(&op.to_string());
+                s.push(',');
+                s.push_str(&ns.to_string());
+                s.push(']');
+            }
+            s.push(']');
+        }
+        Frame::LayerAct { layer, idx, val } => {
+            s.push_str(",\"layer\":"); s.push_str(&layer.to_string());
+            s.push_str(",\"idx\":[");
+            for (i, x) in idx.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&x.to_string());
+            }
+            s.push_str("],\"val\":[");
+            for (i, x) in val.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&x.to_string());
+            }
+            s.push(']');
+        }
+        Frame::RoleAct { layer, attn, gdn, router, shex, ple } => {
+            s.push_str(",\"layer\":"); s.push_str(&layer.to_string());
+            s.push_str(",\"attn\":"); s.push_str(&attn.to_string());
+            s.push_str(",\"gdn\":"); s.push_str(&gdn.to_string());
+            s.push_str(",\"router\":"); s.push_str(&router.to_string());
+            s.push_str(",\"shex\":"); s.push_str(&shex.to_string());
+            s.push_str(",\"ple\":"); s.push_str(&ple.to_string());
+        }
+        Frame::ExpertResidency { layer, in_vram } => {
+            s.push_str(",\"layer\":"); s.push_str(&layer.to_string());
+            s.push_str(",\"in_vram\":[");
+            for (i, e) in in_vram.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&e.to_string());
+            }
+            s.push(']');
+        }
+        Frame::TierStats { vram_used_mb, vram_total_mb, ram_experts, ssd_reads } => {
+            s.push_str(",\"vram_used_mb\":"); s.push_str(&vram_used_mb.to_string());
+            s.push_str(",\"vram_total_mb\":"); s.push_str(&vram_total_mb.to_string());
+            s.push_str(",\"ram_experts\":"); s.push_str(&ram_experts.to_string());
+            s.push_str(",\"ssd_reads\":"); s.push_str(&ssd_reads.to_string());
+        }
+        Frame::RouterTopK { layer, experts, weights } => {
+            s.push_str(",\"layer\":"); s.push_str(&layer.to_string());
+            s.push_str(",\"experts\":[");
+            for (i, e) in experts.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&e.to_string());
+            }
+            s.push_str("],\"weights\":[");
+            for (i, w) in weights.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&w.to_string());
+            }
+            s.push(']');
+        }
+        Frame::ExpertSkip { layer, experts } => {
+            s.push_str(",\"layer\":"); s.push_str(&layer.to_string());
+            s.push_str(",\"experts\":[");
+            for (i, e) in experts.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&e.to_string());
+            }
+            s.push(']');
+        }
+    }
+    s.push('}');
+    s
+}
+
+/// フレーム 1 個を NDJSON の 1 行 (末尾 `\n` 込み) として書き出す。
+pub fn write_frame_ndjson<W: Write>(w: &mut W, frame: &Frame) -> std::io::Result<()> {
+    let mut line = frame_to_ndjson(frame);
+    line.push('\n');
+    w.write_all(line.as_bytes())
+}
+
+/// フレーム列を NDJSON として書き出す。書いた行数を返す。
+pub fn write_frames_ndjson<W: Write>(w: &mut W, frames: &[Frame]) -> std::io::Result<usize> {
+    for f in frames {
+        write_frame_ndjson(w, f)?;
+    }
+    Ok(frames.len())
+}
+
+// ----- 最小 JSON パーサ (NDJSON 読み戻し専用。外部依存なし) -----
+
+#[derive(Debug, Clone, PartialEq)]
+enum Json {
+    Null,
+    Bool(bool),
+    /// 数値は原文のまま保持する (u64 を f64 経由で丸めないため)。
+    Num(String),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+struct JsonParser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, i: 0 }
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.b.get(self.i).copied() {
+            if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn expect(&mut self, want: u8) -> Result<(), String> {
+        match self.b.get(self.i).copied() {
+            Some(c) if c == want => {
+                self.i += 1;
+                Ok(())
+            }
+            Some(c) => Err(format!("expected {:?} at {}, got {:?}", want as char, self.i, c as char)),
+            None => Err(format!("unexpected end of input (expected {:?})", want as char)),
+        }
+    }
+
+    fn literal(&mut self, word: &str) -> Result<(), String> {
+        let bytes = word.as_bytes();
+        let end = self.i + bytes.len();
+        if end > self.b.len() || &self.b[self.i..end] != bytes {
+            return Err(format!("invalid literal at {}: expected {word}", self.i));
+        }
+        self.i = end;
+        Ok(())
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<Json, String> {
+        if depth > 64 {
+            return Err("nesting too deep".into());
+        }
+        self.skip_ws();
+        let c = match self.b.get(self.i).copied() {
+            Some(c) => c,
+            None => return Err("unexpected end of input".into()),
+        };
+        match c {
+            b'{' => {
+                self.i += 1;
+                self.parse_obj(depth)
+            }
+            b'[' => {
+                self.i += 1;
+                self.parse_arr(depth)
+            }
+            b'"' => Ok(Json::Str(self.parse_str()?)),
+            b't' => {
+                self.literal("true")?;
+                Ok(Json::Bool(true))
+            }
+            b'f' => {
+                self.literal("false")?;
+                Ok(Json::Bool(false))
+            }
+            b'n' => {
+                self.literal("null")?;
+                Ok(Json::Null)
+            }
+            b'-' | b'0'..=b'9' => self.parse_num(),
+            other => Err(format!("unexpected byte {other:#04x} at {}", self.i)),
+        }
+    }
+
+    fn parse_obj(&mut self, depth: usize) -> Result<Json, String> {
+        let mut fields = Vec::new();
+        self.skip_ws();
+        if self.b.get(self.i).copied() == Some(b'}') {
+            self.i += 1;
+            return Ok(Json::Obj(fields));
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_str()?;
+            self.skip_ws();
+            self.expect(b':')?;
+            let v = self.parse_value(depth + 1)?;
+            fields.push((key, v));
+            self.skip_ws();
+            match self.b.get(self.i).copied() {
+                Some(b',') => {
+                    self.i += 1;
+                }
+                Some(b'}') => {
+                    self.i += 1;
+                    return Ok(Json::Obj(fields));
+                }
+                Some(c) => return Err(format!("expected ',' or '}}' at {}, got {:?}", self.i, c as char)),
+                None => return Err("unexpected end of input in object".into()),
+            }
+        }
+    }
+
+    fn parse_arr(&mut self, depth: usize) -> Result<Json, String> {
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.b.get(self.i).copied() == Some(b']') {
+            self.i += 1;
+            return Ok(Json::Arr(items));
+        }
+        loop {
+            let v = self.parse_value(depth + 1)?;
+            items.push(v);
+            self.skip_ws();
+            match self.b.get(self.i).copied() {
+                Some(b',') => {
+                    self.i += 1;
+                }
+                Some(b']') => {
+                    self.i += 1;
+                    return Ok(Json::Arr(items));
+                }
+                Some(c) => return Err(format!("expected ',' or ']' at {}, got {:?}", self.i, c as char)),
+                None => return Err("unexpected end of input in array".into()),
+            }
+        }
+    }
+
+    fn parse_str(&mut self) -> Result<String, String> {
+        self.expect(b'"')?;
+        let mut out = String::new();
+        loop {
+            let c = match self.b.get(self.i).copied() {
+                Some(c) => c,
+                None => return Err("unterminated string".into()),
+            };
+            self.i += 1;
+            match c {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let e = match self.b.get(self.i).copied() {
+                        Some(e) => e,
+                        None => return Err("unterminated escape".into()),
+                    };
+                    self.i += 1;
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{08}'),
+                        b'f' => out.push('\u{0c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hi = self.parse_hex4()?;
+                            let ch = if (0xd800..0xdc00).contains(&hi) {
+                                // サロゲートペア
+                                if self.b.get(self.i).copied() != Some(b'\\')
+                                    || self.b.get(self.i + 1).copied() != Some(b'u')
+                                {
+                                    return Err("lone high surrogate".into());
+                                }
+                                self.i += 2;
+                                let lo = self.parse_hex4()?;
+                                if !(0xdc00..0xe000).contains(&lo) {
+                                    return Err("invalid low surrogate".into());
+                                }
+                                let cp = 0x10000 + (((hi - 0xd800) as u32) << 10) + (lo - 0xdc00) as u32;
+                                char::from_u32(cp).ok_or("invalid code point")?
+                            } else {
+                                char::from_u32(hi as u32).ok_or("invalid code point")?
+                            };
+                            out.push(ch);
+                        }
+                        other => return Err(format!("invalid escape \\{}", other as char)),
+                    }
+                }
+                c if c < 0x20 => return Err(format!("raw control byte {c:#04x} in string")),
+                c if c < 0x80 => out.push(c as char),
+                c => {
+                    // UTF-8 のマルチバイト列を 1 文字ぶんまとめて読む。
+                    let len = if c >= 0xf0 {
+                        4
+                    } else if c >= 0xe0 {
+                        3
+                    } else if c >= 0xc0 {
+                        2
+                    } else {
+                        return Err(format!("invalid utf-8 lead byte {c:#04x} in string"));
+                    };
+                    let start = self.i - 1;
+                    let end = start + len;
+                    if end > self.b.len() {
+                        return Err("truncated utf-8 sequence in string".into());
+                    }
+                    let s = std::str::from_utf8(&self.b[start..end])
+                        .map_err(|_| "invalid utf-8 sequence in string".to_string())?;
+                    out.push_str(s);
+                    self.i = end;
+                }
+            }
+        }
+    }
+
+    fn parse_hex4(&mut self) -> Result<u16, String> {
+        let mut v: u16 = 0;
+        for _ in 0..4 {
+            let c = match self.b.get(self.i).copied() {
+                Some(c) => c,
+                None => return Err("truncated \\u escape".into()),
+            };
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => return Err("invalid hex digit in \\u escape".into()),
+            };
+            v = (v << 4) | d as u16;
+            self.i += 1;
+        }
+        Ok(v)
+    }
+
+    fn parse_num(&mut self) -> Result<Json, String> {
+        let start = self.i;
+        while let Some(c) = self.b.get(self.i).copied() {
+            match c {
+                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => self.i += 1,
+                _ => break,
+            }
+        }
+        let raw = std::str::from_utf8(&self.b[start..self.i])
+            .map_err(|_| "invalid number bytes".to_string())?;
+        raw.parse::<f64>().map_err(|_| format!("invalid number: {raw}"))?;
+        Ok(Json::Num(raw.to_string()))
+    }
+}
+
+fn field<'a>(obj: &'a [(String, Json)], key: &str) -> Result<&'a Json, String> {
+    obj.iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+        .ok_or_else(|| format!("missing field: {key}"))
+}
+
+fn as_str(j: &Json) -> Result<&str, String> {
+    match j {
+        Json::Str(s) => Ok(s),
+        _ => Err("expected string".into()),
+    }
+}
+
+fn as_u64(j: &Json) -> Result<u64, String> {
+    match j {
+        Json::Num(s) => s.parse::<u64>().map_err(|_| format!("not a non-negative integer: {s}")),
+        _ => Err("expected number".into()),
+    }
+}
+
+fn as_u32(j: &Json) -> Result<u32, String> {
+    let v = as_u64(j)?;
+    if v > u32::MAX as u64 {
+        return Err(format!("{v} overflows u32"));
+    }
+    Ok(v as u32)
+}
+
+fn as_u16(j: &Json) -> Result<u16, String> {
+    let v = as_u64(j)?;
+    if v > u16::MAX as u64 {
+        return Err(format!("{v} overflows u16"));
+    }
+    Ok(v as u16)
+}
+
+fn as_u8(j: &Json) -> Result<u8, String> {
+    let v = as_u64(j)?;
+    if v > u8::MAX as u64 {
+        return Err(format!("{v} overflows u8"));
+    }
+    Ok(v as u8)
+}
+
+fn as_bool(j: &Json) -> Result<bool, String> {
+    match j {
+        Json::Bool(b) => Ok(*b),
+        _ => Err("expected bool".into()),
+    }
+}
+
+fn as_arr(j: &Json) -> Result<&[Json], String> {
+    match j {
+        Json::Arr(a) => Ok(a),
+        _ => Err("expected array".into()),
+    }
+}
+
+fn u32_list(j: &Json) -> Result<Vec<u32>, String> {
+    as_arr(j)?.iter().map(as_u32).collect()
+}
+
+fn u16_list(j: &Json) -> Result<Vec<u16>, String> {
+    as_arr(j)?.iter().map(as_u16).collect()
+}
+
+fn op_ns_list(j: &Json) -> Result<Vec<(u8, u64)>, String> {
+    let mut out = Vec::new();
+    for item in as_arr(j)? {
+        let pair = as_arr(item)?;
+        if pair.len() != 2 {
+            return Err(format!("op pair must have 2 elements, got {}", pair.len()));
+        }
+        out.push((as_u8(&pair[0])?, as_u64(&pair[1])?));
+    }
+    Ok(out)
+}
+
+/// NDJSON の 1 行を [`Frame`] にする。JSON として不正・フィールド欠落・
+/// 型違い・未知の kind・末尾の余分なバイトはすべて `Err` (panic しない)。
+pub fn parse_frame_line(line: &str) -> Result<Frame, String> {
+    let mut p = JsonParser::new(line.as_bytes());
+    let v = p.parse_value(0)?;
+    p.skip_ws();
+    if p.i != p.b.len() {
+        return Err(format!("trailing bytes after JSON: {} / {}", p.i, p.b.len()));
+    }
+    let obj = match &v {
+        Json::Obj(o) => o,
+        _ => return Err("top-level value is not a JSON object".into()),
+    };
+    let kind_name = as_str(field(obj, "kind")?)?;
+    let k = ndjson_kind_from_name(kind_name)
+        .ok_or_else(|| format!("unknown kind: {kind_name}"))?;
+    let f = match k {
+        kind::SERVER_INFO => Frame::ServerInfo {
+            model: as_str(field(obj, "model")?)?.to_string(),
+            model_id: as_str(field(obj, "model_id")?)?.to_string(),
+            quant: as_str(field(obj, "quant")?)?.to_string(),
+            slots: as_u32(field(obj, "slots")?)?,
+            context: as_u32(field(obj, "context")?)?,
+            layers: as_u32(field(obj, "layers")?)?,
+        },
+        kind::SESSION_ADMIT => Frame::SessionAdmit {
+            session: as_u32(field(obj, "session")?)?,
+            slot: as_u32(field(obj, "slot")?)?,
+            prompt_tokens: as_u32(field(obj, "prompt_tokens")?)?,
+        },
+        kind::SESSION_DONE => Frame::SessionDone {
+            session: as_u32(field(obj, "session")?)?,
+            reason: as_u8(field(obj, "reason")?)?,
+            output_tokens: as_u32(field(obj, "output_tokens")?)?,
+        },
+        kind::PREFILL => Frame::Prefill {
+            session: as_u32(field(obj, "session")?)?,
+            prompt_tokens: as_u32(field(obj, "prompt_tokens")?)?,
+            ns: as_u64(field(obj, "ns")?)?,
+            tokens: u32_list(field(obj, "tokens")?)?,
+        },
+        kind::TOKEN => Frame::Token {
+            session: as_u32(field(obj, "session")?)?,
+            token: as_u32(field(obj, "token")?)?,
+            pos: as_u32(field(obj, "pos")?)?,
+        },
+        kind::STEP => Frame::Step {
+            width: as_u32(field(obj, "width")?)?,
+            ns: as_u64(field(obj, "ns")?)?,
+        },
+        kind::OP_SUMMARY => Frame::OpSummary {
+            ops: op_ns_list(field(obj, "ops")?)?,
+        },
+        kind::KV_USAGE => {
+            let busy = as_arr(field(obj, "busy")?)?
+                .iter()
+                .map(as_bool)
+                .collect::<Result<Vec<_>, _>>()?;
+            let t_lens = u32_list(field(obj, "t_lens")?)?;
+            Frame::KvUsage { busy, t_lens }
+        }
+        kind::GAP => Frame::Gap {
+            lost: as_u32(field(obj, "lost")?)?,
+        },
+        kind::TOP_K => {
+            let mut entries = Vec::new();
+            for item in as_arr(field(obj, "entries")?)? {
+                let pair = as_arr(item)?;
+                if pair.len() != 2 {
+                    return Err(format!("top_k entry must have 2 elements, got {}", pair.len()));
+                }
+                entries.push((as_u32(&pair[0])?, as_u16(&pair[1])?));
+            }
+            Frame::TopK {
+                session: as_u32(field(obj, "session")?)?,
+                chosen: as_u32(field(obj, "chosen")?)?,
+                entropy_f16: as_u16(field(obj, "entropy_f16")?)?,
+                entries,
+            }
+        }
+        kind::LAYER_RUN => Frame::LayerRun {
+            layer: as_u16(field(obj, "layer")?)?,
+            ops: op_ns_list(field(obj, "ops")?)?,
+        },
+        kind::LAYER_ACT => Frame::LayerAct {
+            layer: as_u16(field(obj, "layer")?)?,
+            idx: u32_list(field(obj, "idx")?)?,
+            val: u16_list(field(obj, "val")?)?,
+        },
+        kind::ROLE_ACT => Frame::RoleAct {
+            layer: as_u16(field(obj, "layer")?)?,
+            attn: as_u16(field(obj, "attn")?)?,
+            gdn: as_u16(field(obj, "gdn")?)?,
+            router: as_u16(field(obj, "router")?)?,
+            shex: as_u16(field(obj, "shex")?)?,
+            ple: as_u16(field(obj, "ple")?)?,
+        },
+        kind::EXPERT_RESIDENCY => Frame::ExpertResidency {
+            layer: as_u16(field(obj, "layer")?)?,
+            in_vram: u16_list(field(obj, "in_vram")?)?,
+        },
+        kind::TIER_STATS => Frame::TierStats {
+            vram_used_mb: as_u32(field(obj, "vram_used_mb")?)?,
+            vram_total_mb: as_u32(field(obj, "vram_total_mb")?)?,
+            ram_experts: as_u32(field(obj, "ram_experts")?)?,
+            ssd_reads: as_u32(field(obj, "ssd_reads")?)?,
+        },
+        kind::ROUTER_TOPK => Frame::RouterTopK {
+            layer: as_u16(field(obj, "layer")?)?,
+            experts: u16_list(field(obj, "experts")?)?,
+            weights: u16_list(field(obj, "weights")?)?,
+        },
+        kind::EXPERT_SKIP => Frame::ExpertSkip {
+            layer: as_u16(field(obj, "layer")?)?,
+            experts: u16_list(field(obj, "experts")?)?,
+        },
+        other => return Err(format!("unknown kind byte: {other}")),
+    };
+    Ok(f)
+}
+
+/// NDJSON を 1 行ずつ読むイテレータ。壊れた行は `Err` として 1 個返し、
+/// そのまま次の行へ進む (停止しない・panic しない)。空行は読み飛ばす。
+pub struct NdjsonFrames<R: BufRead> {
+    reader: R,
+    buf: Vec<u8>,
+    line: u64,
+    done: bool,
+}
+
+impl<R: BufRead> NdjsonFrames<R> {
+    pub fn new(reader: R) -> Self {
+        Self { reader, buf: Vec::new(), line: 0, done: false }
+    }
+
+    /// ここまでに読んだ行数 (壊れた行・空行を含む)。
+    pub fn line_no(&self) -> u64 {
+        self.line
+    }
+
+    /// 残りを読み切る。`(有効なフレーム, 壊れた行)` を返す。
+    pub fn collect_frames(mut self) -> (Vec<Frame>, Vec<NdjsonError>) {
+        let mut frames = Vec::new();
+        let mut errors = Vec::new();
+        for item in &mut self {
+            match item {
+                Ok(f) => frames.push(f),
+                Err(e) => errors.push(e),
+            }
+        }
+        (frames, errors)
+    }
+}
+
+impl<R: BufRead> Iterator for NdjsonFrames<R> {
+    type Item = Result<Frame, NdjsonError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            self.buf.clear();
+            let n = match self.reader.read_until(b'\n', &mut self.buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.done = true;
+                    self.line += 1;
+                    return Some(Err(NdjsonError {
+                        line: self.line,
+                        message: format!("io error: {e}"),
+                    }));
+                }
+            };
+            if n == 0 {
+                self.done = true;
+                return None;
+            }
+            self.line += 1;
+            let line_no = self.line;
+            while matches!(self.buf.last(), Some(b'\n') | Some(b'\r')) {
+                self.buf.pop();
+            }
+            if self.buf.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let text = match std::str::from_utf8(&self.buf) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Some(Err(NdjsonError {
+                        line: line_no,
+                        message: format!("invalid utf-8: {e}"),
+                    }))
+                }
+            };
+            return Some(
+                parse_frame_line(text).map_err(|message| NdjsonError { line: line_no, message }),
+            );
+        }
+    }
+}
+
+/// `impl BufRead` から NDJSON を読む。壊れた行はスキップし、行番号付きで返す。
+pub fn read_frames_ndjson<R: BufRead>(reader: R) -> (Vec<Frame>, Vec<NdjsonError>) {
+    NdjsonFrames::new(reader).collect_frames()
 }
 
 // ---------- 送出ハブ (エンジン側) ----------
