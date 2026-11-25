@@ -4581,6 +4581,12 @@ include!("tests_h2.rs");
         const NE: usize = 64;
         let dir = TempDir::new("pagehint862");
         let path = write_expert_gguf_n(&dir, "ph.gguf", N_EMBD, N_FF, NE, 1);
+        // dirty のままだと fadvise が無効化しない。書いた内容を確定させてから開く。
+        {
+            use std::fs::OpenOptions;
+            let f = OpenOptions::new().write(true).open(&path).expect("open w");
+            f.sync_all().expect("sync_all");
+        }
         let f = GgufFile::open(&path).expect("open");
         let mut p = cache_test_params();
         p.n_expert = NE;
@@ -4588,9 +4594,25 @@ include!("tests_h2.rs");
         register_expert_maps(&f, std::slice::from_ref(&lw));
         let tensors = [&lw.gate_exps, &lw.up_exps, &lw.down_exps];
         // 1. 全体を追い出してから読み直す (実運用の「ディスクから読んだ直後」)。
+        let probe = |e: usize| -> usize {
+            let (map, base) = lw.gate_exps.map_base().expect("mmap 経路");
+            let stride = lw.gate_exps.expert_stride().expect("stride");
+            map.as_ptr() as usize + base + e * stride + (stride / 2 / 4096) * 4096
+        };
         for w in tensors {
             let (map, _) = w.map_base().expect("mmap 経路");
             let _ = ph::drop_range(&map, 0, map.len());
+        }
+        // 追い出せたことを確かめる (writeback が残っていると何も落ちない)。
+        for _ in 0..50 {
+            if unsafe { crate::model::exp_pf::range_resident(probe(0), 4096) } == Some(false) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            for w in tensors {
+                let (map, _) = w.map_base().expect("mmap 経路");
+                let _ = ph::drop_range(&map, 0, map.len());
+            }
         }
         for w in tensors {
             let mut acc = 0u64;
