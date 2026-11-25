@@ -575,11 +575,9 @@ async fn client_stop_sequence_aligned_to_chunks_truncates() {
     assert_eq!(stop_sequence(&events), json!("STOP"));
 }
 
-/// 既知の engine 側ギャップ (Scope 外): クライアント stop がトークン境界を
-/// またぐと、engine が停止語 prefix を holdback しないため先頭バイトが漏れる。
-/// engine が修正されたらこの `#[ignore]` を外す (そのとき期待値 "xy" で通る)。
+/// クライアント stop がトークン境界をまたいでも停止語の prefix は漏れない
+/// (task 956: engine 側の prefix holdback で解消)。
 #[tokio::test]
-#[ignore = "engine.rs が stop_sequences の prefix holdback を持たない (Scope 外・既知ギャップ)"]
 async fn client_stop_sequence_straddling_chunks_does_not_leak() {
     let pieces = vec![
         b"xy".to_vec(),

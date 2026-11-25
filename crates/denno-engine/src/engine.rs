@@ -1450,33 +1450,35 @@ impl Engine {
         //   - prefix になり得るならその手前まで送出し、末尾は保持
         let start = sess.sent_len;
         let at_line_start = start == 0 || sess.text[..start].ends_with('\n');
-        match overall_stop_status(&sess.text[start..], at_line_start) {
-            StopStatus::Matched(idx, marker) => {
-                let at = start + idx;
-                sess.text.truncate(at);
-                sess.sent_len = sess.text.len();
-                sess.stop_reason = StopReason::StopSequence;
-                sess.stop_sequence = Some(marker);
-                return Ok(true);
-            }
-            StopStatus::Partial(k) => {
-                // k は text 側の char 境界に丸める (安全弁・通常は境界一致)
-                let mut end = (start + k).min(sess.text.len());
-                while end > start && !sess.text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                if end > start {
-                    on_delta(&sess.text[start..end]);
-                }
-                sess.sent_len = end;
-            }
-            StopStatus::Clear => {
-                if start < sess.text.len() {
-                    on_delta(&sess.text[start..]);
-                }
-                sess.sent_len = sess.text.len();
+        let status = overall_stop_status(&sess.text[start..], at_line_start);
+        if let StopStatus::Matched(idx, marker) = &status {
+            let at = start + idx;
+            sess.text.truncate(at);
+            sess.sent_len = sess.text.len();
+            sess.stop_reason = StopReason::StopSequence;
+            sess.stop_sequence = Some(marker.clone());
+            return Ok(true);
+        }
+        // task 956: クライアント stop_sequences の「真の prefix」も保持する。
+        // (空リストなら呼ばない = 既定のストリーミング遅延は不変)
+        let mut safe = sess.text.len() - start;
+        if let StopStatus::Partial(k) = status {
+            safe = safe.min(k);
+        }
+        if !sess.stop_sequences.is_empty() {
+            if let Some(k) = client_stop_prefix_holdback(&sess.text[start..], &sess.stop_sequences) {
+                safe = safe.min(k);
             }
         }
+        // k は text 側の char 境界に丸める (安全弁・通常は境界一致)
+        let mut end = (start + safe).min(sess.text.len());
+        while end > start && !sess.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end > start {
+            on_delta(&sess.text[start..end]);
+        }
+        sess.sent_len = end;
         Ok(false)
     }
 
@@ -1929,6 +1931,29 @@ fn overall_stop_status(s: &str, at_line_start: bool) -> StopStatus {
     partial_holdback(&s[last_start..])
         .map(|k| StopStatus::Partial(last_start + k))
         .unwrap_or(StopStatus::Clear)
+}
+
+/// task 956: クライアント指定 stop_sequence の prefix holdback。
+///
+/// 未送出テキスト `s` の末尾が stop_sequence の **真の prefix** (長さ < stop) に
+/// なり得る場合、保持を始めるべき開始位置 (`s` 先頭からのバイト位置) を返す。
+/// 複数候補があるときは最も手前 (= 最長一致) を返す。該当なしは `None`。
+///
+/// 完全一致は呼び出し側で先に処理済みなので、ここでは扱わない。
+/// `s` の開始位置を超えて保持することはない (開始位置より前は既に送出済み)。
+fn client_stop_prefix_holdback(s: &str, stops: &[String]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for stop in stops.iter().filter(|s| !s.is_empty()) {
+        // suffix の開始位置を手前から走査する (char 境界のみ・長い suffix 優先)。
+        for i in s.char_indices().map(|(i, _)| i) {
+            let tail = &s[i..];
+            if tail.len() < stop.len() && stop.starts_with(tail) {
+                best = Some(best.map_or(i, |b: usize| b.min(i)));
+                break;
+            }
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -2957,12 +2982,22 @@ mod tests {
         extra_vocab: &[&str],
         stop_sequences: Vec<String>,
     ) -> (ChatOutput, Vec<String>) {
+        run_script_streamed_max(script, extra_vocab, stop_sequences, 64)
+    }
+
+    /// `run_script_streamed` の max_tokens 指定版 (EOF 経路の検証用)。
+    fn run_script_streamed_max(
+        script: &[u32],
+        extra_vocab: &[&str],
+        stop_sequences: Vec<String>,
+        max_tokens: usize,
+    ) -> (ChatOutput, Vec<String>) {
         use std::cell::RefCell;
         let tok = crate::testutil::tool_tokenizer_with(extra_vocab).unwrap();
         let model = Box::new(crate::testutil::ScriptModel::new(script.to_vec(), tid("t0")));
         let mut e = Engine::from_parts(model, tok, "m", None);
         let deltas = RefCell::new(Vec::<String>::new());
-        let mut p = params(64);
+        let mut p = params(max_tokens);
         p.stop_sequences = stop_sequences;
         let mut sess = e.begin_chat(None, &msgs("t0"), &p).unwrap();
         e.install_session(&mut sess).unwrap();
@@ -3154,6 +3189,112 @@ mod tests {
         let (ids4, extra4) = script_extra(&["abc def", "eos"]);
         let out4 = run_script_streamed(&ids4, &extra4, vec!["def".into(), "c d".into()]).0;
         assert_eq!(out4.stop_sequence.as_deref(), Some("c d"));
+    }
+
+    // ---------- task 956: クライアント stop_sequence の prefix holdback ----------
+
+    /// 純関数: 真の prefix のみ保持し、完全一致・無関係な末尾・空 stop は
+    /// 保持しない。重なりは最長 (= 最も手前) を採る。
+    #[test]
+    fn client_stop_prefix_holdback_holds_only_true_prefixes() {
+        let stops = vec!["END".to_string()];
+        // 完全一致は呼び出し側で処理済み → ここでは保持しない
+        assert_eq!(client_stop_prefix_holdback("xyEND", &stops), None);
+        // 末尾が真の prefix → その開始位置から保持
+        assert_eq!(client_stop_prefix_holdback("xyEN", &stops), Some(2));
+        assert_eq!(client_stop_prefix_holdback("xyE", &stops), Some(2));
+        // 関係ない末尾は保持しない
+        assert_eq!(client_stop_prefix_holdback("xy", &stops), None);
+        // 全体が prefix なら先頭から保持
+        assert_eq!(client_stop_prefix_holdback("EN", &stops), Some(0));
+        // 重なり: 最長 (= 最も手前) の suffix を採る
+        let stops2 = vec!["aba".to_string(), "ba".to_string()];
+        assert_eq!(client_stop_prefix_holdback("xab", &stops2), Some(1));
+        // 完全一致した suffix ("ba") は保持しないが、より短い真の prefix
+        // ("a" = "aba" の prefix) は保持対象なので手前から保持する
+        assert_eq!(client_stop_prefix_holdback("xba", &stops2), Some(2));
+        // 別 stop の真の prefix が重なる場合はその手前から保持
+        let stops2b = vec!["aba".to_string(), "bab".to_string()];
+        assert_eq!(client_stop_prefix_holdback("xba", &stops2b), Some(1));
+        // 空文字列 stop は無視する
+        assert_eq!(client_stop_prefix_holdback("xyE", &["".to_string()]), None);
+        // マルチバイト: char 境界のみ候補 (途中のバイト位置は保持開始にしない)
+        let stops3 = vec!["日本".to_string()];
+        assert_eq!(client_stop_prefix_holdback("今日", &stops3), Some(3));
+        assert_eq!(client_stop_prefix_holdback("今日本", &stops3), None); // 完全一致は対象外
+        let stops3c = vec!["日本語".to_string()];
+        assert_eq!(client_stop_prefix_holdback("今日本", &stops3c), Some(3));
+        // 2 バイト文字の 1 バイト目は候補にならない ("本日" の suffix "日" は prefix でない)
+        let stops3b = vec!["本日".to_string()];
+        assert_eq!(client_stop_prefix_holdback("今日", &stops3b), None);
+    }
+
+    /// 複数トークンにまたがる stop ("END") でも prefix は漏れず、
+    /// 非ストリーミングと同じ位置で打ち切られる。
+    #[test]
+    fn client_stop_prefix_is_held_back_across_tokens() {
+        let _g = crate::prof::counters_guard();
+        let (ids, extra) = script_extra(&["xy", "E", "N", "D", "z", "eos"]);
+        let (out, deltas) = run_script_streamed(&ids, &extra, vec!["END".into()]);
+        assert_eq!(out.text, "xy");
+        assert_eq!(out.stop_reason, StopReason::StopSequence);
+        assert_eq!(out.stop_sequence.as_deref(), Some("END"));
+        assert_eq!(deltas.concat(), "xy", "deltas = {deltas:?}");
+        // prefix の各文字が delta に現れない (漏れなし)
+        assert!(
+            deltas.iter().all(|d| !d.contains('E') && !d.contains('N') && !d.contains('D')),
+            "stop prefix leaked: {deltas:?}"
+        );
+    }
+
+    /// 重なる stop (["ab", "abc"]) でも最長 prefix を保持し、最早一致で止まる。
+    #[test]
+    fn client_stop_overlapping_prefixes_hold_back() {
+        let _g = crate::prof::counters_guard();
+        let (ids, extra) = script_extra(&["xa", "b", "z", "eos"]);
+        let (out, deltas) = run_script_streamed(&ids, &extra, vec!["ab".into(), "abc".into()]);
+        assert_eq!(out.text, "x");
+        assert_eq!(out.stop_reason, StopReason::StopSequence);
+        assert_eq!(out.stop_sequence.as_deref(), Some("ab"));
+        assert_eq!(deltas.concat(), "x", "deltas = {deltas:?}");
+    }
+
+    /// マルチバイト stop の prefix を 2 バイト文字単位で保持する
+    /// (文字の途中で切らない・漏らさない)。
+    #[test]
+    fn client_stop_multibyte_prefix_is_held_back() {
+        let _g = crate::prof::counters_guard();
+        let (ids, extra) = script_extra(&["今日", "本", "日", "eos"]);
+        let (out, deltas) = run_script_streamed(&ids, &extra, vec!["日本".into()]);
+        assert_eq!(out.text, "今");
+        assert_eq!(out.stop_reason, StopReason::StopSequence);
+        assert_eq!(out.stop_sequence.as_deref(), Some("日本"));
+        assert_eq!(deltas.concat(), "今", "deltas = {deltas:?}");
+    }
+
+    /// stop_sequences が空なら追加の保持は起きない (既定のストリーミング遅延不変)。
+    #[test]
+    fn empty_stop_sequences_do_not_delay_streaming() {
+        let _g = crate::prof::counters_guard();
+        let (ids, extra) = script_extra(&["xy", "E", "N", "D", "eos"]);
+        let (out, deltas) = run_script_streamed(&ids, &extra, Vec::new());
+        assert_eq!(out.text, "xyEND");
+        assert_eq!(deltas.concat(), "xyEND");
+        // 1 step 1 delta (保持が挟まらない)
+        assert_eq!(deltas.len(), 4, "deltas = {deltas:?}");
+    }
+
+    /// max_tokens (EOF 相当) で停止語が完成しなかった場合、保持していた
+    /// 安全なテキストは捨てずに流す。
+    #[test]
+    fn held_stop_prefix_flushes_at_max_tokens() {
+        let _g = crate::prof::counters_guard();
+        let (ids, extra) = script_extra(&["xy", "E", "N", "z", "eos"]);
+        // max_tokens = 3 → "xyE" までで終了 ("EN" は未完成の prefix)
+        let (out, deltas) = run_script_streamed_max(&ids, &extra, vec!["END".into()], 3);
+        assert_eq!(out.text, "xyEN");
+        assert_eq!(out.stop_reason, StopReason::MaxTokens);
+        assert_eq!(deltas.concat(), "xyEN", "held text dropped: {deltas:?}");
     }
 
     // ---------- 第21: tool_choice 拘束デコード (engine 経路) ----------
