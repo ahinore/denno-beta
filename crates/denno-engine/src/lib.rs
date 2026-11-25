@@ -37,6 +37,7 @@ pub mod gpu_report;
 pub mod testutil;
 
 pub use engine::{ChatMessage, ChatOutput, ChatSession, Engine, GenParams, PrefixHit, StopReason};
+pub use engine::{TokenLogprob, TopLogprob};
 pub use quant::{Linear, Quant8Linear, QuantMode};
 pub use toolmask::ToolConstraint;
 

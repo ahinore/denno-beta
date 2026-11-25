@@ -1615,6 +1615,7 @@ mod tool_tests {
             stop_sequence: None,
             input_tokens: 10,
             output_tokens: 5,
+            logprobs: Vec::new(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 10,
         }

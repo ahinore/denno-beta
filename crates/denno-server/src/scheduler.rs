@@ -52,7 +52,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use axum::response::sse::Event;
-use denno_engine::{prof, ChatMessage, ChatOutput, ChatSession, Engine, GenParams, ToolConstraint};
+use denno_engine::{
+    prof, ChatMessage, ChatOutput, ChatSession, Engine, GenParams, TokenLogprob, ToolConstraint,
+};
 use serde_json::json;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -127,6 +129,8 @@ pub enum Job {
         /// system / messages / tools / constraint / enable_thinking は未使用。
         raw_prompt: Option<String>,
         respond: oneshot::Sender<Result<ChatOutput>>,
+        /// P869: logprobs を記録するときだけ Some(top_n) (None = 既定・追加コストなし)
+        logprobs: Option<usize>,
     },
     /// SSE ストリーミング生成 (イベントを events チャネルに流す)
     Stream {
@@ -154,6 +158,8 @@ pub enum Job {
         /// P837: raw prompt (`/v1/completions` の stream。意味は `Job::Chat` と同じ)
         raw_prompt: Option<String>,
         events: tokio_mpsc::Sender<RawEvent>,
+        /// P869: logprobs を記録するときだけ Some(top_n) (None = 既定・追加コストなし)
+        logprobs: Option<usize>,
     },
 }
 
@@ -167,6 +173,9 @@ pub enum RawEvent {
     Start { input_tokens: usize },
     /// detok 済みの text delta (1 トークン分の piece)
     Delta(String),
+    /// P869: 生成 1 トークン分の logprobs (`logprobs=true` のときだけ流れる)。
+    /// `Delta` とは独立の chunk で、HTTP 側は `choices[0].logprobs.content` に載せる。
+    Logprob(TokenLogprob),
     /// 生成終了。stop_reason は engine の表記 (`end_turn` / `max_tokens` / `stop_sequence`)
     Done {
         input_tokens: usize,
@@ -341,8 +350,43 @@ impl Scheduler {
         constraint: Option<ToolConstraint>,
         enable_thinking: Option<bool>,
     ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
+        self.submit_chat_ext(
+            system,
+            messages,
+            params,
+            tools,
+            constraint,
+            enable_thinking,
+            None,
+        )
+    }
+
+    /// P869: [`Scheduler::submit_chat`] の logprobs 指定版。
+    /// `logprobs = Some(top_n)` のときだけ生成トークンの log 確率を
+    /// [`ChatOutput::logprobs`] に載せる (None = 従来と完全同一)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_chat_ext(
+        &self,
+        system: Option<String>,
+        messages: Vec<ChatMessage>,
+        params: GenParams,
+        tools: Option<serde_json::Value>,
+        constraint: Option<ToolConstraint>,
+        enable_thinking: Option<bool>,
+        logprobs: Option<usize>,
+    ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
         let (respond, rx) = oneshot::channel();
-        self.enqueue(Job::Chat { system, messages, params, tools, constraint, enable_thinking, raw_prompt: None, respond })?;
+        self.enqueue(Job::Chat {
+            system,
+            messages,
+            params,
+            tools,
+            constraint,
+            enable_thinking,
+            raw_prompt: None,
+            respond,
+            logprobs,
+        })?;
         Ok(rx)
     }
 
@@ -363,6 +407,7 @@ impl Scheduler {
             enable_thinking: None,
             raw_prompt: Some(prompt),
             respond,
+            logprobs: None,
         })?;
         Ok(rx)
     }
@@ -407,7 +452,43 @@ impl Scheduler {
         enable_thinking: Option<bool>,
         events: tokio_mpsc::Sender<RawEvent>,
     ) -> Result<(), QueueFull> {
-        self.enqueue(Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, raw_prompt: None, events })
+        self.submit_openai_stream_ext(
+            system,
+            messages,
+            params,
+            tools,
+            constraint,
+            enable_thinking,
+            events,
+            None,
+        )
+    }
+
+    /// P869: [`Scheduler::submit_openai_stream`] の logprobs 指定版。
+    /// `logprobs = Some(top_n)` のときだけ [`RawEvent::Logprob`] を流す。
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_openai_stream_ext(
+        &self,
+        system: Option<String>,
+        messages: Vec<ChatMessage>,
+        params: GenParams,
+        tools: Option<serde_json::Value>,
+        constraint: Option<ToolConstraint>,
+        enable_thinking: Option<bool>,
+        events: tokio_mpsc::Sender<RawEvent>,
+        logprobs: Option<usize>,
+    ) -> Result<(), QueueFull> {
+        self.enqueue(Job::OpenaiStream {
+            system,
+            messages,
+            params,
+            tools,
+            constraint,
+            enable_thinking,
+            raw_prompt: None,
+            events,
+            logprobs,
+        })
     }
 
     /// P837: raw prompt の OpenAI 互換ストリーミング (`POST /v1/completions`, stream)。
@@ -428,6 +509,7 @@ impl Scheduler {
             enable_thinking: None,
             raw_prompt: Some(prompt),
             events,
+            logprobs: None,
         })
     }
 }
@@ -611,6 +693,10 @@ fn worker(
                     run.last_progress = now;
                 }
                 // 完了/切断したセッションを外して後処理 (後ろから外すことで添字を維持)
+                // P869: logprobs は完了処理より先に流す (Done の後に取り残さない)
+                for run in active.iter_mut() {
+                    flush_raw_logprobs(run, limits.send);
+                }
                 let mut i = done.len();
                 while i > 0 {
                     i -= 1;
@@ -678,15 +764,15 @@ fn release_run(engine: &Arc<Mutex<Engine>>, run: &mut Run) {
 
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
 fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
-    let (system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond, events, raw) = match job {
-        Job::Chat { system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond } => {
-            (system, messages, params, tools, constraint, enable_thinking, raw_prompt, Some(respond), None, None)
+    let (system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond, events, raw, logprobs) = match job {
+        Job::Chat { system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond, logprobs } => {
+            (system, messages, params, tools, constraint, enable_thinking, raw_prompt, Some(respond), None, None, logprobs)
         }
         Job::Stream { system, messages, params, tools, constraint, enable_thinking, events } => {
-            (system, messages, params, tools, constraint, enable_thinking, None, None, Some(events), None)
+            (system, messages, params, tools, constraint, enable_thinking, None, None, Some(events), None, None)
         }
-        Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, raw_prompt, events } => {
-            (system, messages, params, tools, constraint, enable_thinking, raw_prompt, None, None, Some(events))
+        Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, raw_prompt, events, logprobs } => {
+            (system, messages, params, tools, constraint, enable_thinking, raw_prompt, None, None, Some(events), logprobs)
         }
     };
     let (sess, error) = {
@@ -704,7 +790,13 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
             ),
         };
         match built {
-            Ok(s) => (Some(s), None),
+            Ok(mut s) => {
+                // P869: logprobs 要求時だけセッションに記録を指示する
+                if let Some(top) = logprobs {
+                    s.enable_logprobs(top);
+                }
+                (Some(s), None)
+            }
             Err(e) => (None, Some(e)),
         }
     };
@@ -1027,6 +1119,21 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize, send_timeout: 
         }
     }
     Ok(())
+}
+
+/// P869: セッションに溜まった logprobs を [`RawEvent::Logprob`] として流す
+/// (OpenAI ストリームのみ)。送信に失敗したら `send_dead` を立てる
+/// (次のステップ境界で打ち切られる)。
+fn flush_raw_logprobs(run: &mut Run, send_timeout: Duration) {
+    let Some(raw) = run.raw.clone() else { return };
+    let dead = run.send_dead.clone();
+    let Some(sess) = run.sess.as_mut() else { return };
+    for lp in sess.take_logprobs() {
+        if !send_raw_bounded(&raw, RawEvent::Logprob(lp), send_timeout) {
+            dead.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
 }
 
 /// 完了したセッションの後処理 (respond or SSE 後半イベント)。

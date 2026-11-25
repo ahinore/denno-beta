@@ -82,6 +82,8 @@ chat template・KV prefix cache・engine を通る (違うのはワイヤ形式�
 | `stream_options.include_usage` | true で最終 usage chunk (choices が空の chunk) を追加 |
 | `tools` / `tool_choice` | P797: OpenAI 形式 (`{"type":"function","function":{name,description,parameters}}`) を受理し、chat template の `tools` 変数へ渡す。`tool_choice` は `auto`/`none`/`required`/`{"type":"function","function":{"name":...}}` (詳細は下の「OpenAI tool calling」) |
 | `response_format` | `{"type":"text"}` (無変換) / `{"type":"json_object"}` (JSON オブジェクトのみ返す指示を system へ追加) / `{"type":"json_schema", ...}` (P837: スキーマ指示。下の「Structured Outputs」)。それ以外の type は 400 (`param = response_format.type`) |
+| `logprobs` / `top_logprobs` | P869: `true` で `choices[].logprobs.content[]` を生成トークンごとに埋める。`top_logprobs` は 0..=20 (範囲外・`logprobs` 無しでの指定は 400、`param = top_logprobs`)。語彙数を超える要求は語彙長で頭打ち。下の「logprobs / seed (P869)」 |
+| `seed` | P869: サンプリング seed (任意の整数、負値も可)。同一 seed + 同一入力 + 同一温度なら出力系列が一致する。未指定は乱数 (従来と同じ) |
 | その他 | 未知フィールドは無視 (serde 既定) |
 
 応答 (非ストリーミング):
@@ -104,6 +106,47 @@ chat template・KV prefix cache・engine を通る (違うのはワイヤ形式�
 
 `finish_reason`: `stop` (`end_turn` / `stop_sequence`) / `length` (`max_tokens`) /
 `tool_calls` (tool call を返したとき)。
+
+### logprobs / seed (P869)
+
+`logprobs: true` で `choices[0].logprobs` が `{content: [...], refusal: null}` になる。
+`content[]` は生成トークン 1 個につき 1 要素で、EOS は含まない:
+
+```json
+{
+  "content": [{
+    "token": "Hello",
+    "logprob": -0.1067,
+    "bytes": [72, 101, 108, 108, 111],
+    "top_logprobs": [
+      {"token": "Hello", "logprob": -0.1067, "bytes": [72, 101, 108, 108, 111]},
+      {"token": "Hi",    "logprob": -3.21,   "bytes": [72, 105]}
+    ]
+  }],
+  "refusal": null
+}
+```
+
+- `logprob` は **サンプル直前の logits** (反復抑止 / `tool_choice` マスク適用後、
+  temperature 適用前) の log-softmax。`temperature` / `top_p` は掛けない
+  (生のモデル分布。`/v1/messages` の数値経路には一切影響しない)
+- `top_logprobs` は確率降順 (同値は token id 昇順) の上位 N 件
+  (`logprobs: true` + `top_logprobs: N`、N は 0..=20)。件数は語彙長で頭打ち
+- `bytes` はトークンの生バイト列 (byte-level BPE の分割トークンでも
+  `token` の UTF-8 と一致する)
+- `logprobs` 未指定 / `false` は `null` で、エンジン側も記録しない (追加コストゼロ)
+- tool call を抽出した場合も `content[]` は **生成トークン列そのもの**
+  (本文から除去した `<tool_call>` block の分も含む)
+- ストリーミングでは content とは別の chunk で 1 トークンずつ流す
+  (`delta: {}` + `logprobs.content` が 1 要素):
+
+```
+data: {...,"choices":[{"index":0,"delta":{},"logprobs":{"content":[{"token":"Hello","logprob":-0.1067,"bytes":[...],"top_logprobs":[...]}],"refusal":null},"finish_reason":null}]}
+```
+
+`seed` は OpenAI 互換の整数 (負値も 2 の補数として決定的に扱う)。同じ seed +
+同じ入力 + 同じ temperature なら同じ出力系列になる (greedy は seed 不要で常に
+決定論)。未指定は従来どおり乱数。
 
 ### OpenAI tool calling (P797)
 

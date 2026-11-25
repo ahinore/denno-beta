@@ -42,7 +42,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use denno_engine::{ChatMessage, GenParams, ToolConstraint};
+use denno_engine::{ChatMessage, GenParams, TokenLogprob, ToolConstraint};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -225,6 +225,12 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     /// `{"type": "text" | "json_object" | "json_schema"}` (P837 で json_schema を追加)
     pub response_format: Option<Value>,
+    /// P869: true で `choices[].logprobs` を埋める (既定 false = 従来と同一)
+    pub logprobs: Option<bool>,
+    /// P869: 各トークンで返す top_logprobs の件数 (0..=20)。`logprobs: true` が必須
+    pub top_logprobs: Option<i64>,
+    /// P869: サンプリング seed (OpenAI 互換)。未指定は engine 既定 (乱数)
+    pub seed: Option<i64>,
 }
 
 /// `response_format` を検証し、モデルへ渡す追加ヒントを返す。
@@ -504,6 +510,61 @@ fn usage_json(input_tokens: usize, output_tokens: usize) -> Value {
     })
 }
 
+// ---------- P869: logprobs / seed ----------
+
+/// `logprobs` / `top_logprobs` を検証し、エンジンへの記録要求
+/// (`Some(top_n)`) に正規化する。OpenAI と同じ規則:
+/// - `top_logprobs` は 0..=20 (範囲外は 400)
+/// - `top_logprobs` は `logprobs: true` が必須 (単独指定は 400)
+/// - `logprobs: false` / 未指定なら記録しない (追加コストゼロ)
+fn normalize_logprobs(
+    logprobs: Option<bool>,
+    top_logprobs: Option<i64>,
+) -> Result<Option<usize>, OaError> {
+    let want = logprobs.unwrap_or(false);
+    if let Some(n) = top_logprobs {
+        if !(0..=20).contains(&n) {
+            return Err(OaError::invalid(format!(
+                "top_logprobs: {n} is out of range (0..=20)"
+            ))
+            .with_param("top_logprobs"));
+        }
+        if !want {
+            return Err(OaError::invalid(
+                "top_logprobs: requires logprobs=true",
+            )
+            .with_param("top_logprobs"));
+        }
+    }
+    Ok(if want { Some(top_logprobs.unwrap_or(0) as usize) } else { None })
+}
+
+/// `content[]` 1 件 (`{token, logprob, bytes, top_logprobs}`)。
+fn token_logprob_json(t: &TokenLogprob) -> Value {
+    json!({
+        "token": String::from_utf8_lossy(&t.bytes),
+        "logprob": t.logprob,
+        "bytes": t.bytes,
+        "top_logprobs": t
+            .top
+            .iter()
+            .map(|x| json!({
+                "token": String::from_utf8_lossy(&x.bytes),
+                "logprob": x.logprob,
+                "bytes": x.bytes,
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+/// `choices[].logprobs` (`{content: [...], refusal: null}`)。
+fn choice_logprobs_json(entries: &[TokenLogprob]) -> Value {
+    json!({
+        "content": entries.iter().map(token_logprob_json).collect::<Vec<Value>>(),
+        "refusal": Value::Null,
+    })
+}
+
 /// 非ストリーム応答の `message`。tool call があれば `tool_calls` を足し、
 /// 本文が空なら `content: null` (OpenAI 仕様の tool call 応答と同じ)。
 fn completion_message(text: &str, calls: &[ExtractedToolCall]) -> Value {
@@ -565,6 +626,8 @@ pub async fn chat_completions(
                 .with_param("messages"),
         );
     }
+    // P869: logprobs / top_logprobs の検証 (範囲外・単独指定は 400)
+    let lp_req = normalize_logprobs(req.logprobs, req.top_logprobs)?;
 
     // tools / tool_choice: /v1/messages と同じ検証規則を通す
     let tool_defs = map_tools(&req.tools)?;
@@ -608,7 +671,7 @@ pub async fn chat_completions(
         top_p: req.top_p,
         top_k: None,
         stop_sequences: req.stop.clone(),
-        seed: None,
+        seed: req.seed.map(|s| s as u64),
         repetition_penalty: state.default_repetition_penalty,
         frequency_penalty: None,
         presence_penalty: None,
@@ -626,18 +689,20 @@ pub async fn chat_completions(
             tool_constraint,
             enable_thinking,
             tools_active,
+            lp_req,
         )
         .await
     } else {
         let rx = state
             .scheduler
-            .submit_chat(
+            .submit_chat_ext(
                 system,
                 chat_messages,
                 params,
                 tools_for_prompt,
                 tool_constraint,
                 enable_thinking,
+                lp_req,
             )
             .map_err(|_| queue_full(&state))?;
         let output = match tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await {
@@ -675,6 +740,13 @@ pub async fn chat_completions(
         } else {
             "tool_calls"
         };
+        // P869: logprobs 要求時のみ content[] を埋める (非要求は null で従来と同一)。
+        // 注: content は生成トークン列 (EOS 除外) に対応し、tool call 抽出で
+        // 本文から落ちたトークンも含む。
+        let lp_json = match lp_req {
+            Some(_) => choice_logprobs_json(&output.logprobs),
+            None => Value::Null,
+        };
         let created = now_secs();
         Ok(Json(json!({
             "id": new_chatcmpl_id(),
@@ -684,7 +756,7 @@ pub async fn chat_completions(
             "choices": [{
                 "index": 0,
                 "message": completion_message(&text, &calls),
-                "logprobs": Value::Null,
+                "logprobs": lp_json,
                 "finish_reason": finish,
             }],
             "usage": usage_json(output.input_tokens, output.output_tokens),
@@ -727,6 +799,30 @@ async fn send_delta_chunk(
     tx.send(Ok(sse_data(&chunk))).await.is_ok()
 }
 
+/// P869: 1 トークン分の logprobs を載せた chunk を送る (delta は空)。
+/// OpenAI は logprobs を任意の chunk に載せられるので、content と分離して流す。
+async fn send_logprob_chunk(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
+    id: &str,
+    created: u64,
+    model: &str,
+    t: &TokenLogprob,
+) -> bool {
+    let chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "logprobs": choice_logprobs_json(std::slice::from_ref(t)),
+            "finish_reason": Value::Null,
+        }],
+    });
+    tx.send(Ok(sse_data(&chunk))).await.is_ok()
+}
+
 /// [`StreamAssembler`] のイベント列を OpenAI の delta へ翻訳する。
 ///
 /// - text_delta → `{"content": ...}`
@@ -763,12 +859,13 @@ async fn stream_response(
     constraint: Option<ToolConstraint>,
     enable_thinking: Option<bool>,
     assemble_tools: bool,
+    logprobs: Option<usize>,
 ) -> Result<Response, OaError> {
     let include_usage = stream_options.map(|o| o.include_usage).unwrap_or(false);
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<RawEvent>(64);
     state
         .scheduler
-        .submit_openai_stream(
+        .submit_openai_stream_ext(
             system,
             chat_messages,
             params,
@@ -776,6 +873,7 @@ async fn stream_response(
             constraint,
             enable_thinking,
             raw_tx,
+            logprobs,
         )
         .map_err(|_| queue_full(&state))?;
 
@@ -880,6 +978,12 @@ async fn stream_response(
                     input_tokens = i;
                     output_tokens = o;
                     reason = finish_reason(&stop_reason);
+                }
+                // P869: logprobs (`logprobs=true` のときだけ届く)
+                RawEvent::Logprob(t) => {
+                    if !send_logprob_chunk(&tx, &id, created, &model, &t).await {
+                        return;
+                    }
                 }
                 RawEvent::Error(msg) => {
                     let err = json!({
@@ -1184,6 +1288,8 @@ async fn completion_stream_response(
                     output_tokens = o;
                     reason = finish_reason(&stop_reason);
                 }
+                // P869: /v1/completions は logprobs を要求しない (常に None)。
+                RawEvent::Logprob(_) => {}
                 RawEvent::Error(msg) => {
                     let err = json!({
                         "error": {"message": msg, "type": "server_error", "param": Value::Null, "code": Value::Null}
