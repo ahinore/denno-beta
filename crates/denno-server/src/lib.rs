@@ -1098,10 +1098,9 @@ pub fn router_with_body_limit(
         // ときだけ 200 (それ以外は 503)。liveness の /health とは別物。
         .route("/ready", get(ready))
         .route("/v1/models", get(models))
-        // task 901: `GET /v1/models/:id`。ルート登録は `openai::models_router`
-        // (仕様書 docs/openapi.yaml がこのパスをまだ持たないため、task 893 の
-        // 契約テストが読む lib.rs の `.route("...")` 行を増やさない)。
-        .merge(openai::models_router())
+        // task 961: `GET /v1/models/:id`。仕様 (`docs/openapi.yaml` の
+        // `GET /v1/models/{id}`) と 1:1 なので、他のルートと同じくここで登録する。
+        .route("/v1/models/:id", get(openai::model_by_id))
         // task 926: prefix cache の管理 (`/v1/cache/stats` / `DELETE /v1/cache`)。
         // パスは定数なので、task 893 の `.route("` 行の契約テストには現れない。
         .merge(cache_admin_router())

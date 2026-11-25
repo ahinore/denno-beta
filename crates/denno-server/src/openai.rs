@@ -41,8 +41,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use denno_engine::{ChatMessage, GenParams, TokenLogprob, ToolConstraint};
 use rand::Rng;
 use serde::Deserialize;
@@ -287,16 +286,10 @@ pub(crate) fn model_object(state: &AppState) -> Value {
 /// `GET /v1/models/:id`。canonical 名または登録別名なら model object を返し、
 /// それ以外は OpenAI 形式の 404 を返す。
 ///
-/// このルートは router() (`lib.rs`) ではなくここで登録している。task 893 の
-/// 契約テストは `lib.rs` の `.route("...")` 行と `docs/openapi.yaml` を
-/// 突き合わせるため、仕様書に未記載のパスを lib.rs に足すと落ちる。
-/// `docs/openapi.yaml` へ `GET /v1/models/{id}` を足すのは仕様側の作業
-/// (スコープ外) なので、それまではここに置く。
-pub(crate) fn models_router() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/models/:id", get(model_by_id))
-}
-
-async fn model_by_id(
+/// task 961: ルート登録は `lib.rs::router()` の `.route("/v1/models/:id", ...)`
+/// に集約した (他のルートと同じ形)。`docs/openapi.yaml` の
+/// `GET /v1/models/{id}` と 1:1 で対応する。
+pub(crate) async fn model_by_id(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
