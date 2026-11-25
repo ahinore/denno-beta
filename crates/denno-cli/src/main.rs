@@ -81,6 +81,12 @@ enum Commands {
         /// (既定の推論は不変)。
         #[arg(long)]
         steer_recipe: Option<PathBuf>,
+        /// P818: カードの VRAM から `DENNO_*` の既定を選ぶ。`auto` で起動時に
+        /// VRAM / RAM / モデルサイズを引き、未設定の env だけを埋める
+        /// (明示 env は常に勝つ)。数値 (MiB) を渡すと総 VRAM を上書きする。
+        /// 未指定なら環境変数 `DENNO_AUTO_CONFIG`。
+        #[arg(long)]
+        vram_budget: Option<String>,
     },
     /// P801: 起動中のサーバーに対する再現可能ベンチ (llama-bench 風 pp/tg)。
     /// プロンプトはサーバーの usage.input_tokens で目標トークン数へ較正する。
@@ -690,6 +696,7 @@ fn main() -> Result<()> {
             mtp_path,
             kv_slots,
             steer_recipe,
+            vram_budget,
         } => {
             serve_flash::run(serve_flash::FlashConfig {
                 dir,
@@ -701,6 +708,7 @@ fn main() -> Result<()> {
                 mtp_path,
                 kv_slots,
                 steer_recipe,
+                vram_budget,
             })?;
         }
         Commands::Pull { repo } => {

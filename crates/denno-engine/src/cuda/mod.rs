@@ -127,6 +127,9 @@ pub(crate) type FnCuMemsetD32Async = unsafe extern "C" fn(CUdeviceptr, u32, usiz
 
 pub(crate) type FnCuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 
+/// task 818: デバイスの総 VRAM (`cuDeviceTotalMem_v2`)。context を作らない。
+pub(crate) type FnCuDeviceTotalMem = unsafe extern "C" fn(*mut usize, CUdevice) -> CUresult;
+
 pub(crate) type FnCuMemcpyHtoDV2 = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 
 pub(crate) type FnCuMemcpyDtoHV2 = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
@@ -217,6 +220,8 @@ pub(crate) struct CudaLib {
     mem_alloc: FnCuMemAllocV2,
     mem_free: FnCuMemFreeV2,
     mem_get_info: Option<FnCuMemGetInfo>,
+    // task 818: context 無しで総 VRAM を引く (`cuMemGetInfo` は current context が要る)。
+    device_total_mem: Option<FnCuDeviceTotalMem>,
     memcpy_htod: FnCuMemcpyHtoDV2,
     memcpy_dtoh: FnCuMemcpyDtoHV2,
     memset_d32_async: FnCuMemsetD32Async,
@@ -610,6 +615,8 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         mem_free: std::mem::transmute(sym(handle, "cuMemFree_v2")?),
         mem_get_info: sym_opt(handle, "cuMemGetInfo_v2")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuMemGetInfo>(p) }),
+        device_total_mem: sym_opt(handle, "cuDeviceTotalMem_v2")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuDeviceTotalMem>(p) }),
         memcpy_htod: {
             let p: FnCuMemcpyHtoDV2 = std::mem::transmute(sym(handle, "cuMemcpyHtoD_v2")?);
             REAL_HTOD.store(p as *mut c_void, Ordering::Relaxed);
@@ -700,6 +707,60 @@ pub fn dev_mem_mb() -> Option<(usize, usize)> {
         return None;
     }
     Some((free >> 20, total >> 20))
+}
+
+
+/// task 818: デバイスの**総** VRAM を MiB で返す (context を作らない)。
+///
+/// [`dev_mem_mb`] の `cuMemGetInfo` は current context を要求するので、
+/// モデルを組む前 (起動直後) に呼ぶと `CUDA_ERROR_INVALID_CONTEXT` で
+/// 必ず `None` になる (lab t818a で実際に踏んだ)。こちらは
+/// `cuInit` + `cuDeviceGet` + `cuDeviceTotalMem_v2` だけで引く。
+/// ドライバが `cuDeviceTotalMem_v2` を持たない (CUDA 3.0 以前) なら `None`。
+pub fn device_total_mem_mb() -> Option<usize> {
+    let l = lib().ok()?;
+    let f = l.device_total_mem?;
+    if unsafe { (l.cu_init)(0) } != CUDA_SUCCESS {
+        return None;
+    }
+    let idx: i32 = std::env::var("DENNO_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut dev: CUdevice = 0;
+    if unsafe { (l.device_get)(&mut dev, idx) } != CUDA_SUCCESS {
+        return None;
+    }
+    let mut total: usize = 0;
+    if unsafe { f(&mut total, dev) } != CUDA_SUCCESS {
+        return None;
+    }
+    Some(total >> 20)
+}
+
+
+/// task 818: デバイスの compute capability (major, minor)。
+///
+/// [`device_total_mem_mb`] と同じく context を作らない。auto 計画の
+/// ログに出すだけ (計画の式には入れない)。
+pub fn device_sm() -> Option<(i32, i32)> {
+    let l = lib().ok()?;
+    if unsafe { (l.cu_init)(0) } != CUDA_SUCCESS {
+        return None;
+    }
+    let idx: i32 = std::env::var("DENNO_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut dev: CUdevice = 0;
+    if unsafe { (l.device_get)(&mut dev, idx) } != CUDA_SUCCESS {
+        return None;
+    }
+    let (mut maj, mut min) = (0i32, 0i32);
+    if unsafe { (l.device_cc)(&mut maj, &mut min, dev) } != CUDA_SUCCESS {
+        return None;
+    }
+    Some((maj, min))
 }
 
 
