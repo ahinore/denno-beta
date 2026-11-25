@@ -18,7 +18,7 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,7 +49,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,4 +65,7 @@ jobs:
           cargo run --release --bin denno -- pull Qwen/Qwen3-0.6B
 
       - name: Run exactness tests (ignored)
-        run: cargo test --release --workspace -- --ignored --test-threads=1
+        run: |
+          DENNO_QWEN_DIR="$HOME/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct" \
+          DENNO_QWEN3_DIR="$HOME/.cache/denno/hub/models--Qwen--Qwen3-0.6B" \
+          cargo test --release -p denno-engine --test exactness -- --ignored --test-threads=1 --nocapture
