@@ -335,6 +335,38 @@ where
     })
 }
 
+/// P981: `logprobs` は bool のみ (null / 未指定は「無し」)。型違いは
+/// serde_json の既定メッセージがフィールド名を含まないため、`param` を
+/// 付けられるように明示メッセージで弾く ([`oa_body_error`])。
+fn de_opt_logprobs<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(b)),
+        Some(_) => Err(serde::de::Error::custom("logprobs must be a boolean")),
+    }
+}
+
+/// P981: `top_logprobs` は整数のみ (0..=20 の範囲検証は [`normalize_logprobs`])。
+/// 3.0 のような非整数の数値・文字列・bool は 400。
+fn de_opt_top_logprobs<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("top_logprobs must be an integer (0..=20)")),
+        Some(_) => Err(serde::de::Error::custom(
+            "top_logprobs must be an integer (0..=20)",
+        )),
+    }
+}
+
 /// 履歴の assistant `tool_calls[].function`。
 /// `arguments` は OpenAI 仕様では **JSON 文字列**。デンノ拡張として
 /// オブジェクト直書きも受ける (どちらも同じ input へ正規化する)。
@@ -419,9 +451,13 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     /// `{"type": "text" | "json_object" | "json_schema"}` (P837 で json_schema を追加)
     pub response_format: Option<Value>,
-    /// P869: true で `choices[].logprobs` を埋める (既定 false = 従来と同一)
+    /// P869: true で `choices[].logprobs` を埋める (既定 false = 従来と同一)。
+    /// P981: 型違いは `param: "logprobs"` 付きの 400 (deserializer で明示メッセージ)。
+    #[serde(default, deserialize_with = "de_opt_logprobs")]
     pub logprobs: Option<bool>,
     /// P869: 各トークンで返す top_logprobs の件数 (0..=20)。`logprobs: true` が必須
+    /// P981: 型違い / 非整数は `param: "top_logprobs"` 付きの 400。
+    #[serde(default, deserialize_with = "de_opt_top_logprobs")]
     pub top_logprobs: Option<i64>,
     /// P869: サンプリング seed (OpenAI 互換)。未指定は engine 既定 (乱数)
     pub seed: Option<i64>,
@@ -809,6 +845,22 @@ fn count_to_usize(v: Option<i64>) -> Option<usize> {
 
 // ---------- P869: logprobs / seed ----------
 
+/// P981: 本文デコード失敗を OpenAI エラーへ。`logprobs` / `top_logprobs` の
+/// 型違いだけはフィールド名が分かるので `param` を持たせる (OpenAI 互換
+/// クライアントは `error.param` を見て直す実装がある)。他は従来どおり param 無し。
+fn oa_body_error(e: serde_json::Error) -> OaError {
+    let msg = format!("invalid request body: {e}");
+    let err = OaError::invalid(msg.clone());
+    let rest = msg.strip_prefix("invalid request body: ").unwrap_or_default();
+    if rest.starts_with("top_logprobs ") {
+        err.with_param("top_logprobs")
+    } else if rest.starts_with("logprobs ") {
+        err.with_param("logprobs")
+    } else {
+        err
+    }
+}
+
 /// `logprobs` / `top_logprobs` を検証し、エンジンへの記録要求
 /// (`Some(top_n)`) に正規化する。OpenAI と同じ規則:
 /// - `top_logprobs` は 0..=20 (範囲外は 400)
@@ -901,8 +953,7 @@ pub async fn chat_completions(
     check_auth(&state, &headers).map_err(OaError::from)?;
     // P817: drain 中は新規の生成要求を受けない (/v1/messages と同じ 503)。
     crate::reject_if_draining(&state).map_err(OaError::from)?;
-    let req: ChatCompletionRequest = serde_json::from_slice(&body)
-        .map_err(|e| OaError::invalid(format!("invalid request body: {e}")))?;
+    let req: ChatCompletionRequest = serde_json::from_slice(&body).map_err(oa_body_error)?;
 
     // model: /v1/messages と同じ規則 (不一致は 400/404 系。OpenAI は 404 ではなく
     // 400 invalid_request_error を返す実装が多いが、既存の分類を尊重する)
