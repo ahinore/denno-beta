@@ -86,6 +86,31 @@
   #camlabel { left:50%; top:64px; transform:translateX(-50%); color:#9fefff;
               background:rgba(4,10,16,.8); border:1px solid #123a4c; border-radius:4px;
               padding:2px 10px; opacity:0; transition:opacity .3s; }
+  /* ---- task 904: 層インスペクタ HUD ---- */
+  #insp { left:14px; top:232px; min-width:238px; padding:6px 9px;
+          background:rgba(4,10,16,.72); border:1px solid #123a4c; border-radius:5px;
+          box-shadow:0 0 18px rgba(0,190,240,.10); }
+  #insp .ih { color:var(--vram); letter-spacing:.06em; font-size:11px; }
+  #insp .ih .dim { color:var(--dim); letter-spacing:.02em; }
+  #insp .ir { color:#c8dde8; }
+  #insp .ir b { color:#9fefff; font-weight:600; }
+  #insp .im { position:relative; height:4px; margin-top:4px; background:#0a1c26; border-radius:2px;
+              overflow:hidden; }
+  #insp .im i { position:absolute; left:0; top:0; bottom:0; width:0%; background:var(--neu);
+                box-shadow:0 0 6px rgba(127,240,255,.7); }
+  #insp .ik.qsa { color:var(--qsa); } #insp .ik.gdn { color:var(--gdn); }
+  #lstrip .cell { cursor:pointer; }
+  #lstrip .cell.pick { outline:1px solid rgba(255,59,48,.85); }
+  /* ---- task 904: fps オーバーレイ (外部 CDN なし) ---- */
+  #fpsov { left:50%; bottom:12px; transform:translateX(-50%); display:none; text-align:center;
+           padding:3px 10px; background:rgba(4,10,16,.78); border:1px solid #123a4c;
+           border-radius:4px; }
+  #fpsov.show { display:block; }
+  #fpsov b { color:var(--neu); font-weight:600; }
+  #fpsov .dim { color:var(--dim); }
+  #fpsov_hist { display:flex; gap:1px; justify-content:flex-end; align-items:flex-end;
+                height:16px; margin-top:3px; }
+  #fpsov_hist i { width:3px; background:var(--vram); opacity:.75; }
 </style>
 </head>
 <body>
@@ -136,9 +161,20 @@
 <div id="keys" class="panel" role="dialog" aria-label="keyboard shortcuts">
   <div class="kh">keyboard <span class="dim">— ? で開閉</span></div>
   <div id="keys-rows"></div>
-  <div class="kf">1-4 でカメラ / f でフライト / space で停止 / c でチャット / ? でこの凡例</div>
+  <div class="kf">1-5 でカメラ / [ ] で層 / p で fps / f でフライト / space で停止 / c でチャット / ? でこの凡例</div>
 </div>
 <div id="camlabel" class="panel"></div>
+<div id="insp" class="panel">
+  <div class="ih">layer inspector <span class="dim">— バーをクリック / [ ]</span></div>
+  <div class="ir">layer <b id="insp_idx">--</b> <span id="insp_kind" class="ik qsa">--</span></div>
+  <div class="ir dim">experts <b id="insp_exp">--</b></div>
+  <div class="ir dim">activation <b id="insp_mag">--</b></div>
+  <div class="im"><i id="insp_bar"></i></div>
+</div>
+<div id="fpsov" class="panel">
+  <b id="fpsov_v">--</b>
+  <div id="fpsov_hist"></div>
+</div>
 <div id="dump" style="display:none"></div>
 <div id="live_done" style="display:none"></div>
 <script>
@@ -168,6 +204,10 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { decodeFrame, FrameDecodeError } from '/frames.mjs';
 import {
   bookmarkForKey, bookmarkGoal, legendRows, toggleLegend, isLegendKey, legendFromQuery,
+  presetForKey, presetGoal, createCamAnim, startCamAnim, stepCamAnim,
+  layerKind, stepLayer, clampLayer, activationStats, formatMagnitude,
+  expertSummary, formatExpertSummary, isLayerStepKey, isFpsKey, overlayFromQuery,
+  createFpsMeter, noteFrame, fpsSummary, fpsText, fpsBars, camAnimActive,
 } from '/keys3d.mjs';
 
 // ===== 実モデルの数 (GGUF ヘッダ実測) =====================================
@@ -250,6 +290,87 @@ controls.minDistance = 8; controls.maxDistance = 380;
 const keyState = { legend: false };
 const keysEl = document.getElementById('keys');
 const camLabelEl = document.getElementById('camlabel');
+
+// ===== task 904: カメラ補間 / 層インスペクタ / fps オーバーレイ ============
+// 純ロジックは keys3d.mjs。ここは DOM と three.js の状態をつなぐだけ。
+const camAnim = createCamAnim(0.45);
+const insp = { sel: 0 };
+const fpsMeter = createFpsMeter(32);
+const fpsUi = {
+  on: false,
+  el: document.getElementById('fpsov'),
+  v: document.getElementById('fpsov_v'),
+  hist: document.getElementById('fpsov_hist'),
+};
+const inspUi = {
+  idx: document.getElementById('insp_idx'),
+  kind: document.getElementById('insp_kind'),
+  exp: document.getElementById('insp_exp'),
+  mag: document.getElementById('insp_mag'),
+  bar: document.getElementById('insp_bar'),
+};
+
+/** 層を選び、インスペクタを即座に描き直す (キー操作にも使う)。 */
+function selectLayer(il) {
+  insp.sel = clampLayer(il);
+  updateInspector();
+  return insp.sel;
+}
+
+/** 選択層の kind / expert / 活性を HUD に出す。 */
+function updateInspector() {
+  const il = insp.sel;
+  const w = walls[il], s = slabs[il];
+  const kind = layerKind(il, INTERVAL);
+  if (inspUi.idx) inspUi.idx.textContent = String(il).padStart(2, '0');
+  if (inspUi.kind) {
+    inspUi.kind.textContent = kind;
+    inspUi.kind.className = 'ik ' + (kind === 'FullAttn' ? 'qsa' : 'gdn');
+  }
+  // 今ステップの routing (デモでも実テレメトリでも s.route に入る)
+  const route = (s && s.route) || [];
+  const weights = route.map((k) => (s && s.act ? s.act[k] : 0));
+  if (inspUi.exp) inspUi.exp.textContent = formatExpertSummary(expertSummary(route, weights, 3));
+  // 活性は残差ストリームの実値 (0..1 の蓄積) をそのまま要約する
+  const st = activationStats(w ? w.act : []);
+  if (inspUi.mag) inspUi.mag.textContent = formatMagnitude(st);
+  if (inspUi.bar) inspUi.bar.style.width = Math.round(Math.min(1, st.max) * 100) + '%';
+  for (let i = 0; lcells && i < lcells.length; i++) lcells[i].cell.classList.toggle('pick', i === il);
+}
+
+/** fps オーバーレイの開閉。state は返り値 (true = 表示)。 */
+function setFpsOverlay(on) {
+  fpsUi.on = !!on;
+  if (fpsUi.el) fpsUi.el.classList.toggle('show', fpsUi.on);
+  return fpsUi.on;
+}
+function toggleFpsOverlay() { return setFpsOverlay(!fpsUi.on); }
+
+/** 計測値をオーバーレイに反映する。バーは直近 24 フレーム。 */
+function paintFpsOverlay(sum) {
+  if (!fpsUi.on) return;
+  if (fpsUi.v) fpsUi.v.textContent = fpsText(sum);
+  if (!fpsUi.hist) return;
+  const bars = fpsBars(sum, 24);
+  if (fpsUi.hist.childElementCount !== bars.length) {
+    fpsUi.hist.innerHTML = '';
+    for (let i = 0; i < bars.length; i++) fpsUi.hist.appendChild(document.createElement('i'));
+  }
+  const kids = fpsUi.hist.children;
+  for (let i = 0; i < bars.length; i++) {
+    kids[i].style.height = Math.max(1, Math.round(bars[i] * 16)) + 'px';
+  }
+}
+
+/** プリセットへ滑らかに移動する (fly 中なら Orbit に戻す)。 */
+function applyPreset(preset) {
+  const goal = presetGoal(preset);
+  if (!goal) return false;
+  if (fly.on) exitFly();
+  startCamAnim(camAnim, goal, { pos: camera.position.toArray(), target: controls.target.toArray() });
+  showCamLabel('camera: ' + preset.name + ' (' + preset.key + ')');
+  return true;
+}
 (() => {
   const rows = document.getElementById('keys-rows');
   if (!rows) return;
@@ -286,6 +407,7 @@ function applyBookmark(bm) {
   return true;
 }
 if (legendFromQuery(Q.get('legend'))) setLegend(true);   // 検証用 ?legend=1
+if (overlayFromQuery(Q.get('fps'))) setFpsOverlay(true);  // 検証用 ?fps=1
 
 const m4 = new THREE.Matrix4();
 
@@ -937,6 +1059,8 @@ window.__animateInputText = animateInputText;
 const fly = { on: false, keys: new Set(), sens: 0.0022, speed: 16, savedTarget: new THREE.Vector3() };
 // 検証用: ?bm=2 で起動時からブックマークの視点にする (fly の初期化後に置く)。
 if (Q.get('bm')) { const b0 = bookmarkForKey(Q.get('bm')); if (b0) applyBookmark(b0); }
+// 検証用: ?insp=23 で層インスペクタの初期選択を固定する (描画は最初の hud() が行う)。
+if (Q.get('insp')) { const i0 = parseInt(Q.get('insp'), 10); if (Number.isFinite(i0)) insp.sel = clampLayer(i0, LAYERS); }
 
 const _qy = new THREE.Quaternion(), _qyAxis = new THREE.Vector3(0, 1, 0);
 const _qp = new THREE.Quaternion(), _qxAxis = new THREE.Vector3(1, 0, 0);
@@ -982,6 +1106,12 @@ addEventListener('keydown', (e) => {
   // task 813: `?` で凡例、1-4 でカメラブックマーク
   if (isLegendKey(e)) { toggleLegendUI(); e.preventDefault(); return; }
   if (e.key === 'Escape' && keyState.legend) { setLegend(false); return; }
+  // task 904: p で fps、[ ] で層インスペクタ、1-5 でカメラプリセット
+  if (isFpsKey(e)) { toggleFpsOverlay(); e.preventDefault(); return; }
+  const dstep = isLayerStepKey(e);
+  if (dstep) { selectLayer(stepLayer(insp.sel, dstep, LAYERS)); e.preventDefault(); return; }
+  const pg = presetForKey(e.key);
+  if (pg) { applyPreset(pg); e.preventDefault(); return; }
   const bm = bookmarkForKey(e.key);
   if (bm) { applyBookmark(bm); e.preventDefault(); return; }
   if (e.key === 'f' || e.key === 'F') { fly.on ? exitFly() : enterFly(); e.preventDefault(); return; }
@@ -1320,6 +1450,14 @@ function step(dt, doRender) {
   stepFlights(dt);
   if (candPulse > 0.01) { candPulse *= 0.94; paintCands(); }
   stepFly(dt);
+  // task 904: プリセットへの移動は補間でつなぐ (キー入力直後は from から始まる)
+  if (camAnimActive(camAnim)) {
+    const g = stepCamAnim(camAnim, dt);
+    if (g) {
+      camera.position.set(g.pos[0], g.pos[1], g.pos[2]);
+      controls.target.set(g.target[0], g.target[1], g.target[2]);
+    }
+  }
   if (!fly.on) controls.update();
   if (doRender !== false) composer.render();
 }
@@ -1349,6 +1487,7 @@ function hud() {
   document.getElementById('n_ram').textContent = r;
   document.getElementById('n_ssd').textContent = d;
   updateLayerStrip(vcnt, hcnt, rcnt, ncnt, mcnt, nmax, rmax);
+  updateInspector();   // task 904: 選択層の内訳 (HUD と同じ周期で更新)
 }
 
 // 層ごとの expert 内訳ストリップ (左下): 上段 = VRAM 常駐数, 下段 = 加熱 expert 数。
@@ -1374,6 +1513,8 @@ function ensureLayerStrip() {
     cell.appendChild(lab);
     lstrip.appendChild(cell);
     lcells.push({ cell, barV, barH, barR, barN, labV, labH, labR, labN });
+    // task 904: バーをクリックしたらその層をインスペクタで選ぶ
+    cell.addEventListener('click', () => selectLayer(il));
   }
 }
 // バー + 数値ラベル (バーの中央に入る大きさのときだけ表示)
@@ -1417,8 +1558,15 @@ function frame() {
   step(dt);
   if (replayOn) replayStep();
   window.__viewReady = true;
+  // task 904: fps はオーバーレイ側でも同じ計測値を使う (p で開閉)
+  const fsum = noteFrame(fpsMeter, performance.now());
   acc += dt; cnt++;
-  if (acc > 0.4) { document.getElementById('fps').textContent = (cnt / acc).toFixed(0); hud(); acc = 0; cnt = 0; }
+  if (acc > 0.4) {
+    document.getElementById('fps').textContent = (cnt / acc).toFixed(0);
+    hud();
+    paintFpsOverlay(fsum || fpsSummary(fpsMeter));
+    acc = 0; cnt = 0;
+  }
   requestAnimationFrame(frame);
 }
 
