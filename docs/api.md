@@ -1,5 +1,9 @@
 # denno API 仕様(対応範囲)
 
+機械可読の仕様は [`docs/openapi.yaml`](openapi.yaml) (OpenAPI 3.1)。
+ルートと実装のドリフトは `crates/denno-server/tests/openapi_contract.rs` が落とす。
+以下は各経路の意味とフィールド対応表(散文の一次資料)。
+
 ## POST /v1/messages
 
 Anthropic Messages API 互換。対応フィールド:

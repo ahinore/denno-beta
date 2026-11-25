@@ -1,0 +1,1570 @@
+openapi: 3.1.0
+info:
+  title: denno inference server
+  version: 1.0.0
+  summary: Anthropic / OpenAI / Ollama compatible inference API with denno extensions
+  description: |
+    denno exposes one wire-compatible surface per client family, all sharing the
+    same scheduler, chat template, KV prefix cache and engine:
+
+    * Anthropic Messages (`/v1/messages`, `/v1/messages/count_tokens`)
+    * OpenAI Chat Completions and legacy Completions (`/v1/chat/completions`,
+      `/v1/completions`)
+    * OpenAI model listing (`/v1/models`)
+    * Ollama (`/api/tags`, `/api/version`, `/api/chat`, `/api/generate`)
+    * operations (`/health`, `/ready`, `/metrics`)
+    * residual-stream steering, served by `denno serve-flash` only
+      (`/v1/steer/*`)
+
+    Two processes implement this document:
+
+    * `denno serve` (axum router in `crates/denno-server`) on port 8080 by
+      default. It serves every operation marked `x-denno-impl: engine`.
+    * `denno serve-flash` (hand-written HTTP server in
+      `crates/denno-cli/src/serve_flash.rs`) on port 8098 by default. It serves
+      `/health`, `/ready`, `/metrics`, `/v1/messages` and every `/v1/steer/*`
+      operation marked `x-denno-impl: flash-cli`.
+
+    The contract test `crates/denno-server/tests/openapi_contract.rs` parses this
+    file and fails if a documented path/method disagrees with the implementation.
+    Keep `x-denno-impl` accurate: it decides which implementation is checked.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://127.0.0.1:8080
+    description: denno serve (denno-server axum router)
+  - url: http://127.0.0.1:8098
+    description: denno serve-flash (Qwen3.8-Flash-Next path, adds /v1/steer/*)
+security:
+  - apiKey: []
+  - bearerAuth: []
+tags:
+  - name: anthropic
+    description: Anthropic Messages compatible endpoints
+  - name: openai
+    description: OpenAI compatible endpoints
+  - name: ollama
+    description: Ollama compatible endpoints
+  - name: ops
+    description: Operational probes and metrics
+  - name: steer
+    description: Residual-stream steering (serve-flash only)
+paths:
+  /health:
+    get:
+      tags: [ops]
+      summary: Liveness probe
+      operationId: health
+      security: []
+      x-denno-impl: engine
+      responses:
+        '200':
+          description: |
+            Process is alive. No authentication required.
+            `denno serve` returns `{"status":"ok"}`;
+            `denno serve-flash` returns `{"ok":true,"model":"<name>"}`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: ok
+                  ok:
+                    type: boolean
+                  model:
+                    type: string
+                additionalProperties: true
+              examples:
+                engine:
+                  value: {"status": "ok"}
+                flash:
+                  value: {"ok": true, "model": "denno-test"}
+  /ready:
+    get:
+      tags: [ops]
+      summary: Readiness probe
+      operationId: ready
+      security: []
+      x-denno-impl: engine
+      description: |
+        200 only when the model is loaded, the worker is alive and the server is
+        not draining. Otherwise 503 with `status` set to `loading` or `draining`.
+      responses:
+        '200':
+          description: Accepting requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyStatus'
+        '503':
+          description: Starting up, draining, or the worker died
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyStatus'
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus metrics
+      operationId: metrics
+      security: []
+      x-denno-impl: engine
+      description: |
+        Prometheus text format 0.0.4. Series names follow vLLM (the `vllm:`
+        prefix) so existing vLLM dashboards read them; denno-only gauges use
+        `denno_`.
+      responses:
+        '200':
+          description: Metrics exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/models:
+    get:
+      tags: [openai, anthropic]
+      summary: List models
+      operationId: listModels
+      x-denno-impl: engine
+      responses:
+        '200':
+          description: |
+            One model (the one being served). The response carries both the
+            Anthropic fields (`type`, `display_name`, `context_length`,
+            `has_more`) and the OpenAI fields (`object`, `owned_by`) so either
+            client family works against it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+        '401':
+          $ref: '#/components/responses/AnthropicUnauthorized'
+  /v1/messages:
+    post:
+      tags: [anthropic]
+      summary: Anthropic Messages
+      operationId: createMessage
+      x-denno-impl: engine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessagesRequest'
+      responses:
+        '200':
+          description: |
+            Non-streaming JSON when `stream` is absent or false; SSE
+            (`text/event-stream`) when `stream` is true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagesResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  `message_start`, `content_block_start`, `content_block_delta`
+                  (text_delta / input_json_delta), `content_block_stop`,
+                  `message_delta`, `message_stop`, plus `ping` and `error`.
+        '400':
+          $ref: '#/components/responses/AnthropicBadRequest'
+        '401':
+          $ref: '#/components/responses/AnthropicUnauthorized'
+        '404':
+          $ref: '#/components/responses/AnthropicNotFound'
+        '500':
+          $ref: '#/components/responses/AnthropicServerError'
+        '503':
+          $ref: '#/components/responses/AnthropicOverloaded'
+  /v1/messages/count_tokens:
+    post:
+      tags: [anthropic]
+      summary: Count input tokens without prefill
+      operationId: countTokens
+      x-denno-impl: engine
+      description: |
+        Uses the same normalization (system, tools, default `thinking`) and the
+        same tokenizer as `/v1/messages`, but never prefills or touches the KV
+        cache. The value equals `usage.input_tokens` of the equivalent
+        `/v1/messages` call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessagesRequest'
+      responses:
+        '200':
+          description: Token estimate
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [input_tokens]
+                properties:
+                  input_tokens:
+                    type: integer
+                    minimum: 0
+        '400':
+          $ref: '#/components/responses/AnthropicBadRequest'
+        '404':
+          $ref: '#/components/responses/AnthropicNotFound'
+        '503':
+          $ref: '#/components/responses/AnthropicOverloaded'
+  /v1/chat/completions:
+    post:
+      tags: [openai]
+      summary: OpenAI Chat Completions
+      operationId: chatCompletions
+      x-denno-impl: engine
+      description: |
+        Same scheduler, chat template, KV prefix cache and engine as
+        `/v1/messages`; only the wire format differs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: |
+            JSON, or SSE (data-only lines terminated by `[DONE]`) when `stream`
+            is true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/OpenAIBadRequest'
+        '401':
+          $ref: '#/components/responses/OpenAIUnauthorized'
+        '404':
+          $ref: '#/components/responses/OpenAINotFound'
+        '429':
+          $ref: '#/components/responses/OpenAIRateLimited'
+        '500':
+          $ref: '#/components/responses/OpenAIServerError'
+  /v1/completions:
+    post:
+      tags: [openai]
+      summary: OpenAI legacy Completions (no chat template)
+      operationId: createCompletion
+      x-denno-impl: engine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompletionRequest'
+      responses:
+        '200':
+          description: JSON, or SSE when `stream` is true
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/OpenAIBadRequest'
+        '404':
+          $ref: '#/components/responses/OpenAINotFound'
+        '429':
+          $ref: '#/components/responses/OpenAIRateLimited'
+        '500':
+          $ref: '#/components/responses/OpenAIServerError'
+  /api/tags:
+    get:
+      tags: [ollama]
+      summary: Ollama model list
+      operationId: ollamaTags
+      x-denno-impl: engine
+      responses:
+        '200':
+          description: |
+            `size` is always 0 and `digest` is a deterministic display identifier
+            derived from the model name (not a hash of the weights).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OllamaTags'
+        '401':
+          $ref: '#/components/responses/OllamaUnauthorized'
+  /api/version:
+    get:
+      tags: [ollama]
+      summary: Ollama version
+      operationId: ollamaVersion
+      x-denno-impl: engine
+      responses:
+        '200':
+          description: Static version string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version]
+                properties:
+                  version:
+                    type: string
+                    examples: ["0.1.0-denno"]
+  /api/chat:
+    post:
+      tags: [ollama]
+      summary: Ollama chat
+      operationId: ollamaChat
+      x-denno-impl: engine
+      description: |
+        `stream` defaults to true (Ollama convention), unlike the Anthropic and
+        OpenAI paths. Streaming responses are NDJSON
+        (`application/x-ndjson`), one JSON object per line, the last one with
+        `done: true`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OllamaChatRequest'
+      responses:
+        '200':
+          description: NDJSON when streaming, single JSON when `stream` is false
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/OllamaChatResponse'
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OllamaChatResponse'
+        '400':
+          $ref: '#/components/responses/OllamaBadRequest'
+        '404':
+          $ref: '#/components/responses/OllamaNotFound'
+        '503':
+          $ref: '#/components/responses/OllamaOverloaded'
+  /api/generate:
+    post:
+      tags: [ollama]
+      summary: Ollama generate
+      operationId: ollamaGenerate
+      x-denno-impl: engine
+      description: |
+        `raw: false` (default) runs `system` plus user (= `prompt`) through the
+        chat template; `raw: true` skips the template (same raw path as
+        `/v1/completions`). `stream` defaults to true.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OllamaGenerateRequest'
+      responses:
+        '200':
+          description: NDJSON when streaming, single JSON when `stream` is false
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/OllamaGenerateResponse'
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OllamaGenerateResponse'
+        '400':
+          $ref: '#/components/responses/OllamaBadRequest'
+        '404':
+          $ref: '#/components/responses/OllamaNotFound'
+        '503':
+          $ref: '#/components/responses/OllamaOverloaded'
+  /v1/telemetry/ws:
+    get:
+      tags: [ops]
+      summary: Inference telemetry WebSocket
+      operationId: telemetryWebSocket
+      x-denno-impl: engine
+      description: |
+        WebSocket upgrade only. Frames carry denno-trace telemetry and are
+        independent of the compatibility APIs. A plain GET without the upgrade
+        headers is rejected with 400.
+      responses:
+        '101':
+          description: Switching protocols
+        '400':
+          description: Upgrade headers missing or invalid
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/steer:
+    get:
+      tags: [steer]
+      summary: Current steering state
+      operationId: steerStatus
+      x-denno-impl: flash-cli
+      description: Served by `denno serve-flash` only.
+      responses:
+        '200':
+          description: Applied steering, snapshots and recording status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SteerStatus'
+  /v1/steer/record:
+    post:
+      tags: [steer]
+      summary: Start recording a residual mean
+      operationId: steerRecord
+      x-denno-impl: flash-cli
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                mode:
+                  type: string
+                  description: Capture mode passed through to the steering engine
+              additionalProperties: true
+      responses:
+        '200':
+          description: Recording started; returns the new steering status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SteerStatus'
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+  /v1/steer/record/stop:
+    post:
+      tags: [steer]
+      summary: Stop recording and save the snapshot
+      operationId: steerRecordStop
+      x-denno-impl: flash-cli
+      responses:
+        '200':
+          description: Snapshot saved; status plus a `saved` summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SteerStatus'
+                  - type: object
+                    properties:
+                      saved:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          tokens:
+                            type: integer
+                          created:
+                            type: string
+                          layers:
+                            type: integer
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+  /v1/steer/snapshots/{name}:
+    delete:
+      tags: [steer]
+      summary: Delete a snapshot
+      operationId: steerDeleteSnapshot
+      x-denno-impl: flash-cli
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Snapshot deleted; returns the steering status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SteerStatus'
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+  /v1/steer/apply:
+    post:
+      tags: [steer]
+      summary: Apply steering
+      operationId: steerApply
+      x-denno-impl: flash-cli
+      description: |
+        Either the legacy shape (`terms` / `layers` / `alpha` / `mode`) or the
+        stacked shape (`rules`, at most 8, applied in order). `rules` cannot be
+        combined with `terms` / `layers` / `alpha` / `mode` (400).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SteerApplyRequest'
+      responses:
+        '200':
+          description: Applied; returns the resulting apply object
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+    delete:
+      tags: [steer]
+      summary: Clear applied steering
+      operationId: steerApplyClear
+      x-denno-impl: flash-cli
+      responses:
+        '200':
+          description: Cleared; returns the steering status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SteerStatus'
+  /v1/steer/analyze:
+    post:
+      tags: [steer]
+      summary: Per-layer separation score of two snapshots
+      operationId: steerAnalyze
+      x-denno-impl: flash-cli
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pos:
+                  type: string
+                neg:
+                  type: string
+              additionalProperties: true
+      responses:
+        '200':
+          description: Per-layer scores
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+  /v1/steer/export:
+    get:
+      tags: [steer]
+      summary: Export a snapshot as .dns or JSON
+      operationId: steerExport
+      x-denno-impl: flash-cli
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [json]
+          description: Omit for binary DNSTEER1; `json` returns the payload as base64
+      responses:
+        '200':
+          description: Snapshot bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+  /v1/steer/import:
+    post:
+      tags: [steer]
+      summary: Import a snapshot (.dns bytes or JSON payload)
+      operationId: steerImport
+      x-denno-impl: flash-cli
+      parameters:
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Rename the imported snapshot
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Imported
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+  /v1/steer/recipe/export:
+    post:
+      tags: [steer]
+      summary: Export the current steering as a recipe JSON
+      operationId: steerRecipeExport
+      x-denno-impl: flash-cli
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                snapshots:
+                  type: boolean
+                  description: Embed both snapshots as base64 DNSTEER1 (self-contained recipe)
+              additionalProperties: true
+      responses:
+        '200':
+          description: Recipe document
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+  /v1/steer/recipe/import:
+    post:
+      tags: [steer]
+      summary: Import a recipe (validate, optionally apply)
+      operationId: steerRecipeImport
+      x-denno-impl: flash-cli
+      parameters:
+        - name: apply
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['1', 'true', '0', 'false']
+          description: The value `1` or `true` applies the recipe after validation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Validated (and applied when requested)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/SteerBadRequest'
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ReadyStatus:
+      type: object
+      required: [status, ready, draining, model_loaded, worker_alive, model, pending, in_flight]
+      properties:
+        status:
+          type: string
+          enum: [ready, draining, loading]
+        ready:
+          type: boolean
+        draining:
+          type: boolean
+        model_loaded:
+          type: boolean
+        worker_alive:
+          type: boolean
+        model:
+          type: string
+        context_length:
+          type: integer
+        pending:
+          type: integer
+        in_flight:
+          type: integer
+        aborts:
+          type: object
+          properties:
+            completed:
+              type: integer
+            timeout:
+              type: integer
+            disconnected:
+              type: integer
+            error:
+              type: integer
+        limits:
+          type: object
+          properties:
+            max_queue_depth:
+              type: integer
+            request_timeout_secs:
+              type: integer
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+    Model:
+      type: object
+      required: [id, object, type, display_name, created, owned_by, context_length]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: model
+        type:
+          type: string
+          const: model
+        display_name:
+          type: string
+        created:
+          type: integer
+        owned_by:
+          type: string
+        context_length:
+          type: integer
+        max_context_length:
+          type: integer
+        model_dir:
+          type: string
+        quant:
+          type: string
+        slots:
+          type: integer
+        layers:
+          type: integer
+        has_more:
+          type: boolean
+        capabilities:
+          type: object
+          properties:
+            anthropic:
+              type: boolean
+            openai:
+              type: boolean
+            ollama:
+              type: boolean
+            streaming:
+              type: boolean
+            tools:
+              type: boolean
+            count_tokens:
+              type: boolean
+          additionalProperties: true
+      additionalProperties: true
+    TextBlock:
+      type: object
+      required: [type, text]
+      properties:
+        type:
+          type: string
+          const: text
+        text:
+          type: string
+        cache_control:
+          type: object
+          additionalProperties: true
+    ImageBlock:
+      type: object
+      properties:
+        type:
+          type: string
+        source:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    ToolUseBlock:
+      type: object
+      required: [type, id, name, input]
+      properties:
+        type:
+          type: string
+          const: tool_use
+        id:
+          type: string
+          pattern: '^toolu_[0-9a-f]{24}$'
+        name:
+          type: string
+        input:
+          type: object
+          additionalProperties: true
+    ToolResultBlock:
+      type: object
+      required: [type, tool_use_id]
+      properties:
+        type:
+          type: string
+          const: tool_result
+        tool_use_id:
+          type: string
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/TextBlock'
+        is_error:
+          type: boolean
+    ContentBlock:
+      oneOf:
+        - $ref: '#/components/schemas/TextBlock'
+        - $ref: '#/components/schemas/ToolUseBlock'
+        - $ref: '#/components/schemas/ToolResultBlock'
+        - $ref: '#/components/schemas/ImageBlock'
+    Message:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/ContentBlock'
+    Tool:
+      type: object
+      required: [name, input_schema]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        input_schema:
+          type: object
+          description: JSON Schema object (required; a non-object is 400)
+          additionalProperties: true
+    ToolChoice:
+      oneOf:
+        - type: string
+          enum: [auto, none, any]
+        - type: object
+          required: [type, name]
+          properties:
+            type:
+              type: string
+              const: tool
+            name:
+              type: string
+    ThinkingControl:
+      oneOf:
+        - type: string
+          enum: [off, brief, full]
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [enabled, disabled]
+          additionalProperties: true
+    MessagesRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: Must match the served name, otherwise 404 not_found_error
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Message'
+        system:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/TextBlock'
+        max_tokens:
+          type: integer
+          minimum: 0
+          description: Default 1024, clamped to 4096. 0 means prefill only
+        max_completion_tokens:
+          type: integer
+          description: Alias used only when `max_tokens` is absent
+        temperature:
+          type: number
+        top_p:
+          type: number
+        top_k:
+          type: integer
+        stop_sequences:
+          type: array
+          items:
+            type: string
+        repetition_penalty:
+          type: number
+          description: HF-compatible; 1.0 or absent disables it
+        frequency_penalty:
+          type: number
+        presence_penalty:
+          type: number
+        no_repeat_ngram_size:
+          type: integer
+          description: 2..=1024; 1 or more than 1024 is 400
+        stream:
+          type: boolean
+          default: false
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+        tool_choice:
+          $ref: '#/components/schemas/ToolChoice'
+        thinking:
+          $ref: '#/components/schemas/ThinkingControl'
+        metadata:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    Usage:
+      type: object
+      required: [input_tokens, output_tokens]
+      properties:
+        input_tokens:
+          type: integer
+        output_tokens:
+          type: integer
+        cache_read_input_tokens:
+          type: integer
+        cache_creation_input_tokens:
+          type: integer
+    MessagesResponse:
+      type: object
+      required: [id, type, role, model, content, stop_reason, usage]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          const: message
+        role:
+          type: string
+          const: assistant
+        model:
+          type: string
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContentBlock'
+        stop_reason:
+          type: string
+          enum: [end_turn, max_tokens, stop_sequence, tool_use]
+        stop_sequence:
+          type: [string, 'null']
+        usage:
+          $ref: '#/components/schemas/Usage'
+    OpenAIError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+            param:
+              type: [string, 'null']
+            code:
+              type: [string, 'null']
+    AnthropicError:
+      type: object
+      required: [type, error]
+      properties:
+        type:
+          type: string
+          const: error
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, not_found_error, overloaded_error, api_error]
+            message:
+              type: string
+    OllamaError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    ChatMessage:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [system, developer, user, assistant, tool, function]
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+            - type: 'null'
+        name:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+        tool_call_id:
+          type: string
+      additionalProperties: true
+    ToolCall:
+      type: object
+      required: [id, type, function]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          const: function
+        function:
+          type: object
+          required: [name, arguments]
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: JSON object encoded as a string
+    ChatCompletionRequest:
+      type: object
+      required: [messages]
+      properties:
+        model:
+          type: string
+          description: Empty or absent is accepted; a mismatch is 404
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        max_tokens:
+          type: integer
+        max_completion_tokens:
+          type: integer
+        temperature:
+          type: number
+        top_p:
+          type: number
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        stream:
+          type: boolean
+          default: false
+        stream_options:
+          type: object
+          properties:
+            include_usage:
+              type: boolean
+        tools:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        tool_choice:
+          oneOf:
+            - type: string
+              enum: [auto, none, required]
+            - type: object
+              additionalProperties: true
+        response_format:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [text, json_object, json_schema]
+            json_schema:
+              type: object
+              additionalProperties: true
+          additionalProperties: true
+        logprobs:
+          type: boolean
+        top_logprobs:
+          type: integer
+          minimum: 0
+          maximum: 20
+        seed:
+          type: integer
+      additionalProperties: true
+    ChatCompletionResponse:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [chat.completion, chat.completion.chunk]
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                $ref: '#/components/schemas/ChatMessage'
+              delta:
+                $ref: '#/components/schemas/ChatMessage'
+              logprobs:
+                oneOf:
+                  - type: 'null'
+                  - type: object
+                    additionalProperties: true
+              finish_reason:
+                type: [string, 'null']
+            additionalProperties: true
+        usage:
+          $ref: '#/components/schemas/OpenAIUsage'
+    OpenAIUsage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+    CompletionRequest:
+      type: object
+      required: [prompt]
+      properties:
+        model:
+          type: string
+        prompt:
+          oneOf:
+            - type: string
+            - type: array
+              maxItems: 1
+              items:
+                type: string
+        max_tokens:
+          type: integer
+        max_completion_tokens:
+          type: integer
+        temperature:
+          type: number
+        top_p:
+          type: number
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        stream:
+          type: boolean
+        stream_options:
+          type: object
+          properties:
+            include_usage:
+              type: boolean
+        echo:
+          type: boolean
+      additionalProperties: true
+    CompletionResponse:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: text_completion
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              text:
+                type: string
+              index:
+                type: integer
+              logprobs:
+                type: 'null'
+              finish_reason:
+                type: [string, 'null']
+            additionalProperties: true
+        usage:
+          $ref: '#/components/schemas/OpenAIUsage'
+    OllamaTags:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              model:
+                type: string
+              modified_at:
+                type: string
+                format: date-time
+              size:
+                type: integer
+              digest:
+                type: string
+              details:
+                type: object
+                properties:
+                  parent_model:
+                    type: string
+                  format:
+                    type: string
+                  family:
+                    type: string
+                  families:
+                    type: array
+                    items:
+                      type: string
+                  parameter_size:
+                    type: string
+                  quantization_level:
+                    type: string
+    OllamaOptions:
+      type: object
+      properties:
+        temperature:
+          type: number
+        top_p:
+          type: number
+        num_predict:
+          type: integer
+          description: Positive values only; negative and 0 mean "unset"
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        seed:
+          type: integer
+        num_ctx:
+          type: integer
+      additionalProperties: true
+    OllamaChatRequest:
+      type: object
+      required: [messages]
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        stream:
+          type: boolean
+          default: true
+        options:
+          $ref: '#/components/schemas/OllamaOptions'
+      additionalProperties: true
+    OllamaChatResponse:
+      type: object
+      properties:
+        model:
+          type: string
+        created_at:
+          type: string
+        message:
+          $ref: '#/components/schemas/ChatMessage'
+        done:
+          type: boolean
+        done_reason:
+          type: string
+          enum: [stop, length]
+        total_duration:
+          type: integer
+        load_duration:
+          type: integer
+        prompt_eval_count:
+          type: integer
+        prompt_eval_duration:
+          type: integer
+        eval_count:
+          type: integer
+        eval_duration:
+          type: integer
+    OllamaGenerateRequest:
+      type: object
+      required: [prompt]
+      properties:
+        model:
+          type: string
+        prompt:
+          type: string
+        system:
+          type: string
+        raw:
+          type: boolean
+          default: false
+        stream:
+          type: boolean
+          default: true
+        options:
+          $ref: '#/components/schemas/OllamaOptions'
+      additionalProperties: true
+    OllamaGenerateResponse:
+      type: object
+      properties:
+        model:
+          type: string
+        created_at:
+          type: string
+        response:
+          type: string
+        done:
+          type: boolean
+        done_reason:
+          type: string
+        total_duration:
+          type: integer
+        load_duration:
+          type: integer
+        prompt_eval_count:
+          type: integer
+        prompt_eval_duration:
+          type: integer
+        eval_count:
+          type: integer
+        eval_duration:
+          type: integer
+    SteerStatus:
+      type: object
+      properties:
+        apply:
+          type: object
+          description: Applied steering; carries `rules` (empty array means the legacy single rule)
+          additionalProperties: true
+        recording:
+          oneOf:
+            - type: 'null'
+            - type: object
+              properties:
+                name:
+                  type: string
+                tokens:
+                  type: integer
+              additionalProperties: true
+        snapshots:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
+    SteerApplyRequest:
+      type: object
+      properties:
+        terms:
+          type: array
+          items:
+            type: object
+            required: [snapshot, coef]
+            properties:
+              snapshot:
+                type: string
+              coef:
+                type: number
+        layers:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: integer
+          description: Half-open layer range [from, to)
+        alpha:
+          type: number
+        mode:
+          type: string
+          enum: [project, subtract]
+        rules:
+          type: array
+          maxItems: 8
+          items:
+            type: object
+            properties:
+              terms:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              layers:
+                type: array
+                minItems: 2
+                maxItems: 2
+                items:
+                  type: integer
+              alpha:
+                type: number
+              mode:
+                type: string
+                enum: [project, subtract]
+            additionalProperties: true
+      additionalProperties: true
+  responses:
+    AnthropicBadRequest:
+      description: Invalid request body or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicError'
+    AnthropicUnauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicError'
+    AnthropicNotFound:
+      description: Unknown model
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicError'
+    AnthropicServerError:
+      description: Engine failure during generation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicError'
+    AnthropicOverloaded:
+      description: Queue full or draining; carries `Retry-After` 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicError'
+    OpenAIBadRequest:
+      description: Invalid request body or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
+    OpenAIUnauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
+    OpenAINotFound:
+      description: Unknown model
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
+    OpenAIRateLimited:
+      description: Queue full (rate_limit_exceeded), with `Retry-After`
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
+    OpenAIServerError:
+      description: Engine failure during generation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
+    OllamaBadRequest:
+      description: Invalid request body or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OllamaError'
+    OllamaUnauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OllamaError'
+    OllamaNotFound:
+      description: Unknown model
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OllamaError'
+    OllamaOverloaded:
+      description: Queue full or draining, with `Retry-After`
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OllamaError'
+    SteerBadRequest:
+      description: Invalid steering request
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: string
