@@ -129,6 +129,17 @@ class Reader {
     }
   }
   u8() { this.need(1); return this.b[this.p++]; }
+  /// 要素数を読む。lib.rs の `count(min_elem)` と同じ考え方で、1 要素が最低
+  /// `minElem` バイトなので残りバイト数から上限を見る。過大な count で
+  /// `new Array(n)` を確保しない。足りない場合は「バイト不足」と同じ扱い
+  /// (partial = true) にして、呼び手が次のメッセージへ繰り越せるようにする。
+  count(minElem = 1) {
+    const n = this.u32();
+    if (minElem > 0 && n > Math.floor((this.b.length - this.p) / minElem)) {
+      throw new FrameDecodeError('truncated frame', [], this.start, true);
+    }
+    return n;
+  }
   u32() {
     let v = 0, shift = 0, n = 0;
     for (;;) {
@@ -160,7 +171,7 @@ class Reader {
   }
   f16() { this.need(2); const h = this.b[this.p] | (this.b[this.p + 1] << 8); this.p += 2; return h; }
   str() {
-    const n = this.u32();
+    const n = this.count(1);
     this.need(n);
     const s = new TextDecoder().decode(this.b.subarray(this.p, this.p + n));
     this.p += n;
@@ -176,18 +187,22 @@ class Reader {
  */
 export function decodeFrame(bytes, offset = 0) {
   const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  if (buf.length - offset < 6) {
-    throw new FrameDecodeError('short frame', [], offset, true);
+  const off = Number(offset);
+  if (!Number.isFinite(off) || off < 0) {
+    throw new FrameDecodeError('bad offset: ' + offset, [], 0, false);
   }
-  if (buf[offset] !== 0x44 || buf[offset + 1] !== 0x4e ||
-      buf[offset + 2] !== 0x54 || buf[offset + 3] !== 0x4c) {
-    throw new FrameDecodeError('bad magic', [], offset, false);
+  if (buf.length - off < 6) {
+    throw new FrameDecodeError('short frame', [], off, true);
   }
-  const ver = buf[offset + 4];
-  if (ver !== VERSION) throw new FrameDecodeError('unsupported version: ' + ver, [], offset, false);
-  const kind = buf[offset + 5];
-  const r = new Reader(buf, offset + 6);
-  r.start = offset;          // エラー位置はフレーム先頭で報告する
+  if (buf[off] !== 0x44 || buf[off + 1] !== 0x4e ||
+      buf[off + 2] !== 0x54 || buf[off + 3] !== 0x4c) {
+    throw new FrameDecodeError('bad magic', [], off, false);
+  }
+  const ver = buf[off + 4];
+  if (ver !== VERSION) throw new FrameDecodeError('unsupported version: ' + ver, [], off, false);
+  const kind = buf[off + 5];
+  const r = new Reader(buf, off + 6);
+  r.start = off;             // エラー位置はフレーム先頭で報告する
   const frame = decodePayload(kind, r);
   const next = r.p;
   return { frame, next };
@@ -205,7 +220,7 @@ function decodePayload(kind, r) {
       return { kind: 'SessionDone', session: r.u32(), reason: r.u8(), output_tokens: r.u32() };
     case KIND.PREFILL: {
       const session = r.u32(), prompt_tokens = r.u32(), ns = r.u64();
-      const n = r.u32();
+      const n = r.count(1);
       const tokens = new Array(n);
       for (let i = 0; i < n; i++) tokens[i] = r.u32();
       return { kind: 'Prefill', session, prompt_tokens, ns, tokens };
@@ -215,12 +230,12 @@ function decodePayload(kind, r) {
     case KIND.STEP:
       return { kind: 'Step', width: r.u32(), ns: r.u64() };
     case KIND.OP_SUMMARY: {
-      const n = r.u32(), ops = new Array(n);
+      const n = r.count(2), ops = new Array(n);
       for (let i = 0; i < n; i++) ops[i] = [r.u8(), r.u64()];
       return { kind: 'OpSummary', ops };
     }
     case KIND.KV_USAGE: {
-      const n = r.u32();
+      const n = r.count(2);
       const busy = new Array(n), t_lens = new Array(n);
       for (let i = 0; i < n; i++) busy[i] = r.u8() !== 0;
       for (let i = 0; i < n; i++) t_lens[i] = r.u32();
@@ -230,17 +245,17 @@ function decodePayload(kind, r) {
       return { kind: 'Gap', lost: r.u32() };
     case KIND.TOP_K: {
       const session = r.u32(), chosen = r.u32(), entropy = f16ToF32(r.f16());
-      const n = r.u32(), entries = new Array(n);
+      const n = r.count(3), entries = new Array(n);
       for (let i = 0; i < n; i++) entries[i] = [r.u32(), f16ToF32(r.f16())];
       return { kind: 'TopK', session, chosen, entropy, entries };
     }
     case KIND.LAYER_RUN: {
-      const layer = r.u32(), n = r.u32(), ops = new Array(n);
+      const layer = r.u32(), n = r.count(2), ops = new Array(n);
       for (let i = 0; i < n; i++) ops[i] = [r.u8(), r.u64()];
       return { kind: 'LayerRun', layer, ops };
     }
     case KIND.LAYER_ACT: {
-      const layer = r.u32(), n = r.u32();
+      const layer = r.u32(), n = r.count(3);
       const idx = new Array(n), val = new Array(n);
       for (let i = 0; i < n; i++) idx[i] = r.u32();
       for (let i = 0; i < n; i++) val[i] = f16ToF32(r.f16());
@@ -254,14 +269,14 @@ function decodePayload(kind, r) {
       return { kind: 'RoleAct', layer, roles };
     }
     case KIND.EXPERT_RESIDENCY: {
-      const layer = r.u32(), n = r.u32();
+      const layer = r.u32(), n = r.count(1);
       const idx = new Array(n);
       for (let i = 0; i < n; i++) idx[i] = r.u32();
       return { kind: 'ExpertResidency', layer, vram: idx };
     }
     case KIND.ROUTER_TOPK: {
       const layer = r.u32();
-      const n = r.u32();
+      const n = r.count(3);
       const experts = new Array(n);
       for (let i = 0; i < n; i++) experts[i] = r.u32();
       const weights = new Array(n);
@@ -271,7 +286,7 @@ function decodePayload(kind, r) {
     case KIND.EXPERT_SKIP: {
       // task 220: ルータが選びたかったが介入で無効化されていた expert (index 昇順)。
       const layer = r.u32();
-      const n = r.u32();
+      const n = r.count(1);
       const experts = new Array(n);
       for (let i = 0; i < n; i++) experts[i] = r.u32();
       return { kind: 'ExpertSkip', layer, experts };

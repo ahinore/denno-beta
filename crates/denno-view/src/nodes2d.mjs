@@ -56,6 +56,30 @@ export const LEAF_TYPES = Object.freeze(['expert', 'mixer', 'moe', 'shared', 'pl
 export const GROUP_TYPES = Object.freeze(['layer', 'hybrid', 'residual', 'ffn', 'experts']);
 export const HYBRID_SIZE = 4;
 
+function num0(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/// 層が 0 の形 (壊れた ServerInfo) 用の空 shape。normaliseShape は layers が
+/// 正でないと例外にするので、ツリーだけは「情報ノードのみ」で通す。
+const EMPTY_SHAPE = Object.freeze({
+  layers: 0, layer_kinds: Object.freeze([]), n_expert: 1, n_expert_used: 1,
+  n_hc: 1, n_embd: 1, ple_layers: Object.freeze([]),
+});
+
+function treeShape(raw) {
+  try {
+    return normaliseShape(raw);
+  } catch (e) {
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) &&
+        raw.layers !== undefined && raw.layers !== null && Number(raw.layers) === 0) {
+      return EMPTY_SHAPE;
+    }
+    throw e;
+  }
+}
+
 // ---- ツリー -----------------------------------------------------------------
 
 function layerName(l, kind) {
@@ -67,7 +91,7 @@ function layerName(l, kind) {
 /// 各ノード: {id, type, label, parent, children|null, depth, layer, kind, index, item,
 ///            lo, hi}  — items[lo..hi) がこのノードの下 (自身を含む) の item。
 export function buildTree(shape) {
-  const s = normaliseShape(shape);
+  const s = treeShape(shape);
   const nodes = [];
   const byId = new Map();
   const mk = (o, parent) => {
@@ -154,9 +178,10 @@ export function buildTree(shape) {
 /// 開いているノードだけを並べた行 (仮想スクロール用)。root 自身は含めない。
 export function visibleRows(tree, expanded) {
   const out = [];
+  const exp = expanded || new Set();
   const walk = (n) => {
     out.push(n);
-    if (n.children && expanded.has(n.id)) for (const c of n.children) walk(c);
+    if (n.children && exp.has(n.id)) for (const c of n.children) walk(c);
   };
   for (const c of tree.root.children) walk(c);
   return out;
@@ -261,11 +286,11 @@ export function createEnv(tree, data) {
       let r = rankCache.get(n.layer);
       if (!r) {
         const a = (st && st.count && st.count[n.layer]) || new Uint32Array(s.n_expert);
-        const idx = Array.from({ length: a.length }, (_, i) => i).sort((x, y) => a[y] - a[x] || x - y);
+        const idx = Array.from({ length: a.length }, (_, i) => i).sort((x, y) => num0(a[y]) - num0(a[x]) || x - y);
         r = new Uint32Array(a.length);
-        // 同点は同順位 (1, 2, 2, 4 …)
+        // 同点は同順位 (1, 2, 2, 4 …)。NaN は 0 として扱う。
         for (let k = 0; k < idx.length; k++) {
-          r[idx[k]] = k > 0 && a[idx[k]] === a[idx[k - 1]] ? r[idx[k - 1]] : k + 1;
+          r[idx[k]] = k > 0 && num0(a[idx[k]]) === num0(a[idx[k - 1]]) ? r[idx[k - 1]] : k + 1;
         }
         rankCache.set(n.layer, r);
       }
@@ -292,6 +317,13 @@ export function createEnv(tree, data) {
       return 0;
     },
   };
+  // テレメトリに NaN / Infinity が混ざっても DSL の比較が静かに壊れないよう、
+  // 数値を返す関数は有限値に落としてから返す (NaN は 0)。
+  const wrapNum = (fn) => (n) => num0(fn(n));
+  env.count = wrapNum(env.count);
+  env.act = wrapNum(env.act);
+  env.acc = wrapNum(env.acc);
+  env.rank = wrapNum(env.rank);
   return env;
 }
 
