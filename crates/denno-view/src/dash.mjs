@@ -24,6 +24,12 @@ export const SERIES_LABELS = Object.freeze({
 export const DEFAULT_WINDOW_MS = 1000;
 export const DEFAULT_CAP = 90;
 
+/// スパークライン/リングバッファの保持数 (task 909: 120 サンプル)。
+export const SERIES_CAP = 120;
+
+/// 計器の棒 (KV / VRAM) の既定の幅 (文字セル数)。
+export const GAUGE_WIDTH = 10;
+
 function numOrNull(v) {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -32,6 +38,27 @@ function numOrNull(v) {
 
 function clamp01(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/// リングバッファ (task 909)。古い値から落ちる固定長の系列。
+/// 値は有限数だけを受ける (NaN / Infinity は捨てる)。
+export function createRing(cap = SERIES_CAP) {
+  const c = Math.max(2, Math.trunc(Number(cap) || SERIES_CAP));
+  return { cap: c, values: [] };
+}
+
+export function ringPush(ring, v) {
+  if (!ring || !Array.isArray(ring.values)) return false;
+  const n = numOrNull(v);
+  if (n === null) return false;
+  ring.values.push(n);
+  while (ring.values.length > ring.cap) ring.values.shift();
+  return true;
+}
+
+export function ringLast(ring) {
+  if (!ring || !Array.isArray(ring.values) || !ring.values.length) return null;
+  return ring.values[ring.values.length - 1];
 }
 
 /// 計器の状態。residency は「層 → VRAM に居る expert の集合」。
@@ -55,6 +82,11 @@ export function createDash(opts = {}) {
     prefills: 0,
     tokens: 0,
     hits: 0,
+    // task 909: decode の tok/s と step の所要時間 (ms) を 120 本のリングに持つ。
+    decodeRing: createRing(SERIES_CAP),
+    latencyRing: createRing(SERIES_CAP),
+    // KV スロットの使用状況 (KvUsage フレームの集計)
+    kv: { busy: null, slots: null },
   };
 }
 
@@ -99,6 +131,7 @@ export function step(d, now) {
   const dt = t - d.winStart;
   if (dt < d.windowMs) return false;
   pushSample(d, 'decode', d.winTokens * 1000 / dt);
+  if (d.decodeRing) ringPush(d.decodeRing, d.winTokens * 1000 / dt);
   d.winStart = t;
   d.winTokens = 0;
   return true;
@@ -146,12 +179,40 @@ export function noteTierStats(d, frame) {
   return true;
 }
 
+/// Step フレーム (ns) / 生の ms → 1 ステップの所要時間 (ms) をリングに積む。
+/// 負値・壊れた値は捨てる (数字を作らない)。
+export function noteLatency(d, v) {
+  if (!d || !d.latencyRing) return false;
+  let ms = null;
+  if (v && typeof v === 'object') {
+    const ns = numOrNull(v.ns);
+    if (ns !== null) ms = ns / 1e6;
+  } else {
+    ms = numOrNull(v);
+  }
+  if (ms === null || ms < 0) return false;
+  ringPush(d.latencyRing, ms);
+  return true;
+}
+
+/// KvUsage フレーム → 使用中スロット数 / 全スロット数。比率は kvGauge が作る。
+export function noteKv(d, frame) {
+  if (!d || !frame || !Array.isArray(frame.busy)) return false;
+  const busy = frame.busy.filter(Boolean).length;
+  const slots = frame.busy.length;
+  if (!slots) return false;
+  d.kv = { busy, slots };
+  return true;
+}
+
 /// フレーム 1 枚を kind で振り分ける。計器に無関係な kind は false。
 export function noteFrame(d, frame, now) {
   if (!d || !frame || typeof frame !== 'object') return false;
   switch (frame.kind) {
     case 'Prefill': return notePrefill(d, frame, now);
     case 'Token': return noteToken(d, 1, now);
+    case 'Step': return noteLatency(d, frame);
+    case 'KvUsage': return noteKv(d, frame);
     case 'ExpertResidency': return noteResidency(d, frame);
     case 'RouterTopK': return noteRoute(d, frame);
     case 'TierStats': return noteTierStats(d, frame);
@@ -217,6 +278,83 @@ export function dashRows(d, opts = {}) {
       samples: values.length,
     };
   });
+}
+
+/// ---- task 909: リング系列 → スパークライン / 利用量の棒 -------------------
+
+/// latency のリング (120 本) → SVG path。空/一定/NaN 混じりでも安全。
+export function latencyPath(d, opts = {}) {
+  const ring = d && d.latencyRing;
+  return sparkPath(ring && Array.isArray(ring.values) ? ring.values : [], opts);
+}
+
+/// 1 ステップの所要時間 (ms) の行。表示は画面がこれを描くだけ。
+export function latencyRow(d, opts = {}) {
+  const ring = d && d.latencyRing;
+  const values = ring && Array.isArray(ring.values) ? ring.values : [];
+  const last = values.length ? values[values.length - 1] : null;
+  return {
+    key: 'latency',
+    label: 'step latency ms',
+    text: last === null ? '-' : fmtRate(last) + ' ms',
+    path: sparkPath(values, opts),
+    samples: values.length,
+  };
+}
+
+/// KV / VRAM の利用量を「詰まった棒 + 割合」の 1 行にする。
+/// used/total が壊れている (null, total<=0, used<0) ときは空の棒と '-'。
+export function gaugeBar(used, total, opts = {}) {
+  const w = Number(opts.w);
+  const width = Math.min(40, Math.max(1, Math.trunc(w > 0 ? w : GAUGE_WIDTH)));
+  const full = opts.full === undefined ? '█' : String(opts.full);
+  const empty = opts.empty === undefined ? '░' : String(opts.empty);
+  const blank = {
+    ratio: null,
+    pct: '-',
+    filled: 0,
+    width,
+    bar: empty.repeat(width),
+    text: '-',
+  };
+  const u = numOrNull(used);
+  const t = numOrNull(total);
+  if (u === null || t === null || !(t > 0) || u < 0) return blank;
+  const ratio = clamp01(u / t);
+  const filled = Math.round(ratio * width);
+  const bar = full.repeat(filled) + empty.repeat(width - filled);
+  const pct = Math.round(ratio * 100) + '%';
+  return { ratio, pct, filled, width, bar, text: bar + ' ' + pct };
+}
+
+/// KV スロットの使用率 (KvUsage の busy / slots)。
+export function kvGauge(d, opts = {}) {
+  const kv = d && d.kv ? d.kv : null;
+  return gaugeBar(kv ? kv.busy : null, kv ? kv.slots : null, opts);
+}
+
+/// VRAM の使用率 (TierStats の usedMB / totalMB)。
+export function vramGauge(d, opts = {}) {
+  const t = d && d.tier ? d.tier : null;
+  return gaugeBar(t ? t.usedMB : null, t ? t.totalMB : null, opts);
+}
+
+/// ダッシュボードのクイックナビ。2 -> /2d, 3 -> /3d, R -> refresh。
+/// 入力欄に打っている間と修飾キー付きは横取りしない。
+export const QUICK_NAV = Object.freeze({
+  '2': '/2d',
+  '3': '/3d',
+  'r': 'refresh',
+});
+
+export function quickNav(key, ctx = {}) {
+  const c = ctx && typeof ctx === 'object' ? ctx : {};
+  if (c.ctrlKey || c.metaKey || c.altKey) return null;
+  const tag = String(c.tagName || '').toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return null;
+  if (c.contentEditable || c.isContentEditable) return null;
+  const k = String(key == null ? '' : key).toLowerCase();
+  return Object.prototype.hasOwnProperty.call(QUICK_NAV, k) ? QUICK_NAV[k] : null;
 }
 
 // ---- API の案内 -----------------------------------------------------------

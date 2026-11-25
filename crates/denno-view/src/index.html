@@ -58,6 +58,15 @@
                           stroke-linejoin: round; vector-effect: non-scaling-stroke; }
   #rates .rate.vram svg.spark path { stroke: var(--glow); }
   #rates .rate.prefill svg.spark path { stroke: var(--warm); }
+  /* ---- 左: KV / VRAM 利用量 + step レイテンシ (task 909) ---- */
+  #util .urow { display: flex; align-items: baseline; gap: 6px; font-size: 10px; color: var(--mut); }
+  #util .ulabel { width: 44px; flex: none; }
+  #util .ubar { color: var(--acc); letter-spacing: 1px; }
+  #util .ubar.vram { color: var(--glow); }
+  #util .uval { color: var(--warm); }
+  #util svg.lspark { display: block; width: 100%; height: 20px; margin-top: 2px; }
+  #util svg.lspark path { fill: none; stroke: var(--warm); stroke-width: 1.2;
+                          stroke-linejoin: round; vector-effect: non-scaling-stroke; }
   #apis .ep { display: flex; align-items: center; gap: 5px; margin-bottom: 4px; }
   #apis .epname { width: 74px; color: var(--mut); font-size: 10px; flex: none; }
   #apis code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -181,6 +190,7 @@
   <span id="srvinfo" class="muted">disconnected</span>
   <span id="sess" class="muted"></span>
   <span id="gap" class="warn"></span>
+  <span id="navhint" class="muted" style="font-size:10px">[2] /2d · [3] /3d · [R] refresh</span>
   <span id="stat" class="muted" style="margin-left:auto"></span>
   <label class="muted">speed
     <span style="font-size:10px">low</span>
@@ -230,6 +240,13 @@
         <svg class="spark" id="rate-vram-s" viewBox="0 0 220 34" preserveAspectRatio="none"><path id="rate-vram-p" d=""/></svg>
         <div class="rsub" id="rate-vram-n">0 samples</div>
       </div>
+    </div>
+    <h2 style="margin-top:10px">utilization</h2>
+    <div id="util">
+      <div class="urow"><span class="ulabel">KV</span><span class="ubar" id="util-kv">-</span></div>
+      <div class="urow"><span class="ulabel">VRAM</span><span class="ubar vram" id="util-vram">-</span></div>
+      <div class="urow"><span class="ulabel">latency</span><span class="uval" id="util-lat">-</span></div>
+      <svg class="lspark" id="lat-spark" viewBox="0 0 220 20" preserveAspectRatio="none"><path id="lat-spark-p" d=""/></svg>
     </div>
     <h2 style="margin-top:10px">API endpoints</h2>
     <div id="apis">
@@ -1296,9 +1313,11 @@ connect();
 <script type="module">
 import {
   createDash, noteFrame, step, dashRows, apiEndpoints, curlFor,
+  kvGauge, vramGauge, latencyRow, quickNav,
 } from "/dash.mjs";
 
 const SPARK = { w: 220, h: 34, pad: 2 };
+const LAT = { w: 220, h: 20, pad: 2 };
 const dash = createDash();
 let model = "denno";
 const origin = location.origin;
@@ -1338,9 +1357,36 @@ function draw() {
     tv.textContent = dash.tier.usedMB + "/" + dash.tier.totalMB + " MB · " +
       dash.series.vram.length + " samples";
   }
+  // task 909: KV / VRAM の利用量の棒と step レイテンシのスパークライン。
+  const kv = kvGauge(dash, { w: 12 });
+  const kve = el("util-kv");
+  if (kve) kve.textContent = kv.text;
+  const vr = vramGauge(dash, { w: 12 });
+  const vre = el("util-vram");
+  if (vre) vre.textContent = vr.text;
+  const lat = latencyRow(dash, LAT);
+  const late = el("util-lat");
+  if (late) late.textContent = lat.text;
+  const latp = el("lat-spark-p");
+  if (latp) latp.setAttribute("d", lat.path);
 }
 setInterval(() => { step(dash, performance.now()); draw(); }, 250);
 draw();
+
+// task 909: クイックナビ。2 -> /2d, 3 -> /3d, R -> refresh。
+// 入力欄に打っている間は横取りしない (quickNav が見る)。
+window.addEventListener("keydown", (e) => {
+  if (e.defaultPrevented) return;
+  const target = e.target;
+  const act = quickNav(e.key, {
+    tagName: target && target.tagName,
+    isContentEditable: !!(target && target.isContentEditable),
+    ctrlKey: e.ctrlKey, metaKey: e.metaKey, altKey: e.altKey,
+  });
+  if (!act) return;
+  if (act === "refresh") { location.reload(); return; }
+  location.href = act;
+});
 
 async function copyText(text) {
   const note = el("copy-note");
