@@ -14,7 +14,7 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Html;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::Router;
 use denno_telemetry::{self as telem, Frame};
 use futures_util::StreamExt;
@@ -251,7 +251,8 @@ fn build_router(app: AppState) -> Router {
         .route("/replay", get(replay_bin))
         .route("/capture.bin", get(capture_bin))
         .route("/code/src", get(code_src))
-        .route("/chat", post(chat_proxy))
+        .route("/chat", get(chat_page).post(chat_proxy))
+        .route("/chat.mjs", get(chat_mjs))
         .route("/v1/limits", get(limits_proxy))
         .route("/api/*path", axum::routing::any(api_proxy))
         .with_state(app)
@@ -509,6 +510,17 @@ async fn dashboard3d() -> Html<&'static str> {
 /// GET /2d — 層マップ + チャット + 介入/ステアリング操作の 2D ビューワ。
 async fn dashboard2d() -> Html<&'static str> {
     Html(include_str!("index2d.html"))
+}
+
+/// GET /chat — 最小のチャット画面 (task 889)。プロンプトを投げると
+/// 同じ上流へ流れるので /2d の活性化がそのまま動く。純ロジックは chat.mjs。
+async fn chat_page() -> Html<&'static str> {
+    Html(include_str!("chat.html"))
+}
+
+/// GET /chat.mjs — /chat の純ロジック (プリセット・本文・SSE・TTFT/tok/s)。
+async fn chat_mjs() -> axum::response::Response {
+    js_response(include_str!("chat.mjs"))
 }
 
 /// GET /view2d.mjs — /2d が import する純ロジック
@@ -821,6 +833,72 @@ mod tests {
         );
         assert!(
             got.iter().any(|s| s.starts_with("DELETE /v1/steer/apply")),
+            "upstream saw: {got:?}"
+        );
+    }
+
+    /// task 889: /chat は画面 (GET) と上流へのプロキシ (POST) の両方を
+    /// 同じパスに持つ。GET は chat.mjs を読み、POST は /v1/messages へ
+    /// 本文をそのまま送る (system / temperature / max_tokens を含む)。
+    #[tokio::test]
+    async fn chat_page_and_streaming_proxy() {
+        let seen = Seen::default();
+        let upstream = Router::new()
+            .fallback(mock_upstream)
+            .with_state(seen.clone());
+        let up_base = serve(upstream).await;
+        let base = serve(build_router(test_state(&up_base))).await;
+        let c = reqwest::Client::new();
+
+        // GET /chat — 画面。純ロジックを import し、操作の器が揃っている。
+        let r = c.get(format!("{base}/chat")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "GET /chat");
+        assert!(r
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let html = r.text().await.unwrap();
+        assert!(html.contains("./chat.mjs"), "/chat が chat.mjs を読んでいない");
+        for id in [
+            "sys-preset", "sys-text", "temperature", "max-tokens",
+            "send", "stop", "badge-ttft", "badge-rate", "log",
+            "split-toggle", "open-2d",
+        ] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "missing #{id}");
+        }
+
+        // GET /chat.mjs — 純ロジック
+        let r = c.get(format!("{base}/chat.mjs")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "GET /chat.mjs");
+        assert!(r
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript"));
+        let js = r.text().await.unwrap();
+        assert!(js.contains("export function buildChatBody"));
+        assert!(js.contains("export function createSseParser"));
+        assert!(js.contains("export const SYSTEM_PRESETS"));
+
+        // POST /chat — 上流 /v1/messages へ本文ごと転送する。
+        let body = r#"{"model":"denno","max_tokens":16,"temperature":0.3,"stream":true,"system":"be brief","messages":[{"role":"user","content":"hi"}]}"#;
+        let r = c
+            .post(format!("{base}/chat"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        // mock_upstream は未知の経路に 404 を返す — 転送されたことが分かる。
+        assert_eq!(r.status(), 404, "POST /chat should reach upstream");
+        let got = seen.0.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|s| s == &format!("POST /v1/messages query= body={body}")),
             "upstream saw: {got:?}"
         );
     }

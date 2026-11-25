@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>denno chat — /chat</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg:#060b10; --panel:#0b131b; --line:#16232e; --fg:#c8d6e0;
+    --dim:#5b7280; --acc:#00d9a0; --warn:#ffc44d; --err:#ff6b86;
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; }
+  body {
+    background:var(--bg); color:var(--fg);
+    font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    display:flex; flex-direction:column;
+  }
+  header {
+    display:flex; align-items:center; gap:12px; padding:8px 12px;
+    border-bottom:1px solid var(--line); background:var(--panel);
+  }
+  header .logo { font-weight:700; letter-spacing:.06em; }
+  header .logo span { color:var(--acc); }
+  header .sp { flex:1; }
+  header a, header button {
+    color:var(--fg); background:#0f1c26; border:1px solid var(--line);
+    border-radius:4px; padding:3px 9px; text-decoration:none; cursor:pointer;
+    font:inherit; font-size:12px;
+  }
+  header a:hover, header button:hover { border-color:var(--acc); color:#fff; }
+  header button.on { border-color:var(--acc); color:var(--acc); }
+  #badges { display:flex; gap:10px; }
+  .badge {
+    border:1px solid var(--line); border-radius:4px; padding:2px 8px;
+    background:#0a141c; font-size:11px; color:var(--dim);
+  }
+  .badge b { color:var(--fg); font-weight:600; margin-left:6px; }
+  main { flex:1; display:flex; min-height:0; }
+  #chat { flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; }
+  #controls {
+    display:flex; flex-wrap:wrap; gap:8px; align-items:flex-end;
+    padding:8px 12px; border-bottom:1px solid var(--line);
+  }
+  #controls label { display:flex; flex-direction:column; gap:2px; font-size:10px; color:var(--dim); }
+  #controls select, #controls input, #controls textarea {
+    background:#08131c; color:var(--fg); border:1px solid var(--line);
+    border-radius:4px; font:inherit; padding:3px 6px;
+  }
+  #sys-text { width:320px; height:28px; resize:vertical; }
+  #temperature, #max-tokens { width:76px; }
+  #log { flex:1; overflow:auto; padding:12px; white-space:pre-wrap; }
+  #log .u { color:#8fb6cf; margin-top:8px; }
+  #log .a { color:var(--fg); }
+  #log .e { color:var(--err); }
+  #log .note { color:var(--dim); font-size:11px; }
+  #row { display:flex; gap:8px; padding:8px 12px; border-top:1px solid var(--line); }
+  #in { flex:1; height:56px; resize:none; background:#08131c; color:var(--fg);
+        border:1px solid var(--line); border-radius:4px; padding:6px; font:inherit; }
+  #send, #stop { align-self:stretch; min-width:76px; }
+  #send { color:#04120c; background:var(--acc); border:0; border-radius:4px; font-weight:700; cursor:pointer; }
+  #send:disabled { opacity:.4; cursor:default; }
+  #stop { color:var(--err); background:#160a0f; border:1px solid #3a1620; border-radius:4px; cursor:pointer; }
+  #stop:disabled { opacity:.35; cursor:default; }
+  #status { padding:0 12px 6px; font-size:11px; color:var(--dim); }
+  #split { width:46%; border-left:1px solid var(--line); display:none; }
+  #split.on { display:block; }
+  #split iframe { width:100%; height:100%; border:0; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">denno<span>chat</span></div>
+  <div id="badges">
+    <span class="badge">ttft<b id="badge-ttft">-</b></span>
+    <span class="badge">tok/s<b id="badge-rate">-</b></span>
+  </div>
+  <div class="sp"></div>
+  <button id="split-toggle" title="/2d の地図を右半分に並べる (同じ推論の活性化が流れる)">split /2d</button>
+  <a id="open-2d" href="/2d" target="_blank" rel="noopener" title="/2d を別タブで開く">open /2d ↗</a>
+</header>
+
+<main>
+  <section id="chat">
+    <div id="controls">
+      <label>system prompt preset
+        <select id="sys-preset"></select>
+      </label>
+      <label>system (空なら preset の本文)
+        <textarea id="sys-text" placeholder="system prompt…"></textarea>
+      </label>
+      <label>temperature
+        <input id="temperature" type="number" min="0" max="2" step="0.05" value="0.7">
+      </label>
+      <label>max tokens
+        <input id="max-tokens" type="number" min="0" max="4096" step="1" value="512">
+      </label>
+    </div>
+    <div id="log"></div>
+    <div id="row">
+      <textarea id="in" placeholder="prompt… (Enter to send, Shift+Enter = newline)"></textarea>
+      <button id="send">send</button>
+      <button id="stop" disabled title="生成を強制停止する (POST /v1/abort。次のトークンで止まる)">stop</button>
+    </div>
+    <div id="status">ready</div>
+  </section>
+  <aside id="split">
+    <iframe id="split-frame" title="/2d" loading="lazy"></iframe>
+  </aside>
+</main>
+
+<script type="module">
+import {
+  CHAT_URL, SYSTEM_PRESETS, CHAT_DEFAULTS, TEMPERATURE_MAX, MAX_TOKENS_CLAMP,
+  applyChatEvent, buildChatBody, chatBegin, chatEnd, chatFields, chatOnToken,
+  clampMaxTokens, clampTemperature, createChatState, createSseParser,
+  normaliseControls, splitViewUrl, systemPreset,
+} from './chat.mjs';
+
+const $ = (id) => document.getElementById(id);
+const log = $('log');
+const st = createChatState();
+const history = [];
+let busy = false;
+let stopAsked = false;
+let limit = MAX_TOKENS_CLAMP;
+
+// プリセットの選択肢は純ロジックの配列から作る (HTML と二重管理しない)
+const sel = $('sys-preset');
+for (const p of SYSTEM_PRESETS) {
+  const o = document.createElement('option');
+  o.value = p.id;
+  o.textContent = p.label;
+  sel.appendChild(o);
+}
+sel.value = CHAT_DEFAULTS.presetId;
+$('temperature').value = String(CHAT_DEFAULTS.temperature);
+$('max-tokens').value = String(CHAT_DEFAULTS.maxTokens);
+
+// 生成上限はサーバーの /v1/limits を尊重する (取れなければ 4096)
+(async () => {
+  try {
+    const r = await fetch('/v1/limits');
+    if (r.ok) {
+      const j = await r.json();
+      if (j && Number(j.max_tokens_limit) > 0) limit = Number(j.max_tokens_limit);
+      if (j && Number(j.max_tokens_default) > 0) {
+        $('max-tokens').value = String(clampMaxTokens(j.max_tokens_default, CHAT_DEFAULTS.maxTokens, limit));
+      }
+    }
+  } catch (e) { /* 既定値 */ }
+})();
+
+function addLine(cls, text) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+function setBadges() {
+  const f = chatFields(st);
+  $('badge-ttft').textContent = f[0].value;
+  $('badge-rate').textContent = f[1].value;
+}
+
+function setBusy(on) {
+  busy = on;
+  $('send').disabled = on || !$('in').value.trim();
+  $('stop').disabled = !on;
+  sel.disabled = on;
+  $('temperature').disabled = on;
+  $('max-tokens').disabled = on;
+}
+
+/// 1 リクエスト。画面は純ロジックの状態機械に時刻を食わせるだけ。
+async function runStream(node, cont) {
+  chatBegin(st, performance.now());
+  setBadges();
+  let acc = node.textContent || '';
+  let usage = null;
+  let stopReason = null;
+  let err = null;
+  try {
+    const ctl = normaliseControls({
+      presetId: sel.value,
+      system: $('sys-text').value,
+      temperature: $('temperature').value,
+      maxTokens: $('max-tokens').value,
+      limit,
+    });
+    const body = buildChatBody({
+      system: ctl.systemText,
+      temperature: ctl.temperature,
+      maxTokens: ctl.maxTokens,
+      messages: history,
+      stream: true,
+      continue: !!cont,
+    });
+    const res = await fetch(CHAT_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 200));
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    const parser = createSseParser();
+    let lastPaint = 0;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      const events = parser.push(dec.decode(chunk.value, { stream: true }));
+      for (const ev of events) {
+        const r = applyChatEvent(st, ev);
+        if (!r) continue;
+        if (typeof r.text === 'string' && r.text) {
+          acc += r.text;
+          node.textContent = acc;
+          log.scrollTop = log.scrollHeight;
+          chatOnToken(st, performance.now());
+          if (performance.now() - lastPaint > 100) { setBadges(); lastPaint = performance.now(); }
+        }
+        if (r.usage) usage = r.usage;
+        if (r.stopReason) stopReason = r.stopReason;
+        if (r.error) err = r.error;
+      }
+    }
+    for (const ev of parser.flush()) {
+      const r = applyChatEvent(st, ev);
+      if (!r) continue;
+      if (typeof r.text === 'string' && r.text) { acc += r.text; node.textContent = acc; chatOnToken(st, performance.now()); }
+      if (r.usage) usage = r.usage;
+      if (r.stopReason) stopReason = r.stopReason;
+      if (r.error) err = r.error;
+    }
+  } catch (e) {
+    err = (e && e.message) ? e.message : String(e);
+  }
+  chatEnd(st, performance.now(), usage && usage.output_tokens);
+  setBadges();
+  return { acc, usage, err, stopReason };
+}
+
+function setStatus(text) { $('status').textContent = text; }
+
+async function send() {
+  const text = $('in').value;
+  if (busy || !text.trim()) return;
+  stopAsked = false;
+  setBusy(true);
+  addLine('u', '> ' + text);
+  $('in').value = '';
+  $('in').style.height = '';
+  history.push({ role: 'user', content: text });
+  const node = addLine('a', '');
+  setStatus('generating…');
+  const r = await runStream(node, false);
+  if (r.err) addLine('e', '[error] ' + r.err);
+  if (!r.acc && !r.err) node.textContent = '(empty reply)';
+  history.push({ role: 'assistant', content: r.acc || '' });
+  const out = r.usage ? r.usage.output_tokens : null;
+  setStatus((r.err ? 'error' : 'ok') + (out ? ' · ' + out + ' tok' : '') +
+    ' · history ' + history.length + ' msgs' + (stopAsked ? ' · stopped' : ''));
+  setBusy(false);
+}
+
+async function stopGen() {
+  if (!busy) return;
+  stopAsked = true;
+  $('stop').disabled = true;
+  try {
+    const r = await fetch('/api/v1/abort', { method: 'POST' });
+    if (!r.ok) setStatus('stop → ' + r.status);
+  } catch (e) {
+    setStatus('stop → ' + ((e && e.message) || e));
+  }
+}
+
+// ---- 操作の結線 ---------------------------------------------------------
+$('send').addEventListener('click', send);
+$('stop').addEventListener('click', stopGen);
+$('in').addEventListener('input', () => { $('send').disabled = busy || !$('in').value.trim(); });
+$('in').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+// プリセットを選ぶと本文の欄を空にして「下敷き」に戻す
+sel.addEventListener('change', () => {
+  const p = systemPreset(sel.value);
+  $('sys-text').placeholder = p && p.text ? p.text : 'system prompt…';
+  $('sys-text').value = '';
+});
+$('temperature').addEventListener('change', () => {
+  $('temperature').value = String(clampTemperature($('temperature').value));
+});
+$('max-tokens').addEventListener('change', () => {
+  $('max-tokens').value = String(clampMaxTokens($('max-tokens').value, CHAT_DEFAULTS.maxTokens, limit));
+});
+
+// ---- 分割表示 (/2d を右半分に並べる) -----------------------------------
+const split = $('split');
+const frame = $('split-frame');
+$('split-toggle').addEventListener('click', () => {
+  const on = !split.classList.contains('on');
+  split.classList.toggle('on', on);
+  $('split-toggle').classList.toggle('on', on);
+  // 開いたときだけ /2d を読み込む (閉じている間は WS を張らない)
+  if (on && !frame.getAttribute('src')) frame.setAttribute('src', splitViewUrl());
+});
+$('open-2d').href = '/2d?panes=map';
+
+setBadges();
+setBusy(false);
+setStatus('ready · ' + CHAT_URL + ' → /v1/messages · Enter=send');
+</script>
+</body>
+</html>

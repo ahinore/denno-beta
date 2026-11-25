@@ -36,6 +36,10 @@
   .cache.reset { border-color:#7a5a12; background:rgba(255,196,77,.10); color:#ffcf7a; }
   #cachenote { font-size:10px; color:#7fa4b8; padding-top:2px; height:14px; overflow:hidden;
                white-space:nowrap; text-overflow:ellipsis; }
+  /* task 889: /chat (最小のチャット画面) を別タブで開くリンク */
+  #chatpage { font-size:10px; padding:2px 7px; border-radius:3px; border:1px solid #1c3444;
+              color:var(--dim); text-decoration:none; white-space:nowrap; }
+  #chatpage:hover { border-color:#2f8aa8; color:#9fefff; }
   #cachenote b { color:#ffcf7a; font-weight:500; }
   .banner { font-size:11px; padding:2px 9px; border-radius:3px; border:1px solid #1c3444;
             color:var(--dim); white-space:nowrap; max-width:46vw; overflow:hidden; text-overflow:ellipsis; }
@@ -260,6 +264,8 @@
   </div>
   <div class="epoch">epoch <b id="epoch">0</b></div>
   <div id="cache" class="cache">cache: -</div>
+  <a id="chatpage" href="/chat" target="_blank" rel="noopener"
+     title="最小のチャット画面を別タブで開く (/chat)。同じ上流なので、こちらで送ったプロンプトの活性化はこの地図にも流れる (task 889)">chat ↗</a>
   <div id="banner" class="banner">no intervention · no steering</div>
 </header>
 
