@@ -591,11 +591,15 @@ async fn vendor(axum::extract::Path(path): axum::extract::Path<String>) -> axum:
         "addons/shaders/OutputShader.js" => (include_bytes!("vendor/addons/shaders/OutputShader.js"), "text/javascript; charset=utf-8"),
         _ => (b"not found", "text/plain; charset=utf-8"),
     };
-    let status = if body == b"not found" { 404 } else { 200 };
+    let found = body != b"not found";
+    let status = if found { 200 } else { 404 };
+    // 404 を `public, max-age=3600` で配ると、後から足したアセットがブラウザに
+    // 1 時間見えない。200 のときだけキャッシュさせる (task 949)。
+    let cache = if found { "public, max-age=3600" } else { "no-store" };
     axum::response::Response::builder()
         .status(status)
         .header("content-type", mime)
-        .header("cache-control", "public, max-age=3600")
+        .header("cache-control", cache)
         .body(axum::body::Body::from(body.to_vec()))
         .unwrap()
 }
