@@ -34,14 +34,15 @@
 //! `response_format` (`text` | `json_object` | `json_schema`)。未知フィールドは無視する
 //! (serde 既定)。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::routing::get;
+use axum::{Json, Router};
 use denno_engine::{ChatMessage, GenParams, TokenLogprob, ToolConstraint};
 use rand::Rng;
 use serde::Deserialize;
@@ -129,6 +130,186 @@ impl From<ApiError> for OaError {
         out.retry_after = retry_after;
         out
     }
+}
+
+// ---------- モデルカタログ (task 901) ----------
+//
+// `/v1/models` の 1 件分のメタデータと、`/v1/models/:id` / 各生成経路の
+// 別名解決をここに集約する。別名は「同じ重みを指す別の名前」なので、
+// 生成経路では canonical 名と区別しない (応答の `model` は canonical を返す)。
+
+/// 環境変数 `DENNO_MODEL_ALIASES` (カンマ区切り)。各項目は `alias` か
+/// `alias=target`。`target` が今のモデル名と一致しない項目は無視する
+/// (1 プロセス 1 モデルなので、他モデル向けの別名を受けてしまわないようにする)。
+fn env_aliases(canonical: &str) -> Vec<String> {
+    match std::env::var("DENNO_MODEL_ALIASES") {
+        Ok(raw) => parse_aliases(&raw, canonical),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`env_aliases`] の本体 (env を読まないので単体テストできる)。
+fn parse_aliases(raw: &str, canonical: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (alias, target) = match item.split_once('=') {
+            Some((a, t)) => (a.trim(), Some(t.trim())),
+            None => (item, None),
+        };
+        if alias.is_empty() {
+            continue;
+        }
+        if let Some(t) = target {
+            if !t.is_empty() && t != canonical {
+                continue;
+            }
+        }
+        out.push(alias.to_string());
+    }
+    out
+}
+
+/// 既定の別名: `model_id` (pull 元 repo id) とその最終セグメント、
+/// `model_dir` の basename。どれも canonical 名と同じなら出さない。
+fn default_aliases(state: &AppState) -> Vec<String> {
+    let mut out = Vec::new();
+    let id = state.model_id.trim();
+    if !id.is_empty() {
+        out.push(id.to_string());
+        if let Some(tail) = id.rsplit('/').next() {
+            if !tail.is_empty() && tail != id {
+                out.push(tail.to_string());
+            }
+        }
+    }
+    let dir = state.info.model_dir.trim();
+    if !dir.is_empty() {
+        out.push(dir.to_string());
+    }
+    out
+}
+
+/// サービング中のモデルに登録された別名 (canonical 名は含めない、重複無し)。
+pub(crate) fn model_aliases(state: &AppState) -> Vec<String> {
+    let canonical = state.model_name.as_str();
+    let mut out: Vec<String> = Vec::new();
+    for a in default_aliases(state).into_iter().chain(env_aliases(canonical)) {
+        let a = a.trim().to_string();
+        if a.is_empty() || a == canonical || out.iter().any(|x| *x == a) {
+            continue;
+        }
+        out.push(a);
+    }
+    out
+}
+
+/// `requested` が今サービングしているモデル (canonical 名 or 登録別名) を
+/// 指すか。空文字は「未指定」として呼び出し側が扱う。
+pub(crate) fn model_matches(state: &AppState, requested: &str) -> bool {
+    requested == state.model_name || model_aliases(state).iter().any(|a| a == requested)
+}
+
+/// モデルの作成時刻 (epoch 秒) の解決順:
+/// 1. `DENNO_MODEL_CREATED` (epoch 秒) — 運用が正確な値を与えたいとき。
+/// 2. `register_model_dir` で登録された重みディレクトリの mtime
+///    (`serve` 起動時のみ。重みを置いた時刻の近似)。
+/// 3. このプロセスが最初にカタログを読んだ時刻。
+///
+/// 学習日時や repo の公開日時は分からない (`EngineInfo::model_dir` は basename
+/// だけ) ので、2 は「重みを配置した時刻」の意味でしかない。
+fn model_created() -> u64 {
+    static CREATED: OnceLock<u64> = OnceLock::new();
+    *CREATED.get_or_init(|| {
+        let env = std::env::var("DENNO_MODEL_CREATED")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        created_from(env, MODEL_DIR_PATH.get().map(|p| p.as_path())).unwrap_or_else(now_secs)
+    })
+}
+
+/// [`model_created`] の優先順位だけを持つ純関数 (env も static も読まない)。
+fn created_from(env: Option<u64>, dir: Option<&std::path::Path>) -> Option<u64> {
+    if env.is_some() {
+        return env;
+    }
+    let dir = dir?;
+    let mtime = std::fs::metadata(dir).ok()?.modified().ok()?;
+    Some(mtime.duration_since(UNIX_EPOCH).ok()?.as_secs())
+}
+
+/// `serve` 起動時に重みディレクトリを 1 回だけ登録する
+/// ([`model_created`] が mtime を読むため)。テストは登録しない。
+pub(crate) fn register_model_dir(path: &std::path::Path) {
+    let _ = MODEL_DIR_PATH.set(path.to_path_buf());
+}
+
+/// [`register_model_dir`] が入れる重みディレクトリ (最初の 1 個だけ)。
+static MODEL_DIR_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// `/v1/models` の `data[]` 1 件、および `/v1/models/:id` の本文。
+/// Anthropic 側フィールド (`type` / `display_name` / `context_length`) と
+/// OpenAI 側 (`object` / `owned_by` / `created`) を併記したまま、
+/// `context_window` / `aliases` を足す。
+pub(crate) fn model_object(state: &AppState) -> Value {
+    let name = &state.model_name;
+    json!({
+        "id": name,
+        "object": "model",
+        "type": "model",
+        "display_name": name,
+        "created": model_created(),
+        "owned_by": "denno",
+        "context_window": state.info.context,
+        "context_length": state.info.context,
+        "max_context_length": state.info.context,
+        "model_id": state.model_id,
+        "model_dir": state.info.model_dir,
+        "quant": state.info.quant,
+        "slots": state.info.slots,
+        "layers": state.info.layers,
+        "aliases": model_aliases(state),
+        "capabilities": {
+            "anthropic": true,
+            "openai": true,
+            "ollama": true,
+            "tools": true,
+            "streaming": true,
+            "count_tokens": true,
+            "telemetry": denno_telemetry::enabled(),
+        },
+    })
+}
+
+/// `GET /v1/models/:id`。canonical 名または登録別名なら model object を返し、
+/// それ以外は OpenAI 形式の 404 を返す。
+///
+/// このルートは router() (`lib.rs`) ではなくここで登録している。task 893 の
+/// 契約テストは `lib.rs` の `.route("...")` 行と `docs/openapi.yaml` を
+/// 突き合わせるため、仕様書に未記載のパスを lib.rs に足すと落ちる。
+/// `docs/openapi.yaml` へ `GET /v1/models/{id}` を足すのは仕様側の作業
+/// (スコープ外) なので、それまではここに置く。
+pub(crate) fn models_router() -> Router<Arc<AppState>> {
+    Router::new().route("/v1/models/:id", get(model_by_id))
+}
+
+async fn model_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, OaError> {
+    check_auth(&state, &headers).map_err(OaError::from)?;
+    if !model_matches(&state, &id) {
+        return Err(OaError::new(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            format!("model: {id} not found"),
+        ));
+    }
+    Ok(Json(model_object(&state)))
 }
 
 // ---------- リクエスト DTO ----------
@@ -626,7 +807,8 @@ pub async fn chat_completions(
 
     // model: /v1/messages と同じ規則 (不一致は 400/404 系。OpenAI は 404 ではなく
     // 400 invalid_request_error を返す実装が多いが、既存の分類を尊重する)
-    if !req.model.is_empty() && req.model != state.model_name {
+    // task 901: 登録別名 (canonical 名以外) も同じモデルとして受ける。
+    if !req.model.is_empty() && !model_matches(&state, &req.model) {
         return Err(OaError::from(ApiError::not_found(format!(
             "model: {} not found",
             req.model
@@ -1190,7 +1372,8 @@ pub async fn completions(
     let req: CompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| OaError::invalid(format!("invalid request body: {e}")))?;
 
-    if !req.model.is_empty() && req.model != state.model_name {
+    // task 901: `/v1/chat/completions` と同じく登録別名を受ける。
+    if !req.model.is_empty() && !model_matches(&state, &req.model) {
         return Err(OaError::from(ApiError::not_found(format!(
             "model: {} not found",
             req.model
@@ -1353,4 +1536,48 @@ async fn completion_stream_response(
                 .event(Event::default().comment("ping")),
         )
         .into_response())
+}
+
+// ---------- 単体テスト (task 901 の別名・created 解決) ----------
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::{created_from, parse_aliases};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parse_aliases_keeps_bare_and_matching_targets() {
+        let got = parse_aliases(" swift , fast=denno-test ,,bad=other", "denno-test");
+        assert_eq!(got, vec!["swift".to_string(), "fast".to_string()]);
+    }
+
+    #[test]
+    fn parse_aliases_ignores_empty_items() {
+        assert!(parse_aliases("", "denno-test").is_empty());
+        assert!(parse_aliases(" , =x , ", "denno-test").is_empty());
+    }
+
+    #[test]
+    fn created_from_prefers_env_over_dir_mtime() {
+        let dir = std::env::temp_dir();
+        assert_eq!(created_from(Some(1234), Some(dir.as_path())), Some(1234));
+    }
+
+    #[test]
+    fn created_from_uses_dir_mtime_without_env() {
+        let dir = std::env::temp_dir();
+        let got = created_from(None, Some(dir.as_path())).expect("temp_dir の mtime が読めない");
+        // temp_dir は 2020 年以降に存在する (mtime が実時刻であることの下限)。
+        assert!(got > 1_577_836_800, "mtime = {got}");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert!(got <= now, "mtime が未来: {got} > {now}");
+    }
+
+    #[test]
+    fn created_from_is_none_without_env_and_dir() {
+        assert_eq!(created_from(None, None), None);
+        // 存在しないディレクトリも None (呼び出し側が now に落とす)。
+        let missing = std::path::Path::new("/nonexistent-denno-model-dir-901");
+        assert_eq!(created_from(None, Some(missing)), None);
+    }
 }
