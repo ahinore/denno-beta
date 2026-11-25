@@ -477,9 +477,18 @@ async fn response_format_text_and_json_object_are_accepted() {
 #[tokio::test]
 async fn response_format_unsupported_type_is_rejected() {
     let app = plain_app();
+    // P837: `json_schema` は対応した (このテストは「未知の type」の 400 を見る)。
+    let mut body = chat_body(false, false);
+    body["response_format"] = json!({"type": "json_schema_like"});
+    let (status, v) = post(&app, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
+    assert_eq!(v["error"]["param"], "response_format.type");
+
+    // `json_schema` でも `json_schema` オブジェクトが無ければ 400
+    // (param は追加された入れ子の方になる — P837)
     let mut body = chat_body(false, false);
     body["response_format"] = json!({"type": "json_schema"});
     let (status, v) = post(&app, body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body = {v}");
-    assert_eq!(v["error"]["param"], "response_format.type");
+    assert_eq!(v["error"]["param"], "response_format.json_schema");
 }

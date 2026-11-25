@@ -122,6 +122,10 @@ pub enum Job {
         constraint: Option<ToolConstraint>,
         /// s47: thinking 制御 (off のとき Some(false)・brief/full は None)
         enable_thinking: Option<bool>,
+        /// P837: raw prompt (Some なら chat template を通さず、このテキストを
+        /// そのままトークン化する = `/v1/completions` 経路)。Some のとき
+        /// system / messages / tools / constraint / enable_thinking は未使用。
+        raw_prompt: Option<String>,
         respond: oneshot::Sender<Result<ChatOutput>>,
     },
     /// SSE ストリーミング生成 (イベントを events チャネルに流す)
@@ -147,6 +151,8 @@ pub enum Job {
         tools: Option<serde_json::Value>,
         constraint: Option<ToolConstraint>,
         enable_thinking: Option<bool>,
+        /// P837: raw prompt (`/v1/completions` の stream。意味は `Job::Chat` と同じ)
+        raw_prompt: Option<String>,
         events: tokio_mpsc::Sender<RawEvent>,
     },
 }
@@ -336,7 +342,28 @@ impl Scheduler {
         enable_thinking: Option<bool>,
     ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
         let (respond, rx) = oneshot::channel();
-        self.enqueue(Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond })?;
+        self.enqueue(Job::Chat { system, messages, params, tools, constraint, enable_thinking, raw_prompt: None, respond })?;
+        Ok(rx)
+    }
+
+    /// P837: raw prompt の非ストリーミング生成 (`POST /v1/completions`)。
+    /// chat template を通さない以外は [`Scheduler::submit_chat`] と同一経路。
+    pub fn submit_completion(
+        &self,
+        prompt: String,
+        params: GenParams,
+    ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
+        let (respond, rx) = oneshot::channel();
+        self.enqueue(Job::Chat {
+            system: None,
+            messages: Vec::new(),
+            params,
+            tools: None,
+            constraint: None,
+            enable_thinking: None,
+            raw_prompt: Some(prompt),
+            respond,
+        })?;
         Ok(rx)
     }
 
@@ -380,7 +407,28 @@ impl Scheduler {
         enable_thinking: Option<bool>,
         events: tokio_mpsc::Sender<RawEvent>,
     ) -> Result<(), QueueFull> {
-        self.enqueue(Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, events })
+        self.enqueue(Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, raw_prompt: None, events })
+    }
+
+    /// P837: raw prompt の OpenAI 互換ストリーミング (`POST /v1/completions`, stream)。
+    /// 流すのは [`RawEvent`] なので、HTTP 側 (openai.rs) が `text_completion`
+    /// chunk へ組み直す。
+    pub fn submit_completion_stream(
+        &self,
+        prompt: String,
+        params: GenParams,
+        events: tokio_mpsc::Sender<RawEvent>,
+    ) -> Result<(), QueueFull> {
+        self.enqueue(Job::OpenaiStream {
+            system: None,
+            messages: Vec::new(),
+            params,
+            tools: None,
+            constraint: None,
+            enable_thinking: None,
+            raw_prompt: Some(prompt),
+            events,
+        })
     }
 }
 
@@ -630,27 +678,32 @@ fn release_run(engine: &Arc<Mutex<Engine>>, run: &mut Run) {
 
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
 fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
-    let (system, messages, params, tools, constraint, enable_thinking, respond, events, raw) = match job {
-        Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond } => {
-            (system, messages, params, tools, constraint, enable_thinking, Some(respond), None, None)
+    let (system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond, events, raw) = match job {
+        Job::Chat { system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond } => {
+            (system, messages, params, tools, constraint, enable_thinking, raw_prompt, Some(respond), None, None)
         }
         Job::Stream { system, messages, params, tools, constraint, enable_thinking, events } => {
-            (system, messages, params, tools, constraint, enable_thinking, None, Some(events), None)
+            (system, messages, params, tools, constraint, enable_thinking, None, None, Some(events), None)
         }
-        Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, events } => {
-            (system, messages, params, tools, constraint, enable_thinking, None, None, Some(events))
+        Job::OpenaiStream { system, messages, params, tools, constraint, enable_thinking, raw_prompt, events } => {
+            (system, messages, params, tools, constraint, enable_thinking, raw_prompt, None, None, Some(events))
         }
     };
     let (sess, error) = {
         let g = engine.lock().unwrap();
-        match g.begin_chat_with_tools(
-            system.as_deref(),
-            &messages,
-            &params,
-            tools.as_ref(),
-            constraint.as_ref(),
-            enable_thinking,
-        ) {
+        // P837: `raw_prompt` があれば chat template を通さない (completion 経路)
+        let built = match raw_prompt.as_deref() {
+            Some(p) => g.begin_completion(p, &params),
+            None => g.begin_chat_with_tools(
+                system.as_deref(),
+                &messages,
+                &params,
+                tools.as_ref(),
+                constraint.as_ref(),
+                enable_thinking,
+            ),
+        };
+        match built {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         }

@@ -18,12 +18,21 @@
 //! [`crate::stream_asm::StreamAssembler`] をそのまま使い、そのイベント列を
 //! OpenAI の `delta.tool_calls` へ翻訳する (抽出/組立の意味論を二重実装しない)。
 //!
+//! P837: 追加 2 経路。
+//! - `response_format: {"type":"json_schema", ...}` (Structured Outputs):
+//!   スキーマを検証し (厳格モードの制約は [`crate::json_schema`])、スキーマ本文を
+//!   system へ埋め込む。トークン拘束デコードは行わない (docs/api.md に明記)。
+//! - `POST /v1/completions`: chat template を通さない raw prompt の続き生成
+//!   (scheduler は [`crate::scheduler::Job::Chat`] / `OpenaiStream` の
+//!   `raw_prompt` 経路をそのまま使う)。
+//!
 //! 対応フィールド (docs/api.md §POST /v1/chat/completions):
 //! `model` / `messages` (system・developer・user・assistant (+ `tool_calls`)・
 //! tool・function、content は文字列 or text part 配列) / `max_tokens` /
 //! `max_completion_tokens` / `temperature` / `top_p` / `stop` (文字列 or 配列) /
 //! `stream` / `stream_options.include_usage` / `tools` / `tool_choice` /
-//! `response_format` (`text` | `json_object`)。未知フィールドは無視する (serde 既定)。
+//! `response_format` (`text` | `json_object` | `json_schema`)。未知フィールドは無視する
+//! (serde 既定)。
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -214,30 +223,29 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tools: Option<Vec<OaTool>>,
     pub tool_choice: Option<Value>,
-    /// `{"type": "text" | "json_object"}` (json_schema は未対応で 400)
+    /// `{"type": "text" | "json_object" | "json_schema"}` (P837 で json_schema を追加)
     pub response_format: Option<Value>,
 }
 
 /// `response_format` を検証し、モデルへ渡す追加ヒントを返す。
-/// `text` は無変換、`json_object` は「JSON オブジェクトだけを返す」指示を
-/// system へ足す (未指定時はプロンプト不変 = P793 と同一経路)。
-fn response_format_hint(v: &Option<Value>) -> Result<Option<&'static str>, OaError> {
+/// `text` は無変換、`json_object` は「JSON オブジェクトだけを返す」指示、
+/// `json_schema` (P837) はスキーマ本文を埋め込んだ指示を system へ足す
+/// (未指定時はプロンプト不変 = P793 と同一経路)。
+fn response_format_hint(v: &Option<Value>) -> Result<Option<String>, OaError> {
     let Some(v) = v else { return Ok(None) };
-    let ty = v
-        .get("type")
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| {
-            OaError::invalid("response_format: object form requires a string \"type\"")
-                .with_param("response_format.type")
-        })?;
-    match ty {
-        "text" => Ok(None),
-        "json_object" => Ok(Some(JSON_OBJECT_HINT)),
-        other => Err(OaError::invalid(format!(
-            "response_format.type: unsupported value {other:?} (text/json_object)"
-        ))
-        .with_param("response_format.type")),
-    }
+    let fmt = crate::json_schema::parse_response_format(v).map_err(|msg| {
+        let param = if msg.starts_with("response_format.json_schema") {
+            "response_format.json_schema"
+        } else {
+            "response_format.type"
+        };
+        OaError::invalid(msg).with_param(param)
+    })?;
+    Ok(match fmt {
+        crate::json_schema::ResponseFormat::Text => None,
+        crate::json_schema::ResponseFormat::JsonObject => Some(JSON_OBJECT_HINT.to_string()),
+        crate::json_schema::ResponseFormat::JsonSchema(spec) => Some(spec.hint()),
+    })
 }
 
 /// `response_format: {"type":"json_object"}` のときに system へ足す固定文。
@@ -946,4 +954,271 @@ async fn stream_response(
 
 fn sse_data(v: &Value) -> Event {
     Event::default().data(v.to_string())
+}
+
+// ---------- P837: POST /v1/completions (旧 text completions) ----------
+
+/// `POST /v1/completions` のリクエスト (OpenAI 旧 Completions API)。
+///
+/// chat template を通さず、`prompt` の文字列をそのままトークン化して続きを
+/// 生成する (IDE の FIM / インライン補完のように role 包みを望まないクライアント用)。
+#[derive(Debug, Deserialize)]
+pub struct CompletionRequest {
+    #[serde(default)]
+    pub model: String,
+    /// 文字列 or 1 要素の文字列配列。複数プロンプト (batch) とトークン ID 配列は 400。
+    pub prompt: Value,
+    pub max_tokens: Option<usize>,
+    pub max_completion_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    #[serde(default, deserialize_with = "de_stop")]
+    pub stop: Vec<String>,
+    pub stream: Option<bool>,
+    pub stream_options: Option<StreamOptions>,
+    /// true なら `text` の先頭にプロンプト自身を付ける (OpenAI と同じ)。
+    #[serde(default)]
+    pub echo: Option<bool>,
+}
+
+/// `prompt` を 1 本の文字列へ正規化する。空文字は生成不能なので 400。
+fn normalize_prompt(v: &Value) -> Result<String, OaError> {
+    let s = match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => {
+            if a.len() != 1 {
+                return Err(OaError::invalid(format!(
+                    "prompt: batch of {} prompts is not supported (send exactly one prompt)",
+                    a.len()
+                ))
+                .with_param("prompt"));
+            }
+            match &a[0] {
+                Value::String(s) => s.clone(),
+                other => {
+                    return Err(OaError::invalid(format!(
+                        "prompt[0]: expected a string, got {}",
+                        json_type_name(other)
+                    ))
+                    .with_param("prompt[0]"))
+                }
+            }
+        }
+        other => {
+            return Err(OaError::invalid(format!(
+                "prompt: expected a string or an array of one string, got {} \
+                 (token-id arrays are not supported)",
+                json_type_name(other)
+            ))
+            .with_param("prompt"))
+        }
+    };
+    if s.is_empty() {
+        return Err(OaError::invalid("prompt: must be a non-empty string").with_param("prompt"));
+    }
+    Ok(s)
+}
+
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// `cmpl-` + 24hex。
+fn new_cmpl_id() -> String {
+    format!("cmpl-{}", hex24())
+}
+
+/// `/v1/completions` の 1 chunk (`object = text_completion`)。
+fn completion_chunk(id: &str, created: u64, model: &str, text: &str, finish: Value) -> Value {
+    json!({
+        "id": id,
+        "object": "text_completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "text": text,
+            "index": 0,
+            "logprobs": Value::Null,
+            "finish_reason": finish,
+        }],
+    })
+}
+
+pub async fn completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, OaError> {
+    check_auth(&state, &headers).map_err(OaError::from)?;
+    crate::reject_if_draining(&state).map_err(OaError::from)?;
+    let req: CompletionRequest = serde_json::from_slice(&body)
+        .map_err(|e| OaError::invalid(format!("invalid request body: {e}")))?;
+
+    if !req.model.is_empty() && req.model != state.model_name {
+        return Err(OaError::from(ApiError::not_found(format!(
+            "model: {} not found",
+            req.model
+        ))));
+    }
+    let prompt = normalize_prompt(&req.prompt)?;
+
+    // chat 経路と同じ既定 (max_tokens クランプ・temperature 上限・反復抑止の既定値)
+    let params = GenParams {
+        max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
+        temperature: apply_temperature_cap(req.temperature, state.temperature_cap),
+        top_p: req.top_p,
+        top_k: None,
+        stop_sequences: req.stop.clone(),
+        seed: None,
+        repetition_penalty: state.default_repetition_penalty,
+        frequency_penalty: None,
+        presence_penalty: None,
+        no_repeat_ngram_size: None,
+    };
+    let echo = req.echo.unwrap_or(false);
+
+    if req.stream.unwrap_or(false) {
+        return completion_stream_response(state, prompt, params, req.stream_options, echo).await;
+    }
+
+    let rx = state
+        .scheduler
+        .submit_completion(prompt.clone(), params)
+        .map_err(|_| queue_full(&state))?;
+    let output = match tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await {
+        Ok(Ok(Ok(out))) => out,
+        Ok(Ok(Err(e))) => return Err(OaError::from(crate::error_from_anyhow(e))),
+        Ok(Err(e)) => {
+            return Err(OaError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                format!("scheduler dropped: {e}"),
+            ))
+        }
+        Err(_) => {
+            return Err(OaError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                format!(
+                    "timeout: no response from the engine within {:.1}s; \
+                     the request was abandoned (retry later)",
+                    RESPONSE_WAIT_TIMEOUT.as_secs_f64()
+                ),
+            ))
+        }
+    };
+    let mut text = String::new();
+    if echo {
+        text.push_str(&prompt);
+    }
+    text.push_str(&output.text);
+    let finish = finish_reason(output.stop_reason.as_str());
+    Ok(Json(json!({
+        "id": new_cmpl_id(),
+        "object": "text_completion",
+        "created": now_secs(),
+        "model": state.model_name,
+        "choices": [{
+            "text": text,
+            "index": 0,
+            "logprobs": Value::Null,
+            "finish_reason": finish,
+        }],
+        "usage": usage_json(output.input_tokens, output.output_tokens),
+    }))
+    .into_response())
+}
+
+/// `/v1/completions` の SSE (`object = text_completion` の chunk + `[DONE]`)。
+async fn completion_stream_response(
+    state: Arc<AppState>,
+    prompt: String,
+    params: GenParams,
+    stream_options: Option<StreamOptions>,
+    echo: bool,
+) -> Result<Response, OaError> {
+    let include_usage = stream_options.map(|o| o.include_usage).unwrap_or(false);
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<RawEvent>(64);
+    state
+        .scheduler
+        .submit_completion_stream(prompt.clone(), params, raw_tx)
+        .map_err(|_| queue_full(&state))?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+    let id = new_cmpl_id();
+    let created = now_secs();
+    let model = state.model_name.clone();
+    tokio::spawn(async move {
+        let send = |v: Value| {
+            let tx = tx.clone();
+            async move { tx.send(Ok(sse_data(&v))).await.is_ok() }
+        };
+        // echo: プロンプト自身を最初の chunk として流す (OpenAI と同じ)
+        if echo && !prompt.is_empty() {
+            if !send(completion_chunk(&id, created, &model, &prompt, Value::Null)).await {
+                return;
+            }
+        }
+        let mut reason = "stop";
+        let (mut input_tokens, mut output_tokens) = (0usize, 0usize);
+        while let Some(ev) = raw_rx.recv().await {
+            match ev {
+                RawEvent::Start { input_tokens: n } => input_tokens = n,
+                RawEvent::Delta(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if !send(completion_chunk(&id, created, &model, &text, Value::Null)).await {
+                        return;
+                    }
+                }
+                RawEvent::Done { input_tokens: i, output_tokens: o, stop_reason, .. } => {
+                    input_tokens = i;
+                    output_tokens = o;
+                    reason = finish_reason(&stop_reason);
+                }
+                RawEvent::Error(msg) => {
+                    let err = json!({
+                        "error": {"message": msg, "type": "server_error", "param": Value::Null, "code": Value::Null}
+                    });
+                    let _ = tx.send(Ok(sse_data(&err))).await;
+                    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    return;
+                }
+            }
+        }
+        // 最終 chunk (finish_reason)
+        if !send(completion_chunk(&id, created, &model, "", json!(reason))).await {
+            return;
+        }
+        if include_usage {
+            let u = json!({
+                "id": id,
+                "object": "text_completion",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage_json(input_tokens, output_tokens),
+            });
+            if !send(u).await {
+                return;
+            }
+        }
+        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+    });
+
+    Ok(Sse::new(ReceiverStream::new(rx))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(2))
+                .event(Event::default().comment("ping")),
+        )
+        .into_response())
 }

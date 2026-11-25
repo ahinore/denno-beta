@@ -22,6 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 mod lifecycle;
 mod logging;
+/// P837: OpenAI Structured Outputs のスキーマ検証 (`response_format: json_schema`)。
+pub mod json_schema;
 mod openai;
 mod scheduler;
 mod stream_asm;
@@ -880,6 +882,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/messages/count_tokens", post(count_tokens))
         // P793: OpenAI 互換 (同じ Scheduler / chat template / KV prefix cache を通す)
         .route("/v1/chat/completions", post(openai::chat_completions))
+        // P837: OpenAI 旧 Completions (chat template を通さない raw prompt)
+        .route("/v1/completions", post(openai::completions))
         // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
         // Anthropic 互換 API とは別系統で、互換性には影響しない。
         .route("/v1/telemetry/ws", get(telemetry_ws))
