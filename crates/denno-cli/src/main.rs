@@ -235,6 +235,10 @@ enum Commands {
         #[arg(long)] name: Option<String>,
         /// 設定すると x-api-key 認証を要求
         #[arg(long)] api_key: Option<String>,
+        /// task 951: 複数の API キー (カンマ区切り)。`--api-key` と
+        /// `DENNO_API_KEYS` の和が受理される (どれか 1 つに一致すれば通る)。
+        /// 未指定かつ他も空なら従来どおり認証なし。
+        #[arg(long, value_name = "KEYS")] api_keys: Option<String>,
         #[arg(long, default_value_t = 256)] max_tokens: usize,
         /// デフォルト seed(固定すると決定論的)
         #[arg(long)] seed: Option<u64>,
@@ -1215,7 +1219,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap, log_format: _log_format, cors_origin, max_body_mb } => {
+        Commands::Serve { repo, host, port, name, api_key, api_keys, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap, log_format: _log_format, cors_origin, max_body_mb } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -1229,6 +1233,7 @@ fn main() -> Result<()> {
                 host,
                 port,
                 api_key,
+                api_keys,
                 default_seed: seed,
                 prefix_cache_tokens,
                 quant: quant_mode,
@@ -1277,6 +1282,37 @@ mod tests {
             Cli::try_parse_from(["denno", "serve", "repo/x", "--cors-origin", "*"]).unwrap();
         match cli.command {
             Commands::Serve { cors_origin, .. } => assert_eq!(cors_origin.as_deref(), Some("*")),
+            _ => panic!("serve でない"),
+        }
+    }
+
+    /// task 951: `serve --api-keys` の受け取り。未指定は None (他と env の和へ)。
+    /// `--api-key` と併用できる。
+    #[test]
+    fn serve_api_keys_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["denno", "serve", "repo/x"]).unwrap();
+        match cli.command {
+            Commands::Serve { api_keys, api_key, .. } => {
+                assert_eq!(api_keys, None);
+                assert_eq!(api_key, None);
+            }
+            _ => panic!("serve でない"),
+        }
+        let cli = Cli::try_parse_from([
+            "denno",
+            "serve",
+            "repo/x",
+            "--api-keys",
+            "alpha,beta",
+            "--api-key",
+            "solo",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { api_keys, api_key, .. } => {
+                assert_eq!(api_keys.as_deref(), Some("alpha,beta"));
+                assert_eq!(api_key.as_deref(), Some("solo"));
+            }
             _ => panic!("serve でない"),
         }
     }
