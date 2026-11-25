@@ -83,6 +83,10 @@ impl EngineInfo {
 
 pub struct AppState {
     pub engine: Arc<Mutex<Engine>>,
+    /// task 951: 受理する API キーの一覧を **カンマ区切りの 1 本** で持つ
+    /// (`--api-key` / `--api-keys` / `DENNO_API_KEYS` の和を
+    /// [`resolve_api_keys`] が正規化したもの)。None = 認証なし (従来どおり開放)。
+    /// 値は決してログ / 応答に出さない。
     pub api_key: Option<String>,
     /// P4: リクエストスケジューラ (有界キュー + 単一ワーカー)
     pub scheduler: Scheduler,
@@ -115,7 +119,11 @@ pub struct ServeConfig {
     pub model_id: String,
     pub host: String,
     pub port: u16,
+    /// 単一キー (従来)。task 951: カンマ区切りも受け付ける。
     pub api_key: Option<String>,
+    /// task 951: 複数キー (`--api-keys`)。`api_key` と `DENNO_API_KEYS` の
+    /// 和が実効キー一覧になる。None = 未指定。
+    pub api_keys: Option<String>,
     pub default_seed: Option<u64>,
     /// マルチエントリ prefix cache のトークン上限 (None なら env/デフォルトのまま)
     pub prefix_cache_tokens: Option<usize>,
@@ -1805,9 +1813,25 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
             format!("{request_timeout_secs}s")
         }
     );
+    // task 951: 認証キーを解決する。実効一覧 = `--api-key` / `--api-keys` /
+    // `DENNO_API_KEYS` (いずれもカンマ区切り可) の和。空なら従来どおり開放。
+    // ログには **本数だけ** を出し、値は決して出さない。
+    let env_api_keys = std::env::var(API_KEYS_ENV).ok();
+    let api_key = resolve_api_keys(&[
+        cfg.api_key.as_deref(),
+        cfg.api_keys.as_deref(),
+        env_api_keys.as_deref(),
+    ]);
+    match &api_key {
+        Some(k) => tracing::info!(
+            "api auth: {} key(s) configured (values not logged)",
+            k.split(',').filter(|s| !s.is_empty()).count()
+        ),
+        None => tracing::info!("api auth: disabled (no key configured)"),
+    }
     let state = Arc::new(AppState {
         engine: engine.clone(),
-        api_key: cfg.api_key,
+        api_key,
         scheduler: Scheduler::spawn_with_limits(engine, queue_depth, limits),
         model_name,
         model_id,
@@ -2000,20 +2024,94 @@ async fn models(
     })))
 }
 
+/// task 951: 複数 API キーの環境変数名 (カンマ区切り)。
+pub const API_KEYS_ENV: &str = "DENNO_API_KEYS";
+
+/// task 951: カンマ区切りのキー一覧を正規化する。
+/// 前後の空白を落とし、空要素と重複を除く (順序は保つ)。
+pub fn parse_api_keys(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let k = part.trim();
+        if !k.is_empty() && !out.iter().any(|e| e == k) {
+            out.push(k.to_string());
+        }
+    }
+    out
+}
+
+/// task 951: 複数の出所 (CLI フラグ / env) のキーを 1 本のカンマ区切りに
+/// まとめる。1 つも無ければ None (= 認証なし = 従来どおり開放)。
+pub fn resolve_api_keys(sources: &[Option<&str>]) -> Option<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for raw in sources.iter().flatten() {
+        for k in parse_api_keys(raw) {
+            if !keys.iter().any(|e| e == &k) {
+                keys.push(k);
+            }
+        }
+    }
+    if keys.is_empty() {
+        None
+    } else {
+        Some(keys.join(","))
+    }
+}
+
+/// task 951: バイト列の定数時間比較。
+///
+/// 長さが違っても `max(len)` 回だけ走査し、途中で早期 return しない
+/// (一致した位置・接頭辞の長さをタイミングで漏らさない)。`black_box` で
+/// 最適化による畳み込み (早期打ち切りへの書き換え) を防ぐ。
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u32 = (a.len() ^ b.len()) as u32;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0) as u32;
+        let y = b.get(i).copied().unwrap_or(0) as u32;
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// `Authorization: Bearer <key>` の資格情報部を取り出す (スキーム名の
+/// 大文字小文字は無視する)。それ以外のスキームは None。
+fn bearer_credential(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(key) = &state.api_key else { return Ok(()) };
-    let provided = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-        });
-    match provided {
-        Some(p) if p == key => Ok(()),
-        _ => Err(ApiError::auth()),
+    let Some(keys) = &state.api_key else { return Ok(()) };
+    // task 951: `x-api-key` と `Authorization: Bearer` のどちらでも通す
+    // (両方あるときは、どれか 1 つが一致すれば受理する)。
+    let mut provided: [Option<&str>; 2] = [None, None];
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        provided[0] = Some(v.trim());
+    }
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        provided[1] = bearer_credential(v);
+    }
+    // 全キー × 全候補を走査し、早期 return しない (どのキーで一致したかを
+    // タイミングで漏らさない)。個々の比較は定数時間。
+    let mut ok = false;
+    for key in keys.split(',') {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        for cand in provided.iter().flatten() {
+            ok |= constant_time_eq(cand.as_bytes(), key.as_bytes());
+        }
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::auth())
     }
 }
 
