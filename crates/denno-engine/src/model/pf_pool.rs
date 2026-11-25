@@ -166,10 +166,23 @@ pub fn pf_pool_mb_from_value(v: Option<&str>) -> usize {
     }
 }
 
-/// プールの大きさ (バイト)。env はプロセスで 1 回だけ読む。
+/// プールの大きさ (バイト)。
+///
+/// task 814: `DENNO_PF_POOL_MB` が未設定ならメモリ空きに応じた配分
+/// ([`crate::model::pf_budget`]) を使う (空きが十分なら [`DEFAULT_POOL_MB`])。
+/// 借りるたびに引くので、長い prefill の途中で空きが減っても次の借用から
+/// 小さくなる (`borrow_plan` は上限を超えると従来の確保へ落ちる)。
 pub fn pf_pool_bytes() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| pf_pool_mb_from_value(std::env::var(PF_POOL_MB_ENV).ok().as_deref()) << 20)
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    match *V.get_or_init(|| {
+        std::env::var(PF_POOL_MB_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| pf_pool_mb_from_value(Some(&s)))
+    }) {
+        Some(mb) => mb << 20,
+        None => crate::model::pf_budget::tuning().pool_mb << 20,
+    }
 }
 
 /// 1 区画 (プール先頭からのオフセットとバイト数)。
