@@ -9,6 +9,7 @@ mod flash_telemetry;
 mod inspect;
 mod pull;
 mod serve_flash;
+mod tokenize;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -288,6 +289,22 @@ enum Commands {
         /// dense + expert キャッシュ見積りで expert に許す MiB (既定 4096)
         #[arg(long, default_value_t = inspect::DEFAULT_EXPERT_CACHE_MIB)]
         expert_cache_mib: u64,
+    },
+    /// task 941: GGUF のトークナイザ・メタデータだけで文字列をトークン化する
+    /// (重みは読まない)。トークン数 / id / 復号した断片を出す。
+    Tokenize {
+        /// 単一の GGUF か、分割 GGUF のあるディレクトリ
+        #[arg(long)]
+        dir: PathBuf,
+        /// トークン化する文字列 (空文字列 `""` も指定できる)
+        #[arg(long, conflicts_with = "stdin")]
+        text: Option<String>,
+        /// 標準入力から UTF-8 のテキストを読む
+        #[arg(long)]
+        stdin: bool,
+        /// 機械可読な JSON で出力する
+        #[arg(long)]
+        json: bool,
     },
     /// task 881: 環境とハードウェアの自己診断 (CPU SIMD / RAM / CUDA /
     /// Level Zero / GGUF の欠け)。GPU は実行しない (存在と /proc だけ見る)。
@@ -1055,6 +1072,16 @@ fn main() -> Result<()> {
         }
         Commands::Inspect { path, json, expert_cache_mib } => {
             inspect::run(&path, json, expert_cache_mib)?;
+        }
+        Commands::Tokenize { dir, text, stdin, json } => {
+            // task 941: 失敗は終了コードを分けて返す (2=使い方 / 3=GGUF /
+            // 4=標準入力が UTF-8 でない)。main の `?` だとすべて 1 になるため
+            // ここだけ自前で stderr に出して exit する。
+            if let Err(e) = tokenize::run(&dir, text.as_deref(), stdin, json) {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "denno tokenize: {}", e.message);
+                std::process::exit(e.code);
+            }
         }
         Commands::Doctor { dir, json } => {
             doctor::run(dir.as_deref(), json)?;
