@@ -93,6 +93,28 @@ impl StopReason {
     }
 }
 
+/// P869: OpenAI `logprobs` 用の選択候補 1 件 (token id / log 確率 / 生バイト列)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopLogprob {
+    pub token: u32,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+}
+
+/// P869: 生成 1 トークン分の logprobs 記録。
+///
+/// `logprob` は **サンプル直前の logits** (反復抑止 / tool 拘束マスク適用後、
+/// temperature 適用前) の log-softmax。EOS トークンは記録しない (本文に
+/// 現れないため)。`top` は確率降順 (同値は token id 昇順) の上位 `top_n` 件で、
+/// 選ばれたトークンを含むことが多いが保証はしない (top_n=0 なら空)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    pub token: u32,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top: Vec<TopLogprob>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatOutput {
     pub text: String,
@@ -100,6 +122,9 @@ pub struct ChatOutput {
     pub stop_sequence: Option<String>,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// P869: `logprobs=true` のときだけ埋まる生成トークンの log 確率列
+    /// (既定は空 = 追加コストゼロ)。順序は生成順。
+    pub logprobs: Vec<TokenLogprob>,
     /// P805: prefix cache から再利用した KV のトークン数 (= prompt のうち
     /// prefill を省いた先頭長)。Anthropic の `usage.cache_read_input_tokens`。
     pub cache_read_input_tokens: usize,
@@ -120,6 +145,8 @@ impl PartialEq for ChatOutput {
             && self.stop_sequence == other.stop_sequence
             && self.input_tokens == other.input_tokens
             && self.output_tokens == other.output_tokens
+        // P869: `logprobs` は比較しない (logits から決まる派生値で、要求時のみ
+        // 埋まる。既存テストは要求しないため両方空)。
     }
 }
 
@@ -293,6 +320,11 @@ pub struct ChatSession {
     /// Some のとき decode 毎に sample 直前に logits マスクを適用し、
     /// サンプル後に状態機械を前進させる (toolmask.rs)。
     tool_mask: Option<crate::toolmask::ToolMask>,
+    /// P869: `logprobs=true` のときだけ Some(top_n)。None = 記録しない
+    /// (既定経路は分岐 1 本のみ = 数値・速度とも不変)。
+    logprob_top: Option<usize>,
+    /// P869: 生成トークンの logprobs 蓄積 (要求時のみ非空)。
+    logprobs: Vec<TokenLogprob>,
     /// テレメトリ用のセッション ID (採番順。数値経路には無関係)
     pub id: u32,
 }
@@ -317,6 +349,7 @@ impl ChatSession {
             stop_sequence: self.stop_sequence,
             input_tokens: self.input_tokens,
             output_tokens: self.generated.len(),
+            logprobs: self.logprobs,
             cache_read_input_tokens: self.lcp,
             cache_creation_input_tokens: self.input_tokens.saturating_sub(self.lcp),
         }
@@ -326,6 +359,22 @@ impl ChatSession {
     /// (ストリーミングの `message_start.usage` を組み立てるために使う)
     pub fn reused_prefix_tokens(&self) -> usize {
         self.lcp
+    }
+
+    /// P869: 生成トークンの logprobs 記録を有効化する (`top_n` = top_logprobs 件数)。
+    /// 未呼び出し (既定) は記録しない = 追加コストゼロ。
+    pub fn enable_logprobs(&mut self, top_n: usize) {
+        self.logprob_top = Some(top_n);
+    }
+
+    /// P869: 蓄積した logprobs を取り出す (ストリーム経路がステップ毎に drain する)。
+    pub fn take_logprobs(&mut self) -> Vec<TokenLogprob> {
+        std::mem::take(&mut self.logprobs)
+    }
+
+    /// P869: 蓄積した logprobs を参照する。
+    pub fn logprobs(&self) -> &[TokenLogprob] {
+        &self.logprobs
     }
 }
 
@@ -995,8 +1044,61 @@ impl Engine {
             .normalized(),
             gen_prompt_start,
             tool_mask,
+            logprob_top: None,
+            logprobs: Vec::new(),
             id: telem::next_session_id(),
         })
+    }
+
+    /// P869: サンプル直前の logits から 1 トークン分の logprobs 記録を作る。
+    ///
+    /// - 分布は log-softmax (max 引き算で安定化)。temperature / top-p は
+    ///   適用しない (サンプラ内部の話なので、生のモデル分布を返す)
+    /// - `top_n` 件は logit 降順 (同値は token id 昇順) に並べる
+    fn capture_token_logprob(&self, logits: &[f32], token: u32, top_n: usize) -> TokenLogprob {
+        let max = logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f64;
+        for &l in logits {
+            if l.is_finite() {
+                sum += ((l - max) as f64).exp();
+            }
+        }
+        let log_z = max as f64 + sum.ln();
+        let lp_of = |id: u32| -> f32 {
+            match logits.get(id as usize) {
+                Some(&l) if !l.is_nan() => (l as f64 - log_z) as f32,
+                _ => f32::NEG_INFINITY,
+            }
+        };
+        let bytes = self.tok.piece_bytes(token).unwrap_or_default();
+        let mut top = Vec::new();
+        let n = top_n.min(logits.len());
+        if n > 0 {
+            let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+            let desc = |a: u32, b: u32| {
+                logits[b as usize]
+                    .total_cmp(&logits[a as usize])
+                    .then(a.cmp(&b))
+            };
+            if n < idx.len() {
+                idx.select_nth_unstable_by(n - 1, |&a, &b| desc(a, b));
+                idx.truncate(n);
+            }
+            idx.sort_by(|&a, &b| desc(a, b));
+            top = idx
+                .into_iter()
+                .map(|id| TopLogprob {
+                    token: id,
+                    logprob: lp_of(id),
+                    bytes: self.tok.piece_bytes(id).unwrap_or_default(),
+                })
+                .collect();
+        }
+        TokenLogprob { token, logprob: lp_of(token), bytes, top }
     }
 
     /// A2.5/s56: 反復抑止をセッションの logits に適用する (サンプル直前)。
@@ -1178,6 +1280,14 @@ impl Engine {
             crate::prof::time(crate::prof::SAMPLER, || sess.sampler.sample(&sess.logits)) as u32;
         crate::prof::span_end(samp_t, crate::prof::SL_STEP_SAMPLER);
         sess.generated.push(next);
+        // P869: logprobs 要求時のみ記録する (EOS は本文に出ないので除外)。
+        // 既定 (logprob_top == None) は分岐 1 本で、logits にも触らない。
+        if let Some(top) = sess.logprob_top {
+            if !self.model.eos_ids().contains(&next) {
+                let lp = self.capture_token_logprob(&sess.logits, next, top);
+                sess.logprobs.push(lp);
+            }
+        }
         // 第21: 拘束状態の前進 (サンプル済みトークンの piece で状態遷移)
         if let Some(mask) = sess.tool_mask.as_mut() {
             mask.feed(&self.tok, next);
@@ -1463,6 +1573,13 @@ impl Engine {
             }) as u32;
             crate::prof::span_end(samp_t, crate::prof::SL_STEP_SAMPLER);
             sess.generated.push(next);
+            // P869: logprobs 要求時のみ記録 (EOS は本文に出ないので除外)。
+            if let Some(top) = sess.logprob_top {
+                if !self.model.eos_ids().contains(&next) {
+                    let lp = self.capture_token_logprob(&sess.logits, next, top);
+                    sess.logprobs.push(lp);
+                }
+            }
             // 第21: 拘束状態の前進 (サンプル済みトークンの piece で状態遷移)
             if let Some(mask) = sess.tool_mask.as_mut() {
                 mask.feed(&self.tok, next);

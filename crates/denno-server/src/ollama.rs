@@ -427,6 +427,8 @@ impl Stream for NdjsonStream {
                         this.pending.push_back(line);
                         this.finished = true;
                     }
+                    // P869: ollama 経路は logprobs を要求しない (常に None)。
+                    RawEvent::Logprob(_) => {}
                     RawEvent::Error(msg) => {
                         this.pending.push_back(ndjson_line(json!({"error": msg})));
                         this.finished = true;
