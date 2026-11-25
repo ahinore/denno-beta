@@ -4851,8 +4851,11 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let steer_state = steer::snapshot();
         let steer_apply = steer_state.apply.as_ref();
         let steer_rec = steer::rec_on();
+        // task 849: 重ね掛け (rules) は 1 本の合成ベクトルに畳めない (規則ごとに
+        // 層範囲 / alpha / mode が違う)。GPU の常駐経路は使わずホスト経路へ落とす
+        // (値は同じ、速度だけ落ちる)。単一規則は従来どおり。
         let steer_dev_apply = steer_apply
-            .map(|a| a.from < n_layer && a.to > 0)
+            .map(|a| a.is_single_rule() && a.from < n_layer && a.to > 0)
             .unwrap_or(false);
         if steer_rec && !crate::cuda::pf_steer_acc_ensure(n_layer, hc, e) {
             crate::cuda::pf_release();
@@ -5605,8 +5608,11 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let steer_state = steer::snapshot();
         let steer_apply = steer_state.apply.as_ref();
         let steer_rec = steer::rec_on();
+        // task 849: 重ね掛け (rules) は 1 本の合成ベクトルに畳めない (規則ごとに
+        // 層範囲 / alpha / mode が違う)。GPU の常駐経路は使わずホスト経路へ落とす
+        // (値は同じ、速度だけ落ちる)。単一規則は従来どおり。
         let steer_dev_apply = steer_apply
-            .map(|a| a.from < n_layer && a.to > 0)
+            .map(|a| a.is_single_rule() && a.from < n_layer && a.to > 0)
             .unwrap_or(false);
         if steer_rec && !crate::cuda::pf_steer_acc_ensure(n_layer, hc, e) {
             crate::cuda::pf_release();

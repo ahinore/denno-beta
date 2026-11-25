@@ -14,7 +14,9 @@ import {
   ablitImportBody, ablitLayerAt, ablitRange, ablitRangeFromDrag, ablitRecipeBodyFromUi,
   ablitRecipeFileName, ablitRecipeFromText, ablitRecipeObject, ablitRecipeSummaryText,
   ablitRecommendedRange, ablitRecordBody, ablitRefusalLike, ablitSepScores, ablitSnippet,
-  ablitSummary, createMockStore, parsePromptList, steerApplyBody,
+  ablitStackBody, ablitStackSummary, ablitSummary, createMockStore, parsePromptList,
+  steerApplyBody, steerSummary,
+  ABLIT_STACK_MAX,
 } from '../src/view2d.mjs';
 import { archLayout, drawArch, fitView } from '../src/arch2d.mjs';
 
@@ -555,4 +557,121 @@ test('モック: recipe export / import が実 API の形で答える (task 833)
   }).status, 400);
   assert.equal(m.handle('POST', '/v1/steer/recipe/export', { name: 'a b' }).status, 400);
   assert.equal(m.handle('POST', '/v1/steer/recipe/export', { embed_snapshots: 'yes' }).status, 400);
+});
+
+test('ablitStackBody: 規則ごとの層範囲 / alpha / mode と検証 (task 849)', () => {
+  assert.equal(ABLIT_STACK_MAX, 4);
+  const stack = [
+    { pos: 'ablit_A', neg: 'ablit_B', mode: 'project', alpha: 1, layers: [0, 24] },
+    { pos: 'ablit_C', neg: 'ablit_D', alpha: 0.5, layers: [8, 16] }, // mode 省略は project
+  ];
+  const body = ablitStackBody(stack, { nLayers: 48 });
+  assert.deepEqual(body, {
+    rules: [
+      { terms: [{ snapshot: 'ablit_A', coef: 1 }, { snapshot: 'ablit_B', coef: -1 }],
+        layers: [0, 24], alpha: 1, mode: 'project' },
+      { terms: [{ snapshot: 'ablit_C', coef: 1 }, { snapshot: 'ablit_D', coef: -1 }],
+        layers: [8, 16], alpha: 0.5, mode: 'project' },
+    ],
+  });
+  // enable トグル (on === false) の行は捨てる。
+  const off = ablitStackBody([
+    { on: false, pos: 'X', neg: 'Y', layers: [0, 1] },
+    { on: true, pos: 'A', neg: 'B', mode: 'subtract', layers: [2, 4] },
+  ], { nLayers: 48 });
+  assert.equal(off.rules.length, 1);
+  assert.equal(off.rules[0].mode, 'subtract');
+  // 単一規則の本文とは形が違う (同時に送らない)。
+  assert.equal(body.terms, undefined);
+  assert.equal(body.layers, undefined);
+
+  // 不正
+  assert.throws(() => ablitStackBody([], {}), /at least one/);
+  assert.throws(() => ablitStackBody([{ on: false, pos: 'A', neg: 'B', layers: [0, 1] }], {}), /at least one/);
+  const many = Array.from({ length: ABLIT_STACK_MAX + 1 }, (_, i) => (
+    { pos: 'P' + i, neg: 'N' + i, layers: [0, 1] }
+  ));
+  assert.throws(() => ablitStackBody(many, { nLayers: 48 }), /at most 4/);
+  assert.throws(() => ablitStackBody([{ pos: '', neg: 'B', layers: [0, 1] }], {}), /pos: snapshot name/);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'a b', layers: [0, 1] }], {}), /neg: snapshot name/);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'A', layers: [0, 1] }], {}), /different/);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'B', layers: [2, 2] }], {}), /from must be </);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'B', layers: [3, 2] }], {}), /from must be </);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'B', layers: [0, 49] }], { nLayers: 48 }), /to must be <=/);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'B', layers: [0, 1], alpha: 2.5 }], {}), /alpha/);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'B', layers: [0, 1], alpha: NaN }], {}), /alpha/);
+  assert.throws(() => ablitStackBody([{ pos: 'A', neg: 'B', layers: [0, 1], mode: 'add' }], {}), /mode/);
+  assert.throws(() => ablitStackBody([null], {}), /must be an object/);
+});
+
+test('モック: /v1/steer/apply が rules (重ね掛け) を受けて状態に載せる (task 849)', () => {
+  const m = createMockStore({ layers: 8, n_expert: 8, n_expert_used: 2, n_hc: 1, n_embd: 16 },
+    { now: () => 1762732800 });
+  for (const name of ['ablit_A', 'ablit_B', 'ablit_C', 'ablit_D']) {
+    m.handle('POST', '/v1/steer/record', { name });
+    m.tick(2);
+    m.handle('POST', '/v1/steer/record/stop');
+  }
+  const body = ablitStackBody([
+    { pos: 'ablit_A', neg: 'ablit_B', mode: 'project', alpha: 1, layers: [0, 5] },
+    { pos: 'ablit_C', neg: 'ablit_D', mode: 'subtract', alpha: 0.25, layers: [3, 8] },
+  ], { nLayers: 8 });
+  const r = m.handle('POST', '/v1/steer/apply', body);
+  assert.equal(r.status, 200);
+  const st = m.handle('GET', '/v1/steer').body;
+  assert.equal(st.apply.rules.length, 2);
+  assert.deepEqual(st.apply.rules[0].layers, [0, 5]);
+  assert.deepEqual(st.apply.rules[1].layers, [3, 8]);
+  assert.equal(st.apply.rules[1].mode, 'subtract');
+  assert.equal(st.apply.rules[1].alpha, 0.25);
+  assert.deepEqual(st.apply.terms.map((t) => t.snapshot),
+    ['ablit_A', 'ablit_B', 'ablit_C', 'ablit_D'], 'terms は全規則の連結');
+  assert.deepEqual(st.apply.layers, [0, 8], '包みは全規則の外側');
+
+  // 不正 (rules と単一規則の混在 / 空 / 多すぎ / 未知のフィールド / 無い snapshot)。
+  assert.equal(m.handle('POST', '/v1/steer/apply', { ...body, layers: [0, 1] }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', { rules: [] }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', { rules: 'x' }).status, 400);
+  const nine = Array.from({ length: 9 }, () => (
+    { terms: [{ snapshot: 'ablit_A', coef: 1 }], layers: [0, 1], alpha: 1, mode: 'project' }
+  ));
+  assert.equal(m.handle('POST', '/v1/steer/apply', { rules: nine }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', {
+    rules: [{ terms: [{ snapshot: 'ablit_A', coef: 1 }], layers: [0, 1], alpha: 1, mode: 'project', x: 1 }],
+  }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', {
+    rules: [{ terms: [], layers: [0, 1], alpha: 1, mode: 'project' }],
+  }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', {
+    rules: [{ terms: [{ snapshot: 'ghost', coef: 1 }], layers: [0, 1], alpha: 1, mode: 'project' }],
+  }).status, 400);
+  assert.equal(m.handle('POST', '/v1/steer/apply', {
+    rules: [{ terms: [{ snapshot: 'ablit_A', coef: 1 }], layers: [0, 9], alpha: 1, mode: 'project' }],
+  }).status, 400);
+  // 適用中の snapshot を消すと、重ね掛けの適用も落ちる。
+  m.handle('DELETE', '/v1/steer/snapshots/ablit_C');
+  assert.equal(m.handle('GET', '/v1/steer').body.apply, null);
+});
+
+test('steerSummary / ablitStackSummary: 重ね掛けは規則ごとに出す (task 849)', () => {
+  const apply = {
+    terms: [{ snapshot: 'ablit_A', coef: 1 }, { snapshot: 'ablit_B', coef: -1 }],
+    layers: [0, 8], alpha: 1, mode: 'project',
+    rules: [
+      { terms: [{ snapshot: 'ablit_A', coef: 1 }, { snapshot: 'ablit_B', coef: -1 }],
+        layers: [0, 5], alpha: 1, mode: 'project' },
+      { terms: [{ snapshot: 'ablit_C', coef: 1 }], layers: [3, 8], alpha: 0.5, mode: 'subtract' },
+    ],
+  };
+  const s = steerSummary(apply);
+  assert.equal(s, ablitStackSummary(apply));
+  assert.ok(s.includes('ablit_A +1'), s);
+  assert.ok(s.includes('layers 0-5'), s);
+  assert.ok(s.includes('subtract'), s);
+  assert.ok(s.includes('layers 3-8'), s);
+  assert.equal(ablitStackSummary({ rules: [] }), '');
+  assert.equal(ablitStackSummary(null), '');
+  // 単一規則の要約は従来どおり。
+  assert.equal(steerSummary({ terms: [{ snapshot: 'A', coef: 1 }], layers: [0, 2], alpha: 1, mode: 'subtract' }),
+    'A +1 · subtract · α 1 · layers 0-2');
 });
