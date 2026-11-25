@@ -56,6 +56,10 @@ use std::time::Instant;
 #[path = "serve_metrics.rs"]
 mod metrics;
 
+// task 866: prefix KV スロットの radix (パス圧縮トライ) 索引。既定 off。
+#[path = "kv_radix.rs"]
+mod kv_radix;
+
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
@@ -470,6 +474,18 @@ fn kv_slot_max_tok(v: Option<&str>, max_ctx: usize) -> usize {
     }
 }
 
+/// task 866: `DENNO_KV_RADIX` (既定 off)。`1` / `true` / `yes` / `on` で、
+/// スロット選択を radix (パス圧縮トライ) 索引 + 前置き優先の追い出しにする。
+///
+/// 他のフラグと違い **既定 off** (task の規則: 実験経路は明示フラグの裏)。
+/// 既定 off では索引を 1 度も作らず、ログにも radix の欄を出さない
+/// (既定の挙動とログ行を byte 単位で変えないため)。スロット数 2 では
+/// 従来の main/aux heuristic (`pick_ctx`) をそのまま使うので不活性
+/// (radix は `--kv-slots` / `DENNO_KV_SLOTS` が 3 以上のときだけ効く)。
+fn kv_radix_enabled(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("true") | Some("yes") | Some("on"))
+}
+
 /// P812: N スロット選択の入力 (1 スロットぶん)。
 ///
 /// `len` は文脈のトークン数 (空きスロットは `None`)、`lcp` は今回のプロンプト
@@ -511,6 +527,29 @@ impl SlotPick {
     }
 }
 
+/// task 866 監査: 既存の multi-slot prefix cache (P812) と radix 化の限界。
+///
+/// 既存の形: スロット 1 本 = 系列状態 1 つ (`Cached`)。選択は
+/// [`pick_ctx`] (2 本) と [`pick_slot_n`] (3 本以上) で、
+/// 1. 「キャッシュ全体がプロンプトの前置き」のスロットを最長優先で再利用、
+/// 2. 部分一致は splice (task 131) で継げるものだけ、
+/// 3. 空き → LRU 追い出し。
+/// 状態は move でしか動かないので、スロット間で KV は共有されない。
+///
+/// task 866 で radix (パス圧縮トライ) を入れた範囲と、入れなかった範囲:
+/// - 入れた: 全スロットの lcp を 1 回の走査で求める索引 ([`kv_radix::KvRadix`])。
+///   共通 system プロンプトのような長い前置きを N 本が共有していても、
+///   選択のコストが O(N × プロンプト長) から O(プロンプト長 + N) になる。
+///   追い出しは「今回のプロンプトと前置きを共有しない文脈」を優先する。
+/// - 入れなかった: 部分一致 (LCP の途中) からの KV 再利用 = copy-on-write の
+///   分岐。理由は 2 つ。(a) full attention の KV は層長を戻せる
+///   (`AttnCache::truncate_layer`) が、GDN (ssm) の再帰状態は層ごとの clone が
+///   要る (spec decode の `SpecGdnSnap` と同じ形。1 文脈 117 MiB)。毎リクエスト
+///   clone するコストはこの task では測っていない。(b) 部分再利用を入れると
+///   「同じ前置きでも計算経路が変わる」ので、md5 一致の検証が重くなる。
+///   したがって **再利用は従来どおり「キャッシュ全体が前置き」のときだけ** で、
+///   出力は radix の有無で変わらない (ラボで md5 一致を確認する前提)。
+///
 /// P812: N スロットから 1 つ選ぶ純関数 (テストが規約を固定する)。
 ///
 /// 優先順:
@@ -1483,6 +1522,10 @@ impl Flash {
         // 使う (既定 --kv-slots 2 の挙動・メモリ量を変えないため)。3 本以上では
         // LCP 一致 + LRU の汎用経路。
         let n_slots = self.slots.len();
+        // task 866: radix (パス圧縮トライ) 索引。既定 off。スロット 2 本では
+        // 従来の main/aux 経路 (pick_ctx) をそのまま使うので不活性。
+        let radix_on =
+            kv_radix_enabled(std::env::var("DENNO_KV_RADIX").ok().as_deref()) && n_slots >= 3;
         let legacy_pick = if n_slots <= 2 {
             let lcp_main = self.main_ctx().map(|c| first_mismatch(&c.toks, &prompt));
             let lcp_aux = self.aux_ctx().map(|c| first_mismatch(&c.toks, &prompt));
@@ -1527,16 +1570,50 @@ impl Flash {
             Some(CtxPick::Fresh) => None,
             None => {
                 // 汎用経路: 全スロットの共通前置き長を見て 1 本選ぶ。
+                // task 866: `DENNO_KV_RADIX=1` ではパス圧縮トライを 1 回なぞって
+                // 全スロットの lcp を求める (プロンプト長 1 回ぶんの走査)。
+                // 値は `first_mismatch` と一致する (下の debug_assert とテスト
+                // `lcps_match_bruteforce` が担保)。
+                let radix = radix_on.then(|| {
+                    kv_radix::KvRadix::from_slots(
+                        self.slots
+                            .iter()
+                            .map(|s| s.ctx.as_ref().map(|c| c.toks.as_slice())),
+                    )
+                });
+                let lcps: Vec<usize> = match radix.as_ref() {
+                    Some(r) => r.lcps(&prompt, n_slots),
+                    None => self
+                        .slots
+                        .iter()
+                        .map(|s| {
+                            s.ctx
+                                .as_ref()
+                                .map(|c| first_mismatch(&c.toks, &prompt))
+                                .unwrap_or(0)
+                        })
+                        .collect(),
+                };
+                debug_assert!(
+                    !radix_on
+                        || self
+                            .slots
+                            .iter()
+                            .zip(&lcps)
+                            .all(|(s, &l)| l
+                                == s.ctx
+                                    .as_ref()
+                                    .map(|c| first_mismatch(&c.toks, &prompt))
+                                    .unwrap_or(0)),
+                    "radix の lcp が総当りと違う"
+                );
                 let metas: Vec<SlotMeta> = self
                     .slots
                     .iter()
-                    .map(|s| SlotMeta {
+                    .zip(&lcps)
+                    .map(|(s, &lcp)| SlotMeta {
                         len: s.ctx.as_ref().map(|c| c.toks.len()),
-                        lcp: s
-                            .ctx
-                            .as_ref()
-                            .map(|c| first_mismatch(&c.toks, &prompt))
-                            .unwrap_or(0),
+                        lcp,
                         used_at: s.used_at,
                         splice: splice_on
                             && prompt_from_render
@@ -1545,10 +1622,21 @@ impl Flash {
                                 .is_some_and(|c| self.splice_compatible(c, req)),
                     })
                     .collect();
-                let sp = pick_slot_n(prompt.len(), &metas);
+                let mut sp = pick_slot_n(prompt.len(), &metas);
+                if radix_on {
+                    // task 866: 追い出しだけは前置き優先にする (今回のプロンプトと
+                    // 前置きを共有しない文脈から捨てる)。再利用の可否は変えない。
+                    if let SlotPick::Evict(_) = sp {
+                        let l: Vec<usize> = metas.iter().map(|m| m.lcp).collect();
+                        let u: Vec<u64> = metas.iter().map(|m| m.used_at).collect();
+                        if let Some(v) = kv_radix::evict_victim(&l, &u) {
+                            sp = SlotPick::Evict(v);
+                        }
+                    }
+                }
                 dest_slot = sp.idx();
                 eprintln!(
-                    "[flash] ctx: slots=[{}] pick={} plen={}",
+                    "[flash] ctx: slots=[{}] pick={} plen={}{}",
                     metas
                         .iter()
                         .map(|m| match m.len {
@@ -1558,7 +1646,15 @@ impl Flash {
                         .collect::<Vec<_>>()
                         .join(" "),
                     sp.name(),
-                    prompt.len()
+                    prompt.len(),
+                    match radix.as_ref() {
+                        Some(r) => format!(
+                            " radix(nodes={} tok_sum={})",
+                            r.node_count(),
+                            r.total_tokens()
+                        ),
+                        None => String::new(),
+                    }
                 );
                 match sp {
                     SlotPick::Reuse(i) => self.take_slot(i),
@@ -1571,7 +1667,12 @@ impl Flash {
                         let old = self.take_slot(i).map(|c| c.toks.len());
                         if let Some(n) = old {
                             eprintln!(
-                                "[flash] slot {i}: LRU 追い出し ({} tok, スロット {n_slots} 本)",
+                                "[flash] slot {i}: {} ({} tok, スロット {n_slots} 本)",
+                                if radix_on {
+                                    "前置き優先の追い出し"
+                                } else {
+                                    "LRU 追い出し"
+                                },
                                 n
                             );
                         }
@@ -4542,6 +4643,18 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             (kv_slots - 2) * cfg.max_ctx * 48 / 1024,
             cfg.max_ctx
         );
+    }
+    // task 866: radix 索引の状態を 1 行だけ出す (既定 off なので既定ログは不変)。
+    if kv_radix_enabled(std::env::var("DENNO_KV_RADIX").ok().as_deref()) {
+        if kv_slots >= 3 {
+            eprintln!(
+                "[flash] kv-radix=on: パス圧縮トライ + 前置き優先の追い出し (slots={kv_slots})"
+            );
+        } else {
+            eprintln!(
+                "[flash] kv-radix: slots={kv_slots} では不活性 (main/aux 経路のまま。--kv-slots 3 以上で有効)"
+            );
+        }
     }
     let mut flash = Flash {
         parts,
