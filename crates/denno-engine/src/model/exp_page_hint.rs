@@ -23,6 +23,13 @@
 //! 落とす単位は expert のバイト範囲で、連続する expert id は 1 回の syscall に
 //! まとめる。
 //!
+//! # 読み直す量の上限 (lab 実測)
+//!
+//! 上限は [`warm_mb`] (既定 2048 MiB)。lab t862c (UD-Q4_K_XL、3,826 cold) で
+//! 上限を 4096 / 無制限にすると読み直しは 4,097 / 6,843-8,309 MiB まで増えたが、
+//! 直後の decode は 88.7 / 80.2 ms/tok で 2048 の 76.6 ms/tok を下回らなかった
+//! (落とし + 戻しは 0.62-0.76 s)。上限を上げる根拠が出ないので既定は 2048 のまま。
+//!
 //! # 落とし方 (ここが要点)
 //!
 //! このホスト (kernel 7.0) で実測した挙動:
@@ -59,7 +66,7 @@ pub const ENV: &str = "DENNO_EXPERT_PAGE_HINT";
 /// `DENNO_EXPERT_PAGE_HINT_KEEP_TOK`: prefill の末尾で残すトークン数 (既定 256)。
 pub const KEEP_TOK_ENV: &str = "DENNO_EXPERT_PAGE_HINT_KEEP_TOK";
 
-/// `DENNO_EXPERT_PAGE_HINT_DEC_TOK`: decode の履歴から残すトークン数 (既定 256)。
+/// `DENNO_EXPERT_PAGE_HINT_DEC_TOK`: decode の履歴から残すトークン数 (既定 64)。
 pub const DEC_TOK_ENV: &str = "DENNO_EXPERT_PAGE_HINT_DEC_TOK";
 
 /// `DENNO_EXPERT_PAGE_HINT_MIN_TOK`: これ未満のプロンプトでは何もしない (既定 2048)。
