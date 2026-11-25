@@ -1920,9 +1920,19 @@ pub fn lm_tile_from_value(v: Option<&str>) -> usize {
 }
 
 /// 1 回の MoE で受けるトークン数 (nt 以下に丸める。0 相当なら分割しない)。
+///
+/// task 814: `DENNO_PF_LM_TILE` が未設定ならメモリ空きに応じた配分
+/// ([`super::pf_budget`]) を使う (空きが十分なら [`DEFAULT_LM_TILE`])。
 pub fn lm_tile(nt: usize) -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let t = *N.get_or_init(|| lm_tile_from_value(std::env::var(LM_TILE_ENV).ok().as_deref()));
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let t = V
+        .get_or_init(|| {
+            std::env::var(LM_TILE_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| lm_tile_from_value(Some(&s)))
+        })
+        .unwrap_or_else(|| super::pf_budget::tuning().lm_tile);
     if t == 0 || t >= nt {
         nt
     } else {
@@ -2126,15 +2136,25 @@ pub fn pread_kb_default(wide_on: bool) -> usize {
 }
 
 /// 1 回の `read_at` の長さ (バイト)。
+///
+/// task 814: `DENNO_PF_PREAD_KB` が未設定のとき、メモリが圧迫されていれば
+/// 配分 ([`super::pf_budget`]) の上限 (`pread_kb_cap`) まで下げる。空きが
+/// 十分なら上限は 0 で、従来の [`pread_kb_default`] のまま。明示値は常に勝つ。
 pub fn pread_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        let kb = match std::env::var(PREAD_KB_ENV).ok().as_deref() {
-            Some(s) if !s.trim().is_empty() => pread_kb_from_value(Some(s)),
-            _ => pread_kb_default(split_wide_bytes() > 0),
-        };
-        kb << 10
-    })
+    let kb = *N.get_or_init(|| match std::env::var(PREAD_KB_ENV).ok().as_deref() {
+        Some(s) if !s.trim().is_empty() => pread_kb_from_value(Some(s)),
+        _ => {
+            let d = pread_kb_default(split_wide_bytes() > 0);
+            let cap = super::pf_budget::tuning().pread_kb_cap;
+            if cap > 0 {
+                d.min(cap)
+            } else {
+                d
+            }
+        }
+    });
+    kb << 10
 }
 
 /// `len` バイトを `blk` ずつに切った (転送元の中のオフセット, 長さ) の列。
@@ -2370,12 +2390,22 @@ pub fn pread_threads_from_value(v: Option<&str>) -> usize {
     }
 }
 
-/// pread 専用プールのスレッド数 (プロセスで 1 回だけ env を読む)。
+/// pread 専用プールのスレッド数。
+///
+/// task 814: `DENNO_PF_PREAD_THREADS` が未設定なら `DENNO_PF_MEMADAPT` の
+/// 計算 ([`super::pf_budget`]) を使う。空きが十分なら
+/// [`DEFAULT_PREAD_THREADS`] と同じ値を返す (恒等)。
 pub fn pread_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        pread_threads_from_value(std::env::var(PREAD_THREADS_ENV).ok().as_deref())
-    })
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    match *V.get_or_init(|| {
+        std::env::var(PREAD_THREADS_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| pread_threads_from_value(Some(&s)))
+    }) {
+        Some(n) => n,
+        None => super::pf_budget::tuning().pread_threads,
+    }
 }
 
 /// `DENNO_PF_PREAD_POOL_PER_UP`: pread のプールを**上げスレッドごとに**持つ。
@@ -5299,12 +5329,21 @@ pub fn rc_cache_mb_from_value(v: Option<&str>) -> usize {
     }
 }
 
-/// 置き場のバイト数 (プロセスで 1 回だけ env を読む)。
+/// 置き場のバイト数。
+///
+/// task 814: `DENNO_PF_RC_CACHE_MB` が未設定ならメモリ空きに応じた配分
+/// ([`super::pf_budget`]) を使う (空きが十分なら [`DEFAULT_RC_CACHE_MB`])。
 pub fn rc_cache_bytes() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        rc_cache_mb_from_value(std::env::var(RC_CACHE_MB_ENV).ok().as_deref()) << 20
-    })
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    match *V.get_or_init(|| {
+        std::env::var(RC_CACHE_MB_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| rc_cache_mb_from_value(Some(&s)))
+    }) {
+        Some(mb) => mb << 20,
+        None => super::pf_budget::tuning().rc_cache_mb << 20,
+    }
 }
 
 /// [`RC_THREADS_ENV`] の解釈 (純関数)。1..=32。
@@ -5320,9 +5359,20 @@ pub fn rc_threads_from_value(v: Option<&str>) -> usize {
 }
 
 /// 先読みの並列度。
+///
+/// task 814: `DENNO_PF_RA_THREADS` が未設定ならメモリ空きに応じた配分
+/// ([`super::pf_budget`]) を使う (空きが十分なら [`DEFAULT_RC_THREADS`])。
 pub fn rc_threads() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| rc_threads_from_value(std::env::var(RC_THREADS_ENV).ok().as_deref()))
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    match *V.get_or_init(|| {
+        std::env::var(RC_THREADS_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| rc_threads_from_value(Some(&s)))
+    }) {
+        Some(n) => n,
+        None => super::pf_budget::tuning().ra_threads,
+    }
 }
 
 /// 置き場の 1 エントリ。`base` は [`RcBuf`] の先頭からのオフセット。
