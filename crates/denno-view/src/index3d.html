@@ -111,6 +111,11 @@
   #fpsov_hist { display:flex; gap:1px; justify-content:flex-end; align-items:flex-end;
                 height:16px; margin-top:3px; }
   #fpsov_hist i { width:3px; background:var(--vram); opacity:.75; }
+  /* ---- task 939: reduced motion では CSS の動きも止める ---- */
+  @media (prefers-reduced-motion: reduce) {
+    #camlabel { transition:none; }
+    #lstrip .cell i { transition:none; }
+  }
 </style>
 </head>
 <body>
@@ -138,7 +143,7 @@
   <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span> · <span class="warm">選択履歴 黄→橙</span></div>
   <div>rank rail (router 上): 上 = rank 1 · 大きさ/明るさ = 重み · 色 = expert の居場所の段</div>
   <div>heat: 選ばれた回数が多い expert ほど濃く光る (冷えるのに約 40 秒)</div>
-  <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
+  <div>drag: rotate · wheel: zoom · space: pause · [h] chat · [c] theme · [s] snapshot · [m] motion</div>
 </div>
 <div id="layers" class="panel">
   <div>layers 00-47: <span class="vram">VRAM 常駐</span> / <span class="ram">加熱</span> /
@@ -161,7 +166,7 @@
 <div id="keys" class="panel" role="dialog" aria-label="keyboard shortcuts">
   <div class="kh">keyboard <span class="dim">— ? で開閉</span></div>
   <div id="keys-rows"></div>
-  <div class="kf">1-5 でカメラ / [ ] で層 / p で fps / f でフライト / space で停止 / c でチャット / ? でこの凡例</div>
+  <div class="kf">1-5 でカメラ / [ ] で層 / p で fps / c でテーマ / s で snapshot / m で idle orbit / f でフライト / space で停止 / h でチャット / ? でこの凡例</div>
 </div>
 <div id="camlabel" class="panel"></div>
 <div id="insp" class="panel">
@@ -208,6 +213,9 @@ import {
   layerKind, stepLayer, clampLayer, activationStats, formatMagnitude,
   expertSummary, formatExpertSummary, isLayerStepKey, isFpsKey, overlayFromQuery,
   createFpsMeter, noteFrame, fpsSummary, fpsText, fpsBars, camAnimActive,
+  THEME_COUNT, themeAt, themeIndex, cycleTheme, isThemeKey, themeCssVars,
+  snapshotFilename, isSnapshotKey,
+  createMotion, effectiveReduced, setEnvReduced, toggleReducedMotion, orbitEnabled, isMotionKey,
 } from '/keys3d.mjs';
 
 // ===== 実モデルの数 (GGUF ヘッダ実測) =====================================
@@ -408,6 +416,58 @@ function applyBookmark(bm) {
 }
 if (legendFromQuery(Q.get('legend'))) setLegend(true);   // 検証用 ?legend=1
 if (overlayFromQuery(Q.get('fps'))) setFpsOverlay(true);  // 検証用 ?fps=1
+
+// ===== task 939: カラーテーマ / スナップショット / reduced motion =========
+// 純ロジックは keys3d.mjs。ここは CSS 変数と three.js の色に反映するだけ。
+let themeIdx = themeIndex(Q.get('theme') || 'cyber');
+if (themeIdx < 0) themeIdx = 0;
+
+/** 添字のテーマを CSS 変数と scene に反映する (announce 時だけトースト)。 */
+function applyTheme(idx, announce) {
+  themeIdx = ((Number(idx) % THEME_COUNT) + THEME_COUNT) % THEME_COUNT || 0;
+  const th = themeAt(themeIdx);
+  const vars = themeCssVars(themeIdx);
+  for (const k of Object.keys(vars)) document.documentElement.style.setProperty(k, vars[k]);
+  if (scene.background) scene.background.set(th.bg);
+  if (scene.fog && scene.fog.color) scene.fog.color.set(th.bg);
+  if (announce) showCamLabel('theme: ' + th.name + ' (' + (themeIdx + 1) + '/' + THEME_COUNT + ')');
+  return th;
+}
+applyTheme(themeIdx, false);
+
+/** 今のフレームを描き直してから PNG を保存する (preserveDrawingBuffer と二重の保険)。 */
+function captureSnapshot() {
+  composer.render();                       // 直前に描いた絵を保証してから読む
+  const name = snapshotFilename(new Date());
+  const a = document.createElement('a');
+  a.href = canvas.toDataURL('image/png');
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  showCamLabel('snapshot: ' + name);
+  return name;
+}
+
+// prefers-reduced-motion を初期値にし、OS 設定の変化にも追随する。
+const mqReduced = typeof matchMedia === 'function'
+  ? matchMedia('(prefers-reduced-motion: reduce)') : null;
+const motion = createMotion(!!(mqReduced && mqReduced.matches));
+if (mqReduced) {
+  const onReducedChange = (ev) => {
+    setEnvReduced(motion, ev.matches);
+    showCamLabel('motion: ' + (effectiveReduced(motion) ? 'reduced (orbit frozen)' : 'orbit on'));
+  };
+  if (mqReduced.addEventListener) mqReduced.addEventListener('change', onReducedChange);
+  else if (mqReduced.addListener) mqReduced.addListener(onReducedChange);
+}
+// idle orbit はキー / ポインタが動いてから少し経ってから回す。
+let lastInput = performance.now();
+function noteInput() { lastInput = performance.now(); }
+addEventListener('pointerdown', noteInput);
+addEventListener('pointermove', noteInput);
+addEventListener('wheel', noteInput, { passive: true });
+
 
 const m4 = new THREE.Matrix4();
 
@@ -1105,11 +1165,20 @@ addEventListener('pointermove', (e) => {
 });
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+  noteInput();
   // task 813: `?` で凡例、1-4 でカメラブックマーク
   if (isLegendKey(e)) { toggleLegendUI(); e.preventDefault(); return; }
   if (e.key === 'Escape' && keyState.legend) { setLegend(false); return; }
   // task 904: p で fps、[ ] で層インスペクタ、1-5 でカメラプリセット
   if (isFpsKey(e)) { toggleFpsOverlay(); e.preventDefault(); return; }
+  // task 939: c でテーマ、s でスナップショット、m で reduced motion
+  if (isThemeKey(e)) { applyTheme(cycleTheme(themeIdx), true); e.preventDefault(); return; }
+  if (isSnapshotKey(e) && !fly.on) { captureSnapshot(); e.preventDefault(); return; }
+  if (isMotionKey(e)) {
+    const frozen = toggleReducedMotion(motion);
+    showCamLabel('motion: ' + (frozen ? 'reduced (orbit frozen)' : 'orbit on'));
+    e.preventDefault(); return;
+  }
   const dstep = isLayerStepKey(e);
   if (dstep) { selectLayer(stepLayer(insp.sel, dstep, LAYERS)); e.preventDefault(); return; }
   const pg = presetForKey(e.key);
@@ -1460,7 +1529,13 @@ function step(dt, doRender) {
       controls.target.set(g.target[0], g.target[1], g.target[2]);
     }
   }
-  if (!fly.on) controls.update();
+  // task 939: idle orbit は reduced motion (env / M) のとき止める。
+  if (!fly.on) {
+    const idle = performance.now() - lastInput > 2200;
+    controls.autoRotate = orbitEnabled(motion) && idle && !camAnimActive(camAnim);
+    if (controls.autoRotate) controls.autoRotateSpeed = 0.30;
+    controls.update();
+  }
   if (doRender !== false) composer.render();
 }
 
@@ -1963,7 +2038,7 @@ document.getElementById('hidec').addEventListener('click', () => chatEl.box.clas
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea/i.test(e.target.tagName)) return;
   if (e.code === 'Space') { demo.paused = !demo.paused; e.preventDefault(); }
-  if (e.key === 'c') chatEl.box.classList.toggle('hide');
+  if (e.key === 'h' || e.key === 'H') chatEl.box.classList.toggle('hide');
 });
 
 // ?shot — 固定ステップ数だけ進めて canvas を #dump に書き出す
