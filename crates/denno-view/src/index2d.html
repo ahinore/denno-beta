@@ -229,6 +229,12 @@
   .drill .er.sel { outline:1px solid #ffffff; border-radius:2px; }
   .reqlog { font-size:9.5px; color:var(--dim); max-height:150px; overflow-y:auto;
             display:flex; flex-direction:column; gap:1px; }
+  /* task 885: トレースのシークバー (幅を箱に合わせ、つまみを少し大きく) */
+  .tracebar { display:flex; align-items:center; gap:4px; }
+  .tracebar input[type=range] { flex:1; min-width:0; accent-color:#3fe08a; }
+  .tracebar button { width:22px; padding:1px 0; }
+  #tr-filelabel { flex-wrap:wrap; }
+  #tr-file { max-width:100%; min-width:0; font-size:10px; }
   .reqlog .q { color:#7fa4b8; }
   .reqlog .ok { color:#3fe08a; }
   .reqlog .bad { color:#ff6b86; }
@@ -377,6 +383,30 @@
       <div id="topk-hist" class="topkhist" title="直近のトークン。ホバー / クリックでそのトークンの内訳を表示"></div>
       <div id="topk-bars" class="topbars"></div>
       <div id="topk-note" class="small dim"></div>
+    </div>
+
+    <div class="box" id="tracebox">
+      <h2>trace <span class="dim">record → .denno-trace.json</span></h2>
+      <div class="small dim">ライブのテレメトリを <b>2,048 フレーム</b>まで溜めて書き出し、
+        後からトークン単位でシーク再生する (推論には一切送らない)。</div>
+      <div class="row2">
+        <button id="tr-record" class="b go" title="いまのテレメトリを記録し始める (バッファは消える)">record</button>
+        <button id="tr-stop" class="b" title="記録を止める (バッファは残る)">stop</button>
+        <button id="tr-export" class="b" title="バッファを .denno-trace.json としてダウンロードする">export</button>
+      </div>
+      <label class="f" id="tr-filelabel" style="margin-top:4px">load trace<input id="tr-file" type="file" accept=".json,application/json"></label>
+      <div id="tr-info" class="small dim" style="margin-top:4px">trace: idle</div>
+      <div class="tracebar" style="margin-top:4px">
+        <button id="tr-prev" class="b" title="前のトークン (←)">-</button>
+        <input id="tr-seek" type="range" min="0" max="0" value="0" step="1"
+               title="トークン位置。ドラッグでその時点の地図に戻す">
+        <button id="tr-next" class="b" title="次のトークン (→)">+</button>
+      </div>
+      <div id="tr-pos" class="small dim">token -/-</div>
+      <div class="row2">
+        <button id="tr-live" class="b" title="再生を止めてライブに戻る">back to live</button>
+      </div>
+      <div id="tr-err" class="err"></div>
     </div>
 
     <div class="box">
@@ -549,6 +579,10 @@ import {
   parsePromptList,
   TOPK_HISTORY_MAX, entropyBits, entropyColor, topkBarRows, topkPush, topkSummary,
   EXPERT_FREQ_WINDOW,
+  // task 885: トレースの記録 / 再生
+  TRACE_MAX_FRAMES, createReplay, createTrace, replayStateAt, replayStep,
+  replayTokenCount, traceDocument, traceFileName, traceMemory, traceParse, traceRecord,
+  traceSerialize, traceStart, traceStop, traceSummary,
 } from '/view2d.mjs';
 import {
   archLayout, archHitTest, archItemsInRect, archNodeRect, drawArch, fitView, gridPixels,
@@ -588,6 +622,13 @@ let topkHist = [];
 let topkSel = -1;
 let topkPin = -1;
 let loadedPreset = null;               // 直前に読み込んだプリセット (まだ apply していない)
+// task 885: トレース記録 (録るまで空) とオフライン再生。
+// `trace` は録っている間だけ育つ。`replay` が非 null の間は、ライブのフレームを
+// 地図に流さず、`replayToken` の位置までのフレームを新しい state に流し直して描く。
+let trace = createTrace(shape);
+let replay = null;
+let replayToken = -1;
+let lastTraceRender = 0;
 let hover = null;
 let drag = null;                       // {x0,y0,x1,y1,add,items}
 let offExp = new Map();                // layer -> Set(expert)
@@ -3241,7 +3282,192 @@ $('topk-hist').addEventListener('click', (ev) => {
 });
 renderTopk();
 
+// ---- task 885: トレース記録 / オフライン再生 -----------------------------
+// 記録はブラウザのメモリだけ。サーバーには何も送らない (推論の挙動は不変)。
+// バッファは TRACE_MAX_FRAMES で頭から落ちるので、長いセッションでも
+// 使用量は有界。落とした数は tr-info に出す (黙って欠けさせない)。
+
+function renderTraceInfo() {
+  const mem = traceMemory(trace);
+  const bits = [trace.recording ? 'recording' : (mem.frames ? 'stopped' : 'idle')];
+  bits.push(mem.frames + ' / ' + mem.maxFrames + ' frames (' + Math.round(mem.pct * 100) + '%)');
+  bits.push(mem.kb + ' KB');
+  if (mem.tokens) bits.push(mem.tokens + ' tokens');
+  if (mem.dropped) bits.push('dropped ' + mem.dropped);
+  if (replay) bits.push('replay: ' + replay.doc.frames.length + ' frames');
+  $('tr-info').textContent = 'trace: ' + bits.join(' · ');
+  $('tr-record').disabled = trace.recording;
+  $('tr-stop').disabled = !trace.recording;
+  $('tr-export').disabled = !(trace.frames.length || (replay && replay.doc.frames.length));
+  $('tr-err').textContent = '';
+}
+
+function renderTraceSeek() {
+  const n = replayTokenCount(replay);
+  const max = Math.max(0, n - 1);
+  const seek = $('tr-seek');
+  seek.max = String(max);
+  seek.disabled = n === 0;
+  $('tr-prev').disabled = n === 0 || replayToken <= 0;
+  $('tr-next').disabled = n === 0 || replayToken >= max;
+  seek.value = String(Math.max(0, replayToken));
+  $('tr-pos').textContent = n === 0
+    ? 'token -/-'
+    : 'token ' + (replayToken + 1) + ' / ' + n + (replayToken >= max ? ' · end' : '');
+  $('tr-live').disabled = !replay;
+}
+
+function traceErr(msg) {
+  $('tr-err').textContent = 'trace: ' + msg;
+}
+
+// 再生の位置を地図に反映する。ライブの `st` は捨てて、その位置までのフレームを
+// 新しい state に流し直すので、記録に無い情報は出ない (推測しない)。
+function applyReplayAt(tok) {
+  if (!replay) return null;
+  const r = replayStateAt(replay, tok);
+  replayToken = r.token;
+  st = r.state;
+  topkHist = r.topk;
+  topkSel = -1;
+  topkPin = -1;
+  frameCount = r.frames;
+  lastKind = 'replay';
+  $('tokstat').textContent = String(st.token);
+  $('fstat').textContent = String(frameCount);
+  $('laststat').textContent = lastKind;
+  renderTopk();
+  renderTraceSeek();
+  dirty = true;
+  gridDirty = true;
+  return r;
+}
+
+function startTraceRecord() {
+  if (replay) backToLive();
+  trace = createTrace(shape, { maxFrames: TRACE_MAX_FRAMES });
+  traceStart(trace, Date.now());
+  lastTraceRender = 0;
+  renderTraceInfo();
+  renderTraceSeek();
+  return trace.recording;
+}
+
+function stopTraceRecord() {
+  if (!trace.recording) return trace.frames.length;
+  traceStop(trace, { at: Date.now() });
+  renderTraceInfo();
+  return trace.frames.length;
+}
+
+// 書き出し用の文書。再生中なら読み込んだトレースをそのまま返す。
+function currentTraceDoc() {
+  if (trace.frames.length) return traceDocument(trace, { at: Date.now() });
+  return replay ? replay.doc : null;
+}
+
+function exportTraceText() {
+  const doc = currentTraceDoc();
+  return doc ? traceSerialize(doc) : '';
+}
+
+function exportTraceNow() {
+  const text = exportTraceText();
+  if (!text) { traceErr('export: 記録が空 (先に record か load)'); return false; }
+  const blob = new Blob([text], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = traceFileName(Date.now());
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  renderTraceInfo();
+  return true;
+}
+
+// テキスト → 再生。形が違うトレースは断る (地図の寸法が変わるので)。
+function loadTraceFromText(text) {
+  const doc = traceParse(text);                       // 不正は例外
+  if (doc.shape.layers !== shape.layers || doc.shape.n_expert !== shape.n_expert) {
+    throw new Error('shape mismatch (trace ' + doc.shape.layers + 'L/' + doc.shape.n_expert +
+      'e, live ' + shape.layers + 'L/' + shape.n_expert + 'e)');
+  }
+  if (trace.recording) traceStop(trace, { at: Date.now() });
+  replay = createReplay(doc);
+  replayToken = replayTokenCount(replay) - 1;
+  applyReplayAt(replayToken);
+  renderTraceInfo();
+  renderTraceSeek();
+  return traceSummary(doc);
+}
+
+// 再生を止めてライブに戻る。ライブのフレームは次の受信から積み直る。
+function backToLive() {
+  if (!replay) return false;
+  replay = null;
+  replayToken = -1;
+  rebuild(shape);
+  topkHist = [];
+  topkSel = -1;
+  topkPin = -1;
+  frameCount = 0;
+  lastKind = '-';
+  $('tokstat').textContent = '0';
+  $('fstat').textContent = '0';
+  $('laststat').textContent = lastKind;
+  renderTopk();
+  renderTraceInfo();
+  renderTraceSeek();
+  return true;
+}
+
+$('tr-record').addEventListener('click', () => startTraceRecord());
+$('tr-stop').addEventListener('click', () => stopTraceRecord());
+$('tr-export').addEventListener('click', () => exportTraceNow());
+$('tr-live').addEventListener('click', () => backToLive());
+$('tr-prev').addEventListener('click', () => {
+  if (!replay) return;
+  const r = replayStep(replay, -1);
+  applyReplayAt(r.token);
+});
+$('tr-next').addEventListener('click', () => {
+  if (!replay) return;
+  const r = replayStep(replay, 1);
+  applyReplayAt(r.token);
+});
+$('tr-seek').addEventListener('input', () => {
+  if (!replay) return;
+  const v = Number($('tr-seek').value);
+  if (!Number.isFinite(v)) return;
+  applyReplayAt(v);
+});
+$('tr-file').addEventListener('change', async () => {
+  const file = $('tr-file').files && $('tr-file').files[0];
+  if (!file) return;
+  try {
+    const sum = loadTraceFromText(await file.text());
+    $('tr-info').textContent = 'trace: loaded ' + sum.tokens + ' tokens · ' +
+      sum.frames + ' frames · ' + sum.kb + ' KB';
+  } catch (e) {
+    traceErr((e && e.message) || String(e));
+  }
+});
+renderTraceInfo();
+renderTraceSeek();
+
 function handleFrame(f) {
+  // task 885: 記録中のフレームをバッファに積む (対象外の kind は捨てる)。
+  if (trace.recording) {
+    traceRecord(trace, f, Date.now());
+    const now = performance.now();
+    if (now - lastTraceRender > 250) {
+      lastTraceRender = now;
+      renderTraceInfo();
+    }
+  }
+  // 再生中はライブのフレームで地図を動かさない (記録だけは続く)。
+  if (replay) return;
   frameCount++;
   lastKind = f.kind;
   if (st.onFrame(f)) dirty = true;
@@ -3541,6 +3767,12 @@ function setBusy(on) {
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
   if (e.key === 'Escape') { closeDrill(); clearSel(sel); renderState(); dirty = true; }
+  // task 885: 再生中は ←/→ でトークンを 1 つずつ動かす。
+  if (replay && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+    e.preventDefault();
+    applyReplayAt(replayStep(replay, e.key === 'ArrowLeft' ? -1 : 1).token);
+    return;
+  }
   if (viewMode === 'arch' && arch) {
     if (e.key === '0') focusRect(arch.bounds, 16);
     else if (e.key === '+' || e.key === '=') zoomBy(1.5);
@@ -3615,6 +3847,27 @@ window.__view2d = {
   expand: (id) => { expanded.add(id); treeDirty = true; },
   reveal: (id) => revealNode(id),
   dsl: (src, how) => { $('dsl').value = src; if (how) dslApply(how); else evalDsl(); return lastDsl ? dslSummary(lastDsl) : $('dslstat').textContent; },
+  // task 885: トレースの検証用フック (記録 → 書き出しテキスト → 読み込み → シーク)
+  trace: () => Object.assign({ recording: trace.recording }, traceMemory(trace),
+    { replay: !!replay, replayToken }),
+  traceDoc: () => currentTraceDoc(),
+  traceText: () => exportTraceText(),
+  recordTrace: () => startTraceRecord(),
+  stopTrace: () => stopTraceRecord(),
+  exportTrace: () => exportTraceNow(),
+  loadTraceText: (text) => loadTraceFromText(text),
+  replay: () => (replay ? {
+    token: replayToken, tokens: replayTokenCount(replay),
+    frames: replay.doc.frames.length, atEnd: replayToken >= replayTokenCount(replay) - 1,
+  } : null),
+  seekTrace: (t) => {
+    if (!replay) return null;
+    const r = applyReplayAt(t);
+    return { token: r.token, tokens: replayTokenCount(replay), frames: r.frames, atEnd: r.atEnd };
+  },
+  replayState: () => (replay ? st : null),
+  stopReplay: () => backToLive(),
+  traceInfoText: () => $('tr-info').textContent,
   ready: false,
 };
 

@@ -2502,3 +2502,377 @@ export function createMockStore(shape, opts = {}) {
   };
   return store;
 }
+
+// ---- trace の記録 / 再生 (task 885) ---------------------------------------
+//
+// `/2d` でライブのテレメトリを記録し、`.denno-trace.json` に書き出して、
+// 後からトークン単位でシーク再生するための純ロジック。DOM も時刻も外から渡す
+// (記録の開始時刻は `traceRecord(..., at)` / `traceDocument(rec, {at})`)。
+//
+// 記録するのは地図を描くのに要るフレームだけ (createMapState が読む kind と
+// Token / TopK / ServerInfo / TierStats / Gap)。配列は上限で切るので、
+// 1 フレームの大きさは層数に依らず有界。バッファは `TRACE_MAX_FRAMES` で
+// 古いものから落とし、落とした数を `dropped` に残す (黙って欠けさせない)。
+export const TRACE_SCHEMA = 'denno-trace';
+export const TRACE_VERSION = 1;
+export const TRACE_MAX_FRAMES = 2048;
+export const TRACE_MAX_ARRAY = 256;      // 1 フレームの配列 (prompt id / vram 等)
+export const TRACE_MAX_PAIRS = 128;      // LayerAct の idx/val、TopK の entries
+export const TRACE_SUFFIX = '.denno-trace.json';
+
+const TRACE_KINDS = Object.freeze([
+  'ServerInfo', 'Prefill', 'Token', 'Step', 'TopK', 'RoleAct', 'LayerAct',
+  'ExpertResidency', 'TierStats', 'RouterTopK', 'ExpertSkip', 'Gap',
+]);
+
+function tNum(v, dflt = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : dflt;
+}
+
+function tInt(v, dflt = 0) {
+  return Math.trunc(tNum(v, dflt));
+}
+
+function tInts(arr, max) {
+  if (!Array.isArray(arr)) return [];
+  const n = Math.min(arr.length, max);
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = tInt(arr[i], 0);
+  return out;
+}
+
+function tNums(arr, max) {
+  if (!Array.isArray(arr)) return [];
+  const n = Math.min(arr.length, max);
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = tNum(arr[i], 0);
+  return out;
+}
+
+/// デコード済みフレーム → 保存できる形 (JSON 安全・配列は上限で切る)。
+/// 地図に要らない kind と壊れた値は null (記録しない)。
+export function traceFrame(f) {
+  if (!f || typeof f !== 'object' || Array.isArray(f)) return null;
+  const kind = String(f.kind || '');
+  if (TRACE_KINDS.indexOf(kind) < 0) return null;
+  switch (kind) {
+    case 'ServerInfo':
+      return {
+        kind,
+        model: String(f.model == null ? '' : f.model).slice(0, 200),
+        model_id: String(f.model_id == null ? '' : f.model_id).slice(0, 200),
+        quant: String(f.quant == null ? '' : f.quant).slice(0, 80),
+        slots: tInt(f.slots, 0), context: tInt(f.context, 0), layers: tInt(f.layers, 0),
+      };
+    case 'Prefill':
+      return {
+        kind, session: tInt(f.session, 0), prompt_tokens: tInt(f.prompt_tokens, 0),
+        ns: tInt(f.ns, 0), tokens: tInts(f.tokens, TRACE_MAX_ARRAY),
+      };
+    case 'Token':
+      return { kind, session: tInt(f.session, 0), token: tInt(f.token, 0), pos: tInt(f.pos, 0) };
+    case 'Step':
+      return { kind, width: tInt(f.width, 0), ns: tInt(f.ns, 0) };
+    case 'TopK': {
+      const src = Array.isArray(f.entries) ? f.entries : [];
+      const n = Math.min(src.length, TRACE_MAX_PAIRS);
+      const entries = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const e = Array.isArray(src[i]) ? src[i] : [];
+        entries[i] = [tInt(e[0], 0), tNum(e[1], 0)];
+      }
+      return { kind, session: tInt(f.session, 0), chosen: tInt(f.chosen, 0), entropy: tNum(f.entropy, 0), entries };
+    }
+    case 'RoleAct': {
+      const src = f.roles && typeof f.roles === 'object' ? f.roles : {};
+      const roles = {};
+      for (const k of ROLE_KEYS) roles[k] = tNum(src[k], 0);
+      return { kind, layer: tInt(f.layer, 0), roles };
+    }
+    case 'LayerAct': {
+      const n = Math.min(Array.isArray(f.idx) ? f.idx.length : 0,
+        Array.isArray(f.val) ? f.val.length : 0, TRACE_MAX_PAIRS);
+      const idx = new Array(n), val = new Array(n);
+      for (let i = 0; i < n; i++) { idx[i] = tInt(f.idx[i], 0); val[i] = tNum(f.val[i], 0); }
+      return { kind, layer: tInt(f.layer, 0), idx, val };
+    }
+    case 'ExpertResidency':
+      return { kind, layer: tInt(f.layer, 0), vram: tInts(f.vram, TRACE_MAX_ARRAY) };
+    case 'TierStats':
+      return {
+        kind, vramMB: tInt(f.vramMB, 0), vramTotalMB: tInt(f.vramTotalMB, 0),
+        ramExperts: tInt(f.ramExperts, 0), ssdReads: tInt(f.ssdReads, 0),
+      };
+    case 'RouterTopK': {
+      const experts = tInts(f.experts, TRACE_MAX_ARRAY);
+      const weights = tNums(f.weights, experts.length);
+      while (weights.length < experts.length) weights.push(0);
+      return { kind, layer: tInt(f.layer, 0), experts, weights };
+    }
+    case 'ExpertSkip':
+      return { kind, layer: tInt(f.layer, 0), experts: tInts(f.experts, TRACE_MAX_ARRAY) };
+    case 'Gap':
+      return { kind, lost: tInt(f.lost, 0) };
+    default:
+      return null;
+  }
+}
+
+function traceShapeOf(shape) {
+  const s = normaliseShape(shape);
+  return {
+    layers: s.layers, n_expert: s.n_expert, n_expert_used: s.n_expert_used,
+    n_hc: s.n_hc, n_embd: s.n_embd,
+    layer_kinds: [...s.layer_kinds], ple_layers: [...s.ple_layers],
+  };
+}
+
+/// 記録バッファ。`recording` が true の間だけ `traceRecord` が積む。
+export function createTrace(shape, opts = {}) {
+  const maxFrames = clampInt(tInt(opts.maxFrames, TRACE_MAX_FRAMES), 1, 1 << 20);
+  return {
+    recording: false,
+    frames: [],
+    dropped: 0,
+    maxFrames,
+    bytes: 0,
+    tokens: 0,
+    shape: traceShapeOf(shape),
+    startedAt: null,
+    lastAt: null,
+  };
+}
+
+/// 記録を開始する (バッファは消す)。戻り値は同じ rec。
+export function traceStart(rec, at) {
+  rec.recording = true;
+  rec.frames.length = 0;
+  rec.dropped = 0;
+  rec.bytes = 0;
+  rec.tokens = 0;
+  rec.startedAt = Number.isFinite(at) ? at : null;
+  rec.lastAt = rec.startedAt;
+  return rec;
+}
+
+/// 1 フレーム積む。記録していない / 対象外の kind は false。
+export function traceRecord(rec, f, at) {
+  if (!rec || !rec.recording) return false;
+  const nf = traceFrame(f);
+  if (!nf) return false;
+  let line = 0;
+  try { line = JSON.stringify(nf).length; } catch (e) { return false; }
+  rec.frames.push(nf);
+  rec.bytes += line;
+  if (nf.kind === 'Token') rec.tokens++;
+  if (Number.isFinite(at)) rec.lastAt = at;
+  while (rec.frames.length > rec.maxFrames) {
+    const old = rec.frames.shift();
+    try { rec.bytes -= JSON.stringify(old).length; } catch (e) { /* 数え直しは traceBytes がやる */ }
+    if (old.kind === 'Token' && rec.tokens > 0) rec.tokens--;
+    rec.dropped++;
+  }
+  if (rec.bytes < 0) rec.bytes = 0;
+  return true;
+}
+
+/// 記録を止める。戻り値は書き出し用の文書 (まだ JSON 文字列ではない)。
+export function traceStop(rec, meta = {}) {
+  rec.recording = false;
+  return traceDocument(rec, meta);
+}
+
+/// 記録中のバッファ → `.denno-trace.json` の文書。
+export function traceDocument(rec, meta = {}) {
+  return {
+    schema: TRACE_SCHEMA,
+    version: TRACE_VERSION,
+    created_at: Number.isFinite(meta.at) ? meta.at : (rec.startedAt == null ? null : rec.startedAt),
+    shape: Object.assign({}, rec.shape),
+    tokens: rec.tokens | 0,
+    dropped: rec.dropped | 0,
+    frames: rec.frames.map((f) => JSON.parse(JSON.stringify(f))),
+  };
+}
+
+/// 記録バッファの使用量。画面のメモリ表示に使う。
+export function traceMemory(rec) {
+  const frames = rec.frames.length;
+  const bytes = traceBytes(rec);
+  return {
+    frames, maxFrames: rec.maxFrames, bytes,
+    kb: Math.round(bytes / 102.4) / 10,
+    pct: rec.maxFrames > 0 ? frames / rec.maxFrames : 0,
+    dropped: rec.dropped | 0,
+    tokens: rec.tokens | 0,
+  };
+}
+
+/// 保存する JSON のおおよその大きさ (バイト)。積み上げの値を返す。
+export function traceBytes(rec) {
+  if (!rec) return 0;
+  if (!Number.isFinite(rec.bytes) || rec.bytes < 0) {
+    rec.bytes = rec.frames.reduce((a, f) => a + JSON.stringify(f).length, 0);
+  }
+  return rec.bytes;
+}
+
+/// 文書 → JSON 文字列 (末尾に改行 1 つ)。
+export function traceSerialize(doc) {
+  return JSON.stringify(doc) + '\n';
+}
+
+/// 文書の検証。壊れていたら例外 (画面は赤字で理由を出す)。
+/// 通ったら正規化した文書を返す (未知のフィールドは落とす)。
+export function traceValidate(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error('trace: object required');
+  }
+  if (doc.schema !== TRACE_SCHEMA) {
+    throw new Error('trace: schema must be "' + TRACE_SCHEMA + '" (got ' + JSON.stringify(doc.schema) + ')');
+  }
+  if (doc.version !== TRACE_VERSION) {
+    throw new Error('trace: unsupported version ' + JSON.stringify(doc.version) + ' (want ' + TRACE_VERSION + ')');
+  }
+  const shape = traceShapeOf(doc.shape);
+  if (!Array.isArray(doc.frames)) throw new Error('trace: frames must be an array');
+  if (doc.frames.length > TRACE_MAX_FRAMES) {
+    throw new Error('trace: too many frames (' + doc.frames.length + ' > ' + TRACE_MAX_FRAMES + ')');
+  }
+  const frames = new Array(doc.frames.length);
+  for (let i = 0; i < doc.frames.length; i++) {
+    const nf = traceFrame(doc.frames[i]);
+    if (!nf) {
+      const k = doc.frames[i] && doc.frames[i].kind;
+      throw new Error('trace: frames[' + i + '] is not a recordable frame (kind ' + JSON.stringify(k) + ')');
+    }
+    frames[i] = nf;
+  }
+  const tokens = frames.reduce((a, f) => a + (f.kind === 'Token' ? 1 : 0), 0);
+  return {
+    schema: TRACE_SCHEMA,
+    version: TRACE_VERSION,
+    created_at: Number.isFinite(doc.created_at) ? doc.created_at : null,
+    shape,
+    tokens: tokens,
+    dropped: tInt(doc.dropped, 0),
+    frames,
+  };
+}
+
+/// JSON 文字列 → 検証済みの文書。
+export function traceParse(text) {
+  let v;
+  try {
+    v = JSON.parse(String(text));
+  } catch (e) {
+    throw new Error('trace: invalid JSON (' + ((e && e.message) || e) + ')');
+  }
+  return traceValidate(v);
+}
+
+/// 書き出しのファイル名。`at` はミリ秒 (省略可)。
+export function traceFileName(at) {
+  const d = Number.isFinite(at) ? new Date(at) : new Date(0);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  const stamp = d.getUTCFullYear() + p(d.getUTCMonth() + 1) + p(d.getUTCDate()) + '-' +
+    p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds());
+  return 'trace-' + stamp + TRACE_SUFFIX;
+}
+
+/// 文書の要約 (画面の 1 行)。
+export function traceSummary(doc) {
+  const d = doc && doc.schema === TRACE_SCHEMA ? doc : traceValidate(doc);
+  let bytes = 0;
+  try { bytes = JSON.stringify(d).length; } catch (e) { bytes = 0; }
+  return {
+    tokens: d.tokens | 0, frames: d.frames.length, layers: d.shape.layers,
+    dropped: d.dropped | 0, bytes,
+    kb: Math.round(bytes / 102.4) / 10,
+  };
+}
+
+/// 再生の状態。`Token` フレームごとにトークンの区間 [start, end) を作る
+/// (最初の Token より前の ServerInfo / Prefill は preamble)。
+export function createReplay(doc) {
+  const d = traceValidate(doc);
+  const groups = [];
+  let cur = null;
+  for (let i = 0; i < d.frames.length; i++) {
+    if (d.frames[i].kind === 'Token') {
+      if (cur) cur.end = i;
+      cur = { token: groups.length, start: i, end: d.frames.length };
+      groups.push(cur);
+    }
+  }
+  if (cur) cur.end = d.frames.length;
+  const preambleEnd = groups.length ? groups[0].start : d.frames.length;
+  return {
+    doc: d,
+    shape: normaliseShape(d.shape),
+    frames: d.frames,
+    groups,
+    preambleEnd,
+    token: groups.length ? groups.length - 1 : -1,
+  };
+}
+
+export function replayTokenCount(rep) {
+  return rep && rep.groups ? rep.groups.length : 0;
+}
+
+/// トークン位置へ移動する (範囲外は端に丸める)。その位置までのフレームを返す。
+export function replaySeek(rep, tok) {
+  if (!rep || !rep.groups) return { token: -1, start: 0, end: 0, frames: [], atEnd: true };
+  const n = rep.groups.length;
+  if (n === 0) {
+    rep.token = -1;
+    return { token: -1, start: 0, end: rep.frames.length, frames: rep.frames.slice(), atEnd: true };
+  }
+  const t = clampInt(tInt(tok, 0), 0, n - 1);
+  rep.token = t;
+  const g = rep.groups[t];
+  return {
+    token: t, start: g.start, end: g.end,
+    frames: rep.frames.slice(0, g.end), atEnd: t === n - 1,
+  };
+}
+
+/// 前後のトークンへ。`delta` は整数。
+export function replayStep(rep, delta) {
+  const n = replayTokenCount(rep);
+  const base = rep && Number.isFinite(rep.token) ? rep.token : n - 1;
+  return replaySeek(rep, base + tInt(delta, 0));
+}
+
+/// フレーム位置 → トークン位置 (シークバーの目盛り用)。-1 は preamble。
+export function replayTokenAt(rep, frameIdx) {
+  if (!rep || !rep.groups || !rep.groups.length) return -1;
+  const i = clampInt(tInt(frameIdx, 0), 0, rep.frames.length);
+  let lo = 0, hi = rep.groups.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (rep.groups[mid].start <= i) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return ans;
+}
+
+/// そのトークンまでのフレームを地図の状態に流し直す (スクラブ描画用)。
+/// `state` は新しい createMapState なので、ライブの `st` とは独立。
+export function replayStateAt(rep, tok, opts = {}) {
+  const r = replaySeek(rep, tok);
+  const state = createMapState(rep.shape);
+  const topkMax = clampInt(tInt(opts.topkMax, TOPK_HISTORY_MAX), 1, 256);
+  let topk = [];
+  let lastToken = null;
+  for (const f of r.frames) {
+    state.onFrame(f);
+    if (f.kind === 'TopK') topk = topkPush(topk, f, topkMax);
+    if (f.kind === 'Token') lastToken = f;
+  }
+  return {
+    token: r.token, start: r.start, end: r.end, atEnd: r.atEnd,
+    frames: r.frames.length, state, topk, lastToken,
+  };
+}
