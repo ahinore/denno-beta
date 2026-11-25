@@ -41,7 +41,7 @@ use tokio_stream::Stream;
 use crate::scheduler::RawEvent;
 use crate::{
     apply_temperature_cap, brief_system, check_auth, debug_api_error, resolve_max_tokens, ApiError,
-    AppState, RESPONSE_WAIT_TIMEOUT,
+    AppState,
 };
 
 /// `/api/version` が返す文字列。
@@ -54,11 +54,18 @@ pub const OLLAMA_VERSION: &str = "0.1.0-denno";
 pub struct OllamaError {
     status: StatusCode,
     message: String,
+    /// P873: `Retry-After` ヘッダ (秒)。None = 付けない。
+    retry_after: Option<u64>,
 }
 
 impl OllamaError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self { status, message: message.into(), retry_after: None }
+    }
+    /// P873: `Retry-After` を付ける (過負荷の応答)。
+    fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs);
+        self
     }
     fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
@@ -73,7 +80,14 @@ impl OllamaError {
 
 impl IntoResponse for OllamaError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({"error": self.message}))).into_response()
+        let mut resp = (self.status, Json(json!({"error": self.message}))).into_response();
+        // P873: 過負荷では再試行までの待ちをヘッダで示す。
+        if let Some(secs) = self.retry_after {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+        }
+        resp
     }
 }
 
@@ -81,14 +95,19 @@ impl IntoResponse for OllamaError {
 /// 本文の形だけを変える。
 impl From<ApiError> for OllamaError {
     fn from(e: ApiError) -> Self {
+        let retry_after = e.retry_after();
         let (status, _, message) = debug_api_error(e);
-        Self::new(
+        let mut out = Self::new(
             StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             message,
-        )
+        );
+        out.retry_after = retry_after;
+        out
     }
 }
 
+/// P873: キュー満杯 (待ち行列の上限超過)。Ollama は過負荷を 503 で返す慣例なので
+/// そのまま 503 + `Retry-After`。
 fn queue_full(state: &AppState) -> OllamaError {
     OllamaError::new(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -97,6 +116,7 @@ fn queue_full(state: &AppState) -> OllamaError {
             state.scheduler.max_queue()
         ),
     )
+    .with_retry_after(crate::QUEUE_RETRY_AFTER_SECS)
 }
 
 // ---------- 時刻 (Ollama の created_at は RFC3339) ----------
@@ -493,15 +513,19 @@ pub async fn version(
 
 async fn await_output(
     rx: tokio::sync::oneshot::Receiver<anyhow::Result<ChatOutput>>,
+    limits: crate::Limits,
 ) -> Result<ChatOutput, OllamaError> {
-    match tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await {
+    // P873: `--request-timeout-secs` が有効ならその少し後まで待つ
+    // (スケジューラ側の期限が先に発火して理由を返す)。
+    let wait = crate::response_wait_timeout(limits);
+    match tokio::time::timeout(wait, rx).await {
         Ok(Ok(Ok(out))) => Ok(out),
         Ok(Ok(Err(e))) => Err(OllamaError::from(crate::error_from_anyhow(e))),
         Ok(Err(e)) => Err(OllamaError::server(format!("scheduler dropped: {e}"))),
         Err(_) => Err(OllamaError::server(format!(
             "timeout: no response from the engine within {:.1}s; \
              the request was abandoned (retry later)",
-            RESPONSE_WAIT_TIMEOUT.as_secs_f64()
+            wait.as_secs_f64()
         ))),
     }
 }
@@ -600,7 +624,7 @@ pub async fn chat(
         .scheduler
         .submit_chat(system, chat_messages, params, None, None, enable_thinking)
         .map_err(|_| queue_full(&state))?;
-    let out = await_output(rx).await?;
+    let out = await_output(rx, state.scheduler.limits()).await?;
     let mut v = json!({
         "model": state.model_name,
         "created_at": rfc3339_from_unix(now_secs()),
@@ -661,7 +685,7 @@ pub async fn generate(
             .scheduler
             .submit_completion(prompt, params)
             .map_err(|_| queue_full(&state))?;
-        let out = await_output(rx).await?;
+        let out = await_output(rx, state.scheduler.limits()).await?;
         return Ok(Json(generate_json(&state, started, &out)).into_response());
     }
 
@@ -684,7 +708,7 @@ pub async fn generate(
         .scheduler
         .submit_chat(system, messages, params, None, None, enable_thinking)
         .map_err(|_| queue_full(&state))?;
-    let out = await_output(rx).await?;
+    let out = await_output(rx, state.scheduler.limits()).await?;
     Ok(Json(generate_json(&state, started, &out)).into_response())
 }
 

@@ -44,6 +44,11 @@
 //!   検知されなかった場合 (EPIPE) は生成が完走し、hyper がその接続タスクだけを
 //!   終了させるため、いずれの経路でもジョブは完走/破棄のどちらかで確実に整理され、
 //!   ワーカー・KV・受付ループへの残留影響は無い。
+//! - P873: リクエスト単位の壁時計上限 ([`Limits::request`]、既定 0 = 無効)。
+//!   0 でないときは受付時刻から `request` を超えた Run をステップ境界で打ち切り、
+//!   KV スロットを解放してクライアントへエラーを返す (生成そのものは中断できない —
+//!   エンジンロックを握った 1 ステップが返ってきた境界で必ず整理する)。
+//!   打ち切り理由は [`RunStats`] に数える (切断 / 期限 / エラー)。
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -88,6 +93,11 @@ pub struct Limits {
     pub stall: Duration,
     /// SSE イベント 1 本の送信待ちの上限
     pub send: Duration,
+    /// P873: リクエストの壁時計 (受付 → 完了) の上限。`Duration::ZERO` = 無効
+    /// (既定。従来と完全に同一の挙動)。0 でないときは `admit` / `stall` より
+    /// 優先して効く — 待ち行列の中でも生成中でも、受付から `request` を超えた
+    /// Run はステップ境界で打ち切る。
+    pub request: Duration,
 }
 
 impl Default for Limits {
@@ -96,6 +106,20 @@ impl Default for Limits {
             admit: Duration::from_secs(300),
             stall: Duration::from_secs(900),
             send: Duration::from_secs(30),
+            request: Duration::ZERO,
+        }
+    }
+}
+
+impl Limits {
+    /// P873: キュー待ち (admit) に実効的に効く上限。`request` が有効なら
+    /// その方が短いときに採用する (待ち行列の中で request 期限を過ぎたジョブを
+    /// 生成開始させない)。
+    fn admit_budget(&self) -> Duration {
+        if self.request.is_zero() {
+            self.admit
+        } else {
+            self.admit.min(self.request)
         }
     }
 }
@@ -191,6 +215,54 @@ pub enum RawEvent {
 #[derive(Debug)]
 pub struct QueueFull;
 
+/// P873: キュー満杯時にクライアントへ返す `Retry-After` の秒数。
+///
+/// 根拠 (推定): 1 スロットあたりの生成は最短でも数百 ms なので、1 秒後に
+/// 再試行すれば「同じ瞬間に集中した分」は確実にはけた状態になる。値を伸ばすと
+/// クライアント側の体感 (と総スループット) を落とすため、短い固定値にする。
+pub const QUEUE_RETRY_AFTER_SECS: u64 = 1;
+
+impl QueueFull {
+    /// クライアントへ返す `Retry-After` (秒)。
+    pub fn retry_after_secs(&self) -> u64 {
+        QUEUE_RETRY_AFTER_SECS
+    }
+}
+
+/// P873: 打ち切り / 完了の計数。atomic 1 回の読み書きだけで、生成経路の
+/// 数値・順序には触れない。運用 (`/ready`) が読む。
+#[derive(Debug, Default)]
+pub struct RunStats {
+    completed: AtomicUsize,
+    aborted_timeout: AtomicUsize,
+    aborted_disconnected: AtomicUsize,
+    aborted_error: AtomicUsize,
+}
+
+/// [`RunStats`] のコピー (読み出し用)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunStatsSnapshot {
+    /// 正常完了したリクエスト数
+    pub completed: usize,
+    /// 期限超過 (admit / stall / request) で打ち切った数
+    pub aborted_timeout: usize,
+    /// クライアント切断で打ち切った数
+    pub aborted_disconnected: usize,
+    /// 生成エラーで終わった数
+    pub aborted_error: usize,
+}
+
+impl RunStats {
+    fn snapshot(&self) -> RunStatsSnapshot {
+        RunStatsSnapshot {
+            completed: self.completed.load(Ordering::Relaxed),
+            aborted_timeout: self.aborted_timeout.load(Ordering::Relaxed),
+            aborted_disconnected: self.aborted_disconnected.load(Ordering::Relaxed),
+            aborted_error: self.aborted_error.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// ワーカー内での 1 リクエスト分の実行状態。
 struct Run {
     /// begin_chat が成功していれば Some。失敗した場合は error に理由が入る。
@@ -215,6 +287,9 @@ struct Run {
     /// P57: 最後にステップが成功した時刻 (無進捗スイープの入力)。
     /// 起点は受付時刻 (= prefill 待ちも無進捗として数える)。
     last_progress: Instant,
+    /// P873: リクエストの壁時計の期限 (`Limits::request` が 0 のときは None)。
+    /// 受付時刻 + request。超えたらステップ境界で打ち切る。
+    deadline: Option<Instant>,
     /// P57: SSE イベント送信が詰まった (読み手が止まっている) ことを
     /// delta コールバックから Run へ伝えるフラグ。ステップ境界で読む。
     send_dead: Arc<AtomicBool>,
@@ -257,6 +332,8 @@ pub struct Scheduler {
     queued: Arc<AtomicUsize>,
     /// P817: 運用の状態 (`/ready` / drain)。
     lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    /// P873: 完了 / 打ち切りの計数 (`/ready` が読む)。
+    stats: Arc<RunStats>,
     max_queue: usize,
     limits: Limits,
 }
@@ -300,14 +377,26 @@ impl Scheduler {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let queued = Arc::new(AtomicUsize::new(0));
         let lifecycle = crate::lifecycle::Lifecycle::new(ready);
+        let stats = Arc::new(RunStats::default());
         let worker_in_flight = in_flight.clone();
         let worker_queued = queued.clone();
         let worker_lifecycle = lifecycle.clone();
+        let worker_stats = stats.clone();
         std::thread::Builder::new()
             .name("denno-scheduler".into())
-            .spawn(move || worker(engine, rx, worker_in_flight, worker_queued, worker_lifecycle, limits))
+            .spawn(move || {
+                worker(
+                    engine,
+                    rx,
+                    worker_in_flight,
+                    worker_queued,
+                    worker_lifecycle,
+                    worker_stats,
+                    limits,
+                )
+            })
             .expect("scheduler スレッドの起動に失敗");
-        Self { tx, in_flight, queued, lifecycle, max_queue, limits }
+        Self { tx, in_flight, queued, lifecycle, stats, max_queue, limits }
     }
 
     pub fn max_queue(&self) -> usize {
@@ -332,6 +421,11 @@ impl Scheduler {
     /// 現在進行中のジョブ数 (pull 済み未完了。キュー待ちは含まない)
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// P873: 完了 / 打ち切り (切断・期限・エラー) の計数。読み取りのみ。
+    pub fn stats(&self) -> RunStatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// s146 (B8-3): テスト用に「同時実行上限」の値を公開する (分類メッセージと
@@ -528,6 +622,7 @@ fn worker(
     in_flight: Arc<AtomicUsize>,
     queued: Arc<AtomicUsize>,
     lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    stats: Arc<RunStats>,
     limits: Limits,
 ) {
     // P817: このスレッドが終わったら `Lifecycle` に生存=false を書く
@@ -553,7 +648,7 @@ fn worker(
                     // drain の待ち判定に 0/0 の窓を作らない。
                     in_flight.fetch_add(1, Ordering::SeqCst);
                     queued.fetch_sub(1, Ordering::SeqCst);
-                    admit_job(&engine, job, submitted, &in_flight, &mut active, limits)
+                    admit_job(&engine, job, submitted, &in_flight, &mut active, &stats, limits)
                 }
                 Err(_) => return,
             }
@@ -563,7 +658,7 @@ fn worker(
                 Ok((submitted, job)) => {
                     in_flight.fetch_add(1, Ordering::SeqCst);
                     queued.fetch_sub(1, Ordering::SeqCst);
-                    admit_job(&engine, job, submitted, &in_flight, &mut active, limits)
+                    admit_job(&engine, job, submitted, &in_flight, &mut active, &stats, limits)
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -587,10 +682,12 @@ fn worker(
             i -= 1;
             if active[i].client_gone() {
                 in_flight.fetch_sub(1, Ordering::SeqCst);
+                stats.aborted_disconnected.fetch_add(1, Ordering::Relaxed);
                 let run = active.remove(i);
                 abort_disconnected(&engine, run);
             } else if let Some(why) = expired(&active[i], limits) {
                 in_flight.fetch_sub(1, Ordering::SeqCst);
+                stats.aborted_timeout.fetch_add(1, Ordering::Relaxed);
                 let mut run = active.remove(i);
                 release_run(&engine, &mut run);
                 send_error(&mut run, why, limits.send);
@@ -615,6 +712,7 @@ fn worker(
                 Ok(_) => active[i].last_progress = Instant::now(),
                 Err(e) => {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
+                    stats.aborted_error.fetch_add(1, Ordering::Relaxed);
                     let mut run = active.remove(i);
                     release_run(&engine, &mut run);
                     send_error(&mut run, e, limits.send);
@@ -702,6 +800,7 @@ fn worker(
                     i -= 1;
                     if done[i] {
                         in_flight.fetch_sub(1, Ordering::SeqCst);
+                        stats.completed.fetch_add(1, Ordering::Relaxed);
                         let mut run = active.remove(i);
                         release_run(&engine, &mut run);
                         finish_run(run, limits.send);
@@ -712,6 +811,7 @@ fn worker(
                         // 生成を打ち切って KV スロットを解放する (通常完了と同一の
                         // 除去経路なので他 Run / engine 状態への影響は無い)
                         in_flight.fetch_sub(1, Ordering::SeqCst);
+                        stats.aborted_disconnected.fetch_add(1, Ordering::Relaxed);
                         let run = active.remove(i);
                         abort_disconnected(&engine, run);
                     }
@@ -730,6 +830,7 @@ fn worker(
                 let mut runs = std::mem::take(&mut active);
                 for run in runs.iter_mut() {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
+                    stats.aborted_error.fetch_add(1, Ordering::Relaxed);
                     release_run(&engine, run);
                 }
                 for mut run in runs {
@@ -743,6 +844,12 @@ fn worker(
 
 /// P57: 打ち切り理由 (上限を超えていなければ None)。
 fn expired(run: &Run, limits: Limits) -> Option<anyhow::Error> {
+    // P873: リクエストの壁時計上限を最優先で見る (admit / stall より厳しい場合が多い)。
+    if let Some(deadline) = run.deadline {
+        if Instant::now() >= deadline {
+            return Some(timeout_error("request wall clock", limits.request));
+        }
+    }
     if run.send_dead.load(Ordering::Relaxed) {
         return Some(timeout_error(
             "SSE event send (client stopped reading)",
@@ -763,7 +870,7 @@ fn release_run(engine: &Arc<Mutex<Engine>>, run: &mut Run) {
 }
 
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
-fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
+fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant, limits: Limits) -> Run {
     let (system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond, events, raw, logprobs) = match job {
         Job::Chat { system, messages, params, tools, constraint, enable_thinking, raw_prompt, respond, logprobs } => {
             (system, messages, params, tools, constraint, enable_thinking, raw_prompt, Some(respond), None, None, logprobs)
@@ -811,6 +918,12 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
     let req_mark = prof::request_begin();
     // P57: 無進捗の起点は「受付時刻」。prefill が始まるまでの待ちもここから測る。
     let last_progress = submitted;
+    // P873: リクエストの壁時計上限 (0 = 無効)。受付時刻からの絶対期限にする。
+    let deadline = if limits.request.is_zero() {
+        None
+    } else {
+        Some(submitted + limits.request)
+    };
     Run {
         sess,
         error,
@@ -821,6 +934,7 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
         asm,
         req_mark,
         last_progress,
+        deadline,
         send_dead: Arc::new(AtomicBool::new(false)),
     }
 }
@@ -839,20 +953,25 @@ fn admit_job(
     submitted: Instant,
     in_flight: &AtomicUsize,
     active: &mut Vec<Run>,
+    stats: &RunStats,
     limits: Limits,
 ) {
     // P817: `in_flight` の加算は呼び出し側 (pull 直後) で `queued` の減算より
     // **先** に行う。ここで加算すると「queued も in_flight も 0」に見える窓が
     // でき、drain が進行中のジョブを見落とす。
-    let mut run = build_run(engine, job, submitted);
+    let mut run = build_run(engine, job, submitted, limits);
     // P57: キュー待ち + スロット待ちの上限。スロットはまだ取っていないので
     // 解放は不要 (取得済みでも release_run は no-op)。
+    // P873: `request` が有効ならその方が短いときに adopt する (期限切れのジョブを
+    // 生成開始させない)。
+    let budget = limits.admit_budget();
     let waited = submitted.elapsed();
-    if waited >= limits.admit {
+    if waited >= budget {
         in_flight.fetch_sub(1, Ordering::SeqCst);
+        stats.aborted_timeout.fetch_add(1, Ordering::Relaxed);
         let why = timeout_error(
             &format!("queue/slot wait ({:.1}s)", waited.as_secs_f64()),
-            limits.admit,
+            budget,
         );
         send_error(&mut run, why, limits.send);
         return;
@@ -862,8 +981,10 @@ fn admit_job(
     if let Err(e) = admit(engine, &mut run, live, limits.send) {
         in_flight.fetch_sub(1, Ordering::SeqCst);
         if run.client_gone() {
+            stats.aborted_disconnected.fetch_add(1, Ordering::Relaxed);
             abort_disconnected(engine, run);
         } else {
+            stats.aborted_error.fetch_add(1, Ordering::Relaxed);
             // s144 (B8-1): `admit` は install (スロット取得) の **後** にも失敗しうる
             // (SSE プリアンブルの送信失敗など)。旧コードはこの経路で send_error だけを
             // 行い、取得済みスロットの busy フラグを立てたまま返していた。そのため
