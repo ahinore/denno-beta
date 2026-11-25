@@ -3580,6 +3580,26 @@ pub(crate) fn moe_experts_flat(
     }
     lap!("validate+slices+task_table");
 
+    // task 874: 選択 expert の f32 展開を使い回すキャッシュ (`DENNO_PF_DEQUANT_CACHE_MB`、
+    // 既定 off)。off では 1 回の atomic load で空の Vec を返し、下の分岐は全部外れる。
+    // 統計 (`DENNO_PF_DEQUANT_CACHE_STATS`) は off でも選択の延べ数と重複度を数える。
+    super::pf_dq_cache::note_selection(lw.il as u16, &eid);
+    let dq: Vec<Option<std::sync::Arc<super::pf_dq_cache::Dq>>> =
+        if !idx_mode && super::pf_dq_cache::enabled() {
+            super::pf_dq_cache::layer_entries(
+                lw.il as u16,
+                e,
+                ff,
+                &eid,
+                &gs,
+                &us,
+                &ds,
+                [gty, uty, dty],
+            )
+        } else {
+            Vec::new()
+        };
+
     // 5. タスク表 (gate+up+silu 積 / down)。**m の降順** に並べる
     //    (m の大きい expert から先にタスク列へ入るので、rayon の分割で
     //    重い仕事が先に始まる)。タスクは独立な領域を書くので順序は値に影響しない。
@@ -3707,17 +3727,26 @@ pub(crate) fn moe_experts_flat(
         }
         // task 95: `DENNO_EXP_KPROF=1` のとき、バッチ GEMM の型別記録が行列を
         // 知る必要がある。off では `set_mat` が分岐 1 回で戻る。
-        for (mat, (ty, rb, w, dst, use_vnni)) in [
+        // task 874: キャッシュに載っている expert は展開済み f32 で回す
+        // (融合カーネルの dequant を飛ばす)。累積順が違うので値はビット一致しない。
+        let dq_rows = dq.get(pos).and_then(|o| o.as_ref());
+        for (mat, (ty, rb, w, dst, use_vnni), dqf) in [
             (
                 crate::model::exp_kprof::GATE,
                 (gty, rb_g, gs[pos], dst_a.get(), use_g),
+                dq_rows.map(|d| d.gate.as_slice()),
             ),
             (
                 crate::model::exp_kprof::UP,
                 (uty, rb_u, us[pos], dst_u.get(), use_u),
+                dq_rows.map(|d| d.up.as_slice()),
             ),
         ] {
             crate::model::exp_kprof::set_mat(mat);
+            if let Some(rows) = dqf {
+                moe_expert::gemm_rows_f32(rows, e, a, b, x, m, dst, ff);
+                continue;
+            }
             let used =
                 use_vnni && moe_expert::gemm_rows_vnni(ty, w, e, a, b, &act_g, dst, ff);
             if !used {
@@ -3793,6 +3822,11 @@ pub(crate) fn moe_experts_flat(
         let dst = h_p.add(off_h[pos] + t0 * e + a);
         crate::model::exp_kprof::set_mat(crate::model::exp_kprof::DOWN);
         moe_prefetch_task_ahead(&tb, i, 3, &ds, rb_d);
+        // task 874: キャッシュに載っていれば展開済み f32 で回す。
+        if let Some(d) = dq.get(pos).and_then(|o| o.as_ref()) {
+            moe_expert::gemm_rows_f32(&d.down, ff, a, b, x, m, dst.get(), e);
+            return;
+        }
         // 前提は run_a と同じ (`[a, b)` は [0, n_out) の分割の 1 つ、領域は `m * stride` 以上)。
         if use_d {
             let act_d = moe_expert::VnniAct {

@@ -4364,6 +4364,10 @@ impl Qwen4Exp {
     ) -> Result<Vec<f32>> {
         // P78: 層の外の区間計測の分母 (prefill 回数とトークン数)。
         prekprof::note_prefill(ctx.len());
+        // task 874: 選択 expert の f32 展開キャッシュ (`DENNO_PF_DEQUANT_CACHE_MB`)。
+        // prefill の間だけ保持し、終端 (この関数の出口) で Drop が全部捨てる。
+        // off では何も確保しない (atomic load 1 回)。
+        let _pf_dq = pf_dq_cache::begin_prefill(ctx.len(), self.p.n_layer);
         // task 862: page hint の追跡を始める (`DENNO_EXPERT_PAGE_HINT`、既定 off)。
         // off では atomic load 1 回で戻る。短いプロンプトは追跡しない。
         crate::model::exp_page_hint::begin_prefill(ctx.len());

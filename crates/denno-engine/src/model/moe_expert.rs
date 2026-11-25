@@ -5490,6 +5490,56 @@ fn gemm_rows_scalar(
     }
 }
 
+/// task 874: 展開済み f32 の expert 行列を使う行バッチ GEMM。
+///
+/// `rows` は **行優先** の f32 (`rows[r * n_in + i]`)。呼び出し側の契約は
+/// [`gemm_rows`] と同じ (`r0..r1` は `[0, stride)` の分割の 1 つ、`xs` は
+/// `m * n_in`、`out` は `m * stride` 要素以上)。
+///
+/// # 数値
+///
+/// 1 要素は「4 本の部分和に i 昇順で足し、最後に `a0 + a1 + a2 + a3` の順で
+/// 畳む」。融合カーネル (量子ブロックを 8 レーンで回して hsum) とは累積順が
+/// 違うので **ビット一致しない**。量子 → f32 の展開そのものは
+/// [`crate::kquant::dequant_row_into`] と同一。決定的 (同じ入力 → 同じビット)
+/// で、行・トークンの分割に依らない。
+pub(crate) fn gemm_rows_f32(
+    rows: &[f32],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: *mut f32,
+    stride: usize,
+) {
+    debug_assert!(rows.len() >= r1 * n_in);
+    debug_assert!(xs.len() >= m * n_in);
+    for r in r0..r1 {
+        let w = &rows[r * n_in..(r + 1) * n_in];
+        for t in 0..m {
+            let x = &xs[t * n_in..(t + 1) * n_in];
+            let mut a = [0.0f32; 4];
+            let mut i = 0usize;
+            while i + 4 <= n_in {
+                a[0] += w[i] * x[i];
+                a[1] += w[i + 1] * x[i + 1];
+                a[2] += w[i + 2] * x[i + 2];
+                a[3] += w[i + 3] * x[i + 3];
+                i += 4;
+            }
+            let mut s = a[0] + a[1] + a[2] + a[3];
+            while i < n_in {
+                s += w[i] * x[i];
+                i += 1;
+            }
+            // SAFETY: 呼び出し側の契約どおり `out` は m * stride 要素以上、
+            // t < m / r0 <= r < r1 <= n_out = stride。
+            unsafe { *out.add(t * stride + (r - r0)) = s };
+        }
+    }
+}
+
 /// Q8_0 のバッチ融合カーネル。[`gemv_q8_0_avx2`] と**同じレーン累積順**。
 ///
 /// 1 行版はブロックごとに `w = q*d` を変換し直すが、`w` は行に依らないので
