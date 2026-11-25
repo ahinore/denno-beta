@@ -29,7 +29,7 @@
 //! 数値経路・決定論への影響は構造的にゼロ (ロギングのみ・推論/サンプリングに触れない)。
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,6 +165,40 @@ pub fn init_serve_logging() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let writer = NonBlockingStdout::spawn();
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(writer).init();
+}
+
+// ---------- P877: アクセスログの形式 ----------
+
+/// `--log-format json` のとき true。`log_requests` ミドルウェアが読む。
+static ACCESS_JSON: AtomicBool = AtomicBool::new(false);
+
+/// アクセスログを JSON 形式にする (CLI の `--log-format json`)。
+/// 他のログ行 (起動・エラー) は従来のテキストのまま — アクセスログだけを
+/// 機械可読にする (ログ収集側で 1 行 1 JSON として扱える)。
+pub fn set_access_log_json(on: bool) {
+    ACCESS_JSON.store(on, Ordering::Relaxed);
+}
+
+/// アクセスログが JSON 形式か。
+pub fn access_log_json() -> bool {
+    ACCESS_JSON.load(Ordering::Relaxed)
+}
+
+/// 1 リクエストぶんの JSON アクセスログ行 (`--log-format json`)。
+/// `log_requests` ミドルウェアが応答後に 1 行だけ出す。
+pub fn access_log_line(method: &str, path: &str, status: u16, duration_ms: f64) -> String {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    serde_json::json!({
+        "ts_ms": ts_ms,
+        "method": method,
+        "path": path,
+        "status": status,
+        "duration_ms": duration_ms,
+    })
+    .to_string()
 }
 
 // ---------- テスト ----------
@@ -319,5 +353,22 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         writer.make_writer().write_all(b"after errors\n").unwrap();
         assert_eq!(writer.dropped(), 0);
+    }
+
+    /// P877: `--log-format json` のゲートと、1 行 JSON の中身。
+    #[test]
+    fn access_log_json_toggle_and_line_shape() {
+        set_access_log_json(true);
+        assert!(access_log_json());
+        let line = access_log_line("POST", "/v1/messages", 200, 12.5);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("JSON として読めない");
+        assert_eq!(v["method"], "POST");
+        assert_eq!(v["path"], "/v1/messages");
+        assert_eq!(v["status"], 200);
+        assert!((v["duration_ms"].as_f64().unwrap() - 12.5).abs() < 1e-9);
+        assert!(v["ts_ms"].as_u64().unwrap() > 0);
+        // 既定 (text) に戻す — 同じプロセスの他テストに漏らさない。
+        set_access_log_json(false);
+        assert!(!access_log_json());
     }
 }

@@ -22,6 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 mod lifecycle;
 mod logging;
+/// P877: Prometheus `/metrics` (依存クレート無し) の計器。
+pub mod metrics;
 /// P837: OpenAI Structured Outputs のスキーマ検証 (`response_format: json_schema`)。
 pub mod json_schema;
 mod openai;
@@ -30,7 +32,9 @@ mod ollama;
 mod scheduler;
 mod stream_asm;
 pub use lifecycle::{Lifecycle, DEFAULT_DRAIN_TIMEOUT_MS};
-pub use logging::{init_serve_logging, NonBlockingStdout};
+pub use logging::{
+    access_log_json, access_log_line, init_serve_logging, set_access_log_json, NonBlockingStdout,
+};
 pub use scheduler::{
     AdmitFailure, AdmitKind, Job, Limits, RunStatsSnapshot, MAX_ACTIVE_SESSIONS,
     QUEUE_RETRY_AFTER_SECS, QueueFull, Scheduler,
@@ -954,6 +958,8 @@ pub(crate) fn new_tool_id() -> String {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        // P877: Prometheus のスクレイプ先 (認証は /health と同じく不要)。
+        .route("/metrics", get(metrics_endpoint))
         // P817: readiness。モデルロード済み + ワーカー生存 + drain していない
         // ときだけ 200 (それ以外は 503)。liveness の /health とは別物。
         .route("/ready", get(ready))
@@ -981,10 +987,53 @@ async fn log_requests(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    tracing::info!("{} {}", req.method(), req.uri().path());
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    // P877: ラベルは既知ルート名へ正規化する (未知のパスは `other`)。
+    let endpoint = metrics::normalize_endpoint(&path);
+    if logging::access_log_json() {
+        // JSON 形式は 1 リクエスト 1 行 (応答後にまとめて出す)。
+    } else {
+        tracing::info!("{} {}", method, path);
+    }
     let resp = next.run(req).await;
-    tracing::info!("-> {}", resp.status());
+    let status = resp.status();
+    // P877: HTTP カウンタ (endpoint, status)。
+    metrics::record_http(endpoint, status.as_u16());
+    if logging::access_log_json() {
+        let line = logging::access_log_line(
+            &method,
+            &path,
+            status.as_u16(),
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        tracing::info!(target: "denno_access", "{line}");
+    } else {
+        tracing::info!("-> {}", status);
+    }
     resp
+}
+
+/// P877: Prometheus text exposition format 0.0.4。
+///
+/// 認証は要求しない (`/health` / `/ready` と同じ。スクレイパは API キーを持たない)。
+/// ゲージは既存のスケジューラ状態を読むだけで、ここでは何も変えない。
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Response {
+    let body = metrics::render(
+        &state.model_name,
+        state.scheduler.in_flight(),
+        state.scheduler.pending(),
+        &state.scheduler.stats(),
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 pub async fn run(cfg: ServeConfig) -> Result<()> {
