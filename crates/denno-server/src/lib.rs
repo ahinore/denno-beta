@@ -2472,6 +2472,24 @@ pub(crate) fn to_event(v: &serde_json::Value) -> Event {
             record_prefix_cache_reuse(reused as usize);
         }
     }
+    // task 976: Anthropic は `stop_reason` が `"tool_use"` のとき `stop_sequence`
+    // を null にする (非ストリーミング `message_json` と同一規則)。scheduler の
+    // message_delta は engine の `out.stop_sequence` をそのまま載せるため、
+    // tool_use 上書き時だけ SSE へ出す直前に正規化してパリティを取る
+    // (それ以外の stop_reason では何もしない = 既定経路は不変)。
+    let mut normalized: Option<serde_json::Value> = None;
+    if v.get("type").and_then(|t| t.as_str()) == Some("message_delta")
+        && v.pointer("/delta/stop_reason").and_then(|r| r.as_str()) == Some("tool_use")
+        && v.pointer("/delta/stop_sequence")
+            .map_or(false, |s| !s.is_null())
+    {
+        let mut n = v.clone();
+        if let Some(d) = n.get_mut("delta").and_then(|d| d.as_object_mut()) {
+            d.insert("stop_sequence".to_string(), serde_json::Value::Null);
+        }
+        normalized = Some(n);
+    }
+    let v = normalized.as_ref().unwrap_or(v);
     // Anthropic の SSE は各イベントに event: <type> 行が必要
     // (例: event: message_start / data: {...})
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("message");
