@@ -708,6 +708,19 @@ fn usage_json(input_tokens: usize, output_tokens: usize) -> Value {
     })
 }
 
+/// task 936: `stream_options.include_usage = true` のとき、usage chunk 以外の
+/// 全 chunk に `"usage": null` を載せる (OpenAI の仕様:
+/// "All other chunks will also include a usage field, but with a null value")。
+/// false / 未指定なら usage フィールド自体を出さない (従来と同一バイト列)。
+fn with_usage_slot(mut chunk: Value, include_usage: bool) -> Value {
+    if include_usage {
+        if let Some(obj) = chunk.as_object_mut() {
+            obj.insert("usage".to_string(), Value::Null);
+        }
+    }
+    chunk
+}
+
 // ---------- P869: logprobs / seed ----------
 
 /// `logprobs` / `top_logprobs` を検証し、エンジンへの記録要求
@@ -990,19 +1003,23 @@ async fn send_delta_chunk(
     created: u64,
     model: &str,
     delta: Value,
+    include_usage: bool,
 ) -> bool {
-    let chunk = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "logprobs": Value::Null,
-            "finish_reason": Value::Null,
-        }],
-    });
+    let chunk = with_usage_slot(
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "logprobs": Value::Null,
+                "finish_reason": Value::Null,
+            }],
+        }),
+        include_usage,
+    );
     tx.send(Ok(sse_data(&chunk))).await.is_ok()
 }
 
@@ -1014,19 +1031,23 @@ async fn send_logprob_chunk(
     created: u64,
     model: &str,
     t: &TokenLogprob,
+    include_usage: bool,
 ) -> bool {
-    let chunk = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "logprobs": choice_logprobs_json(std::slice::from_ref(t)),
-            "finish_reason": Value::Null,
-        }],
-    });
+    let chunk = with_usage_slot(
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "logprobs": choice_logprobs_json(std::slice::from_ref(t)),
+                "finish_reason": Value::Null,
+            }],
+        }),
+        include_usage,
+    );
     tx.send(Ok(sse_data(&chunk))).await.is_ok()
 }
 
@@ -1090,18 +1111,21 @@ async fn stream_response(
     let model = state.model_name.clone();
     tokio::spawn(async move {
         // 最初の chunk: delta.role (OpenAI の慣習どおり content は空文字)
-        let first = json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"role": "assistant", "content": ""},
-                "logprobs": Value::Null,
-                "finish_reason": Value::Null,
-            }],
-        });
+        let first = with_usage_slot(
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "logprobs": Value::Null,
+                    "finish_reason": Value::Null,
+                }],
+            }),
+            include_usage,
+        );
         if tx.send(Ok(sse_data(&first))).await.is_err() {
             return; // クライアント切断 → raw_rx を落として生成を打ち切らせる
         }
@@ -1119,8 +1143,15 @@ async fn stream_response(
                     }
                     match asm.as_mut() {
                         None => {
-                            if !send_delta_chunk(&tx, &id, created, &model, json!({"content": text}))
-                                .await
+                            if !send_delta_chunk(
+                                &tx,
+                                &id,
+                                created,
+                                &model,
+                                json!({"content": text}),
+                                include_usage,
+                            )
+                            .await
                             {
                                 return;
                             }
@@ -1173,7 +1204,11 @@ async fn stream_response(
                                     _ => None,
                                 };
                                 if let Some(d) = delta {
-                                    if !send_delta_chunk(&tx, &id, created, &model, d).await {
+                                    if !send_delta_chunk(
+                                        &tx, &id, created, &model, d, include_usage,
+                                    )
+                                    .await
+                                    {
                                         return;
                                     }
                                 }
@@ -1188,7 +1223,7 @@ async fn stream_response(
                 }
                 // P869: logprobs (`logprobs=true` のときだけ届く)
                 RawEvent::Logprob(t) => {
-                    if !send_logprob_chunk(&tx, &id, created, &model, &t).await {
+                    if !send_logprob_chunk(&tx, &id, created, &model, &t, include_usage).await {
                         return;
                     }
                 }
@@ -1209,7 +1244,15 @@ async fn stream_response(
                 if e["type"] == "content_block_delta" && e["delta"]["type"] == "text_delta" {
                     let t = e["delta"]["text"].as_str().unwrap_or_default();
                     if !t.is_empty()
-                        && !send_delta_chunk(&tx, &id, created, &model, json!({"content": t})).await
+                        && !send_delta_chunk(
+                            &tx,
+                            &id,
+                            created,
+                            &model,
+                            json!({"content": t}),
+                            include_usage,
+                        )
+                        .await
                     {
                         return;
                     }
@@ -1220,18 +1263,21 @@ async fn stream_response(
             }
         }
         // 最終 chunk (finish_reason)
-        let last = json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "logprobs": Value::Null,
-                "finish_reason": reason,
-            }],
-        });
+        let last = with_usage_slot(
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "logprobs": Value::Null,
+                    "finish_reason": reason,
+                }],
+            }),
+            include_usage,
+        );
         if tx.send(Ok(sse_data(&last))).await.is_err() {
             return;
         }
@@ -1347,19 +1393,29 @@ fn new_cmpl_id() -> String {
 }
 
 /// `/v1/completions` の 1 chunk (`object = text_completion`)。
-fn completion_chunk(id: &str, created: u64, model: &str, text: &str, finish: Value) -> Value {
-    json!({
-        "id": id,
-        "object": "text_completion",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "text": text,
-            "index": 0,
-            "logprobs": Value::Null,
-            "finish_reason": finish,
-        }],
-    })
+fn completion_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    text: &str,
+    finish: Value,
+    include_usage: bool,
+) -> Value {
+    with_usage_slot(
+        json!({
+            "id": id,
+            "object": "text_completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "text": text,
+                "index": 0,
+                "logprobs": Value::Null,
+                "finish_reason": finish,
+            }],
+        }),
+        include_usage,
+    )
 }
 
 pub async fn completions(
@@ -1475,7 +1531,16 @@ async fn completion_stream_response(
         };
         // echo: プロンプト自身を最初の chunk として流す (OpenAI と同じ)
         if echo && !prompt.is_empty() {
-            if !send(completion_chunk(&id, created, &model, &prompt, Value::Null)).await {
+            if !send(completion_chunk(
+                &id,
+                created,
+                &model,
+                &prompt,
+                Value::Null,
+                include_usage,
+            ))
+            .await
+            {
                 return;
             }
         }
@@ -1488,7 +1553,16 @@ async fn completion_stream_response(
                     if text.is_empty() {
                         continue;
                     }
-                    if !send(completion_chunk(&id, created, &model, &text, Value::Null)).await {
+                    if !send(completion_chunk(
+                        &id,
+                        created,
+                        &model,
+                        &text,
+                        Value::Null,
+                        include_usage,
+                    ))
+                    .await
+                    {
                         return;
                     }
                 }
@@ -1510,7 +1584,16 @@ async fn completion_stream_response(
             }
         }
         // 最終 chunk (finish_reason)
-        if !send(completion_chunk(&id, created, &model, "", json!(reason))).await {
+        if !send(completion_chunk(
+            &id,
+            created,
+            &model,
+            "",
+            json!(reason),
+            include_usage,
+        ))
+        .await
+        {
             return;
         }
         if include_usage {
