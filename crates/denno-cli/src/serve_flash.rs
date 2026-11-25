@@ -94,6 +94,9 @@ pub struct FlashConfig {
     /// P812: 文脈スロット数 (`--kv-slots` / `DENNO_KV_SLOTS`、既定 2)。
     /// 2 は従来の main + aux と同じ、3 以上は LCP 一致 + LRU の汎用経路。
     pub kv_slots: Option<usize>,
+    /// task 833: 起動時に掛けるレシピ (`--steer-recipe` / `DENNO_STEER_RECIPE`)。
+    /// `None` かつ env 未設定なら何もしない (既定の推論は不変)。
+    pub steer_recipe: Option<PathBuf>,
 }
 
 fn shards(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -2764,6 +2767,217 @@ fn import_steer(body: &[u8], rename: Option<&str>) -> Result<Value, String> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// task 833: レシピ (持ち運びできるステアリング設定) の HTTP
+// ---------------------------------------------------------------------------
+
+/// `--steer-recipe` / `DENNO_STEER_RECIPE` のパス (フラグが優先)。
+fn steer_recipe_path(cfg: &FlashConfig) -> Option<PathBuf> {
+    if let Some(p) = &cfg.steer_recipe {
+        return Some(p.clone());
+    }
+    let s = std::env::var("DENNO_STEER_RECIPE").ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// レシピを読んで検証し、適用する。返り値は起動ログの 1 行。
+fn apply_steer_recipe(path: &Path) -> Result<String, String> {
+    let r = steer::SteerRecipe::from_file(path)?;
+    steer::SteerState::new().apply_recipe(&r)?;
+    Ok(format!(
+        "[flash] steer recipe loaded: {} mode={} alpha={} layers={}..{}",
+        r.name,
+        r.mode.name(),
+        r.alpha,
+        r.layer_from,
+        r.layer_to
+    ))
+}
+
+/// レシピの要約 (`/v1/steer/recipe/*` の応答に載せる)。
+fn recipe_summary(r: &steer::SteerRecipe) -> Value {
+    json!({
+        "name": r.name,
+        "description": r.description,
+        "model_id": r.model_id,
+        "mode": r.mode.name(),
+        "alpha": r.alpha,
+        "layers": [r.layer_from, r.layer_to],
+        "terms": r
+            .terms
+            .iter()
+            .map(|t| json!({"snapshot": t.snapshot, "coef": t.coef}))
+            .collect::<Vec<_>>(),
+        "embedded": r.snapshots.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+    })
+}
+
+/// `POST /v1/steer/recipe/export`。適用中の設定か、body で指定した設定を
+/// レシピ JSON にして返す。**panic しない**。
+fn recipe_export(body: &Value) -> Result<Value, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
+    for k in obj.keys() {
+        if !matches!(
+            k.as_str(),
+            "name" | "description" | "embed_snapshots" | "terms" | "layers" | "alpha" | "mode"
+        ) {
+            return Err(format!(
+                "未知のフィールド {k:?} (name / description / embed_snapshots / terms / layers / alpha / mode のみ)"
+            ));
+        }
+    }
+    let name = match obj.get("name") {
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| "name は文字列".to_string())?
+            .to_string(),
+        None => "recipe".to_string(),
+    };
+    let embed = match obj.get("embed_snapshots") {
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| "embed_snapshots は真偽値".to_string())?,
+        None => false,
+    };
+    let model_id = match steer::meta() {
+        Some((_, m)) if !m.is_empty() => Some(m),
+        _ => None,
+    };
+    let mut r = if obj.contains_key("terms") {
+        // body で指定された設定 (まだ適用していなくてもよい)。
+        let tv = obj["terms"]
+            .as_array()
+            .ok_or_else(|| "terms は配列".to_string())?;
+        if tv.is_empty() {
+            return Err("terms が空".into());
+        }
+        let mut terms = Vec::with_capacity(tv.len());
+        for (i, t) in tv.iter().enumerate() {
+            let o = t
+                .as_object()
+                .ok_or_else(|| format!("terms[{i}] はオブジェクト"))?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "snapshot" | "coef") {
+                    return Err(format!("terms[{i}]: 未知のフィールド {k:?}"));
+                }
+            }
+            let snap = o
+                .get("snapshot")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("terms[{i}].snapshot は文字列"))?;
+            let coef = as_f32(
+                o.get("coef")
+                    .ok_or_else(|| format!("terms[{i}].coef が無い"))?,
+                &format!("terms[{i}].coef"),
+            )?;
+            terms.push(steer::Term {
+                snapshot: snap.to_string(),
+                coef,
+            });
+        }
+        let (from, to) = match obj.get("layers") {
+            Some(v) => {
+                let lv = v
+                    .as_array()
+                    .filter(|a| a.len() == 2)
+                    .ok_or_else(|| "layers は [from, to]".to_string())?;
+                (as_index(&lv[0], "layers[0]")?, as_index(&lv[1], "layers[1]")?)
+            }
+            None => {
+                let n = steer::meta().map(|(s, _)| s.n_layer).unwrap_or(0);
+                (0, n)
+            }
+        };
+        let alpha = match obj.get("alpha") {
+            Some(v) => as_f32(v, "alpha")?,
+            None => 1.0,
+        };
+        let mode = match obj.get("mode") {
+            Some(v) => {
+                let s = v.as_str().ok_or_else(|| "mode は文字列".to_string())?;
+                steer::Mode::parse(s)
+                    .ok_or_else(|| format!("未知の mode {s:?} (subtract / project)"))?
+            }
+            None => steer::Mode::Project,
+        };
+        steer::SteerRecipe {
+            name: name.clone(),
+            description: None,
+            model_id: model_id.clone(),
+            mode,
+            alpha,
+            layer_from: from,
+            layer_to: to,
+            terms,
+            snapshots: Vec::new(),
+        }
+    } else {
+        let mut r = steer::current_recipe(&name, false)?;
+        r.model_id = model_id;
+        r
+    };
+    r.description = match obj.get("description") {
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| "description は文字列".to_string())?
+                .to_string(),
+        ),
+        None => None,
+    };
+    if embed {
+        r.embed_snapshots()?;
+    }
+    Ok(r.to_json())
+}
+
+/// `POST /v1/steer/recipe/import`。レシピ JSON を検証し、`apply` が真なら
+/// 適用する (埋め込みはメモリにだけ載せる)。**panic しない**。
+fn recipe_import(body: &Value, apply_query: bool) -> Result<Value, String> {
+    let (rv, want_apply) = match body.as_object() {
+        Some(o) if o.contains_key("recipe") => {
+            for k in o.keys() {
+                if !matches!(k.as_str(), "recipe" | "apply") {
+                    return Err(format!(
+                        "未知のフィールド {k:?} (recipe / apply のみ。レシピそのものを送るなら recipe を包まない)"
+                    ));
+                }
+            }
+            let a = match o.get("apply") {
+                Some(v) => v
+                    .as_bool()
+                    .ok_or_else(|| "apply は真偽値".to_string())?,
+                None => false,
+            };
+            (
+                o.get("recipe")
+                    .ok_or_else(|| "recipe が無い".to_string())?,
+                a,
+            )
+        }
+        _ => (body, false),
+    };
+    let r = steer::SteerRecipe::from_json(rv)?;
+    let do_apply = apply_query || want_apply;
+    let mut out = json!({
+        "valid": true,
+        "applied": false,
+        "recipe": recipe_summary(&r),
+    });
+    if do_apply {
+        steer::SteerState::new().apply_recipe(&r)?;
+        out["applied"] = json!(true);
+        out["steer"] = steer_status_to_json();
+    }
+    Ok(out)
+}
+
 /// 生のバイト列を返す (ダウンロード用。Content-Disposition 付き)。
 fn send_bytes(
     stream: &mut TcpStream,
@@ -3415,6 +3629,36 @@ fn handle_req(
             Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
         };
     }
+    // task 833: レシピ (1 ファイルのステアリング設定) の持ち出し / 取り込み。
+    // import は既定で検証だけ。`?apply=1` か body の `apply: true` で適用する。
+    if req.method == "POST" && path == "/v1/steer/recipe/export" {
+        let body: Value = if req.body.is_empty() || req.body == b"{}" {
+            json!({})
+        } else {
+            match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
+            }
+        };
+        return match recipe_export(&body) {
+            Ok(v) => send_json(&mut stream, "200 OK", &v),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
+    if req.method == "POST" && path == "/v1/steer/recipe/import" {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return send_json(&mut stream, "400 Bad Request", &err_json(&e.to_string())),
+        };
+        let apply = matches!(
+            query_param(&req.path, "apply").as_deref(),
+            Some("1") | Some("true")
+        );
+        return match recipe_import(&body, apply) {
+            Ok(v) => send_json(&mut stream, "200 OK", &v),
+            Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
+        };
+    }
     if req.method != "POST" || path != "/v1/messages" {
         return send_json(
             &mut stream,
@@ -3965,6 +4209,14 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         );
     }
     drop(f);
+    // task 833: 起動時のレシピ。`--steer-recipe` か `DENNO_STEER_RECIPE` が
+    // あるときだけ読む (どちらも無ければ従来どおり = 既定の推論は不変)。
+    if let Some(path) = steer_recipe_path(&cfg) {
+        match apply_steer_recipe(&path) {
+            Ok(line) => eprintln!("{line}"),
+            Err(e) => bail!("--steer-recipe {}: {e}", path.display()),
+        }
+    }
     let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
     let chunk = std::env::var("DENNO_PREFILL_BATCH_CHUNK").unwrap_or_else(|_| "8".into());
 
@@ -4728,5 +4980,221 @@ mod flash_tests {
         steer::start_record("cm_all").expect("記録開始");
         assert_eq!(steer_status_to_json()["capture_mode"], json!("all"));
         steer::stop_record().ok();
+    }
+
+    // ---- task 833: レシピのハンドラ ---------------------------------------
+
+    /// A +1 / B -1 / project を適用した状態を作る。
+    fn recipe833_apply() {
+        steer::set_apply(
+            vec![
+                steer::Term {
+                    snapshot: "ablit_A".into(),
+                    coef: 1.0,
+                },
+                steer::Term {
+                    snapshot: "ablit_B".into(),
+                    coef: -1.0,
+                },
+            ],
+            1,
+            3,
+            0.5,
+            steer::Mode::Project,
+        )
+        .expect("適用");
+    }
+
+    /// 適用中の設定を export し、import (検証のみ / 適用) で戻せる。
+    #[test]
+    fn recipe_export_import_handlers_round_trip() {
+        // ステアリングのグローバルを触るので、合成モデルの HTTP テスト
+        // (`flash_synth`) と同じロックを同じ順で取る。
+        let _g = STEER825_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _r = super::flash_synth::REUSE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _i = super::flash_synth::IV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = steer825_fixture();
+        recipe833_apply();
+
+        // 適用中の設定から (埋め込み無し)。
+        let v = recipe_export(&json!({"name": "rc1"})).expect("export current");
+        assert_eq!(v["version"], json!(steer::RECIPE_VERSION));
+        assert_eq!(v["name"], "rc1");
+        assert_eq!(v["mode"], "project");
+        assert_eq!(v["layer_from"], 1);
+        assert_eq!(v["layer_to"], 3);
+        assert!((v["alpha"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(v["model_id"], "cli-825");
+        assert_eq!(v["terms"].as_array().unwrap().len(), 2);
+        assert!(v.get("snapshots").is_none(), "既定では埋め込まない");
+
+        // 埋め込み付きは自分だけで完結する。
+        let emb = recipe_export(&json!({"name": "rc1", "embed_snapshots": true}))
+            .expect("export embedded");
+        let snaps = emb["snapshots"].as_object().expect("snapshots");
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps.contains_key("ablit_A") && snaps.contains_key("ablit_B"));
+        assert!(snaps["ablit_A"].as_str().unwrap().len() > 16);
+
+        // 検証だけの import は状態を変えない。
+        let before = steer::apply_status().expect("apply").terms;
+        let out = recipe_import(&emb, false).expect("validate only");
+        assert_eq!(out["valid"], true);
+        assert_eq!(out["applied"], false);
+        assert_eq!(out["recipe"]["embedded"].as_array().unwrap().len(), 2);
+        assert_eq!(steer::apply_status().expect("apply").terms, before);
+
+        // apply=true で適用される (埋め込みだけでも = ディスクは使わない)。
+        steer::clear_apply();
+        let out = recipe_import(&json!({"recipe": emb, "apply": true}), false).expect("apply");
+        assert_eq!(out["applied"], true);
+        assert_eq!(out["steer"]["apply"]["mode"], "project");
+        assert_eq!(out["steer"]["apply"]["layers"], json!([1, 3]));
+        assert!(steer::apply_status().is_some(), "適用されていない");
+
+        // body で指定した設定 (未適用でもよい) の export。
+        let req = recipe_export(&json!({
+            "name": "rc2",
+            "terms": [
+                {"snapshot": "ablit_A", "coef": 1.0},
+                {"snapshot": "ablit_B", "coef": -1.0},
+            ],
+            "layers": [0, 2],
+            "alpha": 0.25,
+            "mode": "subtract",
+            "description": "requested",
+        }))
+        .expect("export requested");
+        assert_eq!(req["name"], "rc2");
+        assert_eq!(req["mode"], "subtract");
+        assert_eq!(req["layer_from"], 0);
+        assert_eq!(req["layer_to"], 2);
+        assert_eq!(req["description"], "requested");
+        assert!(req.get("snapshots").is_none());
+
+        // 不正は Err (panic しない)。
+        for body in [
+            json!(null),
+            json!([1]),
+            json!({"bogus": 1}),
+            json!({"embed_snapshots": "yes"}),
+            json!({"name": 1}),
+            json!({"terms": []}),
+            json!({"terms": "x"}),
+            json!({"terms": [{"snapshot": "ablit_A", "coef": 1}], "layers": [0]}),
+            json!({"terms": [{"snapshot": "ablit_A", "coef": 1}], "alpha": "x"}),
+            json!({"terms": [{"snapshot": "ablit_A", "coef": 1}], "mode": "bogus"}),
+            // 埋め込み指定で参照先が無い → Err。
+            json!({"terms": [{"snapshot": "ghost", "coef": 1}], "embed_snapshots": true}),
+        ] {
+            assert!(recipe_export(&body).is_err(), "通ってしまった: {body}");
+        }
+        // 埋め込み無しなら参照先の有無は見ない (後で置いてもよいレシピ)。
+        let late = recipe_export(&json!({
+            "terms": [{"snapshot": "later", "coef": 1.0}],
+            "layers": [0, 2],
+        }))
+        .expect("参照先がまだ無いレシピ");
+        assert_eq!(late["terms"][0]["snapshot"], "later");
+        // import の不正。
+        for body in [
+            json!(null),
+            json!([1]),
+            json!({}),
+            json!({"version": 2, "name": "x", "mode": "project", "layer_from": 0, "layer_to": 1,
+                   "terms": [{"snapshot": "ablit_A", "coef": 1}]}),
+            json!({"recipe": {"version": 1}, "extra": 1}),
+            json!({"recipe": emb, "apply": "yes"}),
+        ] {
+            assert!(recipe_import(&body, false).is_err(), "通ってしまった: {body}");
+        }
+        steer::clear_apply();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 起動時のレシピ: ファイルを読み、1 行を返し、実際に適用する。
+    #[test]
+    fn apply_steer_recipe_loads_file_and_logs_one_line() {
+        let _g = STEER825_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _r = super::flash_synth::REUSE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _i = super::flash_synth::IV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = steer825_fixture();
+        recipe833_apply();
+        let emb = recipe_export(&json!({"name": "rc_start", "embed_snapshots": true}))
+            .expect("export");
+
+        // 別プロセス相当: メモリのスナップショットを捨て、ディスクも空にする。
+        steer::reset_for_test();
+        let s = steer::Shape {
+            n_layer: 4,
+            n_hc: 2,
+            n_embd: 3,
+        };
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::env::set_var("DENNO_STEER_DIR", &empty);
+        steer::init(s, "cli-825");
+        assert!(steer::snapshots().is_empty(), "ディスクに残っている");
+
+        let path = dir.join("rc_start.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&emb).unwrap()).unwrap();
+        let line = apply_steer_recipe(&path).expect("起動時適用");
+        assert_eq!(
+            line,
+            format!(
+                "[flash] steer recipe loaded: rc_start mode=project alpha={} layers=1..3",
+                0.5f32
+            )
+        );
+        let info = steer::apply_status().expect("適用されていない");
+        assert_eq!((info.from, info.to), (1, 3));
+        assert_eq!(info.mode, steer::Mode::Project);
+        assert_eq!(steer::snapshots().len(), 2, "埋め込みがメモリに載っていない");
+
+        // 壊れたファイル / 無いファイルは Err。
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, b"{not json").unwrap();
+        assert!(apply_steer_recipe(&bad).is_err());
+        assert!(apply_steer_recipe(&dir.join("missing.json")).is_err());
+
+        // フラグは env より優先。どちらも無ければ None。
+        let cfg = |p: Option<std::path::PathBuf>| FlashConfig {
+            dir: dir.clone(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            max_ctx: 4096,
+            name: "t".into(),
+            max_tokens: 16,
+            mtp_path: None,
+            kv_slots: None,
+            steer_recipe: p,
+        };
+        std::env::remove_var("DENNO_STEER_RECIPE");
+        assert!(steer_recipe_path(&cfg(None)).is_none());
+        std::env::set_var("DENNO_STEER_RECIPE", " /tmp/env_rc.json ");
+        assert_eq!(
+            steer_recipe_path(&cfg(None)),
+            Some(std::path::PathBuf::from("/tmp/env_rc.json"))
+        );
+        assert_eq!(
+            steer_recipe_path(&cfg(Some(path.clone()))),
+            Some(path.clone()),
+            "フラグが優先されていない"
+        );
+        std::env::remove_var("DENNO_STEER_RECIPE");
+        // 空文字の env は「未設定」と同じ。
+        std::env::set_var("DENNO_STEER_RECIPE", "  ");
+        assert!(steer_recipe_path(&cfg(None)).is_none());
+        std::env::remove_var("DENNO_STEER_RECIPE");
+        steer::clear_apply();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

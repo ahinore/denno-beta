@@ -729,7 +729,7 @@ fn builds() -> usize {
 /// task 123: env (`DENNO_FLASH_MODEL_REUSE`) と `TEST_FAIL_STEP` を書き替える
 /// テストの直列化。`cargo test -p denno-cli` は既定で並列に走るので、env や
 /// 注入スイッチを触るテスト同士が重なると build 数の assert が割れる。
-static REUSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(super) static REUSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// task 123: K 番目の差分で失敗する emit (それまでは成功)。クライアント切断
 /// (broken pipe) の代わり。失敗のエラーはそのまま呼び出し元へ返る。
@@ -1618,7 +1618,7 @@ fn aux_ctx_evicted_at_memory_limit() {
 
 /// グローバル設定 (介入) を触るテストの直列化。generate を回すテストは
 /// REUSE_ENV_LOCK を先に取るので、こちらも同じ順で取って直列にする。
-static IV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(super) static IV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 1 リクエストを生の HTTP で流し、応答 (ヘッダ + 本文) を返す。
 fn http_roundtrip(flash: &mut Flash, raw: &str) -> String {

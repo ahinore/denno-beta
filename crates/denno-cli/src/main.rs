@@ -76,6 +76,11 @@ enum Commands {
         /// 環境変数 `DENNO_KV_SLOTS`、それも無ければ 2。
         #[arg(long)]
         kv_slots: Option<usize>,
+        /// task 833: 起動時に掛けるステアリングのレシピ (.json)。未指定なら
+        /// 環境変数 `DENNO_STEER_RECIPE` を見る。どちらも無ければ何もしない
+        /// (既定の推論は不変)。
+        #[arg(long)]
+        steer_recipe: Option<PathBuf>,
     },
     /// P801: 起動中のサーバーに対する再現可能ベンチ (llama-bench 風 pp/tg)。
     /// プロンプトはサーバーの usage.input_tokens で目標トークン数へ較正する。
@@ -675,7 +680,17 @@ fn main() -> Result<()> {
                 eprintln!("wrote {}", path.display());
             }
         }
-        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens, mtp_path, kv_slots } => {
+        Commands::ServeFlash {
+            dir,
+            host,
+            port,
+            max_ctx,
+            name,
+            max_tokens,
+            mtp_path,
+            kv_slots,
+            steer_recipe,
+        } => {
             serve_flash::run(serve_flash::FlashConfig {
                 dir,
                 host,
@@ -685,6 +700,7 @@ fn main() -> Result<()> {
                 max_tokens,
                 mtp_path,
                 kv_slots,
+                steer_recipe,
             })?;
         }
         Commands::Pull { repo } => {
