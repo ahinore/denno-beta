@@ -207,11 +207,78 @@ pub struct Term {
     pub coef: f32,
 }
 
+/// task 849: 重ね掛けの 1 規則 (概念 1 個ぶん)。
+///
+/// 単一規則の [`Apply`] と違い、層範囲・alpha・mode を規則ごとに持つ。
+/// サーバーの `POST /v1/steer/apply` の `rules: [{terms, layers, alpha, mode}]`
+/// がこれに落ちる。`v` / `vhat` は `from..to` の外が 0 (全層ぶんの長さ)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rule {
+    pub terms: Vec<Term>,
+    pub from: usize,
+    pub to: usize,
+    pub alpha: f32,
+    pub mode: Mode,
+    /// `[layer][stream][n_embd]` の合成ベクトル (範囲外は 0)。
+    pub v: Vec<f32>,
+    /// `v` を (layer, stream) ごとに正規化したもの (範囲外は 0)。
+    pub vhat: Vec<f32>,
+}
+
+impl Rule {
+    #[inline]
+    pub fn covers(&self, layer: usize) -> bool {
+        layer >= self.from && layer < self.to
+    }
+
+    /// 1 トークンぶんの残差 (`[hc][n_embd]`) に、この規則だけを適用する。
+    /// 演算の順序は [`Apply::apply_one`] の単一規則経路と同じ。
+    pub fn apply_one(&self, layer: usize, data: &mut [f32], st: usize, e: usize, hc: usize) {
+        if st == 0 || !self.covers(layer) || data.len() < st {
+            return;
+        }
+        let base = layer * st;
+        match self.mode {
+            Mode::Subtract => {
+                let v = &self.v[base..base + st];
+                let a = self.alpha;
+                for d in 0..st {
+                    data[d] -= a * v[d];
+                }
+            }
+            Mode::Project => {
+                for s in 0..hc {
+                    let vp = &self.vhat[base + s * e..base + (s + 1) * e];
+                    let hp = &mut data[s * e..(s + 1) * e];
+                    let mut dot = 0.0f32;
+                    for d in 0..e {
+                        dot += hp[d] * vp[d];
+                    }
+                    let c = self.alpha * dot;
+                    for d in 0..e {
+                        hp[d] -= c * vp[d];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// task 849: 「規則 1 個ぶんの指定」。`set_rules` に渡す。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuleSpec {
+    pub terms: Vec<Term>,
+    pub from: usize,
+    pub to: usize,
+    pub alpha: f32,
+    pub mode: Mode,
+}
+
 /// いま効いている適用。
 #[derive(Clone, Debug)]
 pub struct Apply {
     pub terms: Vec<Term>,
-    /// `[from, to)`。`to` は含まない。
+    /// `[from, to)`。`to` は含まない。重ね掛けでは全規則の外側の包み。
     pub from: usize,
     pub to: usize,
     pub alpha: f32,
@@ -220,13 +287,26 @@ pub struct Apply {
     pub v: Vec<f32>,
     /// `v` を (layer, stream) ごとに正規化したもの。
     pub vhat: Vec<f32>,
+    /// task 849: 重ね掛けの規則。空なら従来の単一規則 (`v` / `alpha` / `mode`)。
+    pub rules: Vec<Rule>,
     shape: Shape,
 }
 
 impl Apply {
     #[inline]
     pub fn covers(&self, layer: usize) -> bool {
+        if !self.rules.is_empty() {
+            return self.rules.iter().any(|r| r.covers(layer));
+        }
         layer >= self.from && layer < self.to
+    }
+
+    /// 単一規則 (`v` / `alpha` / `mode`) だけで表せるか。
+    /// GPU の常駐 prefill は 1 本の合成ベクトルと 1 個の alpha しか置けないので、
+    /// 重ね掛けのときはホスト経路へ落とす (task 849)。
+    #[inline]
+    pub fn is_single_rule(&self) -> bool {
+        self.rules.is_empty()
     }
 
     pub fn shape(&self) -> Shape {
@@ -239,6 +319,15 @@ impl Apply {
     pub fn apply_one(&self, layer: usize, data: &mut [f32]) {
         let st = self.shape.stride();
         if st == 0 || !self.covers(layer) || data.len() < st {
+            return;
+        }
+        // task 849: 重ね掛けは規則の順に 1 個ずつ掛ける (範囲も alpha も別)。
+        if !self.rules.is_empty() {
+            let e = self.shape.n_embd;
+            let hc = self.shape.n_hc;
+            for r in &self.rules {
+                r.apply_one(layer, data, st, e, hc);
+            }
             return;
         }
         let base = layer * st;
@@ -279,6 +368,18 @@ pub struct Steer {
 /// 適用中の設定の要約 (GET /v1/steer 用。`v` は持たない)。
 #[derive(Clone, Debug)]
 pub struct ApplyInfo {
+    pub terms: Vec<Term>,
+    pub from: usize,
+    pub to: usize,
+    pub alpha: f32,
+    pub mode: Mode,
+    /// task 849: 重ね掛けの規則 (空なら従来の単一規則)。
+    pub rules: Vec<RuleInfo>,
+}
+
+/// 重ね掛け 1 規則の要約 (GET /v1/steer 用)。
+#[derive(Clone, Debug)]
+pub struct RuleInfo {
     pub terms: Vec<Term>,
     pub from: usize,
     pub to: usize,
@@ -473,8 +574,26 @@ fn build_apply(
         }
     }
     // `v_hat`: (layer, stream) ごとに正規化する。0 ベクトルはそのまま 0。
-    let mut vhat = vec![0.0f32; v.len()];
+    let vhat = normalize_layers(shape, &v, from, to);
+    Ok(Apply {
+        terms: terms.to_vec(),
+        from,
+        to,
+        alpha,
+        mode,
+        v,
+        vhat,
+        rules: Vec::new(),
+        shape: *shape,
+    })
+}
+
+/// `v` のうち `from..to` の層を (layer, stream) ごとに正規化する。
+/// 範囲外と 0 ベクトルはそのまま 0。
+fn normalize_layers(shape: &Shape, v: &[f32], from: usize, to: usize) -> Vec<f32> {
+    let st = shape.stride();
     let e = shape.n_embd;
+    let mut vhat = vec![0.0f32; v.len()];
     for il in from..to {
         for s in 0..shape.n_hc {
             let base = il * st + s * e;
@@ -493,14 +612,114 @@ fn build_apply(
             }
         }
     }
+    vhat
+}
+
+/// task 849: 重ね掛けする規則の上限 (壊れた入力でメモリを食い潰さないため)。
+pub const MAX_RULES: usize = 16;
+
+/// task 849: 規則ごとの層範囲・alpha・mode を持つ適用を組み立てる。
+///
+/// 単一規則の [`build_apply`] と同じ規則で各項を検証し、規則ごとに
+/// `v` / `vhat` を作る。`Apply` の `terms` は全規則の項を連結したもの、
+/// `from` / `to` は全規則の外側の包み、`alpha` / `mode` は先頭規則のもの
+/// (実効値は `rules` を見る)。
+fn build_rules_apply(
+    shape: &Shape,
+    snaps: &[Arc<Snapshot>],
+    specs: &[RuleSpec],
+) -> Result<Apply, String> {
+    if !shape.is_valid() {
+        return Err("モデルの形が未初期化 (steer::init を先に呼ぶ)".into());
+    }
+    if specs.is_empty() {
+        return Err("rules が空 (何も掛けないなら DELETE /v1/steer/apply)".into());
+    }
+    if specs.len() > MAX_RULES {
+        return Err(format!(
+            "rules が多すぎる ({} 個 / 上限 {MAX_RULES})",
+            specs.len()
+        ));
+    }
+    let st = shape.stride();
+    let mut rules = Vec::with_capacity(specs.len());
+    let mut combined = vec![0.0f32; shape.len()];
+    for (i, sp) in specs.iter().enumerate() {
+        if sp.terms.is_empty() {
+            return Err(format!("rules[{i}].terms が空"));
+        }
+        if sp.from > sp.to {
+            return Err(format!(
+                "rules[{i}].layers の from {} が to {} より大きい",
+                sp.from, sp.to
+            ));
+        }
+        if sp.to > shape.n_layer {
+            return Err(format!(
+                "rules[{i}].layers の to {} が層数 {} を超える ({}-{})",
+                sp.to, shape.n_layer, sp.from, shape.n_layer
+            ));
+        }
+        if !sp.alpha.is_finite() {
+            return Err(format!("rules[{i}].alpha が有限でない"));
+        }
+        for t in &sp.terms {
+            if !t.coef.is_finite() {
+                return Err(format!("rules[{i}].coef が有限でない ({})", t.snapshot));
+            }
+            if !snaps.iter().any(|s| s.name == t.snapshot) {
+                return Err(format!("スナップショット {:?} が無い", t.snapshot));
+            }
+        }
+        let mut v = vec![0.0f32; shape.len()];
+        for t in &sp.terms {
+            let s = snaps
+                .iter()
+                .find(|s| s.name == t.snapshot)
+                .expect("存在は上で確認済み");
+            if s.layers != shape.n_layer || s.n_hc != shape.n_hc || s.n_embd != shape.n_embd {
+                return Err(format!(
+                    "スナップショット {:?} の形が違う ({}x{}x{} / モデル {}x{}x{})",
+                    t.snapshot, s.layers, s.n_hc, s.n_embd, shape.n_layer, shape.n_hc, shape.n_embd
+                ));
+            }
+            let c = t.coef;
+            for il in sp.from..sp.to {
+                let base = il * st;
+                let m = &s.mean[base..base + st];
+                let dst = &mut v[base..base + st];
+                for d in 0..st {
+                    dst[d] += c * m[d];
+                }
+            }
+        }
+        let vhat = normalize_layers(shape, &v, sp.from, sp.to);
+        for (c, x) in combined.iter_mut().zip(v.iter()) {
+            *c += *x;
+        }
+        rules.push(Rule {
+            terms: sp.terms.clone(),
+            from: sp.from,
+            to: sp.to,
+            alpha: sp.alpha,
+            mode: sp.mode,
+            v,
+            vhat,
+        });
+    }
+    let from = rules.iter().map(|r| r.from).min().unwrap_or(0);
+    let to = rules.iter().map(|r| r.to).max().unwrap_or(0);
+    let terms = rules.iter().flat_map(|r| r.terms.iter().cloned()).collect();
+    let vhat = normalize_layers(shape, &combined, from, to);
     Ok(Apply {
-        terms: terms.to_vec(),
+        terms,
         from,
         to,
-        alpha,
-        mode,
-        v,
+        alpha: rules[0].alpha,
+        mode: rules[0].mode,
+        v: combined,
         vhat,
+        rules,
         shape: *shape,
     })
 }
@@ -530,6 +749,20 @@ pub fn set_apply(
         Arc::clone(&g)
     };
     let a = build_apply(&shape, &snaps, &terms, from, to, alpha, mode)?;
+    Ok(install_apply(a))
+}
+
+/// task 849: 複数概念の重ね掛けを設定する (epoch が進む)。
+///
+/// 単一規則の [`set_apply`] はそのまま (この関数を通らない) なので、
+/// 従来の API と数値は 1 ビットも変わらない。
+pub fn set_rules(specs: Vec<RuleSpec>) -> Result<Arc<Steer>, String> {
+    let (shape, _) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
+    let snaps = {
+        let g = snaps_cell().read().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&g)
+    };
+    let a = build_rules_apply(&shape, &snaps, &specs)?;
     Ok(install_apply(a))
 }
 
@@ -888,6 +1121,17 @@ pub fn apply_status() -> Option<ApplyInfo> {
         to: a.to,
         alpha: a.alpha,
         mode: a.mode,
+        rules: a
+            .rules
+            .iter()
+            .map(|r| RuleInfo {
+                terms: r.terms.clone(),
+                from: r.from,
+                to: r.to,
+                alpha: r.alpha,
+                mode: r.mode,
+            })
+            .collect(),
     })
 }
 
@@ -1932,6 +2176,13 @@ impl SteerState {
 pub fn current_recipe(name: &str, embed: bool) -> Result<SteerRecipe, String> {
     validate_name(name)?;
     let info = apply_status().ok_or_else(|| "適用中のステアリングが無い".to_string())?;
+    // task 849: レシピ (version 1) は 1 規則ぶんの形しか持たない。
+    // 重ね掛けを黙って 1 規則に潰さない (lossy な保存はしない)。
+    if !info.rules.is_empty() {
+        return Err(
+            "重ね掛け (rules) の適用はレシピ 1 個に畳めない (単一規則に戻してから保存)".into(),
+        );
+    }
     let (_, model) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
     let mut r = SteerRecipe {
         name: name.to_string(),
@@ -3209,6 +3460,160 @@ mod tests {
         }
         clear_apply();
         assert!(current_recipe("saved", false).is_err(), "適用が無い");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- task 849: 重ね掛け (rules) -------------------------------------
+
+    /// テスト用: スナップショットをメモリに載せる。
+    fn add_snap(s: &Shape, name: &str, seed: f32) {
+        push_snapshot(Arc::new(Snapshot {
+            name: name.into(),
+            tokens: 4,
+            created: 1,
+            model: "stack-model".into(),
+            layers: s.n_layer,
+            n_hc: s.n_hc,
+            n_embd: s.n_embd,
+            // 全層ぶん (`[layer][stream][n_embd]`)。
+            mean: (0..s.len())
+                .map(|i| i as f32 * 0.125 + seed)
+                .collect(),
+        }));
+    }
+
+    fn tr(name: &str, coef: f32) -> Term {
+        Term {
+            snapshot: name.into(),
+            coef,
+        }
+    }
+
+    /// 重ね掛けは「規則を 1 本ずつ順に掛けた結果」と 1 ビット一致する
+    /// (層範囲・alpha・mode が規則ごとに違っても)。
+    #[test]
+    fn stacked_rules_match_sequential_single_applies() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("stack");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "stack-model");
+        add_snap(&s, "A", 0.25);
+        add_snap(&s, "B", -0.5);
+        add_snap(&s, "C", 0.75);
+        let h0 = rows(&s, 1, 0.125).pop().unwrap();
+
+        // 参照: 単一規則を規則の順に、層ごとに 1 回ずつ。
+        let mut want = h0.clone();
+        for il in 0..s.n_layer {
+            let a = set_apply(
+                vec![tr("A", 1.0), tr("B", -1.0)],
+                0,
+                2,
+                0.5,
+                Mode::Project,
+            )
+            .expect("単一規則 1");
+            assert!(a.apply.as_ref().unwrap().rules.is_empty(), "単一規則に rules が入った");
+            a.apply.as_ref().unwrap().apply_one(il, &mut want);
+            let b = set_apply(vec![tr("C", 1.0)], 1, 3, 1.25, Mode::Subtract).expect("単一規則 2");
+            b.apply.as_ref().unwrap().apply_one(il, &mut want);
+        }
+
+        let st = set_rules(vec![
+            RuleSpec {
+                terms: vec![tr("A", 1.0), tr("B", -1.0)],
+                from: 0,
+                to: 2,
+                alpha: 0.5,
+                mode: Mode::Project,
+            },
+            RuleSpec {
+                terms: vec![tr("C", 1.0)],
+                from: 1,
+                to: 3,
+                alpha: 1.25,
+                mode: Mode::Subtract,
+            },
+        ])
+        .expect("重ね掛け");
+        let a = st.apply.as_ref().unwrap();
+        assert_eq!(a.rules.len(), 2, "規則の本数");
+        for il in 0..s.n_layer {
+            assert!(a.covers(il), "層 {il} を包んでいない");
+        }
+        assert!(!a.covers(s.n_layer), "層数を超えて包んでいる");
+        // 包みは全規則の外側。
+        assert_eq!((a.from, a.to), (0, 3));
+        // terms は全規則の連結。
+        assert_eq!(a.terms.len(), 3);
+        let mut got = h0.clone();
+        for il in 0..s.n_layer {
+            a.apply_one(il, &mut got);
+        }
+        assert_eq!(got, want, "重ね掛けが逐次適用と 1 ビット一致しない");
+
+        // 範囲外の層は何もしない (単一規則と同じ)。
+        let mut outside = h0.clone();
+        a.apply_one(s.n_layer, &mut outside);
+        a.apply_one(s.n_layer + 3, &mut outside);
+        assert_eq!(outside, h0);
+
+        // status は規則ごとの層範囲 / alpha / mode を返す。
+        let info = apply_status().expect("status");
+        assert_eq!(info.rules.len(), 2);
+        assert_eq!((info.rules[0].from, info.rules[0].to), (0, 2));
+        assert_eq!(info.rules[0].alpha, 0.5);
+        assert_eq!(info.rules[0].mode, Mode::Project);
+        assert_eq!((info.rules[1].from, info.rules[1].to), (1, 3));
+        assert_eq!(info.rules[1].alpha, 1.25);
+        assert_eq!(info.rules[1].mode, Mode::Subtract);
+        // レシピ (version 1) へは黙って畳まない。
+        assert!(current_recipe("stacked", false).is_err(), "重ね掛けがレシピに落ちた");
+
+        clear_apply();
+        assert!(apply_status().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 重ね掛けの入力検証 (壊れた rules は適用しない)。
+    #[test]
+    fn stacked_rules_reject_bad_input() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("stack-bad");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "stack-model");
+        add_snap(&s, "A", 0.25);
+        let ok = || RuleSpec {
+            terms: vec![tr("A", 1.0)],
+            from: 0,
+            to: 2,
+            alpha: 1.0,
+            mode: Mode::Project,
+        };
+        assert!(set_rules(vec![]).is_err(), "空の rules");
+        let mut bad = ok();
+        bad.terms = vec![];
+        assert!(set_rules(vec![bad]).is_err(), "空の terms");
+        let mut bad = ok();
+        bad.from = 3;
+        assert!(set_rules(vec![bad]).is_err(), "from > to");
+        let mut bad = ok();
+        bad.to = s.n_layer + 1;
+        assert!(set_rules(vec![bad]).is_err(), "to > 層数");
+        let mut bad = ok();
+        bad.alpha = f32::NAN;
+        assert!(set_rules(vec![bad]).is_err(), "alpha が非有限");
+        let mut bad = ok();
+        bad.terms = vec![tr("ghost", 1.0)];
+        assert!(set_rules(vec![bad]).is_err(), "無いスナップショット");
+        assert!(
+            set_rules(vec![ok(); MAX_RULES + 1]).is_err(),
+            "規則が多すぎる"
+        );
+        // 失敗した適用は状態を変えない。
+        assert!(apply_status().is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

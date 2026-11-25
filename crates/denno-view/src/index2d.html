@@ -415,6 +415,14 @@
         <button id="ab-apply" class="b go" title="POST /v1/steer/apply (A +1 / B -1 / project)">apply abliteration</button>
         <button id="ab-reset" class="b warn" title="DELETE /v1/steer/apply">reset / clear</button>
       </div>
+      <div class="row2"><h2 style="margin:0;flex:1">stack <span class="dim">2–4 concepts · per-vector α / layers</span></h2></div>
+      <div class="small dim">概念ごとに pos / neg の組・mode・α・層範囲を持つ。有効な行だけを 1 回の <code>POST /v1/steer/apply</code> の <code>rules</code> として送る。</div>
+      <div id="ab-stack" class="stack"></div>
+      <div class="row2">
+        <button id="ab-stack-add" class="b" title="概念ベクトルを 1 行足す (最大 4)">add vector</button>
+        <button id="ab-stack-apply" class="b go" title="POST /v1/steer/apply {rules:[{terms,layers,alpha,mode}]}">apply stack</button>
+      </div>
+      <div id="ab-stack-info" class="small dim" style="margin-top:2px"></div>
       <div class="row2"><h2 style="margin:0;flex:1">batch eval <span class="dim">off vs on</span></h2></div>
       <label class="f">eval prompts (1 行 1 プロンプト、最大 10)
         <textarea id="ab-eval-prompts" rows="3" placeholder="eval prompts — one per line"></textarea></label>
@@ -478,11 +486,12 @@ import {
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
   toggleItem, addItem, removeItem, selectionItems, wallHitTest,
   wallItemsInRect, wallLayout, hasItem,
-  ABLIT_A, ABLIT_ALPHA_MIN, ABLIT_B, ABLIT_CAPTURE_MODE, CAPTURE_MODES, ablitApplyBody, ablitChart,
+  ABLIT_A, ABLIT_ALPHA_MIN, ABLIT_B, ABLIT_CAPTURE_MODE, ABLIT_STACK_MAX, CAPTURE_MODES, ablitApplyBody, ablitChart,
   ablitCompareRows, ablitEvalPrompts, ablitEvalRows, ablitExportName,
   ablitExportUrl, ablitImportBody, ablitLayerAt, ablitRecipeBodyFromUi,
   ablitRecipeFileName, ablitRecipeFromText, ablitRecipeSummaryText,
-  ablitRange, ablitRangeFromDrag, ablitRecordBody, ablitSepScores, ablitSummary,
+  ablitRange, ablitRangeFromDrag, ablitRecordBody, ablitSepScores,
+  ablitStackBody, ablitStackSummary, ablitSummary,
   parsePromptList,
 } from '/view2d.mjs';
 import {
@@ -512,7 +521,7 @@ let applied = { epoch: 0, experts_off: [], blocks_off: [], streams_off: [] };
 let steer = { recording: null, snapshots: [], apply: null };
 // task 825: Abliterate 作業台の状態。`chart` は最後に描いたバーの配置 (クリック判定)。
 let colourMode = 'token';              // 'token' | 'accum' | 'ablit'
-let ablit = { analysis: null, range: [0, 0], chart: null, drag: null, busy: false, cancel: false };
+let ablit = { analysis: null, range: [0, 0], chart: null, drag: null, busy: false, cancel: false, stack: [] };
 let ablitScores = [];                  // 層ごとの分離スコア (0..1、色モード用)
 let terms = new Map();                 // snapshot name -> coef
 // task 809: ライブ性能の HUD。イベントは hud2d.mjs の状態機械に渡すだけ。
@@ -1605,6 +1614,147 @@ $('ab-reset').addEventListener('click', async () => {
   }
   await refreshAll('abliteration cleared');
   ablitInfo('cleared (no steering)');
+});
+
+// ---- 重ね掛け (task 849) ------------------------------------------------
+// 概念ベクトル (pos/neg の組) を 2-4 本重ねる。層範囲・alpha・mode は行ごと。
+// 本文の組み立ては view2d.mjs の ablitStackBody (実 API の規則と同じ検証)。
+
+function stackRangeSeed() {
+  const r = ablit.range;
+  if (Array.isArray(r) && r[1] > r[0]) return [r[0] | 0, r[1] | 0];
+  return [0, Math.max(0, shape.layers | 0)];
+}
+
+function stackDefaults(idx) {
+  const names = steer.snapshots.map((s) => s.name);
+  const pick = (want, fallback) => (names.indexOf(want) >= 0 ? want : (names[fallback] || ''));
+  // 2 本目以降は別の組を選べるよう、名前をずらす。
+  const pos = pick(ABLIT_A, idx * 2);
+  const neg = pick(ABLIT_B, idx * 2 + 1);
+  return { pos, neg };
+}
+
+function stackField(value, placeholder, width, onInput) {
+  const el = document.createElement('input');
+  el.type = 'text';
+  el.className = 'cx';
+  el.style.width = width;
+  el.placeholder = placeholder;
+  el.value = value == null ? '' : String(value);
+  el.title = placeholder;
+  el.addEventListener('input', () => onInput(el.value.trim()));
+  return el;
+}
+
+function renderStack() {
+  const box = $('ab-stack');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!ablit.stack.length) {
+    const d = document.createElement('div');
+    d.className = 'small dim';
+    d.textContent = 'no vector — press add vector (max ' + ABLIT_STACK_MAX + ')';
+    box.appendChild(d);
+    return;
+  }
+  ablit.stack.forEach((v, i) => {
+    const row = document.createElement('div');
+    row.className = 'row2';
+    row.style.gap = '4px';
+    row.style.marginTop = '3px';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = v.on !== false;
+    cb.title = 'enable this vector';
+    cb.addEventListener('change', () => { v.on = cb.checked; });
+    const pos = stackField(v.pos, 'pos snapshot', '5.5em', (x) => { v.pos = x; });
+    const neg = stackField(v.neg, 'neg snapshot', '5.5em', (x) => { v.neg = x; });
+    const mode = document.createElement('select');
+    mode.className = 'cx';
+    for (const m of ['project', 'subtract']) {
+      const o = document.createElement('option');
+      o.value = m;
+      o.textContent = m;
+      mode.appendChild(o);
+    }
+    mode.value = v.mode === 'subtract' ? 'subtract' : 'project';
+    mode.title = 'mode';
+    mode.addEventListener('change', () => { v.mode = mode.value; });
+    const from = document.createElement('input');
+    from.type = 'number';
+    from.min = '0';
+    from.className = 'cx';
+    from.style.width = '3.4em';
+    from.value = String(v.layers[0] | 0);
+    from.title = 'layers from (inclusive)';
+    from.addEventListener('change', () => { v.layers[0] = Math.max(0, Math.round(Number(from.value) || 0)); });
+    const to = document.createElement('input');
+    to.type = 'number';
+    to.min = '0';
+    to.className = 'cx';
+    to.style.width = '3.4em';
+    to.value = String(v.layers[1] | 0);
+    to.title = 'layers to (exclusive)';
+    to.addEventListener('change', () => { v.layers[1] = Math.max(0, Math.round(Number(to.value) || 0)); });
+    const alpha = document.createElement('input');
+    alpha.type = 'range';
+    alpha.min = String(ABLIT_ALPHA_MIN);
+    alpha.max = '2';
+    alpha.step = '0.05';
+    alpha.value = String(Number.isFinite(Number(v.alpha)) ? Number(v.alpha) : 1);
+    alpha.style.width = '4.2em';
+    alpha.title = 'alpha';
+    const av = document.createElement('span');
+    av.className = 'small dim';
+    av.textContent = Number(alpha.value).toFixed(2);
+    alpha.addEventListener('input', () => {
+      v.alpha = Number(alpha.value);
+      av.textContent = Number(alpha.value).toFixed(2);
+    });
+    const del = document.createElement('button');
+    del.className = 'b';
+    del.textContent = '×';
+    del.title = 'remove this vector';
+    del.addEventListener('click', () => {
+      ablit.stack.splice(i, 1);
+      renderStack();
+    });
+    row.append(cb, pos, neg, mode, from, to, alpha, av, del);
+    box.appendChild(row);
+  });
+}
+
+$('ab-stack-add').addEventListener('click', () => {
+  ablitErr('');
+  if (ablit.stack.length >= ABLIT_STACK_MAX) {
+    ablitErr('stack: at most ' + ABLIT_STACK_MAX + ' vectors');
+    return;
+  }
+  const d = stackDefaults(ablit.stack.length);
+  ablit.stack.push({
+    on: true, pos: d.pos, neg: d.neg, mode: 'project', alpha: 1,
+    layers: stackRangeSeed(),
+  });
+  renderStack();
+});
+
+$('ab-stack-apply').addEventListener('click', async () => {
+  ablitErr('');
+  let body;
+  try {
+    body = ablitStackBody(ablit.stack, { nLayers: shape.layers });
+  } catch (e) {
+    ablitErr((e && e.message) || String(e));
+    return;
+  }
+  const r = await api('POST', '/v1/steer/apply', body);
+  if (r.status !== 200) {
+    ablitErr('apply stack → ' + r.status + ' ' + errText(r));
+    return;
+  }
+  await refreshAll('stack applied');
+  $('ab-stack-info').textContent = 'applied: ' + ablitStackSummary(body);
 });
 
 $('ab-colour').addEventListener('click', () => {

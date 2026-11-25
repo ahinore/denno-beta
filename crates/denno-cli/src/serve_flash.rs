@@ -2484,6 +2484,21 @@ fn steer_status_to_json() -> Value {
             "layers": [a.from, a.to],
             "alpha": a.alpha,
             "mode": a.mode.name(),
+            // task 849: 重ね掛けの規則 (空配列なら従来の単一規則)。
+            "rules": a
+                .rules
+                .iter()
+                .map(|r| json!({
+                    "terms": r
+                        .terms
+                        .iter()
+                        .map(|t| json!({"snapshot": t.snapshot, "coef": t.coef}))
+                        .collect::<Vec<_>>(),
+                    "layers": [r.from, r.to],
+                    "alpha": r.alpha,
+                    "mode": r.mode.name(),
+                }))
+                .collect::<Vec<_>>(),
         }),
         None => Value::Null,
     };
@@ -2511,17 +2526,119 @@ fn as_f32(v: &Value, what: &str) -> Result<f32, String> {
     Ok(x as f32)
 }
 
+/// task 849: `/v1/steer/apply` の `rules` の上限 (画面は 4 まで)。
+const MAX_STEER_RULES: usize = 8;
+
 /// `POST /v1/steer/apply` の body を検証して適用する。**panic しない**。
 fn apply_steer(body: &Value) -> Result<Value, String> {
     let obj = body
         .as_object()
         .ok_or_else(|| "body は JSON オブジェクト".to_string())?;
     for k in obj.keys() {
-        if !matches!(k.as_str(), "terms" | "layers" | "alpha" | "mode") {
+        if !matches!(k.as_str(), "terms" | "layers" | "alpha" | "mode" | "rules") {
             return Err(format!(
-                "未知のフィールド {k:?} (terms / layers / alpha / mode のみ)"
+                "未知のフィールド {k:?} (terms / layers / alpha / mode / rules のみ)"
             ));
         }
+    }
+    // task 849: 複数概念の重ね掛け。`rules: [{terms, layers, alpha, mode}]` は
+    // 単一規則の `terms` / `layers` / ... と同時には使えない (規則ごとに持つ)。
+    if let Some(rv) = obj.get("rules") {
+        for k in ["terms", "layers", "alpha", "mode"] {
+            if obj.contains_key(k) {
+                return Err(format!(
+                    "rules と {k} は同時に使えない (層範囲・alpha・mode は規則ごとに書く)"
+                ));
+            }
+        }
+        let arr = rv
+            .as_array()
+            .ok_or_else(|| "rules は配列".to_string())?;
+        if arr.is_empty() {
+            return Err("rules が空 (消すなら DELETE /v1/steer/apply)".into());
+        }
+        if arr.len() > MAX_STEER_RULES {
+            return Err(format!(
+                "rules が多すぎる ({} 個 / 上限 {MAX_STEER_RULES})",
+                arr.len()
+            ));
+        }
+        let mut specs = Vec::with_capacity(arr.len());
+        for (i, r) in arr.iter().enumerate() {
+            let o = r
+                .as_object()
+                .ok_or_else(|| format!("rules[{i}] はオブジェクト"))?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "terms" | "layers" | "alpha" | "mode") {
+                    return Err(format!("rules[{i}]: 未知のフィールド {k:?}"));
+                }
+            }
+            let tv = o
+                .get("terms")
+                .ok_or_else(|| format!("rules[{i}].terms が無い"))?
+                .as_array()
+                .ok_or_else(|| format!("rules[{i}].terms は配列"))?;
+            if tv.is_empty() {
+                return Err(format!("rules[{i}].terms が空"));
+            }
+            let mut terms = Vec::with_capacity(tv.len());
+            for (j, t) in tv.iter().enumerate() {
+                let to = t
+                    .as_object()
+                    .ok_or_else(|| format!("rules[{i}].terms[{j}] はオブジェクト"))?;
+                for k in to.keys() {
+                    if !matches!(k.as_str(), "snapshot" | "coef") {
+                        return Err(format!(
+                            "rules[{i}].terms[{j}]: 未知のフィールド {k:?}"
+                        ));
+                    }
+                }
+                let name = to
+                    .get("snapshot")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("rules[{i}].terms[{j}].snapshot は文字列"))?;
+                let coef = as_f32(
+                    to.get("coef")
+                        .ok_or_else(|| format!("rules[{i}].terms[{j}].coef が無い"))?,
+                    &format!("rules[{i}].terms[{j}].coef"),
+                )?;
+                terms.push(steer::Term {
+                    snapshot: name.to_string(),
+                    coef,
+                });
+            }
+            let lv = o
+                .get("layers")
+                .ok_or_else(|| format!("rules[{i}].layers が無い"))?
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .ok_or_else(|| format!("rules[{i}].layers は [from, to]"))?;
+            let from = as_index(&lv[0], &format!("rules[{i}].layers[0]"))?;
+            let to = as_index(&lv[1], &format!("rules[{i}].layers[1]"))?;
+            let alpha = match o.get("alpha") {
+                Some(v) => as_f32(v, &format!("rules[{i}].alpha"))?,
+                None => 1.0,
+            };
+            let mode = match o.get("mode") {
+                Some(v) => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| format!("rules[{i}].mode は文字列"))?;
+                    steer::Mode::parse(s)
+                        .ok_or_else(|| format!("rules[{i}]: 未知の mode {s:?} (subtract / project)"))?
+                }
+                None => steer::Mode::Subtract,
+            };
+            specs.push(steer::RuleSpec {
+                terms,
+                from,
+                to,
+                alpha,
+                mode,
+            });
+        }
+        steer::set_rules(specs)?;
+        return Ok(steer_status_to_json());
     }
     let tv = obj
         .get("terms")

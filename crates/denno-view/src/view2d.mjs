@@ -1021,6 +1021,8 @@ export function steerApplyBody(spec, opts = {}) {
 /// いま効いているステアリングの 1 行要約 (バナー用)。
 export function steerSummary(apply) {
   if (!apply) return '';
+  // task 849: 重ね掛けは規則ごとに出す (terms / layers / alpha / mode は包み)。
+  if (Array.isArray(apply.rules) && apply.rules.length) return ablitStackSummary(apply);
   const parts = (apply.terms || []).map((t) => {
     const c = Number(t.coef);
     return t.snapshot + (c >= 0 ? ' +' : ' ') + c;
@@ -1200,6 +1202,83 @@ export function ablitApplyBody(range, alpha, opts = {}) {
     alpha: a,
     mode: 'project',
   }, { nLayers });
+}
+
+/// task 849: 重ね掛けできる概念ベクトルの上限 (画面)。実 API は 8 まで。
+export const ABLIT_STACK_MAX = 4;
+
+/// 1 概念ベクトルの指定 (画面の 1 行) を実 API の規則で検証する。
+///
+/// `pos` / `neg` はスナップショット名 (snapshot と同じ名前規則)、`mode` は
+/// subtract / project、`alpha` は 0..2、`layers` は `[from, to)`。
+function ablitStackRule(v, i, nLayers) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    throw new Error('stack[' + i + '] must be an object');
+  }
+  const pos = typeof v.pos === 'string' ? v.pos : '';
+  const neg = typeof v.neg === 'string' ? v.neg : '';
+  if (!NAME_RE.test(pos)) throw new Error('stack[' + i + '].pos: snapshot name required (A-Z a-z 0-9 _ -)');
+  if (!NAME_RE.test(neg)) throw new Error('stack[' + i + '].neg: snapshot name required (A-Z a-z 0-9 _ -)');
+  if (pos === neg) throw new Error('stack[' + i + ']: pos and neg must be different snapshots');
+  const layers = Array.isArray(v.layers) ? v.layers : [];
+  if (layers.length !== 2) throw new Error('stack[' + i + '].layers: [from, to] required');
+  const from = intOr(layers[0], -1);
+  const to = intOr(layers[1], -1);
+  if (from < 0 || to < 0) throw new Error('stack[' + i + '].layers: from/to must be >= 0');
+  if (from >= to) throw new Error('stack[' + i + '].layers: from must be < to (空の範囲は掛けない)');
+  if (nLayers > 0 && to > nLayers) {
+    throw new Error('stack[' + i + '].layers: to must be <= ' + nLayers);
+  }
+  const alpha = v.alpha == null ? 1 : Number(v.alpha);
+  if (!Number.isFinite(alpha)) throw new Error('stack[' + i + '].alpha: must be a finite number');
+  if (alpha < ABLIT_ALPHA_MIN || alpha > ABLIT_ALPHA_MAX) {
+    throw new Error('stack[' + i + '].alpha: ' + ABLIT_ALPHA_MIN + ' .. ' + ABLIT_ALPHA_MAX + ' (got ' + alpha + ')');
+  }
+  const mode = v.mode == null ? 'project' : String(v.mode);
+  if (STEER_MODES.indexOf(mode) < 0) throw new Error('stack[' + i + '].mode: subtract or project');
+  return {
+    terms: [{ snapshot: pos, coef: 1 }, { snapshot: neg, coef: -1 }],
+    layers: [from, to],
+    alpha,
+    mode,
+  };
+}
+
+/// 画面の重ね掛け (概念ベクトルの配列) → `POST /v1/steer/apply` の本文。
+///
+/// `on === false` の行は捨てる (画面の enable トグル)。1 本以上 4 本まで。
+/// 本文は `{rules: [{terms, layers, alpha, mode}]}` で、単一規則の
+/// `{terms, layers, alpha, mode}` とは同時に送らない (実 API が 400 にする)。
+export function ablitStackBody(stack, opts = {}) {
+  const arr = Array.isArray(stack) ? stack : [];
+  const nLayers = Math.max(0, intOr(opts.nLayers, 0));
+  const rules = [];
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v && v.on === false) continue;
+    rules.push(ablitStackRule(v, i, nLayers));
+  }
+  if (rules.length === 0) throw new Error('stack: at least one enabled vector is required');
+  if (rules.length > ABLIT_STACK_MAX) {
+    throw new Error('stack: at most ' + ABLIT_STACK_MAX + ' vectors (got ' + rules.length + ')');
+  }
+  return { rules };
+}
+
+/// 重ね掛けの 1 行要約 (バナー / 情報行用)。
+export function ablitStackSummary(apply) {
+  if (!apply) return '';
+  const rules = Array.isArray(apply.rules) ? apply.rules : [];
+  if (!rules.length) return '';
+  return rules.map((r) => {
+    const terms = Array.isArray(r.terms) ? r.terms : [];
+    const names = terms.map((t) => {
+      const c = Number(t.coef);
+      return t.snapshot + (c >= 0 ? ' +' : ' ') + c;
+    }).join(' / ');
+    const l = Array.isArray(r.layers) ? r.layers : [];
+    return names + ' · ' + r.mode + ' · α ' + r.alpha + ' · layers ' + l.join('-');
+  }).join(' + ');
 }
 
 /// Hybrid block (4 層) の分離スコア = その 4 層の平均。
@@ -1967,9 +2046,73 @@ export function createMockStore(shape, opts = {}) {
       if (m === 'POST' && p === '/v1/steer/apply') {
         if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'body must be an object');
         for (const k of Object.keys(body)) {
-          if (['terms', 'layers', 'alpha', 'mode'].indexOf(k) < 0) {
-            return err(400, 'unknown field ' + JSON.stringify(k) + ' (terms / layers / alpha / mode only)');
+          if (['terms', 'layers', 'alpha', 'mode', 'rules'].indexOf(k) < 0) {
+            return err(400, 'unknown field ' + JSON.stringify(k) + ' (terms / layers / alpha / mode / rules only)');
           }
+        }
+        // task 849: 重ね掛け (規則ごとに層範囲 / alpha / mode)。
+        if (body.rules !== undefined) {
+          for (const k of ['terms', 'layers', 'alpha', 'mode']) {
+            if (k in body) return err(400, 'rules cannot be combined with ' + k);
+          }
+          if (!Array.isArray(body.rules) || body.rules.length === 0) {
+            return err(400, 'rules must be a non-empty array');
+          }
+          if (body.rules.length > 8) return err(400, 'rules: at most 8');
+          const rules = [];
+          for (let i = 0; i < body.rules.length; i++) {
+            const r = body.rules[i];
+            if (!r || typeof r !== 'object' || Array.isArray(r)) return err(400, 'rules[' + i + '] must be an object');
+            for (const k of Object.keys(r)) {
+              if (['terms', 'layers', 'alpha', 'mode'].indexOf(k) < 0) {
+                return err(400, 'rules[' + i + ']: unknown field ' + JSON.stringify(k));
+              }
+            }
+            if (!Array.isArray(r.terms) || r.terms.length === 0) {
+              return err(400, 'rules[' + i + '].terms must be a non-empty array');
+            }
+            for (let j = 0; j < r.terms.length; j++) {
+              const t = r.terms[j];
+              if (!t || typeof t !== 'object' || Array.isArray(t)) return err(400, 'rules[' + i + '].terms[' + j + '] must be an object');
+              for (const k of Object.keys(t)) {
+                if (['snapshot', 'coef'].indexOf(k) < 0) return err(400, 'rules[' + i + '].terms[' + j + ']: unknown field ' + JSON.stringify(k));
+              }
+              if (typeof t.snapshot !== 'string' || !t.snapshot) return err(400, 'rules[' + i + '].terms[' + j + '].snapshot must be a string');
+              if (!Number.isFinite(Number(t.coef))) return err(400, 'rules[' + i + '].terms[' + j + '].coef must be a finite number');
+            }
+            if (!Array.isArray(r.layers) || r.layers.length !== 2) return err(400, 'rules[' + i + '].layers must be [from, to]');
+            const rf = Number(r.layers[0]);
+            const rt = Number(r.layers[1]);
+            if (!Number.isInteger(rf) || !Number.isInteger(rt) || rf < 0 || rt < 0) {
+              return err(400, 'rules[' + i + '].layers must be non-negative integers');
+            }
+            if (rf > rt) return err(400, 'rules[' + i + '].layers: from must be <= to');
+            if (rt > s.layers) return err(400, 'rules[' + i + '].layers: to must be <= ' + s.layers);
+            const ra = r.alpha == null ? 1 : Number(r.alpha);
+            if (!Number.isFinite(ra)) return err(400, 'rules[' + i + '].alpha must be a finite number');
+            const rm = r.mode == null ? 'subtract' : r.mode;
+            if (STEER_MODES.indexOf(rm) < 0) return err(400, 'rules[' + i + '].mode: subtract or project');
+            for (const t of r.terms) {
+              if (!st.snapshots.some((x) => x.name === t.snapshot)) {
+                return err(400, 'no such snapshot: ' + t.snapshot);
+              }
+            }
+            rules.push({
+              terms: r.terms.map((t) => ({ snapshot: t.snapshot, coef: Number(t.coef) })),
+              layers: [rf, rt],
+              alpha: ra,
+              mode: rm,
+            });
+          }
+          st.apply = {
+            terms: rules.reduce((acc, r) => acc.concat(r.terms), []),
+            layers: [Math.min(...rules.map((r) => r.layers[0])), Math.max(...rules.map((r) => r.layers[1]))],
+            alpha: rules[0].alpha,
+            mode: rules[0].mode,
+            rules,
+          };
+          st.epoch++;
+          return { status: 200, body: status() };
         }
         if (!Array.isArray(body.terms) || body.terms.length === 0) {
           return err(400, 'terms must be a non-empty array (use DELETE /v1/steer/apply to clear)');
