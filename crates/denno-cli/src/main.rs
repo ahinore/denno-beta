@@ -1,5 +1,6 @@
 //! denno: TensorFold 型の単一バイナリ CLI (pull / models / info / generate / serve)
 
+mod abliterate;
 mod bench;
 mod chat;
 mod flash_telemetry;
@@ -105,6 +106,49 @@ enum Commands {
         /// x-api-key / Bearer で送る API キー (サーバーが要求する場合)
         #[arg(long)]
         api_key: Option<String>,
+        /// HTTP 読み取りタイムアウト秒
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+    /// task 865: A/B 残差の記録 → 分離チャート → `.dns`/レシピ書き出し → OFF/ON 差分評価。
+    /// 起動中のサーバーに HTTP で指示する (推論の既定経路は変えない)。
+    Abliterate {
+        /// ベース URL
+        #[arg(long, default_value = "http://127.0.0.1:8098")]
+        url: String,
+        /// positive (消したい概念) のプロンプト集 (1 行 1 本、# 始まりは無視)
+        #[arg(long)]
+        pos_file: PathBuf,
+        /// negative のプロンプト集
+        #[arg(long)]
+        neg_file: PathBuf,
+        /// OFF/ON の差分評価に使うプロンプト集 (省略なら評価しない)
+        #[arg(long)]
+        eval_file: Option<PathBuf>,
+        /// 残差の記録モード (all = 全トークン平均 / last_prompt_token = prefill 末尾)
+        #[arg(long, default_value = "all")]
+        capture_mode: String,
+        /// 適用係数
+        #[arg(long, default_value_t = 1.0)]
+        alpha: f32,
+        /// `.dns` の書き出し先ディレクトリ
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+        /// レシピ JSON の書き出し先
+        #[arg(long)]
+        out_recipe: Option<PathBuf>,
+        /// スナップショット名の接頭辞 (`<tag>_pos` / `<tag>_neg`)
+        #[arg(long, default_value = "ablit")]
+        tag: String,
+        /// モデル ID (未指定なら GET /v1/models の先頭)
+        #[arg(long)]
+        model: Option<String>,
+        /// 差分評価の生成上限
+        #[arg(long, default_value_t = 32)]
+        eval_max_tokens: usize,
+        /// レシピに `.dns` を埋め込む (持ち運び用)
+        #[arg(long)]
+        embed_snapshots: bool,
         /// HTTP 読み取りタイムアウト秒
         #[arg(long, default_value_t = 600)]
         timeout: u64,
@@ -667,6 +711,37 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Abliterate {
+            url,
+            pos_file,
+            neg_file,
+            eval_file,
+            capture_mode,
+            alpha,
+            out_dir,
+            out_recipe,
+            tag,
+            model,
+            eval_max_tokens,
+            embed_snapshots,
+            timeout,
+        } => {
+            abliterate::run(abliterate::AbliterateOptions {
+                url,
+                pos_file,
+                neg_file,
+                eval_file,
+                capture_mode,
+                alpha,
+                out_dir,
+                out_recipe,
+                tag,
+                model,
+                eval_max_tokens,
+                embed_snapshots,
+                timeout_secs: timeout,
+            })?;
+        }
         Commands::Bench {
             url,
             api,
