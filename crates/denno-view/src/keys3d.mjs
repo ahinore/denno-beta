@@ -294,9 +294,12 @@ export const SHORTCUTS = Object.freeze([
   Object.freeze({ key: '5', label: 'camera: Reset' }),
   Object.freeze({ key: '[ / ]', label: 'layer inspector: 層を前後' }),
   Object.freeze({ key: 'p', label: 'fps オーバーレイの表示切替' }),
+  Object.freeze({ key: 'c', label: 'カラーテーマの切替 (cyber / thermal / mono-high-contrast)' }),
+  Object.freeze({ key: 's', label: 'PNG スナップショットの保存 (fly 中は後退)' }),
+  Object.freeze({ key: 'm', label: 'reduced motion の手動切替 (idle orbit を止める)' }),
   Object.freeze({ key: 'f', label: 'fly mode (WASD + mouse, Esc で戻る)' }),
   Object.freeze({ key: 'space', label: 'demo の一時停止 / 再開' }),
-  Object.freeze({ key: 'c', label: 'チャット欄の表示切替' }),
+  Object.freeze({ key: 'h', label: 'チャット欄の表示切替' }),
   Object.freeze({ key: '?', label: 'この凡例の表示切替' }),
 ]);
 
@@ -323,4 +326,158 @@ export function isLegendKey(e) {
 /// `?legend=1` のようなクエリ値 → 初期表示。真値は 1 / true / yes / on。
 export function legendFromQuery(v) {
   return truthy(v);
+}
+
+// ===== task 939: カラーテーマ (純ロジック) ================================
+// 3 つの curated なプリセット。ramp は 0..1 の値を色へ写すための 5 段の
+// アンカーで、両端は必ず ramp[0] / ramp[last] に張り付く (範囲外は端で clamp)。
+// 値はすべて固定の hex なので、同じ入力からは常に同じ色が出る (乱数なし)。
+export const THEMES = Object.freeze([
+  Object.freeze({
+    name: 'cyber', bg: '#04060b', fg: '#cfeeff', dim: '#4d6470', accent: '#00eaff',
+    ramp: Object.freeze(['#061018', '#0a3a4a', '#00b8d4', '#7ff0ff', '#ffffff']),
+  }),
+  Object.freeze({
+    name: 'thermal', bg: '#0a0503', fg: '#ffe9d6', dim: '#6b4a3a', accent: '#ff8c1a',
+    ramp: Object.freeze(['#100704', '#4a1608', '#c2410c', '#ffb020', '#fff3c4']),
+  }),
+  Object.freeze({
+    name: 'mono-high-contrast', bg: '#000000', fg: '#ffffff', dim: '#808080', accent: '#ffffff',
+    ramp: Object.freeze(['#000000', '#404040', '#a0a0a0', '#e0e0e0', '#ffffff']),
+  }),
+]);
+export const THEME_COUNT = THEMES.length;
+
+/// 添字を 0..THEME_COUNT-1 に丸める (負や範囲外は回り込む)。壊れた値は 0。
+export function clampThemeIndex(i) {
+  const n = THEME_COUNT;
+  const k = Number.isFinite(Number(i)) ? Math.trunc(Number(i)) : 0;
+  return ((k % n) + n) % n;
+}
+
+/// 添字 → テーマ (範囲外は回り込む)。
+export function themeAt(i) {
+  return THEMES[clampThemeIndex(i)];
+}
+
+/// 名前 → 添字。無ければ -1。
+export function themeIndex(name) {
+  const s = String(name == null ? '' : name).trim().toLowerCase();
+  for (let i = 0; i < THEMES.length; i++) if (THEMES[i].name === s) return i;
+  return -1;
+}
+
+/// 次のテーマの添字 (cyber -> thermal -> mono -> cyber)。
+export function cycleTheme(i) {
+  return (clampThemeIndex(i) + 1) % THEME_COUNT;
+}
+
+/// 添字 → テーマ名。
+export function themeName(i) {
+  return themeAt(i).name;
+}
+
+/// キーイベントがテーマ切替か (c / C)。
+export function isThemeKey(e) {
+  return !!e && (e.key === 'c' || e.key === 'C');
+}
+
+/// `#rgb` / `#rrggbb` → {r,g,b} (0..255)。壊れていれば null。
+export function hexToRgb(hex) {
+  const s = String(hex == null ? '' : hex).trim().replace(/^#/, '');
+  let full = null;
+  if (s.length === 3) full = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
+  else if (s.length === 6) full = s;
+  if (!full || !/^[0-9a-fA-F]{6}$/.test(full)) return null;
+  return {
+    r: parseInt(full.slice(0, 2), 16),
+    g: parseInt(full.slice(2, 4), 16),
+    b: parseInt(full.slice(4, 6), 16),
+  };
+}
+
+/// {r,g,b} → `#rrggbb`。各成分は 0..255 に丸めて clamp する。壊れた値は null。
+export function rgbToHex(r, g, b) {
+  const c = [r, g, b].map((v) => Number(v));
+  if (c.some((v) => !Number.isFinite(v))) return null;
+  return '#' + c.map((v) => Math.min(255, Math.max(0, Math.round(v))).toString(16).padStart(2, '0')).join('');
+}
+
+/// ramp 上の位置 t (0..1) → rgb。範囲外は端、NaN は先頭。
+export function themeRgbAt(i, t) {
+  const ramp = themeAt(i).ramp;
+  const x = Number.isFinite(Number(t)) ? Math.min(1, Math.max(0, Number(t))) : 0;
+  const seg = ramp.length - 1;
+  const p = x * seg;
+  const k = Math.min(seg - 1, Math.floor(p));
+  const u = p - k;
+  const a = hexToRgb(ramp[k]), b = hexToRgb(ramp[k + 1]);
+  return {
+    r: a.r + (b.r - a.r) * u,
+    g: a.g + (b.g - a.g) * u,
+    b: a.b + (b.b - a.b) * u,
+  };
+}
+
+/// ramp 上の位置 t (0..1) → `#rrggbb`。
+export function themeHexAt(i, t) {
+  const c = themeRgbAt(i, t);
+  return rgbToHex(c.r, c.g, c.b);
+}
+
+/// テーマ → CSS 変数 (画面はこれを root に入れるだけ)。
+export function themeCssVars(i) {
+  const th = themeAt(i);
+  return { '--bg': th.bg, '--fg': th.fg, '--dim': th.dim, '--vram': th.accent };
+}
+
+// ===== task 939: PNG スナップショット ====================================
+/// 撮影時刻 → ファイル名。`denno3d-YYYYMMDD-HHMMSS.png` (ローカル時刻)。
+/// 分・秒までなので連打しても同じ秒なら同じ名前 (上書き確認はブラウザ任せ)。
+export function snapshotFilename(date, prefix = 'denno3d') {
+  const d = date instanceof Date ? date : new Date(date);
+  const p = String(prefix == null || prefix === '' ? 'denno3d' : prefix);
+  if (Number.isNaN(d.getTime())) return p + '-snapshot.png';
+  const pad = (n) => String(n).padStart(2, '0');
+  return p + '-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+    '-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.png';
+}
+
+/// キーイベントがスナップショットか (s / S)。
+export function isSnapshotKey(e) {
+  return !!e && (e.key === 's' || e.key === 'S');
+}
+
+// ===== task 939: reduced motion =========================================
+// envReduced は prefers-reduced-motion の現在値、manualFreeze は M キーの
+// 手動トグル。どちらかが真なら idle orbit を止める (OR 合成)。
+export function createMotion(prefersReduced) {
+  return { envReduced: !!prefersReduced, manualFreeze: false };
+}
+
+/// 実際に reduced motion が効いているか。
+export function effectiveReduced(state) {
+  return !!(state && (state.envReduced || state.manualFreeze));
+}
+
+/// prefers-reduced-motion の変化を反映し、新しい実効値を返す。
+export function setEnvReduced(state, flag) {
+  if (state && typeof state === 'object') state.envReduced = !!flag;
+  return effectiveReduced(state);
+}
+
+/// M キー: 手動フリーズを反転し、新しい実効値を返す。
+export function toggleReducedMotion(state) {
+  if (state && typeof state === 'object') state.manualFreeze = !state.manualFreeze;
+  return effectiveReduced(state);
+}
+
+/// idle orbit を回してよいか (reduced motion でなければ true)。
+export function orbitEnabled(state) {
+  return !effectiveReduced(state);
+}
+
+/// キーイベントが reduced motion の手動切替か (m / M)。
+export function isMotionKey(e) {
+  return !!e && (e.key === 'm' || e.key === 'M');
 }
