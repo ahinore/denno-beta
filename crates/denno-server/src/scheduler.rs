@@ -287,6 +287,12 @@ struct Run {
     /// P57: 最後にステップが成功した時刻 (無進捗スイープの入力)。
     /// 起点は受付時刻 (= prefill 待ちも無進捗として数える)。
     last_progress: Instant,
+    /// P877: 受付時刻 (TTFT の起点)。`last_progress` と同じ値だが、無進捗の
+    /// 判定で書き換わらないよう別に持つ。
+    accepted: Instant,
+    /// P877: 最初のトークンが用意できた時刻 (= prefill 完了時点)。
+    /// TTFT / TPOT の計測にだけ使う (数値経路には触れない)。
+    first_token_at: Option<Instant>,
     /// P873: リクエストの壁時計の期限 (`Limits::request` が 0 のときは None)。
     /// 受付時刻 + request。超えたらステップ境界で打ち切る。
     deadline: Option<Instant>,
@@ -709,7 +715,15 @@ fn worker(
                 g.step_chat(active[i].sess.as_mut().unwrap(), &mut |_| {})
             };
             match step {
-                Ok(_) => active[i].last_progress = Instant::now(),
+                Ok(_) => {
+                    let now = Instant::now();
+                    active[i].last_progress = now;
+                    // P877: prefill が終わった = 最初のトークンが用意できた時点。
+                    // TTFT の終端として 1 回だけ記録する (decode は次の周回から)。
+                    if active[i].first_token_at.is_none() {
+                        active[i].first_token_at = Some(now);
+                    }
+                }
                 Err(e) => {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     stats.aborted_error.fetch_add(1, Ordering::Relaxed);
@@ -934,6 +948,8 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant, limits: 
         asm,
         req_mark,
         last_progress,
+        accepted: submitted,
+        first_token_at: None,
         deadline,
         send_dead: Arc::new(AtomicBool::new(false)),
     }
@@ -1263,9 +1279,29 @@ fn finish_run(mut run: Run, send_timeout: Duration) {
     // SSE でも同じ 1 本で、Run の終端は全経路でここ (または abort) を通る。
     let mark = run.req_mark.take();
     prof::request_end(mark);
+    // P877: 計測用の時刻は destructure 前に取り出す。
+    let accepted = run.accepted;
+    let first_token_at = run.first_token_at;
     let Run { sess, respond, events, raw, mut asm, .. } = run;
     let Some(sess) = sess else { return };
     let out = sess.into_output();
+    // P877: 完走サンプルを 1 回だけ記録する (全 API・stream/非stream 共通)。
+    // TTFT = 受付 → prefill 完了、TPOT = prefill 完了 → 完了 の平均トークン間隔。
+    if out.output_tokens > 0 {
+        let ttft = first_token_at
+            .map(|t| t.saturating_duration_since(accepted).as_secs_f64());
+        let tpot = first_token_at.map(|t| {
+            let decode = Instant::now().saturating_duration_since(t).as_secs_f64();
+            decode / out.output_tokens.max(1) as f64
+        });
+        crate::metrics::record_completion(&crate::metrics::CompletionSample {
+            input_tokens: out.input_tokens as u64,
+            output_tokens: out.output_tokens as u64,
+            cached_tokens: out.cache_read_input_tokens as u64,
+            ttft_secs: ttft,
+            tpot_secs: if out.output_tokens > 1 { tpot } else { None },
+        });
+    }
     if let Some(respond) = respond {
         let _ = respond.send(Ok(out));
         return;

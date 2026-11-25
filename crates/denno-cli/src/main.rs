@@ -239,6 +239,11 @@ enum Commands {
         /// thinking 有効時に temperature=1 を機械的に送るクライアント
         /// (Hermes 等) で小型モデルが崩壊する対策として 0.7 を推奨
         #[arg(long)] temperature_cap: Option<f32>,
+        /// P877: アクセスログの形式。`text` (既定) は従来どおり 2 行、
+        /// `json` は 1 リクエスト 1 行の JSON (`ts_ms` / `method` / `path` /
+        /// `status` / `duration_ms`)。
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        log_format: String,
     },
 }
 
@@ -711,6 +716,10 @@ fn main() -> Result<()> {
     // サーバスレッドがブロックしない)。他サブコマンドは従来どおりの同期ロギング。
     if matches!(cli.command, Commands::Serve { .. }) {
         denno_server::init_serve_logging();
+        // P877: `--log-format json` ならアクセスログだけ JSON にする。
+        if let Commands::Serve { log_format, .. } = &cli.command {
+            denno_server::set_access_log_json(log_format == "json");
+        }
     } else {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             tracing_subscriber::EnvFilter::new("info")
@@ -963,7 +972,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap, log_format: _log_format } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
