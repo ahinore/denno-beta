@@ -639,6 +639,58 @@ fn first_mismatch(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// task 926: prefix cache の利用実績 (累積)。サーバ本体は 1 本のスレッドが
+/// `&mut Flash` を持つが、テストは複数スレッドで回すため原子カウンタにする
+/// (Relaxed の加算 1 回だけで、ロックも確保もしない)。
+static CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHE_REUSED_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// task 926: prefix cache の利用実績を 1 リクエストにつき 1 回だけ数える。
+/// `reused` は前置きを使い回したトークン数 (0 ならフル prefill = miss)。
+fn record_cache_reuse(reused: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if reused > 0 {
+        CACHE_HITS.fetch_add(1, Relaxed);
+        CACHE_REUSED_TOKENS.fetch_add(reused as u64, Relaxed);
+    } else {
+        CACHE_MISSES.fetch_add(1, Relaxed);
+    }
+}
+
+/// task 926: 累積カウンタ `(hits, misses, total_reused_tokens)`。
+fn cache_counters() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        CACHE_HITS.load(Relaxed),
+        CACHE_MISSES.load(Relaxed),
+        CACHE_REUSED_TOKENS.load(Relaxed),
+    )
+}
+
+/// task 926: `GET /v1/cache/stats` の本文 (純関数。テストが形を固定する)。
+///
+/// - `slots_used` / `slots_capacity`: 文脈スロットの使用本数と総本数
+/// - `hits` / `misses`: 完了したリクエストのうち前置きを使い回した / しなかった本数
+/// - `hit_rate`: `hits / (hits + misses)`。リクエストが 0 なら 0
+/// - `total_reused_tokens`: 使い回した先頭トークン数の累計
+fn cache_stats_json(used: usize, capacity: usize, hits: u64, misses: u64, reused: u64) -> Value {
+    let lookups = hits + misses;
+    let hit_rate = if lookups == 0 {
+        0.0
+    } else {
+        hits as f64 / lookups as f64
+    };
+    json!({
+        "slots_used": used,
+        "slots_capacity": capacity,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": hit_rate,
+        "total_reused_tokens": reused,
+    })
+}
+
 /// task 131: 前置きが一致せず reuse=0 になったときの 1 行 (原因追跡用)。
 ///
 /// 本番で「なぜ reuse=0 になったか」を後から説明できるように、最初の不一致
@@ -1337,6 +1389,13 @@ impl Flash {
         n
     }
 
+    /// task 926: `GET /v1/cache/stats` の本文 (読み取りのみ。状態は変えない)。
+    fn cache_stats(&self) -> Value {
+        let (used, _tokens) = self.ctx_totals();
+        let (hits, misses, reused) = cache_counters();
+        cache_stats_json(used, self.slots.len(), hits, misses, reused)
+    }
+
     /// ビューワ用: いま持っている文脈 (main / aux / 全スロット) のトークン数と epoch。
     /// 文脈 = full attention の KV と GDN の再帰状態・conv 履歴・PLE conv 履歴。
     /// 残差 stream そのものはトークンごとに作り直すので、リクエストの間には残らない。
@@ -1680,6 +1739,10 @@ impl Flash {
             logits = self.prefill_logits(&mut dec, &prompt)?;
         }
         let t_prefill = t1.elapsed().as_secs_f64();
+        // task 926: prefix cache の利用実績をこのリクエスト 1 本ぶん数える
+        // (前置きを使い回したら hit、フル prefill なら miss)。整数加算だけで、
+        // ホットパスの数値経路には触れない。
+        record_cache_reuse(reused);
         let n_prompt = prompt.len();
         // 次のリクエストが同じ入力を送ってきたら splice できるように、
         // このリクエストのプロンプト構築入力を残す (task 131)。
@@ -3678,6 +3741,11 @@ fn handle_req(
             Err(msg) => send_json(&mut stream, "400 Bad Request", &err_json(&msg)),
         };
     }
+    // task 926: prefix cache の利用実績 (ヒット / ミス / 再利用トークン) の要約。
+    // ビューワ向けの詳細 (task 217 の /v1/cache) とは別に、監視用の平たい JSON を返す。
+    if req.method == "GET" && path == "/v1/cache/stats" {
+        return send_json(&mut stream, "200 OK", &flash.cache_stats());
+    }
     // ビューワ用: 保持している文脈 (KV / GDN 状態) の確認と破棄。
     if req.method == "GET" && path == "/v1/cache" {
         return send_json(&mut stream, "200 OK", &flash.ctx_json());
@@ -4674,6 +4742,34 @@ mod flash_tests {
         let mut buf = Vec::new();
         let _ = s.read_to_end(&mut buf);
         String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// task 926: `/v1/cache/stats` の本文 (キーと率) を固定する。
+    #[test]
+    fn cache_stats_json_shape_and_rates() {
+        let v = cache_stats_json(2, 4, 3, 1, 120);
+        assert_eq!(v["slots_used"], 2);
+        assert_eq!(v["slots_capacity"], 4);
+        assert_eq!(v["hits"], 3);
+        assert_eq!(v["misses"], 1);
+        assert!((v["hit_rate"].as_f64().unwrap() - 0.75).abs() < 1e-12);
+        assert_eq!(v["total_reused_tokens"], 120);
+        // リクエスト 0 本なら率は 0 (NaN を返さない)。
+        let z = cache_stats_json(0, 2, 0, 0, 0);
+        assert_eq!(z["hit_rate"].as_f64().unwrap(), 0.0);
+    }
+
+    /// task 926: 再利用の計上 (hit / miss / トークン) が累積する。
+    /// 同じバイナリの他のテストも generate() 経由で計上するので、差分は下限で見る。
+    #[test]
+    fn record_cache_reuse_accumulates() {
+        let (h0, m0, r0) = cache_counters();
+        record_cache_reuse(7);
+        record_cache_reuse(0);
+        let (h, m, r) = cache_counters();
+        assert!(h > h0, "hit が増えていない: {h0} -> {h}");
+        assert!(m > m0, "miss が増えていない: {m0} -> {m}");
+        assert!(r >= r0 + 7, "再利用トークンが増えていない: {r0} -> {r}");
     }
 
     /// 生成中 (主スレッドが要求を取りに来ない間) でも `POST /v1/abort` は読み取り
