@@ -31,6 +31,8 @@ mod openai;
 
 /// task 931: 任意オプトインのレート制限 (env 未設定なら無効)。
 pub mod ratelimit;
+/// task 971: 起動サマリの整形 (純関数。生の API キーは持たない)。
+pub mod startup;
 // P841: Ollama 互換 facade (`/api/tags` / `/api/version` / `/api/chat` / `/api/generate`)
 mod ollama;
 mod scheduler;
@@ -42,6 +44,10 @@ pub use logging::{
 pub use scheduler::{
     AdmitFailure, AdmitKind, Job, Limits, RunStatsSnapshot, MAX_ACTIVE_SESSIONS,
     QUEUE_RETRY_AFTER_SECS, QueueFull, Scheduler,
+};
+pub use startup::{
+    format_startup_summary, summarize_auth, AuthState, CorsSummary, RateLimitSummary,
+    StartupSummary,
 };
 
 /// P57: エンジンの **不変情報**。起動時に 1 回だけ読み、以降はハンドラが
@@ -1804,30 +1810,17 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         request: std::time::Duration::from_secs(request_timeout_secs),
         ..Limits::default()
     };
-    tracing::info!(
-        "scheduler: max_queue_depth = {queue_depth}, request_timeout = {}",
-        if request_timeout_secs == 0 {
-            "off".to_string()
-        } else {
-            format!("{request_timeout_secs}s")
-        }
-    );
     // task 951: 認証キーを解決する。実効一覧 = `--api-key` / `--api-keys` /
     // `DENNO_API_KEYS` (いずれもカンマ区切り可) の和。空なら従来どおり開放。
-    // ログには **本数だけ** を出し、値は決して出さない。
+    // ログには **本数だけ** を出し、値は決して出さない (task 971: 起動サマリの
+    // `AuthState` が本数だけを持つ)。
     let env_api_keys = std::env::var(API_KEYS_ENV).ok();
     let api_key = resolve_api_keys(&[
         cfg.api_key.as_deref(),
         cfg.api_keys.as_deref(),
         env_api_keys.as_deref(),
     ]);
-    match &api_key {
-        Some(k) => tracing::info!(
-            "api auth: {} key(s) configured (values not logged)",
-            k.split(',').filter(|s| !s.is_empty()).count()
-        ),
-        None => tracing::info!("api auth: disabled (no key configured)"),
-    }
+    let auth_state = summarize_auth(api_key.as_deref());
     let state = Arc::new(AppState {
         engine: engine.clone(),
         api_key,
@@ -1847,34 +1840,40 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
 
     // task 916: CORS の許可オリジンを解決する (CLI > env > ループバック既定)。
     let cors = resolve_cors_origin(cfg.cors_origin.as_deref());
-    tracing::info!(
-        "cors: {}",
-        if cors.allow_any {
-            "* (any origin)".to_string()
-        } else if cors.allow_loopback {
-            "loopback only".to_string()
-        } else {
-            format!("allowlist {:?}", cors.origins)
-        }
-    );
     // task 946: ボディ上限を解決する (CLI > env > 既定 16 MiB)。
     if cfg.max_body_mb == Some(0) {
         anyhow::bail!("--max-body-mb must be >= 1");
     }
     let max_body_bytes = resolve_max_body_bytes(cfg.max_body_mb);
-    tracing::info!(
-        "request body limit: {} MiB",
-        max_body_bytes / (1024 * 1024)
-    );
-    let app = router_with_body_limit(
-        state.clone(),
-        cors,
-        ratelimit::RateLimiter::from_env(),
-        max_body_bytes,
-    );
+    let rate_limiter = ratelimit::RateLimiter::from_env();
+    let rate_limit_summary = RateLimitSummary::from_config(&rate_limiter.config());
+    let cors_summary = CorsSummary::from_config(&cors);
     let addr = format!("{}:{}", cfg.host, cfg.port);
+    let app = router_with_body_limit(state.clone(), cors, rate_limiter, max_body_bytes);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on http://{}", addr);
+    // task 971: 解決済みの設定を 1 つの起動サマリにまとめて出す。値 (API キー)
+    // は AuthState が本数だけを持つので、この行から秘密は出ない。
+    tracing::info!(
+        "{}",
+        format_startup_summary(&StartupSummary {
+            host: &cfg.host,
+            port: cfg.port,
+            model_id: &state.model_id,
+            model_name: &state.model_name,
+            context_tokens: state.info.context,
+            kv_slots: state.info.slots,
+            quant: &state.info.quant,
+            layers: state.info.layers,
+            auth: auth_state,
+            metrics_enabled: metrics::enabled(),
+            queue_depth,
+            request_timeout_secs,
+            cors: cors_summary,
+            max_body_bytes,
+            rate_limit: rate_limit_summary,
+        })
+    );
     // P817: SIGTERM / SIGINT では即死せず drain する。新規要求は 503 にし、
     // 進行中の生成を短い上限 (`DENNO_DRAIN_TIMEOUT_MS`、既定 10 s) まで待って
     // から axum を止める。expert 使用回数もここで書く。
