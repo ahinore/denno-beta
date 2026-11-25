@@ -929,6 +929,19 @@ export function topkSummary(frame) {
 ///   st.accum[l]  — decay 付きの選択回数 (mode に依らない。accum モードでは
 ///                  st.experts[l] がこの配列そのものを指す)
 ///   st.topk[l]   — 最後のトークンでルータが選んだ expert のビット
+///   st.hist[l]   — 直近 EXPERT_FREQ_WINDOW トークンの選択ビット (ドリルダウン用)
+///   st.raw[l]    — 最後のトークンの生のゲート重み (最大で割る前)
+///   st.residencySeen[l] — ExpertResidency が来たか (hit/miss の判定に使う)
+
+// ---- task 857: 層ドリルダウン ---------------------------------------------
+
+/// 直近のトークンの本数。expert ごとの出現頻度のスパークラインはこの窓で数える。
+export const EXPERT_FREQ_WINDOW = 16;
+
+/// 層ドリルダウンが 1 層に並べる expert の上限 (router の top-k は 10 だが、
+/// サーバーが n_expert_used を増やしても箱が伸びすぎないようにする)。
+export const DRILL_MAX_ROWS = 16;
+
 const ROLE_KEYS = Object.freeze(['attn', 'gdn', 'router', 'shex', 'ple']);
 
 function zeroRoleCount() {
@@ -947,7 +960,10 @@ export function createMapState(shape, opts = {}) {
     accum: [],
     last: [],
     topk: [],
+    raw: [],
+    hist: [],
     residency: [],
+    residencySeen: [],
     skip: [],
     role: [],
     act: [],
@@ -965,7 +981,10 @@ export function createMapState(shape, opts = {}) {
     st.experts.push(st.mode === 'accum' ? st.accum[l] : new Float32Array(s.n_expert));
     st.last.push(new Float32Array(s.n_expert));
     st.topk.push(new Uint8Array(s.n_expert));
+    st.raw.push(new Float32Array(s.n_expert));
+    st.hist.push([]);
     st.residency.push(new Uint8Array(s.n_expert));
+    st.residencySeen.push(false);
     st.skip.push(new Uint8Array(s.n_expert));
     st.role.push({ attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 });
     st.act.push(new Float32Array(ACT_BUCKETS));
@@ -992,7 +1011,10 @@ export function createMapState(shape, opts = {}) {
       if (st.experts[l] !== st.accum[l]) st.experts[l].fill(0);
       st.last[l].fill(0);
       st.topk[l].fill(0);
+      st.raw[l].fill(0);
+      st.hist[l].length = 0;
       st.residency[l].fill(0);
+      st.residencySeen[l] = false;
       st.skip[l].fill(0);
       st.role[l] = { attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 };
       st.act[l].fill(0);
@@ -1026,6 +1048,16 @@ export function createMapState(shape, opts = {}) {
         const top = st.topk[l];
         top.fill(0);
         const acc = st.accum[l];
+        // task 857: 生のゲート重みと、直近トークンの選択ビットを残す
+        // (ドリルダウンの重み表示と頻度スパークライン)。
+        const raw = st.raw[l];
+        raw.fill(0);
+        const fe = Array.isArray(f.experts) ? f.experts : [];
+        for (let i = 0; i < fe.length; i++) {
+          const e = fe[i];
+          const wv = Number(f.weights ? f.weights[i] : 0);
+          if (e >= 0 && e < s.n_expert && Number.isFinite(wv) && wv > 0) raw[e] = wv;
+        }
         for (let i = 0; i < w.length; i++) {
           if (w[i] > 0) {
             top[i] = 1;
@@ -1033,6 +1065,10 @@ export function createMapState(shape, opts = {}) {
             st.count[l][i]++;
           }
         }
+        // task 857: ドリルダウンの頻度スパークライン用に、このトークンの
+        // 選択を窓の末尾へ積む (古いものから落とす)。
+        st.hist[l].push(top.slice());
+        if (st.hist[l].length > EXPERT_FREQ_WINDOW) st.hist[l].shift();
         if (st.mode === 'token') st.experts[l].set(w);
         st.frames++;
         return true;
@@ -1055,6 +1091,7 @@ export function createMapState(shape, opts = {}) {
       }
       case 'ExpertResidency': {
         st.residency[l].set(residencyBits(f, s.n_expert));
+        st.residencySeen[l] = true;
         st.frames++;
         return true;
       }

@@ -14,7 +14,10 @@
 // (画面 = 世界 * s + t) で行い、描画は画面上の大きさで細部を出し分ける (文字は 6px 以上、
 // expert のセルは 1.2px 以上で 1 つずつ、それ未満は層ごとの縮小画像)。
 
-import { normaliseShape, roleForBlock, streamValue, rampRGB, heat, WALL_COLORS } from './view2d.mjs';
+import {
+  normaliseShape, roleForBlock, streamValue, rampRGB, heat, WALL_COLORS,
+  EXPERT_FREQ_WINDOW, DRILL_MAX_ROWS,
+} from './view2d.mjs';
 import { HYBRID_SIZE } from './nodes2d.mjs';
 
 /// 層パネルの中の配置 (パネル左上からの相対)。上へ流れる (入力が下)。
@@ -818,6 +821,140 @@ export function gridPixels(layout, st, l, out, offE, moeOff) {
     else if (arr[e] > 0) c = rampRGB(arr[e] / scale);
     else c = none;
     out[e * 4] = c[0]; out[e * 4 + 1] = c[1]; out[e * 4 + 2] = c[2]; out[e * 4 + 3] = 255;
+  }
+  return out;
+}
+
+// ---- task 857: 層ドリルダウン -------------------------------------------------
+//
+// 層の箱 (column) か層パネルをクリックしたとき、その層の router が選んだ
+// expert の id・ゲート重み・VRAM hit / CPU miss・直近トークンの頻度を 1 枚に
+// まとめる。DOM には触らない (index2d.html がこの値を描く)。
+//
+// テレメトリは最小構成でも動く: RouterTopK だけなら重みは出て hit/miss は
+// 「不明」(null)、ExpertResidency が来ていれば vram / cpu を出す。
+// 何も来ていなければ note にその旨を 1 行入れて空の行を返す。
+
+/// hit/miss の色 (ドリルダウンのバッジと頻度バーで共有)。
+export const DRILL_COLORS = Object.freeze({
+  vram: '#3fe08a', cpu: '#ff8a94', unknown: '#5b7280',
+  bar: '#2f8aa8', weight: '#9fefff',
+});
+
+/// 直近のトークン列 (st.hist[l]) から expert ごとの 0/1 の系列を取る。
+/// ids は expert id の配列。窓の古い → 新しい順。window は実際に残っている本数。
+export function expertFrequency(st, layer, ids, opts = {}) {
+  if (!st) return { window: 0, rows: [] };
+  const l = Math.trunc(Number(layer));
+  const n = st && st.shape && Number.isFinite(Number(st.shape.n_expert)) ? st.shape.n_expert | 0 : 0;
+  const cap = Math.max(1, Math.trunc(Number(opts.window) || EXPERT_FREQ_WINDOW));
+  const all = st && Array.isArray(st.hist) && Array.isArray(st.hist[l]) ? st.hist[l] : [];
+  const win = all.slice(Math.max(0, all.length - cap));
+  const rows = [];
+  for (const raw of Array.isArray(ids) ? ids : []) {
+    const e = Math.trunc(Number(raw));
+    if (!(e >= 0 && (n <= 0 || e < n))) continue;
+    const values = win.map((bits) => (bits && bits[e] === 1 ? 1 : 0));
+    let hits = 0;
+    for (const v of values) hits += v;
+    rows.push({ id: e, values, hits, rate: win.length ? hits / win.length : 0 });
+  }
+  return { window: win.length, rows };
+}
+
+/// 層 1 枚のドリルダウンの中身。layer が範囲外・st が無いときは null。
+/// opts.maxRows で並べる expert の上限を変えられる (既定 DRILL_MAX_ROWS)。
+export function expertDrilldown(st, shape, layer, opts = {}) {
+  const l = Math.trunc(Number(layer));
+  if (!st || !Number.isFinite(l)) return null;
+  let s;
+  try { s = normaliseShape(st.shape || shape); } catch (e) { return null; }
+  if (!(l >= 0 && l < s.layers)) return null;
+
+  const topk = Array.isArray(st.topk) ? st.topk[l] : null;
+  const last = Array.isArray(st.last) ? st.last[l] : null;
+  const raw = Array.isArray(st.raw) ? st.raw[l] : null;
+  const res = Array.isArray(st.residency) ? st.residency[l] : null;
+  const seenRes = !!(Array.isArray(st.residencySeen) ? st.residencySeen[l] : false);
+  const skip = Array.isArray(st.skip) ? st.skip[l] : null;
+  const count = Array.isArray(st.count) ? st.count[l] : null;
+
+  const ids = [];
+  if (topk) for (let e = 0; e < s.n_expert; e++) if (topk[e] === 1) ids.push(e);
+  // 重み: 生のゲート値があればそれ、無ければ正規化済みの最終重みで代用する。
+  const weightOf = (e) => {
+    if (raw && Number(raw[e]) > 0) return Number(raw[e]);
+    return last && Number.isFinite(Number(last[e])) ? Number(last[e]) : 0;
+  };
+  let sum = 0;
+  for (const e of ids) sum += weightOf(e);
+
+  let rows = ids.map((e) => ({
+    id: e,
+    weight: weightOf(e),
+    share: sum > 0 ? weightOf(e) / sum : 0,
+    rel: last && Number.isFinite(Number(last[e])) ? Number(last[e]) : 0,
+    hit: seenRes ? (res && res[e] === 1 ? 'vram' : 'cpu') : null,
+    skipped: !!(skip && skip[e] === 1),
+    count: count ? Number(count[e]) || 0 : 0,
+  }));
+  rows.sort((a, b) => (b.weight - a.weight) || (a.id - b.id));
+  const limit = Math.max(1, Math.trunc(Number(opts.maxRows) || DRILL_MAX_ROWS));
+  const shown = rows.slice(0, limit);
+
+  // 頻度のスパークライン (表示する行だけ)
+  const freq = expertFrequency(st, l, shown.map((r) => r.id), opts);
+  for (let i = 0; i < shown.length; i++) {
+    const f = freq.rows[i];
+    shown[i].values = f ? f.values : [];
+    shown[i].freqHits = f ? f.hits : 0;
+    shown[i].freqRate = f ? f.rate : 0;
+  }
+
+  let hitVram = 0;
+  let hitCpu = 0;
+  for (const r of rows) {
+    if (r.hit === 'vram') hitVram++;
+    else if (r.hit === 'cpu') hitCpu++;
+  }
+  const notes = [];
+  if (!rows.length) notes.push('router の top-k 待ち (RouterTopK がまだ来ていない)');
+  else {
+    if (!seenRes) notes.push('ExpertResidency 待ち (hit / miss は不明。DENNO_EXPERT_GPU=1 で出る)');
+    if (rows.length > shown.length) notes.push('上位 ' + shown.length + ' 件だけ表示 (' + rows.length + ' 件)');
+  }
+  const note = notes.join(' · ');
+
+  return {
+    layer: l,
+    kind: s.layer_kinds[l],
+    n_expert: s.n_expert,
+    n_used: rows.length,
+    shown: shown.length,
+    residency: seenRes,
+    hitVram,
+    hitCpu,
+    experts: shown,
+    window: freq.window,
+    freqWindow: EXPERT_FREQ_WINDOW,
+    tokens: Number(st.token) || 0,
+    note,
+  };
+}
+
+/// 0/1 (または 0..1) の系列 → 小さな棒の矩形 (SVG 用)。
+/// 新しい値ほど右。w/h は CSS px。空の系列は []。
+export function drillSparkBars(values, w = 64, h = 12) {
+  const vals = Array.isArray(values) ? values : [];
+  const n = vals.length;
+  if (!n) return [];
+  const slot = w / n;
+  const bw = Math.max(0.5, slot - Math.min(1, slot * 0.25));
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const v = Math.max(0, Math.min(1, Number(vals[i]) || 0));
+    const bh = Math.max(v > 0 ? 1 : 0, v * h);
+    out.push({ x: i * slot, y: h - bh, w: bw, h: bh, v });
   }
   return out;
 }

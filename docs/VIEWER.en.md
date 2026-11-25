@@ -40,6 +40,10 @@ An expression is `[types:] condition [| top N by expr [per layer|hybrid]] [| lim
 
 `denno-view` environment variables: `VIEW_UPSTREAM` (default `ws://127.0.0.1:8080/v1/telemetry/ws`), `VIEW_PORT` (default 8093), `VIEW_RECORD` (append frames to a file), `VIEW_REPLAY` (serve a recording at `/replay`), `VIEW_CAPTURE` (serve a captured frame stream at `/capture.bin`), `VIEW_TOKENIZER` (tokenizer.json for token text). Its `/chat` endpoint proxies to the upstream server, so the built-in chat box needs no CORS setup.
 
+### Layer drilldown (task 857)
+
+Clicking a layer box in the left column (or one of the layer panels on the right) opens a compact drilldown in the bottom-left corner of the map. It lists the experts the layer's router put in its top-k with their gating weights (raw value; the bar is normalised to the largest one), a VRAM hit / CPU miss badge (`?` until `ExpertResidency` arrives, `skip` for experts an intervention cut), and a sparkline of how often each expert fired over the last 16 tokens (one vertical tick per token it was selected). `×` or Esc closes it; clicking another layer switches to that layer. Clicking a layer in the old `wall` view opens the same drawer. hit / miss is only meaningful with `DENNO_EXPERT_GPU=1` and `DENNO_EXPERT_VRAM_MB>0`; when the telemetry has not arrived the drawer says "waiting for RouterTopK" / "waiting for ExpertResidency" and shows no guessed numbers.
+
 ## Abliteration workbench (`/2d` → Abliterate)
 
 The `abliterate` box in the right-hand control pane is the A/B contrast workbench for directional ablation. It builds on the residual-stream steering engine (`crates/denno-engine/src/model/steer.rs`) and the `/v1/steer` endpoints.
