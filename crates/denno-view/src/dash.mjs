@@ -27,32 +27,55 @@ export const DEFAULT_CAP = 90;
 /// スパークライン/リングバッファの保持数 (task 909: 120 サンプル)。
 export const SERIES_CAP = 120;
 
+/// リング/系列の上限 (cap に Infinity や巨大値を渡されても青天井にしない)。
+export const MAX_RING_CAP = 65536;
+
+/// 常駐表に残す層の上限 (壊れた層 id の連投で Map が伸び続けないように)。
+export const MAX_LAYERS = 512;
+
 /// 計器の棒 (KV / VRAM) の既定の幅 (文字セル数)。
 export const GAUGE_WIDTH = 10;
 
+/// 数値化。数値と数値文字列だけを受ける。NaN / Infinity / 空白だけの
+/// 文字列 / bool / 配列 / オブジェクトは null (暗黙の型変換で数字を作らない)。
+/// テレメトリの生値はここを通してから系列に入れる。
 function numOrNull(v) {
-  if (v === null || v === undefined || v === '') return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (!s) return null;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
 function clamp01(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
+/// cap を [2, MAX_RING_CAP] に正規化する。0 / 非数 / 未指定は既定値。
+function normalizeCap(v, dflt) {
+  const n = numOrNull(v);
+  if (!n) return dflt;
+  return Math.min(MAX_RING_CAP, Math.max(2, Math.trunc(n)));
+}
+
 /// リングバッファ (task 909)。古い値から落ちる固定長の系列。
-/// 値は有限数だけを受ける (NaN / Infinity は捨てる)。
+/// 値は有限かつ非負の数だけを受ける (NaN / Infinity / 負値は捨てる)。
 export function createRing(cap = SERIES_CAP) {
-  const c = Math.max(2, Math.trunc(Number(cap) || SERIES_CAP));
-  return { cap: c, values: [] };
+  return { cap: normalizeCap(cap, SERIES_CAP), values: [] };
 }
 
 export function ringPush(ring, v) {
   if (!ring || !Array.isArray(ring.values)) return false;
+  // 手で組み立てたリング (cap 欠け / Infinity) でも暴走しないよう正規化する。
+  const c = normalizeCap(ring.cap, SERIES_CAP);
+  if (ring.cap !== c) ring.cap = c;
   const n = numOrNull(v);
-  if (n === null) return false;
+  if (n === null || n < 0) return false;
   ring.values.push(n);
-  while (ring.values.length > ring.cap) ring.values.shift();
+  while (ring.values.length > c) ring.values.shift();
   return true;
 }
 
@@ -63,8 +86,10 @@ export function ringLast(ring) {
 
 /// 計器の状態。residency は「層 → VRAM に居る expert の集合」。
 export function createDash(opts = {}) {
-  const windowMs = Math.max(1, Number(opts.windowMs) || DEFAULT_WINDOW_MS);
-  const cap = Math.max(2, Math.trunc(Number(opts.cap) || DEFAULT_CAP));
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const wm = numOrNull(o.windowMs);
+  const windowMs = wm !== null && wm > 0 ? wm : DEFAULT_WINDOW_MS;
+  const cap = normalizeCap(o.cap, DEFAULT_CAP);
   return {
     schema: DASH_SCHEMA,
     windowMs,
@@ -92,9 +117,15 @@ export function createDash(opts = {}) {
 
 function pushSample(d, key, v) {
   const s = d.series[key];
-  s.push(v);
-  while (s.length > d.cap) s.shift();
-  d.last[key] = v;
+  if (!Array.isArray(s)) return false;
+  // 系列は「率」なので非負の有限数だけ。壊れた値で last を汚さない。
+  const n = numOrNull(v);
+  if (n === null || n < 0) return false;
+  const cap = normalizeCap(d.cap, DEFAULT_CAP);
+  s.push(n);
+  while (s.length > cap) s.shift();
+  d.last[key] = n;
+  return true;
 }
 
 /// Prefill フレーム → prefill tok/s。ns はナノ秒、tokens は実際に食わせた分。
@@ -105,7 +136,9 @@ export function notePrefill(d, frame, now) {
     ? frame.tokens.length
     : numOrNull(frame.prompt_tokens);
   if (ns === null || ns <= 0 || fed === null || fed <= 0) return false;
-  pushSample(d, 'prefill', fed / (ns / 1e9));
+  const rate = fed / (ns / 1e9);
+  if (!Number.isFinite(rate)) return false;        // 桁あふれは捨てる
+  if (!pushSample(d, 'prefill', rate)) return false;
   d.prefills++;
   return true;
 }
@@ -113,11 +146,15 @@ export function notePrefill(d, frame, now) {
 /// Token フレーム n 個ぶん。窓は step() が締める (decode tok/s は時間で割る)。
 export function noteToken(d, n = 1, now) {
   if (!d) return false;
-  const add = Math.max(1, Math.trunc(Number(n) || 1));
+  const raw = n === undefined ? 1 : numOrNull(n);
+  const add = raw === null ? NaN : Math.trunc(raw);
+  if (!Number.isSafeInteger(add) || add < 1) return false;
   const t = numOrNull(now);
   if (d.winStart === null && t !== null) d.winStart = t;
-  d.winTokens += add;
-  d.tokens += add;
+  const prevWin = numOrNull(d.winTokens);
+  const prevAll = numOrNull(d.tokens);
+  d.winTokens = (prevWin === null || prevWin < 0 ? 0 : prevWin) + add;
+  d.tokens = (prevAll === null || prevAll < 0 ? 0 : prevAll) + add;
   return true;
 }
 
@@ -129,21 +166,42 @@ export function step(d, now) {
   if (t === null) return false;
   if (d.winStart === null) { d.winStart = t; return false; }
   const dt = t - d.winStart;
-  if (dt < d.windowMs) return false;
-  pushSample(d, 'decode', d.winTokens * 1000 / dt);
-  if (d.decodeRing) ringPush(d.decodeRing, d.winTokens * 1000 / dt);
+  if (!(dt >= d.windowMs)) return false;           // 戻った時計 / NaN は据え置き
+  const wt = numOrNull(d.winTokens);
+  if (wt === null) {
+    // 窓の累積値が壊れている (NaN / Infinity)。数字を作らず窓だけ畳む。
+    d.winStart = t;
+    d.winTokens = 0;
+    return false;
+  }
+  const rate = (wt < 0 ? 0 : wt) * 1000 / dt;
+  if (!Number.isFinite(rate) || rate < 0) return false;
+  pushSample(d, 'decode', rate);
+  if (d.decodeRing) ringPush(d.decodeRing, rate);
   d.winStart = t;
   d.winTokens = 0;
   return true;
 }
 
 /// ExpertResidency フレーム → その層の VRAM 常駐集合を置き換える。
+/// expert id は非負の整数だけを受ける (NaN / Infinity / 負値は落とす)。
 export function noteResidency(d, frame) {
   if (!d || !frame) return false;
   const layer = numOrNull(frame.layer);
   const list = Array.isArray(frame.vram) ? frame.vram : null;
-  if (layer === null || list === null) return false;
-  d.residency.set(Math.trunc(layer), new Set(list.map((x) => Math.trunc(Number(x)))));
+  if (layer === null || layer < 0 || list === null) return false;
+  const ids = new Set();
+  for (const x of list) {
+    const id = numOrNull(x);
+    if (id !== null && id >= 0) ids.add(Math.trunc(id));
+  }
+  // 層の数にも上限を置く (壊れた層 id で Map が伸び続けないように)。
+  // 既存の層を更新するときは追い出さない。新しい層で満杯なら最古を落とす。
+  if (d.residency.size >= MAX_LAYERS && !d.residency.has(Math.trunc(layer))) {
+    const oldest = d.residency.keys().next().value;
+    if (oldest !== undefined) d.residency.delete(oldest);
+  }
+  d.residency.set(Math.trunc(layer), ids);
   return true;
 }
 
@@ -153,12 +211,18 @@ export function noteRoute(d, frame) {
   if (!d || !frame) return false;
   const layer = numOrNull(frame.layer);
   const sel = Array.isArray(frame.experts) ? frame.experts : null;
-  if (layer === null || !sel || !sel.length) return false;
+  if (layer === null || layer < 0 || !sel || !sel.length) return false;
   const res = d.residency.get(Math.trunc(layer));
   if (!res) return false;
-  let hit = 0;
-  for (const e of sel) if (res.has(Math.trunc(Number(e)))) hit++;
-  pushSample(d, 'vram', hit / sel.length);
+  let hit = 0, count = 0;
+  for (const e of sel) {
+    const id = numOrNull(e);
+    if (id === null || id < 0) continue;           // 壊れた id は分母からも外す
+    count++;
+    if (res.has(Math.trunc(id))) hit++;
+  }
+  if (!count) return false;
+  if (!pushSample(d, 'vram', hit / count)) return false;
   d.hits++;
   return true;
 }
@@ -168,13 +232,14 @@ export function noteTierStats(d, frame) {
   if (!d || !frame) return false;
   const used = numOrNull(frame.vramMB);
   const total = numOrNull(frame.vramTotalMB);
-  if (used === null || total === null) return false;
+  if (used === null || total === null || used < 0 || total < 0) return false;
+  const nonNeg = (v) => { const n = numOrNull(v); return n !== null && n >= 0 ? n : null; };
   d.tier = {
     usedMB: used,
     totalMB: total,
     fill: total > 0 ? clamp01(used / total) : null,
-    ramExperts: numOrNull(frame.ramExperts),
-    ssdReads: numOrNull(frame.ssdReads),
+    ramExperts: nonNeg(frame.ramExperts),
+    ssdReads: nonNeg(frame.ssdReads),
   };
   return true;
 }
@@ -184,23 +249,23 @@ export function noteTierStats(d, frame) {
 export function noteLatency(d, v) {
   if (!d || !d.latencyRing) return false;
   let ms = null;
-  if (v && typeof v === 'object') {
+  if (v && typeof v === 'object' && !Array.isArray(v)) {
     const ns = numOrNull(v.ns);
-    if (ns !== null) ms = ns / 1e6;
+    if (ns !== null && ns >= 0) ms = ns / 1e6;
   } else {
     ms = numOrNull(v);
   }
-  if (ms === null || ms < 0) return false;
-  ringPush(d.latencyRing, ms);
-  return true;
+  if (ms === null || ms < 0 || !Number.isFinite(ms)) return false;
+  return ringPush(d.latencyRing, ms);
 }
 
 /// KvUsage フレーム → 使用中スロット数 / 全スロット数。比率は kvGauge が作る。
 export function noteKv(d, frame) {
   if (!d || !frame || !Array.isArray(frame.busy)) return false;
-  const busy = frame.busy.filter(Boolean).length;
   const slots = frame.busy.length;
   if (!slots) return false;
+  let busy = 0;
+  for (const b of frame.busy) if (b === true || b === 1) busy++;
   d.kv = { busy, slots };
   return true;
 }
@@ -235,14 +300,26 @@ export function fmtPercent(v) {
 
 /// 系列 → 点列。min/max を省くとデータから決める (全部同じ値なら真ん中の水平線)。
 /// x は右端が最新。サンプル 1 個でも点を返す。
+/// 幅・高さ・余白に Infinity / NaN を渡されても既定値に落とす。
 export function sparkPoints(values, opts = {}) {
-  const w = Number(opts.w) > 0 ? Number(opts.w) : 220;
-  const h = Number(opts.h) > 0 ? Number(opts.h) : 34;
-  const pad = Number(opts.pad) >= 0 ? Number(opts.pad) : 2;
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const wv = numOrNull(o.w);
+  const hv = numOrNull(o.h);
+  const pv = numOrNull(o.pad);
+  const w = wv !== null && wv > 0 ? wv : 220;
+  const h = hv !== null && hv > 0 ? hv : 34;
+  let pad = pv !== null && pv >= 0 ? pv : 2;
+  pad = Math.min(pad, Math.min(w, h) / 2);          // 負の描画域を作らない
   const vals = (Array.isArray(values) ? values : []).filter((v) => Number.isFinite(v));
   if (!vals.length) return [];
-  const lo = Number.isFinite(opts.min) ? Number(opts.min) : Math.min(...vals);
-  const hi = Number.isFinite(opts.max) ? Number(opts.max) : Math.max(...vals);
+  // 大量サンプルでも Math.min(...vals) のスタック溢れを起こさない。
+  let dataLo = Infinity, dataHi = -Infinity;
+  for (const v of vals) {
+    if (v < dataLo) dataLo = v;
+    if (v > dataHi) dataHi = v;
+  }
+  const lo = Number.isFinite(o.min) ? Number(o.min) : dataLo;
+  const hi = Number.isFinite(o.max) ? Number(o.max) : dataHi;
   const span = hi - lo;
   const n = vals.length;
   const pts = [];
@@ -293,10 +370,11 @@ export function latencyRow(d, opts = {}) {
   const ring = d && d.latencyRing;
   const values = ring && Array.isArray(ring.values) ? ring.values : [];
   const last = values.length ? values[values.length - 1] : null;
+  const ok = Number.isFinite(last) && last >= 0;
   return {
     key: 'latency',
     label: 'step latency ms',
-    text: last === null ? '-' : fmtRate(last) + ' ms',
+    text: ok ? fmtRate(last) + ' ms' : '-',
     path: sparkPath(values, opts),
     samples: values.length,
   };
@@ -338,8 +416,14 @@ export function latencyPercentiles(values) {
   out.p50 = percentile(vals, 50);
   out.p95 = percentile(vals, 95);
   out.p99 = percentile(vals, 99);
-  out.min = Math.min(...vals);
-  out.max = Math.max(...vals);
+  // 大量サンプルでもスプレッドでスタックを溢れさせない。
+  let lo = Infinity, hi = -Infinity;
+  for (const v of vals) {
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  out.min = lo;
+  out.max = hi;
   return out;
 }
 
@@ -450,10 +534,15 @@ export function metricsJson(d, opts = {}) {
 /// KV / VRAM の利用量を「詰まった棒 + 割合」の 1 行にする。
 /// used/total が壊れている (null, total<=0, used<0) ときは空の棒と '-'。
 export function gaugeBar(used, total, opts = {}) {
-  const w = Number(opts.w);
-  const width = Math.min(40, Math.max(1, Math.trunc(w > 0 ? w : GAUGE_WIDTH)));
-  const full = opts.full === undefined ? '█' : String(opts.full);
-  const empty = opts.empty === undefined ? '░' : String(opts.empty);
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const wn = numOrNull(o.w);
+  const width = Math.min(40, Math.max(1, Math.trunc(wn !== null && wn > 0 ? wn : GAUGE_WIDTH)));
+  const oneChar = (v, dflt) => {
+    const s = v === undefined || v === null ? '' : String(v);
+    return s === '' ? dflt : (Array.from(s)[0] || dflt);   // 幅 1 文字に固定
+  };
+  const full = oneChar(o.full, '█');
+  const empty = oneChar(o.empty, '░');
   const blank = {
     ratio: null,
     pct: '-',
