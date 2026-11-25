@@ -614,7 +614,7 @@ tools + stream の場合、生成中の `<tool_call>` block は block 単位で�
 | invalid_request_error | 400 |
 | authentication_error | 401 |
 | not_found_error | 404 |
-| overloaded_error | 503 (s 番号なし: P4 の `--max-queue` 上限超過時) |
+| overloaded_error | 503 (P4 の `--max-queue-depth` 上限超過時。`Retry-After` 付き) |
 | api_error | 500 |
 
 - リクエスト本文が JSON として不正 / 必須フィールド欠落 (serde エラー) は 400 invalid_request_error
@@ -622,9 +622,15 @@ tools + stream の場合、生成中の `<tool_call>` block は block 単位で�
 - 生成開始後に engine 側で判明したリクエスト不正 (prompt + max_tokens が context / KV スロット上限を
   超える等) は、メッセージに `invalid_request_error:` を含む場合のみ 400 に写像し、
   それ以外の実行時失敗は 500 api_error になる (`crates/denno-server/src/lib.rs` の `messages` ハンドラ)
-- キュー溢れ (実行中 1 件に加えて `--max-queue` 件が待ち行列にいる) は 503 overloaded_error
+- キュー溢れ (実行中 1 件に加えて `--max-queue-depth` 件が待ち行列にいる) は 503 overloaded_error
   (Anthropic の `overloaded_error` と同じ type 名・`server busy: request queue is full ...`)。
+  P873 から `Retry-After: 1` を付ける。同じ状況の OpenAI 経路 (`/v1/chat/completions`,
+  `/v1/completions`) は **429 rate_limit_exceeded**、Ollama 経路 (`/api/chat`, `/api/generate`) は
+  **503** + `Retry-After` (プロトコルごとの過負荷表現に合わせる)。
   上表 5 種が s101 時点でコードに存在する全 type
+- リクエスト期限 (`--request-timeout-secs` / `DENNO_REQUEST_TIMEOUT_SECS`、既定 0 = 無効) を
+  超えた生成は、ステップ境界で打ち切られ KV スロットが解放される。非ストリームは 500 api_error
+  (`timeout: request wall clock exceeded ...`)、SSE は `error` イベントで同じ本文を流して閉じる
 
 認証: `--api-key` 指定時は `x-api-key` ヘッダ(または `Authorization: Bearer ...`)を検証する。
 `anthropic-version` ヘッダは検証せず受け流す。

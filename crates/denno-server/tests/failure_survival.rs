@@ -322,6 +322,7 @@ async fn queued_request_beyond_stall_returns_500_and_server_recovers() {
         admit: Duration::from_secs(10),
         stall: Duration::from_millis(150),
         send: Duration::from_secs(2),
+        request: Duration::ZERO,
     };
     let state = app_state(
         Box::new(GatedModel { ctx: 256, entered: entered.clone(), open: open.clone() }),
@@ -387,6 +388,7 @@ async fn stalled_sse_reader_does_not_block_the_worker() {
         admit: Duration::from_secs(10),
         stall: Duration::from_secs(60),
         send: Duration::from_millis(80),
+        request: Duration::ZERO,
     };
     let tok = dummy_tokenizer().unwrap();
     let engine = Engine::from_parts(

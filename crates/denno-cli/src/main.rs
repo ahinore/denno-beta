@@ -225,8 +225,16 @@ enum Commands {
         /// fp32 と同一出力ではない (丸め誤差)
         #[arg(long, default_value = "fp32")] quant: String,
         /// P4: リクエストキューの上限 (実行中 1 件の他に待ち行列に入れられる数)。
-        /// 同時受け付けがこれを超えると 503 (overloaded_error) を返す
-        #[arg(long, default_value_t = 32)] max_queue: usize,
+        /// 同時受け付けがこれを超えると過負荷応答 (Anthropic 503 /
+        /// OpenAI 429 / Ollama 503、いずれも Retry-After 付き) を返す。
+        /// 未指定時は DENNO_MAX_QUEUE_DEPTH、それも無ければ 32
+        #[arg(long = "max-queue-depth", visible_alias = "max-queue", value_name = "N")]
+        max_queue_depth: Option<usize>,
+        /// P873: リクエストの壁時計上限 (秒)。0 = 無効 (既定)。
+        /// 超えたリクエストは生成を打ち切り、KV スロットを解放してエラーを返す。
+        /// 未指定時は DENNO_REQUEST_TIMEOUT_SECS
+        #[arg(long, value_name = "SECS")]
+        request_timeout_secs: Option<u64>,
         /// s56b: serve 既定の repetition_penalty (リクエスト未指定時のみ適用)。
         /// 未指定なら従来と完全に同一のサンプリング経路 (出力ビット不変)。
         /// Qwen3.5-9B int8 + 長い system + tools の崩壊対策として 1.05 を推奨
@@ -963,7 +971,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue, repetition_penalty, temperature_cap } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue_depth, request_timeout_secs, repetition_penalty, temperature_cap } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -980,7 +988,9 @@ fn main() -> Result<()> {
                 default_seed: seed,
                 prefix_cache_tokens,
                 quant: quant_mode,
-                max_queue,
+                max_queue: denno_server::DEFAULT_MAX_QUEUE_DEPTH,
+                max_queue_depth,
+                request_timeout_secs,
                 repetition_penalty,
                 temperature_cap,
             }))?;

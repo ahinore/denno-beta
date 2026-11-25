@@ -13,9 +13,10 @@
 //!    両 API で行う。ストリーミングの組み立ても両方で確認する。
 //! 3. 生成中のクライアント切断で生成が止まり、スロットが解放される (両 API)。
 //! 4. キュー満杯のバックプレッシャ。
-//!    実装の契約は **503** (`max_queue` 超過)。Anthropic は
-//!    `overloaded_error`、OpenAI は `server_error` に寄せる既存規則
-//!    (P793 / P817)。429 `rate_limit_error` は「KV スロット枯渇」の別経路で、
+//!    実装の契約は Anthropic が **503** `overloaded_error`、OpenAI が
+//!    **429** `rate_limit_exceeded` (`max_queue-depth` 超過時、P873 で
+//!    プロトコル別に分かれた)。どちらも `Retry-After` を伴う。
+//!    429 `rate_limit_error` の「KV スロット枯渇」経路は別で、
 //!    `tests/admit_error_message.rs` が単一スロット構成で実 HTTP 検証している。
 //! 5. 壊れた JSON のエラー封筒 (両 API で形が異なる) と、その直後の回復。
 //!
@@ -228,6 +229,25 @@ async fn post(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, v)
+}
+
+/// P873: 応答ヘッダも見たいテスト用 (過負荷応答の `Retry-After` 確認)。
+/// 戻り値は (status, Retry-After があるか, body)。
+async fn post_with_retry_header(app: &Router, uri: &str, body: Value) -> (StatusCode, bool, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let has_retry_after = resp
+        .headers()
+        .contains_key(axum::http::header::RETRY_AFTER);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, has_retry_after, v)
 }
 
 async fn post_raw_body(app: &Router, uri: &str, body: &str) -> (StatusCode, Value) {
@@ -768,15 +788,15 @@ async fn queue_full_backpressure_is_retryable_on_both_apis() {
                 openai_body("t0", 8, false)
             };
             let uri = if anthropic { "/v1/messages" } else { "/v1/chat/completions" };
-            let (status, v) = post(&app, uri, body).await;
-            (i, anthropic, status, v)
+            let (status, has_retry_after, v) = post_with_retry_header(&app, uri, body).await;
+            (i, anthropic, status, has_retry_after, v)
         }));
     }
 
     let mut ok = 0usize;
     let mut overloaded = 0usize;
     for t in tasks {
-        let (i, anthropic, status, v) = t.await.unwrap();
+        let (i, anthropic, status, has_retry_after, v) = t.await.unwrap();
         match status {
             StatusCode::OK => {
                 ok += 1;
@@ -790,21 +810,25 @@ async fn queue_full_backpressure_is_retryable_on_both_apis() {
                 };
                 assert_eq!(text, expected, "request {i}: 受理済みの本文が基準と不一致");
             }
-            // 実装の契約: キュー満杯は 503。Anthropic は overloaded_error、
-            // OpenAI は server_error に寄せる (P793 / P817)。
-            StatusCode::SERVICE_UNAVAILABLE => {
+            // 実装の契約 (P873 でプロトコル別に分かれた): キュー満杯は
+            // Anthropic が 503 overloaded_error、OpenAI が 429 rate_limit_exceeded。
+            // どちらも `Retry-After` を伴う。
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => {
                 overloaded += 1;
                 if anthropic {
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body = {v}");
                     assert_eq!(v["type"], "error", "body = {v}");
                     assert_eq!(v["error"]["type"], "overloaded_error", "body = {v}");
                 } else {
-                    assert_eq!(v["error"]["type"], "server_error", "body = {v}");
+                    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "body = {v}");
+                    assert_eq!(v["error"]["type"], "rate_limit_exceeded", "body = {v}");
                 }
                 let msg = v["error"]["message"].as_str().unwrap_or("");
                 assert!(
                     msg.contains("queue is full"),
                     "再試行可能な理由が本文に無い: {v}"
                 );
+                assert!(has_retry_after, "request {i}: Retry-After が無い");
             }
             other => panic!("unexpected status {other} (request {i}): {v}"),
         }
@@ -812,7 +836,7 @@ async fn queue_full_backpressure_is_retryable_on_both_apis() {
     assert_eq!(ok + overloaded, 8);
     assert!(
         overloaded >= 1,
-        "503 が 1 件も無い (キュー上限が効いていない: ok={ok})"
+        "過負荷応答が 1 件も無い (キュー上限が効いていない: ok={ok})"
     );
     assert!(ok >= 2, "受理数が少なすぎる: ok={ok}");
 

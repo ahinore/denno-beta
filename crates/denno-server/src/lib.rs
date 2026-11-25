@@ -32,7 +32,8 @@ mod stream_asm;
 pub use lifecycle::{Lifecycle, DEFAULT_DRAIN_TIMEOUT_MS};
 pub use logging::{init_serve_logging, NonBlockingStdout};
 pub use scheduler::{
-    AdmitFailure, AdmitKind, Job, Limits, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler,
+    AdmitFailure, AdmitKind, Job, Limits, RunStatsSnapshot, MAX_ACTIVE_SESSIONS,
+    QUEUE_RETRY_AFTER_SECS, QueueFull, Scheduler,
 };
 
 /// P57: エンジンの **不変情報**。起動時に 1 回だけ読み、以降はハンドラが
@@ -117,7 +118,14 @@ pub struct ServeConfig {
     /// キューに入ったリクエストは実行開始まで待つが、待ちには上限がある
     /// (P57: `scheduler::Limits` — キュー待ち + スロット待ちが 300s を超えたら
     /// 500 で返してスロットを解放する。旧実装は上限が無かった)。
+    ///
+    /// P873: 実際の値は [`resolve_max_queue_depth`] が決める (`--max-queue-depth`
+    /// > `DENNO_MAX_QUEUE_DEPTH` > このフィールド > 既定 32)。
     pub max_queue: usize,
+    /// P873: `--max-queue-depth` (未指定 = env / `max_queue` / 既定に従う)。
+    pub max_queue_depth: Option<usize>,
+    /// P873: `--request-timeout-secs` (None = env / 既定 0 = 無効)。
+    pub request_timeout_secs: Option<u64>,
     /// s56b: serve 既定の repetition_penalty (None = リクエスト指定のみ)。
     /// Qwen3.5-9B int8 は長い system + tools の greedy 経路で崩壊するため、
     /// 運用では 1.05 を指定する (実測: 崩壊解消・短答化)。
@@ -133,11 +141,13 @@ pub struct ApiError {
     status: StatusCode,
     kind: &'static str,
     message: String,
+    /// P873: `Retry-After` ヘッダ (秒)。None = 付けない。
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
-        Self { status, kind, message: message.into() }
+        Self { status, kind, message: message.into(), retry_after: None }
     }
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
@@ -151,6 +161,13 @@ impl ApiError {
     /// キュー満杯 (同時受け付け上限超過)。Anthropic 流の overloaded_error。
     pub fn overloaded(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", message)
+    }
+    /// P873: 過負荷 + `Retry-After` (秒)。クライアントに「いつ再試行してよいか」を
+    /// 明示する (Anthropic / OpenAI / Ollama のいずれも待ちを推奨する応答で使う)。
+    pub fn overloaded_retry_after(message: impl Into<String>, secs: u64) -> Self {
+        let mut e = Self::overloaded(message);
+        e.retry_after = Some(secs);
+        e
     }
     fn api(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message)
@@ -201,7 +218,21 @@ impl IntoResponse for ApiError {
             "type": "error",
             "error": {"type": self.kind, "message": self.message}
         });
-        (self.status, Json(body)).into_response()
+        let mut resp = (self.status, Json(body)).into_response();
+        // P873: 過負荷のときは再試行までの待ちをヘッダで示す。
+        if let Some(secs) = self.retry_after {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            }
+        }
+        resp
+    }
+}
+
+impl ApiError {
+    /// P873: このエラーが要求する `Retry-After` (秒)。HTTP 変換とテストが読む。
+    pub fn retry_after(&self) -> Option<u64> {
+        self.retry_after
     }
 }
 
@@ -249,6 +280,54 @@ pub const DEFAULT_MAX_TOKENS: usize = 1024;
 /// 短くすると「キュー待ちで 500」が先に出てしまうため、stall と同値の 900s に
 /// する (無期限より短ければよい、という設計)。
 pub const RESPONSE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+// ---------- P873: キュー深度 / リクエスト期限の解決 ----------
+
+/// P873: 待ち行列の上限を上書きする env (`--max-queue-depth` が無いとき)。
+pub const MAX_QUEUE_DEPTH_ENV: &str = "DENNO_MAX_QUEUE_DEPTH";
+/// P873: リクエストの壁時計上限 (秒) を上書きする env。
+pub const REQUEST_TIMEOUT_SECS_ENV: &str = "DENNO_REQUEST_TIMEOUT_SECS";
+/// P873: 待ち行列の上限の既定値 (旧 `--max-queue` の既定と同じ = 既存挙動)。
+pub const DEFAULT_MAX_QUEUE_DEPTH: usize = 32;
+/// P873: リクエスト期限の既定値。0 = 無効 (従来と完全に同一の挙動)。
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 0;
+/// P873: 待ち行列の上限の上限 (暴走した env / CLI をそのまま確保しない)。
+pub const MAX_QUEUE_DEPTH_LIMIT: usize = 65_536;
+/// P873: リクエスト期限の上限 (秒)。
+pub const MAX_REQUEST_TIMEOUT_SECS: u64 = 86_400;
+
+/// P873: env から非負整数を読む (空白は無視、解析できなければ None)。
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// P873: 実効の待ち行列上限。優先順は CLI > env > 既存フィールド > 既定。
+/// 0 は 1 に切り上げ、[`MAX_QUEUE_DEPTH_LIMIT`] で頭打ち (sync_channel の長さ)。
+pub fn resolve_max_queue_depth(cli: Option<usize>, fallback: usize) -> usize {
+    let from_env = env_u64(MAX_QUEUE_DEPTH_ENV).map(|v| v.min(MAX_QUEUE_DEPTH_LIMIT as u64) as usize);
+    cli.or(from_env).unwrap_or(fallback).clamp(1, MAX_QUEUE_DEPTH_LIMIT)
+}
+
+/// P873: 実効のリクエスト期限 (秒)。優先順は CLI > env > 既定 0 (無効)。
+pub fn resolve_request_timeout_secs(cli: Option<u64>) -> u64 {
+    cli.or_else(|| env_u64(REQUEST_TIMEOUT_SECS_ENV))
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS)
+        .min(MAX_REQUEST_TIMEOUT_SECS)
+}
+
+/// P873: ハンドラが応答を待つ上限。リクエスト期限が有効ならその少し後まで
+/// 待つ (スケジューラが期限で打ち切ってエラーを返すのを、ハンドラ側の
+/// タイムアウトが先回りして握り潰さないため)。無効なら従来の
+/// [`RESPONSE_WAIT_TIMEOUT`] (挙動不変)。
+pub fn response_wait_timeout(limits: Limits) -> std::time::Duration {
+    if limits.request.is_zero() {
+        RESPONSE_WAIT_TIMEOUT
+    } else {
+        limits.request + std::time::Duration::from_secs(30)
+    }
+}
 
 /// P805: `count_tokens` がエンジンロックを待つ上限。生成中 (ワーカーが Mutex を
 /// ほぼ連続保持) でも制御プレーンを永久にブロックしないための上限。
@@ -954,10 +1033,25 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     let engine = Arc::new(Mutex::new(engine));
+    // P873: キュー深度とリクエスト期限を解決する (CLI > env > 既定)。
+    let queue_depth = resolve_max_queue_depth(cfg.max_queue_depth, cfg.max_queue);
+    let request_timeout_secs = resolve_request_timeout_secs(cfg.request_timeout_secs);
+    let limits = Limits {
+        request: std::time::Duration::from_secs(request_timeout_secs),
+        ..Limits::default()
+    };
+    tracing::info!(
+        "scheduler: max_queue_depth = {queue_depth}, request_timeout = {}",
+        if request_timeout_secs == 0 {
+            "off".to_string()
+        } else {
+            format!("{request_timeout_secs}s")
+        }
+    );
     let state = Arc::new(AppState {
         engine: engine.clone(),
         api_key: cfg.api_key,
-        scheduler: Scheduler::spawn(engine, cfg.max_queue.max(1)),
+        scheduler: Scheduler::spawn_with_limits(engine, queue_depth, limits),
         model_name,
         model_id,
         info,
@@ -1068,6 +1162,8 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
     let lc = state.scheduler.lifecycle();
     let ok = lc.serves_requests();
     let status = if ok { "ready" } else if lc.is_draining() { "draining" } else { "loading" };
+    // P873: 打ち切り / 完了の計数 (全 API 共通のスケジューラ計数)。
+    let st = state.scheduler.stats();
     let body = json!({
         "status": status,
         "ready": ok,
@@ -1078,6 +1174,16 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
         "context_length": state.info.context,
         "pending": state.scheduler.pending(),
         "in_flight": state.scheduler.in_flight(),
+        "aborts": {
+            "completed": st.completed,
+            "timeout": st.aborted_timeout,
+            "disconnected": st.aborted_disconnected,
+            "error": st.aborted_error,
+        },
+        "limits": {
+            "max_queue_depth": state.scheduler.max_queue(),
+            "request_timeout_secs": state.scheduler.limits().request.as_secs(),
+        },
     });
     let code = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (code, Json(body)).into_response()
@@ -1349,7 +1455,10 @@ async fn messages_inner(
         // 期限を超えたら 500 を返し、`rx` を落とす (= ワーカーから見て
         // 「クライアント切断」と同じ扱いになり、次のステップ境界で
         // KV スロットが解放される)。
-        let waited = tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await;
+        // P873: `--request-timeout-secs` が有効ならその少し後まで待つ
+        // (スケジューラ側の期限が先に発火して、期限超過を説明するエラーを返す)。
+        let wait = response_wait_timeout(state.scheduler.limits());
+        let waited = tokio::time::timeout(wait, rx).await;
         let mut output = match waited {
             Ok(Ok(Ok(out))) => out,
             Ok(Ok(Err(e))) => return Err(ApiError::from_anyhow(e)),
@@ -1360,7 +1469,7 @@ async fn messages_inner(
                 return Err(ApiError::api(format!(
                     "timeout: no response from the engine within {:.1}s; \
                      the request was abandoned (retry later)",
-                    RESPONSE_WAIT_TIMEOUT.as_secs_f64()
+                    wait.as_secs_f64()
                 )))
             }
         };
@@ -1428,12 +1537,19 @@ async fn count_tokens(
 }
 
 /// キュー満杯時の 503 エラー (Anthropic 流 overloaded_error)
+///
+/// P873: `Retry-After` を付ける (クライアントが待ち時間を知らずに即再試行して
+/// 同じ混雑を繰り返すのを避ける)。ステータスは既存契約の 503 のまま
+/// (Anthropic の過負荷は overloaded_error)。
 fn queue_full_error(state: &AppState) -> impl Fn(QueueFull) -> ApiError + '_ {
-    move |_| {
-        ApiError::overloaded(format!(
-            "server busy: request queue is full (max_queue = {}, in_flight = 1); retry later",
-            state.scheduler.max_queue()
-        ))
+    move |e: QueueFull| {
+        ApiError::overloaded_retry_after(
+            format!(
+                "server busy: request queue is full (max_queue = {}, in_flight = 1); retry later",
+                state.scheduler.max_queue()
+            ),
+            e.retry_after_secs(),
+        )
     }
 }
 

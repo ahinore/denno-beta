@@ -53,7 +53,7 @@ use crate::stream_asm::StreamAssembler;
 use crate::{
     apply_temperature_cap, brief_system, check_auth, debug_api_error, extract_tool_calls,
     parse_tool_choice, resolve_max_tokens, tool_use_to_xml, validate_tools, ApiError, AppState,
-    ExtractedToolCall, ToolChoice, ToolDef, RESPONSE_WAIT_TIMEOUT,
+    ExtractedToolCall, ToolChoice, ToolDef,
 };
 
 // ---------- エラー (OpenAI 形式) ----------
@@ -65,11 +65,18 @@ pub struct OaError {
     kind: &'static str,
     message: String,
     param: Option<String>,
+    /// P873: `Retry-After` ヘッダ (秒)。None = 付けない。
+    retry_after: Option<u64>,
 }
 
 impl OaError {
     fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
-        Self { status, kind, message: message.into(), param: None }
+        Self { status, kind, message: message.into(), param: None, retry_after: None }
+    }
+    /// P873: `Retry-After` を付ける (過負荷 / レート制限の応答)。
+    fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs);
+        self
     }
     fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
@@ -90,7 +97,14 @@ impl IntoResponse for OaError {
                 "code": Value::Null,
             }
         });
-        (self.status, Json(body)).into_response()
+        let mut resp = (self.status, Json(body)).into_response();
+        // P873: 過負荷 / レート制限では再試行までの待ちをヘッダで示す。
+        if let Some(secs) = self.retry_after {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            }
+        }
+        resp
     }
 }
 
@@ -98,6 +112,7 @@ impl IntoResponse for OaError {
 /// (値は既存の分類のままで、この変換は表示形式だけを変える)。
 impl From<ApiError> for OaError {
     fn from(e: ApiError) -> Self {
+        let retry_after = e.retry_after();
         let (status, kind, message) = debug_api_error(e);
         // Anthropic の type 名を OpenAI の type 名へ寄せる (未知はそのまま)
         let kind = match kind {
@@ -106,11 +121,13 @@ impl From<ApiError> for OaError {
             "api_error" => "server_error",
             other => other,
         };
-        Self::new(
+        let mut out = Self::new(
             StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             kind,
             message,
-        )
+        );
+        out.retry_after = retry_after;
+        out
     }
 }
 
@@ -705,7 +722,8 @@ pub async fn chat_completions(
                 lp_req,
             )
             .map_err(|_| queue_full(&state))?;
-        let output = match tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await {
+        let wait = crate::response_wait_timeout(state.scheduler.limits());
+        let output = match tokio::time::timeout(wait, rx).await {
             Ok(Ok(Ok(out))) => out,
             Ok(Ok(Err(e))) => return Err(OaError::from(crate::error_from_anyhow(e))),
             Ok(Err(e)) => {
@@ -722,7 +740,7 @@ pub async fn chat_completions(
                     format!(
                         "timeout: no response from the engine within {:.1}s; \
                          the request was abandoned (retry later)",
-                        RESPONSE_WAIT_TIMEOUT.as_secs_f64()
+                        wait.as_secs_f64()
                     ),
                 ))
             }
@@ -765,15 +783,22 @@ pub async fn chat_completions(
     }
 }
 
+/// P873: キュー満杯 (待ち行列の上限超過)。
+///
+/// OpenAI のプロトコルでは「一時的な容量不足 = 後で再試行」は **429**
+/// (`rate_limit_exceeded`) で、`Retry-After` を添えるのが慣例。Anthropic 経路
+/// (`/v1/messages`) は overloaded_error の 503 のまま (プロトコルごとに
+/// 適切な形が違うため、ここで分ける)。
 fn queue_full(state: &AppState) -> OaError {
     OaError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "server_error",
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_exceeded",
         format!(
             "server busy: request queue is full (max_queue = {}, in_flight = 1); retry later",
             state.scheduler.max_queue()
         ),
     )
+    .with_retry_after(crate::QUEUE_RETRY_AFTER_SECS)
 }
 
 /// 1 個の delta chunk を送る。送信失敗 (クライアント切断) は false。
@@ -1196,7 +1221,8 @@ pub async fn completions(
         .scheduler
         .submit_completion(prompt.clone(), params)
         .map_err(|_| queue_full(&state))?;
-    let output = match tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await {
+    let wait = crate::response_wait_timeout(state.scheduler.limits());
+    let output = match tokio::time::timeout(wait, rx).await {
         Ok(Ok(Ok(out))) => out,
         Ok(Ok(Err(e))) => return Err(OaError::from(crate::error_from_anyhow(e))),
         Ok(Err(e)) => {
@@ -1213,7 +1239,7 @@ pub async fn completions(
                 format!(
                     "timeout: no response from the engine within {:.1}s; \
                      the request was abandoned (retry later)",
-                    RESPONSE_WAIT_TIMEOUT.as_secs_f64()
+                    wait.as_secs_f64()
                 ),
             ))
         }
