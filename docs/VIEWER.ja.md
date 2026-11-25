@@ -48,15 +48,21 @@ mixer: kind == "qsa" and layer % 8 == 3; moe: layer in [5, 9, 17]
 2. `capture A & B` が `ablit_A` → `ablit_B` の順に記録する。各プロンプトの前に KV を捨ててプロンプト全体を prefill させ、`/chat` を `max_tokens: 1, temperature: 0` で流し、集合ごとに記録を止めて、最後に `/v1/steer/analyze` を呼ぶ。進み具合は `A 3/8…` のように出て、`cancel` はプロンプトの切れ目で止める (そこまでの記録は保存される)。
 3. 分離チャートは層ごとの `sep_score = ||mu_A - mu_B|| / (||mu_A|| + ||mu_B|| + 1e-12)`。チャートをクリック / ドラッグすると層の範囲 `[from, to)` が決まる。`use recommended` はピークの半値以上が続く連続窓 (層 0 と最終層は除く) を選ぶ。
 4. `apply abliteration` が `POST /v1/steer/apply` を `terms: [{ablit_A, +1}, {ablit_B, -1}]`、`mode: "project"`、選んだ層と `alpha` (0.0–2.0、刻み 0.05、既定 1.0) で送る。`reset / clear` は `DELETE /v1/steer/apply`。
-5. `compare off vs on` は同じテストプロンプトを、ステアリング無しで 1 回、いまの範囲を掛けて 1 回流し、2 つの答えを並べる。比較のあとは元の適用状態に戻す。
+5. `eval off vs on` が一括比較。`eval prompts` に 1 行 1 プロンプトで 1〜10 本貼ると、ステアリング無し (OFF) で全部流し、いまの `[from, to)` / `alpha` を `project` で掛けてから (ON) もう一度全部流し、`prompt | OFF | ON | len delta` の表にする。進み具合は `eval 2/5 (off)…` / `eval 2/5 (on)…` で、`cancel` はプロンプトの切れ目で止める。出力長は `usage.output_tokens` (返さないサーバーでは文字数)、拒否っぽい応答には `[refuse]` が付き、変化した行は薄く着色する。元の適用状態は完了時もキャンセル時も必ず戻す。
 6. `colour: ablit` (ヘッダの `ablit` チップも同じ) で、48 層の柱と 12 個の Hybrid block を層ごとの分離スコアで塗る。
 7. `download .dns` / `download .json` は `GET /v1/steer/export?name=ablit_A` を取る (DNSTEER1 のバイナリ、または本体を base64 で載せた JSON)。`import` はそのファイルを `POST /v1/steer/import` へ送る (`.dns` は `application/octet-stream`、JSON は向きの JSON として)。
+8. `save recipe (.json)` はいまの `[from, to)` / `alpha` (A +1 / B −1 / `project`) を `POST /v1/steer/recipe/export` へ送り、`<name>.recipe.json` をダウンロードする。`embed snapshots` を入れると 1 ファイルで完結する (2 つのスナップショットが base64 の DNSTEER1 として `snapshots` に載るので、移した先に `$DENNO_STEER_DIR` が要らない)。
+9. `load recipe (.json)` は手元で検証してから (規則はサーバーと同じ) `POST /v1/steer/recipe/import?apply=1` で適用し、層の範囲・alpha・名前をレシピに合わせる。埋め込みスナップショットはメモリにだけ載り、ディスクは触らない。
 
 このために足した API (crates/denno-cli/src/serve_flash.rs):
 
 - `POST /v1/steer/analyze` — 本文は `{pos, neg}` か `{terms:[{snapshot,coef}...]}` (正の係数が A 側、負が B 側)。返りは `{pos, neg, n_layer, peak_layer, recommended_range:[from,to], layers:[{layer, diff_norm, norm_pos, norm_neg, cos_sim, sep_score}]}`。
 - `GET /v1/steer/export?name=<snap>[&format=json]` — 保存済みの DNSTEER1 スナップショット、または同じバイト列を base64 にした JSON。
 - `POST /v1/steer/import[?name=<new>]` — DNSTEER1 の本文か、`data_base64` / `mean` 配列を持つ JSON。形とモデル id の検証はローダと同じで、不正は 400。
+- `POST /v1/steer/recipe/export` — 本文 `{name?, description?, embed_snapshots?}` で適用中の設定を、`terms` / `layers` / `alpha` / `mode` を渡せば未適用の設定をレシピ JSON (`version: 1`) にする。
+- `POST /v1/steer/recipe/import[?apply=1]` — レシピ JSON (または `{recipe, apply}`)。検証し、`apply` があれば適用する。埋め込みはメモリにだけ載る。
+
+レシピの形は `{version: 1, name, description?, model_id?, mode, alpha, layer_from, layer_to, terms: [{snapshot, coef}], snapshots?: {name: base64-DNSTEER1}}`。検証は厳密で、未知のフィールド・非有限の alpha/coef・空の terms・`layer_from > layer_to`・壊れた埋め込み・適用時の model_id の食い違いはすべてエラー。`denno serve-flash --steer-recipe <path>` (または `DENNO_STEER_RECIPE`) で起動時に読み込んで適用し、`[flash] steer recipe loaded: <name> mode=<mode> alpha=<alpha> layers=<from>..<to>` を 1 行だけ出す。フラグも env も無ければ何も変わらない。
 
 `POST /v1/steer/record` は `capture_mode` も受ける。`"all"` (既定、従来どおり) は全トークンの平均、`"last_prompt_token"` は prefill の最終トークン (`nt - 1`) の残差だけを層ごとに記録し、生成中の decode トークンは載せない。それ以外の値は 400。`GET /v1/steer` は現在の `capture_mode` を返す。Abliterate パネルの `capture mode` セレクタの既定は `last_prompt_token` (指示境界での difference-in-means)。
 

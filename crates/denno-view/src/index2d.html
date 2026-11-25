@@ -415,11 +415,25 @@
         <button id="ab-apply" class="b go" title="POST /v1/steer/apply (A +1 / B -1 / project)">apply abliteration</button>
         <button id="ab-reset" class="b warn" title="DELETE /v1/steer/apply">reset / clear</button>
       </div>
+      <div class="row2"><h2 style="margin:0;flex:1">batch eval <span class="dim">off vs on</span></h2></div>
+      <label class="f">eval prompts (1 行 1 プロンプト、最大 10)
+        <textarea id="ab-eval-prompts" rows="3" placeholder="eval prompts — one per line"></textarea></label>
       <div class="row2">
-        <input id="ab-test" type="text" placeholder="test prompt" style="flex:2">
-        <button id="ab-compare" class="b" title="同じプロンプトを OFF / ON の両方で流して並べる">compare off vs on</button>
+        <button id="ab-eval-run" class="b go" title="OFF を全部 → ON を全部、順に流して表にする (終わったら元の適用へ戻す)">eval off vs on</button>
+        <button id="ab-eval-cancel" class="b warn" disabled>cancel</button>
       </div>
-      <div id="ab-cmp" class="small" style="white-space:pre-wrap"></div>
+      <div id="ab-evalprog" class="small dim" style="margin-top:4px">idle</div>
+      <div id="ab-eval-table" class="small" style="overflow-x:auto;margin-top:4px"></div>
+      <div class="row2">
+        <input id="ab-recipe-name" type="text" value="recipe" placeholder="recipe name (A-Z a-z 0-9 _ -)">
+        <label class="f" style="white-space:nowrap"><input id="ab-recipe-embed" type="checkbox"> embed snapshots</label>
+      </div>
+      <div class="row2">
+        <button id="ab-recipe-save" class="b" title="POST /v1/steer/recipe/export → .recipe.json をダウンロード">save recipe (.json)</button>
+      </div>
+      <label class="f">load recipe (.json) — 読み込んで適用
+        <input id="ab-recipe-file" type="file" accept=".json,application/json"></label>
+      <div id="ab-recipe-info" class="small dim" style="margin-top:2px"></div>
       <div class="row2">
         <button id="ab-dlbin" class="b" title="GET /v1/steer/export?name=ablit_A">download .dns</button>
         <button id="ab-dljson" class="b" title="GET /v1/steer/export?name=ablit_A&amp;format=json">download .json</button>
@@ -464,8 +478,10 @@ import {
   selectionFromBody, selectionToBody, steerApplyBody, steerSummary, streamValue,
   toggleItem, addItem, removeItem, selectionItems, wallHitTest,
   wallItemsInRect, wallLayout, hasItem,
-  ABLIT_A, ABLIT_B, ABLIT_CAPTURE_MODE, CAPTURE_MODES, ablitApplyBody, ablitChart,
-  ablitCompareRows, ablitExportName, ablitExportUrl, ablitImportBody, ablitLayerAt,
+  ABLIT_A, ABLIT_ALPHA_MIN, ABLIT_B, ABLIT_CAPTURE_MODE, CAPTURE_MODES, ablitApplyBody, ablitChart,
+  ablitCompareRows, ablitEvalPrompts, ablitEvalRows, ablitExportName,
+  ablitExportUrl, ablitImportBody, ablitLayerAt, ablitRecipeBodyFromUi,
+  ablitRecipeFileName, ablitRecipeFromText, ablitRecipeSummaryText,
   ablitRange, ablitRangeFromDrag, ablitRecordBody, ablitSepScores, ablitSummary,
   parsePromptList,
 } from '/view2d.mjs';
@@ -1433,10 +1449,8 @@ $('ab-clearset').addEventListener('click', () => {
 async function ablitChat(prompt, maxTokens) {
   if (mock) {
     if (steer.recording) mock.tick(1);
-    return {
-      text: '(mock) ' + prompt.slice(0, 60) + (steer.apply ? ' — abliterated' : ' — baseline'),
-      err: null,
-    };
+    const text = '(mock) ' + prompt.slice(0, 60) + (steer.apply ? ' — abliterated' : ' — baseline');
+    return { text, tokens: text.split(/\s+/).filter(Boolean).length, err: null };
   }
   const body = {
     model: 'denno',
@@ -1456,7 +1470,11 @@ async function ablitChat(prompt, maxTokens) {
     const text = j && Array.isArray(j.content)
       ? j.content.map((b) => (b && b.text) || '').join('')
       : '';
-    return { text, err: null };
+    // 出力トークン数 (anthropic / openai の両方の名前を見る)。
+    const u = (j && j.usage) || {};
+    const raw = u.output_tokens != null ? u.output_tokens : u.completion_tokens;
+    const tokens = Number.isFinite(Number(raw)) ? Number(raw) : undefined;
+    return { text, tokens, err: null };
   } catch (e) {
     return { text: '', err: (e && e.message) ? e.message : String(e) };
   }
@@ -1593,41 +1611,129 @@ $('ab-colour').addEventListener('click', () => {
   setMode(colourMode === 'ablit' ? 'token' : 'ablit');
 });
 
-/// 同じプロンプトを OFF (介入なし) と ON (いまの範囲で project) で流して並べる。
-/// 比較のあとは元の適用状態へ戻す。
-$('ab-compare').addEventListener('click', async () => {
-  const p = $('ab-test').value.trim();
+/// ファイルをブラウザへ落とす。
+function downloadBlob(blob, fname) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = fname;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+/// 一括評価の結果を表にする (prompt | OFF | ON | len Δ)。
+function renderAblitEval(rows) {
+  const box = $('ab-eval-table');
+  box.textContent = '';
+  if (!rows.length) return;
+  const t = document.createElement('table');
+  t.style.borderCollapse = 'collapse';
+  const head = document.createElement('tr');
+  for (const h of ['prompt', 'OFF', 'ON', 'len Δ']) {
+    const th = document.createElement('th');
+    th.textContent = h;
+    th.style.cssText = 'text-align:left;padding:2px 6px;border-bottom:1px solid #244;white-space:nowrap';
+    head.appendChild(th);
+  }
+  t.appendChild(head);
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    const cells = [
+      r.prompt,
+      (r.offSnippet || '(空)') + (r.offRefusal ? ' [refuse]' : ''),
+      (r.onSnippet || '(空)') + (r.onRefusal ? ' [refuse]' : ''),
+      r.deltaText,
+    ];
+    for (const txt of cells) {
+      const td = document.createElement('td');
+      // textContent で入れる (応答を HTML として解釈しない)。
+      td.textContent = txt;
+      td.style.cssText = 'padding:2px 6px;border-bottom:1px solid #16202a;vertical-align:top;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+      tr.appendChild(td);
+    }
+    if (r.changed) tr.style.background = 'rgba(127,227,255,.06)';
+    t.appendChild(tr);
+  }
+  box.appendChild(t);
+}
+
+/// 1 行 1 プロンプトの一括評価: OFF を全部 → ON を全部流し、表にする。
+/// 終わったら (キャンセルでも) 元の適用状態へ戻す。
+async function runAblitEval() {
+  if (ablit.busy) return;
   ablitErr('');
-  if (!p) {
-    ablitErr('test prompt が空');
+  const prompts = ablitEvalPrompts($('ab-eval-prompts').value);
+  if (!prompts.length) {
+    ablitErr('eval prompts が空 (1 行 1 プロンプト、最大 10)');
     return;
   }
-  if (ablit.busy) return;
   let body = null;
   try {
     body = ablitBodyFromUi();
   } catch (e) {
-    $('ab-cmp').textContent = '';
     ablitErr((e && e.message) || String(e));
     return;
   }
-  ablit.busy = true;
-  $('ab-compare').disabled = true;
-  $('ab-cmp').textContent = 'running off / on…';
   const saved = steer.apply;
+  const n = prompts.length;
+  const offs = [];
+  const ons = [];
+  const offTokens = [];
+  const onTokens = [];
+  const errs = [];
+  ablit.busy = true;
+  ablit.cancel = false;
+  $('ab-eval-run').disabled = true;
+  $('ab-eval-cancel').disabled = false;
+  $('ab-eval-table').textContent = '';
   try {
+    // OFF (介入もステアリングも無し)。
     await api('DELETE', '/v1/steer/apply');
-    await refreshSteer('compare off');
-    const off = await ablitChat(p, 64);
-    let on = { text: '', err: null };
-    const r = await api('POST', '/v1/steer/apply', body);
-    if (r.status === 200) {
-      await refreshSteer('compare on');
-      on = await ablitChat(p, 64);
-    } else {
-      on = { text: '', err: 'apply → ' + r.status + ' ' + errText(r) };
+    await refreshSteer('eval off');
+    for (let i = 0; i < n && !ablit.cancel; i++) {
+      $('ab-evalprog').textContent = ablitEvalProgress(i + 1, n, 'off');
+      if (!mock) await api('DELETE', '/v1/cache');
+      const res = await ablitChat(prompts[i], 96);
+      offs.push(res.text || '');
+      offTokens.push(res.tokens);
+      if (res.err) errs.push('off ' + (i + 1) + ': ' + res.err);
     }
-    // 元の状態へ戻す (比較で消した適用を残さない)。
+    // ON (いまの [from,to) / alpha の project)。OFF の途中で止めたら掛けない。
+    let applied = false;
+    if (!ablit.cancel) {
+      const r = await api('POST', '/v1/steer/apply', body);
+      if (r.status === 200) {
+        applied = true;
+        await refreshSteer('eval on');
+      } else {
+        errs.push('apply → ' + r.status + ' ' + errText(r));
+      }
+    }
+    for (let i = 0; applied && i < n && !ablit.cancel; i++) {
+      $('ab-evalprog').textContent = ablitEvalProgress(i + 1, n, 'on');
+      if (!mock) await api('DELETE', '/v1/cache');
+      const res = await ablitChat(prompts[i], 96);
+      ons.push(res.text || '');
+      onTokens.push(res.tokens);
+      if (res.err) errs.push('on ' + (i + 1) + ': ' + res.err);
+    }
+    const items = [];
+    const m = Math.max(offs.length, ons.length);
+    for (let i = 0; i < m; i++) {
+      items.push({
+        prompt: prompts[i],
+        off: offs[i] || '',
+        on: ons[i] || '',
+        offTokens: offTokens[i],
+        onTokens: onTokens[i],
+      });
+    }
+    renderAblitEval(ablitEvalRows(items));
+    if (items.length) ablitInfo('evaluated ' + items.length + ' prompt(s) · off ' + offs.length + ' / on ' + ons.length);
+    $('ab-evalprog').textContent = ablit.cancel
+      ? 'cancelled (' + offs.length + ' off / ' + ons.length + ' on)'
+      : (applied ? 'done — ' + n + ' prompts' : 'off only (適用できなかった)');
+  } finally {
+    // 元の適用状態へ常に戻す (比較で消した適用を残さない)。
     await api('DELETE', '/v1/steer/apply');
     if (saved && Array.isArray(saved.terms) && saved.terms.length) {
       await api('POST', '/v1/steer/apply', {
@@ -1637,14 +1743,99 @@ $('ab-compare').addEventListener('click', async () => {
         mode: saved.mode,
       });
     }
-    await refreshSteer('compare restore');
-    const rows = ablitCompareRows(off.text, on.text);
-    $('ab-cmp').textContent = rows.map((r) => '[' + r.label + ']\n' + (r.text || '(空)')).join('\n\n');
-    const errs = [off.err, on.err].filter(Boolean);
-    if (errs.length) ablitErr(errs.join(' / '));
-  } finally {
+    await refreshSteer('eval restore');
     ablit.busy = false;
-    $('ab-compare').disabled = false;
+    $('ab-eval-run').disabled = false;
+    $('ab-eval-cancel').disabled = true;
+    if (errs.length) ablitErr(errs.join(' / '));
+  }
+}
+
+$('ab-eval-run').addEventListener('click', runAblitEval);
+$('ab-eval-cancel').addEventListener('click', () => {
+  ablit.cancel = true;
+  $('ab-evalprog').textContent = 'cancelling…';
+});
+
+/// いまの [from,to) / alpha をレシピとして保存する (.recipe.json)。
+async function ablitRecipeSave() {
+  ablitErr('');
+  $('ab-recipe-info').textContent = '';
+  let body;
+  try {
+    body = ablitRecipeBodyFromUi(ablit.range, Number($('ab-alpha').value), {
+      name: ($('ab-recipe-name').value || '').trim() || 'recipe',
+      embed: $('ab-recipe-embed').checked,
+      description: 'from /2d abliterate (layers ' + ablit.range[0] + '-' + ablit.range[1] + ')',
+    });
+  } catch (e) {
+    ablitErr((e && e.message) || String(e));
+    return;
+  }
+  try {
+    let recipe;
+    if (mock) {
+      const r = mock.handle('POST', '/v1/steer/recipe/export', body);
+      if (r.status !== 200) throw new Error('export → ' + r.status + ' ' + JSON.stringify(r.body).slice(0, 200));
+      recipe = r.body;
+    } else {
+      const res = await fetch('/api/v1/steer/recipe/export', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await res.json().catch(() => null);
+      if (!res.ok) throw new Error('export → HTTP ' + res.status + ' ' + JSON.stringify(j).slice(0, 200));
+      recipe = j;
+    }
+    const fname = ablitRecipeFileName(recipe.name || body.name);
+    downloadBlob(new Blob([JSON.stringify(recipe, null, 2)], { type: 'application/json' }), fname);
+    $('ab-recipe-info').textContent = 'saved ' + fname + ' · ' + ablitRecipeSummaryText(recipe);
+  } catch (e) {
+    ablitErr((e && e.message) || String(e));
+  }
+}
+$('ab-recipe-save').addEventListener('click', ablitRecipeSave);
+
+/// レシピを読んで検証し、適用する (埋め込みはサーバーがメモリにだけ載せる)。
+$('ab-recipe-file').addEventListener('change', async () => {
+  const f = $('ab-recipe-file').files && $('ab-recipe-file').files[0];
+  ablitErr('');
+  $('ab-recipe-info').textContent = '';
+  if (!f) return;
+  let recipe;
+  try {
+    recipe = ablitRecipeFromText(await f.text());
+  } catch (e) {
+    ablitErr('recipe: ' + ((e && e.message) ? e.message : String(e)));
+    return;
+  }
+  try {
+    let res;
+    if (mock) {
+      res = mock.handle('POST', '/v1/steer/recipe/import?apply=1', recipe);
+    } else {
+      const r = await fetch('/api/v1/steer/recipe/import?apply=1', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(recipe),
+      });
+      res = { status: r.status, body: await r.json().catch(() => null) };
+    }
+    if (res.status !== 200) {
+      throw new Error('import → ' + res.status + ' ' + JSON.stringify(res.body).slice(0, 200));
+    }
+    // 画面をレシピの設定に合わせる (alpha はスライダの範囲へ丸める)。
+    setAblitRange(recipe.layer_from, recipe.layer_to);
+    const a = Math.max(ABLIT_ALPHA_MIN, Math.min(Number($('ab-alpha').max) || 2, recipe.alpha));
+    $('ab-alpha').value = String(a);
+    $('ab-alphav').textContent = Number($('ab-alpha').value).toFixed(2);
+    $('ab-recipe-name').value = recipe.name;
+    $('ab-recipe-embed').checked = !!(recipe.snapshots && Object.keys(recipe.snapshots).length);
+    await refreshAll('steer recipe');
+    $('ab-recipe-info').textContent = 'loaded · ' + ablitRecipeSummaryText(recipe) + ' · applied';
+  } catch (e) {
+    ablitErr((e && e.message) || String(e));
   }
 });
 

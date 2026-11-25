@@ -1279,6 +1279,245 @@ export function ablitCompareRows(offText, onText, opts = {}) {
   ];
 }
 
+// ---- バッチ評価 (task 833) ----------------------------------------------
+//
+// `compare off vs on` を 1 プロンプトから 1 行 1 プロンプトの一括評価へ広げる。
+// 実行 (OFF を全部 → ON を全部、進捗とキャンセル) は DOM 側
+// (`index2d.html`) が持ち、ここは行の組み立てと表の文字列化だけを持つ。
+
+/// 一括評価のプロンプト数の上限 (画面は 3-10 を想定)。
+export const ABLIT_EVAL_MAX = 10;
+/// 表に載せる応答の最大文字数 (1 行に潰す)。
+export const ABLIT_EVAL_SNIPPET = 120;
+
+/// テキストエリア → 評価するプロンプト (空行は捨て、上限で切る)。
+export function ablitEvalPrompts(text, opts = {}) {
+  return parsePromptList(text, { max: intOr(opts.max, ABLIT_EVAL_MAX) });
+}
+
+/// 拒否っぽい応答か (素朴なヒューリスティック。判定ではない)。
+const ABLIT_REFUSAL_RE =
+  /(i can(?:no|')?t|i cannot|i'm sorry|i am sorry|as an ai|i won't|i will not|i'm not able|i am not able|cannot assist|can't assist|i must decline|unable to help|not able to help)/i;
+
+export function ablitRefusalLike(text) {
+  return typeof text === 'string' && ABLIT_REFUSAL_RE.test(text);
+}
+
+/// 応答を 1 行の抜粋にする (改行は空白へ、長すぎれば … で切る)。
+export function ablitSnippet(text, max) {
+  const s = typeof text === 'string' ? text : '';
+  const one = s.replace(/\s+/g, ' ').trim();
+  const m = Math.max(8, intOr(max, ABLIT_EVAL_SNIPPET));
+  return one.length > m ? one.slice(0, m) + '…' : one;
+}
+
+/// 出力トークン数。分からなければ文字数で代用する (表示用)。
+function evalLen(text, tokens) {
+  const t = Number(tokens);
+  if (Number.isFinite(t) && t >= 0) return Math.round(t);
+  return typeof text === 'string' ? text.trim().length : 0;
+}
+
+/// `[{prompt, off, on, offTokens?, onTokens?}]` → 表の行。
+///
+/// - `offLen` / `onLen` は出力トークン数 (渡されなければ文字数)
+/// - `delta` は `onLen - offLen`
+/// - `changed` は空白を潰した応答が違うか
+/// - `offRefusal` / `onRefusal` は拒否っぽい言い回しか
+export function ablitEvalRows(items, opts = {}) {
+  const arr = Array.isArray(items) ? items : [];
+  const max = intOr(opts.max, ABLIT_EVAL_SNIPPET);
+  return arr.map((it, i) => {
+    const src = it && typeof it === 'object' ? it : {};
+    const prompt = typeof src.prompt === 'string' ? src.prompt : '';
+    const off = typeof src.off === 'string' ? src.off : '';
+    const on = typeof src.on === 'string' ? src.on : '';
+    const offLen = evalLen(off, src.offTokens);
+    const onLen = evalLen(on, src.onTokens);
+    const delta = onLen - offLen;
+    return {
+      index: i,
+      prompt,
+      off,
+      on,
+      offLen,
+      onLen,
+      delta,
+      deltaText: (delta > 0 ? '+' : '') + delta,
+      changed: off.replace(/\s+/g, ' ').trim() !== on.replace(/\s+/g, ' ').trim(),
+      offRefusal: ablitRefusalLike(off),
+      onRefusal: ablitRefusalLike(on),
+      offSnippet: ablitSnippet(off, max),
+      onSnippet: ablitSnippet(on, max),
+    };
+  });
+}
+
+/// 行 → 等幅の表 (`prompt | OFF | ON | len Δ`)。1 プロンプト 1 行。
+export function ablitEvalTable(rows) {
+  const arr = Array.isArray(rows) ? rows : [];
+  const head = ['prompt', 'OFF', 'ON', 'len Δ'];
+  const cells = arr.map((r) => [
+    String(r.prompt == null ? '' : r.prompt).replace(/\s+/g, ' '),
+    (r.offSnippet == null ? '' : String(r.offSnippet)) + (r.offRefusal ? ' [refuse]' : ''),
+    (r.onSnippet == null ? '' : String(r.onSnippet)) + (r.onRefusal ? ' [refuse]' : ''),
+    String(r.deltaText == null ? '' : r.deltaText),
+  ]);
+  const w = head.map((h, i) => Math.max(h.length, ...cells.map((c) => c[i].length)));
+  const line = (c) => c.map((x, i) => x + ' '.repeat(w[i] - x.length)).join(' | ');
+  return [line(head), w.map((n) => '-'.repeat(n)).join('-+-'), ...cells.map(line)].join('\n');
+}
+
+// ---- レシピ (task 833) ----------------------------------------------------
+//
+// `/2d` の設定を 1 ファイルにまとめ、`denno serve-flash --steer-recipe` で
+// 起動時に掛け直せるようにする。検証規則は engine の
+// `SteerRecipe::from_json` と同じ (版・名前・層範囲・有限の alpha/coef・
+// 埋め込みは base64 文字列)。
+
+/// レシピの JSON スキーマ版。
+export const RECIPE_VERSION = 1;
+/// レシピ 1 本の項数の上限。
+export const RECIPE_MAX_TERMS = 16;
+
+/// 画面の [from,to)・alpha・名前 → レシピの本文 (保存用)。
+/// `opts.embed` はサーバーに埋め込ませる指定 (`embed_snapshots`)。
+export function ablitRecipeBodyFromUi(range, alpha, opts = {}) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const r = Array.isArray(range) ? range : [];
+  if (r.length !== 2) throw new Error('range: [from, to] required');
+  const from = intOr(r[0], -1);
+  const to = intOr(r[1], -1);
+  if (from < 0 || to < 0) throw new Error('range: from/to must be >= 0');
+  if (from > to) throw new Error('range: from must be <= to');
+  const a = alpha == null ? 1 : Number(alpha);
+  if (!Number.isFinite(a)) throw new Error('alpha: must be a finite number');
+  const name = o.name == null ? 'recipe' : String(o.name);
+  if (!NAME_RE.test(name)) throw new Error('name: A-Z a-z 0-9 _ - only, at most 64 chars');
+  const body = {
+    name,
+    embed_snapshots: o.embed === true,
+    terms: [
+      { snapshot: o.a || ABLIT_A, coef: 1 },
+      { snapshot: o.b || ABLIT_B, coef: -1 },
+    ],
+    layers: [from, to],
+    alpha: a,
+    mode: 'project',
+  };
+  if (o.description != null) {
+    if (typeof o.description !== 'string') throw new Error('description must be a string');
+    body.description = o.description;
+  }
+  return body;
+}
+
+/// パース済みのレシピを検証して正規化する (実 API の `from_json` と同じ規則)。
+/// 不正は例外。未知のフィールドは黙って捨てずに弾く。
+export function ablitRecipeObject(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('recipe must be a JSON object');
+  const allowed = [
+    'version', 'name', 'description', 'model_id', 'mode', 'alpha',
+    'layer_from', 'layer_to', 'terms', 'snapshots',
+  ];
+  for (const k of Object.keys(v)) {
+    if (allowed.indexOf(k) < 0) throw new Error('unknown field ' + JSON.stringify(k));
+  }
+  if (!Object.prototype.hasOwnProperty.call(v, 'version')) throw new Error('version: required (1)');
+  if (v.version !== RECIPE_VERSION) throw new Error('version: expected ' + RECIPE_VERSION + ' (got ' + v.version + ')');
+  if (typeof v.name !== 'string' || !NAME_RE.test(v.name)) {
+    throw new Error('name: A-Z a-z 0-9 _ - only, at most 64 chars');
+  }
+  const out = { version: RECIPE_VERSION, name: v.name };
+  if (v.description != null) {
+    if (typeof v.description !== 'string') throw new Error('description must be a string');
+    out.description = v.description;
+  }
+  if (v.model_id != null) {
+    if (typeof v.model_id !== 'string') throw new Error('model_id must be a string');
+    if (v.model_id) out.model_id = v.model_id;
+  }
+  if (typeof v.mode !== 'string' || STEER_MODES.indexOf(v.mode) < 0) {
+    throw new Error('mode: ' + STEER_MODES.join(' / '));
+  }
+  out.mode = v.mode;
+  const alpha = v.alpha == null ? 1 : Number(v.alpha);
+  if (!Number.isFinite(alpha)) throw new Error('alpha: must be a finite number');
+  out.alpha = alpha;
+  const from = intOr(v.layer_from, -1);
+  const to = intOr(v.layer_to, -1);
+  if (from < 0 || to < 0) throw new Error('layer_from / layer_to: must be integers >= 0');
+  if (from > to) throw new Error('layer_from must be <= layer_to');
+  out.layer_from = from;
+  out.layer_to = to;
+  if (!Array.isArray(v.terms) || v.terms.length === 0) throw new Error('terms: at least one term is required');
+  if (v.terms.length > RECIPE_MAX_TERMS) throw new Error('terms: at most ' + RECIPE_MAX_TERMS);
+  out.terms = v.terms.map((t, i) => {
+    if (!t || typeof t !== 'object' || Array.isArray(t)) throw new Error('terms[' + i + ']: must be an object');
+    for (const k of Object.keys(t)) {
+      if (k !== 'snapshot' && k !== 'coef') throw new Error('terms[' + i + ']: unknown field ' + JSON.stringify(k));
+    }
+    if (typeof t.snapshot !== 'string' || !NAME_RE.test(t.snapshot)) {
+      throw new Error('terms[' + i + '].snapshot: A-Z a-z 0-9 _ - only');
+    }
+    const coef = Number(t.coef);
+    if (!Number.isFinite(coef)) throw new Error('terms[' + i + '].coef: must be a finite number');
+    return { snapshot: t.snapshot, coef };
+  });
+  if (v.snapshots != null) {
+    if (typeof v.snapshots !== 'object' || Array.isArray(v.snapshots)) {
+      throw new Error('snapshots: must be an object of { name: base64 }');
+    }
+    const outSnaps = {};
+    for (const k of Object.keys(v.snapshots)) {
+      if (!NAME_RE.test(k)) throw new Error('snapshots: bad name ' + JSON.stringify(k));
+      const s = v.snapshots[k];
+      if (typeof s !== 'string' || !s) throw new Error('snapshots[' + JSON.stringify(k) + ']: non-empty base64 string required');
+      outSnaps[k] = s;
+    }
+    out.snapshots = outSnaps;
+  }
+  return out;
+}
+
+/// レシピのテキスト (ファイル) → 検証済みのレシピ。
+export function ablitRecipeFromText(text) {
+  if (typeof text !== 'string' || !text.trim()) throw new Error('file is empty');
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch (e) {
+    throw new Error('not JSON: ' + ((e && e.message) ? e.message : String(e)));
+  }
+  return ablitRecipeObject(v);
+}
+
+/// レシピの 1 行要約 ("no_refusal · project · α 0.5 · layers 1-3 · embedded 2")。
+export function ablitRecipeSummaryText(r) {
+  if (!r || typeof r !== 'object') return '';
+  const parts = [String(r.name || '')];
+  parts.push(String(r.mode || ''));
+  parts.push('α ' + (r.alpha == null ? 1 : r.alpha));
+  parts.push('layers ' + intOr(r.layer_from, 0) + '-' + intOr(r.layer_to, 0));
+  const n = r.snapshots && typeof r.snapshots === 'object' ? Object.keys(r.snapshots).length : 0;
+  if (n) parts.push('embedded ' + n);
+  if (r.model_id) parts.push('model ' + r.model_id);
+  return parts.join(' · ');
+}
+
+/// レシピの保存ファイル名。
+export function ablitRecipeFileName(name) {
+  const n = String(name || 'recipe');
+  return n + '.recipe.json';
+}
+
+/// 評価の進捗表示 ("eval 2/5…" / "eval 2/5 (off)…")。
+export function ablitEvalProgress(done, total, phase) {
+  const t = Math.max(0, intOr(total, 0));
+  const d = Math.max(0, Math.min(t, intOr(done, 0)));
+  return 'eval ' + d + '/' + t + (phase ? ' (' + phase + ')' : '') + '…';
+}
+
 // ---- モック店 (shape が 404 のとき) ---------------------------------------
 
 /// 名前 → 32 bit の決定的な種 (モックの合成スコア用)。
@@ -1858,6 +2097,118 @@ export function createMockStore(shape, opts = {}) {
         st.snapshots.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
         const out = status();
         out.imported = jsonClone(snap);
+        return { status: 200, body: out };
+      }
+      // task 833: レシピ (持ち出し / 取り込み)。検証規則は実 API と同じ。
+      if (m === 'POST' && bare === '/v1/steer/recipe/export') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'body must be an object');
+        for (const k of Object.keys(body)) {
+          if (['name', 'description', 'embed_snapshots', 'terms', 'layers', 'alpha', 'mode'].indexOf(k) < 0) {
+            return err(400, 'unknown field ' + JSON.stringify(k));
+          }
+        }
+        const name = body.name == null ? 'recipe' : body.name;
+        if (typeof name !== 'string' || !NAME_RE.test(name)) {
+          return err(400, 'name: A-Z a-z 0-9 _ - only, at most 64 chars');
+        }
+        if (body.embed_snapshots != null && typeof body.embed_snapshots !== 'boolean') {
+          return err(400, 'embed_snapshots must be a boolean');
+        }
+        if (body.description != null && typeof body.description !== 'string') {
+          return err(400, 'description must be a string');
+        }
+        let base;
+        if (body.terms != null) {
+          const draft = {
+            version: RECIPE_VERSION, name,
+            mode: body.mode == null ? 'project' : body.mode,
+            alpha: body.alpha == null ? 1 : body.alpha,
+            layer_from: Array.isArray(body.layers) ? body.layers[0] : 0,
+            layer_to: Array.isArray(body.layers) ? body.layers[1] : s.layers,
+            terms: body.terms,
+          };
+          let recipe;
+          try {
+            recipe = ablitRecipeObject(draft);
+          } catch (e) {
+            return err(400, (e && e.message) ? e.message : String(e));
+          }
+          base = recipe;
+        } else {
+          if (!st.apply) return err(400, 'no active steering (pass terms or apply one first)');
+          base = {
+            version: RECIPE_VERSION, name, mode: st.apply.mode, alpha: st.apply.alpha,
+            layer_from: st.apply.layers[0], layer_to: st.apply.layers[1], terms: st.apply.terms,
+          };
+        }
+        base.model_id = 'mock';
+        if (body.description != null) base.description = body.description;
+        if (body.embed_snapshots === true) {
+          const snaps = {};
+          for (const t of base.terms) {
+            if (!st.snapshots.some((x) => x.name === t.snapshot)) {
+              return err(400, 'no such snapshot: ' + t.snapshot);
+            }
+            // 実 API は DNSTEER1 を base64 で載せる。モックは中身を持たない。
+            snaps[t.snapshot] = 'bW9jaw==';
+          }
+          base.snapshots = snaps;
+        }
+        return { status: 200, body: jsonClone(base) };
+      }
+      if (m === 'POST' && bare === '/v1/steer/recipe/import') {
+        let rv = body;
+        let wantApply = false;
+        if (body && typeof body === 'object' && !Array.isArray(body)
+          && Object.prototype.hasOwnProperty.call(body, 'recipe')) {
+          for (const k of Object.keys(body)) {
+            if (k !== 'recipe' && k !== 'apply') return err(400, 'unknown field ' + JSON.stringify(k));
+          }
+          if (body.apply != null && typeof body.apply !== 'boolean') return err(400, 'apply must be a boolean');
+          rv = body.recipe;
+          wantApply = body.apply === true;
+        }
+        let recipe;
+        try {
+          recipe = ablitRecipeObject(rv);
+        } catch (e) {
+          return err(400, (e && e.message) ? e.message : String(e));
+        }
+        const embedded = recipe.snapshots ? Object.keys(recipe.snapshots) : [];
+        if (recipe.layer_to > s.layers) return err(400, 'layers: to must be <= ' + s.layers);
+        for (const t of recipe.terms) {
+          if (embedded.indexOf(t.snapshot) < 0 && !st.snapshots.some((x) => x.name === t.snapshot)) {
+            return err(400, 'no such snapshot: ' + t.snapshot);
+          }
+        }
+        // 埋め込みはメモリにだけ載せる (実 API と同じ)。
+        for (const n of embedded) {
+          if (!st.snapshots.some((x) => x.name === n)) {
+            st.snapshots.push({ name: n, tokens: 0, created: now(), layers: s.layers });
+          }
+        }
+        st.snapshots.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        const doApply = wantApply || q.get('apply') === '1' || q.get('apply') === 'true';
+        const out = {
+          valid: true,
+          applied: false,
+          recipe: {
+            name: recipe.name, description: recipe.description || null, model_id: recipe.model_id || null,
+            mode: recipe.mode, alpha: recipe.alpha, layers: [recipe.layer_from, recipe.layer_to],
+            terms: recipe.terms, embedded,
+          },
+        };
+        if (doApply) {
+          st.apply = {
+            terms: recipe.terms.map((t) => ({ snapshot: t.snapshot, coef: t.coef })),
+            layers: [recipe.layer_from, recipe.layer_to],
+            alpha: recipe.alpha,
+            mode: recipe.mode,
+          };
+          st.epoch++;
+          out.applied = true;
+          out.steer = status();
+        }
         return { status: 200, body: out };
       }
       return { status: 404, body: apiError('not found: ' + m + ' ' + p) };

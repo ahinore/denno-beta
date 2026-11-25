@@ -177,7 +177,7 @@ impl Mode {
 }
 
 /// 名前付きの平均ベクトル。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     pub name: String,
     pub tokens: u64,
@@ -1543,6 +1543,413 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// task 833: 持ち運びできるレシピ (SteerRecipe)
+// ---------------------------------------------------------------------------
+//
+// `/2d` で見つけた (snapshot, layer range, alpha, mode) の組を 1 ファイルに
+// まとめ、`denno serve-flash --steer-recipe <path>` で起動時に掛け直せるように
+// する。スナップショットは `$DENNO_STEER_DIR/<name>.dns` を参照してもよいし、
+// `snapshots` に base64 で埋め込んで 1 ファイルで完結してもよい。
+//
+// JSON (version 1):
+//
+// ```json
+// {
+//   "version": 1,
+//   "name": "no_refusal",
+//   "description": "任意",
+//   "model_id": "flash-next-UD-IQ3_XXS",
+//   "mode": "project",
+//   "alpha": 0.5,
+//   "layer_from": 8,
+//   "layer_to": 32,
+//   "terms": [{ "snapshot": "ablit_A", "coef": 1.0 },
+//             { "snapshot": "ablit_B", "coef": -1.0 }],
+//   "snapshots": { "ablit_A": "<base64 DNSTEER1>" }
+// }
+// ```
+//
+// 埋め込みは**メモリにだけ**載せる (`apply_recipe`)。ディスクは触らない。
+
+/// レシピの JSON スキーマ版。
+pub const RECIPE_VERSION: u64 = 1;
+/// レシピ 1 本の項数の上限 (取り違え防止)。
+pub const MAX_RECIPE_TERMS: usize = 16;
+
+/// 適用の材料を 1 ファイルにまとめたもの。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteerRecipe {
+    pub name: String,
+    pub description: Option<String>,
+    /// モデル id (任意。空でない同士が食い違ったら適用しない)。
+    pub model_id: Option<String>,
+    pub mode: Mode,
+    pub alpha: f32,
+    /// `[layer_from, layer_to)`。
+    pub layer_from: usize,
+    pub layer_to: usize,
+    pub terms: Vec<Term>,
+    /// 埋め込みスナップショット (名前順)。
+    pub snapshots: Vec<Snapshot>,
+}
+
+fn recipe_usize(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<usize, String> {
+    let v = obj
+        .get(key)
+        .ok_or_else(|| format!("{key} が無い"))?
+        .as_u64()
+        .ok_or_else(|| format!("{key} は 0 以上の整数"))?;
+    if v > 1 << 20 {
+        return Err(format!("{key} が大きすぎる ({v})"));
+    }
+    Ok(v as usize)
+}
+
+impl SteerRecipe {
+    /// JSON を検証して読む。未知のフィールド・非有限・空 terms は `Err`。
+    pub fn from_json(v: &serde_json::Value) -> Result<SteerRecipe, String> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| "レシピは JSON オブジェクト".to_string())?;
+        for k in obj.keys() {
+            if !matches!(
+                k.as_str(),
+                "version"
+                    | "name"
+                    | "description"
+                    | "model_id"
+                    | "mode"
+                    | "alpha"
+                    | "layer_from"
+                    | "layer_to"
+                    | "terms"
+                    | "snapshots"
+            ) {
+                return Err(format!(
+                    "未知のフィールド {k:?} (version / name / description / model_id / mode / alpha / layer_from / layer_to / terms / snapshots のみ)"
+                ));
+            }
+        }
+        let version = obj
+            .get("version")
+            .ok_or_else(|| "version が無い (1)".to_string())?
+            .as_u64()
+            .ok_or_else(|| "version は 1 (整数)".to_string())?;
+        if version != RECIPE_VERSION {
+            return Err(format!(
+                "version {version} は未対応 ({RECIPE_VERSION} のみ)"
+            ));
+        }
+        let name = obj
+            .get("name")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "name は文字列".to_string())?;
+        validate_name(name)?;
+        let description = match obj.get("description") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(x) => Some(
+                x.as_str()
+                    .ok_or_else(|| "description は文字列".to_string())?
+                    .to_string(),
+            ),
+        };
+        let model_id = match obj.get("model_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(x) => {
+                let s = x
+                    .as_str()
+                    .ok_or_else(|| "model_id は文字列".to_string())?;
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            }
+        };
+        let mode_s = obj
+            .get("mode")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "mode は文字列 (project / subtract)".to_string())?;
+        let mode = Mode::parse(mode_s)
+            .ok_or_else(|| format!("未知の mode {mode_s:?} (project / subtract)"))?;
+        let alpha = match obj.get("alpha") {
+            Some(x) => {
+                let f = x.as_f64().ok_or_else(|| "alpha は数値".to_string())?;
+                if !f.is_finite() || f.abs() > 1e30 {
+                    return Err("alpha が有限の範囲に無い".into());
+                }
+                f as f32
+            }
+            None => 1.0,
+        };
+        if !alpha.is_finite() {
+            return Err("alpha が有限でない".into());
+        }
+        let layer_from = recipe_usize(obj, "layer_from")?;
+        let layer_to = recipe_usize(obj, "layer_to")?;
+        if layer_from > layer_to {
+            return Err(format!(
+                "layers の from {layer_from} が to {layer_to} より大きい"
+            ));
+        }
+        let tv = obj
+            .get("terms")
+            .ok_or_else(|| "terms が無い".to_string())?
+            .as_array()
+            .ok_or_else(|| "terms は配列".to_string())?;
+        if tv.is_empty() {
+            return Err("terms が空 (掛けないレシピは作らない)".into());
+        }
+        if tv.len() > MAX_RECIPE_TERMS {
+            return Err(format!(
+                "terms が多すぎる ({} > {MAX_RECIPE_TERMS})",
+                tv.len()
+            ));
+        }
+        let mut terms = Vec::with_capacity(tv.len());
+        for (i, t) in tv.iter().enumerate() {
+            let o = t
+                .as_object()
+                .ok_or_else(|| format!("terms[{i}] はオブジェクト"))?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "snapshot" | "coef") {
+                    return Err(format!("terms[{i}]: 未知のフィールド {k:?}"));
+                }
+            }
+            let snap = o
+                .get("snapshot")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("terms[{i}].snapshot は文字列"))?;
+            validate_name(snap)?;
+            let coef = o
+                .get("coef")
+                .and_then(|x| x.as_f64())
+                .ok_or_else(|| format!("terms[{i}].coef は数値"))?;
+            if !coef.is_finite() || coef.abs() > 1e30 {
+                return Err(format!("terms[{i}].coef が有限の範囲に無い"));
+            }
+            terms.push(Term {
+                snapshot: snap.to_string(),
+                coef: coef as f32,
+            });
+        }
+        let mut snapshots: Vec<Snapshot> = Vec::new();
+        if let Some(sv) = obj.get("snapshots") {
+            let m = sv
+                .as_object()
+                .ok_or_else(|| "snapshots は { name: base64 } のオブジェクト".to_string())?;
+            for (key, val) in m {
+                validate_name(key)?;
+                let b64 = val
+                    .as_str()
+                    .ok_or_else(|| format!("snapshots[{key:?}] は base64 文字列"))?;
+                let raw = base64_decode(b64)
+                    .map_err(|e| format!("snapshots[{key:?}]: {e}"))?;
+                let s = decode_snapshot(&raw)
+                    .map_err(|e| format!("snapshots[{key:?}]: {e}"))?;
+                if s.name != *key {
+                    return Err(format!(
+                        "snapshots[{key:?}] の中の名前が違う ({:?})",
+                        s.name
+                    ));
+                }
+                if !s.mean.iter().all(|x| x.is_finite()) {
+                    return Err(format!("snapshots[{key:?}] に非有限の値が入っている"));
+                }
+                snapshots.push(s);
+            }
+            snapshots.sort_by(|a, b| a.name.cmp(&b.name));
+            if let Some(first) = snapshots.first() {
+                for s in &snapshots[1..] {
+                    if (s.layers, s.n_hc, s.n_embd)
+                        != (first.layers, first.n_hc, first.n_embd)
+                    {
+                        return Err(format!(
+                            "埋め込みスナップショットの形が揃っていない ({:?} / {:?})",
+                            first.name, s.name
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(SteerRecipe {
+            name: name.to_string(),
+            description,
+            model_id,
+            mode,
+            alpha,
+            layer_from,
+            layer_to,
+            terms,
+            snapshots,
+        })
+    }
+
+    /// レシピ → JSON (`to_json` → 文字列 → `from_json` で同じものに戻る)。
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut o = serde_json::Map::new();
+        o.insert("version".into(), serde_json::json!(RECIPE_VERSION));
+        o.insert("name".into(), serde_json::json!(self.name));
+        if let Some(d) = &self.description {
+            o.insert("description".into(), serde_json::json!(d));
+        }
+        if let Some(m) = &self.model_id {
+            o.insert("model_id".into(), serde_json::json!(m));
+        }
+        o.insert("mode".into(), serde_json::json!(self.mode.name()));
+        o.insert("alpha".into(), serde_json::json!(self.alpha));
+        o.insert("layer_from".into(), serde_json::json!(self.layer_from));
+        o.insert("layer_to".into(), serde_json::json!(self.layer_to));
+        o.insert(
+            "terms".into(),
+            serde_json::json!(self
+                .terms
+                .iter()
+                .map(|t| serde_json::json!({"snapshot": t.snapshot, "coef": t.coef}))
+                .collect::<Vec<_>>()),
+        );
+        if !self.snapshots.is_empty() {
+            let mut m = serde_json::Map::new();
+            for s in &self.snapshots {
+                m.insert(
+                    s.name.clone(),
+                    serde_json::json!(base64_encode(&encode_snapshot(s))),
+                );
+            }
+            o.insert("snapshots".into(), serde_json::Value::Object(m));
+        }
+        serde_json::Value::Object(o)
+    }
+
+    /// ファイルを読んで検証する。
+    pub fn from_file(path: &Path) -> Result<SteerRecipe, String> {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{}: JSON でない: {e}", path.display()))?;
+        Self::from_json(&v)
+    }
+
+    /// 項が参照するスナップショットを埋め込む (メモリ上のものだけ)。
+    ///
+    /// 参照先がメモリにも埋め込みにも無ければ `Err` (黙って欠けたレシピを作らない)。
+    pub fn embed_snapshots(&mut self) -> Result<(), String> {
+        let have = snapshots();
+        let mut add: Vec<Snapshot> = Vec::new();
+        for t in &self.terms {
+            if self.snapshots.iter().any(|s| s.name == t.snapshot) {
+                continue;
+            }
+            let s = have
+                .iter()
+                .find(|s| s.name == t.snapshot)
+                .ok_or_else(|| format!("スナップショット {:?} が無い", t.snapshot))?;
+            add.push((**s).clone());
+        }
+        self.snapshots.extend(add);
+        self.snapshots.sort_by(|a, b| a.name.cmp(&b.name));
+        self.snapshots.dedup_by(|a, b| a.name == b.name);
+        Ok(())
+    }
+
+    /// 項と埋め込みの食い違い (terms の参照先が無い) を検査する。
+    fn check_terms_resolvable(&self) -> Result<(), String> {
+        for t in &self.terms {
+            let embedded = self.snapshots.iter().any(|s| s.name == t.snapshot);
+            let on_disk = snapshots().iter().any(|s| s.name == t.snapshot);
+            if !embedded && !on_disk {
+                return Err(format!("スナップショット {:?} が無い", t.snapshot));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// レシピの適用先。グローバルのステアリング状態を指す軽いハンドル。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SteerState;
+
+impl SteerState {
+    pub fn new() -> SteerState {
+        SteerState
+    }
+
+    /// 埋め込みスナップショットを**メモリにだけ**載せる (ディスクは書かない)。
+    /// 返り値は載せた本数。
+    pub fn load_embedded(&self, r: &SteerRecipe) -> Result<usize, String> {
+        let (shape, _) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
+        for s in &r.snapshots {
+            if s.layers != shape.n_layer || s.n_hc != shape.n_hc || s.n_embd != shape.n_embd {
+                return Err(format!(
+                    "埋め込みスナップショット {:?} の形が違う ({}x{}x{} / モデル {}x{}x{})",
+                    s.name, s.layers, s.n_hc, s.n_embd, shape.n_layer, shape.n_hc, shape.n_embd
+                ));
+            }
+            if s.mean.len() != shape.len() {
+                return Err(format!(
+                    "埋め込みスナップショット {:?} の本体長が違う",
+                    s.name
+                ));
+            }
+            push_snapshot(Arc::new(s.clone()));
+        }
+        Ok(r.snapshots.len())
+    }
+
+    /// レシピを検証して適用する (epoch が進む)。
+    pub fn apply_recipe(&self, r: &SteerRecipe) -> Result<Arc<Steer>, String> {
+        let (shape, model) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
+        if let Some(mid) = &r.model_id {
+            if !mid.is_empty() && !model.is_empty() && *mid != model {
+                return Err(format!(
+                    "レシピの model_id {mid:?} がモデル {model:?} と違う"
+                ));
+            }
+        }
+        if r.layer_to > shape.n_layer {
+            return Err(format!(
+                "layers の to {} が層数 {} を超える ({}-{})",
+                r.layer_to, shape.n_layer, r.layer_from, r.layer_to
+            ));
+        }
+        if r.terms.is_empty() {
+            return Err("terms が空".into());
+        }
+        self.load_embedded(r)?;
+        r.check_terms_resolvable()?;
+        set_apply(
+            r.terms.clone(),
+            r.layer_from,
+            r.layer_to,
+            r.alpha,
+            r.mode,
+        )
+    }
+}
+
+/// いまの適用状態からレシピを組み立てる (`embed` でスナップショットを埋め込む)。
+pub fn current_recipe(name: &str, embed: bool) -> Result<SteerRecipe, String> {
+    validate_name(name)?;
+    let info = apply_status().ok_or_else(|| "適用中のステアリングが無い".to_string())?;
+    let (_, model) = meta().ok_or_else(|| "モデルが未初期化".to_string())?;
+    let mut r = SteerRecipe {
+        name: name.to_string(),
+        description: None,
+        model_id: if model.is_empty() { None } else { Some(model) },
+        mode: info.mode,
+        alpha: info.alpha,
+        layer_from: info.from,
+        layer_to: info.to,
+        terms: info.terms,
+        snapshots: Vec::new(),
+    };
+    if embed {
+        r.embed_snapshots()?;
+    }
+    Ok(r)
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2552,6 +2959,256 @@ mod tests {
         }
         let all = stop_record().expect("保存");
         assert_eq!(all.tokens, 6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- task 833: レシピ ------------------------------------------------
+
+    /// 記録済みの A / B を埋め込んだレシピを作る (テスト用の材料)。
+    fn recipe_fixture(s: &Shape, dir: &Path) -> (SteerRecipe, Vec<Arc<Snapshot>>) {
+        std::env::set_var("DENNO_STEER_DIR", dir);
+        init(*s, "recipe-model");
+        for (name, seed) in [("A", -0.25f32), ("B", 0.75f32)] {
+            let toks = rows(s, 3, seed);
+            start_record(name).expect("記録開始");
+            for row in &toks {
+                for il in 0..s.n_layer {
+                    acc_host(il, row);
+                }
+            }
+            stop_record().expect("保存");
+        }
+        let snaps: Vec<Arc<Snapshot>> = snaps_cell().read().unwrap().as_ref().clone();
+        let mut r = SteerRecipe {
+            name: "rc".into(),
+            description: Some("test recipe".into()),
+            model_id: Some("recipe-model".into()),
+            mode: Mode::Project,
+            alpha: 0.5,
+            layer_from: 1,
+            layer_to: 3,
+            terms: vec![
+                Term {
+                    snapshot: "A".into(),
+                    coef: 1.0,
+                },
+                Term {
+                    snapshot: "B".into(),
+                    coef: -1.0,
+                },
+            ],
+            snapshots: Vec::new(),
+        };
+        r.embed_snapshots().expect("埋め込み");
+        (r, snaps)
+    }
+
+    /// to_json → 文字列 → from_json が同じレシピに戻り、埋め込みも保たれる。
+    #[test]
+    fn recipe_json_round_trip_keeps_embedded_snapshots() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("recipe-rt");
+        let s = shape();
+        let (r, _) = recipe_fixture(&s, &dir);
+        assert_eq!(r.snapshots.len(), 2, "埋め込みの本数");
+        let text = serde_json::to_string(&r.to_json()).expect("JSON");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("parse");
+        assert_eq!(v["version"], json!(RECIPE_VERSION));
+        let back = SteerRecipe::from_json(&v).expect("from_json");
+        assert_eq!(back, r, "往復で変わった");
+        // 埋め込みは base64 の文字列で、名前は項と同じ。
+        let snapobj = v["snapshots"].as_object().expect("snapshots");
+        assert_eq!(snapobj.len(), 2);
+        for (k, val) in snapobj {
+            assert!(val.as_str().map(|x| !x.is_empty()).unwrap_or(false), "{k}");
+        }
+        // ファイル経由でも同じ。
+        let path = dir.join("rc.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&r.to_json()).unwrap()).unwrap();
+        assert_eq!(SteerRecipe::from_file(&path).expect("from_file"), r);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 埋め込みレシピの適用は、ディスクのスナップショットで組んだ適用と
+    /// ビット一致し、**ディスクを書かない**。
+    #[test]
+    fn recipe_apply_matches_disk_and_writes_no_files() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("recipe-apply");
+        let s = shape();
+        let (r, _) = recipe_fixture(&s, &dir);
+        SteerState::new().apply_recipe(&r).expect("適用 (ディスク)");
+        let want = snapshot().apply.as_ref().expect("apply").clone();
+        let want_info = apply_status().expect("status");
+        assert_eq!((want_info.from, want_info.to), (1, 3));
+        assert_eq!(want_info.alpha, 0.5);
+        assert_eq!(want_info.mode, Mode::Project);
+
+        // 新しいプロセスを模す: メモリを捨て、ディスクにも何も無い。
+        *snaps_cell().write().unwrap() = Arc::new(Vec::new());
+        let empty = tmpdir("recipe-apply-empty");
+        std::env::set_var("DENNO_STEER_DIR", &empty);
+        SteerState::new().apply_recipe(&r).expect("適用 (埋め込み)");
+        assert_eq!(snapshots().len(), 2, "メモリへ載せた本数");
+        let got = snapshot().apply.as_ref().expect("apply").clone();
+        assert_eq!(got.v.len(), want.v.len());
+        for i in 0..want.v.len() {
+            assert_eq!(got.v[i].to_bits(), want.v[i].to_bits(), "v[{i}]");
+            assert_eq!(got.vhat[i].to_bits(), want.vhat[i].to_bits(), "vhat[{i}]");
+        }
+        // 1 トークンぶんの適用結果も一致する。
+        let mut h0 = rows(&s, 1, 0.125).pop().unwrap();
+        let mut h1 = h0.clone();
+        for il in 0..s.n_layer {
+            want.apply_one(il, &mut h0);
+            got.apply_one(il, &mut h1);
+        }
+        assert_eq!(h0, h1, "適用後の残差が違う");
+        // ディスクは空のまま (埋め込みはメモリだけ)。
+        let files: Vec<_> = std::fs::read_dir(&empty)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(files.is_empty(), "ディスクに書いた: {files:?}");
+        std::fs::remove_dir_all(&empty).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 壊れたレシピは `from_json` が弾く。
+    #[test]
+    fn recipe_json_rejects_bad_input() {
+        let _g = LOCK.lock().unwrap();
+        let base = |patch: serde_json::Value| -> serde_json::Value {
+            let mut v = json!({
+                "version": 1,
+                "name": "rc",
+                "mode": "project",
+                "alpha": 0.5,
+                "layer_from": 0,
+                "layer_to": 3,
+                "terms": [{ "snapshot": "A", "coef": 1.0 }],
+            });
+            for (k, x) in patch.as_object().unwrap() {
+                if x.is_null() {
+                    v.as_object_mut().unwrap().remove(k);
+                } else {
+                    v.as_object_mut().unwrap().insert(k.clone(), x.clone());
+                }
+            }
+            v
+        };
+        assert!(SteerRecipe::from_json(&base(json!({}))).is_ok());
+        // 未知のフィールド / 版 / 必須キー
+        assert!(SteerRecipe::from_json(&base(json!({"x": 1}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"version": 2}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"version": "1"}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"name": null}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"name": "a b"}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"mode": "bogus"}))).is_err());
+        // alpha / 層範囲 / terms
+        assert!(SteerRecipe::from_json(&base(json!({"alpha": "x"}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"alpha": 1e40}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"layer_from": -1}))).is_err());
+        assert!(
+            SteerRecipe::from_json(&base(json!({"layer_from": 4, "layer_to": 3}))).is_err()
+        );
+        assert!(SteerRecipe::from_json(&base(json!({"terms": []}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"terms": null}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"terms": [{"snapshot": "A"}]}))).is_err());
+        assert!(SteerRecipe::from_json(
+            &base(json!({"terms": [{"snapshot": "A", "coef": 1.0, "x": 1}]}))
+        )
+        .is_err());
+        // 埋め込み
+        assert!(SteerRecipe::from_json(&base(json!({"snapshots": "x"}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"snapshots": {"A": "!!!"}}))).is_err());
+        assert!(SteerRecipe::from_json(&base(json!({"snapshots": {"A": 1}}))).is_err());
+        // 名前が中身と違う / 中身が DNSTEER1 でない。
+        let good = base(json!({}));
+        let s = shape();
+        let snap = Snapshot {
+            name: "A".into(),
+            tokens: 1,
+            created: 1,
+            model: "recipe-model".into(),
+            layers: s.n_layer,
+            n_hc: s.n_hc,
+            n_embd: s.n_embd,
+            mean: vec![1.0; s.len()],
+        };
+        let b64 = base64_encode(&encode_snapshot(&snap));
+        let mut ok = good.clone();
+        ok.as_object_mut().unwrap().insert(
+            "snapshots".into(),
+            json!({ "A": b64.clone() }),
+        );
+        assert_eq!(SteerRecipe::from_json(&ok).unwrap().snapshots.len(), 1);
+        let mut misnamed = good.clone();
+        misnamed
+            .as_object_mut()
+            .unwrap()
+            .insert("snapshots".into(), json!({ "B": b64 }));
+        assert!(SteerRecipe::from_json(&misnamed).is_err(), "名前の食い違い");
+        let notdns = base64_encode(b"nope");
+        let mut bad = good;
+        bad.as_object_mut()
+            .unwrap()
+            .insert("snapshots".into(), json!({ "A": notdns }));
+        assert!(SteerRecipe::from_json(&bad).is_err(), "DNSTEER1 でない");
+    }
+
+    /// model_id / 層数 / 参照先の検証。埋め込みが形違いなら適用しない。
+    #[test]
+    fn recipe_apply_checks_model_range_and_shape() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("recipe-checks");
+        let s = shape();
+        let (r, snaps) = recipe_fixture(&s, &dir);
+        SteerState::new().apply_recipe(&r).expect("基準は通る");
+
+        let mut other = r.clone();
+        other.model_id = Some("another-model".into());
+        let e = SteerState::new().apply_recipe(&other).unwrap_err();
+        assert!(e.contains("model_id"), "{e}");
+        // model_id 無しは通る。
+        other.model_id = None;
+        SteerState::new().apply_recipe(&other).expect("model_id 無し");
+
+        let mut wide = r.clone();
+        wide.layer_to = s.n_layer + 1;
+        assert!(SteerState::new().apply_recipe(&wide).is_err(), "層数超過");
+
+        let mut missing = r.clone();
+        missing.terms.push(Term {
+            snapshot: "ghost".into(),
+            coef: 1.0,
+        });
+        assert!(SteerState::new().apply_recipe(&missing).is_err(), "無い参照");
+
+        // 埋め込みだけが形違い (4 層) → 適用しない。
+        let mut bad_shape = r.clone();
+        let mut bad = bad_shape.snapshots[0].clone();
+        bad.layers = 4;
+        bad.mean = vec![0.0; 4 * s.n_hc * s.n_embd];
+        bad_shape.snapshots[0] = bad;
+        assert!(SteerState::new().apply_recipe(&bad_shape).is_err(), "形違い");
+
+        // current_recipe は適用中の設定をそのまま写す。
+        SteerState::new().apply_recipe(&r).expect("適用");
+        let cur = current_recipe("saved", true).expect("current_recipe");
+        assert_eq!(cur.model_id.as_deref(), Some("recipe-model"));
+        assert_eq!((cur.layer_from, cur.layer_to), (1, 3));
+        assert_eq!(cur.mode, Mode::Project);
+        assert_eq!(cur.alpha, 0.5);
+        assert_eq!(cur.terms, r.terms);
+        assert_eq!(cur.snapshots.len(), 2, "項の参照を埋め込む");
+        for s in &cur.snapshots {
+            let want = snaps.iter().find(|x| x.name == s.name).expect("元");
+            assert_eq!(&s.mean, &want.mean);
+        }
+        clear_apply();
+        assert!(current_recipe("saved", false).is_err(), "適用が無い");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
