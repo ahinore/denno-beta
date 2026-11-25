@@ -994,29 +994,180 @@ async fn log_requests(
     let started = std::time::Instant::now();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
+    // task 911: クライアントの `x-request-id` を無害化して引き継ぐ。
+    // 無効 (空 / 制御文字だけ / 非 ASCII だけ) なら新しい ID を振る。
+    let request_id = req
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .map(|v| v.as_bytes())
+        .and_then(sanitize_request_id_bytes)
+        .unwrap_or_else(generate_request_id);
     // P877: ラベルは既知ルート名へ正規化する (未知のパスは `other`)。
     let endpoint = metrics::normalize_endpoint(&path);
     if logging::access_log_json() {
         // JSON 形式は 1 リクエスト 1 行 (応答後にまとめて出す)。
     } else {
-        tracing::info!("{} {}", method, path);
+        tracing::info!("{} {} rid={}", method, path, request_id);
     }
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
     let status = resp.status();
+    let elapsed = started.elapsed();
     // P877: HTTP カウンタ (endpoint, status)。
     metrics::record_http(endpoint, status.as_u16());
+    // task 911: 全応答 (SSE / NDJSON を含む) にリクエスト ID を付ける。
+    set_header_str(&mut resp, "x-request-id", &request_id);
+    // task 911: 完了した非ストリーミング JSON 応答にだけ計測ヘッダを足す。
+    // (SSE / NDJSON はボディが終わらないので対象外)
+    resp = add_timing_headers(resp, elapsed).await;
     if logging::access_log_json() {
         let line = logging::access_log_line(
             &method,
             &path,
             status.as_u16(),
-            started.elapsed().as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0,
+            &request_id,
         );
         tracing::info!(target: "denno_access", "{line}");
     } else {
-        tracing::info!("-> {}", status);
+        tracing::info!("-> {} rid={}", status, request_id);
     }
     resp
+}
+
+// ---------- task 911: リクエスト ID と計測ヘッダ ----------
+
+/// `x-request-id` として受理・返却する最大長 (byte。ASCII 前提)。
+pub const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// [`add_timing_headers`] が応答ボディを読み込む上限 (byte)。
+/// 生成応答は数 KB なので実質的に当たらない。
+const TIMING_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// クライアントのリクエスト ID を受け取るヘッダ名。
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// 生成 ID の連番 (プロセス内で単調増加)。
+static NEXT_REQUEST_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// 生成 ID の上位ビット (プロセス起動ごとに変わる 48 bit)。
+static REQUEST_ID_BASE: OnceLock<u64> = OnceLock::new();
+
+/// 送信元の `x-request-id` を無害化する。
+///
+/// ASCII の印字可能文字 (0x21..=0x7E) だけを残し、制御文字・空白・非 ASCII は
+/// 捨てる (`\"` と `\\` も落とす)。[`MAX_REQUEST_ID_LEN`] byte で切る。
+/// 有効な文字が残らない場合は `None` (呼び側が新しい ID を振る)。
+pub fn sanitize_request_id(raw: &str) -> Option<String> {
+    sanitize_request_id_bytes(raw.as_bytes())
+}
+
+/// [`sanitize_request_id`] の byte 版。ヘッダは非表示 byte (obs-text) を
+/// 含み得て `str` にならないので、ミドルウェアはこちらを使う。
+pub fn sanitize_request_id_bytes(raw: &[u8]) -> Option<String> {
+    let mut out = String::with_capacity(raw.len().min(MAX_REQUEST_ID_LEN));
+    for &b in raw {
+        if out.len() >= MAX_REQUEST_ID_LEN {
+            break;
+        }
+        if (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+            out.push(b as char);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 新しいリクエスト ID を振る (`req-` + base 12 hex + 連番 8 hex)。
+///
+/// base はプロセス起動時に一度だけ作る (時刻 ^ 乱数の下位 48 bit)。連番は
+/// プロセス内で単調増加するので、同じプロセスの ID は衝突せず辞書順も
+/// 時刻順になる。
+pub fn generate_request_id() -> String {
+    let base = *REQUEST_ID_BASE.get_or_init(|| {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        (ns ^ rand::random::<u64>()) & 0x0000_ffff_ffff_ffff
+    });
+    let seq = NEXT_REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32;
+    format!("req-{base:012x}{seq:08x}")
+}
+
+/// 応答ヘッダを 1 個上書きする (値がヘッダとして不正なら何もしない)。
+fn set_header_str(resp: &mut Response, name: &'static str, value: &str) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(value) {
+        resp.headers_mut().insert(axum::http::HeaderName::from_static(name), v);
+    }
+}
+
+/// JSON 応答から生成トークン数を読む (`usage.output_tokens` (Anthropic) /
+/// `usage.completion_tokens` (OpenAI) / `eval_count` (Ollama))。
+fn body_output_tokens(v: &serde_json::Value) -> Option<u64> {
+    v.get("usage")
+        .and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens")))
+        .and_then(|n| n.as_u64())
+        .or_else(|| v.get("eval_count").and_then(|n| n.as_u64()))
+}
+
+/// task 911: 完了した非ストリーミング JSON 応答に計測ヘッダを足す。
+///
+/// - `x-denno-ttft-ms`: リクエスト受付から応答完成までの壁時計 (ms)。
+///   非ストリーミング応答ではボディの最初の byte が生成完了後に出るため、
+///   これは HTTP 上の TTFT (= 応答全体の待ち時間) になる。エンジンは
+///   サーバ crate へ最初のトークンの時刻を公開していない
+///   (`scheduler.rs` の `first_token_at` は非公開・別ファイル) ので、
+///   prefill と decode の内訳は測れない。
+/// - `x-denno-decode-tps`: `output_tokens / 壁時計` の end-to-end スループット
+///   (tokens/s)。prefill を含むので真の decode 速度の下限。Ollama 経路の
+///   `eval_duration` 近似と同じ方針。
+///
+/// JSON でも生成結果でない応答 (usage が無い `/health` 等) には付けない。
+/// ボディは読み込んでそのまま返す (内容・順序は変えない)。
+async fn add_timing_headers(resp: Response, elapsed: std::time::Duration) -> Response {
+    let is_json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, TIMING_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("response body could not be buffered for timing headers: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let out_tokens = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| body_output_tokens(&v));
+    if let Some(out_tokens) = out_tokens {
+        let secs = elapsed.as_secs_f64();
+        let ttft_ms = secs * 1000.0;
+        let tps = if secs > 0.0 { out_tokens as f64 / secs } else { 0.0 };
+        let mut hdrs = axum::http::HeaderMap::new();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{ttft_ms:.1}")) {
+            hdrs.insert(axum::http::HeaderName::from_static("x-denno-ttft-ms"), v);
+        }
+        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{tps:.2}")) {
+            hdrs.insert(axum::http::HeaderName::from_static("x-denno-decode-tps"), v);
+        }
+        for (name, value) in hdrs.iter() {
+            parts.headers.insert(name.clone(), value.clone());
+        }
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 /// P877: Prometheus text exposition format 0.0.4。

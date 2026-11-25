@@ -186,7 +186,17 @@ pub fn access_log_json() -> bool {
 
 /// 1 リクエストぶんの JSON アクセスログ行 (`--log-format json`)。
 /// `log_requests` ミドルウェアが応答後に 1 行だけ出す。
-pub fn access_log_line(method: &str, path: &str, status: u16, duration_ms: f64) -> String {
+///
+/// task 911: `request_id` は応答ヘッダ `x-request-id` と同じ値
+/// (クライアントが送った ID の無害化版、または生成した ID)。ログ行と
+/// クライアント側の記録を突き合わせるための鍵になる。
+pub fn access_log_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: f64,
+    request_id: &str,
+) -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -197,6 +207,7 @@ pub fn access_log_line(method: &str, path: &str, status: u16, duration_ms: f64) 
         "path": path,
         "status": status,
         "duration_ms": duration_ms,
+        "request_id": request_id,
     })
     .to_string()
 }
@@ -360,11 +371,12 @@ mod tests {
     fn access_log_json_toggle_and_line_shape() {
         set_access_log_json(true);
         assert!(access_log_json());
-        let line = access_log_line("POST", "/v1/messages", 200, 12.5);
+        let line = access_log_line("POST", "/v1/messages", 200, 12.5, "req-000000000001");
         let v: serde_json::Value = serde_json::from_str(&line).expect("JSON として読めない");
         assert_eq!(v["method"], "POST");
         assert_eq!(v["path"], "/v1/messages");
         assert_eq!(v["status"], 200);
+        assert_eq!(v["request_id"], "req-000000000001");
         assert!((v["duration_ms"].as_f64().unwrap() - 12.5).abs() < 1e-9);
         assert!(v["ts_ms"].as_u64().unwrap() > 0);
         // 既定 (text) に戻す — 同じプロセスの他テストに漏らさない。
