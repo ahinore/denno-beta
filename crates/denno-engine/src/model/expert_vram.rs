@@ -1583,10 +1583,47 @@ mod gpu {
 
     /// expert 1 本ぶん (gate / up / down の 3 行列) のデバイス上の実体。
     pub struct ExpertDev {
+        /// task 834: 非同期 H2D の完了待ち (**先頭に置く**)。
+        ///
+        /// 構造体のフィールドは宣言順に drop されるので、`bufs` の VRAM を
+        /// `cuMemFree` で返す前に、このフィールドの `Drop` が DMA の完了を
+        /// ホストで待つ。順序を入れ替えると転送中の領域を解放する
+        /// (`unsafe` な use-after-free)。テスト
+        /// `cuda::h2d::tests::pending_drops_before_buffers` がこの順序を見ている。
+        pending: Option<crate::cuda::h2d::H2dPending>,
         bufs: ExpertBufs,
         shapes: [ExpertShape; 3],
         /// 3 行列の合計バイト数 (LRU の会計に使う)。
         bytes: usize,
+    }
+
+    /// task 834: 積んだが `ExpertDev` に渡していない非同期 H2D。
+    ///
+    /// スコープを抜けるときにホストで待つ (確保に失敗して VRAM を返す経路で、
+    /// 転送中の領域を解放しないため)。`take` したら `ExpertDev` 側が持つ。
+    #[derive(Default)]
+    struct PendingH2d(Option<u64>);
+
+    impl PendingH2d {
+        /// 新しいイベントだけを覚える (行列ごとに呼ぶので、最後の 1 本でよい:
+        /// 3 本は同じコピーストリームへ順に積まれるので、最後の完了が前を含む)。
+        fn set(&mut self, ev: Option<u64>) {
+            if ev.is_some() {
+                self.0 = ev;
+            }
+        }
+
+        fn take(&mut self) -> Option<u64> {
+            self.0.take()
+        }
+    }
+
+    impl Drop for PendingH2d {
+        fn drop(&mut self) {
+            if let Some(ev) = self.0.take() {
+                crate::cuda::h2d::sync(ev);
+            }
+        }
     }
 
     impl ExpertBufs {
@@ -1618,6 +1655,27 @@ mod gpu {
     }
 
     impl ExpertDev {
+        /// task 834: 実体を作る。`ev` は非同期 H2D を積んだときの完了イベント。
+        fn new_dev(bufs: ExpertBufs, shapes: [ExpertShape; 3], bytes: usize, ev: Option<u64>) -> Self {
+            Self {
+                pending: ev.map(crate::cuda::h2d::H2dPending::new),
+                bufs,
+                shapes,
+                bytes,
+            }
+        }
+
+        /// task 834: この expert のデバイス領域を読む前に呼ぶ (冪等)。
+        ///
+        /// 非同期 H2D を積んでいなければ何もしない (分岐 1 回)。
+        /// `ptr` / `gemv` の入口で呼ぶので、表を組む経路 (`ptr`) も
+        /// 1 本ずつ回す経路 (`gemv`) も必ず待ちが入る。
+        pub fn wait_ready(&self) {
+            if let Some(p) = &self.pending {
+                p.wait_for_compute();
+            }
+        }
+
         pub fn bytes(&self) -> usize {
             self.bytes
         }
@@ -1641,6 +1699,8 @@ mod gpu {
         /// 呼び出し側は**計算が終わるまで `Arc<ExpertDev>` を保持する**こと
         /// (保持している間は追い出されても実体が残る)。
         pub fn ptr(&self, m: ExpertMatrix) -> u64 {
+            // task 834: 非同期 H2D の完了を計算ストリームへ並べる (冪等)。
+            self.wait_ready();
             let i = m.index();
             match &self.bufs {
                 ExpertBufs::Direct(b) => b[i].ptr(),
@@ -1668,6 +1728,8 @@ mod gpu {
         /// ここで `false` が返るのは「載せた後にコンテキストが変わった」場合だけ。
         /// 途中で CPU に混ざると 1 expert の計算が 2 経路に割れるので、**エラー**にする。
         pub fn gemv(&self, m: ExpertMatrix, x: &[f32], out: &mut [f32]) -> Result<()> {
+            // task 834: 非同期 H2D の完了を計算ストリームへ並べる (冪等)。
+            self.wait_ready();
             let i = m.index();
             let s = self.shapes[i];
             let view = self.view(m)?;
@@ -1947,6 +2009,55 @@ mod gpu {
             rep.released = bytes_before.saturating_sub(bytes_after);
         }
         (rep, keys)
+    }
+
+    /// task 834: slab のスロットへ 3 行列を上げる。
+    ///
+    /// 非同期ゲート (`DENNO_EXPERT_H2D_ASYNC`) が立っていれば専用コピーストリームへ
+    /// 積むだけで戻る。完了待ちは `ExpertDev::wait_ready` (読む直前) と
+    /// `H2dPending` の `Drop` (VRAM を返す前) が担う。
+    fn upload_slab_parts(
+        h: &DevBuffer,
+        base: usize,
+        offs: [usize; 3],
+        parts: [&[u8]; 3],
+        src_pinned: bool,
+        pend: &mut PendingH2d,
+    ) -> anyhow::Result<()> {
+        for (i, part) in parts.iter().enumerate() {
+            let ev = h.upload_at_async(base + offs[i], part, src_pinned)?;
+            pend.set(ev);
+        }
+        Ok(())
+    }
+
+    /// task 834: 3 本を別々に確保して上げる ([`alloc_three`] の非同期版)。
+    ///
+    /// ゲート off / 転送元が pinned のときは従来の [`alloc_three`] と同一経路。
+    /// ゲート on のときは確保だけ先に済ませ、転送は [`DevBuffer::upload_at_async`]
+    /// (pinned リング + 専用コピーストリーム) に任せる。
+    fn alloc_three_maybe_async(
+        pinned: bool,
+        parts: [&[u8]; 3],
+        src_pinned: bool,
+        pend: &mut PendingH2d,
+    ) -> anyhow::Result<[DevBuffer; 3]> {
+        let biggest = parts.iter().map(|p| p.len()).max().unwrap_or(0);
+        if !crate::model::h2d_ring::take_async(
+            crate::model::h2d_ring::enabled(),
+            src_pinned,
+            biggest,
+            crate::cuda::h2d::MAX_SLOT_BYTES,
+        ) {
+            return alloc_three(pinned, parts[0], parts[1], parts[2]);
+        }
+        let one = |b: &[u8]| DevBuffer::alloc_tagged(b.len().max(1), crate::mem_audit::TAG_EXPERTS);
+        let bufs = [one(parts[0])?, one(parts[1])?, one(parts[2])?];
+        for (b, part) in bufs.iter().zip(parts.iter()) {
+            let ev = b.upload_at_async(0, part, false)?;
+            pend.set(ev);
+        }
+        Ok(bufs)
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。
@@ -2416,6 +2527,9 @@ mod gpu {
         };
         let mut slot: Option<crate::model::expert_slab::SlabSlot<DevBuffer>> = None;
         let mut slab_failed = !crate::model::expert_slab::slab_enabled();
+        // task 834: 非同期 H2D を積んだら完了イベントをここへ控える。確保に失敗して
+        // VRAM を返す経路では `Drop` が待ってから解放する。
+        let mut pend = PendingH2d::default();
         for attempt in 0..2 {
             if !slab_failed && slot.is_none() {
                 match crate::model::expert_slab::alloc_slot(slot_bytes) {
@@ -2435,11 +2549,10 @@ mod gpu {
                 Some(s) => {
                     let base = s.offset();
                     let h = s.handle();
-                    h.upload_at_from(base + offs[0], gb, src_pinned)
-                        .and_then(|_| h.upload_at_from(base + offs[1], ub, src_pinned))
-                        .and_then(|_| h.upload_at_from(base + offs[2], db, src_pinned))
+                    upload_slab_parts(&h, base, offs, [gb, ub, db], src_pinned, &mut pend)
                 }
-                None => alloc_three(pinned, gb, ub, db).map(|b| direct = Some(b)),
+                None => alloc_three_maybe_async(pinned, [gb, ub, db], src_pinned, &mut pend)
+                    .map(|b| direct = Some(b)),
             };
             match r {
                 Ok(()) => {
@@ -2494,11 +2607,7 @@ mod gpu {
             ALLOC_DEAD.store(false, Ordering::Relaxed);
         }
 
-        let dev = Arc::new(ExpertDev {
-            bufs,
-            shapes,
-            bytes: want,
-        });
+        let dev = Arc::new(ExpertDev::new_dev(bufs, shapes, want, pend.take()));
         g.insert(key, want, Arc::clone(&dev));
         Ok(Some(Acquired { dev, hit: false }))
     }
@@ -2606,8 +2715,11 @@ mod gpu {
             (0, [0usize; 3])
         };
         let mut bufs: Option<ExpertBufs> = None;
+        // task 834: 背景の上げ直しは専用コピーストリームへ積んで先へ進む
+        // (完了待ちは VRAM を読む直前と解放前)。
+        let mut pend = PendingH2d::default();
         if !crate::model::expert_slab::slab_enabled() {
-            bufs = alloc_three(pinned, gb, ub, db)
+            bufs = alloc_three_maybe_async(pinned, [gb, ub, db], false, &mut pend)
                 .ok()
                 .map(ExpertBufs::Direct);
         } else {
@@ -2615,17 +2727,14 @@ mod gpu {
                 Ok(slot) => {
                     let base = slot.offset();
                     let h = slot.handle();
-                    let r = h
-                        .upload_pinned_at(base + offs[0], gb)
-                        .and_then(|_| h.upload_pinned_at(base + offs[1], ub))
-                        .and_then(|_| h.upload_pinned_at(base + offs[2], db));
+                    let r = upload_slab_parts(&h, base, offs, [gb, ub, db], false, &mut pend);
                     if r.is_ok() {
                         bufs = Some(ExpertBufs::Slab { slot, offs });
                     }
                 }
                 // slab のチャンクが無い → この 1 本だけ per-expert 確保へ。
                 Err(_) => {
-                    bufs = alloc_three(pinned, gb, ub, db)
+                    bufs = alloc_three_maybe_async(pinned, [gb, ub, db], false, &mut pend)
                         .ok()
                         .map(ExpertBufs::Direct);
                 }
@@ -2636,11 +2745,7 @@ mod gpu {
             FB_ALLOC.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
-        let dev = Arc::new(ExpertDev {
-            bufs,
-            shapes,
-            bytes: want,
-        });
+        let dev = Arc::new(ExpertDev::new_dev(bufs, shapes, want, pend.take()));
         // 3. 挿入 (ロック内)。転送中に誰かが同じ鍵を入れたら、そちらを使う。
         let mut g = cache
             .lock()

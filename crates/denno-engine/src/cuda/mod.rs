@@ -53,6 +53,7 @@ mod attn;
 mod ctx;
 mod gdn;
 mod gemm;
+pub(crate) mod h2d;
 mod mix;
 mod moe_dec;
 mod moe_pf;
