@@ -143,6 +143,9 @@ pub struct ServeConfig {
     /// task 916: CORS の許可オリジン。None = `DENNO_CORS_ORIGIN` → 既定
     /// (ループバックのみ)。`*` またはカンマ区切りのオリジン一覧。
     pub cors_origin: Option<String>,
+    /// task 946: HTTP リクエストボディの上限 (MiB)。None = `DENNO_MAX_BODY_MB`
+    /// → 既定 16 MiB。超過は 413 + JSON 封筒。
+    pub max_body_mb: Option<u64>,
 }
 
 // ---------- Anthropic 形式エラー ----------
@@ -326,6 +329,81 @@ pub fn resolve_request_timeout_secs(cli: Option<u64>) -> u64 {
     cli.or_else(|| env_u64(REQUEST_TIMEOUT_SECS_ENV))
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS)
         .min(MAX_REQUEST_TIMEOUT_SECS)
+}
+
+// ---------- task 946: リクエストボディ上限 ----------
+
+/// `DENNO_MAX_BODY_MB` の env 名 (MiB 単位)。
+pub const MAX_BODY_MB_ENV: &str = "DENNO_MAX_BODY_MB";
+
+/// ボディ上限の既定値 (MiB)。長いプロンプト (数万トークン + tools) が
+/// 収まる一方で、無制限にはしない。
+pub const DEFAULT_MAX_BODY_MB: u64 = 16;
+
+/// ボディ上限の絶対上限 (MiB)。
+pub const MAX_BODY_MB_LIMIT: u64 = 4096;
+
+/// task 946: 実効のボディ上限 (MiB)。優先順は CLI > env > 既定 16 MiB。
+/// 0 は 1 MiB に、[`MAX_BODY_MB_LIMIT`] を超える値はそこに丸める。
+pub fn resolve_max_body_mb(cli: Option<u64>) -> u64 {
+    cli.or_else(|| env_u64(MAX_BODY_MB_ENV))
+        .unwrap_or(DEFAULT_MAX_BODY_MB)
+        .clamp(1, MAX_BODY_MB_LIMIT)
+}
+
+/// task 946: [`resolve_max_body_mb`] の byte 版 (`DefaultBodyLimit` 用)。
+pub fn resolve_max_body_bytes(cli_mb: Option<u64>) -> usize {
+    (resolve_max_body_mb(cli_mb) as usize).saturating_mul(1024 * 1024)
+}
+
+/// task 946: 413 の JSON 封筒 (他のエラーと同じ `{"type":"error", ...}` 形)。
+pub fn payload_too_large_response(max_body_bytes: usize) -> Response {
+    let body = json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": format!(
+                "request body too large: the configured limit is {max_body_bytes} bytes"
+            )
+        }
+    });
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response()
+}
+
+/// task 946: `Content-Length` が上限を超える要求を早期に 413 にし、
+/// 抽出器 (`DefaultBodyLimit`) が出す平文 413 を JSON 封筒へ置き換える。
+///
+/// `Content-Length` を信じない / 持たない chunked ボディは
+/// `DefaultBodyLimit` が読み込み中に打ち切り、その 413 をここで包む。
+async fn body_limit_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+    max_body_bytes: usize,
+) -> Response {
+    let declared = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if let Some(n) = declared {
+        if n > max_body_bytes as u64 {
+            return payload_too_large_response(max_body_bytes);
+        }
+    }
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        // ハンドラが自分で JSON の 413 を返した場合はそのまま通す。
+        let is_json = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
+            .unwrap_or(false);
+        if !is_json {
+            return payload_too_large_response(max_body_bytes);
+        }
+    }
+    resp
 }
 
 /// P873: ハンドラが応答を待つ上限。リクエスト期限が有効ならその少し後まで
@@ -987,6 +1065,21 @@ pub fn router_with_rate_limit(
     cors: CorsConfig,
     limiter: ratelimit::RateLimiter,
 ) -> Router {
+    // task 946: ボディ上限は env (`DENNO_MAX_BODY_MB`) → 既定 16 MiB。
+    // 明示指定は [`router_with_body_limit`] を使う。
+    router_with_body_limit(state, cors, limiter, resolve_max_body_bytes(None))
+}
+
+/// task 946: ボディ上限 (byte) を明示してルーターを組む。
+///
+/// 上限を超えるボディは HTTP 413 を `application/json` の
+/// `{"type":"error","error":{...}}` 封筒で返す。
+pub fn router_with_body_limit(
+    state: Arc<AppState>,
+    cors: CorsConfig,
+    limiter: ratelimit::RateLimiter,
+    max_body_bytes: usize,
+) -> Router {
     let cors = Arc::new(cors);
     let limiter = Arc::new(limiter);
     Router::new()
@@ -1024,6 +1117,12 @@ pub fn router_with_rate_limit(
         // 下の log_requests / CORS の層がこの 2 つにも掛かる。
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        // task 946: ボディ上限。`DefaultBodyLimit` は抽出器 (Bytes / Json) に
+        // 効き、413 はすぐ外側の `body_limit_middleware` が JSON 封筒へ包む。
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
+        .layer(axum::middleware::from_fn(move |req, next| async move {
+            body_limit_middleware(req, next, max_body_bytes).await
+        }))
         // task 931: レート制限。CORS 層より内側 (コード上は先) に置くことで、
         // 429 にも Allow-Origin などの CORS ヘッダが付く。
         .layer(axum::middleware::from_fn(move |req, next| {
@@ -1735,7 +1834,21 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
             format!("allowlist {:?}", cors.origins)
         }
     );
-    let app = router_with_cors(state.clone(), cors);
+    // task 946: ボディ上限を解決する (CLI > env > 既定 16 MiB)。
+    if cfg.max_body_mb == Some(0) {
+        anyhow::bail!("--max-body-mb must be >= 1");
+    }
+    let max_body_bytes = resolve_max_body_bytes(cfg.max_body_mb);
+    tracing::info!(
+        "request body limit: {} MiB",
+        max_body_bytes / (1024 * 1024)
+    );
+    let app = router_with_body_limit(
+        state.clone(),
+        cors,
+        ratelimit::RateLimiter::from_env(),
+        max_body_bytes,
+    );
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on http://{}", addr);
