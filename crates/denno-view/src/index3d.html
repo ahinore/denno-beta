@@ -143,7 +143,7 @@
   <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span> · <span class="warm">選択履歴 黄→橙</span></div>
   <div>rank rail (router 上): 上 = rank 1 · 大きさ/明るさ = 重み · 色 = expert の居場所の段</div>
   <div>heat: 選ばれた回数が多い expert ほど濃く光る (冷えるのに約 40 秒)</div>
-  <div>drag: rotate · wheel: zoom · space: pause · [h] chat · [c] theme · [s] snapshot · [m] motion</div>
+  <div>drag: rotate · wheel: zoom · space: pause · [h] chat · [c] theme · [s] snapshot · [m] motion · [F] fit · [g] layer</div>
 </div>
 <div id="layers" class="panel">
   <div>layers 00-47: <span class="vram">VRAM 常駐</span> / <span class="ram">加熱</span> /
@@ -164,9 +164,9 @@
 </div>
 <div id="err"></div>
 <div id="keys" class="panel" role="dialog" aria-label="keyboard shortcuts">
-  <div class="kh">keyboard <span class="dim">— ? で開閉</span></div>
+  <div class="kh">keyboard <span class="dim">— ? / H で開閉 · Esc で閉じる</span></div>
   <div id="keys-rows"></div>
-  <div class="kf">1-5 でカメラ / [ ] で層 / p で fps / c でテーマ / s で snapshot / m で idle orbit / f でフライト / space で停止 / h でチャット / ? でこの凡例</div>
+  <div class="kf">1-5 でカメラ / F で auto-fit / [ ] で層 / g + 数字で層ジャンプ / p で fps / c でテーマ / s で snapshot / m で idle orbit / f でフライト (Esc で戻る) / space で停止 / h でチャット / ? / H でこの凡例</div>
 </div>
 <div id="camlabel" class="panel"></div>
 <div id="insp" class="panel">
@@ -208,7 +208,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { decodeFrame, FrameDecodeError } from '/frames.mjs';
 import {
-  bookmarkForKey, bookmarkGoal, legendRows, toggleLegend, isLegendKey, legendFromQuery,
+  bookmarkForKey, bookmarkGoal, legendRows, isLegendKey, legendFromQuery,
   presetForKey, presetGoal, createCamAnim, startCamAnim, stepCamAnim,
   layerKind, stepLayer, clampLayer, activationStats, formatMagnitude,
   expertSummary, formatExpertSummary, isLayerStepKey, isFpsKey, overlayFromQuery,
@@ -216,6 +216,10 @@ import {
   THEME_COUNT, themeAt, themeIndex, cycleTheme, isThemeKey, themeCssVars,
   snapshotFilename, isSnapshotKey,
   createMotion, effectiveReduced, setEnvReduced, toggleReducedMotion, orbitEnabled, isMotionKey,
+  createHelpState, helpOpen, setHelpOpen, toggleHelp, closeHelp, isHelpKey, isHelpCloseKey,
+  fitCameraGoal, isAutoFitKey,
+  createLayerJump, beginLayerJump, cancelLayerJump, isLayerJumpKey, digitFromKey,
+  pushLayerDigit, jumpToLayer,
 } from '/keys3d.mjs';
 
 // ===== 実モデルの数 (GGUF ヘッダ実測) =====================================
@@ -295,7 +299,9 @@ controls.minDistance = 8; controls.maxDistance = 380;
 
 // ===== task 813: カメラブックマーク (1-4) と `?` のキーボード凡例 ==========
 // 位置と注視点は keys3d.mjs が持つ。ここは camera / controls に入れるだけ。
+// task 984: 凡例は ? / H で開き、Esc で閉じるモーダルとして扱う (状態は keys3d)。
 const keyState = { legend: false };
+const help = createHelpState(false);
 const keysEl = document.getElementById('keys');
 const camLabelEl = document.getElementById('camlabel');
 
@@ -303,6 +309,7 @@ const camLabelEl = document.getElementById('camlabel');
 // 純ロジックは keys3d.mjs。ここは DOM と three.js の状態をつなぐだけ。
 const camAnim = createCamAnim(0.45);
 const insp = { sel: 0 };
+const jump = createLayerJump(LAYERS);
 const fpsMeter = createFpsMeter(32);
 const fpsUi = {
   on: false,
@@ -379,6 +386,17 @@ function applyPreset(preset) {
   showCamLabel('camera: ' + preset.name + ' (' + preset.key + ')');
   return true;
 }
+
+/** task 984: F — 層数から決めた目標へ滑らかに寄せる (全層が入る)。 */
+function applyAutoFit(nLayers) {
+  const goal = fitCameraGoal(nLayers);
+  if (!goal) return false;
+  if (fly.on) exitFly();
+  startCamAnim(camAnim, { pos: goal.pos, target: goal.target },
+               { pos: camera.position.toArray(), target: controls.target.toArray() });
+  showCamLabel('camera: auto-fit (' + goal.layers + ' layers · d ' + goal.distance.toFixed(0) + ')');
+  return true;
+}
 (() => {
   const rows = document.getElementById('keys-rows');
   if (!rows) return;
@@ -391,11 +409,11 @@ function applyPreset(preset) {
   }
 })();
 function setLegend(on) {
-  keyState.legend = !!on;
+  keyState.legend = setHelpOpen(help, on);
   if (keysEl) keysEl.classList.toggle('show', keyState.legend);
   return keyState.legend;
 }
-function toggleLegendUI() { return setLegend(toggleLegend(keyState)); }
+function toggleLegendUI() { return setLegend(toggleHelp(help)); }
 let camLabelTimer = 0;
 function showCamLabel(text) {
   if (!camLabelEl) return;
@@ -1166,9 +1184,30 @@ addEventListener('pointermove', (e) => {
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea/i.test(e.target.tagName)) return;
   noteInput();
+  // task 984: `?` / `H` で凡例モーダルを開閉、Esc で閉じる
+  if (isHelpKey(e)) { cancelLayerJump(jump); toggleLegendUI(); e.preventDefault(); return; }
+  if (isHelpCloseKey(e) && helpOpen(help)) { cancelLayerJump(jump); closeHelp(help); setLegend(false); return; }
+  // task 984: g のあと数字で層へ直接ジャンプ (0..47 に clamp)
+  if (isLayerJumpKey(e)) {
+    beginLayerJump(jump);
+    showCamLabel('layer jump: 数字で層へ (0-' + (LAYERS - 1) + ')');
+    e.preventDefault(); return;
+  }
+  if (jump.active) {
+    const dig = digitFromKey(e);
+    if (dig !== null) {
+      const il = pushLayerDigit(jump, dig);
+      if (il !== null) {
+        selectLayer(il);
+        if (jump.digits.length >= 2) jumpToLayer(jump);   // 2 桁で確定 (0..47)
+      }
+      e.preventDefault(); return;
+    }
+    // Esc か他のキーで保留を取り消し、以降の通常処理へ流す
+    cancelLayerJump(jump);
+  }
   // task 813: `?` で凡例、1-4 でカメラブックマーク
   if (isLegendKey(e)) { toggleLegendUI(); e.preventDefault(); return; }
-  if (e.key === 'Escape' && keyState.legend) { setLegend(false); return; }
   // task 904: p で fps、[ ] で層インスペクタ、1-5 でカメラプリセット
   if (isFpsKey(e)) { toggleFpsOverlay(); e.preventDefault(); return; }
   // task 939: c でテーマ、s でスナップショット、m で reduced motion
@@ -1179,13 +1218,15 @@ addEventListener('keydown', (e) => {
     showCamLabel('motion: ' + (frozen ? 'reduced (orbit frozen)' : 'orbit on'));
     e.preventDefault(); return;
   }
+  // task 984: F で auto-fit (全層が入る位置へ)。小文字 f の fly mode とは別。
+  if (isAutoFitKey(e)) { applyAutoFit(LAYERS); e.preventDefault(); return; }
   const dstep = isLayerStepKey(e);
   if (dstep) { selectLayer(stepLayer(insp.sel, dstep, LAYERS)); e.preventDefault(); return; }
   const pg = presetForKey(e.key);
   if (pg) { applyPreset(pg); e.preventDefault(); return; }
   const bm = bookmarkForKey(e.key);
   if (bm) { applyBookmark(bm); e.preventDefault(); return; }
-  if (e.key === 'f' || e.key === 'F') { fly.on ? exitFly() : enterFly(); e.preventDefault(); return; }
+  if (e.key === 'f') { fly.on ? exitFly() : enterFly(); e.preventDefault(); return; }
   if (e.key === 'Escape' && fly.on) { exitFly(); return; }
   if (fly.on) fly.keys.add(e.code);
 });
@@ -2038,7 +2079,7 @@ document.getElementById('hidec').addEventListener('click', () => chatEl.box.clas
 addEventListener('keydown', (e) => {
   if (e.target && /input|textarea/i.test(e.target.tagName)) return;
   if (e.code === 'Space') { demo.paused = !demo.paused; e.preventDefault(); }
-  if (e.key === 'h' || e.key === 'H') chatEl.box.classList.toggle('hide');
+  if (e.key === 'h') chatEl.box.classList.toggle('hide');   // H は凡例 (? / H) が使う
 });
 
 // ?shot — 固定ステップ数だけ進めて canvas を #dump に書き出す
