@@ -839,6 +839,45 @@
         );
     }
 
+    /// task 850: 層間先読みのフックが実際に発火する (ゲート on で層 0 → 層 1 を
+    /// 2 トークン回し、観測・遷移・予測・積み込みのカウンタが動くことを見る)。
+    ///
+    /// 緑 = 分岐が発火した証拠、にするため、カウンタの差分で確かめる。
+    #[test]
+    fn markov_hook_fires_on_layer_path() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("markov_hook");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw0 = cache_test_layer(&f, &p);
+        let mut lw1 = layer_at(&f, &p, 0);
+        lw1.il = 1;
+        let x = cache_test_x(p.n_embd);
+
+        crate::model::exp_markov::set_enabled_for_tests(Some(true));
+        let _ = crate::model::exp_markov::stats_line();
+        let (l0, p0, pred0, _h0, sub0) = crate::model::exp_markov::test_counters();
+        // 8 トークン x 2 層 (後継の信頼フィルタが min_count=3 なので、
+        // 4 トークン目から予測が出る)。
+        for _ in 0..8 {
+            with_markov_next(Some(&lw1), || {
+                moe_ffn_quant_with(&p, &lw0, &x, None, false, Route::Cpu)
+            })
+            .expect("層 0 (markov on)");
+            with_markov_next(None, || {
+                moe_ffn_quant_with(&p, &lw1, &x, None, false, Route::Cpu)
+            })
+            .expect("層 1 (markov on)");
+        }
+        let (l1, p1, pred1, _h1, sub1) = crate::model::exp_markov::test_counters();
+        crate::model::exp_markov::set_enabled_for_tests(None);
+        assert_eq!(l1 - l0, 16, "層の観測回数が 8 トークン x 2 層でない");
+        assert!(p1 > p0, "層間の遷移が 1 本も数えられていない");
+        assert!(pred1 > pred0, "予測が出ていない (8 トークン目)");
+        assert!(sub1 > sub0, "予測 expert を背景スレッドへ積んでいない");
+    }
+
     /// task 263: prefill のバッチ経路が 8 トークンに 1 回だけ数えている。
     ///
     /// nt=24, k=n_expert_used なら標本は t=0,8,16 の 3 本 → 3 * k 回。
@@ -4518,3 +4557,107 @@
     // -----------------------------------------------------------------
 
 include!("tests_h2.rs");
+
+
+    // ---------------------------------------------------------------------
+    // task 862: page hint の配線 (冷たい範囲が実際に page cache から落ちる)
+    // ---------------------------------------------------------------------
+
+    /// ゲートを開き、合成 GGUF の 1 層で「prefill の冷たい範囲」を落として、
+    /// **page cache から本当に消えたこと**を `mincore(2)` で確かめる。
+    ///
+    /// 緑 = 通った証拠ではないので、`madvise` までで止まっていないこと
+    /// (= `posix_fadvise(DONTNEED)` まで届いていること) を見る。このホストでは
+    /// `madvise(MADV_DONTNEED)` 単独ではページが残る。
+    ///
+    /// 注意 (実測): 書いた直後のファイルは write 経路の大きい folio に載っており、
+    /// folio を丸ごと覆わない範囲は `invalidate_mapping_pages` が飛ばす。ここでは
+    /// 一度ファイル全体を追い出してから **読み直して** 実運用と同じ状態にする。
+    #[test]
+    #[cfg(feature = "par")]
+    fn page_hint_drops_cold_expert_pages() {
+        use crate::model::exp_page_hint as ph;
+        let _g = moe_test_guard();
+        const NE: usize = 64;
+        let dir = TempDir::new("pagehint862");
+        let path = write_expert_gguf_n(&dir, "ph.gguf", N_EMBD, N_FF, NE, 1);
+        // dirty のままだと fadvise が無効化しない。書いた内容を確定させてから開く。
+        {
+            use std::fs::OpenOptions;
+            let f = OpenOptions::new().write(true).open(&path).expect("open w");
+            f.sync_all().expect("sync_all");
+        }
+        let f = GgufFile::open(&path).expect("open");
+        let mut p = cache_test_params();
+        p.n_expert = NE;
+        let lw = cache_test_layer(&f, &p);
+        register_expert_maps(&f, std::slice::from_ref(&lw));
+        let tensors = [&lw.gate_exps, &lw.up_exps, &lw.down_exps];
+        // 1. 全体を追い出してから読み直す (実運用の「ディスクから読んだ直後」)。
+        let probe = |e: usize| -> usize {
+            let (map, base) = lw.gate_exps.map_base().expect("mmap 経路");
+            let stride = lw.gate_exps.expert_stride().expect("stride");
+            map.as_ptr() as usize + base + e * stride + (stride / 2 / 4096) * 4096
+        };
+        for w in tensors {
+            let (map, _) = w.map_base().expect("mmap 経路");
+            let _ = ph::drop_range(&map, 0, map.len());
+        }
+        // 追い出せたことを確かめる (writeback が残っていると何も落ちない)。
+        for _ in 0..50 {
+            if unsafe { crate::model::exp_pf::range_resident(probe(0), 4096) } == Some(false) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            for w in tensors {
+                let (map, _) = w.map_base().expect("mmap 経路");
+                let _ = ph::drop_range(&map, 0, map.len());
+            }
+        }
+        for w in tensors {
+            let mut acc = 0u64;
+            for &b in w.full() {
+                acc = acc.wrapping_add(b as u64);
+            }
+            std::hint::black_box(acc);
+        }
+        // expert `e` の gate テンソルの真ん中の 1 ページ (端は隣と共有しうる)。
+        let mid = |e: usize| -> usize {
+            let (map, base) = lw.gate_exps.map_base().expect("mmap 経路");
+            let stride = lw.gate_exps.expert_stride().expect("stride");
+            map.as_ptr() as usize + base + e * stride + (stride / 2 / 4096) * 4096
+        };
+        let (m0, m62) = (mid(0), mid(62));
+        assert_eq!(
+            unsafe { crate::model::exp_pf::range_resident(m0, 4096) },
+            Some(true),
+            "読み直した直後は載っている"
+        );
+
+        ph::set_enabled_for_tests(Some(true));
+        ph::begin_prefill(4096);
+        ph::set_keep_for_tests(1);
+        // トークン 0 = 0..61 / トークン 1 = 62,63。末尾 1 トークン以外が cold。
+        let all: Vec<usize> = (0..62).collect();
+        ph::note_selection(0, 1, 62, &all);
+        ph::note_selection(0, 1, 2, &[62, 63]);
+        let plan = ph::peek_plan();
+        assert_eq!(plan.cold.first().map(|(l, _)| *l), Some(0), "{plan:?}");
+        assert_eq!(plan.cold[0].1, (0u16..62).collect::<Vec<_>>(), "cold の範囲");
+        page_hint_apply(std::slice::from_ref(&lw));
+        let line = ph::finish_prefill().unwrap_or_default();
+        ph::set_enabled_for_tests(None);
+
+        assert!(line.contains("failed=0"), "{line}");
+        assert!(!line.contains("dropped=0 "), "{line}");
+        assert_eq!(
+            unsafe { crate::model::exp_pf::range_resident(m0, 4096) },
+            Some(false),
+            "expert 0 のページは落ちる (madvise + posix_fadvise): {line}"
+        );
+        assert_eq!(
+            unsafe { crate::model::exp_pf::range_resident(m62, 4096) },
+            Some(true),
+            "末尾トークンの expert 62 は残る: {line}"
+        );
+    }

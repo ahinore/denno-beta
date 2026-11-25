@@ -314,6 +314,45 @@ impl DevBuffer {
         self.upload_ptr_at(offset, data.as_ptr(), bytes)
     }
 
+    /// task 834: 非同期 H2D (`DENNO_EXPERT_H2D_ASYNC`)。
+    ///
+    /// 戻り値 `Ok(Some(ev))` は「専用コピーストリームへ積んだ。完了は `ev`」。
+    /// `Ok(None)` は同期で上げた (ゲート off / リングが使えない / 転送元が pinned)。
+    /// 転送元が RAM tier の pinned 区間のときは、写さずにそのまま DMA する既存の
+    /// 利点 (`task 260`) を残すため同期経路のままにする。
+    pub(crate) fn upload_at_async(
+        &self,
+        offset: usize,
+        data: &[u8],
+        src_pinned: bool,
+    ) -> Result<Option<u64>> {
+        // 判定は純関数 ([`crate::model::h2d_ring::take_async`]) に寄せる
+        // (テストで同じ関数を通せるようにするため)。
+        if !crate::model::h2d_ring::take_async(
+            crate::model::h2d_ring::enabled(),
+            src_pinned,
+            data.len(),
+            super::h2d::MAX_SLOT_BYTES,
+        ) {
+            self.upload_at_from(offset, data, src_pinned)?;
+            return Ok(None);
+        }
+        let bytes = data.len();
+        assert!(
+            offset.saturating_add(bytes) <= self.bytes,
+            "DevBuffer::upload_at_async: 範囲外 (offset={offset}, bytes={bytes}, len={})",
+            self.bytes
+        );
+        match super::h2d::upload(self.ptr + offset as CUdeviceptr, data) {
+            Some(ev) => Ok(Some(ev)),
+            None => {
+                // リング・ストリーム・イベントのどれかが用意できない。数値は同じ。
+                self.upload_pinned_at(offset, data)?;
+                Ok(None)
+            }
+        }
+    }
+
     /// ホストのポインタから H2D する (転送元は pinned であること)。
     ///
     /// `upload_pinned_at` と `upload_at_from` の共通部分 (ストリームの有無・

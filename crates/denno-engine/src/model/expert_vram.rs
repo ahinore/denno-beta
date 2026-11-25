@@ -898,6 +898,29 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         self.stats.evictions = self.stats.evictions.saturating_add(out.len() as u64);
         out
     }
+
+    /// task 854: 上限を下げたあとに呼ぶ。`used + pinned <= cap` に収まるまで、
+    /// 冷たい順 (`tinylfu` は頻度最小 → 同点は古い順) に追い出して返す。
+    ///
+    /// 呼び出し側が返り値をすぐ drop すれば VRAM が空く。値は `Arc` などなら
+    /// 使用中の参照が生きている間は解放されない (use-after-free しない)。
+    ///
+    /// `pinned` (prefill の外部予約) だけで上限を超えているときは 1 本も
+    /// 追い出さずに止まる (外部予約はこの LRU からは動かせない)。
+    pub fn trim_to_cap(&mut self) -> Vec<(K, V)> {
+        let mut out = Vec::new();
+        while self.used_bytes + self.pinned_bytes > self.cap_bytes {
+            let Some(victim) = self.victim() else {
+                break;
+            };
+            match self.remove(&victim) {
+                Some(v) => out.push((victim, v)),
+                None => break,
+            }
+        }
+        self.stats.evictions = self.stats.evictions.saturating_add(out.len() as u64);
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,6 +1369,261 @@ fn env_expert_cap() -> usize {
         .saturating_mul(1024 * 1024)
 }
 
+// ---------------------------------------------------------------------------
+// task 854: 文脈長に応じた expert プールの増減 (DENNO_EXPERT_VRAM_DYNAMIC)
+// ---------------------------------------------------------------------------
+
+/// `DENNO_EXPERT_VRAM_DYNAMIC=1`: 文脈長に応じて expert プールの上限を動かす。**既定 off**。
+pub const EXPERT_VRAM_DYNAMIC_ENV: &str = "DENNO_EXPERT_VRAM_DYNAMIC";
+/// `DENNO_EXPERT_VRAM_DYNAMIC_MIN_MB`: 縮めても残す床 (MiB)。既定 4096。
+pub const EXPERT_VRAM_DYNAMIC_MIN_MB_ENV: &str = "DENNO_EXPERT_VRAM_DYNAMIC_MIN_MB";
+/// `DENNO_EXPERT_VRAM_DYNAMIC_HYST_TOKENS`: 見直しの最小間隔 (トークン)。既定 1024。
+pub const EXPERT_VRAM_DYNAMIC_HYST_TOKENS_ENV: &str = "DENNO_EXPERT_VRAM_DYNAMIC_HYST_TOKENS";
+/// `DENNO_EXPERT_VRAM_DYNAMIC_HYST_MB`: 見直しの最小差 (MiB)。既定 64。
+pub const EXPERT_VRAM_DYNAMIC_HYST_MB_ENV: &str = "DENNO_EXPERT_VRAM_DYNAMIC_HYST_MB";
+/// `DENNO_EXPERT_VRAM_DYNAMIC_KV_PCT`: KV 見積りの倍率 (%)。既定 100。
+///
+/// `200` は「KV と同量の予備 (prefill の作業域) も空ける」の意味。KV が小さい形で
+/// 効果を測りたいときのノブ。
+pub const EXPERT_VRAM_DYNAMIC_KV_PCT_ENV: &str = "DENNO_EXPERT_VRAM_DYNAMIC_KV_PCT";
+
+/// [`EXPERT_VRAM_DYNAMIC_MIN_MB_ENV`] の既定値 (MiB)。
+pub const DEFAULT_DYNAMIC_MIN_MB: usize = 4096;
+/// [`EXPERT_VRAM_DYNAMIC_HYST_TOKENS_ENV`] の既定値。
+pub const DEFAULT_DYNAMIC_HYST_TOKENS: usize = 1024;
+/// [`EXPERT_VRAM_DYNAMIC_HYST_MB_ENV`] の既定値 (MiB)。
+pub const DEFAULT_DYNAMIC_HYST_MB: usize = 64;
+
+/// 上限を動かす向き。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicDir {
+    /// 文脈が伸びた → 冷たい expert を落として上限を下げる。
+    Shrink,
+    /// 文脈が 0 に戻った → 上限を元へ戻す。
+    Grow,
+}
+
+/// 1 回ぶんの予算変更 (`from` / `to` はバイト)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynamicEvent {
+    pub dir: DynamicDir,
+    pub from: usize,
+    pub to: usize,
+    pub ctx_tokens: usize,
+}
+
+/// 文脈長から「expert に使ってよい上限」を出す規則 (**純粋データ**)。
+///
+/// - `base_cap` — `DENNO_EXPERT_VRAM_MB` のバイト数 (動かす前の上限)
+/// - `min_cap` — 縮めても残す床
+/// - `kv_per_token` — 文脈 1 トークンで KV が増えるバイト数 (モデルの形から)
+/// - `hyst_tokens` / `hyst_bytes` — 見直しの最小間隔 (振動で往復しないため)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynamicBudget {
+    pub base_cap: usize,
+    pub min_cap: usize,
+    pub kv_per_token: usize,
+    pub hyst_tokens: usize,
+    pub hyst_bytes: usize,
+}
+
+impl DynamicBudget {
+    /// 文脈長 `ctx_tokens` のときの上限。KV の見積りを引いて床で止める。
+    pub fn target_cap(&self, ctx_tokens: usize) -> usize {
+        let kv = ctx_tokens.saturating_mul(self.kv_per_token);
+        self.base_cap
+            .saturating_sub(kv)
+            .max(self.min_cap.min(self.base_cap))
+            .min(self.base_cap)
+    }
+}
+
+/// 予算変更の状態機械 (**GPU 非依存**。単体テストはこれだけを見る)。
+///
+/// 文脈が伸びる / 戻るのを跨いだときに、ヒステリシスの範囲内では 1 バイトも
+/// 動かさない (振動で cold expert を往復させない)。向きが反転した回だけは
+/// 2 倍の間隔を要求する (縮む・戻るを繰り返す文脈でも往復しない)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DynamicState {
+    last_ctx: usize,
+    last_cap: usize,
+    last_dir: Option<DynamicDir>,
+}
+
+impl DynamicState {
+    pub const fn new() -> Self {
+        DynamicState {
+            last_ctx: 0,
+            last_cap: 0,
+            last_dir: None,
+        }
+    }
+
+    /// 直前の適用値へ戻す (テストと、上限の再初期化用)。
+    pub fn reset(&mut self) {
+        *self = DynamicState::new();
+    }
+
+    /// 直近に適用した上限 (0 = まだ 1 度も動かしていない)。
+    pub fn cap(&self) -> usize {
+        self.last_cap
+    }
+
+    /// 直近に見た文脈長 (トークン)。
+    pub fn ctx(&self) -> usize {
+        self.last_ctx
+    }
+
+    /// 文脈長 `ctx` での新しい上限を決める。動かさないなら `None`。
+    ///
+    /// 状態 (`last_ctx` / `last_cap` / `last_dir`) は**動かしたときだけ**進める。
+    pub fn update(&mut self, b: &DynamicBudget, ctx: usize) -> Option<DynamicEvent> {
+        if b.base_cap == 0 {
+            return None;
+        }
+        let cur = if self.last_cap == 0 {
+            b.base_cap
+        } else {
+            self.last_cap
+        };
+        let to = b.target_cap(ctx);
+        let dir = match to.cmp(&cur) {
+            std::cmp::Ordering::Less => DynamicDir::Shrink,
+            std::cmp::Ordering::Greater => DynamicDir::Grow,
+            std::cmp::Ordering::Equal => return None,
+        };
+        let reverse = matches!(
+            (self.last_dir, dir),
+            (Some(DynamicDir::Shrink), DynamicDir::Grow) | (Some(DynamicDir::Grow), DynamicDir::Shrink)
+        );
+        let need_tokens = if reverse {
+            b.hyst_tokens.saturating_mul(2)
+        } else {
+            b.hyst_tokens
+        };
+        if ctx.abs_diff(self.last_ctx) < need_tokens {
+            return None;
+        }
+        if to.abs_diff(cur) < b.hyst_bytes {
+            return None;
+        }
+        self.last_ctx = ctx;
+        self.last_cap = to;
+        self.last_dir = Some(dir);
+        Some(DynamicEvent {
+            dir,
+            from: cur,
+            to,
+            ctx_tokens: ctx,
+        })
+    }
+}
+
+/// 動的予算の状態 ([`note_context`] が更新する)。
+static DYN_STATE: std::sync::Mutex<DynamicState> = std::sync::Mutex::new(DynamicState::new());
+
+/// いま LRU に適用している動的な上限 (0 = 動かしていない)。
+static DYN_CAP: AtomicUsize = AtomicUsize::new(0);
+
+/// `DENNO_EXPERT_VRAM_DYNAMIC` が立っているか。
+pub fn dynamic_enabled() -> bool {
+    flag_on(std::env::var(EXPERT_VRAM_DYNAMIC_ENV).ok().as_deref())
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// env とモデルの形から [`DynamicBudget`] を組み立てる。
+pub fn dynamic_budget(base_cap: usize, kv_per_token: usize) -> DynamicBudget {
+    let min_mb = env_usize(EXPERT_VRAM_DYNAMIC_MIN_MB_ENV, DEFAULT_DYNAMIC_MIN_MB);
+    let pct = env_usize(EXPERT_VRAM_DYNAMIC_KV_PCT_ENV, 100);
+    DynamicBudget {
+        base_cap,
+        min_cap: min_mb.saturating_mul(1 << 20).min(base_cap),
+        kv_per_token: kv_per_token.saturating_mul(pct) / 100,
+        hyst_tokens: env_usize(
+            EXPERT_VRAM_DYNAMIC_HYST_TOKENS_ENV,
+            DEFAULT_DYNAMIC_HYST_TOKENS,
+        ),
+        hyst_bytes: env_usize(EXPERT_VRAM_DYNAMIC_HYST_MB_ENV, DEFAULT_DYNAMIC_HYST_MB)
+            .saturating_mul(1 << 20),
+    }
+}
+
+/// [`note_context`] が適用した直近の上限 (0 = 未適用)。
+///
+/// [`gpu::refresh_cap`] が確保のたびに読む。**env は読まない** (フラグが
+/// off なら 0 のままなので、既定経路の予算は 1 バイトも変わらない)。
+pub fn dynamic_cap_now() -> usize {
+    DYN_CAP.load(Ordering::Relaxed)
+}
+
+/// 実効上限に動的な上限を被せる (純関数)。off / 未適用なら `base` のまま。
+pub fn dynamic_clamp_cap(base: usize) -> usize {
+    let cap = DYN_CAP.load(Ordering::Relaxed);
+    if cap == 0 || cap >= base {
+        base
+    } else {
+        cap
+    }
+}
+
+/// task 854: いまの文脈長を推論スレッドから知らせる。上限が動いたら 1 行出す。
+///
+/// `ctx_tokens` は**この forward が終わったあとの**文脈長 (prefill は
+/// 既存 + プロンプト長)、`kv_per_token` はモデルの形から出した 1 トークン
+/// あたりの KV 増分。文脈が 0 に戻ったら 0 を渡す。
+///
+/// 既定 off。`DENNO_EXPERT_VRAM_MB` が 0 のときも何もしない。
+pub fn note_context(ctx_tokens: usize, kv_per_token: usize) -> Option<DynamicEvent> {
+    if kv_per_token == 0 || !dynamic_enabled() {
+        return None;
+    }
+    let base = env_expert_cap();
+    if base == 0 {
+        return None;
+    }
+    let b = dynamic_budget(base, kv_per_token);
+    let Ok(mut st) = DYN_STATE.lock() else {
+        return None;
+    };
+    let ev = st.update(&b, ctx_tokens)?;
+    #[cfg(feature = "cuda")]
+    let (applied, freed, evicted) = gpu::apply_dynamic_cap(ev.to);
+    #[cfg(not(feature = "cuda"))]
+    let (applied, freed, evicted) = (ev.to, 0usize, 0usize);
+    DYN_CAP.store(applied, Ordering::Relaxed);
+    st.last_cap = applied;
+    drop(st);
+    let dir = match ev.dir {
+        DynamicDir::Shrink => "shrink",
+        DynamicDir::Grow => "grow",
+    };
+    eprintln!(
+        "[exp-dyn] {dir} ctx={} cap={} -> {} MiB (freed={} MiB experts={})",
+        ctx_tokens,
+        ev.from >> 20,
+        applied >> 20,
+        freed >> 20,
+        evicted
+    );
+    Some(ev)
+}
+
+/// テスト用: 動的予算の状態を初期化する (グローバルの取り合いを避ける)。
+#[cfg(test)]
+pub fn reset_dynamic_state_for_test() {
+    if let Ok(mut st) = DYN_STATE.lock() {
+        st.reset();
+    }
+    DYN_CAP.store(0, Ordering::Relaxed);
+}
+
+
 /// 予算が初期化されているか (= 外部予約が会計に載るか)。
 ///
 /// prefill の staging が [`budget_usage`] の `pinned` に二重計上されないように、
@@ -1583,10 +1861,47 @@ mod gpu {
 
     /// expert 1 本ぶん (gate / up / down の 3 行列) のデバイス上の実体。
     pub struct ExpertDev {
+        /// task 834: 非同期 H2D の完了待ち (**先頭に置く**)。
+        ///
+        /// 構造体のフィールドは宣言順に drop されるので、`bufs` の VRAM を
+        /// `cuMemFree` で返す前に、このフィールドの `Drop` が DMA の完了を
+        /// ホストで待つ。順序を入れ替えると転送中の領域を解放する
+        /// (`unsafe` な use-after-free)。テスト
+        /// `cuda::h2d::tests::pending_drops_before_buffers` がこの順序を見ている。
+        pending: Option<crate::cuda::h2d::H2dPending>,
         bufs: ExpertBufs,
         shapes: [ExpertShape; 3],
         /// 3 行列の合計バイト数 (LRU の会計に使う)。
         bytes: usize,
+    }
+
+    /// task 834: 積んだが `ExpertDev` に渡していない非同期 H2D。
+    ///
+    /// スコープを抜けるときにホストで待つ (確保に失敗して VRAM を返す経路で、
+    /// 転送中の領域を解放しないため)。`take` したら `ExpertDev` 側が持つ。
+    #[derive(Default)]
+    struct PendingH2d(Option<u64>);
+
+    impl PendingH2d {
+        /// 新しいイベントだけを覚える (行列ごとに呼ぶので、最後の 1 本でよい:
+        /// 3 本は同じコピーストリームへ順に積まれるので、最後の完了が前を含む)。
+        fn set(&mut self, ev: Option<u64>) {
+            if ev.is_some() {
+                self.0 = ev;
+            }
+        }
+
+        fn take(&mut self) -> Option<u64> {
+            self.0.take()
+        }
+    }
+
+    impl Drop for PendingH2d {
+        fn drop(&mut self) {
+            if let Some(ev) = self.0.take() {
+                crate::cuda::h2d::sync(ev);
+            }
+        }
     }
 
     impl ExpertBufs {
@@ -1618,6 +1933,27 @@ mod gpu {
     }
 
     impl ExpertDev {
+        /// task 834: 実体を作る。`ev` は非同期 H2D を積んだときの完了イベント。
+        fn new_dev(bufs: ExpertBufs, shapes: [ExpertShape; 3], bytes: usize, ev: Option<u64>) -> Self {
+            Self {
+                pending: ev.map(crate::cuda::h2d::H2dPending::new),
+                bufs,
+                shapes,
+                bytes,
+            }
+        }
+
+        /// task 834: この expert のデバイス領域を読む前に呼ぶ (冪等)。
+        ///
+        /// 非同期 H2D を積んでいなければ何もしない (分岐 1 回)。
+        /// `ptr` / `gemv` の入口で呼ぶので、表を組む経路 (`ptr`) も
+        /// 1 本ずつ回す経路 (`gemv`) も必ず待ちが入る。
+        pub fn wait_ready(&self) {
+            if let Some(p) = &self.pending {
+                p.wait_for_compute();
+            }
+        }
+
         pub fn bytes(&self) -> usize {
             self.bytes
         }
@@ -1641,6 +1977,8 @@ mod gpu {
         /// 呼び出し側は**計算が終わるまで `Arc<ExpertDev>` を保持する**こと
         /// (保持している間は追い出されても実体が残る)。
         pub fn ptr(&self, m: ExpertMatrix) -> u64 {
+            // task 834: 非同期 H2D の完了を計算ストリームへ並べる (冪等)。
+            self.wait_ready();
             let i = m.index();
             match &self.bufs {
                 ExpertBufs::Direct(b) => b[i].ptr(),
@@ -1668,6 +2006,8 @@ mod gpu {
         /// ここで `false` が返るのは「載せた後にコンテキストが変わった」場合だけ。
         /// 途中で CPU に混ざると 1 expert の計算が 2 経路に割れるので、**エラー**にする。
         pub fn gemv(&self, m: ExpertMatrix, x: &[f32], out: &mut [f32]) -> Result<()> {
+            // task 834: 非同期 H2D の完了を計算ストリームへ並べる (冪等)。
+            self.wait_ready();
             let i = m.index();
             let s = self.shapes[i];
             let view = self.view(m)?;
@@ -1799,8 +2139,38 @@ mod gpu {
     }
 
     /// task 149: LRU の上限をカードの実情へ合わせ直す。
+    ///
+    /// task 854: 動的予算 (`DENNO_EXPERT_VRAM_DYNAMIC`) が適用済みなら、
+    /// そちらの上限も被せる (off / 未適用なら `DYN_CAP` が 0 なので従来と同じ)。
     fn refresh_cap(g: &mut VramLru<ExpertKey, Arc<ExpertDev>>) {
-        g.set_cap(super::effective_expert_cap(env_cap()));
+        let base = super::effective_expert_cap(env_cap());
+        g.set_cap(super::dynamic_clamp_cap(base));
+    }
+
+    /// task 854: 動的予算の新しい上限を LRU へ反映する。
+    ///
+    /// 上限を下げたときは、`used + pinned <= cap` に収まるまで冷たい expert を
+    /// 追い出し、空になった slab のチャンクも解放する (VRAM を KV に明け渡す)。
+    /// 追い出した `ExpertDev` は使用中の参照が drop されるまで生きるので、
+    /// **use-after-free はしない** (このモジュールの既存の契約と同じ)。
+    ///
+    /// 戻り値は `(実際に適用した上限, 解放バイト, 追い出した本数)`。
+    pub fn apply_dynamic_cap(target: usize) -> (usize, usize, usize) {
+        let Some(c) = CACHE.get() else {
+            return (target, 0, 0);
+        };
+        let Ok(mut g) = c.lock() else {
+            return (target, 0, 0);
+        };
+        // カード予算 (`DENNO_VRAM_BUDGET_CARD`) が既に下げていれば、そちらを守る。
+        let cap = target.min(super::effective_expert_cap(env_cap()));
+        g.set_cap(cap);
+        let evicted = g.trim_to_cap();
+        let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
+        let n = evicted.len();
+        drop(evicted); // DevBuffer / SlabSlot が落ちる
+        let released = crate::model::expert_slab::release_empty(freed);
+        (cap, freed.saturating_add(released), n)
     }
 
     /// task 149: 確保失敗時の最終手段 (LRU を古い順に追い出して `need` を空ける)。
@@ -1949,6 +2319,55 @@ mod gpu {
         (rep, keys)
     }
 
+    /// task 834: slab のスロットへ 3 行列を上げる。
+    ///
+    /// 非同期ゲート (`DENNO_EXPERT_H2D_ASYNC`) が立っていれば専用コピーストリームへ
+    /// 積むだけで戻る。完了待ちは `ExpertDev::wait_ready` (読む直前) と
+    /// `H2dPending` の `Drop` (VRAM を返す前) が担う。
+    fn upload_slab_parts(
+        h: &DevBuffer,
+        base: usize,
+        offs: [usize; 3],
+        parts: [&[u8]; 3],
+        src_pinned: bool,
+        pend: &mut PendingH2d,
+    ) -> anyhow::Result<()> {
+        for (i, part) in parts.iter().enumerate() {
+            let ev = h.upload_at_async(base + offs[i], part, src_pinned)?;
+            pend.set(ev);
+        }
+        Ok(())
+    }
+
+    /// task 834: 3 本を別々に確保して上げる ([`alloc_three`] の非同期版)。
+    ///
+    /// ゲート off / 転送元が pinned のときは従来の [`alloc_three`] と同一経路。
+    /// ゲート on のときは確保だけ先に済ませ、転送は [`DevBuffer::upload_at_async`]
+    /// (pinned リング + 専用コピーストリーム) に任せる。
+    fn alloc_three_maybe_async(
+        pinned: bool,
+        parts: [&[u8]; 3],
+        src_pinned: bool,
+        pend: &mut PendingH2d,
+    ) -> anyhow::Result<[DevBuffer; 3]> {
+        let biggest = parts.iter().map(|p| p.len()).max().unwrap_or(0);
+        if !crate::model::h2d_ring::take_async(
+            crate::model::h2d_ring::enabled(),
+            src_pinned,
+            biggest,
+            crate::cuda::h2d::MAX_SLOT_BYTES,
+        ) {
+            return alloc_three(pinned, parts[0], parts[1], parts[2]);
+        }
+        let one = |b: &[u8]| DevBuffer::alloc_tagged(b.len().max(1), crate::mem_audit::TAG_EXPERTS);
+        let bufs = [one(parts[0])?, one(parts[1])?, one(parts[2])?];
+        for (b, part) in bufs.iter().zip(parts.iter()) {
+            let ev = b.upload_at_async(0, part, false)?;
+            pend.set(ev);
+        }
+        Ok(bufs)
+    }
+
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。
     ///
     /// 失敗した時点で先に確保したぶんはこの関数を抜けるときに drop され、
@@ -2015,7 +2434,7 @@ mod gpu {
         Some((
             g.used_bytes(),
             g.pinned_bytes(),
-            super::effective_expert_cap(env_cap()),
+            super::dynamic_clamp_cap(super::effective_expert_cap(env_cap())),
         ))
     }
 
@@ -2416,6 +2835,9 @@ mod gpu {
         };
         let mut slot: Option<crate::model::expert_slab::SlabSlot<DevBuffer>> = None;
         let mut slab_failed = !crate::model::expert_slab::slab_enabled();
+        // task 834: 非同期 H2D を積んだら完了イベントをここへ控える。確保に失敗して
+        // VRAM を返す経路では `Drop` が待ってから解放する。
+        let mut pend = PendingH2d::default();
         for attempt in 0..2 {
             if !slab_failed && slot.is_none() {
                 match crate::model::expert_slab::alloc_slot(slot_bytes) {
@@ -2435,11 +2857,10 @@ mod gpu {
                 Some(s) => {
                     let base = s.offset();
                     let h = s.handle();
-                    h.upload_at_from(base + offs[0], gb, src_pinned)
-                        .and_then(|_| h.upload_at_from(base + offs[1], ub, src_pinned))
-                        .and_then(|_| h.upload_at_from(base + offs[2], db, src_pinned))
+                    upload_slab_parts(&h, base, offs, [gb, ub, db], src_pinned, &mut pend)
                 }
-                None => alloc_three(pinned, gb, ub, db).map(|b| direct = Some(b)),
+                None => alloc_three_maybe_async(pinned, [gb, ub, db], src_pinned, &mut pend)
+                    .map(|b| direct = Some(b)),
             };
             match r {
                 Ok(()) => {
@@ -2494,11 +2915,7 @@ mod gpu {
             ALLOC_DEAD.store(false, Ordering::Relaxed);
         }
 
-        let dev = Arc::new(ExpertDev {
-            bufs,
-            shapes,
-            bytes: want,
-        });
+        let dev = Arc::new(ExpertDev::new_dev(bufs, shapes, want, pend.take()));
         g.insert(key, want, Arc::clone(&dev));
         Ok(Some(Acquired { dev, hit: false }))
     }
@@ -2606,8 +3023,11 @@ mod gpu {
             (0, [0usize; 3])
         };
         let mut bufs: Option<ExpertBufs> = None;
+        // task 834: 背景の上げ直しは専用コピーストリームへ積んで先へ進む
+        // (完了待ちは VRAM を読む直前と解放前)。
+        let mut pend = PendingH2d::default();
         if !crate::model::expert_slab::slab_enabled() {
-            bufs = alloc_three(pinned, gb, ub, db)
+            bufs = alloc_three_maybe_async(pinned, [gb, ub, db], false, &mut pend)
                 .ok()
                 .map(ExpertBufs::Direct);
         } else {
@@ -2615,17 +3035,14 @@ mod gpu {
                 Ok(slot) => {
                     let base = slot.offset();
                     let h = slot.handle();
-                    let r = h
-                        .upload_pinned_at(base + offs[0], gb)
-                        .and_then(|_| h.upload_pinned_at(base + offs[1], ub))
-                        .and_then(|_| h.upload_pinned_at(base + offs[2], db));
+                    let r = upload_slab_parts(&h, base, offs, [gb, ub, db], false, &mut pend);
                     if r.is_ok() {
                         bufs = Some(ExpertBufs::Slab { slot, offs });
                     }
                 }
                 // slab のチャンクが無い → この 1 本だけ per-expert 確保へ。
                 Err(_) => {
-                    bufs = alloc_three(pinned, gb, ub, db)
+                    bufs = alloc_three_maybe_async(pinned, [gb, ub, db], false, &mut pend)
                         .ok()
                         .map(ExpertBufs::Direct);
                 }
@@ -2636,11 +3053,7 @@ mod gpu {
             FB_ALLOC.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
-        let dev = Arc::new(ExpertDev {
-            bufs,
-            shapes,
-            bytes: want,
-        });
+        let dev = Arc::new(ExpertDev::new_dev(bufs, shapes, want, pend.take()));
         // 3. 挿入 (ロック内)。転送中に誰かが同じ鍵を入れたら、そちらを使う。
         let mut g = cache
             .lock()
@@ -2732,6 +3145,245 @@ mod gpu {
 mod tests {
     use super::*;
     use crate::model::expert_cache::ExpertKey;
+
+    // ---- task 854: 文脈長に応じた expert プールの増減 ----------------------
+
+    const MIB: usize = 1 << 20;
+
+    /// 実形 (Flash-Next 27B: full 24 層 x kv 2 x dh 256 x2 x f32) の 1 トークン増分。
+    const KV_PER_TOKEN: usize = 24 * 2 * (256 + 256) * 4;
+
+    fn dyn_budget(base_mb: usize, min_mb: usize) -> DynamicBudget {
+        DynamicBudget {
+            base_cap: base_mb * MIB,
+            min_cap: min_mb * MIB,
+            kv_per_token: KV_PER_TOKEN,
+            hyst_tokens: DEFAULT_DYNAMIC_HYST_TOKENS,
+            hyst_bytes: DEFAULT_DYNAMIC_HYST_MB * MIB,
+        }
+    }
+
+    /// 文脈が伸びると KV の見積りぶんだけ上限が下がり、床 (min) で止まる。
+    #[test]
+    fn dynamic_target_cap_subtracts_kv_and_stops_at_min() {
+        let b = dyn_budget(22000, 4096);
+        assert_eq!(b.target_cap(0), b.base_cap, "文脈 0 では元の上限");
+        assert_eq!(
+            b.target_cap(8192),
+            b.base_cap - 8192 * KV_PER_TOKEN,
+            "KV の見積りを引く"
+        );
+        // 床より下がらない (32k でも 4096 MiB 以上)。
+        assert_eq!(b.target_cap(32 * 1024), b.min_cap.max(b.base_cap - 32 * 1024 * KV_PER_TOKEN));
+        assert!(b.target_cap(32 * 1024) >= b.min_cap);
+        assert_eq!(b.target_cap(usize::MAX), b.min_cap, "溢れずに床で止まる");
+        // 床が上限より大きい設定でも上限を超えない。
+        let b2 = dyn_budget(2048, 4096);
+        assert_eq!(b2.target_cap(0), 2048 * MIB);
+        assert_eq!(b2.target_cap(64 * 1024), 2048 * MIB);
+    }
+
+    /// 文脈が伸びるたびに 1 段ずつ縮み、戻さない (単調)。
+    #[test]
+    fn dynamic_state_shrinks_in_steps_and_keeps_the_new_cap() {
+        let b = dyn_budget(22000, 4096);
+        let mut st = DynamicState::new();
+        assert_eq!(st.update(&b, 0), None, "文脈 0 では動かさない");
+        let mut caps = Vec::new();
+        for ctx in [1024usize, 2048, 4096, 8192] {
+            let ev = st.update(&b, ctx).expect("窓を跨いだら縮む");
+            assert_eq!(ev.dir, DynamicDir::Shrink);
+            assert_eq!(ev.to, b.target_cap(ctx));
+            assert_eq!(st.cap(), ev.to);
+            caps.push(ev.to);
+        }
+        assert!(caps.windows(2).all(|w| w[0] > w[1]), "単調に縮む: {caps:?}");
+    }
+
+    /// ヒステリシス内の揺れ (前回から 1024 トークン未満) では 1 バイトも動かさない。
+    #[test]
+    fn dynamic_state_ignores_context_jitter() {
+        let b = dyn_budget(22000, 4096);
+        let mut st = DynamicState::new();
+        let ev = st.update(&b, 4096).expect("最初の窓で縮む");
+        let cap = ev.to;
+        for ctx in [4600usize, 4300, 4900, 4096, 5000] {
+            assert_eq!(
+                st.update(&b, ctx),
+                None,
+                "前回 ({}) から 1024 トークン未満の揺れは無視: ctx={ctx}",
+                st.ctx()
+            );
+        }
+        assert_eq!(st.cap(), cap, "上限は動かない");
+        assert_eq!(st.ctx(), 4096, "状態も進まない");
+    }
+
+    /// 文脈が 0 に戻ったら上限を元へ戻す。
+    #[test]
+    fn dynamic_state_grows_back_on_context_reset() {
+        let b = dyn_budget(22000, 4096);
+        let mut st = DynamicState::new();
+        let shrunk = st.update(&b, 16384).expect("縮む").to;
+        assert!(shrunk < b.base_cap);
+        let ev = st.update(&b, 0).expect("文脈 0 で戻る");
+        assert_eq!(ev.dir, DynamicDir::Grow);
+        assert_eq!(ev.from, shrunk);
+        assert_eq!(ev.to, b.base_cap);
+        assert_eq!(st.cap(), b.base_cap);
+    }
+
+    /// 向きが反転する回は 2 倍の窓を要求する (縮む・戻るを短い間隔で往復しない)。
+    #[test]
+    fn dynamic_state_needs_a_wider_window_to_reverse() {
+        let b = dyn_budget(22000, 4096);
+        let mut st = DynamicState::new();
+        st.update(&b, 8192).expect("縮む");
+        // 1 窓ぶん (1024) は跨いだが 2 窓 (2048) 未満 → 反転しない。
+        assert_eq!(st.update(&b, 7000), None, "反転は 2 窓必要");
+        // 2 窓を跨げば戻る。
+        let ev = st.update(&b, 5000).expect("2 窓なら戻る");
+        assert_eq!(ev.dir, DynamicDir::Grow);
+    }
+
+    /// 上限が 0 (無効) なら何も決めない。
+    #[test]
+    fn dynamic_state_is_inert_without_a_base_cap() {
+        let b = dyn_budget(0, 4096);
+        let mut st = DynamicState::new();
+        assert_eq!(st.update(&b, 32768), None);
+        assert_eq!(st.cap(), 0);
+        // 動的予算の入口も、kv 0 / 上限未適用では動かない。
+        assert_eq!(note_context(32768, 0), None);
+        assert_eq!(dynamic_clamp_cap(12345), 12345, "未適用なら素通し");
+    }
+
+    /// env を触るテストを直列化し、終わったら元へ戻す。
+    static DYN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn new(names: &[&'static str]) -> Self {
+            EnvGuard(names.iter().map(|n| (*n, std::env::var(n).ok())).collect())
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (n, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
+            }
+        }
+    }
+
+    /// env のフラグで入口が開き、縮小 → 復帰の 2 方向が実際に適用される
+    /// (分岐が発火した証拠を数える)。
+    #[test]
+    fn note_context_applies_shrink_and_grow_only_when_enabled() {
+        let _g = DYN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            EXPERT_VRAM_DYNAMIC_ENV,
+            EXPERT_VRAM_MB_ENV,
+            EXPERT_VRAM_DYNAMIC_MIN_MB_ENV,
+            EXPERT_VRAM_DYNAMIC_HYST_TOKENS_ENV,
+            EXPERT_VRAM_DYNAMIC_HYST_MB_ENV,
+            EXPERT_VRAM_DYNAMIC_KV_PCT_ENV,
+        ]);
+        std::env::set_var(EXPERT_VRAM_MB_ENV, "22000");
+        std::env::remove_var(EXPERT_VRAM_DYNAMIC_ENV);
+        reset_dynamic_state_for_test();
+
+        // 既定 (フラグ off) では 1 バイトも動かない。
+        assert_eq!(note_context(8192, KV_PER_TOKEN), None, "既定 off");
+        assert_eq!(dynamic_cap_now(), 0);
+
+        std::env::set_var(EXPERT_VRAM_DYNAMIC_ENV, "1");
+        let base = 22000usize << 20;
+        let ev = note_context(8192, KV_PER_TOKEN).expect("flag on で縮む");
+        assert_eq!(ev.dir, DynamicDir::Shrink);
+        assert_eq!(ev.from, base);
+        assert_eq!(ev.to, base - 8192 * KV_PER_TOKEN);
+        assert_eq!(dynamic_cap_now(), ev.to, "適用値が読める (refresh_cap 用)");
+        assert_eq!(dynamic_clamp_cap(base), ev.to, "実効上限に被さる");
+
+        let grow = note_context(0, KV_PER_TOKEN).expect("文脈 0 で戻る");
+        assert_eq!(grow.dir, DynamicDir::Grow);
+        assert_eq!(grow.to, base);
+        assert_eq!(dynamic_cap_now(), base);
+        assert_eq!(dynamic_clamp_cap(base), base);
+
+        reset_dynamic_state_for_test();
+    }
+
+    /// 上限を下げたら冷たい順 (lru は古い順) に落ちる。
+    #[test]
+    fn trim_to_cap_evicts_the_coldest_first() {
+        let mut c: VramLru<u16, ()> = VramLru::new(5 * 100);
+        for k in 1..=5u16 {
+            assert!(c.make_room(100).is_ok());
+            c.insert(k, 100, ());
+        }
+        // 4, 5 を使って 1, 2, 3 を古い順に残す。
+        assert!(c.get_mut(&4).is_some());
+        assert!(c.get_mut(&5).is_some());
+        c.set_cap(3 * 100);
+        let evicted = c.trim_to_cap();
+        let keys: Vec<u16> = evicted.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![1, 2], "最終使用が古い順に落ちる");
+        assert_eq!(c.used_bytes(), 300);
+        assert_eq!(c.len(), 3);
+        // 既に収まっていれば何もしない。
+        assert!(c.trim_to_cap().is_empty());
+    }
+
+    /// 追い出しても、使用中の参照 (Arc) が生きている間は中身が有効 (use-after-free しない)。
+    #[test]
+    fn trim_to_cap_keeps_a_live_reference_valid() {
+        use std::sync::Arc;
+        let mut c: VramLru<u16, Arc<Vec<u8>>> = VramLru::new(2 * 100);
+        let hot = Arc::new(vec![7u8; 100]);
+        assert!(c.make_room(100).is_ok());
+        c.insert(1, 100, hot.clone());
+        assert!(c.make_room(100).is_ok());
+        c.insert(2, 100, Arc::new(vec![9u8; 100]));
+        // 1 番の参照を握ったまま上限を 100 バイトへ落とす。
+        c.set_cap(100);
+        let evicted = c.trim_to_cap();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, 1, "古い方が落ちる");
+        // 落とした側の参照はまだ読める (Arc が 1 本残っている)。
+        assert_eq!(hot.len(), 100);
+        assert_eq!(hot[0], 7);
+        assert_eq!(
+            Arc::strong_count(&hot),
+            2,
+            "返した値と手元の参照 = 転送中の領域を壊していない"
+        );
+        drop(evicted);
+        assert_eq!(Arc::strong_count(&hot), 1);
+    }
+
+    /// 外部予約 (prefill) だけで上限を超えているときは、LRU を空にしたら止まる。
+    #[test]
+    fn trim_to_cap_stops_when_only_pinned_exceeds_the_cap() {
+        let mut c: VramLru<u16, ()> = VramLru::new(5 * 100);
+        for k in 1..=2u16 {
+            assert!(c.make_room(100).is_ok());
+            c.insert(k, 100, ());
+        }
+        // prefill の作業域を 400 借りる (1 本追い出される)。
+        assert!(c.reserve_pinned(400).is_ok());
+        assert_eq!(c.pinned_bytes(), 400);
+        c.set_cap(300);
+        let evicted = c.trim_to_cap();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(c.used_bytes(), 0, "載っている分は全部落ちる");
+        assert_eq!(c.pinned_bytes(), 400, "外部予約は動かさない");
+    }
 
     // ---- task 256: 作業域の予約 ------------------------------------------
 

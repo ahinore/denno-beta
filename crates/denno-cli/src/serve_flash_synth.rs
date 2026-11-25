@@ -10,10 +10,10 @@
 //! (serve_flash.rs から `#[cfg(test)] #[path] mod flash_synth;` で include)。
 
 use super::{
-    aux_ctx_enabled, aux_ctx_max_tok, aux_ctx_ratio, echo_matches, kv_slot_max_tok, kv_slots_from,
-    model_reuse_enabled, pick_ctx, pick_slot_n, prefix_miss_line, prefix_splice_enabled, CtxPick,
-    Flash, GenReq, ModelShape, SlotMeta, SlotPick, TEST_BUILD_COUNT, TEST_FAIL_STEP,
-    TEST_LAST_PICK, TEST_LAST_REUSE,
+    aux_ctx_enabled, aux_ctx_max_tok, aux_ctx_ratio, echo_matches, first_mismatch,
+    kv_radix_enabled, kv_slot_max_tok, kv_slots_from, model_reuse_enabled, pick_ctx, pick_slot_n,
+    prefix_miss_line, prefix_splice_enabled, CtxPick, Flash, GenReq, ModelShape, SlotMeta,
+    SlotPick, TEST_BUILD_COUNT, TEST_FAIL_STEP, TEST_LAST_PICK, TEST_LAST_REUSE,
 };
 use crate::flash_telemetry::Telemetry;
 use denno_engine::model::intervene as iv;
@@ -1656,6 +1656,12 @@ fn intervene_http_shape_get_set_delete() {
     let _l = IV_LOCK.lock().unwrap();
     let dir = TempDir::new("flash-iv-http");
     let mut flash = build_flash(&dir);
+    // task 866: ステアリング (task 218) は同じ EPOCH カウンタを進めるが、介入の
+    // 設定セルは置き換えない。並列に走る steer テストの後に来ると
+    // `current_epoch()` と設定セルの epoch がずれ、下の `v["epoch"] == e0` が
+    // 落ちる (テストの実行順に依存する既存の脆さ)。ここで空の設定を入れ直して
+    // 基準を揃える (IV_LOCK の中で直列)。
+    iv::reset_for_test(&flash.shape.engine_shape());
     let e0 = iv::current_epoch();
 
     // GET /v1/model/shape
@@ -2668,3 +2674,219 @@ fn kv_slots_default_two_keeps_legacy_shape() {
     assert!(v["main"]["tokens"].as_u64().unwrap_or(0) > 0, "{v}");
     assert!(v["aux"].is_null(), "{v}");
 }
+
+// ---------------------------------------------------------------------------
+// task 866: radix (パス圧縮トライ) prefix cache
+// ---------------------------------------------------------------------------
+
+/// task 866: `DENNO_KV_RADIX` の読み方 (既定 off。他のフラグと違い opt-in)。
+#[test]
+fn kv_radix_truth_table() {
+    assert!(!kv_radix_enabled(None), "既定は off");
+    assert!(!kv_radix_enabled(Some("")), "空は off");
+    assert!(!kv_radix_enabled(Some("0")));
+    assert!(!kv_radix_enabled(Some("off")));
+    assert!(!kv_radix_enabled(Some("x")), "typo は off");
+    assert!(kv_radix_enabled(Some("1")));
+    assert!(kv_radix_enabled(Some("true")));
+    assert!(kv_radix_enabled(Some("yes")));
+    assert!(kv_radix_enabled(Some("on")));
+}
+
+/// task 866: `text` を含む文脈を持つスロットの index (ちょうど 1 本のはず)。
+fn slot_holding(flash: &Flash, text: &str) -> usize {
+    let key = flash.tok.encode(text).expect("encode");
+    assert!(!key.is_empty());
+    let hits: Vec<usize> = flash
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.ctx
+                .as_ref()
+                .is_some_and(|c| c.toks.windows(key.len()).any(|w| w == key.as_slice()))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(hits.len(), 1, "`{text}` を含むスロットが {hits:?}");
+    hits[0]
+}
+
+/// task 866: 共通 system プロンプトを持つ 2 会話を交互に回す。
+///
+/// - どちらも自分の前置きを全長再利用し続ける (相手のターンで消えない)。
+/// - 保存された 2 本のトークン列は system 前置きを共有し、トライでは 1 本の
+///   パスになる (ノード数が総トークン数より少ない)。
+#[test]
+fn kv_radix_shared_system_prompt_reuses_both() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::remove_var("DENNO_KV_SLOT_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+    std::env::set_var("DENNO_KV_RADIX", "1");
+
+    const SYS: &str = "you are a shared system prompt";
+    let dir = TempDir::new("flash-kv-radix-share");
+    let mut flash = build_flash_n(&dir, 4);
+    flash.max_ctx = 512;
+
+    let mut hist = [Vec::new(), Vec::new()];
+    let mut last = [0usize; 2];
+    for turn in 0..3 {
+        for i in 0..2 {
+            hist[i].push(("user".to_string(), format!("q{i}t{turn}")));
+            let g = flash
+                .generate(&conv_req(SYS, &hist[i]), no_emit)
+                .expect("generate");
+            let reuse = TEST_LAST_REUSE.load(Ordering::Relaxed);
+            if turn == 0 {
+                assert_eq!(reuse, 0, "c{i}: 1 ターン目で reuse した");
+            } else {
+                assert_eq!(reuse, last[i], "c{i} turn{turn}: 自分の前置きを全長再利用していない");
+            }
+            // このターンの文脈が入ったスロット (最後の user 本文を含む 1 本)。
+            let slot = slot_holding(&flash, &format!("q{i}t{turn}"));
+            last[i] = flash.slots[slot].ctx.as_ref().expect("ctx").toks.len();
+            hist[i].push(("assistant".to_string(), g.text));
+        }
+    }
+    // 2 本とも残り、トークン列は別 (混線していない)。
+    let a = flash.slots[0].ctx.as_ref().expect("slot0").toks.clone();
+    let b = flash.slots[1].ctx.as_ref().expect("slot1").toks.clone();
+    let shared = first_mismatch(&a, &b);
+    assert!(shared > 0, "system 前置きが共有されていない");
+    assert!(shared < a.len().min(b.len()), "トークン列が同一");
+    // トライでは共有した前置きが 1 本のパスになる。
+    let idx = super::kv_radix::KvRadix::from_slots(
+        flash
+            .slots
+            .iter()
+            .map(|s| s.ctx.as_ref().map(|c| c.toks.as_slice())),
+    );
+    assert!(
+        idx.total_tokens() <= a.len() + b.len() - shared,
+        "前置きが共有されていない: total={} a={} b={} shared={shared}",
+        idx.total_tokens(),
+        a.len(),
+        b.len()
+    );
+    assert_eq!(idx.lcps(&a, flash.slots.len())[0], a.len());
+    std::env::remove_var("DENNO_KV_RADIX");
+}
+
+/// task 866: 分岐 (turn 1 の assistant を別の内容に差し替える) の扱い。
+///
+/// 分岐のプロンプトは親の前置きと長く一致するが、親のキャッシュ全体の前置き
+/// ではない (KV は縮められない) ので **部分再利用はしない** (reuse=0)。
+/// radix の追い出しは前置きを共有する親を残し、無関係な文脈を捨てる。
+/// 親の会話はそのあと全長再利用でき、出力は新規構築と一致する。
+#[test]
+fn kv_radix_branch_turn2_keeps_parent() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::remove_var("DENNO_KV_SLOT_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+    std::env::set_var("DENNO_KV_RADIX", "1");
+
+    let dir = TempDir::new("flash-kv-radix-branch");
+    let mut flash = build_flash_n(&dir, 4);
+    flash.max_ctx = 512;
+
+    // 親の会話 (turn 1)。
+    let mut parent = vec![("user".to_string(), "parent q1".to_string())];
+    let g = flash.generate(&conv_req("parent sys", &parent), no_emit).expect("parent");
+    let parent_toks = flash.slots[0].ctx.as_ref().expect("slot0").toks.clone();
+    assert!(parent_toks.len() > 16);
+    parent.push(("assistant".to_string(), g.text.clone()));
+
+    // 無関係な会話 3 本で 4 スロットを埋める。
+    for i in 0..3 {
+        let h = vec![("user".to_string(), format!("other q{i}"))];
+        flash
+            .generate(&conv_req(&format!("other sys{i}"), &h), no_emit)
+            .expect("other");
+    }
+    assert_eq!(flash.slots.iter().filter(|s| s.ctx.is_some()).count(), 4);
+
+    // 分岐: turn 1 の続きを別の assistant 内容に差し替えて turn 2 を送る。
+    let branch = vec![
+        ("user".to_string(), "parent q1".to_string()),
+        ("assistant".to_string(), "a different reply".to_string()),
+        ("user".to_string(), "parent q2 branch".to_string()),
+    ];
+    flash
+        .generate(&conv_req("parent sys", &branch), no_emit)
+        .expect("branch");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "部分一致から KV を再利用した (縮められないので禁止)"
+    );
+    // 親の文脈は残っている (前置きを共有するので追い出されない)。
+    let kept = flash
+        .slots
+        .iter()
+        .any(|s| s.ctx.as_ref().is_some_and(|c| c.toks == parent_toks));
+    assert!(kept, "分岐で親の文脈が追い出された (前置き優先の追い出しが効いていない)");
+    // 親の続きは全長再利用できる。
+    let mut cont = parent.clone();
+    cont.push(("user".to_string(), "parent q2 own".to_string()));
+    let g2 = flash.generate(&conv_req("parent sys", &cont), no_emit).expect("cont");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        parent_toks.len(),
+        "親の続きが全長再利用できていない"
+    );
+    // 出力は新規構築と一致する (KV の同一性)。
+    let dir2 = TempDir::new("flash-kv-radix-branch-fresh");
+    let mut fresh = build_flash(&dir2);
+    fresh.max_ctx = 512;
+    let g3 = fresh.generate(&conv_req("parent sys", &cont), no_emit).expect("fresh");
+    assert_eq!(g2.text, g3.text, "再利用経路と新規構築で出力が違う");
+    std::env::remove_var("DENNO_KV_RADIX");
+}
+
+/// task 866: 同じ分岐シナリオを radix off (従来の LRU) で回すと、一番古い
+/// 親の文脈が追い出される。radix の追い出しが挙動を変えている証拠
+/// (両方とも出力は同じで、変わるのは「どれを残すか」だけ)。
+#[test]
+fn kv_radix_off_evicts_parent_lru() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::remove_var("DENNO_KV_SLOT_TOK");
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+    std::env::remove_var("DENNO_KV_RADIX");
+
+    let dir = TempDir::new("flash-kv-radix-off-branch");
+    let mut flash = build_flash_n(&dir, 4);
+    flash.max_ctx = 512;
+
+    let parent = vec![("user".to_string(), "parent q1".to_string())];
+    let g = flash.generate(&conv_req("parent sys", &parent), no_emit).expect("parent");
+    let parent_toks = flash.slots[0].ctx.as_ref().expect("slot0").toks.clone();
+    for i in 0..3 {
+        let h = vec![("user".to_string(), format!("other q{i}"))];
+        flash
+            .generate(&conv_req(&format!("other sys{i}"), &h), no_emit)
+            .expect("other");
+    }
+    let branch = vec![
+        ("user".to_string(), "parent q1".to_string()),
+        ("assistant".to_string(), "a different reply".to_string()),
+        ("user".to_string(), "parent q2 branch".to_string()),
+    ];
+    flash
+        .generate(&conv_req("parent sys", &branch), no_emit)
+        .expect("branch");
+    assert_eq!(TEST_LAST_REUSE.load(Ordering::Relaxed), 0);
+    let kept = flash
+        .slots
+        .iter()
+        .any(|s| s.ctx.as_ref().is_some_and(|c| c.toks == parent_toks));
+    assert!(!kept, "radix off で親が残った (LRU の規約が変わっている)");
+    let _ = g;
+}
+

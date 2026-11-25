@@ -306,6 +306,16 @@ pub fn submit(jobs: Vec<Vec<Part>>) -> usize {
     if !any_enabled() || jobs.is_empty() {
         return 0;
     }
+    submit_raw(jobs)
+}
+
+/// ゲートを見ずに job を積む (task 850: 層間先読みは自分のゲートで判断する)。
+///
+/// 待ち行列・ワーカーの作りは [`submit`] と同じ。落としても結果は変わらない。
+pub fn submit_raw(jobs: Vec<Vec<Part>>) -> usize {
+    if jobs.is_empty() {
+        return 0;
+    }
     let p = pool();
     let Ok(mut q) = p.q.lock() else { return 0 };
     let mut n = 0usize;

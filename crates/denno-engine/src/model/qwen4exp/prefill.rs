@@ -638,12 +638,14 @@ pub(crate) fn gemv_batch_inner(
 ) -> Result<()> {
     let (k, n) = (w.k(), w.n());
     match w.ty() {
-        GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => {
+        // task 858: GPU GEMM を試す型は [`crate::quant_matrix::DENSE_GPU`] が唯一の
+        // 定義 (decode の GEMV と同じ 4 型)。表とここがずれると、GPU を試みて必ず
+        // 落ちる (= 静かに CPU へ戻る) か、逆に回せない型を投げることになる。
+        // `DENNO_GPU_GEMM=0` で切れる。false なら CPU バッチへ落ちる。
+        // cfg は `gpu_gemm_into` 側に閉じている (`cuda` feature 無しでは常に false)。
+        ty if crate::quant_matrix::dense_gpu_supported(ty) => {
             // P-PF-GB: prefill のバッチ投影は GPU GEMM を先に試す。
             // 数値契約は prefill のみ解除済み (FMA 融合 + 加算順が違う)。
-            // `DENNO_GPU_GEMM=0` で切れる。false なら CPU バッチへ落ちる。
-            // P39: cfg は `gpu_gemm_into` 側に閉じている (`cuda` feature 無しでは
-            // 常に false を返す) ので、ここに cfg は要らない。
             if !cpu_only && gpu_gemm_into(w, xs, nt, outs) {
                 #[cfg(test)]
                 GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2923,6 +2925,9 @@ pub(crate) fn moe_ffn_quant_batch_full(
     // task 246: 末尾トークンの選択を控える (prefill の終端で LRU を温め直すため)。
     // ゲート off なら `note_tail_selection` が即座に戻る。
     crate::model::exp_pf::note_tail_selection(lw.il, nt, k, &sels);
+    // task 862: page hint 用に、この層・このチャンクの選択を数える
+    // (`DENNO_EXPERT_PAGE_HINT` のときだけ。off は atomic load 1 回)。
+    crate::model::exp_page_hint::note_selection(lw.il, nt, k, &sels);
     // P56: RouterTopK は**チャンク末尾の 1 トークンだけ**送る。
     //
     // 理由: 全トークンを送ると 1 プロンプトで nt × n_layer 枚 (512 トークン ×
@@ -3919,6 +3924,9 @@ pub(crate) fn moe_ffn_quant_batch_lm_dev_at(
         );
     }
     mark(1);
+    // task 862: page hint 用に、この層・このチャンクの選択を数える
+    // (`DENNO_EXPERT_PAGE_HINT` のときだけ。off は atomic load 1 回)。
+    crate::model::exp_page_hint::note_selection(lw.il, nt, k, &sels);
     if emit_last {
         let tail = (nt - 1) * k;
         emit_router_topk(lw.il, &sels[tail..tail + k], &weights[tail..tail + k]);
@@ -4356,6 +4364,9 @@ impl Qwen4Exp {
     ) -> Result<Vec<f32>> {
         // P78: 層の外の区間計測の分母 (prefill 回数とトークン数)。
         prekprof::note_prefill(ctx.len());
+        // task 862: page hint の追跡を始める (`DENNO_EXPERT_PAGE_HINT`、既定 off)。
+        // off では atomic load 1 回で戻る。短いプロンプトは追跡しない。
+        crate::model::exp_page_hint::begin_prefill(ctx.len());
         // task 145: prefill の台帳。全体の壁時計を 1 本で測り、層の中の区間
         // (mix / attn / router / shared / experts) は内側のガードで積む。
         // `other` は「全体 − 名前付き区間の和」の残差として `line_prefill` が出す。
@@ -4396,6 +4407,12 @@ impl Qwen4Exp {
         }
         // P58: 1 リクエスト 1 回の階層統計 (prefill 終了時)。arch off なら即座に戻る。
         self.arch_emit_prefill_done();
+        // task 862: prefill の終端で、冷たい expert 範囲のページを落として
+        // decode の温かい集合を読み直す (`DENNO_EXPERT_PAGE_HINT`、既定 off)。
+        self.pf_page_hint();
+        if let Some(line) = crate::model::exp_page_hint::finish_prefill() {
+            eprintln!("{line}");
+        }
         Ok(logits)
     }
 

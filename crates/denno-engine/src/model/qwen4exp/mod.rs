@@ -670,6 +670,20 @@ impl Qwen4ExpParams {
     pub fn n_ssm_layers(&self) -> usize {
         self.n_layer - self.n_full_attn_layers()
     }
+
+    /// task 854: 文脈が 1 トークン伸びるごとに KV キャッシュが増えるバイト数。
+    ///
+    /// full attention 層だけが文脈長に比例する (ssm 層の状態は層あたり固定長)。
+    /// ホスト側の `AttnCache` は f32 の K + V を持つので、その形で見積る
+    /// (`DENNO_EXPERT_VRAM_DYNAMIC` の上限計算にだけ使う。数値経路は触らない)。
+    pub fn kv_bytes_per_token(&self) -> usize {
+        let row = self
+            .n_head_kv
+            .saturating_mul(self.n_embd_head_k.saturating_add(self.n_embd_head_v));
+        self.n_full_attn_layers()
+            .saturating_mul(row)
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2072,6 +2086,23 @@ impl ExpertW {
         }))
     }
 
+    /// task 862: テンソル先頭の写像と、写像内でのテンソル先頭オフセット。
+    ///
+    /// ヒープ実体 (テスト経路) では `None`。page hint はこの 2 つと
+    /// [`ExpertW::expert_stride`] から expert の絶対範囲を出す。
+    fn map_base(&self) -> Option<(std::sync::Arc<memmap2::Mmap>, usize)> {
+        self.blocks
+            .mapping()
+            .map(|(map, base, _)| (std::sync::Arc::clone(map), base))
+    }
+
+    /// task 862: 1 expert あたりのバイト数 (テンソル内の stride)。
+    fn expert_stride(&self) -> Result<usize> {
+        ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, 0)
+            .map(|s| s.len)
+            .map_err(|err| one(format!("{}: {err}", self.name)))
+    }
+
     /// expert `e` の**ファイル内絶対オフセット**とバイト数 (キャッシュ経路用)。
     ///
     /// mmap 経路の [`ExpertW::slice`] と同じ [`ExpertSlice`] を使うので、
@@ -2279,6 +2310,104 @@ fn matrix_w(l: &LayerW, m: ExpertMatrix) -> &ExpertW {
         ExpertMatrix::Gate => &l.gate_exps,
         ExpertMatrix::Up => &l.up_exps,
         ExpertMatrix::Down => &l.down_exps,
+    }
+}
+
+/// task 862: expert テンソルの写像 → 読み口を page hint に登録する。
+///
+/// `DENNO_EXPERT_PAGE_HINT` の経路は `posix_fadvise(2)` に fd が要るが、
+/// `memmap2::Mmap` は fd を持たない。パートごとに 1 本だけ開いて覚える
+/// (既定 off でも開くだけで、syscall は投げない)。
+fn register_expert_maps(f: &GgufFile, layers: &[LayerW]) {
+    for l in layers {
+        for w in [&l.gate_exps, &l.up_exps, &l.down_exps] {
+            let Some((map, _)) = w.map_base() else {
+                continue;
+            };
+            let Some(path) = f.path_at(w.file) else {
+                continue;
+            };
+            crate::model::exp_page_hint::register_map(&map, path);
+        }
+    }
+}
+
+/// task 862: [`crate::model::exp_page_hint::take_plan`] の計画を実行する。
+///
+/// 1. cold: `madvise(MADV_DONTNEED)` + `posix_fadvise(POSIX_FADV_DONTNEED)` で
+///    page cache から落とす。
+/// 2. warm: 常駐していない範囲だけ `madvise(MADV_WILLNEED)` で読み直す。
+///
+/// 連続する expert id は 1 回の syscall にまとめる (stride 一定なので範囲が連続する)。
+/// 失敗しても数値は変わらない (統計の `failed` に数えるだけ)。
+fn page_hint_apply(layers: &[LayerW]) {
+    let plan = crate::model::exp_page_hint::take_plan();
+    if plan.is_empty() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    for (layer, ids) in &plan.cold {
+        page_hint_runs(layers, *layer, ids, true);
+    }
+    if crate::model::exp_page_hint::willneed_on() {
+        for (layer, ids) in &plan.warm {
+            page_hint_runs(layers, *layer, ids, false);
+        }
+    }
+    crate::model::exp_page_hint::add_flush_ms(t0.elapsed().as_secs_f64() * 1e3);
+}
+
+/// task 862: 層 `layer` の `ids` (昇順) を連続する塊ごとに 1 回の syscall にする。
+///
+/// `drop` が真ならページを落とし、偽なら `MADV_WILLNEED` を投げる。
+/// gate / up / down を別々に回す (テンソル境界をまたがない)。
+fn page_hint_runs(layers: &[LayerW], layer: usize, ids: &[u16], drop: bool) {
+    use crate::model::exp_page_hint::{add_drop_stats, add_warm_stats, drop_range};
+    let Some(lw) = layers.get(layer) else {
+        return;
+    };
+    for w in [&lw.gate_exps, &lw.up_exps, &lw.down_exps] {
+        let Some((map, base)) = w.map_base() else {
+            continue;
+        };
+        let Ok(stride) = w.expert_stride() else {
+            continue;
+        };
+        let mut i = 0;
+        while i < ids.len() {
+            let first = ids[i] as usize;
+            let mut j = i + 1;
+            while j < ids.len() && ids[j] as usize == ids[j - 1] as usize + 1 {
+                j += 1;
+            }
+            let n = j - i;
+            let off = base + first * stride;
+            let len = n.saturating_mul(stride);
+            if !drop && crate::model::exp_page_hint::warm_budget_exhausted() {
+                // 読み直しの上限 (`DENNO_EXPERT_PAGE_HINT_WARM_MB`) に達した。
+                return;
+            }
+            if drop {
+                let out = drop_range(&map, off, len);
+                add_drop_stats(out, n as u64);
+            } else {
+                // 常駐していれば投げない (`mincore(2)`)。落ちている範囲だけ読む。
+                let ptr = unsafe { map.as_ptr().add(off) } as usize;
+                let out = match unsafe { crate::model::exp_pf::range_resident(ptr, len) } {
+                    Some(true) => crate::model::exp_page_hint::DropOutcome::Skipped,
+                    _ => {
+                        let n = crate::model::exp_page_hint::willneed_range(&map, off, len);
+                        if n == 0 {
+                            crate::model::exp_page_hint::DropOutcome::Failed
+                        } else {
+                            crate::model::exp_page_hint::DropOutcome::Warmed(n)
+                        }
+                    }
+                };
+                add_warm_stats(out);
+            }
+            i = j;
+        }
     }
 }
 
@@ -3841,6 +3970,117 @@ fn prefetch_selected(lw: &LayerW, sel: &[usize]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 850: 層間の expert 共起 (Markov bigram) で層 L+1 を先読みする
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// `run_layer` が層 L の MoE を呼ぶ間だけ張る「次の層」の参照。
+    ///
+    /// ルータの選択は `moe_ffn_quant_impl` の中で決まるので、層 L+1 の重みを
+    /// 引数で渡すには呼び出し鎖を全部変える必要がある。ここでは
+    /// [`with_markov_next`] のクロージャの寿命に閉じた生ポインタを 1 本だけ
+    /// TLS に置き、その中でだけ読む (外へは出さない。Drop で必ず消す)。
+    static MARKOV_NEXT: std::cell::Cell<*const LayerW> = const { std::cell::Cell::new(std::ptr::null()) };
+
+    /// 直近に作った「VRAM 常駐の写し」と、そのときのトークン番号。
+    static MARKOV_RESIDENT: std::cell::RefCell<
+        Option<(u64, std::rc::Rc<std::collections::HashSet<(u16, u16)>>)>,
+    > = std::cell::RefCell::new(None);
+}
+
+/// TLS の後始末 (パニック時も消えるようにガードで持つ)。
+struct MarkovNextGuard;
+
+impl Drop for MarkovNextGuard {
+    fn drop(&mut self) {
+        MARKOV_NEXT.with(|c| c.set(std::ptr::null()));
+    }
+}
+
+/// 層 L の MoE 呼び出しを「次の層 L+1 の重み付き」で包む。
+///
+/// ゲート off では TLS に触らず `f()` をそのまま呼ぶ (分岐 1 個)。
+pub(crate) fn with_markov_next<R>(next: Option<&LayerW>, f: impl FnOnce() -> R) -> R {
+    if !crate::model::exp_markov::enabled() {
+        return f();
+    }
+    let p = next.map_or(std::ptr::null(), |l| l as *const LayerW);
+    MARKOV_NEXT.with(|c| c.set(p));
+    let _g = MarkovNextGuard;
+    f()
+}
+
+/// ルータ直後に呼ぶ。層 `layer` の選択を記録し、層 `layer+1` の予測 expert を
+/// 背景スレッドへ渡す (層 `layer` の計算と読みを重ねる)。
+///
+/// 予測が外れても捨てるだけで、値・経路は変わらない。VRAM 常駐は積まない。
+pub(crate) fn markov_note_and_prefetch(layer: usize, sel: &[usize]) {
+    if !crate::model::exp_markov::enabled() {
+        return;
+    }
+    crate::model::exp_markov::observe(layer, sel);
+    let next_ptr = MARKOV_NEXT.with(|c| c.get());
+    if next_ptr.is_null() {
+        return;
+    }
+    // SAFETY: ポインタは `with_markov_next` のクロージャの間だけ有効で、
+    // この関数はそのクロージャの中でしか呼ばれない (`run_layer` の MoE 呼び出し)。
+    let next = unsafe { &*next_ptr };
+    if next.il != layer + 1 {
+        return;
+    }
+    let max = crate::model::exp_markov::max_per_layer();
+    let preds = crate::model::exp_markov::predict(layer, sel, max);
+    if preds.is_empty() {
+        return;
+    }
+    crate::model::exp_markov::note_prediction(layer + 1, &preds);
+    // VRAM 常駐の写しは 1 トークン 1 回だけ作る (層ごとに LRU のロックを取ると
+    // H2D の経路と取り合いになる。lab t850a の decode 退行の一因)。
+    let tok = crate::model::exp_markov::token_index();
+    let resident = MARKOV_RESIDENT.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.as_ref() {
+            Some((t, set)) if *t == tok => std::rc::Rc::clone(set),
+            _ => {
+                let set: std::rc::Rc<std::collections::HashSet<(u16, u16)>> =
+                    std::rc::Rc::new(
+                        expert_vram::resident_keys()
+                            .into_iter()
+                            .map(|k| (k.layer, k.expert))
+                            .collect(),
+                    );
+                *b = Some((tok, std::rc::Rc::clone(&set)));
+                set
+            }
+        }
+    });
+    let mut jobs: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::new();
+    let (mut n_res, mut n_nopart) = (0u64, 0u64);
+    for eid in preds {
+        let key = (next.il as u16, eid);
+        if resident.contains(&key) {
+            n_res += 1;
+            continue;
+        }
+        let part = |w: &ExpertW| w.slice_mapped(eid as usize).ok().flatten();
+        let (Some(g), Some(u), Some(d)) = (
+            part(&next.gate_exps),
+            part(&next.up_exps),
+            part(&next.down_exps),
+        ) else {
+            n_nopart += 1;
+            continue;
+        };
+        jobs.push(vec![g, u, d]);
+    }
+    crate::model::exp_markov::note_skips(n_res, n_nopart);
+    let n = jobs.len();
+    crate::model::exp_markov::note_submitted(n);
+    crate::model::exp_prefetch::submit_raw(jobs);
+}
+
 /// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
 static SHARED_OVERLAP_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
@@ -4996,6 +5236,10 @@ impl Qwen4Exp {
 
         // P-MOE-G1: expert キャッシュ (既定 OFF。`DENNO_EXPERT_CACHE_MB` > 0 で構築)。
         let expert_cache = build_expert_caches(f, &layers)?;
+        // task 862: page hint (`DENNO_EXPERT_PAGE_HINT`) が fadvise を投げられる
+        // ように、expert テンソルの写像 → 読み口を登録する (既定 off でも登録だけ
+        // する。開くのはパート数ぶんだけで、モデルの寿命いっぱい使い回す)。
+        register_expert_maps(f, &layers);
         // task 260/263: ホスト RAM tier (`DENNO_EXPERT_RAM_MB`)。**作成と充填は
         // 背景の起動プラン**が行う (ここで確保すると `/v1/models` が遅れる)。
         // ここでは診断用の mmap 範囲を覚えるだけ。
@@ -5012,6 +5256,14 @@ impl Qwen4Exp {
             expert_cache,
             arch_emit: ArchEmit::default(),
         })
+    }
+
+    /// task 862: prefill の終端で、冷たい expert 範囲のページを落とし、
+    /// decode の温かい集合のうち prefill に追い出されたものを読み直す。
+    ///
+    /// 中身は [`page_hint_apply`] (テストが同じ経路を単層で回せるように分けてある)。
+    pub(crate) fn pf_page_hint(&self) {
+        page_hint_apply(&self.layers);
     }
 
     /// PLE の conv 履歴を消す (系列の切れ目で呼ぶ)。
@@ -5709,15 +5961,19 @@ impl Qwen4Exp {
             }
             hook_at!("hc_mixed_ffn", &cur);
             let t_moe = std::time::Instant::now();
-            let cur = moe_ffn_quant_tapped(
-                &self.p,
-                lw,
-                &cur,
-                self.expert_cache.as_ref(),
-                roles.as_deref_mut(),
-                emit_router,
-                iv,
-            )?;
+            // task 850: ルータ直後に層 L+1 の予測 expert を先読みさせるため、
+            // 次の層の重みを TLS に張ってから MoE を呼ぶ (ゲート off では素通し)。
+            let cur = with_markov_next(self.layers.get(il + 1), || {
+                moe_ffn_quant_tapped(
+                    &self.p,
+                    lw,
+                    &cur,
+                    self.expert_cache.as_ref(),
+                    roles.as_deref_mut(),
+                    emit_router,
+                    iv,
+                )
+            })?;
             {
                 let _l = q4ledger::enter(q4ledger::QPROF);
                 q4prof::add(&q4prof::MOE, t_moe);
