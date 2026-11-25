@@ -3,6 +3,7 @@
 mod abliterate;
 mod bench;
 mod chat;
+mod doctor;
 mod flash_telemetry;
 mod pull;
 mod serve_flash;
@@ -244,6 +245,16 @@ enum Commands {
         /// `status` / `duration_ms`)。
         #[arg(long, default_value = "text", value_parser = ["text", "json"])]
         log_format: String,
+    },
+    /// task 881: 環境とハードウェアの自己診断 (CPU SIMD / RAM / CUDA /
+    /// Level Zero / GGUF の欠け)。GPU は実行しない (存在と /proc だけ見る)。
+    Doctor {
+        /// 分割 GGUF のあるディレクトリ。省略するとモデル検査をしない
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// 機械可読な JSON で出力する (自動化向け)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -847,6 +858,9 @@ fn main() -> Result<()> {
             let dir = model_dir(&repo);
             pull::pull(&repo, &dir)?;
             println!("done: {}", dir.display());
+        }
+        Commands::Doctor { dir, json } => {
+            doctor::run(dir.as_deref(), json)?;
         }
         Commands::Models => {
             let root = cache_root();
