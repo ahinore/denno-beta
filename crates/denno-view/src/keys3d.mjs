@@ -286,13 +286,16 @@ export function fpsBars(sum, n = 24) {
 
 // ===== 凡例 ==============================================================
 /// 全ショートカットの凡例。key は表示用の見出し。
+/// task 984: `?` / `H` は同じモーダル、`F` は auto-fit、`g + 数字` は層ジャンプ。
 export const SHORTCUTS = Object.freeze([
   Object.freeze({ key: '1', label: 'camera: Overview' }),
   Object.freeze({ key: '2', label: 'camera: Router / Experts (Front)' }),
   Object.freeze({ key: '3', label: 'camera: Prediction Head (Top)' }),
   Object.freeze({ key: '4', label: 'camera: KV Band (Side)' }),
   Object.freeze({ key: '5', label: 'camera: Reset' }),
+  Object.freeze({ key: 'F', label: 'camera: auto-fit (層数に合わせて全層を収める)' }),
   Object.freeze({ key: '[ / ]', label: 'layer inspector: 層を前後' }),
+  Object.freeze({ key: 'g + 数字', label: 'layer inspector: 層へ直接ジャンプ (0..47)' }),
   Object.freeze({ key: 'p', label: 'fps オーバーレイの表示切替' }),
   Object.freeze({ key: 'c', label: 'カラーテーマの切替 (cyber / thermal / mono-high-contrast)' }),
   Object.freeze({ key: 's', label: 'PNG スナップショットの保存 (fly 中は後退)' }),
@@ -300,7 +303,7 @@ export const SHORTCUTS = Object.freeze([
   Object.freeze({ key: 'f', label: 'fly mode (WASD + mouse, Esc で戻る)' }),
   Object.freeze({ key: 'space', label: 'demo の一時停止 / 再開' }),
   Object.freeze({ key: 'h', label: 'チャット欄の表示切替' }),
-  Object.freeze({ key: '?', label: 'この凡例の表示切替' }),
+  Object.freeze({ key: '?', label: 'この凡例の表示切替 (H でも開閉 · Esc で閉じる)' }),
 ]);
 
 /// 画面に出す凡例の行 (そのままコピー。画面は DOM を作るだけ)。
@@ -480,4 +483,237 @@ export function orbitEnabled(state) {
 /// キーイベントが reduced motion の手動切替か (m / M)。
 export function isMotionKey(e) {
   return !!e && (e.key === 'm' || e.key === 'M');
+}
+
+// ===== task 984: ショートカット凡例モーダルの状態 ==========================
+// 「開いているか」だけを持つ素の状態。DOM は index3d.html が持つ。
+export function createHelpState(open) {
+  return { open: !!open };
+}
+
+/// モーダルが開いているか。
+export function helpOpen(state) {
+  return !!(state && state.open);
+}
+
+/// 開閉を明示的に設定し、新しい値を返す。
+export function setHelpOpen(state, on) {
+  if (state && typeof state === 'object') state.open = !!on;
+  return helpOpen(state);
+}
+
+/// 表示切替 (開 → 閉 / 閉 → 開)。新しい値を返す。
+export function toggleHelp(state) {
+  if (!state || typeof state !== 'object') return true;
+  state.open = !state.open;
+  return state.open;
+}
+
+/// 閉じる。新しい値を返す (常に false)。
+export function closeHelp(state) {
+  return setHelpOpen(state, false);
+}
+
+/// キーイベントが凡例モーダルの開閉か (`?` / Shift+/ / `H`)。
+/// 小文字 `h` はチャット欄の表示切替なので受けない (index3d.html 側で分ける)。
+export function isHelpKey(e) {
+  if (!e) return false;
+  if (e.key === '?') return true;
+  if (e.key === '/' && !!e.shiftKey) return true;
+  if (e.key === 'H') return true;
+  return e.key === 'h' && !!e.shiftKey;
+}
+
+/// キーイベントがモーダルを閉じるキーか (Escape)。
+export function isHelpCloseKey(e) {
+  return !!e && e.key === 'Escape';
+}
+
+/// モーダルに並べる行 (SHORTCUTS の写し)。
+export function helpRows() {
+  return legendRows();
+}
+
+/// モーダルの 1 行 "key — label"。欠けた入力でも落ちない。
+export function formatHelpRow(row) {
+  if (!row) return '';
+  const k = String(row.key == null ? '' : row.key);
+  const l = String(row.label == null ? '' : row.label);
+  if (k && l) return k + ' — ' + l;
+  return k || l;
+}
+
+// ===== task 984: auto-fit (層数からカメラの target/position を決める) ======
+// index3d.html のシーン配置 (X の並び / zOf(il) = -il * ZSTEP / 3 段の Y) に合わせた
+// 固定のバウンディングボックス。乱数も時刻も使わないので、同じ N なら常に同じ絵になる。
+//   Z: 層 0 が z=0、層 i が z=-i*zStep。1 層ぶんの厚みは 2*halfDepth。
+export const FIT_BOUNDS = Object.freeze({
+  xMin: -14.8, xMax: 7.6,     // deck() の x0..x1
+  yMin: -7.0, yMax: 7.0,      // TIER_Y の下端..上端
+  zStep: 1.7,                 // index3d.html の ZSTEP
+  halfDepth: 0.5,
+  margin: 1.18,               // バウンディング球に足す余白
+  fov: 39,                    // PerspectiveCamera の垂直 fov (度)
+  aspect: 16 / 9,
+  minDistance: 8,             // controls.minDistance
+  maxDistance: 380,           // controls.maxDistance
+});
+
+/// 既存の Overview 視点 (pos - target = [33, 31, 72.6]) と同じ向き。正規化して使う。
+const FIT_DIR_RAW = Object.freeze([33, 31, 72.6]);
+
+function numOr(v, d) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
+}
+
+function posOr(v, d) {
+  const x = Number(v);
+  return Number.isFinite(x) && x > 0 ? x : d;
+}
+
+function norm3(v) {
+  const l = Math.hypot(v[0], v[1], v[2]);
+  return l > 0 ? [v[0] / l, v[1] / l, v[2] / l] : [0, 0, 1];
+}
+
+function round4(v) {
+  return Math.round(v * 10000) / 10000;
+}
+
+/// auto-fit の視線方向 (単位ベクトル)。
+export const FIT_DIR = Object.freeze(norm3(FIT_DIR_RAW));
+
+/// 層数 N (>= 1) → シーンの軸平行バウンディングボックス。
+/// min / max / center / size / radius を返す。N が壊れていれば null。
+export function sceneBounds(nLayers, opts) {
+  const n = Number(nLayers);
+  if (!Number.isFinite(n) || Math.trunc(n) < 1) return null;
+  const count = Math.trunc(n);
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const zStep = posOr(o.zStep, FIT_BOUNDS.zStep);
+  const half = Math.max(0, numOr(o.halfDepth, FIT_BOUNDS.halfDepth));
+  const min = [FIT_BOUNDS.xMin, FIT_BOUNDS.yMin, -(count - 1) * zStep - half];
+  const max = [FIT_BOUNDS.xMax, FIT_BOUNDS.yMax, half];
+  const size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+  return {
+    layers: count,
+    min,
+    max,
+    center: [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2],
+    size,
+    radius: 0.5 * Math.hypot(size[0], size[1], size[2]),
+  };
+}
+
+/// 層数 N (>= 1) → カメラの goal {pos, target}。
+/// バウンディング球が縦横どちらの fov にも収まる距離を出し、OrbitControls の
+/// 距離範囲に clamp する。N が壊れていれば null。
+export function fitCameraGoal(nLayers, opts) {
+  const b = sceneBounds(nLayers, opts);
+  if (!b) return null;
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const fov = Math.min(179, Math.max(1, numOr(o.fov, FIT_BOUNDS.fov)));
+  const aspect = posOr(o.aspect, FIT_BOUNDS.aspect);
+  const margin = posOr(o.margin, FIT_BOUNDS.margin);
+  const minD = posOr(o.minDistance, FIT_BOUNDS.minDistance);
+  const maxD = posOr(o.maxDistance, FIT_BOUNDS.maxDistance);
+  const vHalf = (fov * Math.PI) / 360;
+  const hHalf = Math.atan(Math.tan(vHalf) * aspect);
+  const sinHalf = Math.sin(Math.max(1e-6, Math.min(vHalf, hHalf)));
+  const want = (b.radius / sinHalf) * margin;
+  const distance = Math.min(maxD, Math.max(minD, want));
+  const d = FIT_DIR;
+  const pos = [
+    round4(b.center[0] + d[0] * distance),
+    round4(b.center[1] + d[1] * distance),
+    round4(b.center[2] + d[2] * distance),
+  ];
+  const target = [round4(b.center[0]), round4(b.center[1]), round4(b.center[2])];
+  return {
+    layers: b.layers,
+    pos,
+    target,
+    distance: round4(distance),
+    radius: round4(b.radius),
+  };
+}
+
+/// キーイベントが auto-fit か (`F` = Shift+f)。小文字 `f` は fly mode なので受けない。
+export function isAutoFitKey(e) {
+  if (!e) return false;
+  if (e.key === 'F') return true;
+  return e.code === 'KeyF' && !!e.shiftKey;
+}
+
+// ===== task 984: 層ジャンプ (g + 数字) ====================================
+/// 受け付ける桁数。47 までなら 2 桁で足りるが、層数が増えても壊れないよう 3 桁。
+export const LAYER_JUMP_MAX_DIGITS = 3;
+
+/// 層ジャンプの入力状態。layers は丸め先の層数。
+export function createLayerJump(nLayers) {
+  const n = Number(nLayers);
+  const layers = Number.isFinite(n) && Math.trunc(n) >= 1 ? Math.trunc(n) : LAYER_COUNT;
+  return { layers, digits: '', active: false };
+}
+
+/// `g` を押した: 入力待ちに入る (数字はまだ空)。
+export function beginLayerJump(state) {
+  if (!state || typeof state !== 'object') return false;
+  state.digits = '';
+  state.active = true;
+  return true;
+}
+
+/// 入力待ちを捨てる。新しい active (常に false) を返す。
+export function cancelLayerJump(state) {
+  if (state && typeof state === 'object') {
+    state.digits = '';
+    state.active = false;
+  }
+  return false;
+}
+
+/// キーイベントが層ジャンプの開始か (g / G)。
+export function isLayerJumpKey(e) {
+  return !!e && (e.key === 'g' || e.key === 'G');
+}
+
+/// キーイベント → 0..9 の数字。数字キー以外は null。
+export function digitFromKey(e) {
+  if (!e) return null;
+  const k = String(e.key == null ? '' : e.key);
+  if (k.length !== 1 || k < '0' || k > '9') return null;
+  return Number(k);
+}
+
+/// 数字列 → [0, nLayers-1] の層番号。空 / 数字以外は null。
+export function parseLayerDigits(digits, nLayers = LAYER_COUNT) {
+  const s = String(digits == null ? '' : digits);
+  if (!/^[0-9]+$/.test(s)) return null;
+  const n = Number(nLayers);
+  const layers = Number.isFinite(n) && Math.trunc(n) >= 1 ? Math.trunc(n) : LAYER_COUNT;
+  return Math.min(layers - 1, Math.max(0, parseInt(s, 10)));
+}
+
+/// 数字を 1 つ足して、その時点の層番号 (丸め済み) を返す。
+/// 入力待ちでない / 数字でないときは null。桁あふれは古い方から捨てる。
+export function pushLayerDigit(state, digit) {
+  if (!state || typeof state !== 'object' || !state.active) return null;
+  // 数値 (0..9) か 1 文字の数字列だけを受ける (null / true / {} は受けない)
+  const d = typeof digit === 'number' ? digit
+    : (typeof digit === 'string' && /^[0-9]$/.test(digit) ? Number(digit) : NaN);
+  if (!Number.isInteger(d) || d < 0 || d > 9) return null;
+  if (state.digits.length >= LAYER_JUMP_MAX_DIGITS) state.digits = state.digits.slice(1);
+  state.digits += String(d);
+  return parseLayerDigits(state.digits, state.layers);
+}
+
+/// 保留中の入力を確定して層番号を返し、状態をリセットする。空なら null。
+export function jumpToLayer(state) {
+  if (!state || typeof state !== 'object') return null;
+  const il = parseLayerDigits(state.digits, state.layers);
+  state.digits = '';
+  state.active = false;
+  return il;
 }
