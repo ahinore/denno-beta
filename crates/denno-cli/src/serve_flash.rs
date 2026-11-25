@@ -1780,7 +1780,8 @@ impl Flash {
                 // task 155: top-8 はビューワ (WS) が繋がっているときだけ作る。
                 // 読む相手が居ないときの出力は従来と同じ (誰も受け取らない)。
                 let cand =
-                    if t_on && self.telem.has_clients() {
+                    if t_on && self.telem.has_clients() && denno_telemetry::topk_telemetry_enabled()
+                    {
                         Some(denno_telemetry::topk_softmax(&logits, 8))
                     } else {
                         None
@@ -1903,7 +1904,7 @@ impl Flash {
                 // (248k logits の 1 パスが毎トークン ~1 ms かかる)。繋がって
                 // いる間の出力は従来と同一。
                 let _l = q4ledger::enter(q4ledger::TOPK);
-                if t_on && self.telem.has_clients() {
+                if t_on && self.telem.has_clients() && denno_telemetry::topk_telemetry_enabled() {
                     Some(denno_telemetry::topk_softmax(&logits, 8))
                 } else {
                     None
@@ -4504,6 +4505,14 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         } else {
             "off (DENNO_TELEMETRY_ACT=1 で有効)".to_string()
         }
+    );
+
+    // task 853: sampler の top-k / エントロピー (DENNO_TELEMETRY_TOPK, 既定 off)。
+    // ビューワ (/2d の token probs 欄、3D の候補表示) が要る時だけ有効にする。
+    let topk_on = telem_on && denno_telemetry::topk_telemetry_enabled();
+    eprintln!(
+        "[flash] telemetry topk: {}",
+        if topk_on { "on (top-8 を毎トークン)" } else { "off (DENNO_TELEMETRY_TOPK=1 で有効)" }
     );
 
     // P812: 文脈スロット数 (CLI 引数 > `DENNO_KV_SLOTS` > 既定 2)。

@@ -190,6 +190,18 @@
   .snap button { background:none; border:none; color:#6b2a33; cursor:pointer; font:inherit; }
   .snap.on { border-color:#2f8aa8; background:#08161f; }
   .terms { margin-top:6px; font-size:10.5px; color:#8fb4c8; min-height:14px; }
+  /* task 853: token probs / entropy 欄 */
+  .topkhist { display:flex; gap:2px; margin-top:6px; min-height:12px; align-items:flex-end; }
+  .topkhist .chip { flex:1; height:11px; border-radius:2px; border:1px solid transparent;
+                    cursor:pointer; opacity:.85; }
+  .topkhist .chip.sel { border-color:#fff; opacity:1; }
+  .topbars { margin-top:6px; display:flex; flex-direction:column; gap:2px; font-size:10px; }
+  .topbar { display:flex; align-items:center; gap:5px; }
+  .topbar .tk { width:56px; text-align:right; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .topbar .bar { flex:1; height:8px; background:#0a1a24; border-radius:2px; overflow:hidden; }
+  .topbar .bar i { display:block; height:100%; background:#2f8aa8; }
+  .topbar.chosen .bar i { background:#ffc44d; }
+  .topbar .pv { width:42px; text-align:right; color:#8fb4c8; font-variant-numeric:tabular-nums; }
   .err { color:#ff6b86; font-size:10.5px; white-space:pre-wrap; }
   .reqlog { font-size:9.5px; color:var(--dim); max-height:150px; overflow-y:auto;
             display:flex; flex-direction:column; gap:1px; }
@@ -325,6 +337,15 @@
   </section>
 
   <section id="ctrl">
+    <div class="box" id="topkbox">
+      <h2>token probs <span class="dim" id="topk-h">-</span></h2>
+      <div class="small dim">サンプラ直前の top-8 と全分布のエントロピー。
+        <b>DENNO_TELEMETRY_TOPK=1</b> で有効 (既定 off)。色 = エントロピー (緑 0 → 赤 3 bit)。</div>
+      <div id="topk-hist" class="topkhist" title="直近のトークン。ホバー / クリックでそのトークンの内訳を表示"></div>
+      <div id="topk-bars" class="topbars"></div>
+      <div id="topk-note" class="small dim"></div>
+    </div>
+
     <div class="box">
       <h2>intervention <span class="dim">/api/v1/intervene</span></h2>
       <div class="kv"><span>experts off</span><b id="n-exp">0</b></div>
@@ -493,6 +514,7 @@ import {
   ablitRange, ablitRangeFromDrag, ablitRecordBody, ablitSepScores,
   ablitStackBody, ablitStackSummary, ablitSummary,
   parsePromptList,
+  TOPK_HISTORY_MAX, entropyBits, entropyColor, topkBarRows, topkPush, topkSummary,
 } from '/view2d.mjs';
 import {
   archLayout, archHitTest, archItemsInRect, archNodeRect, drawArch, fitView, gridPixels,
@@ -526,6 +548,11 @@ let ablitScores = [];                  // 層ごとの分離スコア (0..1、�
 let terms = new Map();                 // snapshot name -> coef
 // task 809: ライブ性能の HUD。イベントは hud2d.mjs の状態機械に渡すだけ。
 let hud = createHud();
+// task 853: TopK フレームの履歴 (古い → 新しい)。
+// `topkSel` = ホバー中の index (-1 = 最新)、`topkPin` = クリックで固定した index。
+let topkHist = [];
+let topkSel = -1;
+let topkPin = -1;
 let loadedPreset = null;               // 直前に読み込んだプリセット (まだ apply していない)
 let hover = null;
 let drag = null;                       // {x0,y0,x1,y1,add,items}
@@ -634,6 +661,11 @@ function pushMockToken() {
 function startMockFrames() {
   clearInterval(mockTimer);
   mockTok = 0;
+  // task 853: モックを跨いで前のトークンの top-k を残さない
+  topkHist = [];
+  topkSel = -1;
+  topkPin = -1;
+  renderTopk();
   pushMockToken();
   mockTimer = setInterval(() => {
     if (!document.hidden) pushMockToken();
@@ -2980,6 +3012,91 @@ function connectWs() {
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }
 
+// ---- task 853: token probs / entropy 欄 -----------------------------------
+
+function topkIndex() {
+  if (topkPin >= 0 && topkPin < topkHist.length) return topkPin;
+  return topkSel >= 0 && topkSel < topkHist.length ? topkSel : topkHist.length - 1;
+}
+
+function renderTopkBars() {
+  const idx = topkIndex();
+  const frame = idx >= 0 ? topkHist[idx] : null;
+  const bars = $('topk-bars');
+  bars.textContent = '';
+  if (!frame) {
+    $('topk-h').textContent = '-';
+    $('topk-note').textContent = 'TopK フレーム待ち (サーバーに DENNO_TELEMETRY_TOPK=1 が必要)';
+    return;
+  }
+  $('topk-h').textContent = topkSummary(frame);
+  $('topk-note').textContent = 'tok ' + frame.chosen + ' · H ' +
+    entropyBits(frame.entropy).toFixed(2) + ' bit · ' +
+    (idx + 1) + '/' + topkHist.length;
+  for (const row of topkBarRows(frame)) {
+    const line = document.createElement('div');
+    line.className = 'topbar' + (row.chosen ? ' chosen' : '');
+    const tk = document.createElement('span');
+    tk.className = 'tk';
+    tk.textContent = 'tok ' + row.token;
+    const bar = document.createElement('span');
+    bar.className = 'bar';
+    const fill = document.createElement('i');
+    fill.style.width = (row.w * 100).toFixed(1) + '%';
+    bar.appendChild(fill);
+    const pv = document.createElement('span');
+    pv.className = 'pv';
+    pv.textContent = (row.prob * 100).toFixed(1) + '%';
+    line.append(tk, bar, pv);
+    bars.appendChild(line);
+  }
+}
+
+function renderTopk() {
+  const idx = topkIndex();
+  const strip = $('topk-hist');
+  // 枚数が変わったときだけ作り直す (ホバーのたびに DOM を壊さない)
+  if (strip.childElementCount !== topkHist.length) {
+    strip.textContent = '';
+    topkHist.forEach((v, i) => {
+      const chip = document.createElement('div');
+      chip.className = 'chip';
+      chip.dataset.i = String(i);
+      chip.style.background = entropyColor(v.entropy);
+      chip.title = 'tok ' + v.chosen + ' · H ' + entropyBits(v.entropy).toFixed(2) + ' bit';
+      strip.appendChild(chip);
+    });
+  }
+  for (let i = 0; i < strip.children.length; i++) {
+    strip.children[i].classList.toggle('sel', i === idx);
+  }
+  renderTopkBars();
+}
+
+$('topk-hist').addEventListener('mouseover', (ev) => {
+  const chip = ev.target && ev.target.closest ? ev.target.closest('.chip') : null;
+  if (!chip) return;
+  const i = Number(chip.dataset.i);
+  if (!Number.isFinite(i) || i === topkSel) return;
+  topkSel = i;
+  renderTopk();
+});
+$('topk-hist').addEventListener('mouseleave', () => {
+  if (topkSel < 0) return;
+  topkSel = -1;
+  renderTopk();
+});
+$('topk-hist').addEventListener('click', (ev) => {
+  const chip = ev.target && ev.target.closest ? ev.target.closest('.chip') : null;
+  if (!chip) return;
+  const i = Number(chip.dataset.i);
+  if (!Number.isFinite(i)) return;
+  // 同じチップをもう 1 回押すと固定を外す (最新に戻る)
+  topkPin = topkPin === i ? -1 : i;
+  renderTopk();
+});
+renderTopk();
+
 function handleFrame(f) {
   frameCount++;
   lastKind = f.kind;
@@ -3006,6 +3123,12 @@ function handleFrame(f) {
       lastSteerPoll = now;
       refreshSteer('record');
     }
+  } else if (f.kind === 'TopK') {
+    // task 853: token probs 欄 (既定 off のテレメトリ)。履歴に足して描き直す。
+    topkHist = topkPush(topkHist, f, TOPK_HISTORY_MAX);
+    topkSel = -1;
+    topkPin = -1;
+    renderTopk();
   } else if (f.kind === 'ServerInfo') {
     $('shapeline').textContent = f.model + ' · layers ' + f.layers + ' · ctx ' + f.context;
   } else if (f.kind === 'TierStats') {

@@ -43,6 +43,7 @@ Where the time goes, rtx5090 / UD-IQ3_XXS (warm, measured on the development bra
 | `DENNO_STRIP_TOOLS=1` | drop the `tools` definitions from the prompt (a 40-tool request costs 6,979 prompt tokens, or 842 without them) |
 | `DENNO_MAX_SYSTEM=N` | keep only the first N characters of the system prompt |
 | `DENNO_TELEMETRY`, `DENNO_TELEMETRY_ACT=1`, `DENNO_TELEMETRY_ARCH=1` | telemetry (on by default here; `0` disables) / per-layer activation / structure frames |
+| `DENNO_TELEMETRY_TOPK=1` | emit the sampler's top-8 (id, probability, entropy) as TopK frames (OFF by default; needed by the /2d token-probs panel and the 3D candidate list) |
 | `DENNO_KV_SLOTS=N`, `DENNO_KV_SLOT_TOK` | number of context slots (default 2 = the legacy main + aux; 3 or more uses LCP matching + LRU) / per-slot token cap on the N-slot path (default: context length). The CLI flag is `--kv-slots` |
 
 ## Other models (the dense path, `serve`)

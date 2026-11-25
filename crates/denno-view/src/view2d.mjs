@@ -820,6 +820,103 @@ export function heat(v, scale = 1) {
   return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
 }
 
+// ---- task 853: token probs / entropy (TopK フレーム) -----------------------
+//
+// サーバーは `DENNO_TELEMETRY_TOPK=1` のときだけ TopK (kind 10) を送る。
+// ペイロードは chosen (選ばれた id) / entropy (全分布の nat) / 上位 8 件の
+// (id, 確率 f16)。トークンの**文字列は載らない** (ビューワは語彙を持たない)
+// ので、画面は id と確率・エントロピーで描く。
+
+/// 画面が持つ履歴の本数 (トークン 1 個につき 1 フレーム)。
+export const TOPK_HISTORY_MAX = 16;
+
+const LN2 = Math.LN2;
+
+/// TopK フレームを表示用に正規化する。TopK 以外・壊れた値は null。
+export function topkFrameView(frame) {
+  if (!frame || typeof frame !== 'object' || frame.kind !== 'TopK') return null;
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const chosen = Math.max(0, Math.trunc(num(frame.chosen)));
+  // nat。負・NaN は 0 (log(1) = 0 と同じ床)。
+  const entropy = Math.max(0, num(frame.entropy));
+  const raw = Array.isArray(frame.entries) ? frame.entries : [];
+  const entries = [];
+  for (const e of raw) {
+    if (!Array.isArray(e) || e.length < 2) continue;
+    const token = Math.trunc(num(e[0]));
+    if (!(token >= 0)) continue;
+    const prob = Math.min(1, Math.max(0, num(e[1])));
+    entries.push({ token, prob });
+  }
+  return { kind: 'TopK', chosen, entropy, entries };
+}
+
+/// nat → bit (表示用)。
+export function entropyBits(nats) {
+  const v = Number(nats);
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  return v / LN2;
+}
+
+/// エントロピーの色 (0 = 緑 → 3 bit 以上 = 赤)。NaN は灰色。
+/// 「低い = 確信している (緑)」「高い = 迷っている (赤)」の 1 本の尺度。
+export function entropyColor(nats) {
+  const v = Number(nats);
+  if (!Number.isFinite(v)) return 'rgb(120,140,150)';
+  const t = Math.min(1, Math.max(0, entropyBits(v) / 3));
+  const hue = Math.round(145 * (1 - t));
+  return 'hsl(' + hue + ', 78%, 55%)';
+}
+
+/// 履歴に 1 枚足す (古いものから落とす)。TopK 以外はそのまま返す。
+export function topkPush(history, frame, max = TOPK_HISTORY_MAX) {
+  const view = topkFrameView(frame);
+  if (!view) return history;
+  const cap = Math.max(1, Math.trunc(Number(max)) || TOPK_HISTORY_MAX);
+  const next = Array.isArray(history) ? history.slice() : [];
+  next.push(view);
+  if (next.length > cap) next.splice(0, next.length - cap);
+  return next;
+}
+
+/// 生のフレーム (entries = [id, prob] の配列) と正規化済みの view
+/// (entries = {token, prob}) の両方を受ける。
+function topkViewOf(frame) {
+  if (!frame || typeof frame !== 'object') return null;
+  if (Array.isArray(frame.entries) && frame.entries.length > 0 &&
+      frame.entries[0] && typeof frame.entries[0] === 'object' &&
+      !Array.isArray(frame.entries[0])) {
+    return frame.kind === 'TopK' ? frame : null;
+  }
+  return topkFrameView(frame);
+}
+
+/// 棒グラフの行。`w` は最大確率を 1 とした相対幅 (0..1)。空なら []。
+export function topkBarRows(frame) {
+  const view = topkViewOf(frame);
+  if (!view || view.entries.length === 0) return [];
+  let top = 0;
+  for (const e of view.entries) if (e.prob > top) top = e.prob;
+  const denom = top > 0 ? top : 1;
+  return view.entries.map((e) => ({
+    token: e.token,
+    prob: e.prob,
+    chosen: e.token === view.chosen,
+    w: Math.min(1, Math.max(0, e.prob / denom)),
+  }));
+}
+
+/// 1 行の要約: "H 1.42 bit · top 1234 52.0%"。エントロピーは bit。
+export function topkSummary(frame) {
+  const view = topkViewOf(frame);
+  if (!view) return 'H -';
+  let top = null;
+  for (const e of view.entries) if (!top || e.prob > top.prob) top = e;
+  const bits = entropyBits(view.entropy).toFixed(2);
+  if (!top) return 'H ' + bits + ' bit · no candidates';
+  return 'H ' + bits + ' bit · top ' + top.token + ' ' + (top.prob * 100).toFixed(1) + '%';
+}
+
 // ---- 状態 (トークンごと / 会話の累積) -------------------------------------
 
 /// フレームを食って地図の状態を更新する。DOM には触らない。
@@ -1626,6 +1723,15 @@ export function mockTokenFrames(shape, n, opts = {}) {
   const off = new Set((opts.off || []).map((p) => (p[0] | 0) + ':' + (p[1] | 0)));
   const k = Math.max(1, Math.min(s.n_expert, s.n_expert_used));
   const frames = [{ kind: 'Token', session: 1, token: n | 0, pos: n | 0 }];
+  // task 853: token probs / entropy 欄のモック。8 件を確率降順に作り、
+  // 選ばれた id を先頭に置く (エントロピーは 0.4..2.6 nat)。
+  {
+    const top = 0.32 + rnd() * 0.5;
+    const entries = [[n | 0, top]];
+    for (let i = 1; i < 8; i++) entries.push([Math.floor(rnd() * s.n_expert) + 1000, top * Math.pow(0.62, i)]);
+    const entropy = 0.4 + rnd() * 2.2;
+    frames.push({ kind: 'TopK', session: 1, chosen: n | 0, entropy, entries });
+  }
 
   for (let l = 0; l < s.layers; l++) {
     const kind = s.layer_kinds[l];

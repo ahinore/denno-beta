@@ -227,7 +227,11 @@ pub enum Frame {
     KvUsage { busy: Vec<bool>, t_lens: Vec<u32> },
     /// フレーム欠落 (チャネル満杯 / 購読遅延)
     Gap { lost: u32 },
-    /// sampler の top-k (確率は f16 ビット)
+    /// sampler の top-k (確率は f16 ビット)。
+    ///
+    /// task 853: **既定 off**。`DENNO_TELEMETRY_TOPK=1` のときだけ送出する
+    /// ([`topk_telemetry_enabled`])。off のときは top-k の走査自体をしないので
+    /// 推論経路のコストは分岐 1 個 (ゼロオーバーヘッド)。
     TopK { session: u32, chosen: u32, entropy_f16: u16, entries: Vec<(u32, u16)> },
     /// 1 層の forward で実行された op 列 (op id, ns)。層の実行順に送出される
     /// (P14: ビューアのコールグラフ/層パネルの点灯アニメーション用)。
@@ -1172,6 +1176,46 @@ pub fn try_recv_nowait() -> Option<Frame> {
 
 // ---------- sampler top-k (L1 統計。テレメトリ専用で数値経路に触れない) ----------
 
+/// task 853: `DENNO_TELEMETRY_TOPK` の解釈 (**既定 off**)。
+///
+/// `1` / `true` / `yes` / `on` (大文字小文字を問わない) だけが有効。
+/// 未設定・空・その他の値は無効 (zero overhead)。
+pub fn topk_telemetry_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        }
+        None => false,
+    }
+}
+
+static TOPK_ON: AtomicI8 = AtomicI8::new(-1);
+
+/// task 853: sampler の top-k フレーム ([`Frame::TopK`]) を送出するか。
+///
+/// **既定 off**。off のときは `topk_softmax` の走査 (語彙全体の 1 パス) 自体を
+/// 呼び出し側が飛ばすので、推論経路のコストはフラグ 1 個の分岐だけ。
+pub fn topk_telemetry_enabled() -> bool {
+    match TOPK_ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = topk_telemetry_from_value(
+                std::env::var("DENNO_TELEMETRY_TOPK").ok().as_deref(),
+            );
+            TOPK_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+            v
+        }
+    }
+}
+
+/// テスト専用: top-k 送出の ON/OFF を上書きする (本番コードからは使わない)。
+#[doc(hidden)]
+pub fn set_topk_telemetry_for_tests(v: bool) {
+    TOPK_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopK {
     pub chosen: u32,
@@ -1568,6 +1612,27 @@ mod tests {
         set_arch_for_tests(false);
         assert!(!arch_enabled());
         set_arch_for_tests(before);
+    }
+
+    /// task 853: `DENNO_TELEMETRY_TOPK` の解釈 (既定 off)。
+    #[test]
+    fn topk_telemetry_env_parsing() {
+        assert!(!topk_telemetry_from_value(None), "未設定は既定 off");
+        assert!(!topk_telemetry_from_value(Some("")), "空は off");
+        assert!(!topk_telemetry_from_value(Some("0")), "0 は off");
+        assert!(!topk_telemetry_from_value(Some("off")), "off は off");
+        assert!(!topk_telemetry_from_value(Some("garbage")), "読めない値は off");
+        assert!(topk_telemetry_from_value(Some("1")));
+        assert!(topk_telemetry_from_value(Some("true")));
+        assert!(topk_telemetry_from_value(Some("YES")), "大文字も受ける");
+        assert!(topk_telemetry_from_value(Some(" on ")), "前後の空白は無視");
+        // テスト用の上書きは元に戻せる (他のテストに漏らさない)
+        let before = topk_telemetry_enabled();
+        set_topk_telemetry_for_tests(true);
+        assert!(topk_telemetry_enabled());
+        set_topk_telemetry_for_tests(false);
+        assert!(!topk_telemetry_enabled());
+        set_topk_telemetry_for_tests(before);
     }
 
     /// P53: 層活性の選択 (上位 K・昇順・層内最大で正規化) を全ソートの参照実装と

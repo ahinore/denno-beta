@@ -23,7 +23,20 @@ fn main() {
             session: 1,
             chosen: 100,
             entropy_f16: f(2.75),
-            entries: vec![(100, f(0.5)), (200, f(0.25))],
+            // task 853: /2d の token probs 欄と同じ top-8 (確率降順) を出す。
+            entries: [
+                (100, 0.52),
+                (200, 0.21),
+                (310, 0.09),
+                (42, 0.06),
+                (777, 0.04),
+                (15, 0.03),
+                (9_001, 0.02),
+                (64, 0.01),
+            ]
+            .iter()
+            .map(|&(id, p)| (id, f(p)))
+            .collect(),
         },
         denno_telemetry::Frame::Step { width: 1, ns: 42_000_000 },
         denno_telemetry::Frame::OpSummary { ops: vec![(4, 119_300_000), (10, 55_000_000)] },

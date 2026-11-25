@@ -103,7 +103,7 @@ print(c.messages.create(model="qwen3.8-flash-next", max_tokens=256,
 
 ![denno-view 2D viewer](docs/assets/denno_2d.png)
 
-`serve-flash` enables telemetry by default (add `DENNO_TELEMETRY_ACT=1 DENNO_TELEMETRY_ARCH=1` to stream per-layer activations and full architecture metadata). Start `denno-view` in another terminal and open `/2d`:
+`serve-flash` enables telemetry by default (add `DENNO_TELEMETRY_ACT=1 DENNO_TELEMETRY_ARCH=1` to stream per-layer activations and full architecture metadata, and `DENNO_TELEMETRY_TOPK=1` for the sampler's top-8 / entropy frames that feed the `/2d` token-probs panel). Start `denno-view` in another terminal and open `/2d`:
 
 ```bash
 VIEW_UPSTREAM=ws://127.0.0.1:8098/v1/telemetry/ws \

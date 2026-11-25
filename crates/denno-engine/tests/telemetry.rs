@@ -49,6 +49,8 @@ fn telemetry_off_then_on_lifecycle_and_output_invariance() {
     // --- ON ---
     telem::set_enabled_for_tests(true);
     assert!(telem::enabled(), "telemetry must be on");
+    // task 853: top-k は既定 off。ON 経路のテストでは明示的に有効にする。
+    telem::set_topk_telemetry_for_tests(true);
     let mut e_on = dummy_engine("on", Some(42)).unwrap();
     let out_on = e_on.chat(None, &msgs("t0"), &greedy(20), |_| {}).unwrap();
 
@@ -115,4 +117,34 @@ fn telemetry_off_then_on_lifecycle_and_output_invariance() {
     }
     assert!(telem::dropped() >= before + telem::channel_cap() as u64, "満杯時のドロップ計上");
     assert!(drain().len() >= telem::channel_cap() - 1);
+
+    // task 853: top-k ゲート off の経路 (このテストの最後に順に走らせる)
+    check_topk_gate_off();
+}
+
+/// task 853: `DENNO_TELEMETRY_TOPK` が off (既定) のとき TopK フレームが出ず、
+/// Token は従来どおり出て、出力も変わらないこと (ゲートの発火を見る)。
+///
+/// テレメトリのハブはプロセス全体で 1 本なので、並列に走るテストから
+/// フレームが混ざらないよう単体テストにはせず、上のテストから順に呼ぶ。
+fn check_topk_gate_off() {
+    let prev_on = telem::enabled();
+    telem::set_enabled_for_tests(true);
+    telem::set_topk_telemetry_for_tests(false);
+    assert!(!telem::topk_telemetry_enabled(), "ゲートが off でない");
+
+    let mut e = dummy_engine("topkoff", Some(42)).unwrap();
+    let out = e.chat(None, &msgs("t0"), &greedy(20), |_| {}).unwrap();
+    let frames = drain();
+
+    assert_eq!(out.text, expected_text(), "topk off で出力が変わった");
+    assert!(frames.iter().any(|f| matches!(f, Frame::Token { .. })), "Token 無し");
+    assert!(
+        !frames.iter().any(|f| matches!(f, Frame::TopK { .. })),
+        "topk off なのに TopK が出た"
+    );
+
+    // 戻す (他のテストへ漏らさない)
+    telem::set_topk_telemetry_for_tests(true);
+    telem::set_enabled_for_tests(prev_on);
 }
