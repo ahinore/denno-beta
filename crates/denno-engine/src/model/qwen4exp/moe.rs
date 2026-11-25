@@ -1205,6 +1205,10 @@ pub(crate) fn moe_ffn_quant_impl(
     // (ゲート off では atomic load 1 回。値には触れない)。
     crate::model::exp_prefetch::note_sel(lw.il, &sel);
 
+    // task 850: 層間の共起表を更新し、層 L+1 の予測 expert を背景スレッドへ渡す
+    // (`DENNO_EXPERT_MARKOV_PREFETCH=1` のときだけ。off は atomic load 1 回)。
+    crate::model::qwen4exp::markov_note_and_prefetch(lw.il, &sel);
+
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
     drop(_l_router);
     // task 192: kprof の窓もここで閉じる (expert 段の操作を混ぜない)。

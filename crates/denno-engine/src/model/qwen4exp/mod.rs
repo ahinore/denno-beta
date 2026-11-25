@@ -3841,6 +3841,96 @@ fn prefetch_selected(lw: &LayerW, sel: &[usize]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 850: 層間の expert 共起 (Markov bigram) で層 L+1 を先読みする
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// `run_layer` が層 L の MoE を呼ぶ間だけ張る「次の層」の参照。
+    ///
+    /// ルータの選択は `moe_ffn_quant_impl` の中で決まるので、層 L+1 の重みを
+    /// 引数で渡すには呼び出し鎖を全部変える必要がある。ここでは
+    /// [`with_markov_next`] のクロージャの寿命に閉じた生ポインタを 1 本だけ
+    /// TLS に置き、その中でだけ読む (外へは出さない。Drop で必ず消す)。
+    static MARKOV_NEXT: std::cell::Cell<*const LayerW> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// TLS の後始末 (パニック時も消えるようにガードで持つ)。
+struct MarkovNextGuard;
+
+impl Drop for MarkovNextGuard {
+    fn drop(&mut self) {
+        MARKOV_NEXT.with(|c| c.set(std::ptr::null()));
+    }
+}
+
+/// 層 L の MoE 呼び出しを「次の層 L+1 の重み付き」で包む。
+///
+/// ゲート off では TLS に触らず `f()` をそのまま呼ぶ (分岐 1 個)。
+pub(crate) fn with_markov_next<R>(next: Option<&LayerW>, f: impl FnOnce() -> R) -> R {
+    if !crate::model::exp_markov::enabled() {
+        return f();
+    }
+    let p = next.map_or(std::ptr::null(), |l| l as *const LayerW);
+    MARKOV_NEXT.with(|c| c.set(p));
+    let _g = MarkovNextGuard;
+    f()
+}
+
+/// ルータ直後に呼ぶ。層 `layer` の選択を記録し、層 `layer+1` の予測 expert を
+/// 背景スレッドへ渡す (層 `layer` の計算と読みを重ねる)。
+///
+/// 予測が外れても捨てるだけで、値・経路は変わらない。VRAM 常駐は積まない。
+pub(crate) fn markov_note_and_prefetch(layer: usize, sel: &[usize]) {
+    if !crate::model::exp_markov::enabled() {
+        return;
+    }
+    crate::model::exp_markov::observe(layer, sel);
+    let next_ptr = MARKOV_NEXT.with(|c| c.get());
+    if next_ptr.is_null() {
+        return;
+    }
+    // SAFETY: ポインタは `with_markov_next` のクロージャの間だけ有効で、
+    // この関数はそのクロージャの中でしか呼ばれない (`run_layer` の MoE 呼び出し)。
+    let next = unsafe { &*next_ptr };
+    if next.il != layer + 1 {
+        return;
+    }
+    let max = crate::model::exp_markov::max_per_layer();
+    let preds = crate::model::exp_markov::predict(layer, sel, max);
+    if preds.is_empty() {
+        return;
+    }
+    crate::model::exp_markov::note_prediction(layer + 1, &preds);
+    let resident: std::collections::HashSet<(u16, u16)> = expert_vram::resident_keys()
+        .into_iter()
+        .map(|k| (k.layer, k.expert))
+        .collect();
+    let mut jobs: Vec<Vec<crate::model::exp_up_worker::Part>> = Vec::new();
+    let (mut n_res, mut n_nopart) = (0u64, 0u64);
+    for eid in preds {
+        let key = (next.il as u16, eid);
+        if resident.contains(&key) {
+            n_res += 1;
+            continue;
+        }
+        let part = |w: &ExpertW| w.slice_mapped(eid as usize).ok().flatten();
+        let (Some(g), Some(u), Some(d)) = (
+            part(&next.gate_exps),
+            part(&next.up_exps),
+            part(&next.down_exps),
+        ) else {
+            n_nopart += 1;
+            continue;
+        };
+        jobs.push(vec![g, u, d]);
+    }
+    crate::model::exp_markov::note_skips(n_res, n_nopart);
+    let n = jobs.len();
+    crate::model::exp_markov::note_submitted(n);
+    crate::model::exp_prefetch::submit_raw(jobs);
+}
+
 /// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
 static SHARED_OVERLAP_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
@@ -5709,15 +5799,19 @@ impl Qwen4Exp {
             }
             hook_at!("hc_mixed_ffn", &cur);
             let t_moe = std::time::Instant::now();
-            let cur = moe_ffn_quant_tapped(
-                &self.p,
-                lw,
-                &cur,
-                self.expert_cache.as_ref(),
-                roles.as_deref_mut(),
-                emit_router,
-                iv,
-            )?;
+            // task 850: ルータ直後に層 L+1 の予測 expert を先読みさせるため、
+            // 次の層の重みを TLS に張ってから MoE を呼ぶ (ゲート off では素通し)。
+            let cur = with_markov_next(self.layers.get(il + 1), || {
+                moe_ffn_quant_tapped(
+                    &self.p,
+                    lw,
+                    &cur,
+                    self.expert_cache.as_ref(),
+                    roles.as_deref_mut(),
+                    emit_router,
+                    iv,
+                )
+            })?;
             {
                 let _l = q4ledger::enter(q4ledger::QPROF);
                 q4prof::add(&q4prof::MOE, t_moe);

@@ -971,6 +971,11 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
     }
     denno_engine::model::exp_prefetch::stats_reset();
+    // task 850: 層間共起の先読み (`DENNO_EXPERT_MARKOV_PREFETCH=1` のときだけ 1 行)。
+    if let Some(line) = denno_engine::model::exp_markov::stats_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_markov::stats_reset();
     // task 266: 量子型 mix の fused chain が走った回数 (`DENNO_MIX_QCHAIN` のときだけ)。
     if let Some(line) = denno_engine::model::qwen4exp::mix_qchain_line() {
         eprintln!("{line}");
