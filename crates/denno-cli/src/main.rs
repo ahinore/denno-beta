@@ -222,9 +222,12 @@ enum Commands {
         /// 使い方: --compare base.json new.json
         #[arg(long, num_args = 2, value_names = ["BASE", "NEW"])]
         compare: Option<Vec<PathBuf>>,
-        /// P897: --compare 時に、この % を超える悪化を退行とみなし非 0 で終わる
+        /// P897: --compare 時に、この % を超える悪化を退行とみなす非 0 で終わる
         #[arg(long)]
         fail_on_regress_pct: Option<f64>,
+        /// task 1021: --compare の要約を JSON で書き出す (`-` は stdout)
+        #[arg(long, value_name = "PATH")]
+        compare_json: Option<PathBuf>,
     },
     /// HTTP サーバー起動 (Anthropic Messages API)
     Serve {
@@ -974,6 +977,7 @@ fn main() -> Result<()> {
             timeout,
             compare,
             fail_on_regress_pct,
+            compare_json,
         } => {
             // P897: --compare はベンチを実行せずに 2 つのレポートを比べる。
             if let Some(paths) = &compare {
@@ -986,6 +990,17 @@ fn main() -> Result<()> {
                 }
                 let color = std::env::var_os("NO_COLOR").is_none();
                 print!("{}", bench::render_compare_ansi(&out, color));
+                // task 1021: 要約 JSON (機械可読)。`-` なら stdout。
+                if let Some(path) = &compare_json {
+                    let text = bench::render_compare_json(&out)?;
+                    if path.as_os_str() == "-" {
+                        println!("{text}");
+                    } else {
+                        std::fs::write(path, text)
+                            .with_context(|| format!("write {}", path.display()))?;
+                        eprintln!("wrote {}", path.display());
+                    }
+                }
                 if out.exit_fail {
                     bail!(
                         "bench compare: {} regression(s), {} missing, determinism {:?}",
@@ -995,6 +1010,9 @@ fn main() -> Result<()> {
                     );
                 }
                 return Ok(());
+            }
+            if compare_json.is_some() {
+                bail!("--compare-json requires --compare BASE NEW");
             }
             let opts = bench::BenchOptions {
                 url,
