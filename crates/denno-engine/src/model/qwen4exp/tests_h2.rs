@@ -349,6 +349,79 @@
             assert_eq!(tok, ctx.len(), "prefill の全トークンが層 0 で数えられる");
         }
 
+        /// task 874: dequant 再利用キャッシュの配線。実 prefill 経路
+        /// (`forward_prefill_with` → `forward_prefill_inner`) から
+        /// `begin_prefill` / `finish_prefill` が呼ばれ、展開が走ることを数える。
+        /// 緑 = 発動の証拠ではないので、`fills` が 0 でないことまで見る。
+        #[test]
+        fn pf_dq_cache_hook_fires_in_prefill() {
+            use crate::model::qwen4exp::pf_dq_cache as dqc;
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2_dq_cache_wired");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let ctx: Vec<u32> = (0..8u32).map(|i| i % VOCAB as u32).collect();
+            // VNNI (int8 活性) を切って比べる。切らないと基準側が活性を int8 へ
+            // 量子化するぶん (既存テストの許容 5e-2/層) の差が乗り、
+            // 累積順の差と区別できない。
+            moe_expert::set_vnni_for_test(Some(false));
+            // off (既定)
+            let mut m0 = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            let off = m0.forward_prefill_with(&ctx, true).expect("prefill off");
+            // on
+            dqc::set_stats_for_tests(true);
+            dqc::set_cap_for_tests(16 << 20);
+            let mut m1 = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            let on = m1.forward_prefill_with(&ctx, true).expect("prefill on");
+            let line = dqc::take_line_for_tests().expect("stats 行が出る");
+            dqc::clear_cap_for_tests();
+            dqc::clear_stats_for_tests();
+            moe_expert::set_vnni_for_test(None);
+            assert!(
+                line.contains("fills=") && !line.contains("fills=0 "),
+                "キャッシュ経路が 1 度も走っていない: {line}"
+            );
+            // 値は近い (融合カーネルとの累積順の違いだけ)。
+            assert_eq!(off.len(), on.len());
+            let scale = off.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+            let max_d = off
+                .iter()
+                .zip(&on)
+                .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+            assert!(
+                max_d / scale < 1e-4,
+                "max|Δ|/max|ref| = {} (off/on の差が大きすぎる)",
+                max_d / scale
+            );
+        }
+
+        /// task 874: チャンクを跨いだヒット。同じ expert が次のチャンクでも
+        /// 選ばれるモデル (NEXP=2, k=2) で chunk=2 を回し、2 チャンク目以降が
+        /// キャッシュに当たることを数える。
+        #[test]
+        fn pf_dq_cache_hits_across_chunks() {
+            use crate::model::qwen4exp::pf_dq_cache as dqc;
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2_dq_cache_hits");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let ctx: Vec<u32> = (0..8u32).map(|i| i % VOCAB as u32).collect();
+            dqc::set_stats_for_tests(true);
+            dqc::set_cap_for_tests(16 << 20);
+            let pf = dqc::begin_prefill(ctx.len(), 4);
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            let _ = m.forward_prefill_batch(&ctx, 2).expect("バッチ prefill");
+            drop(pf); // 終端処理 (統計行)
+            let line = dqc::take_line_for_tests().expect("stats 行が出る");
+            dqc::clear_cap_for_tests();
+            dqc::clear_stats_for_tests();
+            // 4 チャンク × (2 expert × 4 層) = 32 回の選択、distinct は 8。
+            assert!(line.contains("sel=32"), "{line}");
+            assert!(line.contains("distinct=8"), "{line}");
+            assert!(!line.contains("hits=0 "), "跨ぎヒットが 0: {line}");
+            assert!(line.contains("evict=0"), "予算内なので落ちない: {line}");
+        }
+
         /// task 172 の 3 本は task 181 (lab t181b) で**既定 on**にした
         /// (3 本 + 小さい N + ミラー + D2H の組で cold prefill -8.9% / -9.4%)。
         #[test]

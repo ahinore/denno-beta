@@ -7989,6 +7989,33 @@ mod q4_attn_tests {
         assert_eq!(q4_mirror_cap(10, 1024), 1024);
     }
 
+    /// task 878: 16k / 32k の q4attn ミラー行数とバイト数の不変条件。
+    ///
+    /// 1 行 = 12 full 層 × kv_dim 512 × 2 (K,V) × 4 B = 49,152 B
+    /// (lab t878a の起動行 kv=3,072 MiB @ max_ctx 65,536 と一致)。
+    /// 実測では 22,758 tok のミラーが 1,537 MiB (= 32,768 行の cap) だった。
+    #[test]
+    fn q4_mirror_rows_at_16k_and_32k_fit_the_default_limit() {
+        let row = 49_152usize;
+        let lim = q4_attn_mirror_limit_from(None);
+        assert_eq!(lim, 3584 << 20);
+        let rows16 = q4_mirror_cap(16_384, 0);
+        assert_eq!(rows16, 16_384, "16k はちょうど 2 の冪");
+        assert_eq!(rows16 * row, 768 << 20);
+        let rows32 = q4_mirror_cap(32_768, 0);
+        assert_eq!(rows32, 32_768);
+        assert_eq!(rows32 * row, 1536 << 20, "lab t878a の 1,537 MiB");
+        // 16k から 32k へは 1 段 (16,384 → 32,768)。cap は 2 倍。
+        assert_eq!(q4_mirror_cap(16_385, 16_384), 32_768);
+        // 2 スロット (主 + 脇) が 32k を保持しても既定上限に収まる。
+        assert!(2 * rows32 * row <= lim);
+        // 3 スロットにすると上限を超える = 32k で slots=3 はミラーが LRU 往復する。
+        assert!(3 * rows32 * row > lim);
+        // 16k なら 4 スロットまで収まる (5 本目で超える)。
+        assert!(4 * rows16 * row <= lim);
+        assert!(5 * rows16 * row > lim);
+    }
+
     /// task 174: lab の失敗と同じ形 (len = cap = 4,096) を CPU ミラーで通す。
     /// flashdec は分割の終端の 1 行先 (= t_total 行目) を投機読みするので、
     /// 確保が cap + 1 行でないとこの長さで確保の外を踏む。SimMirror::sync が

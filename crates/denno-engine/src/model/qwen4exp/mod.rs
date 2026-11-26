@@ -59,6 +59,8 @@ use crate::tensor::{silu_inplace, softmax};
 // 下の `pub use ...::*` で従来どおり解決する。
 mod mix;
 mod moe;
+/// task 874: cold prefill の選択 expert の f32 展開を使い回すキャッシュ (既定 off)。
+mod pf_dq_cache;
 mod prefill;
 mod prof;
 /// task 822: prefill の天井 (計算 vs ディスク) の 1 行診断。
