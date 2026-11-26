@@ -43,6 +43,24 @@ pub struct QuantEntry {
     pub mib: u64,
 }
 
+/// 量子型 1 種の内訳 (task 1096)。`quant` と同じ集計値に、全テンソル
+/// バイトに対する割合を足したもの。並びは型名の昇順 (決定的)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuantBreakdownEntry {
+    /// ggml の型名 (`GgmlType::name`。`quant` と同じ綴り)
+    pub ty: String,
+    pub tensors: usize,
+    pub bytes: u64,
+    pub mib: u64,
+    /// `total_tensor_bytes` に対する割合。ベーシスポイント (1/100 %、
+    /// 10000 = 100%) の整数で持つ。浮動小数を使わないので JSON の値は
+    /// 環境によらず同じになり、`Eq` も保てる。
+    ///
+    /// 型ごとに独立して四捨五入するため、合計は 10000 に一致しないことが
+    /// ある (最大で型数の半分ぶんずれる)。
+    pub pct_bp: u32,
+}
+
 /// VRAM / RAM の見積り。すべてバイト (mib は丸め)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VramEstimate {
@@ -76,6 +94,9 @@ pub struct InspectReport {
     pub tensor_count: usize,
     pub total_tensor_bytes: u64,
     pub quant: Vec<QuantEntry>,
+    /// 型ごとの本数・バイト数・割合 (型名の昇順)。`quant` の後方互換な
+    /// 追加分で、内容は `quant` と一致する (割合だけ足したもの)。
+    pub quant_breakdown: Vec<QuantBreakdownEntry>,
     pub vram: VramEstimate,
 }
 
@@ -174,6 +195,21 @@ pub fn analyze(header: &GgufHeader, path: &Path, expert_cache_mib: u64) -> Inspe
         })
         .collect();
 
+    // task 1096: 型ごとの内訳。`quant` と同じ値に割合を足し、型名の昇順に
+    // 並べ替える (BTreeMap の反復順に暗黙に頼らない = 決定的であることを
+    // この関数単体で保証する)。
+    let mut quant_breakdown: Vec<QuantBreakdownEntry> = quant
+        .iter()
+        .map(|q| QuantBreakdownEntry {
+            ty: q.ty.clone(),
+            tensors: q.tensors,
+            bytes: q.bytes,
+            mib: q.mib,
+            pct_bp: pct_bp(q.bytes, total_tensor_bytes),
+        })
+        .collect();
+    quant_breakdown.sort_by(|a, b| a.ty.cmp(&b.ty));
+
     // dense / expert の分離は engine と同じ式を使う。
     let totals = classify_weights(header.tensors.values().map(|t| {
         (t.name.as_str(), t.ty, t.dims, t.nbytes)
@@ -224,8 +260,27 @@ pub fn analyze(header: &GgufHeader, path: &Path, expert_cache_mib: u64) -> Inspe
         tensor_count: header.tensors.len(),
         total_tensor_bytes,
         quant,
+        quant_breakdown,
         vram,
     }
+}
+
+/// `bytes` が `total` に占める割合をベーシスポイント (1/100 % = 1 bp、
+/// 10000 = 100%) で返す。`total == 0` なら 0。四捨五入は整数演算だけで行う
+/// (浮動小数を持ち込まない)。
+fn pct_bp(bytes: u64, total: u64) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    // bytes * 10000 は最大でも 4e14 程度 (40 GB でも 4e14) で u64 に収まるが、
+    // saturating で念のため頭打ちにする。
+    let scaled = bytes.saturating_mul(10_000).saturating_add(total / 2);
+    (scaled / total).min(10_000) as u32
+}
+
+/// ベーシスポイントを `12.34` 形式の文字列にする (テキスト出力用)。
+fn pct_string(bp: u32) -> String {
+    format!("{}.{:02}", bp / 100, bp % 100)
 }
 
 fn show_u(v: Option<u64>) -> String {
@@ -260,6 +315,26 @@ pub fn render_text(r: &InspectReport) -> String {
             q.ty, q.tensors, q.mib
         ));
     }
+
+    // task 1096: 型ごとの内訳 (割合つき、型名の昇順)。
+    s.push_str("quant breakdown:\n");
+    for b in &r.quant_breakdown {
+        s.push_str(&format!(
+            "  {:<10} tensors={:<8} {:>12} MiB {:>7}%\n",
+            b.ty,
+            b.tensors,
+            b.mib,
+            pct_string(b.pct_bp)
+        ));
+    }
+    let total_pct = if r.total_tensor_bytes == 0 { 0 } else { 10_000 };
+    s.push_str(&format!(
+        "  {:<10} tensors={:<8} {:>12} MiB {:>7}%\n",
+        "total",
+        r.tensor_count,
+        mib(r.total_tensor_bytes),
+        pct_string(total_pct)
+    ));
 
     let v = &r.vram;
     let row = |label: String, bytes: u64| format!("  {label:<26}{:>10} MiB\n", mib(bytes));
