@@ -17,9 +17,24 @@
 //! temperature 上限 / thinking = brief + `enable_thinking=false`)。
 //! `stream` の既定は Ollama 仕様どおり **true** (Anthropic/OpenAI 経路の false と違う)。
 //!
-//! `/api/chat` は tools を持たない (P841 の範囲外)。履歴の `tool` ロールは 400。
+//! `/api/chat` の履歴は system / user / assistant のみ (履歴の `tool` ロールは 400)。
 //! `/api/generate` は `raw: true` のときだけ chat template を通さない
 //! (`Scheduler::submit_completion`)。`raw: false` は system + user の chat 経路。
+//!
+//! task 1071 (互換の監査): 人気クライアント (Open WebUI / Continue / Cline) が
+//! 常に送る任意フィールドを**落とさない**:
+//!
+//! - `keep_alive` (文字列 `"5m"` / 整数 / null / object) — 受理して無視する
+//!   (モデルは常駐なので解放要求には意味を持たせない)。
+//! - `format` (`"json"` / JSON Schema オブジェクト) — system に JSON 指示を足す。
+//!   それ以外の値 (未知の文字列・数値) は無視する。
+//! - `think` (bool / `"low"|"medium"|"high"` 等) — `false` 系は
+//!   `enable_thinking=false` (従来既定)、`true` 系は template 既定に任せる。
+//! - `tools` (OpenAI 形式の function 定義) — プロンプトへ渡し、出力の
+//!   `<tool_call>` block を Ollama 形式の `message.tool_calls` に変換する。
+//!   形が不正な要素は読み飛ばす (400 にしない)。
+//! - メッセージ側の `images` / `tool_calls` / `thinking` 等の未知キーは
+//!   serde が無視する (元から 400 にしない)。
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -41,8 +56,8 @@ use tokio_stream::Stream;
 
 use crate::scheduler::RawEvent;
 use crate::{
-    apply_temperature_cap, brief_system, check_auth, debug_api_error, resolve_max_tokens, ApiError,
-    AppState,
+    apply_temperature_cap, brief_system, check_auth, debug_api_error, extract_tool_calls,
+    resolve_max_tokens, validate_tools, ApiError, AppState, ToolDef,
 };
 
 /// `/api/version` が返す文字列。
@@ -196,6 +211,19 @@ pub struct ChatRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub options: OllamaOptions,
+    /// task 1071: 受理して無視する (モデルは常駐。型は検証しない)。
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub keep_alive: Option<Value>,
+    /// task 1071: `"json"` か JSON Schema オブジェクトなら JSON 指示を足す。
+    #[serde(default)]
+    pub format: Option<Value>,
+    /// task 1071: bool または `"low"|"medium"|"high"` 等。
+    #[serde(default)]
+    pub think: Option<Value>,
+    /// task 1071: OpenAI 形式の function 定義 (配列)。形が不正な要素は無視。
+    #[serde(default)]
+    pub tools: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +241,16 @@ pub struct GenerateRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub options: OllamaOptions,
+    /// task 1071: 受理して無視する (型は検証しない)。
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub keep_alive: Option<Value>,
+    /// task 1071: `"json"` か JSON Schema オブジェクトなら JSON 指示を足す。
+    #[serde(default)]
+    pub format: Option<Value>,
+    /// task 1071: bool または効力文字列。
+    #[serde(default)]
+    pub think: Option<Value>,
 }
 
 /// content (文字列 or parts 配列) を 1 本のテキストにする。
@@ -258,7 +296,8 @@ fn split_chat_messages(
             other => {
                 return Err(OllamaError::invalid(format!(
                     "messages[{i}].role: unsupported role {other:?} \
-                     (expected system, user or assistant; tools are not supported on /api/chat)"
+                     (expected system, user or assistant; \"tool\" role messages are not \
+                      supported on /api/chat)"
                 )))
             }
         }
@@ -291,6 +330,114 @@ fn normalize_stop(v: &Option<Value>) -> Result<Vec<String>, OllamaError> {
             "options.stop: expected a string or an array of strings",
         )),
     }
+}
+
+/// task 1071: `format` の解釈結果を system へ足す指示文にする。
+///
+/// - `"json"` → JSON オブジェクト限定の指示
+/// - オブジェクト → JSON Schema として埋め込む (32 KiB 超は無視)
+/// - それ以外 (未知の文字列・数値・null) → 何も足さない (400 にしない)
+fn format_hint(v: &Option<Value>) -> Option<String> {
+    /// 埋め込むスキーマの上限 (これを超える入力は無視して従来どおり)。
+    const MAX_SCHEMA_CHARS: usize = 32 * 1024;
+    match v {
+        Some(Value::String(s)) if s.trim().eq_ignore_ascii_case("json") => {
+            Some(JSON_OBJECT_HINT.to_string())
+        }
+        Some(Value::Object(map)) => {
+            let schema = Value::Object(map.clone()).to_string();
+            if schema.len() > MAX_SCHEMA_CHARS {
+                return None;
+            }
+            Some(format!(
+                "Return a single valid JSON value that conforms to this JSON Schema and nothing \
+                 else (no markdown fences, no prose): {schema}"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `format: "json"` のときに system へ足す固定文 (OpenAI の
+/// `response_format: {"type":"json_object"}` と同じ文面)。
+const JSON_OBJECT_HINT: &str =
+    "Return a single valid JSON object and nothing else (no markdown fences, no prose).";
+
+/// system に JSON 指示を足す (既存 system があれば改行 2 つで連結)。
+fn append_hint(system: Option<String>, hint: Option<String>) -> Option<String> {
+    match (system, hint) {
+        (s, None) => s,
+        (None, Some(h)) => Some(h),
+        (Some(s), Some(h)) if s.trim().is_empty() => Some(h),
+        (Some(s), Some(h)) => Some(format!("{s}\n\n{h}")),
+    }
+}
+
+/// task 1071: `think` を template の `enable_thinking` へ写す。
+///
+/// - 未指定 / `false` / `"false"` / `"off"` / `"no"` / `"none"` → `Some(false)`
+///   (従来既定 = 思考オフ)
+/// - `true` / `"true"` / `"on"` / 効力文字列 (`"low"|"medium"|"high"`) → `None`
+///   (template 既定に任せる = 思考オン)
+/// - それ以外の型 (数値・object 等) → `Some(false)` (安全側 = 従来既定)
+fn thinking_from(v: &Option<Value>) -> Option<bool> {
+    match v {
+        Some(Value::Bool(false)) => Some(false),
+        Some(Value::Bool(true)) => None,
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "false" | "off" | "no" | "none" | "0" => Some(false),
+            "true" | "on" | "yes" | "low" | "medium" | "high" | "1" => None,
+            _ => Some(false),
+        },
+        _ => Some(false),
+    }
+}
+
+/// task 1071: Ollama の `tools` (OpenAI 形式。`function` を直接持つ形も許す) を
+/// [`ToolDef`] へ写す。形が不正な要素は読み飛ばす (400 にしない)。
+fn ollama_tool_defs(v: &Option<Value>) -> Vec<ToolDef> {
+    let Some(Value::Array(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            let f = it.get("function").unwrap_or(it);
+            let name = f.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let description = f
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string);
+            // `parameters` が無い / object でないツールは引数なしとして受ける
+            // (`validate_tools` は object 以外を 400 にするのでここで正規化する)。
+            let input_schema = match f.get("parameters") {
+                Some(p) if p.is_object() => p.clone(),
+                _ => json!({"type": "object", "properties": {}}),
+            };
+            Some(ToolDef { name, description, input_schema })
+        })
+        .collect()
+}
+
+/// モデル出力の `<tool_call>` block を Ollama 形式の `tool_calls` にする。
+/// Ollama の `arguments` は **オブジェクト** (OpenAI の JSON 文字列とは違う)。
+fn tool_calls_json(calls: &[crate::ExtractedToolCall]) -> Value {
+    Value::Array(
+        calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "function": {
+                        "name": c.name,
+                        "arguments": c.input,
+                    }
+                })
+            })
+            .collect(),
+    )
 }
 
 /// 実効 max_tokens。`num_predict` が正のときだけ採用し、`/v1/messages` と同じ
@@ -363,6 +510,10 @@ struct NdjsonStream {
     /// 最終行 (`done: true` か error) を出したか。出したら次で None。
     finished: bool,
     pending: VecDeque<Bytes>,
+    /// task 1071: tools 有効時は本文をバッファし、Done で 1 行にまとめる
+    /// (途中の chunk に `<tool_call>` block の断片を漏らさないため)。
+    tools_active: bool,
+    buffered: String,
 }
 
 impl NdjsonStream {
@@ -382,6 +533,21 @@ impl NdjsonStream {
             }),
         };
         ndjson_line(v)
+    }
+
+    /// task 1071: tools 有効時の 1 行 (本文 + `message.tool_calls`)。
+    /// Ollama は `arguments` をオブジェクトで返す。
+    fn tool_chunk_line(&self, text: &str, calls: &[crate::ExtractedToolCall]) -> Bytes {
+        let mut msg = json!({"role": "assistant", "content": text});
+        if !calls.is_empty() {
+            msg["tool_calls"] = tool_calls_json(calls);
+        }
+        ndjson_line(json!({
+            "model": self.model,
+            "created_at": self.created_at,
+            "message": msg,
+            "done": false,
+        }))
     }
 
     fn final_line(&self, input_tokens: usize, output_tokens: usize, stop_reason: &str) -> Bytes {
@@ -438,12 +604,23 @@ impl Stream for NdjsonStream {
                     RawEvent::Start { input_tokens } => this.input_tokens = input_tokens,
                     RawEvent::Delta(text) => {
                         if !text.is_empty() {
-                            let line = this.chunk_line(&text);
-                            this.pending.push_back(line);
+                            if this.tools_active {
+                                this.buffered.push_str(&text);
+                            } else {
+                                let line = this.chunk_line(&text);
+                                this.pending.push_back(line);
+                            }
                         }
                     }
                     RawEvent::Done { input_tokens, output_tokens, stop_reason, .. } => {
                         this.input_tokens = input_tokens;
+                        if this.tools_active {
+                            let (text, calls) = extract_tool_calls(&this.buffered);
+                            if !text.is_empty() || !calls.is_empty() {
+                                let line = this.tool_chunk_line(&text, &calls);
+                                this.pending.push_back(line);
+                            }
+                        }
                         let line = this.final_line(input_tokens, output_tokens, &stop_reason);
                         this.pending.push_back(line);
                         this.finished = true;
@@ -649,6 +826,7 @@ fn ndjson_response(
     raw_prompt: Option<String>,
     params: GenParams,
     enable_thinking: Option<bool>,
+    tools: Option<Value>,
 ) -> Result<Response, OllamaError> {
     let (raw_tx, raw_rx) = tokio::sync::mpsc::channel::<RawEvent>(64);
     match raw_prompt {
@@ -662,7 +840,7 @@ fn ndjson_response(
                 system,
                 messages,
                 params,
-                None,
+                tools.clone(),
                 None,
                 enable_thinking,
                 raw_tx,
@@ -678,6 +856,8 @@ fn ndjson_response(
         input_tokens: 0,
         finished: false,
         pending: VecDeque::new(),
+        tools_active: tools.is_some(),
+        buffered: String::new(),
     };
     Ok((
         [(header::CONTENT_TYPE, "application/x-ndjson")],
@@ -713,9 +893,20 @@ pub async fn chat(
     }
     let stop = normalize_stop(&req.options.stop)?;
     let params = build_params(&state, &req.options, stop);
-    // /v1/messages と同じ thinking 既定 (brief + enable_thinking=false)
+    // task 1071: tools (OpenAI 形式) を template 用の JSON へ。形が不正な要素は
+    // 読み飛ばすので 400 にはならない。
+    let tool_defs = ollama_tool_defs(&req.tools);
+    let tools_active = !tool_defs.is_empty();
+    let tools_for_prompt = if tools_active {
+        Some(validate_tools(&tool_defs).map_err(OllamaError::from)?)
+    } else {
+        None
+    };
+    // /v1/messages と同じ thinking 既定 (brief + `enable_thinking` は think から)。
+    // task 1071: `format` の JSON 指示も system に足す。
     let system = brief_system(system);
-    let enable_thinking = Some(false);
+    let system = append_hint(system, format_hint(&req.format));
+    let enable_thinking = thinking_from(&req.think);
 
     if req.stream.unwrap_or(true) {
         return ndjson_response(
@@ -726,18 +917,36 @@ pub async fn chat(
             None,
             params,
             enable_thinking,
+            tools_for_prompt,
         );
     }
 
     let rx = state
         .scheduler
-        .submit_chat(system, chat_messages, params, None, None, enable_thinking)
+        .submit_chat(
+            system,
+            chat_messages,
+            params,
+            tools_for_prompt,
+            None,
+            enable_thinking,
+        )
         .map_err(|_| queue_full(&state))?;
     let out = await_output(rx, state.scheduler.limits()).await?;
+    // task 1071: tools 有効時だけ `<tool_call>` block を Ollama 形式へ変換する。
+    let (text, calls) = if tools_active {
+        extract_tool_calls(&out.text)
+    } else {
+        (out.text.clone(), Vec::new())
+    };
+    let mut message = json!({"role": "assistant", "content": text});
+    if !calls.is_empty() {
+        message["tool_calls"] = tool_calls_json(&calls);
+    }
     let mut v = json!({
         "model": state.model_name,
         "created_at": rfc3339_from_unix(now_secs()),
-        "message": {"role": "assistant", "content": out.text},
+        "message": message,
     });
     if let Value::Object(ref mut m) = v {
         if let Value::Object(fields) = done_fields(
@@ -776,6 +985,9 @@ pub async fn generate(
     let params = build_params(&state, &req.options, stop);
     let raw = req.raw.unwrap_or(false);
     let stream = req.stream.unwrap_or(true);
+    // task 1071: `format` の JSON 指示と `think` の写像 (chat と同じ規則)。
+    let hint = format_hint(&req.format);
+    let enable_thinking = thinking_from(&req.think);
 
     if raw {
         // chat template を通さない (`/v1/completions` と同じ raw 経路)。system は無視する。
@@ -787,6 +999,7 @@ pub async fn generate(
                 Vec::new(),
                 Some(prompt),
                 params,
+                None,
                 None,
             );
         }
@@ -800,8 +1013,8 @@ pub async fn generate(
 
     // 非 raw: system + user の chat 経路 (chat template を通す)。
     let system = brief_system(req.system.filter(|s| !s.is_empty()));
+    let system = append_hint(system, hint);
     let messages = vec![ChatMessage { role: "user".to_string(), content: prompt }];
-    let enable_thinking = Some(false);
     if stream {
         return ndjson_response(
             &state,
@@ -811,6 +1024,7 @@ pub async fn generate(
             None,
             params,
             enable_thinking,
+            None,
         );
     }
     let rx = state
@@ -838,4 +1052,106 @@ fn generate_json(state: &AppState, started: Instant, out: &ChatOutput) -> Value 
         }
     }
     v
+}
+
+#[cfg(test)]
+mod compat_1071_tests {
+    use super::*;
+
+    fn s(v: Value) -> Option<Value> {
+        Some(v)
+    }
+
+    #[test]
+    fn format_hint_accepts_json_and_schema() {
+        assert_eq!(format_hint(&s(json!("json"))), Some(JSON_OBJECT_HINT.to_string()));
+        assert_eq!(format_hint(&s(json!(" JSON "))), Some(JSON_OBJECT_HINT.to_string()));
+        let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let h = format_hint(&s(schema.clone())).expect("schema が無視された");
+        assert!(h.contains("\"properties\""), "hint = {h}");
+        assert!(h.contains("\"a\""), "hint = {h}");
+        // 未知の値は何も足さない (400 にもしない)
+        assert_eq!(format_hint(&s(json!("xml"))), None);
+        assert_eq!(format_hint(&s(json!(42))), None);
+        assert_eq!(format_hint(&s(Value::Null)), None);
+        assert_eq!(format_hint(&None), None);
+    }
+
+    #[test]
+    fn format_hint_ignores_oversized_schema() {
+        let big = "x".repeat(40 * 1024);
+        assert_eq!(format_hint(&s(json!({"const": big}))), None);
+    }
+
+    #[test]
+    fn thinking_from_maps_bool_and_levels() {
+        assert_eq!(thinking_from(&None), Some(false));
+        assert_eq!(thinking_from(&s(json!(false))), Some(false));
+        assert_eq!(thinking_from(&s(json!(true))), None);
+        for on in ["true", "on", "high", "medium", "low"] {
+            assert_eq!(thinking_from(&s(json!(on))), None, "think = {on}");
+        }
+        for off in ["false", "off", "no", "none"] {
+            assert_eq!(thinking_from(&s(json!(off))), Some(false), "think = {off}");
+        }
+        // 未知 / 非文字列は安全側 (従来既定)
+        assert_eq!(thinking_from(&s(json!("bogus"))), Some(false));
+        assert_eq!(thinking_from(&s(json!({"x": 1}))), Some(false));
+    }
+
+    #[test]
+    fn append_hint_joins_system() {
+        assert_eq!(append_hint(None, None), None);
+        assert_eq!(append_hint(Some("a".into()), None), Some("a".to_string()));
+        assert_eq!(append_hint(None, Some("h".into())), Some("h".to_string()));
+        assert_eq!(
+            append_hint(Some("a".into()), Some("h".into())),
+            Some("a\n\nh".to_string())
+        );
+        assert_eq!(append_hint(Some("  ".into()), Some("h".into())), Some("h".to_string()));
+    }
+
+    #[test]
+    fn ollama_tool_defs_skips_malformed_entries() {
+        let v = json!([
+            {"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }},
+            {"function": {"name": "no_params"}},
+            {"function": {}},
+            {"function": {"name": "   "}},
+            {"type": "function"},
+            "not an object",
+            42
+        ]);
+        let defs = ollama_tool_defs(&s(v));
+        assert_eq!(defs.len(), 2, "defs = {defs:?}");
+        assert_eq!(defs[0].name, "get_weather");
+        assert_eq!(defs[0].description.as_deref(), Some("Get current weather"));
+        assert!(defs[0].input_schema.is_object());
+        assert_eq!(defs[1].name, "no_params");
+        // parameters 欠落は「引数なし」の object へ正規化される
+        assert_eq!(defs[1].input_schema, json!({"type": "object", "properties": {}}));
+        // 正規化後は validate_tools が必ず通る (400 の口を作らない)
+        validate_tools(&defs).expect("validate_tools が落ちた");
+        assert!(ollama_tool_defs(&None).is_empty());
+        assert!(ollama_tool_defs(&s(json!({"name": "x"}))).is_empty());
+        assert!(ollama_tool_defs(&s(json!("nope"))).is_empty());
+    }
+
+    #[test]
+    fn tool_calls_json_uses_object_arguments() {
+        let calls = vec![crate::ExtractedToolCall {
+            name: "get_weather".to_string(),
+            input: json!({"city": "Tokyo"}),
+        }];
+        assert_eq!(
+            tool_calls_json(&calls),
+            json!([{"function": {"name": "get_weather", "arguments": {"city": "Tokyo"}}}])
+        );
+        // Ollama の arguments はオブジェクト (OpenAI の JSON 文字列ではない)
+        assert!(tool_calls_json(&calls)[0]["function"]["arguments"].is_object());
+    }
 }
