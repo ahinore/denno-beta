@@ -885,3 +885,703 @@ fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// task 927: 全型 x 境界ブロックの f64 参照突き合わせ (テスト専用)
+// ---------------------------------------------------------------------------
+//
+// `dequant_block` の正しさは `tests/dequant_ref.rs` が llama.cpp の C 実装と
+// のビット一致で固定している (pseudo-random なブロック列 + fixture)。ここに
+// 置くのは別系統の参照で、**ブロック形式の定義から要素番号を引き直して書いた
+// f64 版**と、その比較行列である。役割は 2 つ。
+//
+//   1. fixture では踏みにくい境界値 (全ゼロ / f16 最大 / 負のゼロ / f16 最小
+//      非正規 / 符号が交互のデータ) で全型を突き合わせる。fixture は C 側の
+//      再ビルドが要るので、境界値の追加はどうしてもここに置くことになる。
+//   2. スケールの位置やニブルの向きを取り違える編集を、fixture を触らずに落とす。
+//
+// 算術は f64。f16 スケールと小さい整数の積は f32 でも厳密なので、一致は
+// ほぼビット一致になる (許容は AGENTS.md の絶対 1e-4 + 相対 1e-5)。
+// 格子・符号表は本体と同じ `kquant_tables` を使う (表は gen_kquant_tables.py が
+// ggml-common.h から生成しており、この検査の対象外)。
+#[cfg(test)]
+pub(crate) mod refdev {
+    use super::*;
+    use crate::quant_matrix::ALL_TYPES;
+
+    #[inline]
+    pub(crate) fn f16_at(x: &[u8], off: usize) -> f64 {
+        half::f16::from_bits(u16::from_le_bytes([x[off], x[off + 1]])).to_f32() as f64
+    }
+
+    #[inline]
+    fn u16_at(x: &[u8], off: usize) -> u16 {
+        u16::from_le_bytes([x[off], x[off + 1]])
+    }
+
+    #[inline]
+    fn u32_at(x: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([x[off], x[off + 1], x[off + 2], x[off + 3]])
+    }
+
+    /// 符号表 1 バイト -> 1 要素の符号 (ビットが立っていれば負)。
+    #[inline]
+    fn sgn(byte: u8, j: usize) -> f64 {
+        if byte & KMASK_IQ2XS[j] != 0 {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
+    /// q4_K/q5_K の 6bit scale / min (ビット配置から書き直した版)。
+    /// `sc` は scales[12]。
+    fn scale_min_k4(j: usize, sc: &[u8]) -> (f64, f64) {
+        if j < 4 {
+            ((sc[j] & 63) as f64, (sc[j + 4] & 63) as f64)
+        } else {
+            // j >= 4: low 4bit は sc[j+4] の下位、上位 2bit は前の 4 バイトの
+            // 上位 2bit に散っている。
+            (
+                ((sc[j + 4] & 0x0f) | ((sc[j - 4] >> 6) << 4)) as f64,
+                ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)) as f64,
+            )
+        }
+    }
+
+    /// 1 ブロックを f64 で復元する独立参照。
+    ///
+    /// 索引は「要素番号からブロック内の位置を引き直す」形で書いてある
+    /// (本体は ggml と同じループ順なので、同じ取り違えを写しにくくするため)。
+    pub(crate) fn dequant_ref(ty: GgmlType, x: &[u8]) -> Vec<f64> {
+        let n = ty.blck_size();
+        let mut y = vec![0f64; n];
+        match ty {
+            GgmlType::F32 => y[0] = f32::from_le_bytes([x[0], x[1], x[2], x[3]]) as f64,
+            GgmlType::F16 => y[0] = f16_at(x, 0),
+            GgmlType::Bf16 => y[0] = f32::from_bits((u16_at(x, 0) as u32) << 16) as f64,
+
+            // ---- 32 要素ブロック -------------------------------------------------
+            GgmlType::Q2_0 => {
+                let d = f16_at(x, 0);
+                for i in 0..64 {
+                    let q = ((x[2 + i / 4] >> (2 * (i % 4))) & 3) as i32;
+                    y[i] = (q - 1) as f64 * d;
+                }
+            }
+            GgmlType::Q4_0 => {
+                let d = f16_at(x, 0);
+                for i in 0..32 {
+                    let q = if i < 16 {
+                        x[2 + i] & 0x0f
+                    } else {
+                        x[2 + i - 16] >> 4
+                    };
+                    y[i] = (q as f64 - 8.0) * d;
+                }
+            }
+            GgmlType::Q4_1 => {
+                let (d, m) = (f16_at(x, 0), f16_at(x, 2));
+                for i in 0..32 {
+                    let q = if i < 16 {
+                        x[4 + i] & 0x0f
+                    } else {
+                        x[4 + i - 16] >> 4
+                    };
+                    y[i] = q as f64 * d + m;
+                }
+            }
+            GgmlType::Q5_0 | GgmlType::Q5_1 => {
+                let five = ty == GgmlType::Q5_0;
+                let d = f16_at(x, 0);
+                let m = if five { 0.0 } else { f16_at(x, 2) };
+                let qh_off = if five { 2 } else { 4 };
+                let qs_off = qh_off + 4;
+                let qh = u32_at(x, qh_off);
+                for i in 0..32 {
+                    let bit = ((qh >> i) & 1) as u8;
+                    let nib = (x[qs_off + i % 16] >> (4 * (i / 16))) & 0x0f;
+                    let q = (nib | (bit << 4)) as i32;
+                    y[i] = if five {
+                        (q - 16) as f64 * d
+                    } else {
+                        q as f64 * d + m
+                    };
+                }
+            }
+            GgmlType::Q8_0 => {
+                let d = f16_at(x, 0);
+                for i in 0..32 {
+                    y[i] = x[2 + i] as i8 as f64 * d;
+                }
+            }
+            GgmlType::IQ4Nl => {
+                let d = f16_at(x, 0);
+                for i in 0..32 {
+                    let nib = (x[2 + i % 16] >> (4 * (i / 16))) & 0x0f;
+                    y[i] = d * KVALUES_IQ4NL[nib as usize] as f64;
+                }
+            }
+
+            // ---- K 系 (256 要素スーパーブロック) ---------------------------------
+            GgmlType::Q2K => {
+                let d = f16_at(x, 80);
+                let dmin = f16_at(x, 82);
+                for i in 0..256 {
+                    let chunk = i / 128; // 2 つの 128 要素半ブロック
+                    let j = (i % 128) / 32; // 4 つの 32 要素グループ
+                    let g = (i % 32) / 16; // 16 要素でスケールが切り替わる
+                    let l = i % 16;
+                    let sc = x[chunk * 8 + j * 2 + g];
+                    // qs は半ブロックあたり 32 バイト (16 要素 x 2)
+                    let qb = x[16 + chunk * 32 + g * 16 + l];
+                    let q = (qb >> (2 * j)) & 3;
+                    y[i] = d * (sc & 0x0f) as f64 * q as f64 - dmin * (sc >> 4) as f64;
+                }
+            }
+            GgmlType::Q3K => {
+                let d_all = f16_at(x, 108);
+                let sc = &x[96..108]; // scales[12]
+                for i in 0..256 {
+                    let chunk = i / 128;
+                    let j = (i % 128) / 32;
+                    let g = (i % 32) / 16;
+                    let l = i % 16;
+                    // 16 個の 6bit scale: 下位 4bit は sc[0..8] の 8 バイト
+                    // (i<8 は下ニブル / i>=8 は上ニブル)、上位 2bit は sc[8..12]
+                    // の 2bit x 4 段。
+                    let idx = chunk * 8 + j * 2 + g;
+                    let low = if idx < 8 {
+                        sc[idx] & 0x0f
+                    } else {
+                        sc[idx - 8] >> 4
+                    };
+                    let high2 = (sc[8 + idx % 4] >> (2 * (idx / 4))) & 3;
+                    let s = ((low | (high2 << 4)) as i8) as f64 - 32.0;
+                    let hbit = 1u8 << (4 * chunk + j);
+                    let qb = x[32 + chunk * 32 + g * 16 + l];
+                    let q = ((qb >> (2 * j)) & 3) as f64;
+                    let sub = if x[l + 16 * g] & hbit != 0 { 0.0 } else { 4.0 };
+                    y[i] = d_all * s * (q - sub);
+                }
+            }
+            GgmlType::Q4K | GgmlType::Q5K => {
+                let five = ty == GgmlType::Q5K;
+                let (d, dmin) = (f16_at(x, 0), f16_at(x, 2));
+                let sc = &x[4..16];
+                let (qh_off, qs_off) = if five { (16usize, 48usize) } else { (0, 16) };
+                for i in 0..256 {
+                    let j4 = i / 64; // 64 要素 x 4
+                    let sub = (i % 64) / 32; // 32 要素ごとに 1 つの scale/min
+                    let l = i % 32;
+                    let (s, m) = scale_min_k4(j4 * 2 + sub, sc);
+                    let qb = x[qs_off + j4 * 32 + l];
+                    let q = if sub == 0 { qb & 0x0f } else { qb >> 4 } as f64;
+                    let hi = if five {
+                        let bit = 1u8 << (2 * j4 + sub);
+                        if x[qh_off + l] & bit != 0 {
+                            16.0
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    y[i] = d * s * (q + hi) - dmin * m;
+                }
+            }
+            GgmlType::Q6K => {
+                let d = f16_at(x, 208);
+                for i in 0..256 {
+                    let chunk = i / 128;
+                    let quad = (i % 128) / 32; // 32 要素 x 4 (ql/qh の使う場所が変わる)
+                    let l = i % 32;
+                    let is = l / 16;
+                    let ql = x[chunk * 64 + if quad % 2 == 1 { 32 } else { 0 } + l];
+                    let qh = x[128 + chunk * 32 + l];
+                    let nib = if quad < 2 { ql & 0x0f } else { ql >> 4 };
+                    let hi = (qh >> (2 * quad)) & 3;
+                    let q = (nib as i32 | ((hi as i32) << 4)) - 32;
+                    let s = x[192 + chunk * 8 + quad * 2 + is] as i8 as f64;
+                    y[i] = d * s * q as f64;
+                }
+            }
+
+            // ---- IQ 系 ------------------------------------------------------------
+            GgmlType::IQ2Xxs => {
+                let d = f16_at(x, 0);
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let l = (i % 32) / 8;
+                    let j = i % 8;
+                    let aux0 = u32_at(x, 2 + ib * 8);
+                    let aux1 = u32_at(x, 2 + ib * 8 + 4);
+                    let db = d * (0.5 + ((aux1 >> 28) as f64)) * 0.25;
+                    let gi = aux0.to_le_bytes()[l] as usize;
+                    let grid = IQ2XXS_GRID[gi].to_le_bytes();
+                    let signs = KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
+                    y[i] = db * grid[j] as f64 * sgn(signs, j);
+                }
+            }
+            GgmlType::IQ2Xs => {
+                let d = f16_at(x, 0);
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let l = (i % 32) / 8;
+                    let j = i % 8;
+                    let idx = u16_at(x, 2 + ib * 8 + 2 * l) as usize;
+                    let scb = x[66 + ib];
+                    let nib = if l < 2 { scb & 0x0f } else { scb >> 4 };
+                    let db = d * (0.5 + nib as f64) * 0.25;
+                    let grid = IQ2XS_GRID[idx & 511].to_le_bytes();
+                    let signs = KSIGNS_IQ2XS[idx >> 9];
+                    y[i] = db * grid[j] as f64 * sgn(signs, j);
+                }
+            }
+            GgmlType::IQ2S => {
+                let d = f16_at(x, 0);
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let l = (i % 32) / 8;
+                    let j = i % 8;
+                    let qb = x[2 + ib * 4 + l] as usize;
+                    let idx = qb | (((x[66 + ib] as usize) << (8 - 2 * l)) & 0x300);
+                    let scb = x[74 + ib];
+                    let nib = if l < 2 { scb & 0x0f } else { scb >> 4 };
+                    let db = d * (0.5 + nib as f64) * 0.25;
+                    let grid = IQ2S_GRID[idx].to_le_bytes();
+                    let signs = x[2 + 32 + ib * 4 + l];
+                    y[i] = db * grid[j] as f64 * sgn(signs, j);
+                }
+            }
+            GgmlType::IQ3Xxs => {
+                let d = f16_at(x, 0);
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let l = (i % 32) / 8;
+                    let j = i % 8;
+                    let aux = u32_at(x, 66 + ib * 4);
+                    let db = d * (0.5 + ((aux >> 28) as f64)) * 0.5;
+                    let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                    // 8 要素 = 4bit グリッド 2 本 (前半 4 要素 / 後半 4 要素)
+                    let gi = x[2 + ib * 8 + 2 * l + j / 4] as usize;
+                    let grid = IQ3XXS_GRID[gi].to_le_bytes();
+                    y[i] = db * grid[j % 4] as f64 * sgn(signs, j);
+                }
+            }
+            GgmlType::IQ3S => {
+                let d = f16_at(x, 0);
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let l = (i % 32) / 8;
+                    let j = i % 8;
+                    let second = j >= 4;
+                    let qb = x[2 + ib * 8 + 2 * l + second as usize] as usize;
+                    let sh = if second { 7 - 2 * l } else { 8 - 2 * l };
+                    let idx = qb | (((x[66 + ib] as usize) << sh) & 256);
+                    let scb = x[106 + ib / 2];
+                    let nib = if ib % 2 == 0 { scb & 0x0f } else { scb >> 4 };
+                    let db = d * (1.0 + 2.0 * nib as f64);
+                    let grid = IQ3S_GRID[idx].to_le_bytes();
+                    let signs = x[74 + ib * 4 + l];
+                    y[i] = db * grid[j % 4] as f64 * sgn(signs, j);
+                }
+            }
+            GgmlType::IQ1S => {
+                let d = f16_at(x, 0);
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let l = (i % 32) / 8;
+                    let j = i % 8;
+                    let qh = u16_at(x, 34 + 2 * ib);
+                    let dl = d * (2.0 * ((qh >> 12) & 7) as f64 + 1.0);
+                    let delta = if qh & 0x8000 != 0 {
+                        -IQ1S_DELTA as f64
+                    } else {
+                        IQ1S_DELTA as f64
+                    };
+                    let idx = (x[2 + ib * 4 + l] as usize) | ((((qh >> (3 * l)) & 7) as usize) << 8);
+                    let grid = IQ1S_GRID[idx].to_le_bytes();
+                    y[i] = dl * (grid[j] as i8 as f64 + delta);
+                }
+            }
+            GgmlType::IQ4Xs => {
+                let d = f16_at(x, 0);
+                let sh = u16_at(x, 2);
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let half = (i % 32) / 16;
+                    let j = i % 16;
+                    let low = (x[4 + ib / 2] >> (4 * (ib % 2))) & 0x0f;
+                    let ls = (low as i32 | (((sh >> (2 * ib)) & 3) as i32) << 4) - 32;
+                    let nib = (x[8 + ib * 16 + j] >> (4 * half)) & 0x0f;
+                    y[i] = d * ls as f64 * KVALUES_IQ4NL[nib as usize] as f64;
+                }
+            }
+            GgmlType::Iq1M => {
+                let w = [u16_at(x, 48), u16_at(x, 50), u16_at(x, 52), u16_at(x, 54)];
+                let d_bits = (w[0] >> 12)
+                    | ((w[1] >> 8) & 0x00f0)
+                    | ((w[2] >> 4) & 0x0f00)
+                    | (w[3] & 0xf000);
+                let d = half::f16::from_bits(d_bits).to_f32() as f64;
+                for i in 0..256 {
+                    let ib = i / 32;
+                    let l = (i % 32) / 8;
+                    let j = i % 8;
+                    let s = w[ib / 2];
+                    let shift = 6 * (ib % 2);
+                    let nib = (s >> (shift + 3 * (l / 2))) & 7;
+                    let dl = d * (2.0 * nib as f64 + 1.0);
+                    let hb = x[32 + 2 * ib + l / 2];
+                    let idx = (x[4 * ib + l] as usize)
+                        | (((hb as usize) << (if l % 2 == 0 { 8 } else { 4 })) & 0x700);
+                    let delta = if hb & if l % 2 == 0 { 0x08 } else { 0x80 } != 0 {
+                        -IQ1S_DELTA as f64
+                    } else {
+                        IQ1S_DELTA as f64
+                    };
+                    let grid = IQ1S_GRID[idx].to_le_bytes();
+                    y[i] = dl * (grid[j] as i8 as f64 + delta);
+                }
+            }
+            GgmlType::Tq1_0 => {
+                const POW3: [u32; 5] = [1, 3, 9, 27, 81];
+                let d = f16_at(x, 52);
+                for i in 0..256 {
+                    // 先頭 32 バイト x 5 桁 -> 次の 16 バイト x 5 桁 -> qh 4 x 4 桁
+                    let (src, n) = if i < 160 {
+                        (x[i % 32], i / 32)
+                    } else if i < 240 {
+                        let k = i - 160;
+                        (x[32 + k % 16], k / 16)
+                    } else {
+                        let k = i - 240;
+                        (x[48 + k % 4], k / 4)
+                    };
+                    let q = (src as u32 * POW3[n]) as u8;
+                    let xi = ((q as u16 * 3) >> 8) as i32;
+                    y[i] = (xi - 1) as f64 * d;
+                }
+            }
+
+            // 未対応 (dequant_block が unreachable!)。テストからは呼ばない。
+            GgmlType::Mxfp4 => panic!("MXFP4 の参照実装は無い (未対応の型)"),
+        }
+        y
+    }
+    /// 境界ブロックの 1 バリエーション。
+    pub(crate) struct EdgeCase {
+        pub name: &'static str,
+        /// f16 スケールに書く値 (スケールを持たない型では使わない)。
+        pub bits: u16,
+        /// 偶数バイト / 奇数バイトの値。交互パターンでニブルと符号を散らす。
+        pub even: u8,
+        pub odd: u8,
+    }
+
+    /// 全型に共通の境界ブロック (task 927 の 5 種 + データ最大)。
+    pub(crate) const EDGE_CASES: [EdgeCase; 6] = [
+        EdgeCase {
+            name: "all_zero",
+            bits: 0x0000,
+            even: 0x00,
+            odd: 0x00,
+        },
+        EdgeCase {
+            name: "max_scale",
+            bits: 0x7bff,
+            even: 0xa5,
+            odd: 0x5a,
+        },
+        EdgeCase {
+            name: "neg_zero_scale",
+            bits: 0x8000,
+            even: 0x5a,
+            odd: 0xa5,
+        },
+        EdgeCase {
+            name: "subnormal_scale",
+            bits: 0x0001,
+            even: 0xa5,
+            odd: 0x5a,
+        },
+        EdgeCase {
+            name: "alt_signs",
+            bits: 0x3c00,
+            even: 0x5a,
+            odd: 0xa5,
+        },
+        EdgeCase {
+            name: "max_data",
+            bits: 0x3c00,
+            even: 0xff,
+            odd: 0xff,
+        },
+    ];
+
+    /// ブロック内で f16 スケールとして扱われるフィールドの位置。
+    pub(crate) fn f16_scale_offsets(ty: GgmlType) -> &'static [usize] {
+        use GgmlType as T;
+        match ty {
+            T::Q2K => &[80, 82],        // d + dmin (末尾)
+            T::Q3K => &[108],           // d (末尾)
+            T::Q4K | T::Q5K => &[0, 2], // d + dmin (先頭)
+            T::Q6K => &[208],           // d (末尾)
+            T::Tq1_0 => &[52],          // d (末尾)
+            T::F32 | T::F16 | T::Bf16 | T::Iq1M | T::Mxfp4 => &[],
+            _ => &[0], // ブロック先頭の d
+        }
+    }
+
+    /// スケールを持たない生 float 型か。
+    pub(crate) fn is_raw(ty: GgmlType) -> bool {
+        matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16)
+    }
+
+    /// IQ1_M は d が scales[8] (u16 x 4) の上位ニブルに 4bit ずつ分散している。
+    fn write_iq1m_d(b: &mut [u8], bits: u16) {
+        for w in 0..4 {
+            let off = 48 + 2 * w;
+            let cur = u16::from_le_bytes([b[off], b[off + 1]]);
+            let v = (cur & 0x0fff) | (((bits >> (4 * w)) & 0xf) << 12);
+            b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// 1 ブロックを境界値で埋める。
+    pub(crate) fn build_block(ty: GgmlType, case: &EdgeCase) -> Vec<u8> {
+        let ts = ty.type_size();
+        let mut b: Vec<u8> = (0..ts)
+            .map(|k| if k % 2 == 0 { case.even } else { case.odd })
+            .collect();
+        for &off in f16_scale_offsets(ty) {
+            b[off..off + 2].copy_from_slice(&case.bits.to_le_bytes());
+        }
+        if ty == GgmlType::Iq1M {
+            write_iq1m_d(&mut b, case.bits);
+        }
+        b
+    }
+
+    /// 本体と f64 参照を 1 ブロック突き合わせ、比較した要素数を返す。
+    ///
+    /// 許容は AGENTS.md の方針 (絶対 1e-4 + 相対 1e-5 のどちらかを満たす)。
+    /// f16 スケール x 小さい整数は f32 でも厳密なので実際はほぼビット一致する。
+    /// ゼロは符号まで比べる (f32 と f64 で符号則が同じことの確認)。
+    pub(crate) fn check_block_parity(ty: GgmlType, block: &[u8], ctx: &str) -> usize {
+        let n = ty.blck_size();
+        let want = dequant_ref(ty, block);
+        assert_eq!(want.len(), n, "{ctx}: 参照の要素数");
+        let mut got = vec![0f32; n];
+        dequant_row_into(ty, block, &mut got);
+        for i in 0..n {
+            let w = want[i];
+            let g = got[i] as f64;
+            if w.is_nan() {
+                assert!(g.is_nan(), "{ctx}[{i}]: 参照は NaN、本体は {g:e}");
+                continue;
+            }
+            assert!(g.is_finite(), "{ctx}[{i}]: 本体が非有限 {g:e} (参照 {w:e})");
+            let abs = (g - w).abs();
+            let rel = if w != 0.0 { abs / w.abs() } else { 0.0 };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-5,
+                "{ctx}[{i}]: 本体 {g:e} / 参照 {w:e} (絶対 {abs:e} 相対 {rel:e})"
+            );
+            if w == 0.0 {
+                assert_eq!(
+                    g.is_sign_negative(),
+                    w.is_sign_negative(),
+                    "{ctx}[{i}]: ゼロの符号が違う (本体 {g:e} / 参照 {w:e})"
+                );
+            }
+        }
+        n
+    }
+
+    /// パリティ行列の対象型 (CPU で復元できる全型から MXFP4 を除いたもの)。
+    pub(crate) fn parity_types() -> Vec<GgmlType> {
+        ALL_TYPES
+            .iter()
+            .copied()
+            .filter(|t| dequant_supported(*t) && *t != GgmlType::Mxfp4)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refdev::*;
+    use super::*;
+    use GgmlType as T;
+
+    /// 全型 x 全境界ブロックを f64 参照と突き合わせる (task 927 の本丸)。
+    #[test]
+    fn f64_parity_matrix_covers_every_supported_type() {
+        let mut seen: Vec<GgmlType> = Vec::new();
+        let mut blocks = 0usize;
+        let mut cmp = 0usize;
+        for ty in parity_types() {
+            if is_raw(ty) {
+                continue; // 生 float は raw_float_types_decode_exactly が見る
+            }
+            for case in &EDGE_CASES {
+                let blk = build_block(ty, case);
+                cmp += check_block_parity(ty, &blk, &format!("{} / {}", ty.name(), case.name));
+                blocks += 1;
+            }
+            seen.push(ty);
+        }
+        let want: Vec<GgmlType> = parity_types()
+            .into_iter()
+            .filter(|t| !is_raw(*t))
+            .collect();
+        assert_eq!(seen, want, "行列が対象型を全部は通っていない");
+        assert_eq!(blocks, want.len() * EDGE_CASES.len(), "ブロック数");
+        let want_elems: usize = want.iter().map(|t| t.blck_size() * EDGE_CASES.len()).sum();
+        assert_eq!(cmp, want_elems, "比較した要素数");
+        println!(
+            "f64 parity: {} 型 / {} ブロック / {} 要素",
+            seen.len(),
+            blocks,
+            cmp
+        );
+    }
+
+    /// 全ゼロブロックは全型で 0 になる (スケールもデータも 0)。
+    #[test]
+    fn all_zero_block_is_zero_for_every_type() {
+        for ty in parity_types() {
+            if is_raw(ty) {
+                continue;
+            }
+            let blk = build_block(ty, &EDGE_CASES[0]);
+            let out = dequant_row(ty, &blk, ty.blck_size());
+            assert!(
+                out.iter().all(|v| *v == 0.0),
+                "{}: 全ゼロブロックが 0 にならない",
+                ty.name()
+            );
+        }
+    }
+
+    /// 負のゼロのスケールで、実際に -0.0 が出ていること (行列テストが
+    /// 「+0.0 同士の比較」に退化していないことの確認)。
+    #[test]
+    fn neg_zero_scale_yields_signed_zeros() {
+        let case = EDGE_CASES
+            .iter()
+            .find(|c| c.name == "neg_zero_scale")
+            .expect("neg_zero_scale ケース");
+        let mut neg = 0usize;
+        let mut total = 0usize;
+        for ty in parity_types() {
+            if is_raw(ty) {
+                continue;
+            }
+            let blk = build_block(ty, case);
+            check_block_parity(ty, &blk, &format!("{} / neg_zero", ty.name()));
+            for v in dequant_row(ty, &blk, ty.blck_size()) {
+                total += 1;
+                if v == 0.0 && v.is_sign_negative() {
+                    neg += 1;
+                }
+            }
+        }
+        assert!(neg > 0, "-0.0 が 1 つも出ていない (テストが退化している)");
+        println!("neg_zero: {neg} / {total} 要素が -0.0");
+    }
+
+    /// 生 float 型はバイトをそのまま f32 へ写す (丸めも変換もしない)。
+    #[test]
+    fn raw_float_types_decode_exactly() {
+        for bits in [
+            0x0000_0000u32,
+            0x8000_0000,
+            0x0000_0001, // 最小非正規
+            0x7f7f_ffff, // 最大有限
+            0x3f00_0000,
+            0xbf80_0000,
+            0x4050_0000,
+        ] {
+            let want = f32::from_bits(bits);
+            let raw = bits.to_le_bytes();
+            assert_eq!(dequant_row(T::F32, &raw, 1)[0].to_bits(), want.to_bits());
+            assert_eq!(dequant_ref(T::F32, &raw)[0], want as f64);
+            // 参照実装も一致 (f64 へ広げるだけ)。
+            check_block_parity(T::F32, &raw, "F32");
+        }
+        // F16: 0 (両符号) / 最小非正規 / 最大有限 / 0.5 / -1 / 3.25
+        for bits in [0x0000u16, 0x8000, 0x0001, 0x7bff, 0x3800, 0xbc00, 0x4280] {
+            let want = half::f16::from_bits(bits).to_f32();
+            let raw = bits.to_le_bytes();
+            assert_eq!(
+                dequant_row(T::F16, &raw, 1)[0].to_bits(),
+                want.to_bits(),
+                "F16 {bits:#06x}"
+            );
+            check_block_parity(T::F16, &raw, "F16");
+        }
+        // BF16: f32 の上位 16bit
+        for bits in [0x0000u16, 0x8000, 0x0001, 0x7f7f, 0x3f00, 0xbf80, 0x4050] {
+            let want = f32::from_bits((bits as u32) << 16);
+            let raw = bits.to_le_bytes();
+            assert_eq!(
+                dequant_row(T::Bf16, &raw, 1)[0].to_bits(),
+                want.to_bits(),
+                "BF16 {bits:#06x}"
+            );
+            check_block_parity(T::Bf16, &raw, "BF16");
+        }
+    }
+
+    /// 行 API と 1 ブロック API がビット一致し、2 回目も同じ値になる。
+    #[test]
+    fn row_equals_blockwise_and_is_deterministic() {
+        for ty in parity_types() {
+            for case in &EDGE_CASES {
+                let blk = build_block(ty, case);
+                let bs = ty.blck_size();
+                let row = dequant_row(ty, &blk, bs);
+                let mut blkwise = vec![0f32; bs];
+                let mut tmp = vec![0f32; bs];
+                let ts = ty.type_size();
+                for (i, ch) in blk.chunks_exact(ts).enumerate() {
+                    dequant_block_into(ty, ch, &mut tmp);
+                    blkwise[i * bs..(i + 1) * bs].copy_from_slice(&tmp);
+                }
+                for (i, (a, b)) in row.iter().zip(blkwise.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{} / {}[{i}]: 行とブロックで不一致",
+                        ty.name(),
+                        case.name
+                    );
+                }
+                // 2 回目も同じビット列 (共有バッファ・乱数を使っていない)。
+                let again = dequant_row(ty, &blk, bs);
+                for (i, (a, b)) in row.iter().zip(again.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{} / {}[{i}]: 非決定的",
+                        ty.name(),
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// MXFP4 は `dequant_supported` が true を返すのに `dequant_block` が
+    /// `unreachable!()` で落ちる (UD-GGUF では未使用)。既知の穴として固定する。
+    /// 実装するときはこのテストを消し、パリティ行列に加える。
+    #[test]
+    #[should_panic(expected = "MXFP4")]
+    fn mxfp4_dequant_is_a_known_gap() {
+        let _ = dequant_row(T::Mxfp4, &[0u8; 18], 32);
+    }
+}
+

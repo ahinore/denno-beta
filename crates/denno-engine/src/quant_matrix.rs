@@ -255,4 +255,40 @@ mod tests {
             assert!(!dense_gpu_supported(*ty), "{ty:?} が dense GPU 表に入った");
         }
     }
+
+    /// f64 パリティ行列 (task 927) が「CPU で復元できる全型」を覆っている。
+    ///
+    /// 行列の実体は `kquant::refdev` にあり、本体のデコードを f64 参照と
+    /// 境界ブロックで突き合わせる。ここでは **対象の集合** を固定する:
+    /// `dequant_supported` が true の型はすべて行列に入り、唯一の例外は
+    /// MXFP4 (`dequant_block` が `unreachable!()` の既知の穴) だけ。
+    /// 型を足した / 復元できるようにしたときに行列を更新し忘れると落ちる。
+    #[test]
+    fn f64_parity_matrix_covers_every_dequant_supported_type() {
+        use crate::kquant::refdev;
+        let covered = refdev::parity_types();
+        for ty in ALL_TYPES {
+            if *ty == T::Mxfp4 {
+                assert!(!covered.contains(ty), "MXFP4 は行列に入れない (既知の穴)");
+                continue;
+            }
+            assert_eq!(
+                covered.contains(ty),
+                crate::kquant::dequant_supported(*ty),
+                "{ty:?}: dequant_supported とパリティ行列の対象がずれた"
+            );
+        }
+        // 25 型 - MXFP4 = 24 型 (生 float 3 型も含む)。
+        assert_eq!(covered.len(), ALL_TYPES.len() - 1);
+
+        // 行列側が実際に 1 ブロックずつ突き合わせられる (空回りしていない)。
+        // 全ケースは kquant 側の行列テストが回すので、ここは 1 ケースだけ。
+        let case = &refdev::EDGE_CASES[4]; // alt_signs
+        let mut n = 0usize;
+        for ty in &covered {
+            let blk = refdev::build_block(*ty, case);
+            n += refdev::check_block_parity(*ty, &blk, &format!("{ty:?}/{}", case.name));
+        }
+        assert!(n >= covered.len(), "突き合わせた要素数が型数より少ない: {n}");
+    }
 }
