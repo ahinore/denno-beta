@@ -45,6 +45,41 @@
 //! さらに **匿名メモリの上限** `anon_cap = avail * 60%` を掛け、
 //! プールは `anon_cap/4`、置き場は `anon_cap/8` を超えないようにする
 //! (残り 40% はカーネルの page cache / スタック / 断片化の余裕)。
+//!
+//! # task 937: 監査で見つかった 2 つの穴 (どちらも既定 off のゲートで塞ぐ)
+//!
+//! ## 1. 段の閾値で配分が 1 Hz で往復する (ヒステリシスが無い)
+//!
+//! [`plan`] は 1 秒ごとに `/proc/meminfo` を読み直す。[`pressure_of`] の
+//! 閾値は 1 本の線なので、他のプロセスの解放/確保で `avail` が線を跨ぐと
+//! `Healthy <-> Tight` を毎秒往復し、そのたびに pread 本数・タイル幅・
+//! プールが上下する (タイル幅はチャンク境界を動かすので、縮約順まで
+//! 変わりうる)。[`HYST_ENV`] (`DENNO_PF_MEMADAPT_HYST`、既定 off) を
+//! 明示したときだけ [`pressure_of_hyst`] を使い、**降格は即時・復帰は
+//! `HYST_PCT` の余裕を要求** する非対称ヒステリシスを掛ける。swap 由来の
+//! Critical は従来どおり即時 (押し出しは待てない)。
+//!
+//! ## 2. 匿名上限が床に負ける (avail < 3.34 GiB で cap が破れる)
+//!
+//! [`plan_for`] は cap を掛けたあと `clamp(MIN_POOL_MB, ..)` するので、
+//! `anon_cap/4 < MIN_POOL_MB` の領域 (avail < 3414 MiB) ではプールが
+//! 512 MiB に張り付き、上限を 3 倍以上超える。置き場も avail < 854 MiB で
+//! 同じ。つまり **一番危ない領域でだけ cap が効かない**。`plan_for` の
+//! 既定は 1 バイトも変えず (lab の A/B を壊さない)、[`ANON_STRICT_ENV`]
+//! (`DENNO_PF_MEMADAPT_ANON_STRICT`、既定 off) のときだけ cap を勝たせ、
+//! 床を [`MIN_POOL_MB_STRICT`] / [`MIN_RC_MB_STRICT`] まで下げる。
+//! プールが小さいときは `pf_pool::borrow_plan` が従来の確保へ落ちるだけで、
+//! レイアウトの契約 (合計 <= cap) は変わらない。
+//!
+//! ## 3. 監査で残した穴 (今回変えない)
+//!
+//! `exp_pf` の getter (`pread_threads` / `pread_bytes` / `rc_threads` /
+//! `rc_cache_bytes` / `lm_tile`) は **初回呼び出しの配分を `OnceLock` に
+//! 凍結**するので、プロセス起動後に段が変わっても本数・置き場・タイルは
+//! 追随しない (追随するのは `pf_pool::pf_pool_bytes` だけ)。したがって
+//! 上のヒステリシスが効くのは、`plan()` のログと毎回引くプールの経路。
+//! 凍結を外すと hot path で `Mutex` を踏むため、今回は触らない (lab で
+//! 凍結解除の費用を測ってから決める)。
 
 use std::sync::Mutex;
 
@@ -53,6 +88,25 @@ pub const MEMADAPT_ENV: &str = "DENNO_PF_MEMADAPT";
 
 /// [`MEMADAPT_ENV`] の既定 (on)。
 pub const DEFAULT_MEMADAPT: bool = true;
+
+/// `DENNO_PF_MEMADAPT_HYST`: 段の閾値にヒステリシスを掛けるか (task 937)。既定 off。
+pub const HYST_ENV: &str = "DENNO_PF_MEMADAPT_HYST";
+
+/// [`HYST_ENV`] の既定 (off = 従来の 1 本の閾値)。
+pub const DEFAULT_HYST: bool = false;
+
+/// 復帰に要求する余裕 (%)。閾値の 10% 外側へ戻るまで段を上げない。
+pub const HYST_PCT: u64 = 10;
+
+/// `DENNO_PF_MEMADAPT_ANON_STRICT`: 匿名上限を床より優先するか (task 937)。既定 off。
+pub const ANON_STRICT_ENV: &str = "DENNO_PF_MEMADAPT_ANON_STRICT";
+
+/// [`ANON_STRICT_ENV`] の既定 (off = 床が勝つ従来の挙動)。
+pub const DEFAULT_ANON_STRICT: bool = false;
+
+/// 厳格モードでの床 (cap を優先するときの「これ以下へは絞らない」)。
+pub const MIN_POOL_MB_STRICT: usize = 128;
+pub const MIN_RC_MB_STRICT: usize = 32;
 
 /// 1 MiB (KiB 単位の meminfo を MiB へ落とす)。
 const KIB_PER_MIB: u64 = 1024;
@@ -156,6 +210,24 @@ pub fn memadapt_from_value(v: Option<&str>) -> bool {
     }
 }
 
+/// 既定 off のゲートの解釈 (純関数)。**明示的な真値だけ on**。
+fn opt_in_from_value(v: Option<&str>, default: bool) -> bool {
+    match v.map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_ascii_lowercase()) {
+        None => default,
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// [`HYST_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+pub fn hyst_from_value(v: Option<&str>) -> bool {
+    opt_in_from_value(v, DEFAULT_HYST)
+}
+
+/// [`ANON_STRICT_ENV`] の解釈 (純関数)。明示的な真値だけ on。
+pub fn anon_strict_from_value(v: Option<&str>) -> bool {
+    opt_in_from_value(v, DEFAULT_ANON_STRICT)
+}
+
 /// `/proc/meminfo` の本文を読む (純関数)。`MemTotal` と `MemAvailable` が
 /// 無い / 解析できないときは `None`。
 pub fn parse_meminfo(s: &str) -> Option<MemFacts> {
@@ -194,21 +266,88 @@ pub fn read_meminfo() -> Option<MemFacts> {
     parse_meminfo(&s)
 }
 
-/// 段の判定 (純関数)。
-pub fn pressure_of(m: MemFacts) -> Pressure {
-    let total_mib = m.total_kb / KIB_PER_MIB;
-    let avail_mib = m.avail_kb / KIB_PER_MIB;
-    let healthy = HEALTHY_MIN_MIB.max(total_mib * HEALTHY_FRAC_PCT / 100);
-    let tight = TIGHT_MIN_MIB.max(total_mib * TIGHT_FRAC_PCT / 100);
-    // swap があり、空きが 25% 未満で、RAM の空きも 25% 未満なら危険とみなす
-    // (swap が無いホストは「押し出し先が無い」だけなので段を上げない)。
-    let swap_low = m.swap_total_kb > 0 && m.swap_free_kb * 4 < m.swap_total_kb;
-    if avail_mib < tight || (swap_low && avail_mib < total_mib * 25 / 100) {
+/// 段の 2 本の閾値 (MiB): (Healthy の下限, Tight の下限)。
+fn thresholds(total_mib: u64) -> (u64, u64) {
+    (
+        HEALTHY_MIN_MIB.max(total_mib * HEALTHY_FRAC_PCT / 100),
+        TIGHT_MIN_MIB.max(total_mib * TIGHT_FRAC_PCT / 100),
+    )
+}
+
+/// swap の空きが 25% 未満か (押し出しの危険)。
+fn swap_low(m: MemFacts) -> bool {
+    m.swap_total_kb > 0 && m.swap_free_kb * 4 < m.swap_total_kb
+}
+
+/// `avail` だけで決めた段 (swap を見ない素の判定)。
+fn avail_pressure(total_mib: u64, avail_mib: u64) -> Pressure {
+    let (healthy, tight) = thresholds(total_mib);
+    if avail_mib < tight {
         Pressure::Critical
     } else if avail_mib < healthy {
         Pressure::Tight
     } else {
         Pressure::Healthy
+    }
+}
+
+/// 段の判定 (純関数)。
+pub fn pressure_of(m: MemFacts) -> Pressure {
+    let total_mib = m.total_kb / KIB_PER_MIB;
+    let avail_mib = m.avail_kb / KIB_PER_MIB;
+    let base = avail_pressure(total_mib, avail_mib);
+    // swap があり、空きが 25% 未満で、RAM の空きも 25% 未満なら危険とみなす
+    // (swap が無いホストは「押し出し先が無い」だけなので段を上げない)。
+    if swap_low(m) && avail_mib < total_mib * 25 / 100 {
+        Pressure::Critical
+    } else {
+        base
+    }
+}
+
+/// 段の判定にヒステリシスを掛ける (純関数、task 937)。
+///
+/// **降格は即時** (圧迫はすぐ避ける)、**復帰は [`HYST_PCT`] の余裕を要求**
+/// する。`prev` が無いときは [`pressure_of`] と同じ。Critical へ入る方向は
+/// 余裕を要求しないので、危険側の遅れは生じない。swap 由来の Critical は
+/// ヒステリシスの対象外 (即時に効く)。
+pub fn pressure_of_hyst(m: MemFacts, prev: Option<Pressure>) -> Pressure {
+    let Some(prev) = prev else {
+        return pressure_of(m);
+    };
+    let total_mib = m.total_kb / KIB_PER_MIB;
+    let avail_mib = m.avail_kb / KIB_PER_MIB;
+    if swap_low(m) && avail_mib < total_mib * 25 / 100 {
+        return Pressure::Critical;
+    }
+    let (healthy, tight) = thresholds(total_mib);
+    // 復帰側の線 (閾値の外側)。降格側には余裕を入れない (圧迫は待たない)。
+    let healthy_up = healthy + healthy * HYST_PCT / 100;
+    let tight_up = tight + tight * HYST_PCT / 100;
+    let base = avail_pressure(total_mib, avail_mib);
+    match prev {
+        // 圧迫は待たない: 下がる方向は素の判定のまま。
+        Pressure::Healthy => base,
+        Pressure::Tight => match base {
+            Pressure::Healthy => {
+                if avail_mib >= healthy_up {
+                    Pressure::Healthy
+                } else {
+                    Pressure::Tight
+                }
+            }
+            // Critical へは即時 (安全側)。
+            other => other,
+        },
+        Pressure::Critical => {
+            if avail_mib < tight_up {
+                Pressure::Critical
+            } else if avail_mib >= healthy_up {
+                Pressure::Healthy
+            } else {
+                Pressure::Tight
+            }
+        }
     }
 }
 
@@ -247,24 +386,45 @@ fn target_for(p: Pressure, total_mib: u64, base: Tuning) -> Tuning {
 
 /// 資源配分を決める (純関数)。空きが十分なら `base` をそのまま返す。
 pub fn plan_for(m: MemFacts, base: Tuning) -> Plan {
+    plan_core(m, base, None, false)
+}
+
+/// ヒステリシスと匿名上限の厳格化を明示的に指定して配分を決める (純関数)。
+///
+/// `prev` が `Some` のとき [`pressure_of_hyst`] を使う。`anon_strict` が
+/// `true` のときは匿名上限が床に勝ち、床は [`MIN_POOL_MB_STRICT`] /
+/// [`MIN_RC_MB_STRICT`] まで下がる。既定の [`plan_for`] は
+/// `(None, false)` と等価 (従来と 1 バイトも変わらない)。
+pub fn plan_for_hyst(m: MemFacts, base: Tuning, prev: Option<Pressure>, anon_strict: bool) -> Plan {
+    plan_core(m, base, prev, anon_strict)
+}
+
+fn plan_core(m: MemFacts, base: Tuning, prev: Option<Pressure>, anon_strict: bool) -> Plan {
     let total_mib = m.total_kb / KIB_PER_MIB;
     let avail_mib = m.avail_kb / KIB_PER_MIB;
-    let pressure = pressure_of(m);
+    let pressure = pressure_of_hyst(m, prev);
     let mut t = target_for(pressure, total_mib, base);
+
+    // 床。厳格モードでは cap を勝たせるため床を下げる。
+    let (floor_pool, floor_rc) = if anon_strict {
+        (MIN_POOL_MB_STRICT, MIN_RC_MB_STRICT)
+    } else {
+        (MIN_POOL_MB, MIN_RC_CACHE_MB)
+    };
 
     // 匿名メモリの上限。残り 40% は page cache / 断片化の余裕として残す。
     let anon_cap = avail_mib * ANON_PCT / 100;
-    let pool_cap = (anon_cap / POOL_DIV).max(MIN_POOL_MB as u64);
-    let rc_cap = (anon_cap / RC_DIV).max(MIN_RC_CACHE_MB as u64);
+    let pool_cap = (anon_cap / POOL_DIV).max(floor_pool as u64);
+    let rc_cap = (anon_cap / RC_DIV).max(floor_rc as u64);
     t.pool_mb = t.pool_mb.min(pool_cap as usize);
     t.rc_cache_mb = t.rc_cache_mb.min(rc_cap as usize);
 
     // 床と total の範囲へ丸める (異常値でも暴れない)。
     t.pread_threads = t.pread_threads.clamp(MIN_PREAD_THREADS, 64);
     t.ra_threads = t.ra_threads.clamp(MIN_RA_THREADS, 32);
-    t.rc_cache_mb = t.rc_cache_mb.clamp(MIN_RC_CACHE_MB, 2048);
+    t.rc_cache_mb = t.rc_cache_mb.clamp(floor_rc, 2048);
     t.lm_tile = t.lm_tile.max(MIN_LM_TILE);
-    t.pool_mb = t.pool_mb.clamp(MIN_POOL_MB, 8192);
+    t.pool_mb = t.pool_mb.clamp(floor_pool, 8192);
 
     Plan {
         pressure,
@@ -309,13 +469,69 @@ pub fn gate_on() -> bool {
     *ON.get_or_init(|| memadapt_from_value(std::env::var(MEMADAPT_ENV).ok().as_deref()))
 }
 
+/// ゲート (`DENNO_PF_MEMADAPT_HYST`)。既定 off。
+pub fn hyst_on() -> bool {
+    #[cfg(test)]
+    {
+        let f = FORCE_HYST.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| hyst_from_value(std::env::var(HYST_ENV).ok().as_deref()))
+}
+
+/// ゲート (`DENNO_PF_MEMADAPT_ANON_STRICT`)。既定 off。
+pub fn anon_strict_on() -> bool {
+    #[cfg(test)]
+    {
+        let f = FORCE_ANON_STRICT.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| anon_strict_from_value(std::env::var(ANON_STRICT_ENV).ok().as_deref()))
+}
+
 #[cfg(test)]
 static FORCE_GATE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+#[cfg(test)]
+static FORCE_HYST: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+#[cfg(test)]
+static FORCE_ANON_STRICT: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
 /// テスト用: ゲートを env 無しで固定する (`None` で解除)。
 #[cfg(test)]
 pub(crate) fn set_force_gate_for_test(v: Option<bool>) {
     FORCE_GATE.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// テスト用: ヒステリシスのゲートを env 無しで固定する (`None` で解除)。
+#[cfg(test)]
+pub(crate) fn set_force_hyst_for_test(v: Option<bool>) {
+    FORCE_HYST.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// テスト用: 匿名上限の厳格化を env 無しで固定する (`None` で解除)。
+#[cfg(test)]
+pub(crate) fn set_force_anon_strict_for_test(v: Option<bool>) {
+    FORCE_ANON_STRICT.store(
         match v {
             Some(true) => 1,
             Some(false) => 0,
@@ -344,16 +560,19 @@ pub fn plan() -> Plan {
         };
     }
     let now = std::time::Instant::now();
-    {
+    // 直前の段 (ヒステリシスの入力)。キャッシュが新しいうちはそのまま返す。
+    let prev = {
         let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, p)) = *g {
             if now.saturating_duration_since(at).as_millis() < REFRESH_MS {
                 return p;
             }
         }
-    }
+        g.as_ref().map(|(_, p)| p.pressure)
+    };
+    let prev = if hyst_on() { prev } else { None };
     let p = match read_meminfo() {
-        Some(m) => plan_for(m, base),
+        Some(m) => plan_for_hyst(m, base, prev, anon_strict_on()),
         None => Plan {
             pressure: Pressure::Healthy,
             avail_mib: 0,
@@ -639,5 +858,266 @@ mod tests {
         }
         // ゲート本体も 1 回通す (ログは --nocapture で見える)。
         assert!(crate::model::exp_pf::pread_threads() <= 64);
+    }
+
+    // ---- task 937: 監査 (低メモリ段・ヒステリシス・匿名上限) ----
+
+    fn facts_mib(total_mib: u64, avail_mib: u64) -> MemFacts {
+        MemFacts {
+            total_kb: total_mib * KIB_PER_MIB,
+            avail_kb: avail_mib * KIB_PER_MIB,
+            swap_total_kb: 8 * GIB,
+            swap_free_kb: 8 * GIB,
+        }
+    }
+
+    #[test]
+    fn t937_new_gates_are_explicit_true_only() {
+        assert!(!hyst_from_value(None), "ヒステリシスは既定 off");
+        assert!(!hyst_from_value(Some("")));
+        assert!(!hyst_from_value(Some("0")));
+        assert!(hyst_from_value(Some("1")));
+        assert!(hyst_from_value(Some(" ON ")));
+        // 誤入力は off (既定 off のゲートは安全側 = 従来の挙動)。
+        assert!(!hyst_from_value(Some("xyz")));
+
+        assert!(!anon_strict_from_value(None), "匿名 cap の厳格化も既定 off");
+        assert!(!anon_strict_from_value(Some("off")));
+        assert!(anon_strict_from_value(Some("yes")));
+        assert!(anon_strict_from_value(Some("true")));
+        assert!(!anon_strict_from_value(Some("2")));
+
+        // ゲートの実体 (force 上書きが効くこと = 分岐が配線されている証拠)。
+        set_force_hyst_for_test(Some(true));
+        assert!(hyst_on());
+        set_force_hyst_for_test(Some(false));
+        assert!(!hyst_on());
+        set_force_hyst_for_test(None);
+        set_force_anon_strict_for_test(Some(true));
+        assert!(anon_strict_on());
+        set_force_anon_strict_for_test(Some(false));
+        assert!(!anon_strict_on());
+        set_force_anon_strict_for_test(None);
+    }
+
+    /// 低メモリの段: 閾値のちょうど上下で段が切り替わり、床を割らない。
+    #[test]
+    fn t937_low_memory_tier_boundaries() {
+        let b = base_tuning();
+        // 64 GiB: healthy = 12 GiB の床、tight = 6 GiB の床。
+        assert_eq!(pressure_of(facts_mib(65536, 12288)), Pressure::Healthy);
+        assert_eq!(pressure_of(facts_mib(65536, 12287)), Pressure::Tight);
+        assert_eq!(pressure_of(facts_mib(65536, 6144)), Pressure::Tight);
+        assert_eq!(pressure_of(facts_mib(65536, 6143)), Pressure::Critical);
+
+        // 16 GiB: total の 18% (2.9 GiB) より床 12 GiB が勝つ。
+        assert_eq!(pressure_of(facts_mib(16384, 12288)), Pressure::Healthy);
+        assert_eq!(pressure_of(facts_mib(16384, 12287)), Pressure::Tight);
+        assert_eq!(pressure_of(facts_mib(16384, 6144)), Pressure::Tight);
+
+        // 8 GiB: 床 12 GiB > total なので、全開でも Healthy にはならない。
+        assert_eq!(pressure_of(facts_mib(8192, 8192)), Pressure::Tight);
+        assert_eq!(pressure_of(facts_mib(8192, 6143)), Pressure::Critical);
+
+        // 段ごとの配分が床を割らず、Critical が Tight 以下であること。
+        let mut prev = plan_for(facts_mib(16384, 16000), b).tuning;
+        for avail in [12288u64, 9000, 6144, 6143, 4096, 2048, 1024, 256, 32] {
+            let p = plan_for(facts_mib(16384, avail), b);
+            assert!(p.tuning.pread_threads >= MIN_PREAD_THREADS, "avail={avail}");
+            assert!(p.tuning.ra_threads >= MIN_RA_THREADS, "avail={avail}");
+            assert!(p.tuning.pool_mb >= MIN_POOL_MB, "avail={avail}");
+            assert!(p.tuning.rc_cache_mb >= MIN_RC_CACHE_MB, "avail={avail}");
+            assert!(p.tuning.lm_tile >= MIN_LM_TILE, "avail={avail}");
+            assert!(p.tuning.pread_threads <= prev.pread_threads, "avail={avail}");
+            assert!(p.tuning.pool_mb <= prev.pool_mb, "avail={avail}");
+            prev = p.tuning;
+        }
+    }
+
+    /// 極端に空きが少なくても (32 MiB) 暴れない: 全部の床に張り付く。
+    #[test]
+    fn t937_starved_host_hits_every_floor() {
+        let b = base_tuning();
+        let p = plan_for(facts_mib(16384, 32), b);
+        assert_eq!(p.pressure, Pressure::Critical);
+        assert_eq!(p.tuning.pread_threads, MIN_PREAD_THREADS);
+        assert_eq!(p.tuning.ra_threads, MIN_RA_THREADS);
+        assert_eq!(p.tuning.rc_cache_mb, MIN_RC_CACHE_MB);
+        assert_eq!(p.tuning.pool_mb, MIN_POOL_MB);
+        // タイルは base の半分 (5,120 -> 2,560) で、床 1,024 より上。
+        assert_eq!(p.tuning.lm_tile, (b.lm_tile / 2).max(MIN_LM_TILE));
+        assert!(p.tuning.lm_tile >= MIN_LM_TILE);
+        assert_eq!(p.tuning.pread_kb_cap, 256);
+        // avail 0 でも同じ (0 除算や underflow が無いこと)。
+        let z = plan_for(facts_mib(16384, 0), b);
+        assert_eq!(z.tuning, p.tuning);
+        assert_eq!(z.avail_mib, 0);
+    }
+
+    /// 閾値を毎秒跨ぐ状況で、ヒステリシスが段の往復を止めること。
+    #[test]
+    fn t937_hysteresis_stops_boundary_flapping() {
+        // 64 GiB の healthy = 12288 MiB。閾値の上下 400 MiB を行き来する。
+        let seq = [12000u64, 12400, 12000, 12400, 12000, 12400, 12000, 12400];
+
+        // 従来 (ヒステリシス無し): 毎回 Tight <-> Healthy を往復する。
+        let mut prev: Option<Pressure> = None;
+        let mut raw_changes = 0;
+        for &avail in &seq {
+            let p = pressure_of(facts_mib(65536, avail));
+            if prev.is_some() && prev != Some(p) {
+                raw_changes += 1;
+            }
+            prev = Some(p);
+        }
+        assert_eq!(raw_changes, seq.len() - 1, "素の判定は毎回反転する");
+
+        // ヒステリシス有り: 一度 Tight に入ったら healthy*1.1 (13516 MiB) まで戻らない。
+        let mut prev = Some(Pressure::Tight);
+        let mut hyst_changes = 0;
+        for &avail in &seq {
+            let p = pressure_of_hyst(facts_mib(65536, avail), prev);
+            if prev != Some(p) {
+                hyst_changes += 1;
+            }
+            prev = Some(p);
+        }
+        assert_eq!(hyst_changes, 0, "12.4 GiB では復帰しない");
+
+        // 余裕まで戻れば復帰する (13516 MiB 以上)。
+        assert_eq!(
+            pressure_of_hyst(facts_mib(65536, 13515), Some(Pressure::Tight)),
+            Pressure::Tight
+        );
+        assert_eq!(
+            pressure_of_hyst(facts_mib(65536, 13516), Some(Pressure::Tight)),
+            Pressure::Healthy
+        );
+    }
+
+    /// 非対称: 降格は即時、復帰は余裕が要る。危険側の遅れは無い。
+    #[test]
+    fn t937_hysteresis_is_asymmetric() {
+        let f = |avail: u64| facts_mib(65536, avail);
+        // Healthy からは素の判定で即時に落ちる。
+        assert_eq!(pressure_of_hyst(f(12000), Some(Pressure::Healthy)), Pressure::Tight);
+        assert_eq!(pressure_of_hyst(f(6000), Some(Pressure::Healthy)), Pressure::Critical);
+        // Tight から Critical へは即時 (危険側に余裕を入れない)。
+        assert_eq!(pressure_of_hyst(f(6143), Some(Pressure::Tight)), Pressure::Critical);
+        assert_eq!(pressure_of_hyst(f(4000), Some(Pressure::Tight)), Pressure::Critical);
+        // Critical からは tight*1.1 (6,758 MiB) を超えるまで戻らない。
+        assert_eq!(pressure_of_hyst(f(6757), Some(Pressure::Critical)), Pressure::Critical);
+        assert_eq!(pressure_of_hyst(f(6758), Some(Pressure::Critical)), Pressure::Tight);
+        // Critical から直接 Healthy へは healthy*1.1 以上。
+        assert_eq!(pressure_of_hyst(f(14000), Some(Pressure::Critical)), Pressure::Healthy);
+        // swap 由来の Critical は即時 (ヒステリシスの外)。
+        let mut m = facts_mib(65536, 12000);
+        m.swap_free_kb = m.swap_total_kb / 8;
+        assert_eq!(pressure_of_hyst(m, Some(Pressure::Healthy)), Pressure::Critical);
+        // prev 無しは素の判定と一致する。
+        for avail in [14000u64, 12288, 12287, 6144, 6143, 100] {
+            assert_eq!(
+                pressure_of_hyst(f(avail), None),
+                pressure_of(f(avail)),
+                "avail={avail}"
+            );
+        }
+    }
+
+    /// 既定 (ヒステリシス off) の `plan_for` と `plan_for_hyst(.., None, false)` が同一。
+    #[test]
+    fn t937_hysteresis_off_is_byte_identical() {
+        let b = base_tuning();
+        for avail in [48000u64, 13000, 12288, 9000, 6144, 5000, 2048, 64] {
+            let m = facts_mib(65536, avail);
+            let legacy = plan_for(m, b);
+            // `plan()` はヒステリシス off のとき prev を渡さない。その経路が従来と同一。
+            let got = plan_for_hyst(m, b, None, false);
+            assert_eq!(got.pressure, legacy.pressure, "avail={avail}");
+            assert_eq!(got.tuning, legacy.tuning, "avail={avail}");
+            // prev を渡したときだけ段が保持される (差が出ること自体が分岐の発火)。
+            let held = plan_for_hyst(m, b, Some(Pressure::Tight), true);
+            if legacy.pressure == Pressure::Healthy && avail < 13516 {
+                assert_eq!(held.pressure, Pressure::Tight, "avail={avail}");
+            }
+        }
+    }
+
+    /// 匿名上限の執行: 床が邪魔しない領域では cap が厳密に効く。
+    #[test]
+    fn t937_anon_cap_binds_above_the_floor() {
+        let b = base_tuning();
+        for avail in [3414u64, 4000, 6000, 12000, 20000, 40000, 60000] {
+            let p = plan_for(facts_mib(65536, avail), b);
+            let anon = p.avail_mib * ANON_PCT / 100;
+            assert!(
+                p.tuning.pool_mb as u64 <= anon / POOL_DIV,
+                "avail={avail} pool={} cap={}",
+                p.tuning.pool_mb,
+                anon / POOL_DIV
+            );
+            assert!(
+                p.tuning.rc_cache_mb as u64 <= anon / RC_DIV,
+                "avail={avail} rc={} cap={}",
+                p.tuning.rc_cache_mb,
+                anon / RC_DIV
+            );
+            assert!(p.tuning.pool_mb >= MIN_POOL_MB);
+        }
+        // 境界: anon/4 = 512 MiB ちょうどは avail 3414 MiB。
+        assert_eq!((3414u64 * ANON_PCT / 100) / POOL_DIV, 512);
+    }
+
+    /// 監査で見つかった穴: 床が cap に勝つ領域と、厳格モードでの執行。
+    #[test]
+    fn t937_anon_cap_floor_legacy_vs_strict() {
+        let b = base_tuning();
+        // avail 2048 MiB -> anon 1228 MiB -> cap 307 MiB だが、従来は床 512 が勝つ。
+        let legacy = plan_for(facts_mib(65536, 2048), b);
+        let anon = legacy.avail_mib * ANON_PCT / 100;
+        assert_eq!(anon / POOL_DIV, 307);
+        assert_eq!(legacy.tuning.pool_mb, MIN_POOL_MB, "従来は床に張り付く");
+        assert!(
+            legacy.tuning.pool_mb as u64 > anon / POOL_DIV,
+            "ここが監査で見つかった cap 破れ (既定は変えない)"
+        );
+
+        // 厳格モード: cap が勝ち、床は 128 MiB まで下がる。
+        let strict = plan_for_hyst(facts_mib(65536, 2048), b, None, true);
+        assert_eq!(strict.pressure, Pressure::Critical);
+        assert_eq!(strict.tuning.pool_mb, 307);
+        assert!(strict.tuning.pool_mb as u64 <= anon / POOL_DIV);
+
+        // 極端 (avail 128 MiB) でも絶対床 128 / 32 は守る。
+        let tiny = plan_for_hyst(facts_mib(65536, 128), b, None, true);
+        assert_eq!(tiny.tuning.pool_mb, MIN_POOL_MB_STRICT);
+        assert_eq!(tiny.tuning.rc_cache_mb, MIN_RC_MB_STRICT);
+        assert_eq!(tiny.tuning.pread_threads, MIN_PREAD_THREADS);
+
+        // 厳格モードでも単調 (空きが減って配分が増えない)。
+        let mut prev = plan_for_hyst(facts_mib(65536, 60000), b, None, true).tuning;
+        for avail in [12000u64, 6000, 3414, 2048, 1024, 128, 0] {
+            let t = plan_for_hyst(facts_mib(65536, avail), b, None, true).tuning;
+            assert!(t.pool_mb <= prev.pool_mb, "avail={avail}");
+            assert!(t.rc_cache_mb <= prev.rc_cache_mb, "avail={avail}");
+            assert!(t.pread_threads <= prev.pread_threads, "avail={avail}");
+            assert!(t.pool_mb >= MIN_POOL_MB_STRICT, "avail={avail}");
+            assert!(t.rc_cache_mb >= MIN_RC_MB_STRICT, "avail={avail}");
+            prev = t;
+        }
+    }
+
+    /// ヒステリシス + 厳格 cap を同時に掛けても、恒等の段は base のまま。
+    #[test]
+    fn t937_strict_and_hyst_keep_healthy_identity() {
+        let b = base_tuning();
+        for avail in [20000u64, 40000, 60000] {
+            let p = plan_for_hyst(facts_mib(65536, avail), b, Some(Pressure::Tight), true);
+            assert_eq!(p.tuning, b, "avail={avail}");
+            assert_eq!(p.pressure, Pressure::Healthy);
+        }
+        // 48 GiB 級 (total < 96 GiB) は Healthy でも base のまま (拡大しない)。
+        let p = plan_for_hyst(facts_mib(49152, 48000), b, None, true);
+        assert_eq!(p.tuning, b);
     }
 }

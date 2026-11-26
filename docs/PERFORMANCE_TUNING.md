@@ -225,6 +225,15 @@ CPU の flat) が変わり、縮約順が動いて md5 が変わることがあ�
 さらに匿名メモリの上限 `avail*60%` を掛け、プールはその 1/4、置き場は 1/8 を超えない
 (残り 40% は page cache / スタック / 断片化の余裕)。
 
+注: 既定では床 (プール 512 MiB / 置き場 64 MiB) がこの上限に勝つので、
+`avail < 3,414 MiB` (プール) / `avail < 854 MiB` (置き場) では上限が破れる。
+一番危ない領域でだけ cap を効かせたいときは `DENNO_PF_MEMADAPT_ANON_STRICT=1`
+(床は 128 MiB / 32 MiB まで下がる)。
+
+段の閾値は 1 本の線なので、`avail` が線を跨ぐと 1 Hz で段が往復しうる。
+`DENNO_PF_MEMADAPT_HYST=1` で降格は即時・復帰は閾値の 10% 外側まで待つ
+非対称ヒステリシスになる (swap 由来の Critical は即時のまま)。両方とも既定 off。
+
 静的既定 (恒等の基準) [実装]: pread 16 本 / 先読み 32 本 / 置き場 512 MiB /
 層優先タイル 5,120 トークン / 作業域プール 2,688 MiB / pread 1 回の長さ上限なし。
 
@@ -243,6 +252,9 @@ CPU の flat) が変わり、縮約順が動いて md5 が変わることがあ�
 | `DENNO_PF_POOL_MB` | 2688 | prefill の作業域プール |
 | `DENNO_PF_PREAD_KB` | 1024 (広い塊 on のとき。off は 384) | pread 1 回の長さ |
 | `DENNO_PF_STREAM_MIN_TOK` | 512 | これ未満の末尾チャンクは従来経路 |
+| `DENNO_PF_MEMADAPT` | on | 空きメモリに応じた配分 (§3.2) |
+| `DENNO_PF_MEMADAPT_HYST` | off | 段の復帰に閾値の 10% の余裕を要求 (task 937) |
+| `DENNO_PF_MEMADAPT_ANON_STRICT` | off | 匿名上限を床より優先 (床 128 / 32 MiB、task 937) |
 
 ### 3.3 起動時の温めと診断
 
