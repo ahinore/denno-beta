@@ -1085,6 +1085,12 @@ fn main() -> Result<()> {
         } => {
             // P897: --compare はベンチを実行せずに 2 つのレポートを比べる。
             if let Some(paths) = &compare {
+                // task 1516: --json は --compare では使わない (要約は
+                // --compare-json が担う)。黙って無視すると、書かれたつもりの
+                // ファイルが無いまま終了コード 0 になるため拒否する。
+                if json.is_some() {
+                    bail!("--json is not used with --compare; use --compare-json PATH");
+                }
                 if paths.len() != 2 {
                     bail!("--compare needs exactly 2 paths (BASE NEW)");
                 }
@@ -1117,6 +1123,11 @@ fn main() -> Result<()> {
             }
             if compare_json.is_some() {
                 bail!("--compare-json requires --compare BASE NEW");
+            }
+            // task 1516: 比較しない実行では閾値に意味が無い。黙って無視すると
+            // 「退行で落ちるはず」という期待と実際の終了コードが食い違う。
+            if fail_on_regress_pct.is_some() {
+                bail!("--fail-on-regress-pct requires --compare BASE NEW");
             }
             let opts = bench::BenchOptions {
                 url,
