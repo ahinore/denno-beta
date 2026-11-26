@@ -1634,6 +1634,253 @@
         assert_bitwise_eq(&got, &ref1, "task120: MIN_W=0.51 vs n_expert_used=1 の親経路");
     }
 
+    /// task 922: ルータの `gate_inp` を「expert ごとに全要素同じ値」で組み直した層。
+    /// ロジットは expert e で `rows[e] * sum(x)` になるので、順位を狙って作れる。
+    fn router_layer_rows(f: &GgufFile, p: &Qwen4ExpParams, rows: &[f32]) -> LayerW {
+        assert_eq!(rows.len(), p.n_expert, "行数は n_expert");
+        let mut lw = cache_test_layer(f, p);
+        let mut v = Vec::with_capacity(p.n_embd * p.n_expert * 4);
+        for e in 0..p.n_expert {
+            for _ in 0..p.n_embd {
+                v.extend_from_slice(&rows[e].to_le_bytes());
+            }
+        }
+        lw.gate_inp = GgufLinear::new(
+            GgmlType::F32,
+            p.n_embd,
+            p.n_expert,
+            WeightBlocks::from_vec(v),
+        )
+        .expect("gate_inp (F32)");
+        lw
+    }
+
+    /// task 922: ルータの確率を手で求める (gemv → softmax)。期待値の計算用。
+    fn router_probs(lw: &LayerW, p: &Qwen4ExpParams, x: &[f32]) -> Vec<f32> {
+        let mut probs = vec![0.0f32; p.n_expert];
+        lw.gate_inp
+            .gemv_label("gate_inp", x, &mut probs)
+            .expect("gate_inp");
+        softmax(&mut probs);
+        probs
+    }
+
+    /// task 922: `DENNO_EXPERT_MIN_W` は **expert index** を残す (top-k 内の位置ではない)。
+    ///
+    /// top-k が `0..k` 以外 (ここでは [2, 3]) のとき、位置 0 を expert 0 と
+    /// 取り違えると別の expert を走らせてしまう。修正前はこのテストが落ちた。
+    #[test]
+    fn min_w_gate_keeps_expert_indices_not_slots() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("p922_minw");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let x = p120_flat_x(p.n_embd);
+        let mut p1 = cache_test_params();
+        p1.n_expert_used = 1;
+
+        // (a) 重みが 2 本とも同じ (0.5 / 0.5): 全員しきい値未満 → 位置 0 = expert 2 が残る。
+        let lw = router_layer_rows(&f, &p, &[0.0, 0.0, 1.0, 1.0]);
+        let probs = router_probs(&lw, &p, &x);
+        assert_eq!(select_topk(&probs, 2), vec![2, 3], "前提: top-2 は expert 2 と 3");
+        let want = moe_ffn_quant_with(&p1, &lw, &x, None, false, Route::Cpu).expect("k=1");
+        // 反例: 位置 0 を expert index 0 と取り違えたときに走ってしまう経路。
+        let lw0 = router_layer_rows(&f, &p, &[1.0, 0.0, 0.0, 0.0]);
+        let wrong = moe_ffn_quant_with(&p1, &lw0, &x, None, false, Route::Cpu).expect("expert 0");
+
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: Some(0.51),
+            w_stats: false,
+        }));
+        let before = moe_expert::any_calls();
+        let got = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("MIN_W=0.51");
+        let calls = moe_expert::any_calls() - before;
+        set_expert_prune_measurement(None);
+        assert_eq!(calls, 3, "1 本に絞れていない ({calls})");
+        assert_bitwise_eq(&want, &got, "MIN_W: 残るのは expert 2 (index の小さい方)");
+        assert!(
+            got.iter().zip(&wrong).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "expert 0 の寄与になっている (位置と index の取り違え)"
+        );
+
+        // (b) 重みが僅かに違う: しきい値を 2 本の間に置くと重い方 (expert 2) だけ残る。
+        let lw2 = router_layer_rows(&f, &p, &[0.0, 0.0, 1.0, 0.995]);
+        let probs2 = router_probs(&lw2, &p, &x);
+        let top2 = select_topk(&probs2, 2);
+        assert_eq!(top2, vec![2, 3], "前提: top-2 は expert 2 と 3");
+        let s: f32 = top2.iter().map(|&i| probs2[i]).sum();
+        let (w_a, w_b) = (probs2[2] / s, probs2[3] / s);
+        assert!(w_a > w_b, "前提: expert 2 の方が重い ({w_a} / {w_b})");
+        let want2 = moe_ffn_quant_with(&p1, &lw2, &x, None, false, Route::Cpu).expect("k=1");
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: Some((w_a + w_b) * 0.5),
+            w_stats: false,
+        }));
+        let before = moe_expert::any_calls();
+        let got2 = moe_ffn_quant_with(&p, &lw2, &x, None, false, Route::Cpu).expect("MIN_W=mid");
+        let calls2 = moe_expert::any_calls() - before;
+        set_expert_prune_measurement(None);
+        assert_eq!(calls2, 3, "1 本に絞れていない ({calls2})");
+        assert_bitwise_eq(&want2, &got2, "MIN_W: 重い方 (expert 2) だけ残る");
+    }
+
+    /// task 922: `DENNO_ROUTER_SANITIZE` の真理値表 (既定 off・明示の真値だけ on)。
+    #[test]
+    fn router_sanitize_gate_truth_table() {
+        assert!(!router_sanitize_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", "2", "yes"] {
+            assert!(
+                !router_sanitize_from_value(Some(v)),
+                "{v:?} が on になった"
+            );
+        }
+        for v in ["1", "on", "ON", "true", " 1 ", " true "] {
+            assert!(router_sanitize_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    /// task 922: 純関数 `sanitize_router_logits` の丸め先と個数。有限値は触らない。
+    #[test]
+    fn sanitize_router_logits_maps_non_finite_only() {
+        let mut v = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.5,
+            -0.0,
+            f32::MIN,
+            f32::MAX,
+        ];
+        assert_eq!(sanitize_router_logits(&mut v), 3, "非有限は 3 個");
+        assert_eq!(v[0], f32::MIN, "NaN → f32::MIN");
+        assert_eq!(v[1], f32::MAX, "+inf → f32::MAX");
+        assert_eq!(v[2], f32::MIN, "-inf → f32::MIN");
+        assert_eq!(v[3].to_bits(), 0.5f32.to_bits(), "有限値は触らない");
+        assert_eq!(v[4].to_bits(), (-0.0f32).to_bits(), "-0.0 は有限なので触らない");
+        assert_eq!(v[5], f32::MIN, "既に有限の端はそのまま");
+        assert_eq!(v[6], f32::MAX, "既に有限の端はそのまま");
+        let mut w = [1.0f32, -2.0, 3.5];
+        assert_eq!(sanitize_router_logits(&mut w), 0, "全部有限なら 0 個");
+    }
+
+    /// task 922: +inf の logit を丸める。ゲート off では softmax の和が NaN になり
+    /// 再正規化が一様フォールバックへ落ちる (別の expert を等重みで走らせる)。
+    /// ゲート on では同じ行を有限の 1.0 で置いたルータと**ビット一致**する。
+    #[test]
+    fn router_sanitize_repairs_inf_logits() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("p922_inf");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let x = p120_flat_x(p.n_embd);
+
+        // expert 3 の logits を桁あふれさせる (1e38 * 0.05 * 256 → inf)。
+        let lw_bad = router_layer_rows(&f, &p, &[-1.0e30, -1.0e30, -1.0e30, 1.0e38]);
+        let raw = router_probs(&lw_bad, &p, &x);
+        assert!(
+            raw.iter().any(|v| v.is_nan()),
+            "前提: +inf の logit で NaN が出る ({raw:?})"
+        );
+        // 期待値: 同じ行を有限の 1.0 にしたルータ (確率はちょうど [0,0,0,1])。
+        let lw_ok = router_layer_rows(&f, &p, &[-1.0e30, -1.0e30, -1.0e30, 1.0]);
+        let want = moe_ffn_quant_with(&p, &lw_ok, &x, None, false, Route::Cpu).expect("期待値");
+
+        set_router_sanitize_for_test(Some(false));
+        let fixed0 = ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed);
+        let off = moe_ffn_quant_with(&p, &lw_bad, &x, None, false, Route::Cpu).expect("off");
+        assert_eq!(
+            ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed),
+            fixed0,
+            "off なのに logit を書き換えた"
+        );
+
+        set_router_sanitize_for_test(Some(true));
+        let calls0 = ROUTER_SANITIZE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let fixed1 = ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed);
+        let on = moe_ffn_quant_with(&p, &lw_bad, &x, None, false, Route::Cpu).expect("on");
+        let calls = ROUTER_SANITIZE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let fixed = ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed);
+        set_router_sanitize_for_test(None);
+        assert!(calls > calls0, "ゲートが走っていない (カウンタが増えていない)");
+        assert!(fixed - fixed1 >= 1, "1 個も丸めていない");
+        assert_bitwise_eq(&want, &on, "+inf → f32::MAX の丸め後");
+        assert!(
+            off.iter().zip(&on).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "off と on の出力が同じ (防御が効いていない)"
+        );
+    }
+
+    /// task 922: NaN の logit を丸める。off では NaN が top-k に選ばれて重みが一様に
+    /// なる (先頭 index が無条件で選ばれる走査規則のため)。on では同じ行を
+    /// `-1e30` で置いたルータと**ビット一致**する。
+    #[test]
+    fn router_sanitize_repairs_nan_logits() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("p922_nan");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let x = p120_flat_x(p.n_embd);
+
+        let lw_bad = router_layer_rows(&f, &p, &[f32::NAN, -1.0e30, 1.0, 1.0]);
+        let raw = router_probs(&lw_bad, &p, &x);
+        assert!(raw[0].is_nan(), "前提: expert 0 の確率が NaN");
+        let lw_ok = router_layer_rows(&f, &p, &[-1.0e30, -1.0e30, 1.0, 1.0]);
+        let want = moe_ffn_quant_with(&p, &lw_ok, &x, None, false, Route::Cpu).expect("期待値");
+
+        set_router_sanitize_for_test(Some(false));
+        let off = moe_ffn_quant_with(&p, &lw_bad, &x, None, false, Route::Cpu).expect("off");
+        set_router_sanitize_for_test(Some(true));
+        let fixed0 = ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed);
+        let on = moe_ffn_quant_with(&p, &lw_bad, &x, None, false, Route::Cpu).expect("on");
+        let fixed = ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed);
+        set_router_sanitize_for_test(None);
+        assert!(fixed > fixed0, "NaN を丸めていない");
+        assert_bitwise_eq(&want, &on, "NaN → f32::MIN の丸め後");
+        assert!(
+            off.iter().zip(&on).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "off と on の出力が同じ (防御が効いていない)"
+        );
+    }
+
+    /// task 922: 有限の logits ではゲートが on でも 1 ビットも変わらない
+    /// (分岐は通るが値を触らない)。
+    #[test]
+    fn router_sanitize_is_inert_on_finite_logits() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("p922_finite");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        assert!(
+            router_probs(&lw, &p, &x).iter().all(|v| v.is_finite()),
+            "前提: 通常のルータは有限"
+        );
+
+        set_router_sanitize_for_test(Some(false));
+        let off = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("off");
+        set_router_sanitize_for_test(Some(true));
+        let calls0 = ROUTER_SANITIZE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let fixed0 = ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed);
+        let on = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("on");
+        let calls = ROUTER_SANITIZE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let fixed = ROUTER_SANITIZE_FIXED.load(std::sync::atomic::Ordering::Relaxed);
+        set_router_sanitize_for_test(None);
+        assert!(calls > calls0, "ゲートが走っていない");
+        assert_eq!(fixed, fixed0, "有限の logits を書き換えた");
+        assert_bitwise_eq(&off, &on, "有限 logits: ゲート on/off");
+    }
+
     /// 役割テレメ (P54 の router 活性) は剪定後の expert 集合を示す。
     ///
     /// 独占ルータ (expert 0 がほぼ 1.0) で TOPK=1 を掛けると、router の活性は

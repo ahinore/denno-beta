@@ -681,6 +681,88 @@ pub(crate) fn expert_w_stats_on() -> bool {
 /// 重みの rank 別平均を取る深さ (rank 1..=10)。
 pub(crate) const EXPERT_W_RANKS: usize = 10;
 
+/// task 922: `DENNO_ROUTER_SANITIZE` の解釈 (純関数)。明示的な真値だけ on。
+///
+/// ルータの logits は f32 の GEMV 出力なので、重みが壊れている (NaN) / 桁あふれ
+/// (inf) すると softmax が行ごと壊れる:
+///
+/// - NaN が 1 個でも入ると `softmax` の和が NaN になり、`sum > 0.0` が偽なので
+///   割り算が丸ごと飛ぶ。その NaN が top-k に選ばれると再正規化の和も NaN になり、
+///   一様フォールバック (= 全 expert を等重みで走らせる) まで落ちる。
+/// - +inf が入ると `inf - inf` = NaN で同じ経路に入る。
+///
+/// ゲート on では GEMV の直後に非有限値だけを有限へ丸める
+/// ([`sanitize_router_logits`])。有限の logits には触らないので、通常のモデルでは
+/// 1 ビットも変わらない。**既定 off**。
+pub(crate) fn router_sanitize_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("on") | Some("ON") | Some("true")
+    )
+}
+
+/// task 922: テスト用の上書き (-1 = env 読み / 0 = off / 1 = on)。
+pub(crate) static ROUTER_SANITIZE_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+/// task 922: ゲートが走った層呼び出し数 (テスト用)。
+#[cfg(test)]
+pub(crate) static ROUTER_SANITIZE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// task 922: ゲートが実際に書き換えた logit 数 (テスト用)。
+#[cfg(test)]
+pub(crate) static ROUTER_SANITIZE_FIXED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// task 922: ルータ logits の非有限値を丸めるか (既定 off)。
+pub(crate) fn router_sanitize_on() -> bool {
+    let ov = ROUTER_SANITIZE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov >= 0 {
+        return ov == 1;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        router_sanitize_from_value(std::env::var("DENNO_ROUTER_SANITIZE").ok().as_deref())
+    })
+}
+
+/// task 922: テストから [`ROUTER_SANITIZE_OVERRIDE`] を上書きする (`None` で env 読みに戻す)。
+#[cfg(test)]
+pub(crate) fn set_router_sanitize_for_test(v: Option<bool>) {
+    let raw = match v {
+        None => -1i8,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    ROUTER_SANITIZE_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 非有限の logit を**順序を保つ有限値**へ丸める (書き換えた個数を返す)。
+///
+/// - `NaN` → `f32::MIN`
+/// - `+inf` → `f32::MAX`
+/// - `-inf` → `f32::MIN`
+///
+/// 有限値は触らない。丸め先が有限の端なので softmax の max 引き算が
+/// `inf - inf` にならず、和も有限に戻る。`+inf` が複数あると全部 `f32::MAX` に
+/// 潰れるが、それらは元から同値 (順位の情報が無い) なので等分で正しい。
+#[inline]
+pub(crate) fn sanitize_router_logits(logits: &mut [f32]) -> usize {
+    let mut n = 0usize;
+    for v in logits.iter_mut() {
+        if !v.is_finite() {
+            *v = if *v == f32::INFINITY {
+                f32::MAX
+            } else {
+                f32::MIN
+            };
+            n += 1;
+        }
+    }
+    n
+}
+
 /// 1 リクエストぶんの重み統計の蓄積。
 ///
 /// `calls` = 層呼び出し数 (`moe_ffn_quant_impl` 1 回 = decode 1 トークンの 1 層)。
@@ -1057,6 +1139,18 @@ pub(crate) fn moe_ffn_quant_impl(
     }
     #[cfg(feature = "cuda")]
     let t_softmax = std::time::Instant::now();
+    // task 922: 非有限 logit の防御 (既定 off)。off は atomic load 1 回だけで、
+    // finite な logits には何もしない (通常のモデルでは 1 ビットも変わらない)。
+    if router_sanitize_on() {
+        let fixed = sanitize_router_logits(&mut probs);
+        #[cfg(test)]
+        {
+            ROUTER_SANITIZE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ROUTER_SANITIZE_FIXED.fetch_add(fixed as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
+        let _ = fixed;
+    }
     softmax(&mut probs);
     #[cfg(feature = "cuda")]
     crate::cuda::dec_kprof::note_since("softmax", t_softmax);
@@ -1116,32 +1210,25 @@ pub(crate) fn moe_ffn_quant_impl(
     }
 
     // 3. 再正規化 (選択 index 昇順に逐次加算した和で割る)
+    //
+    // task 922: 実装は prefill の行処理 (`prefill::router_renorm`) と**同じ関数**を
+    // 呼ぶ。以前はここに同じ演算列が写経されていて、片方だけ直すと prefill と
+    // decode で数値が食い違う余地があった (演算順序・一様フォールバックの規則も
+    // 含めて 1 箇所に寄せた)。和は router 活性 (P54) に使うので戻り値で受ける。
     let k_run = sel.len();
     let mut weights = vec![0.0f32; k_run];
-    let mut sum = 0.0f32;
-    for &i in &sel {
-        sum += probs[i];
-    }
-    // task 217: 選んだ expert の確率が全部 0 (softmax のアンダーフロー) だと
-    // 0/0 = NaN になる。介入で支配的な expert を切ると起こりうるので、
-    // そのときだけ一様に分ける (通常の経路では和が正なので 1 ビットも変わらない)。
-    if sum.is_finite() && sum > 0.0 {
-        for (t, &i) in sel.iter().enumerate() {
-            weights[t] = probs[i] / sum;
-        }
-    } else {
-        let u = 1.0f32 / k_run as f32;
-        for w in weights.iter_mut() {
-            *w = u;
-        }
-    }
+    let sum = prefill::router_renorm_sum(&probs, &sel, &mut weights);
     if let Some(x) = min_w_x {
-        // 重みが x 未満の expert を落とす (最低 1 個は残す)。kept は昇順走査の
-        // filter なので index 昇順のまま。
+        // 重みが x 未満の expert を落とす (最低 1 個は残す)。
+        //
+        // task 922: `weights` の添字 `t` は **sel 内の位置** であって expert index
+        // ではない。落とした後の `sel` は `sel[t]` で組み直す (以前は位置をそのまま
+        // expert index として使っていたので、top-k が `0..k_run` 以外のとき
+        // 別の expert を走らせていた。既定 off のゲート内なので出力経路は不変)。
         let kept: Vec<usize> = (0..k_run).filter(|&t| weights[t] >= x).collect();
         if kept.len() < k_run {
             let kept: Vec<usize> = if kept.is_empty() {
-                // 全員が x 未満: 最も重い 1 個だけ残す (同点は先に見た小さい index)。
+                // 全員が x 未満: 最も重い 1 個だけ残す (同点は先に見た = 位置の小さい方)。
                 let mut best = 0usize;
                 for t in 1..k_run {
                     if weights[t] > weights[best] {
@@ -1157,7 +1244,8 @@ pub(crate) fn moe_ffn_quant_impl(
                 sum2 += weights[t];
             }
             let renorm: Vec<f32> = kept.iter().map(|&t| weights[t] / sum2).collect();
-            sel = kept;
+            // 位置 → expert index。kept は位置の昇順なので sel も index 昇順のまま。
+            sel = kept.iter().map(|&t| sel[t]).collect();
             weights = renorm;
         }
     }

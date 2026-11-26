@@ -2492,7 +2492,17 @@ pub(crate) fn router_sm_block() -> Option<usize> {
 }
 
 /// top-k の再正規化 (選択 index 昇順に逐次加算した和で割る)。
+///
+/// decode のルータ (`qwen4exp::moe`) も**この関数を呼ぶ** (task 922 で写経をやめた)。
+/// 演算順序と一様フォールバックの規則はこの 1 箇所が正。
 pub(crate) fn router_renorm(pr: &[f32], sel: &[usize], w: &mut [f32]) {
+    let _ = router_renorm_sum(pr, sel, w);
+}
+
+/// [`router_renorm`] の「生の和」も返す版。decode は和を router 活性 (P54) に使う。
+///
+/// 戻り値は**丸める前の和** (一様フォールバックに入ったときは 0 / 非有限の値)。
+pub(crate) fn router_renorm_sum(pr: &[f32], sel: &[usize], w: &mut [f32]) -> f32 {
     let mut sum = 0.0f32;
     for &i in sel {
         sum += pr[i];
@@ -2509,6 +2519,7 @@ pub(crate) fn router_renorm(pr: &[f32], sel: &[usize], w: &mut [f32]) {
             *x = u;
         }
     }
+    sum
 }
 
 /// task 189: 行ごとの softmax (block が `Some` ならトークンをブロックで割る)。
@@ -2660,6 +2671,139 @@ mod router_sm_tests {
         assert_eq!(s3, vec![0, 1, 2], "同値のとき小さい index が先でない");
         for v in w3 {
             assert!((v - 1.0 / 3.0).abs() < 1e-6, "再正規化の重み {v}");
+        }
+    }
+
+    /// task 922: 再正規化の端の場合分け (decode と prefill が同じ関数を通る)。
+    ///
+    /// - 和が正の有限値: 選んだ確率の和で割る (重みの和は 1)。
+    /// - 選んだ確率が全部 0: 0/0 にせず一様 (1/k)。
+    /// - 和が NaN / +inf: 一様 (順位の情報が無いので等分)。
+    /// - k=1: 重みは 1.0。
+    /// [`router_renorm`] は [`router_renorm_sum`] と**同じ重み**を書き、戻り値だけが
+    /// 違う (和は丸める前の値)。
+    #[test]
+    fn router_renorm_edge_cases() {
+        let cases: [(&[f32], &[usize]); 5] = [
+            (&[0.5, 0.3, 0.2], &[0, 2]),
+            (&[0.0, 0.0, 0.0], &[0, 1, 2]),
+            (&[f32::NAN, 0.4, 0.6], &[0, 2]),
+            (&[f32::INFINITY, 0.1, 0.25], &[0, 1]),
+            (&[0.25, 0.75], &[1]),
+        ];
+        for (pr, sel) in cases {
+            let mut w1 = vec![0.0f32; sel.len()];
+            router_renorm(pr, sel, &mut w1);
+            let mut w2 = vec![0.0f32; sel.len()];
+            let sum = router_renorm_sum(pr, sel, &mut w2);
+            for i in 0..w1.len() {
+                assert_eq!(
+                    w1[i].to_bits(),
+                    w2[i].to_bits(),
+                    "renorm と renorm_sum の重みが違う (pr={pr:?} i={i})"
+                );
+            }
+            // 戻り値は「選択 index 昇順の逐次和」そのもの。
+            let mut want = 0.0f32;
+            for &i in sel {
+                want += pr[i];
+            }
+            assert_eq!(sum.to_bits(), want.to_bits(), "戻り値の和が違う (pr={pr:?})");
+            // 期待する重み。
+            let expect_uniform = !(want.is_finite() && want > 0.0);
+            for (j, &i) in sel.iter().enumerate() {
+                let want_w = if expect_uniform {
+                    1.0f32 / sel.len() as f32
+                } else {
+                    pr[i] / want
+                };
+                assert_eq!(
+                    w1[j].to_bits(),
+                    want_w.to_bits(),
+                    "重みが違う (pr={pr:?} sel={sel:?} j={j})"
+                );
+            }
+        }
+        // k=1 は確率が何であれ 1.0 (一様フォールバックでも同じ)。
+        for p in [0.0f32, 0.25, f32::NAN] {
+            let mut w = [0.0f32; 1];
+            router_renorm(&[p, 1.0], &[0], &mut w);
+            assert_eq!(w[0], 1.0, "k=1 の重み (p={p})");
+        }
+    }
+
+    /// task 922: softmax → top-k → 再正規化の行処理が、挿入法 (`fast`) と
+    /// `select_nth_unstable_by` 版で**選択も重みもビット一致**すること。
+    ///
+    /// 入力は「同値だらけ (softmax 後は完全なタイ)」「全部同じ」「±0.0」「巨大値」
+    /// 「NaN 入り」。mask 経路 (全 0 = 無効 expert なし) と行の割り方 (block) も同じ値。
+    #[test]
+    fn router_pipeline_fast_matches_reference_bits() {
+        let (ne, k) = (512usize, 8usize);
+        let mk = |mode: usize| -> Vec<f32> {
+            (0..ne)
+                .map(|i| match mode {
+                    0 => ((i * 37) % 5) as f32 * 0.1,
+                    1 => 0.5,
+                    2 => {
+                        if i % 2 == 0 {
+                            0.0
+                        } else {
+                            -0.0
+                        }
+                    }
+                    3 => (i as f32) * 1.0e6,
+                    4 => {
+                        if i % 7 == 0 {
+                            f32::NAN
+                        } else {
+                            (i % 3) as f32
+                        }
+                    }
+                    _ => ((i * 61) % 17) as f32 * 0.03 - 0.2,
+                })
+                .collect()
+        };
+        let mask = vec![0u64; ne.div_ceil(64)];
+        for mode in 0..6 {
+            let mut probs = mk(mode);
+            router_softmax_rows(&mut probs, ne, None);
+
+            let run = |fast: bool, block: Option<usize>, m: Option<&[u64]>| {
+                let mut s = vec![usize::MAX; k];
+                let mut w = vec![0f32; k];
+                router_topk_rows(&probs, ne, k, &mut s, &mut w, block, fast, m);
+                (s, w)
+            };
+            let (s_ref, w_ref) = run(false, None, None);
+            let (s_fast, w_fast) = run(true, None, None);
+            let (s_blk, w_blk) = run(true, Some(3), None);
+            let (s_msk, w_msk) = run(false, None, Some(&mask));
+            for (tag, s, w) in [
+                ("fast", &s_fast, &w_fast),
+                ("block", &s_blk, &w_blk),
+                ("mask", &s_msk, &w_msk),
+            ] {
+                assert_eq!(s, &s_ref, "選択が違う (mode={mode} {tag})");
+                for j in 0..k {
+                    assert_eq!(
+                        w[j].to_bits(),
+                        w_ref[j].to_bits(),
+                        "重みが違う (mode={mode} {tag} j={j})"
+                    );
+                }
+            }
+            // 決定性 (同じ入力で 2 回)。
+            let (s_again, w_again) = run(true, None, None);
+            assert_eq!(s_again, s_fast);
+            for j in 0..k {
+                assert_eq!(w_again[j].to_bits(), w_fast[j].to_bits());
+            }
+            // 同値だらけでも選択は index 昇順 (規則の固定)。
+            assert!(s_fast.windows(2).all(|x| x[0] < x[1]), "index 昇順でない (mode={mode})");
+            // 有限の確率なら重みの和は 1 (NaN 入りは一様フォールバックなので 1.0)。
+            let sum: f32 = w_fast.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5, "重みの和 (mode={mode}): {sum}");
         }
     }
 
