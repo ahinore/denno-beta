@@ -367,6 +367,22 @@ where
     }
 }
 
+/// P986: `seed` は 64bit 整数のみ。文字列・小数・bool・配列は 400 で
+/// `error.param = "seed"` を付ける (OpenAI クライアントが直せるように)。
+fn de_opt_seed<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("seed must be an integer")),
+        Some(_) => Err(serde::de::Error::custom("seed must be an integer")),
+    }
+}
+
 /// 履歴の assistant `tool_calls[].function`。
 /// `arguments` は OpenAI 仕様では **JSON 文字列**。デンノ拡張として
 /// オブジェクト直書きも受ける (どちらも同じ input へ正規化する)。
@@ -460,6 +476,8 @@ pub struct ChatCompletionRequest {
     #[serde(default, deserialize_with = "de_opt_top_logprobs")]
     pub top_logprobs: Option<i64>,
     /// P869: サンプリング seed (OpenAI 互換)。未指定は engine 既定 (乱数)
+    /// P986: 型違いは `param: "seed"` 付きの 400 (deserializer で明示メッセージ)。
+    #[serde(default, deserialize_with = "de_opt_seed")]
     pub seed: Option<i64>,
 }
 
@@ -717,6 +735,24 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// P986: OpenAI 応答の `system_fingerprint`。
+///
+/// サーバー構成 (配信モデル名 + 登録モデル ID) から FNV-1a 64bit で決定的に
+/// 導く。同一構成なら全リクエスト・全プロセスで同じ値になり、seed /
+/// temperature / stream の別には依存しない (OpenAI の意味論に合わせ、
+/// 「バックエンド構成が変わったら変わる」識別子として使う)。
+fn system_fingerprint(model_name: &str, model_id: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let parts = [model_name, "\0", model_id];
+    for part in parts {
+        for b in part.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("fp_{h:016x}")
+}
+
 fn hex24() -> String {
     let mut rng = rand::thread_rng();
     (0..24).map(|_| format!("{:x}", rng.gen::<u8>() % 16)).collect()
@@ -856,6 +892,9 @@ fn oa_body_error(e: serde_json::Error) -> OaError {
         err.with_param("top_logprobs")
     } else if rest.starts_with("logprobs ") {
         err.with_param("logprobs")
+    } else if rest.starts_with("seed ") {
+        // P986: seed の型違い
+        err.with_param("seed")
     } else {
         err
     }
@@ -1106,11 +1145,14 @@ pub async fn chat_completions(
             None => Value::Null,
         };
         let created = now_secs();
+        // P986: 構成由来の決定的な指紋 (seed / stream に依存しない)。
+        let fingerprint = system_fingerprint(&state.model_name, &state.model_id);
         Ok(Json(json!({
             "id": new_chatcmpl_id(),
             "object": "chat.completion",
             "created": created,
             "model": state.model_name,
+            "system_fingerprint": fingerprint,
             "choices": [{
                 "index": 0,
                 "message": completion_message(&text, &calls),
@@ -1147,6 +1189,7 @@ async fn send_delta_chunk(
     id: &str,
     created: u64,
     model: &str,
+    fingerprint: &str,
     delta: Value,
     include_usage: bool,
 ) -> bool {
@@ -1156,6 +1199,7 @@ async fn send_delta_chunk(
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
+            "system_fingerprint": fingerprint,
             "choices": [{
                 "index": 0,
                 "delta": delta,
@@ -1175,6 +1219,7 @@ async fn send_logprob_chunk(
     id: &str,
     created: u64,
     model: &str,
+    fingerprint: &str,
     t: &TokenLogprob,
     include_usage: bool,
 ) -> bool {
@@ -1184,6 +1229,7 @@ async fn send_logprob_chunk(
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
+            "system_fingerprint": fingerprint,
             "choices": [{
                 "index": 0,
                 "delta": {},
@@ -1254,6 +1300,8 @@ async fn stream_response(
     let id = new_chatcmpl_id();
     let created = now_secs();
     let model = state.model_name.clone();
+    // P986: 構成由来の決定的な指紋。全 chunk に同じ値を載せる。
+    let fingerprint = system_fingerprint(&state.model_name, &state.model_id);
     tokio::spawn(async move {
         // 最初の chunk: delta.role (OpenAI の慣習どおり content は空文字)
         let first = with_usage_slot(
@@ -1262,6 +1310,7 @@ async fn stream_response(
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
+                "system_fingerprint": fingerprint,
                 "choices": [{
                     "index": 0,
                     "delta": {"role": "assistant", "content": ""},
@@ -1293,6 +1342,7 @@ async fn stream_response(
                                 &id,
                                 created,
                                 &model,
+                                &fingerprint,
                                 json!({"content": text}),
                                 include_usage,
                             )
@@ -1350,7 +1400,13 @@ async fn stream_response(
                                 };
                                 if let Some(d) = delta {
                                     if !send_delta_chunk(
-                                        &tx, &id, created, &model, d, include_usage,
+                                        &tx,
+                                        &id,
+                                        created,
+                                        &model,
+                                        &fingerprint,
+                                        d,
+                                        include_usage,
                                     )
                                     .await
                                     {
@@ -1368,7 +1424,11 @@ async fn stream_response(
                 }
                 // P869: logprobs (`logprobs=true` のときだけ届く)
                 RawEvent::Logprob(t) => {
-                    if !send_logprob_chunk(&tx, &id, created, &model, &t, include_usage).await {
+                    if !send_logprob_chunk(
+                        &tx, &id, created, &model, &fingerprint, &t, include_usage,
+                    )
+                    .await
+                    {
                         return;
                     }
                 }
@@ -1394,6 +1454,7 @@ async fn stream_response(
                             &id,
                             created,
                             &model,
+                            &fingerprint,
                             json!({"content": t}),
                             include_usage,
                         )
@@ -1414,6 +1475,7 @@ async fn stream_response(
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
+                "system_fingerprint": fingerprint,
                 "choices": [{
                     "index": 0,
                     "delta": {},
@@ -1433,6 +1495,7 @@ async fn stream_response(
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
+                "system_fingerprint": fingerprint,
                 "choices": [],
                 "usage": usage_json(input_tokens, output_tokens),
             });
