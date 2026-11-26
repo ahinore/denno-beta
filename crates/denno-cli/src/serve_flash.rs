@@ -60,6 +60,10 @@ mod metrics;
 #[path = "kv_radix.rs"]
 mod kv_radix;
 
+// task 1601: `DENNO_KV_RADIX` の読み方は kv_radix 側に置き、単体試験
+// (`tests/kv_radix_edge_1601.rs`) から同じ関数を固定できるようにした。
+use kv_radix::kv_radix_enabled;
+
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
@@ -472,18 +476,6 @@ fn kv_slot_max_tok(v: Option<&str>, max_ctx: usize) -> usize {
         Some(n) if n >= 8 => n.min(max_ctx),
         _ => max_ctx,
     }
-}
-
-/// task 866: `DENNO_KV_RADIX` (既定 off)。`1` / `true` / `yes` / `on` で、
-/// スロット選択を radix (パス圧縮トライ) 索引 + 前置き優先の追い出しにする。
-///
-/// 他のフラグと違い **既定 off** (task の規則: 実験経路は明示フラグの裏)。
-/// 既定 off では索引を 1 度も作らず、ログにも radix の欄を出さない
-/// (既定の挙動とログ行を byte 単位で変えないため)。スロット数 2 では
-/// 従来の main/aux heuristic (`pick_ctx`) をそのまま使うので不活性
-/// (radix は `--kv-slots` / `DENNO_KV_SLOTS` が 3 以上のときだけ効く)。
-fn kv_radix_enabled(v: Option<&str>) -> bool {
-    matches!(v, Some("1") | Some("true") | Some("yes") | Some("on"))
 }
 
 /// P812: N スロット選択の入力 (1 スロットぶん)。

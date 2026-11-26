@@ -21,6 +21,21 @@
 //! 作り直す (最大 8 本 × 文脈長。prefill の秒に対して無視できる) ので、
 //! スロットと索引がずれる状態が存在しない。
 
+/// task 866 / task 1601: `DENNO_KV_RADIX` の読み方 (既定 off。他のフラグと違い
+/// opt-in)。`1` / `true` / `yes` / `on` だけが on で、空・`0`・typo は off。
+///
+/// 既定 off なのは、これが **索引の実装の切り替え** であって出力を変えない
+/// ため、まずラボで md5 一致と選択ログを確認してから昇格させる経路だから。
+/// 昇格 (既定 on) の条件は [`KvRadix`] の audit メモと
+/// `crates/denno-cli/tests/kv_radix_edge_1601.rs` の doc に列挙した。
+///
+/// なお、この関数が true を返してもスロット数 2 では不活性
+/// (選択は従来の main/aux `pick_ctx` のまま)。効くのは
+/// `--kv-slots` / `DENNO_KV_SLOTS` が 3 以上のときだけ。
+pub(crate) fn kv_radix_enabled(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("true") | Some("yes") | Some("on"))
+}
+
 /// パス圧縮トライの 1 ノード。
 #[derive(Debug)]
 struct Node {
