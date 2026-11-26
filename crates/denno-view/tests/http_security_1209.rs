@@ -52,32 +52,29 @@ impl Resp {
     }
 }
 
-/// 応答を 1 本読み切る (`Connection: close` 前提で EOF まで読む)。
-fn read_response(mut s: TcpStream, what: &str) -> Resp {
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).expect("read response");
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or_else(|| panic!("no header terminator for {what}"));
+/// 生の応答バイト列を分解する。ヘッダ終端が無ければ None。
+fn parse(raw: &[u8]) -> Option<Resp> {
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
     let body = raw[split + 4..].to_vec();
     let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("bad status line for {what}: {status_line:?}"));
+    let status: u16 = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
     let headers = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
         .collect();
-    Resp {
+    Some(Resp {
         status,
         headers,
         body,
-    }
+    })
+}
+
+/// 応答を 1 本読み切る (`Connection: close` 前提で EOF まで読む)。
+fn read_response(mut s: TcpStream, what: &str) -> Resp {
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).expect("read response");
+    parse(&raw).unwrap_or_else(|| panic!("no header terminator for {what}"))
 }
 
 fn connect(addr: &str, what: &str) -> TcpStream {
@@ -86,6 +83,19 @@ fn connect(addr: &str, what: &str) -> TcpStream {
     s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
     let _ = what;
     s
+}
+
+/// 失敗しても panic しない 1 往復 (起動確認用)。
+fn try_probe(addr: &str) -> Option<Resp> {
+    let mut s = TcpStream::connect(addr).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    let req = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).ok()?;
+    s.flush().ok()?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).ok()?;
+    parse(&raw)
 }
 
 /// `method` と生の `raw_target` をそのままリクエスト行に載せる。
@@ -139,37 +149,48 @@ impl Drop for View {
     }
 }
 
-/// 本物のバイナリを立てて、TCP で繋がるまで待つ。
+/// 本物のバイナリを立てて、`GET /` が実際に 200 を返すまで待つ。
+///
+/// `free_port()` は bind → 解放なので、起動までの間に同じポートが別テストの
+/// サーバーに掴まれる競合がある。掴まれた側の子は bind に失敗して即終了するが
+/// connect 自体は成功してしまうため、(a) 子が生きていること と (b) `/` が
+/// 200 + HTML を返すこと の両方を確認してから採用する。駄目なら別ポートで再試行。
 fn start_view() -> View {
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_denno-view"))
-        .env("VIEW_PORT", port.to_string())
-        // 上流は意図的に閉じたポート。ページ配信は上流に依存しない。
-        .env("VIEW_UPSTREAM", "ws://127.0.0.1:1/v1/telemetry/ws")
-        // 配信経路の分岐を固定する (テストランナーの環境変数に依存しない)。
-        .env_remove("VIEW_CAPTURE")
-        .env_remove("VIEW_REPLAY")
-        .env_remove("VIEW_TOKENIZER")
-        .env_remove("VIEW_RECORD")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn denno-view binary");
+    for _ in 0..8 {
+        let port = free_port();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_denno-view"))
+            .env("VIEW_PORT", port.to_string())
+            // 上流は意図的に閉じたポート。ページ配信は上流に依存しない。
+            .env("VIEW_UPSTREAM", "ws://127.0.0.1:1/v1/telemetry/ws")
+            // 配信経路の分岐を固定する (テストランナーの環境変数に依存しない)。
+            .env_remove("VIEW_CAPTURE")
+            .env_remove("VIEW_REPLAY")
+            .env_remove("VIEW_TOKENIZER")
+            .env_remove("VIEW_RECORD")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn denno-view binary");
 
-    let addr = format!("127.0.0.1:{port}");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if TcpStream::connect(&addr).is_ok() {
-            return View { child, port };
+        let addr = format!("127.0.0.1:{port}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            // bind に失敗した子は即終了する。生きたまま応答する個体だけを採る。
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            if let Some(r) = try_probe(&addr) {
+                if r.status == 200 && r.text().starts_with("<!DOCTYPE html>") {
+                    return View { child, port };
+                }
+                break; // 別プロセスが応答している — このポートは捨てる
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        if Instant::now() >= deadline {
-            let mut c = child;
-            let _ = c.kill();
-            let _ = c.wait();
-            panic!("denno-view did not listen on {addr} within 20s");
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    panic!("denno-view did not serve / on any candidate port");
 }
 
 /// 4xx はブラウザや中間キャッシュに残してはいけない。denno-view の未知ルートは
