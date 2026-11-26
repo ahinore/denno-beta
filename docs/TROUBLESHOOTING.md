@@ -1,8 +1,8 @@
-# トラブルシューティング & FAQ
+# トラブルシューティング & 性能診断ガイド
 
-起動しない・遅い・落ちる・ビューアが空、のときに最初に読む文書。
-ここに書いたフラグ・環境変数・ルート・ログ行は、すべて `crates/` のコードで
-名前を確認したものだけを載せている (存在しないノブは書かない)。
+起動しない・遅い・落ちる・HTTP がエラーになる・ビューアが空、のときに最初に読む文書。
+ここに書いたフラグ・環境変数・ルート・ログ行・HTTP ステータスは、すべて `crates/` の
+現在のコードで名前と値を確認したものだけを載せている (存在しないノブは書かない)。
 数値のラベル: **[実装]** = コードの定数、**[推定]** = 測っていない見積り。
 
 対象は 2 つのサーバーバイナリ:
@@ -10,10 +10,12 @@
 | コマンド | 何のサーバー | 既定 | ルート |
 |---|---|---|---|
 | `denno serve-flash --dir <model-dir>` | Qwen3.8-Flash-Next (`qwen4exp`) 専用の最小サーバー | `127.0.0.1:8098` / `--max-ctx 4096` / `--max-tokens 512` | `POST /v1/messages`, `GET /v1/models`, `GET /health`, `GET /ready`, `GET /metrics`, `GET /v1/telemetry/ws` (ほかに介入 / ステアリングの REST) |
-| `denno serve <repo>` | 27B 級 GGUF の多プロトコルサーバー | `127.0.0.1:8080` / `--max-tokens 256` | Anthropic (`/v1/messages`)・OpenAI (`/v1/chat/completions`)・Ollama (`/api/chat`) と `/health` `/ready` `/metrics` `/v1/telemetry/ws` |
+| `denno serve <repo>` | 27B 級 GGUF の多プロトコルサーバー | `127.0.0.1:8080` / 実効 `max_tokens` 1024 | Anthropic (`/v1/messages`)・OpenAI (`/v1/chat/completions`, `/v1/completions`)・Ollama (`/api/chat`, `/api/generate`) と `/health` `/ready` `/metrics` `/v1/telemetry/ws` |
 
 `serve-flash` は OpenAI / Ollama のルートを持たない。叩くと
 `404` + `{"type":"error","error":{"type":"not_found_error","message":"<path>"}}` を返す。
+`serve-flash` は生の TCP 実装で、CORS 層・認証・ボディ上限 (413)・レート制限を持たない
+(§4.3 / §4.4 / §4.5 は `serve` の話)。
 
 ---
 
@@ -23,14 +25,19 @@
 
 ```bash
 denno doctor --dir <model-dir>          # 人が読む形
-denno doctor --dir <model-dir> --json   # 自動化向け
+denno doctor --dir <model-dir> --json   # 自動化向け (JSON を stdout へ)
 ```
 
-`[CPU]` / `[メモリ]` / `[GPU]` / `[モデル]` / `[推奨]` の 5 節を出す **[実装]**。
+`[CPU]` / `[メモリ]` / `[ディスク]` / `[ファイル記述子]` / `[GPU]` / `[モデル]` /
+`[環境変数 (DENNO_*)]` / `[推奨]` の 8 節を出す **[実装]**。
+`--json` は真偽フラグで、ファイルへは書かない (stdout に JSON を出す)。
 GPU は実行しない (`libcuda.so.1` と `/proc/driver/nvidia` の**存在**、Level Zero
-loader の**存在**だけ見る)。`--dir` を省くとモデル検査はしない。
+loader の**存在**だけ見る)。`--dir` を省くとモデル検査はしない (`[モデル]` は未指定表示)。
 
 - モデル検査が NG (シャード欠け・0 バイト・`.gguf` が 0 本) のときは非 0 で終わる。
+  レポート自体は先に出力されるので、JSON は失敗時も読める。
+- `[環境変数 (DENNO_*)]` は値が秘匿対象 (`*_API_KEY` / `*_TOKEN` / `*_SECRET` など) の
+  ときだけ `(値は非表示)` を添える。
 - `[GPU] CUDA driver` が `-` で `NVIDIA kernel` だけ出る場合は「ドライバは居るが
   `libcuda.so.1` が見えない」= コンテナなら `--gpus all` と NVIDIA runtime、
   ホストなら libcuda 入りのドライバが要る、と `[推奨]` に出る。
@@ -49,21 +56,23 @@ loader の**存在**だけ見る)。`--dir` を省くとモデル検査はしな
 [flash] telemetry: on|off (DENNO_TELEMETRY=0) (GET /v1/telemetry/ws)
 [flash] telemetry act: ...
 [flash] telemetry topk: on (top-8 を毎トークン)|off (DENNO_TELEMETRY_TOPK=1 で有効)
-[flash] metrics: on|off (GET /metrics, DENNO_SERVER_METRICS=...)
+[flash] metrics: on|off (GET /metrics, DENNO_METRICS=...)
 [flash] listening on http://<addr> model=<name>
 ```
 
 `[pf-budget]` は配分が変わったときだけ出る (平常の Healthy では 1 行目のみ **[実装]**)。
 
-### 0.3 `/health` と `/ready` は別物
+### 0.3 `/health` / `/ready` / `/metrics` / telemetry は別物
 
-- `/health`: プロセスが応答するかだけ。常に 200。本文は `serve` が `{"status":"ok"}`、
-  `serve-flash` が `{"ok":true,"model":"<name>"}` (`/healthz` も同じ)。
-- `/ready`: 受付可能かの判定。`serve` は「モデルロード済み + ワーカー生存 + drain 中でない」、
-  `serve-flash` は「drain 中でない」(モデルは listen 前にロード済み)。
-  受付不可なら 503 で、本文に `draining` / `loading` と現在の負荷が入る。
-- `/metrics`: `DENNO_SERVER_METRICS` が on のときだけ 200。`serve-flash` は
-  off だと 404 `not_found_error` に落ちる。
+| エンドポイント | `serve` | `serve-flash` |
+|---|---|---|
+| `GET /health` (`/healthz` も同じ) | 常に 200 `{"status":"ok"}` | 常に 200 `{"ok":true,"model":"<name>"}` |
+| `GET /ready` | モデルロード済み + ワーカー生存 + drain 中でないとき 200。それ以外は 503 (`loading` / `draining`) | drain 中でなければ 200。モデルは listen 前にロード済みなので `loading` は出ない。drain 中は 503 (`draining`) |
+| `GET /metrics` | **常に 200**。`DENNO_SERVER_METRICS` は記録の on/off だけ (§5.1) | `DENNO_METRICS` が on のときだけ 200。off は 404 `not_found_error` |
+| `GET /v1/telemetry/ws` | `DENNO_TELEMETRY` が `0` 以外のとき有効。未設定は無効で 503 (§5.3) | `DENNO_TELEMETRY` が `0` のときだけ無効 (§5.3) |
+
+`/health` / `/ready` / `/metrics` は API キーを要求しない (`serve` でも認証対象外)。
+`/v1/telemetry/ws` も `serve` の認証チェックを通らない。
 
 ---
 
@@ -93,6 +102,7 @@ loader の**存在**だけ見る)。`--dir` を省くとモデル検査はしな
 | `split.no が連番でない: 位置 i に split.no=...` | シャードが欠けている / 別モデルのシャードが混ざっている |
 | `split.count=... が渡したパート数 ... と一致しない` | 上と同じ。`--dir` の中身を混ぜた典型 |
 | `テンソル名が split 間で重複: <name>` | 同じシャードを 2 回置いた、または別リビジョンの混在 |
+| `split.tensors.count がパート間で食い違う: ...` | シャードの取り違え |
 | `split.tensors.count=... (全体の宣言値) が実際のテンソル数 ... と一致しない` | シャードの取り違え |
 
 対処は再ダウンロード。`--dir` にモデルの系列を 1 つだけ置く。
@@ -135,7 +145,8 @@ expert は**所有する RAM tier** に置く:
 | `DENNO_EXPERT_RAM_DBG=1` | off | 1 リクエストごとに 1 行 |
 
 `auto` は「`MemAvailable` − 非 expert バイト − 余裕」で、**非 expert を引く**のが要点。
-引かないと tier が page cache を追い出して decode が悪化する (実測で 19.4 → 46.4 ms/tok)。
+引かないと tier が page cache を追い出して decode が悪化する (コードのコメントにある
+実測例: 19.4 → 46.4 ms/tok)。
 
 ### 1.5 `... を listen できない`
 
@@ -152,6 +163,8 @@ accept の待ち行列で待つ。多重接続で速くしたいならプロセ�
   cap の既定は 32768 **[実装]** (`DENNO_MAX_PROMPT_TOKENS`)。
   上限は「Q4 GPU 経路の作業領域がプロンプト長 × 層数で残る」ことへの防御で、
   上げると OOM に近づく。
+- `serve` にはこのほか「prompt + max_tokens が KV スロット上限を超える」と
+  「KV 予算超過」の 400 もある (同時リクエスト数か `DENNO_KV_BUDGET_MB` を見直す)。
 
 `--max-ctx` を上げると増えるのは**ホスト側の KV** だけ。起動ログの `kv=... MiB (host, max_ctx 比例)`
 がそれで、`weights` / `staging` / `arena` は `max_ctx` に比例しない **[実装]**。
@@ -169,12 +182,13 @@ accept の待ち行列で待つ。多重接続で速くしたいならプロセ�
 
 ---
 
-## 2. VRAM 予算
+## 2. VRAM 予算と OOM
 
 ### 2.1 `--vram-budget auto` と手動
 
 `--vram-budget` は `serve-flash` のフラグで、`auto` か MiB の数値を受ける。
 未指定なら `DENNO_AUTO_CONFIG` を見る。CLI が env に勝つ **[実装]**。
+`DENNO_AUTO_CONFIG` は `1` / `true` / `on` / `yes` / `auto` を真として受ける。
 
 - `auto`: 起動時に VRAM / RAM / モデルサイズを引き、**未設定の** `DENNO_*` だけを埋める。
 - 数値 (MiB): auto と同じ式に「総 VRAM = その値」を渡す。検出できない環境用。
@@ -271,7 +285,7 @@ VRAM tier の実績は起動後に
 
 ---
 
-## 3. GPU バックエンド
+## 3. GPU バックエンドの readiness
 
 ### 3.1 CUDA はビルド時 feature + 実行時 dlopen
 
@@ -304,9 +318,19 @@ feature は `default = ["par"]` / `par` / `test-utils` / `cuda` だけで、
   検出器を使うので効かない → `--vram-budget <MiB>` で総量を明示する。
 - Arc 移植の詳細は `docs/PERFORMANCE_TUNING.md` §4.3 を参照。
 
+### 3.4 GPU が使えているかの確認順
+
+1. `denno doctor` の `[GPU]`: `CUDA driver` に `libcuda.so.1` のパスが出るか。
+   `NVIDIA kernel` だけならユーザー空間の libcuda が無い (§0.1)。
+2. 起動ログの `[flash] vram budget: ...` と
+   `[flash] gpu weights: N 本 ok / M 本 失敗`。`M > 0` なら `first_error` を読む。
+3. `GET /metrics` の `denno_expert_vram_used_bytes` / `denno_expert_vram_hit_rate` と
+   `denno_last_decode_ms_per_token`。hit rate が 0 のままなら expert は VRAM に載っていない。
+4. `DENNO_CUDA` の値 (§3.2)。`yes` は無効。
+
 ---
 
-## 4. HTTP サーバー
+## 4. HTTP サーバー (`serve`)
 
 ### 4.1 ルートの取り違え
 
@@ -316,38 +340,96 @@ feature は `default = ["par"]` / `par` / `test-utils` / `cuda` だけで、
 | Ollama クライアントが 404 | 同上 (`/api/chat` / `/api/generate` は `denno serve` のみ) |
 | Anthropic クライアントが 404 | パスの綴り違い (`/v1/messages` であって `/v1/message` ではない) |
 | `/v1/models` は 200 なのに生成だけ失敗 | モデル名の指定違い。`GET /v1/models` の `id` をそのまま使う |
+| OpenAI の `/v1/embeddings` などが 501 | 経路は正しいが未実装 (`not_implemented`)。生成系のルートへ切り替える |
 
 `serve-flash` の `GET /v1/models` は `context_length` と `capabilities`
-(`anthropic` / `openai` / `tools` / `telemetry`) を返す。`telemetry` が `false` なら
-ビューアは繋がらない (§5.2)。
+(`anthropic` / `openai` / `tools` / `streaming` / `telemetry`) を返す。
+`telemetry` が `false` ならビューアは繋がらない (§5.3)。
 
-### 4.2 `/ready` が 503
+### 4.2 認証 (401)
 
-| 本文の `status` | 意味 | 対処 |
-|---|---|---|
-| `loading` | モデルロード未完 / ワーカーが死んだ (`serve`) | 起動完了を待つ。死んでいるならプロセスを再起動 |
-| `draining` | SIGTERM / SIGINT を受けて停止中 | 新規を投げない。オーケストレータは routing から外す |
+`serve` だけが認証を持つ。`--api-key` / `--api-keys` / `DENNO_API_KEYS` の
+いずれかが非空なら有効で、複数指定は**和集合** (カンマ区切り、どれか 1 つに一致すれば通る)。
 
-`serve-flash` はモデルを listen 前にロードするので `loading` は出ない。
-drain 中は **GET 以外**が 503 になり、本文は
-`server is draining (shutdown signal received); the request was not accepted`。
-`serve` も同じ文言で 503 `overloaded_error` を返す。
+- 送るヘッダは `x-api-key: <key>` か `Authorization: Bearer <key>` のどちらでもよい。
+  両方あるときは、どれか 1 つが一致すれば受理される。
+- 不一致は `401` + `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`。
+- `--api-key` を付けなければ認証なし (従来どおり開放)。`serve-flash` に認証は無い。
+- 認証対象は生成系と `/v1/models`。`/health` / `/ready` / `/metrics` /
+  `/v1/telemetry/ws` は対象外。
 
-drain の待ち時間は `DENNO_DRAIN_TIMEOUT_MS` (既定 10 s、0〜600000 にクランプ、0 = 待たない)。
-超過すると `[flash] drain 上限超過: 進行中 N 本のまま終了する` (serve は
-`drain 上限 (...s) 超過: pending=... in_flight=... のまま停止する`) を出して終了する。
+### 4.3 CORS
 
-### 4.3 過負荷 (キュー飽和)
+既定は「ループバックの任意ポートだけ許可」**[実装]**。サーバは 127.0.0.1 で
+待ち受けるのが既定なので、ローカルブラウザ (denno-view など) からはそのまま使え、
+外部オリジンには `Access-Control-Allow-Origin` を出さない。
 
-`serve` は単一ワーカー + 待ち行列。溢れると**プロトコルごとに違う形**で返す。
-下表の `error.type` は Anthropic ルート (`/v1/messages`) のもの。
+| 指定 | 意味 |
+|---|---|
+| 未指定 / 空 | `http(s)://localhost` / `127.0.0.1` / `[::1]` を任意ポートで許可 |
+| `*` | 任意オリジン (`Access-Control-Allow-Origin: *`) |
+| カンマ区切り | その一覧だけを許可。**ループバック既定は無効になる**ので、ローカルも使うなら一覧に入れる |
 
-| 状況 | ステータス | `error.type` | ヘッダ |
+- 優先順は CLI `--cors-origin` > env `DENNO_CORS_ORIGIN`。
+- プリフライト (`OPTIONS` + `Access-Control-Request-Method`) は 204 で完結する。
+  許可メソッドは `GET, POST, OPTIONS`、既定の許可ヘッダは
+  `content-type, x-api-key, authorization, anthropic-version, x-request-id`、
+  キャッシュは 86400 秒。
+- 非プリフライトの応答には `Access-Control-Allow-Origin` と
+  `Access-Control-Expose-Headers: x-request-id, x-denno-ttft-ms, x-denno-decode-tps`
+  を足す (`*` 以外では `Vary: Origin` も)。
+- CORS 層はレート制限・ボディ上限より外側なので、404 / 405 / 413 / 429 の応答にも
+  CORS ヘッダが付く。
+- `serve-flash` は CORS 層を持たない。ブラウザから直接叩かず、denno-view の
+  `/ws` / `/api/*` 中継を使う (§7)。
+
+### 4.4 413 Payload Too Large
+
+`serve` のボディ上限。`--max-body-mb` > env `DENNO_MAX_BODY_MB` > 既定 16 MiB。
+値は 1〜4096 MiB にクランプされる **[実装]**。
+
+- `Content-Length` が上限を超える要求は、本文を読む前に 413 になる。
+- `Content-Length` が無い chunked ボディは、読み込み中に上限を超えた時点で 413。
+- 本文は他のエラーと同じ JSON 封筒:
+  `{"type":"error","error":{"type":"invalid_request_error","message":"request body too large: the configured limit is <N> bytes"}}`
+- 対処: 入力を縮めるか `--max-body-mb` を上げる。上げすぎると prefill の
+  メモリピークも上がるので、まずプロンプト長と添付サイズを確認する。
+- `serve-flash` にボディ上限は無い。
+
+### 4.5 429 Too Many Requests
+
+429 は 2 系統ある。どちらも `error.type` は `rate_limit_error`。
+
+| 発生源 | 条件 | ノブ | `Retry-After` |
 |---|---|---|---|
-| 待ち行列が上限 (`queue_full_error`) | 503 | `overloaded_error` | `Retry-After: <秒>` |
-| KV スロットが全部使用中 (`AdmitKind::SlotsBusy`) | 429 | `rate_limit_error` | なし |
-| 同時実行の防御上限 (`AdmitKind::SessionLimit`) | 503 | `overloaded_error` | なし |
-| 内部要因 (`AdmitKind::Internal`) | 500 | `api_error` | なし |
+| トークンバケット | 推論エンドポイントの RPM 超過 | `DENNO_RATE_LIMIT_RPM` / `DENNO_RATE_LIMIT_BURST` | あり (秒) |
+| KV スロット枯渇 (`AdmitKind::SlotsBusy`) | 全スロットが実行中 | `DENNO_BATCH_SLOTS` (serve) | なし |
+
+- トークンバケットは `DENNO_RATE_LIMIT_RPM` が正のときだけ有効。burst の既定は
+  `rpm / 60` (最低 1)。`/health` `/ready` `/metrics` は消費しない。
+- OpenAI 形式では `type` が `rate_limit_error`、`code` が `rate_limit_exceeded`。
+- 対処: `Retry-After` を尊重して待つ。即時リトライを繰り返すとバケットが回復しない。
+  KV 枯渇なら同時リクエストを減らすか `DENNO_BATCH_SLOTS` を見直す。
+
+### 4.6 503 Service Unavailable
+
+| 状況 | 本文の `error.type` | ヘッダ |
+|---|---|---|
+| `draining` (SIGTERM / SIGINT 後) | `overloaded_error` | なし |
+| 待ち行列が上限 (`queue_full_error`) | `overloaded_error` | `Retry-After: <秒>` |
+| 同時実行の防御上限 (`AdmitKind::SessionLimit`) | `overloaded_error` | なし |
+| 内部要因 (`AdmitKind::Internal`) | `api_error` (500) | なし |
+
+`/ready` は受付不可の間ずっと 503 を返す (§0.3)。本文の `status` は
+`loading` (モデルロード未完 / ワーカー死亡) か `draining` (停止中)。
+
+drain 中の新規生成要求は
+`server is draining (shutdown signal received); the request was not accepted`
+で 503 になる。`serve-flash` も同じ文言で、drain 中は **GET 以外**が 503。
+drain の待ち時間は `DENNO_DRAIN_TIMEOUT_SECS` (秒) > `DENNO_DRAIN_TIMEOUT_MS` (ms)
+> 既定 10 秒。0〜600000 にクランプされ、0 = 待たない。超過すると
+`[flash] drain 上限超過: 進行中 N 本のまま終了する` (serve は
+`drain 上限 (...s) 超過: pending=... in_flight=... のまま停止する`) を出して終了する。
 
 プロトコル差 (同じ「キュー満杯」でも):
 
@@ -359,7 +441,7 @@ drain の待ち時間は `DENNO_DRAIN_TIMEOUT_MS` (既定 10 s、0〜600000 に�
 
 Anthropic のキュー満杯の本文は
 `server busy: request queue is full (max_queue = <N>, in_flight = 1); retry later`。
-429 を返すのは OpenAI の慣例 (「一時的な容量不足 = 後で再試行」) に合わせたもの。
+OpenAI が 429 を返すのは「一時的な容量不足 = 後で再試行」の慣例に合わせたもの。
 
 調整:
 
@@ -368,18 +450,15 @@ Anthropic のキュー満杯の本文は
 | `--max-queue-depth` (別名 `--max-queue`) / `DENNO_MAX_QUEUE_DEPTH` | 32 | 待ち行列の上限 (上限 65536) |
 | `--request-timeout-secs` / `DENNO_REQUEST_TIMEOUT_SECS` | 0 (無効) | リクエストの壁時計上限。超えると生成を打ち切りスロットを解放 |
 
-クライアント側は `Retry-After` を尊重して再試行する。即時リトライを繰り返すと
-待ち行列が埋まったままになる。
-
 `serve-flash` は**逐次処理**なので過負荷応答は無い。2 本目は accept で待つ。
 1 本が長いと全部が待つので、タイムアウトはクライアント側で持つ。
 
-### 4.4 SSE の切断
+### 4.7 SSE の切断
 
 - `serve`: hyper が書き込み失敗 (broken pipe / connection reset) を検知すると
   生成を中断し、KV スロットを解放して次のリクエストに回す。ログは
   `client disconnected; generation aborted`、指標は
-  `denno_requests_aborted_total{reason="disconnected"}` ( `/ready` の本文にも
+  `denno_requests_aborted_total{reason="disconnected"}` (`/ready` の本文にも
   `disconnected` として出る)。
 - `serve-flash`: 送信失敗は「クライアント切断」として扱い、次のトークンで止めて
   文脈をキャッシュに残す (`[flash] abort: N トークンで停止`)。復帰後のリクエストは
@@ -388,29 +467,138 @@ Anthropic のキュー満杯の本文は
   「ストリームでない」と判断して JSON として読む。`stream: true` を送っているか、
   途中のプロキシがバッファリングしていないかを確認する。
 
-### 4.5 クライアントごとのつまずき
+### 4.8 クライアントごとのつまずき
 
 | 症状 | 原因 / 対処 |
 |---|---|
-| 401 `authentication_error` `invalid x-api-key` | `serve` を `--api-key` 付きで起動している。`x-api-key` ヘッダか、`Authorization` に `Bearer ` を前置した値を送る。`serve-flash` に認証は無い |
+| 401 `authentication_error` `invalid x-api-key` | `serve` を API キー付きで起動している。`x-api-key` か `Authorization: Bearer` を送る (§4.2) |
 | OpenAI クライアントで `max_tokens` が無視される | `max_tokens` と `max_completion_tokens` の両方があると `max_tokens` が優先。片方だけ送る |
-| 生成が途中で切れる | `max_tokens` 未指定時の既定 (`serve` 256 / `serve-flash` 512) に当たっている |
-| thinking 有効のクライアントで出力が崩れる | `serve` の `--temperature-cap` で実効 temperature を頭打ちにする (小型モデル向け) |
+| 生成が途中で切れる | `max_tokens` 未指定時の既定に当たっている。`serve` は 1024 (クランプ上限 4096)、`serve-flash` は 512 |
 | 同じ seed なのに出力が違う | 量子化モード (`--quant int8` は fp32 とビット一致しない)、`temperature` が 0 でない、チャンク幅が違う |
+| thinking 有効のクライアントで出力が崩れる | `serve` の `--temperature-cap` で実効 temperature を頭打ちにする (小型モデル向け) |
 
-### 4.6 指標
+注意: `serve` の `--max-tokens` は clap で受理されるが、現在の `ServeConfig` には
+渡されておらず、実効値はサーバー定数の 1024 (リクエストで明示した値は 4096 で
+クランプ) **[実装]**。既定を変えたいときはリクエスト側で `max_tokens` を送る。
 
-`/metrics` は Prometheus 形式。`DENNO_SERVER_METRICS=0|false|no` で記録を止める (既定 on)。
-アクセスログは `serve` の `--log-format json` で 1 リクエスト 1 行
+### 4.9 アクセスログ
+
+`serve` の `--log-format json` で 1 リクエスト 1 行
 (`ts_ms` / `method` / `path` / `status` / `duration_ms`) になる。
-1 リクエストの内訳が要るときは `serve-flash` で `DENNO_Q4_PROFILE=1`
-(または `DENNO_DEV_PROFILE=1`)。decode / prefill の段ごとに 1 行群を出す。
+パラメータ値 (`api_key` / `token` / `secret` など) とヘッダ値はログに出さない。
 
 ---
 
-## 5. ビューア (`/`, `/2d`, `/3d`)
+## 5. 観測: `/metrics` と telemetry
 
-### 5.1 起動と接続
+### 5.1 `serve` の `/metrics`
+
+`GET /metrics` は **常に 200** で Prometheus text exposition format 0.0.4 を返す。
+`DENNO_SERVER_METRICS=0|false|no` は**記録**を止めるだけで、エンドポイントは消えない
+(記録が止まっていれば値は 0 のまま)。既定は記録 on。
+prefix cache の計器は `DENNO_SERVER_METRICS=0` でも数え続ける。
+
+主な系列:
+
+| 系列 | 意味 |
+|---|---|
+| `denno_server_ready` / `denno_server_draining` | `/ready` と同じ判定 (1/0) |
+| `denno_requests_in_flight` / `denno_requests_queued` | 実行中 / 待ち行列 |
+| `denno_requests_completed_total` | 完走数 |
+| `denno_requests_aborted_total{reason="timeout"\|"disconnected"\|"error"}` | 打ち切り内訳 |
+| `denno_http_requests_total{endpoint,status}` | ルート別ステータス (未知パスは `other`) |
+| `denno_prompt_tokens_total` / `denno_completion_tokens_total` | トークン計数 |
+| `denno_kv_reuse_ratio` | prefix 再利用の比率 |
+| `denno_prefix_cache_hit_rate` | prefix cache のヒット率 |
+| `denno_ratelimit_rejections_total{reason="token_bucket"}` | バケットによる 429 数 |
+| `denno_ttft_seconds` / `denno_tpot_seconds` | 初トークン / トークン間の要約 |
+
+### 5.2 `serve-flash` の `/metrics`
+
+`DENNO_METRICS` が既定 on。`0` / `false` / `no` で経路ごと消え、`GET /metrics` は
+404 `not_found_error` になる (§0.3)。系列名は vLLM 互換が主体:
+
+| 系列 | 意味 |
+|---|---|
+| `vllm:num_requests_running` / `vllm:num_requests_waiting` | 実行中 / 待ち |
+| `vllm:time_to_first_token_seconds` / `vllm:inter_token_latency_seconds` | TTFT / トークン間 |
+| `vllm:kv_cache_usage_perc` | KV 使用率 |
+| `vllm:prompt_tokens_total` / `vllm:generation_tokens_total` | トークン計数 |
+| `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_queries_total` | prefix cache |
+| `denno_last_prefill_tokens_per_second` / `denno_last_decode_ms_per_token` | 直近の prefill/decode 速度 |
+| `denno_expert_vram_used_bytes` / `denno_expert_vram_hit_rate` | expert の VRAM 常駐とヒット率 |
+| `denno_expert_disk_read_bytes_total` | expert のディスク読み |
+| `denno_build_info` | ビルド SHA |
+
+### 5.3 テレメトリのゲート
+
+| サーバー | 既定 | 有効化 / 無効化 |
+|---|---|---|
+| `serve-flash` | **有効** | `DENNO_TELEMETRY=0` のときだけ無効 (それ以外の値は有効) |
+| `serve` | **無効** | `DENNO_TELEMETRY` を `0` 以外にする (`1` 推奨) と有効 |
+
+`serve` で有効化していないと `GET /v1/telemetry/ws` は **503** で
+`telemetry disabled (set DENNO_TELEMETRY=1)` を返す。`GET /v1/models` の
+`capabilities.telemetry` でも判別できる。
+
+### 5.4 パネルごとの追加ゲート
+
+| ノブ | 既定 | 何が出るか |
+|---|---|---|
+| `DENNO_TELEMETRY_TOPK=1` | off | sampler の top-8 とエントロピー (`/2d` の token probs 欄)。無いと「TopK フレーム待ち」のまま |
+| `DENNO_TELEMETRY_ACT=1` | off | 層ごとの活性フレーム |
+| `DENNO_TELEMETRY_ARCH=1` | off | ルータの top-k / 役割別 RMS など構造系 |
+| `DENNO_TELEM_EXPERT_SKIP=1` | off | 「ルータは選んだが介入で切った expert」(`DENNO_TELEMETRY_ARCH` も要る) |
+| `DENNO_TELEM_LAZY=0` | on | 購読者 0 人のとき重い観測を省くのを止める (A/B 用) |
+
+`DENNO_TELEM_LAZY` が on のとき、ビューアを開くまで top-8 / 活性 / arch は
+組み立てられない。開いた瞬間から出るのは正常。
+
+---
+
+## 6. 性能診断
+
+### 6.1 まず数字を取る
+
+1. `GET /metrics` の `denno_ttft_seconds` / `denno_tpot_seconds` (serve) または
+   `vllm:time_to_first_token_seconds` / `denno_last_decode_ms_per_token` (serve-flash)。
+2. 起動ログの `[pf-budget]` の段 (`Healthy` / `Tight` / `Critical`) と
+   `[auto-config] plan` の `applied` / `kept`。
+3. `[flash] gpu weights: N 本 ok / M 本 失敗` と `first_error`。
+4. 1 リクエストの内訳が要るときは `DENNO_Q4_PROFILE=1` (または
+   `DENNO_DEV_PROFILE=1`)。decode / prefill の段ごとに 1 行群を出す。
+   計測のみで数値経路は変えない。
+
+### 6.2 prefill が遅い
+
+- `[pf-budget]` が `Critical` に落ちていないか。落ちていれば同時 prefill が
+  最小構成になっている。メモリを空けるか `DENNO_PF_MEMADAPT=0` で静的既定に戻して
+  A/B する。
+- `DENNO_PF_CHUNK` が大きすぎないか。チャンクを縮めるとピークは下がるが
+  オーバーヘッドは増える (**推定**)。
+- `DENNO_PF_PREAD_THREADS` / `DENNO_PF_POOL_MB` の明示値が memadapt の計算に
+  勝っている。意図しない値が残っていないか確認する。
+
+### 6.3 decode が遅い
+
+- expert が VRAM に載っているか (§3.4)。`denno_expert_vram_hit_rate` が低いなら
+  `DENNO_EXPERT_VRAM_MB` を増やすか、`DENNO_EXPERT_GPU_MIN_HIT` を下げる。
+- expert のディスク読みが多いなら §1.4 の prefetch / RAM tier。
+- `DENNO_EXPERT_IQ_GPU=1` のまま CPU に落ちていないか (ログの `[exp-stats]`)。
+- `denno_last_prefill_tokens_per_second` と `denno_last_decode_ms_per_token` を
+  変更前後で比較する。数値経路を変えるノブ (量子化・チャンク) は A/B の条件を揃える。
+
+### 6.4 CPU しか使えていない
+
+`DENNO_CUDA` の値 (§3.2)、`denno doctor` の `[GPU]`、起動ログの
+`libcuda.so.1 を dlopen できません` を確認する。CPU 経路でも SIMD に
+`avx2`/`fma` が無いと Q4_K expert の GEMV はスカラーへ落ちる。
+
+---
+
+## 7. ビューア (`/`, `/2d`, `/3d`)
+
+### 7.1 起動と接続
 
 ```bash
 VIEW_UPSTREAM=ws://127.0.0.1:8098/v1/telemetry/ws denno-view
@@ -431,50 +619,27 @@ VIEW_UPSTREAM=ws://127.0.0.1:8098/v1/telemetry/ws denno-view
 フレームを中継する (ブラウザから上流へ直接は繋がないので CORS 設定は要らない)。
 `/2d` の REST は `/api/*` 経由、チャット欄は `/chat` 経由で上流へ流れる。
 
-### 5.2 テレメトリのゲート
-
-| サーバー | 既定 | 無効化 |
-|---|---|---|
-| `serve-flash` | **有効** | `DENNO_TELEMETRY=0` (`0` のときだけ無効) |
-| `serve` | **無効** | `DENNO_TELEMETRY=1` で有効 |
-
-`serve` で有効化していないと `GET /v1/telemetry/ws` は **503** で
-`telemetry disabled (set DENNO_TELEMETRY=1)` を返す。`GET /v1/models` の
-`capabilities.telemetry` でも判別できる。
-
-### 5.3 パネルごとの追加ゲート
-
-| ノブ | 既定 | 何が出るか |
-|---|---|---|
-| `DENNO_TELEMETRY_TOPK=1` | off | sampler の top-8 とエントロピー (`/2d` の token probs 欄)。無いと「TopK フレーム待ち」のまま |
-| `DENNO_TELEMETRY_ACT=1` | off | 層ごとの活性フレーム |
-| `DENNO_TELEMETRY_ARCH=1` | off | ルータの top-k / 役割別 RMS など構造系 |
-| `DENNO_TELEM_EXPERT_SKIP=1` | off | 「ルータは選んだが介入で切った expert」( `DENNO_TELEMETRY_ARCH` も要る) |
-| `DENNO_TELEM_LAZY=0` | on | 購読者 0 人のとき重い観測を省くのを止める (A/B 用) |
-
-`DENNO_TELEM_LAZY` が on のとき、ビューアを開くまで top-8 / 活性 / arch は
-組み立てられない。開いた瞬間から出るのは正常。
-
-### 5.4 トークンが id のまま表示される
+### 7.2 トークンが id のまま表示される
 
 `VIEW_TOKENIZER=<path>/tokenizer.json` を渡す。読み込みに失敗すると
 `tokenizer.json read failed (...) — token text display disabled` が出て、id 表示に落ちる。
+未設定なら `tokenizer not configured (set VIEW_TOKENIZER)` を返す。
 GGUF 経路 (`serve-flash`) はモデルがトークナイザを持つが、ビューア側は別プロセスなので
 `VIEW_TOKENIZER` が要る。
 
-### 5.5 フレームが落ちる / 映像がカクつく
+### 7.3 フレームが落ちる / 映像がカクつく
 
-- テレメトリは bounded チャネル (4096 フレーム) で、溢れたら**捨てる**。
-  推論を待たせないための設計で、遅いクライアントは切り捨てられる。
-- `serve-flash` の relay は 1 クライアントへの書き込みを 200 ms で打ち切る。
-  ブラウザのタブを絞ると落ちやすい。
+- テレメトリは bounded チャネル (4096 フレーム) で、溢れたら**捨てて**
+  `Gap { lost }` フレームで欠落を明示する。推論を待たせないための設計で、
+  遅いクライアントは切り捨てられる。
+- ブラウザのタブを絞ると受け側が遅くなり、`Gap` が増えやすい。
 - 記録して後で見る: `VIEW_RECORD=<file>` (受信フレームを追記)、
   `VIEW_REPLAY=<file>` (`GET /replay`)、`VIEW_CAPTURE=<file>` (`GET /capture.bin`)。
   未設定のときはそれぞれ `replay record not configured (set VIEW_REPLAY)` 等を返す。
 
 ---
 
-## 6. 早見表
+## 8. 早見表
 
 | 症状 | まず見る | 対処 |
 |---|---|---|
@@ -485,30 +650,40 @@ GGUF 経路 (`serve-flash`) はモデルがトークナイザを持つが、ビ�
 | `cuMemAlloc が失敗` | `要求` と `空き` | `DENNO_SCRATCH_ARENA=0` → `DENNO_PF_CHUNK` 縮小 → expert VRAM を下げる |
 | `libcuda.so.1 を dlopen できません` | `denno doctor` の `[GPU]` | ドライバ / `--gpus all`。無いなら CPU で運用 |
 | `/ready` が 503 `draining` | SIGTERM を受けた | 新規を止める。待ちは `DENNO_DRAIN_TIMEOUT_MS` |
+| 401 `invalid x-api-key` | API キーの指定 | `x-api-key` か `Authorization: Bearer` (§4.2) |
+| 413 `request body too large` | `--max-body-mb` / `DENNO_MAX_BODY_MB` | 入力を縮める。既定 16 MiB (§4.4) |
+| 429 `rate_limit_error` | RPM バケットか KV 枯渇 | `Retry-After` を尊重。`DENNO_RATE_LIMIT_RPM` / `DENNO_BATCH_SLOTS` を見直す |
 | 503 `overloaded_error` | `max_queue` と `in_flight` | `--max-queue-depth` を上げる / 並列度を下げる |
-| 429 `rate_limit_error` (Anthropic 表記) | KV スロット占有 | 待って再試行。`DENNO_BATCH_SLOTS` (serve) / `--kv-slots` (serve-flash) を見直す |
 | SSE が途中で切れる | サーバーログの `client disconnected` | クライアントのタイムアウト / プロキシの buffering |
-| `401 invalid x-api-key` | `--api-key` | ヘッダを合わせる |
+| ブラウザから直叩きで CORS エラー | `--cors-origin` / `DENNO_CORS_ORIGIN` | オリジンを明示するか denno-view の中継を使う (§4.3) |
 | ビューアが空 | `upstream disconnected, retrying` | `VIEW_UPSTREAM` のポート (8080 / 8098) |
+| telemetry ws が 503 | `DENNO_TELEMETRY` | `serve` は `0` 以外にする (§5.3) |
+| `/metrics` が 404 | `DENNO_METRICS` (serve-flash) | 既定 on。`0` になっていないか (§5.2) |
 | `/2d` の token probs が空 | `DENNO_TELEMETRY_TOPK` | `=1` でサーバーを再起動 |
 | トークンが数字のまま | `VIEW_TOKENIZER` | `tokenizer.json` を指す |
 
 ---
 
-## 7. この文書の検証方法
+## 9. この文書の検証方法
 
-文中のフラグ・env・ルートは、次の形でコードに存在することを確認している。
+文中のフラグ・env・ルート・ステータスは、次の形でコードに存在することを確認している。
 
 ```bash
 # 環境変数
-for v in DENNO_TELEMETRY DENNO_TELEMETRY_TOPK DENNO_AUTO_CONFIG ...; do
+for v in DENNO_TELEMETRY DENNO_TELEMETRY_TOPK DENNO_METRICS \
+         DENNO_SERVER_METRICS DENNO_CORS_ORIGIN DENNO_MAX_BODY_MB \
+         DENNO_RATE_LIMIT_RPM DENNO_MAX_QUEUE_DEPTH; do
   grep -rn "\"$v\"" crates/ || echo "MISSING: $v"
 done
 # CLI フラグ
-grep -rn -- '--vram-budget\|--max-queue-depth\|--max-ctx' crates/denno-cli/src/
+grep -rn -- '--vram-budget\|--max-queue-depth\|--max-ctx\|--max-body-mb\|--cors-origin' crates/denno-cli/src/
 # ルート (`serve` は axum の route、`serve-flash` は path の直接比較)
 grep -rn 'route("' crates/denno-server/src/lib.rs
 grep -rn 'path == "/' crates/denno-cli/src/serve_flash.rs
+# ステータスコード
+grep -rn 'PAYLOAD_TOO_LARGE\|SERVICE_UNAVAILABLE\|TOO_MANY_REQUESTS\|UNAUTHORIZED' crates/denno-server/src/
 ```
 
 存在しないノブを見つけたら、この文書ではなくコードが正しい。文書を直すこと。
+docs 全体の衛生 (LAN 私有 IP / `/home` パスの混入) は
+`cargo test --release -p denno-server --test docs_consistency_1249` で検査される。
