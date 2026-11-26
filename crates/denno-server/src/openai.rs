@@ -452,6 +452,49 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+/// task 1501: `stream_options` の型検証。
+///
+/// serde の既定メッセージだと `param` が付かず、`seed` / `logprobs` /
+/// `top_logprobs` (P966/P981/P986) と扱いが揃わない。JSON を Value で受けて
+/// `stream_options` / `stream_options.include_usage` を先頭に持つメッセージを
+/// 作り、[`oa_body_error`] が `error.param` を埋められるようにする。
+///
+/// 受理する形は従来と同じ:
+/// - 未指定 / `null` → `None` (未指定扱い)
+/// - `{}` → `include_usage: false`
+/// - `{"include_usage": bool}` → その値
+/// - 未知フィールドは無視 (OpenAI も同じ)
+///
+/// 拒否する形 (400):
+/// - `stream_options` が object でも null でもない (数値・文字列・配列・bool)
+/// - `include_usage` が bool でない (`null` を含む)
+fn de_stream_options<'de, D>(d: D) -> Result<Option<StreamOptions>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut obj = match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(m)) => m,
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "stream_options must be an object (got {})",
+                json_type_name(&other)
+            )))
+        }
+    };
+    let include_usage = match obj.remove("include_usage") {
+        None => false,
+        Some(Value::Bool(b)) => b,
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "stream_options.include_usage must be a boolean (got {})",
+                json_type_name(&other)
+            )))
+        }
+    };
+    Ok(Some(StreamOptions { include_usage }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     #[serde(default)]
@@ -467,6 +510,8 @@ pub struct ChatCompletionRequest {
     #[serde(default, deserialize_with = "de_stop")]
     pub stop: Vec<String>,
     pub stream: Option<bool>,
+    /// task 1501: 型違いは `param` 付きの 400 ([`de_stream_options`])。
+    #[serde(default, deserialize_with = "de_stream_options")]
     pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub tools: Option<Vec<Value>>,
@@ -912,7 +957,13 @@ fn oa_body_error(e: serde_json::Error) -> OaError {
     let msg = format!("invalid request body: {e}");
     let err = OaError::invalid(msg.clone());
     let rest = msg.strip_prefix("invalid request body: ").unwrap_or_default();
-    if rest.starts_with("top_logprobs ") {
+    if rest.starts_with("stream_options.include_usage ") {
+        // task 1501: include_usage の型違い
+        err.with_param("stream_options.include_usage")
+    } else if rest.starts_with("stream_options ") {
+        // task 1501: stream_options 自体の型違い
+        err.with_param("stream_options")
+    } else if rest.starts_with("top_logprobs ") {
         err.with_param("top_logprobs")
     } else if rest.starts_with("logprobs ") {
         err.with_param("logprobs")
@@ -1563,6 +1614,8 @@ pub struct CompletionRequest {
     #[serde(default, deserialize_with = "de_stop")]
     pub stop: Vec<String>,
     pub stream: Option<bool>,
+    /// task 1501: 型違いは `param` 付きの 400 ([`de_stream_options`])。
+    #[serde(default, deserialize_with = "de_stream_options")]
     pub stream_options: Option<StreamOptions>,
     /// true なら `text` の先頭にプロンプト自身を付ける (OpenAI と同じ)。
     #[serde(default)]
@@ -1656,8 +1709,9 @@ pub async fn completions(
 ) -> Result<Response, OaError> {
     check_auth(&state, &headers).map_err(OaError::from)?;
     crate::reject_if_draining(&state).map_err(OaError::from)?;
-    let req: CompletionRequest = serde_json::from_slice(&body)
-        .map_err(|e| OaError::invalid(format!("invalid request body: {e}")))?;
+    // task 1501: chat 経路と同じ本文エラーマッパを使う (`stream_options` などの
+    // 型違いに `error.param` を付ける)。
+    let req: CompletionRequest = serde_json::from_slice(&body).map_err(oa_body_error)?;
 
     // task 901: `/v1/chat/completions` と同じく登録別名を受ける。
     if !req.model.is_empty() && !model_matches(&state, &req.model) {
