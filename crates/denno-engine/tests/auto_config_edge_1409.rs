@@ -113,8 +113,9 @@ fn plan_budget_invariants_all_tiers() {
 #[test]
 fn plan_tier_table_is_stable() {
     // (公称 GiB, weight MiB, expert MiB)。task 886 の段の表を 48 / 80 まで延長。
+    // 8 GiB は task 932 の監査で dense のワーキングセット床に載せた (以前 2,867)。
     let table: [(u64, u64, u64); 7] = [
-        (8, 2_867, 5_160),
+        (8, 5_632, 1_536),
         (12, 5_632, 5_632),
         (16, 6_144, 9_216),
         (24, 9_420, 16_957),

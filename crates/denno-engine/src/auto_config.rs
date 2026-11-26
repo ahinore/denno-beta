@@ -28,8 +28,16 @@
 //! - 32 GB (RTX 5090) では手動の定番と同じ値になること
 //!   (`expert_vram=22000` / `gpu_weight=12000` / `min_hit=0`) をテストで縛る。
 //!   これが「auto が手動ピークと 1% 以内」の前提になる。
-//! - 8 / 10 / 12 / 16 / 24 / 32 GB × Q3 / Q4 の全組み合わせで
-//!   「VRAM を使い切らず、かつ 0 に潰さない」ことをテストで縛る。
+//! - 8 / 10 / 12 / 16 / 24 / 32 / 48 GB × Q3 / Q4 の全組み合わせで
+//!   「VRAM を使い切らず、かつ 0 に潰さない」ことをテストで縛る (task 932 で
+//!   48 GB と RAM 16-128 GiB の行列を追加)。16 GiB 以下は dense + expert が
+//!   「使える VRAM」に一致し、8-48 GiB を 64 MiB 刻みで回して dense / expert /
+//!   和が単調非減少であることも縛る。
+//! - 予算の和の上限は式の係数 40% + 72% = 112%。以前は 120% で縛っていたが、
+//!   112% が本当の上限 (task 932 の監査で締めた)。
+//! - dense のワーキングセット床は「40% の式が床を下回り、床 + expert の下限が
+//!   使える VRAM に収まる」カード全部に効く (task 932)。以前は 10 GiB の tier
+//!   判定で下限を切っていたため 8-9 GiB が崖の側 (2,867 MiB) に落ちていた。
 //! - 段の判定は**公称 VRAM の実測ずれ** ([`VRAM_TIER_SLACK_MB`]) を含める
 //!   (task 886)。12 GB の RTX 4070 は 12,282 MiB、16 GB の RTX 4080 は
 //!   16,376 MiB を報告するので、公称値の `>=` で切ると 12 GB が 10 GB 扱いに
@@ -110,6 +118,7 @@ pub const RAM_TIER_MIN_RAM_MB: u64 = 32 * 1024;
 /// ワーキングセットを割ると崖、超えたぶんは expert を減らすだけの損。
 /// 5,632 は崖の上側 (5,600 実測) に 32 MiB の余裕を足した値。両モデルで
 /// dense 側のテンソルは同じ (違うのは expert の量子型だけ) なので共通の値。
+/// task 932: この床は 8-16 GiB の全段に効く (以前は 10 GiB 未満が漏れていた)。
 pub const DENSE_WORKING_SET_MB: u64 = 5_632;
 
 /// 小さいカードで prefill の同時 pread を絞る閾値 (MiB)。
@@ -222,14 +231,23 @@ pub fn plan_gpu_config(
     // 小さいカードでも dense が 0 にならないように 256 MiB の床を置く。
     weight = weight.max(256.min(usable));
 
-    // task 886: 10-16 GB のカードでは 40% の dense 枠がワーキングセットを
-    // 下回り、dense の LRU が毎層で入れ替わって attention が CPU に落ちる
-    // (lab t886a: 12 GB 相当で 355.8 ms/tok)。ワーキングセットまで引き上げる。
+    // task 886: dense のワーキングセットを割ると dense の LRU が毎層で入れ替わり、
+    // attention が CPU に落ちて decode が桁で遅くなる (lab t886a: 12 GB 相当で
+    // 355.8 ms/tok)。task 932: この床は「40% の式がワーキングセットを下回り、
+    // かつ ワーキングセット + expert の下限が使える VRAM に収まる」カード全部に
+    // 要る。以前は SMALL_VRAM_MB (10 GiB) の tier 判定で下限を切っていたため、
+    // 8-9 GiB 級が 2,867 MiB = 崖の側に落ちていた (監査で発見)。
     // expert に最低 1 GiB は残す (dense だけで VRAM を使い切らない)。
-    let small_card =
-        tier_at_least(vram_mb, SMALL_VRAM_MB) && vram_mb <= MID_VRAM_MB + VRAM_TIER_SLACK_MB;
-    if small_card {
-        weight = weight.max(DENSE_WORKING_SET_MB.min(usable.saturating_sub(MIN_EXPERT_MB)));
+    let tight_budget = vram_mb <= MID_VRAM_MB + VRAM_TIER_SLACK_MB
+        && usable >= DENSE_WORKING_SET_MB + MIN_EXPERT_MB;
+    if tight_budget {
+        let mut floor = DENSE_WORKING_SET_MB.min(usable.saturating_sub(MIN_EXPERT_MB));
+        // モデルの dense がワーキングセットより小さいなら、そこまでしか要らない
+        // (小さいモデルで「要らないのに 5,632 MiB」とログに書かない)。
+        if dense_est_mb > 0 {
+            floor = floor.min(dense_est_mb);
+        }
+        weight = weight.max(floor);
     }
 
     // expert: 割合の上限と絶対上限の小さい方。expert 総量がそれ未満なら
@@ -239,10 +257,10 @@ pub fn plan_gpu_config(
     if expert_total_mb > 0 {
         expert = expert.min(expert_total_mb);
     }
-    // task 886: 小さいカードは dense + expert を「使える VRAM」に収める。
-    // 大きいカードは従来どおり上限だけ (和が総量を超えるのは既定の流儀で、
-    // 実効はカードの空きで丸められる)。
-    if small_card {
+    // task 886 / 932: 小さいカード (MID + slack 以下) は dense + expert を
+    // 「使える VRAM」に収める。大きいカードは従来どおり上限だけ (和が総量を
+    // 超えるのは既定の流儀で、実効はカードの空きで丸められる)。
+    if tight_budget {
         expert = expert.min(usable.saturating_sub(weight));
     }
     // 使える VRAM の 12% か 1 GiB を expert に回せないカードでは expert を切る
@@ -635,18 +653,18 @@ mod tests {
             assert_eq!(c.pread_threads, None);
             assert_eq!(c.pf_chunk, None);
         }
-        // 8 / 24 GB は式のとおり、10 / 16 GB は dense のワーキングセット床と
-        // 和の整合で変わる (task 886)。どれも手動ピークより小さい。
+        // 8 / 24 GB は式のとおり、8 / 10 / 16 GB は dense のワーキングセット床と
+        // 和の整合で変わる (task 886 / 932)。どれも手動ピークより小さい。
         for gb in [8u64, 10, 16, 24] {
             let c = plan_gpu_config(gb * 1024, 64 * GB, 111_000_000_000, ModelQuant::Q4);
             let usable = gb * 1024 - PLAN_RESERVE_MB;
-            if !(10..=16).contains(&gb) {
+            if !(8..=16).contains(&gb) {
                 assert_eq!(c.expert_vram_mb, usable * EXPERT_PCT / 100, "{gb}");
             } else {
                 assert_eq!(c.expert_vram_mb, usable - c.gpu_weight_mb, "{gb}");
                 assert!(c.gpu_weight_mb >= DENSE_WORKING_SET_MB, "{gb}");
             }
-            if !(10..=16).contains(&gb) {
+            if !(8..=16).contains(&gb) {
                 assert_eq!(c.gpu_weight_mb, usable * WEIGHT_PCT / 100, "{gb}");
             }
             // 32 GB より小さい (単調)
@@ -682,15 +700,16 @@ mod tests {
         assert_eq!(z.gpu_weight_mb, 0);
     }
 
-    /// task 886: 8 / 12 / 16 / 24 / 32 GB の段ごとの計画値を**表で**縛る
+    /// task 886 / 932: 8 / 12 / 16 / 24 / 32 GB の段ごとの計画値を**表で**縛る
     /// (式を書き換えたらここで落ちる)。10 GB は 12 GB の下限側の境界として残す。
     #[test]
     fn plan_tier_table_matches_expected_values() {
         // (公称 GB, weight MiB, expert MiB, min_hit, pread, chunk, ram_tier)
         let table: [(u64, u64, u64, Option<f32>, Option<usize>, Option<usize>, bool); 6] = [
-            // 10-16 GB は dense のワーキングセット 5,632 MiB が床 (task 886):
-            // 式の 40% のままだと 12 GB で 4,505 MiB → 崖 (lab t886a)。
-            (8, 2_867, 5_160, None, Some(8), Some(1024), true),
+            // 8-16 GB は dense のワーキングセット 5,632 MiB が床 (task 886): 式の
+            // 40% のままだと 12 GB で 4,505 MiB → 崖 (lab t886a)。8 GB も同じ床
+            // (task 932 の監査で 2,867 MiB に落ちていたのを修正)。
+            (8, 5_632, 1_536, None, Some(8), Some(1024), true),
             (10, 5_632, 3_584, None, Some(8), Some(1024), true),
             (12, 5_632, 5_632, Some(0.0), Some(12), Some(1536), true),
             (16, 6_144, 9_216, Some(0.0), Some(12), Some(1536), true),
@@ -963,5 +982,304 @@ mod tests {
         assert!(line.contains("applied=DENNO_GPU_WEIGHT_MB"));
         assert!(line.contains("kept(explicit env)=DENNO_EXPERT_VRAM_MB"));
         assert!(!line.contains('\n'), "1 行であること");
+    }
+
+    // ---- task 932: 8-48 GiB x 16-128 GiB RAM の監査 -------------------------
+
+    /// 監査で見つけた回帰: 8-9 GiB 級のカードが dense のワーキングセット床
+    /// (5,632 MiB) に載っていなかった (2,867 MiB = 崖の側, lab t886a の
+    /// 355.8 ms/tok)。8-16 GiB は dense + expert が使える VRAM に一致する。
+    #[test]
+    fn plan_8_to_9_gib_gets_the_dense_working_set_floor() {
+        for vram in [8 * GB, 8 * GB + 256, 9 * GB, 9 * GB + 512, 9728, 9984] {
+            let c = plan_gpu_config(vram, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+            let usable = vram - PLAN_RESERVE_MB;
+            assert_eq!(
+                c.gpu_weight_mb, DENSE_WORKING_SET_MB,
+                "{vram} MiB: dense がワーキングセット未満"
+            );
+            assert_eq!(
+                c.expert_vram_mb,
+                usable - DENSE_WORKING_SET_MB,
+                "{vram} MiB: 和が使える VRAM に一致しない"
+            );
+            assert!(c.experts_on_gpu(), "{vram} MiB: expert を切った");
+            // 8-9 GiB はまだ 12 GiB 未満なので P45 ゲートは既定のまま。
+            assert_eq!(c.expert_gpu_min_hit, None, "{vram} MiB");
+        }
+        // 9 GiB の expert は 8 GiB より広い (監査前は 10 GiB で 5,160 -> 3,584 と
+        // VRAM 増加で減っていた = 非単調)。
+        let e8 = plan_gpu_config(8 * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4).expert_vram_mb;
+        let e9 = plan_gpu_config(9 * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4).expert_vram_mb;
+        let e10 = plan_gpu_config(10 * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4).expert_vram_mb;
+        assert!(e8 < e9 && e9 < e10, "expert が段で増えない: {e8} {e9} {e10}");
+    }
+
+    /// 8-48 GiB を 64 MiB 刻みで回し、dense / expert / 和の単調性と
+    /// 「0 に潰さない・式の係数 (40+72=112%) を超えない」を縛る。
+    #[test]
+    fn plan_sweep_8_to_48_gib_is_monotone_and_bounded() {
+        for q in [ModelQuant::Q3, ModelQuant::Q4] {
+            let mut prev: Option<(u64, u64, u64)> = None;
+            let mut vram = 8 * GB;
+            while vram <= 48 * GB {
+                let c = plan_gpu_config(vram, 64 * GB, 111_000_000_000, q);
+                let usable = vram - PLAN_RESERVE_MB;
+                let sum = c.gpu_weight_mb + c.expert_vram_mb;
+                // 単項は「0 に潰さない」「使える VRAM と絶対上限の範囲」。
+                assert!(c.gpu_weight_mb >= 256, "{vram} MiB {q:?}: dense が床未満");
+                assert!(
+                    c.gpu_weight_mb <= WEIGHT_CAP_MB.min(usable),
+                    "{vram} MiB {q:?}: weight={}",
+                    c.gpu_weight_mb
+                );
+                assert!(
+                    c.expert_vram_mb >= MIN_EXPERT_MB,
+                    "{vram} MiB {q:?}: expert={} が下限未満",
+                    c.expert_vram_mb
+                );
+                assert!(
+                    c.expert_vram_mb <= EXPERT_CAP_MB.min(usable),
+                    "{vram} MiB {q:?}: expert={}",
+                    c.expert_vram_mb
+                );
+                // 実在しない dense は要求しない (小さいモデルで床が暴走しない)。
+                assert!(
+                    c.gpu_weight_mb <= c.dense_est_mb,
+                    "{vram} MiB {q:?}: weight={} > dense_est={}",
+                    c.gpu_weight_mb,
+                    c.dense_est_mb
+                );
+                // 和の上限は式の係数まで (丸めの暴走検出)。以前のテストは 120%
+                // だったが、40+72=112% が本当の上限。
+                assert!(
+                    sum <= usable * 112 / 100,
+                    "{vram} MiB {q:?}: {sum} > {usable}*1.12"
+                );
+                // 16 GiB 以下は dense + expert が使える VRAM に一致する
+                // (= 計画が予約より多くを要求しない)。
+                if vram <= MID_VRAM_MB + VRAM_TIER_SLACK_MB {
+                    assert_eq!(sum, usable, "{vram} MiB {q:?}: 和が使える VRAM と違う");
+                }
+                // フラグは公称の段 (slack 込み) で決まる。
+                assert_eq!(
+                    c.expert_gpu_min_hit,
+                    if tier_at_least(vram, MIN_HIT_ZERO_FROM_MB) {
+                        Some(0.0)
+                    } else {
+                        None
+                    },
+                    "{vram} MiB {q:?}: min_hit"
+                );
+                assert_eq!(
+                    c.expert_ram.is_some(),
+                    vram <= RAM_TIER_MAX_VRAM_MB + VRAM_TIER_SLACK_MB,
+                    "{vram} MiB {q:?}: ram_tier"
+                );
+                let (want_pread, want_chunk) = if vram <= SMALL_VRAM_MB + VRAM_TIER_SLACK_MB {
+                    (Some(8), Some(1024))
+                } else if vram <= MID_VRAM_MB + VRAM_TIER_SLACK_MB {
+                    (Some(12), Some(1536))
+                } else {
+                    (None, None)
+                };
+                assert_eq!((c.pread_threads, c.pf_chunk), (want_pread, want_chunk), "{vram} MiB {q:?}: prefill");
+                // 入力のエコー
+                assert_eq!(c.vram_mb, vram);
+                assert_eq!(c.ram_mb, 64 * GB);
+                assert_eq!(c.quant, q);
+                assert_eq!(c.reserve_mb, PLAN_RESERVE_MB);
+                assert_eq!(c.expert_gpu, c.expert_vram_mb > 0);
+                if let Some((pw, pe, ps)) = prev {
+                    assert!(c.gpu_weight_mb >= pw, "{vram} MiB {q:?}: weight が減った");
+                    assert!(c.expert_vram_mb >= pe, "{vram} MiB {q:?}: expert が減った");
+                    assert!(sum >= ps, "{vram} MiB {q:?}: 和が減った");
+                }
+                prev = Some((c.gpu_weight_mb, c.expert_vram_mb, sum));
+                vram += 64;
+            }
+        }
+    }
+
+    /// ワーキングセット床は「モデルの dense が実在する分」までにする
+    /// (小さいモデルで要らない 5,632 MiB を要求しない)。
+    #[test]
+    fn plan_dense_floor_never_exceeds_the_model_dense_size() {
+        let c = plan_gpu_config(10 * GB, 64 * GB, 3_000_000_000, ModelQuant::Q4);
+        assert!(c.dense_est_mb < DENSE_WORKING_SET_MB, "{}", c.dense_est_mb);
+        assert_eq!(c.gpu_weight_mb, c.dense_est_mb, "dense 推定を超えて要求した");
+        // モデル全体 (dense + expert) を超えない。
+        assert!(c.gpu_weight_mb + c.expert_vram_mb <= c.model_mb);
+        // 大きいモデルでは床がそのまま効く (分岐の発火を数える)。
+        let big = plan_gpu_config(10 * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        assert_eq!(big.gpu_weight_mb, DENSE_WORKING_SET_MB);
+    }
+
+    /// 段の境界 (slack 256 MiB 込み) が 1 MiB で切り替わり、その外側で
+    /// 同じ段に残らないこと。
+    #[test]
+    fn plan_tier_boundaries_flip_one_mib_outside_slack() {
+        let m = 111_000_000_000;
+        // prefill の小段: vram <= 10 GiB + slack。
+        let inside = plan_gpu_config(SMALL_VRAM_MB + VRAM_TIER_SLACK_MB, 64 * GB, m, ModelQuant::Q4);
+        assert_eq!((inside.pread_threads, inside.pf_chunk), (Some(8), Some(1024)));
+        let outside = plan_gpu_config(SMALL_VRAM_MB + VRAM_TIER_SLACK_MB + 1, 64 * GB, m, ModelQuant::Q4);
+        assert_eq!((outside.pread_threads, outside.pf_chunk), (Some(12), Some(1536)));
+        // P45 ゲート: vram + slack >= 12 GiB。
+        let gate_off = plan_gpu_config(MIN_HIT_ZERO_FROM_MB - VRAM_TIER_SLACK_MB - 1, 64 * GB, m, ModelQuant::Q4);
+        assert_eq!(gate_off.expert_gpu_min_hit, None);
+        let gate_on = plan_gpu_config(MIN_HIT_ZERO_FROM_MB - VRAM_TIER_SLACK_MB, 64 * GB, m, ModelQuant::Q4);
+        assert_eq!(gate_on.expert_gpu_min_hit, Some(0.0));
+        // 中段の上限 + RAM tier: vram <= 16 GiB + slack。
+        let mid = plan_gpu_config(MID_VRAM_MB + VRAM_TIER_SLACK_MB, 64 * GB, m, ModelQuant::Q4);
+        assert_eq!((mid.pread_threads, mid.pf_chunk), (Some(12), Some(1536)));
+        assert_eq!(mid.expert_ram, Some("auto"));
+        let past = plan_gpu_config(MID_VRAM_MB + VRAM_TIER_SLACK_MB + 1, 64 * GB, m, ModelQuant::Q4);
+        assert_eq!((past.pread_threads, past.pf_chunk), (None, None));
+        assert_eq!(past.expert_ram, None);
+    }
+
+    /// ホスト RAM 16-128 GiB の行列: RAM tier は「16 GiB 以下のカード +
+    /// 32 GiB 以上の RAM」だけで入り、他の項は RAM に依存しない。
+    #[test]
+    fn plan_ram_matrix_16_to_128_gib_only_toggles_ram_tier() {
+        let m = 111_000_000_000;
+        for gb in [8u64, 10, 12, 16, 17, 24, 32, 48] {
+            let base = plan_gpu_config(gb * GB, 64 * GB, m, ModelQuant::Q4);
+            for ram_gb in [16u64, 24, 31, 32, 64, 128] {
+                let c = plan_gpu_config(gb * GB, ram_gb * GB, m, ModelQuant::Q4);
+                let want = gb * GB <= RAM_TIER_MAX_VRAM_MB + VRAM_TIER_SLACK_MB
+                    && ram_gb * GB >= RAM_TIER_MIN_RAM_MB;
+                assert_eq!(
+                    c.expert_ram,
+                    if want { Some("auto") } else { None },
+                    "{gb} GiB VRAM / {ram_gb} GiB RAM"
+                );
+                assert_eq!(c.ram_mb, ram_gb * GB);
+                assert_eq!(c.gpu_weight_mb, base.gpu_weight_mb, "RAM が dense を変えた");
+                assert_eq!(c.expert_vram_mb, base.expert_vram_mb, "RAM が expert を変えた");
+                assert_eq!(c.expert_gpu_min_hit, base.expert_gpu_min_hit);
+                assert_eq!(c.pread_threads, base.pread_threads);
+            }
+        }
+    }
+
+    /// 48 GiB 以上 (A6000 / RTX 6000 Ada 級) は絶対上限で頭打ち、フラグ無し。
+    #[test]
+    fn plan_48_gib_and_above_hit_the_absolute_caps() {
+        for vram in [48 * GB, 64 * GB, 80 * GB] {
+            for q in [ModelQuant::Q3, ModelQuant::Q4] {
+                let c = plan_gpu_config(vram, 64 * GB, 111_000_000_000, q);
+                assert_eq!(c.gpu_weight_mb, WEIGHT_CAP_MB, "{vram} {q:?}");
+                assert_eq!(c.expert_vram_mb, EXPERT_CAP_MB, "{vram} {q:?}");
+                assert_eq!(c.expert_gpu_min_hit, Some(0.0), "{vram} {q:?}");
+                assert_eq!(c.expert_ram, None, "{vram} {q:?}");
+                assert_eq!(c.pread_threads, None, "{vram} {q:?}");
+                assert!(c.gpu_weight_mb + c.expert_vram_mb <= vram * 112 / 100);
+            }
+        }
+    }
+
+    /// 診断 1 行: 8-48 GiB でフィールドの順序・単一性・余計な空白が変わらない。
+    #[test]
+    fn plan_line_fields_are_stable_across_tiers() {
+        let order = [
+            "dense~",
+            "weight=",
+            "expert_vram=",
+            "expert_gpu=",
+            "min_hit=",
+            "ram_tier=",
+            "pread=",
+            "chunk=",
+            "applied=",
+            "kept(explicit env)=",
+        ];
+        for gb in [8u64, 10, 12, 16, 17, 24, 32, 48] {
+            let c = plan_gpu_config(gb * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+            let line = plan_line(&c, &["DENNO_GPU_WEIGHT_MB"], &["DENNO_EXPERT_VRAM_MB"]);
+            assert!(!line.contains('\n'), "{gb}: 複数行");
+            assert_eq!(line.trim_end(), line.as_str(), "{gb}: 末尾に空白");
+            assert!(!line.contains("  "), "{gb}: 二重空白");
+            assert!(
+                line.starts_with(&format!(
+                    "[auto-config] plan vram={} MiB ram=65536 MiB model={} MiB Q4 (dense~{})",
+                    gb * GB,
+                    c.model_mb,
+                    c.dense_est_mb
+                )),
+                "{gb}: 先頭の形が違う: {line}"
+            );
+            let mut at = 0;
+            for k in order {
+                let i = line[at..]
+                    .find(k)
+                    .unwrap_or_else(|| panic!("{gb}: {k} が順序どおりに出ない: {line}"))
+                    + at;
+                at = i + k.len();
+            }
+            // 各値は config と一致する。
+            let mh = c
+                .expert_gpu_min_hit
+                .map(|m| format!("{m}"))
+                .unwrap_or_else(|| "default(0.5)".to_string());
+            assert!(line.contains(&format!("weight={} MiB", c.gpu_weight_mb)), "{line}");
+            assert!(line.contains(&format!("expert_vram={} MiB", c.expert_vram_mb)), "{line}");
+            assert!(line.contains(&format!("min_hit={mh} ")), "{line}");
+            assert!(line.contains("applied=DENNO_GPU_WEIGHT_MB"), "{line}");
+            assert!(line.contains("kept(explicit env)=DENNO_EXPERT_VRAM_MB"), "{line}");
+        }
+    }
+
+    /// 診断 1 行: 何も適用しなかったときは接尾辞を出さない / 既定の表記。
+    #[test]
+    fn plan_line_defaults_are_explicit() {
+        let c = plan_gpu_config(8 * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        let line = plan_line(&c, &[], &[]);
+        assert!(!line.contains("applied="), "{line}");
+        assert!(!line.contains("kept"), "{line}");
+        assert!(line.contains("min_hit=default(0.5) "), "{line}");
+        assert!(line.contains("pread=8 chunk=1024"), "{line}");
+        // 32 GiB は「既定に任せる」項が default 表記になる。
+        let big = plan_gpu_config(32 * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        let bl = plan_line(&big, &[], &[]);
+        assert!(bl.contains("ram_tier=off"), "{bl}");
+        assert!(bl.contains("pread=default chunk=default"), "{bl}");
+        assert!(bl.contains("expert_gpu=on"), "{bl}");
+    }
+
+    /// `plan_env_pairs` は config と 1 対 1 で、キーの重複も欠落も無い。
+    #[test]
+    fn plan_env_pairs_mirror_the_config_across_tiers() {
+        for gb in [8u64, 10, 12, 16, 17, 24, 32, 48] {
+            let c = plan_gpu_config(gb * GB, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+            let p = plan_env_pairs(&c);
+            let get = |k: &str| {
+                p.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.clone())
+            };
+            assert_eq!(get("DENNO_VRAM_RESERVE_MB"), Some(PLAN_RESERVE_MB.to_string()));
+            assert_eq!(get("DENNO_GPU_WEIGHT_MB"), Some(c.gpu_weight_mb.to_string()));
+            assert_eq!(get("DENNO_EXPERT_VRAM_MB"), Some(c.expert_vram_mb.to_string()));
+            assert_eq!(get("DENNO_EXPERT_GPU"), c.experts_on_gpu().then(|| "1".to_string()));
+            assert_eq!(get("DENNO_EXPERT_IQ_GPU"), c.experts_on_gpu().then(|| "1".to_string()));
+            assert_eq!(
+                get("DENNO_EXPERT_GPU_MIN_HIT"),
+                c.expert_gpu_min_hit.map(|m| format!("{m}"))
+            );
+            assert_eq!(get("DENNO_EXPERT_RAM_MB"), c.expert_ram.map(str::to_string));
+            assert_eq!(
+                get("DENNO_PF_PREAD_THREADS"),
+                c.pread_threads.map(|n| n.to_string())
+            );
+            assert_eq!(get("DENNO_PF_CHUNK"), c.pf_chunk.map(|n| n.to_string()));
+            // 重複キーなし
+            let mut keys: Vec<&str> = p.iter().map(|(k, _)| *k).collect();
+            let n = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), n, "{gb}: キーが重複");
+        }
     }
 }
