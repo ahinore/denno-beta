@@ -1137,15 +1137,11 @@ pub async fn chat_completions(
                 ))
             }
             Err(_) => {
-                return Err(OaError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    format!(
-                        "timeout: no response from the engine within {:.1}s; \
-                         the request was abandoned (retry later)",
-                        wait.as_secs_f64()
-                    ),
-                ))
+                return Err(OaError::from(ApiError::gateway_timeout(format!(
+                    "timeout: no response from the engine within {:.1}s; \
+                     the request was abandoned (retry later)",
+                    wait.as_secs_f64()
+                ))))
             }
         };
         // tools 有効時だけ抽出する (none / 未指定なら本文は P793 と同一)
@@ -1716,15 +1712,11 @@ pub async fn completions(
             ))
         }
         Err(_) => {
-            return Err(OaError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                format!(
-                    "timeout: no response from the engine within {:.1}s; \
-                     the request was abandoned (retry later)",
-                    wait.as_secs_f64()
-                ),
-            ))
+            return Err(OaError::from(ApiError::gateway_timeout(format!(
+                "timeout: no response from the engine within {:.1}s; \
+                 the request was abandoned (retry later)",
+                wait.as_secs_f64()
+            ))))
         }
     };
     let mut text = String::new();

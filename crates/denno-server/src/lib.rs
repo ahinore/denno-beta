@@ -204,6 +204,18 @@ impl ApiError {
     fn api(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message)
     }
+    /// task 1076: 408 Request Timeout — クライアントがリクエスト (ボディ) を
+    /// 期限内に送り切らなかった。サーバー側の生成は始まっていない。
+    /// `error.type` は Anthropic の文書にある `api_error` を使い、ステータスで
+    /// 区別する (OpenAI へは `server_error` に寄る。既存の変換規則のまま)。
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::REQUEST_TIMEOUT, "api_error", message)
+    }
+    /// task 1076: 504 Gateway Timeout — エンジン (上流) が期限内に応答を
+    /// 返さなかった。`error.type` の扱いは [`ApiError::request_timeout`] と同じ。
+    pub fn gateway_timeout(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GATEWAY_TIMEOUT, "api_error", message)
+    }
     /// s146 (B8-3 / P4-9): admit 失敗 (KV スロット枯渇など) の分類済みエラー。
     ///
     /// ステータスの選択 (ルート・他のエラー経路は不変):
@@ -279,6 +291,101 @@ pub fn error_from_anyhow(e: anyhow::Error) -> ApiError {
 /// サーバー挙動には影響しない (読み取りのみ)。
 pub fn debug_api_error(e: ApiError) -> (u16, &'static str, String) {
     (e.status.as_u16(), e.kind, e.message)
+}
+
+// ---------- task 1076: 共通ミドルウェアのエラー封筒 (プロトコル別) ----------
+//
+// レート制限 (429) とリクエスト期限 (408 / 504) はハンドラより外側の層で
+// 発生するため、`ApiError` (Anthropic 形式) を通らない。ルートを見て
+// そのプロトコル固有の封筒で返すのがここの役目。
+//
+//   Anthropic … {"type":"error","error":{"type","message"}}
+//   OpenAI    … {"error":{"message","type","param":null,"code":<code|null>}}
+//   Ollama    … {"error":"<message>"}
+
+/// task 1076: エラー封筒のプロトコル。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Anthropic,
+    OpenAi,
+    Ollama,
+}
+
+/// task 1076: パスからプロトコルを決める (`/api/*` = Ollama、
+/// `/v1/messages*` = Anthropic、それ以外の `/v1/*` = OpenAI)。
+pub fn protocol_for_path(path: &str) -> Protocol {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    if p == "/api" || p.starts_with("/api/") {
+        Protocol::Ollama
+    } else if p == "/v1/messages" || p.starts_with("/v1/messages/") {
+        Protocol::Anthropic
+    } else {
+        Protocol::OpenAi
+    }
+}
+
+/// task 1076: プロトコル別のエラー本文。`code` は OpenAI の `error.code` に載り、
+/// Anthropic / Ollama には載らない (None なら OpenAI でも null)。
+///
+/// ただし Anthropic で `code` が Some のとき (= レート制限 429) は、既存の
+/// `/v1/messages` 429 契約 (`ratelimit_931` / `ratelimit_edge_1139` が `code` と
+/// `param` を読む) を保つため、その 2 キーだけ `error` に残す。
+pub fn protocol_error_body(
+    proto: Protocol,
+    kind: &str,
+    message: &str,
+    code: Option<&str>,
+) -> serde_json::Value {
+    match proto {
+        Protocol::Anthropic => {
+            let mut err = json!({ "type": kind, "message": message });
+            if let Some(c) = code {
+                err["code"] = json!(c);
+                err["param"] = json!(null);
+            }
+            json!({ "type": "error", "error": err })
+        }
+        Protocol::OpenAi => json!({
+            "error": {
+                "message": message,
+                "type": kind,
+                "param": null,
+                "code": code.map(|c| json!(c)).unwrap_or(serde_json::Value::Null),
+            }
+        }),
+        Protocol::Ollama => json!({ "error": message }),
+    }
+}
+
+/// task 1076: プロトコル別封筒の HTTP 応答。`retry_after` 秒があれば
+/// `Retry-After` ヘッダを付ける。
+///
+/// `kind` は Anthropic の `error.type` を渡す。OpenAI では既存の変換規則
+/// ([`openai::`] の `From<ApiError>`) と同じく `api_error` / `overloaded_error`
+/// → `server_error`、`not_found_error` → `invalid_request_error` に寄せる。
+pub fn protocol_error_response(
+    proto: Protocol,
+    status: StatusCode,
+    kind: &str,
+    message: &str,
+    code: Option<&str>,
+    retry_after: Option<u64>,
+) -> Response {
+    let kind = match (proto, kind) {
+        (Protocol::OpenAi, "api_error") => "server_error",
+        (Protocol::OpenAi, "overloaded_error") => "server_error",
+        (Protocol::OpenAi, "not_found_error") => "invalid_request_error",
+        _ => kind,
+    };
+    let body = protocol_error_body(proto, kind, message, code);
+    let mut resp = (status, Json(body)).into_response();
+    if let Some(secs) = retry_after {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    resp
 }
 
 // ---------- リクエストDTO ----------
@@ -1158,9 +1265,59 @@ pub fn router_with_body_limit(
     limiter: ratelimit::RateLimiter,
     max_body_bytes: usize,
 ) -> Router {
+    router_with_request_timeouts(
+        state,
+        cors,
+        limiter,
+        max_body_bytes,
+        RequestTimeouts::disabled(),
+    )
+}
+
+/// task 1076: リクエスト期限 (ボディ読み込み / ハンドラ実行) の設定。
+///
+/// どちらも `None` = 無効 = 従来と完全に同一の挙動。有効にしたときの応答は
+/// プロトコル別の封筒 ([`protocol_error_response`]) で返す:
+///
+/// - [`RequestTimeouts::read_body`] 超過 → **408 Request Timeout**
+///   (クライアントがボディを送り切らなかった)
+/// - [`RequestTimeouts::handler`] 超過 → **504 Gateway Timeout**
+///   (エンジン (上流) が期限内に応答しなかった)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestTimeouts {
+    /// ボディ読み込みの上限。
+    pub read_body: Option<std::time::Duration>,
+    /// ハンドラ (ルート) 実行の上限。
+    pub handler: Option<std::time::Duration>,
+}
+
+impl RequestTimeouts {
+    /// 両方とも無効 (既定)。
+    pub const fn disabled() -> Self {
+        Self { read_body: None, handler: None }
+    }
+
+    /// どちらかが有効か。
+    pub fn is_enabled(&self) -> bool {
+        self.read_body.is_some() || self.handler.is_some()
+    }
+}
+
+/// task 1076: リクエスト期限を明示してルーターを組む。
+///
+/// 期限の層はボディ上限 (`DefaultBodyLimit` / `body_limit_middleware`) と
+/// レート制限より内側 (ルート寄り) に置く。したがって 413 / 429 は従来どおり
+/// 先に返り、期限の対象になるのは「受け付けたリクエストの読み込みと実行」だけ。
+pub fn router_with_request_timeouts(
+    state: Arc<AppState>,
+    cors: CorsConfig,
+    limiter: ratelimit::RateLimiter,
+    max_body_bytes: usize,
+    timeouts: RequestTimeouts,
+) -> Router {
     let cors = Arc::new(cors);
     let limiter = Arc::new(limiter);
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         // P877: Prometheus のスクレイプ先 (認証は /health と同じく不要)。
         .route("/metrics", get(metrics_endpoint))
@@ -1198,7 +1355,22 @@ pub fn router_with_body_limit(
         // OpenAI 形式の JSON 封筒で返す。`.layer()` より前に置くことで、
         // 下の log_requests / CORS の層がこの 2 つにも掛かる。
         .fallback(route_not_found)
-        .method_not_allowed_fallback(method_not_allowed)
+        .method_not_allowed_fallback(method_not_allowed);
+
+    // task 1076: リクエスト期限。層はルートに最も近い位置 (最初の `.layer()`)。
+    // 後から足す `.layer()` ほど外側なので、ハンドラ期限 → ボディ期限の順に
+    // 足す (ボディ期限がいちばん外 = 408 がボディ読み込みだけを見る)。
+    if let Some(limit) = timeouts.handler {
+        router = router.layer(axum::middleware::from_fn(move |req, next| async move {
+            handler_timeout_middleware(req, next, limit).await
+        }));
+    }
+    if let Some(limit) = timeouts.read_body {
+        router = router.layer(axum::middleware::from_fn(move |req, next| async move {
+            body_read_timeout_middleware(req, next, limit, max_body_bytes).await
+        }));
+    }
+    router
         // task 946: ボディ上限。`DefaultBodyLimit` は抽出器 (Bytes / Json) に
         // 効き、413 はすぐ外側の `body_limit_middleware` が JSON 封筒へ包む。
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
@@ -1220,6 +1392,69 @@ pub fn router_with_body_limit(
         // ヘッダ衛生 (nosniff / cache-control / x-accel-buffering / charset) を付ける。
         .layer(axum::middleware::from_fn(header_hygiene))
         .with_state(state)
+}
+
+/// task 1076: ボディ読み込みの期限。超過は 408 Request Timeout。
+///
+/// 上限 ([`resolve_max_body_bytes`]) を超えたボディはここで 413 に落とす
+/// (抽出器の 413 と同じ封筒なので、有効時も外部契約は変わらない)。
+async fn body_read_timeout_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+    limit: std::time::Duration,
+    max_body_bytes: usize,
+) -> Response {
+    let proto = protocol_for_path(req.uri().path());
+    let (parts, body) = req.into_parts();
+    let collected = match tokio::time::timeout(limit, axum::body::to_bytes(body, max_body_bytes))
+        .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        // ボディが上限超過 (chunked で Content-Length が無い場合)。
+        Ok(Err(_)) => return payload_too_large_response(max_body_bytes),
+        Err(_) => {
+            return protocol_error_response(
+                proto,
+                StatusCode::REQUEST_TIMEOUT,
+                "api_error",
+                &format!(
+                    "request timeout: the request body was not received within {:.1}s",
+                    limit.as_secs_f64()
+                ),
+                None,
+                None,
+            )
+        }
+    };
+    let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(collected));
+    next.run(req).await
+}
+
+/// task 1076: ハンドラ実行の期限。超過は 504 Gateway Timeout。
+///
+/// 期限を過ぎたらハンドラの future を落とす。ワーカーから見るとクライアント
+/// 切断と同じ扱いになり、次のステップ境界で KV スロットが解放される。
+async fn handler_timeout_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+    limit: std::time::Duration,
+) -> Response {
+    let proto = protocol_for_path(req.uri().path());
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => protocol_error_response(
+            proto,
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            &format!(
+                "gateway timeout: no response from the engine within {:.1}s; \
+                 the request was abandoned (retry later)",
+                limit.as_secs_f64()
+            ),
+            None,
+            None,
+        ),
+    }
 }
 
 // ---------- task 916: CORS ----------
@@ -1610,7 +1845,21 @@ async fn rate_limit_middleware(
         if let ratelimit::Decision::Deny { retry_after_secs } = limiter.check(req.uri().path()) {
             // task 1011: `/metrics` の拒否カウンタ (Relaxed の原子加算 1 回)。
             metrics::record_rate_limit_rejection();
-            return ratelimit::too_many_requests_response(retry_after_secs);
+            // task 1076: 429 もルートのプロトコルに合わせた封筒で返す
+            // (Anthropic は `type: error` の外枠、Ollama は `{"error": "..."}`)。
+            let secs = retry_after_secs.max(1);
+            let message = format!(
+                "Rate limit exceeded: retry after {secs}s (see {})",
+                ratelimit::RATE_LIMIT_RPM_ENV
+            );
+            return protocol_error_response(
+                protocol_for_path(req.uri().path()),
+                StatusCode::TOO_MANY_REQUESTS,
+                ratelimit::RATE_LIMIT_ERROR_TYPE,
+                &message,
+                Some(ratelimit::RATE_LIMIT_ERROR_CODE),
+                Some(secs),
+            );
         }
     }
     next.run(req).await
@@ -2519,7 +2768,9 @@ async fn messages_inner(
                 return Err(ApiError::api(format!("scheduler dropped: {e}")))
             }
             Err(_) => {
-                return Err(ApiError::api(format!(
+                // task 1076: 応答が返らないのは上流 (エンジン) の期限超過なので
+                // 500 ではなく 504 Gateway Timeout。
+                return Err(ApiError::gateway_timeout(format!(
                     "timeout: no response from the engine within {:.1}s; \
                      the request was abandoned (retry later)",
                     wait.as_secs_f64()
