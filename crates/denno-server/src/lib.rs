@@ -1400,13 +1400,74 @@ fn set_cors_header(
     }
 }
 
+/// task 1051: OpenAI 互換のパスのうち、denno が実装していないもの。
+///
+/// クライアント (OpenAI SDK / LangChain / 各種ゲートウェイ) は起動時に
+/// `/v1/embeddings` や `/v1/responses` を probe することがある。未知ルートの
+/// 404 (`unknown_route`) だと「URL を間違えた」と解釈されるので、ここに載せた
+/// パスだけは **501 Not Implemented** の封筒で「経路は正しいが実装が無い」と
+/// 明示する。2 番目の要素はクライアント向けの説明 (代替の経路を含む)。
+///
+/// ルータには `.route(...)` を足さない (fallback で受ける)。理由は
+/// `tests/openapi_contract.rs` の `every_router_route_is_documented` が
+/// `router()` の `.route("...")` 行と `docs/openapi.yaml` の engine operation を
+/// 1:1 で突き合わせており、仕様に無い経路を `.route` すると必ず落ちるため。
+/// 実装を足すときは、仕様 (`docs/openapi.yaml`) と一緒に `.route` を登録して
+/// ここから外す。
+pub const UNIMPLEMENTED_OPENAI_PATHS: &[(&str, &str)] = &[
+    (
+        "/v1/embeddings",
+        "denno serves a generative chat model only and has no embedding model loaded. \
+         Use POST /v1/chat/completions or POST /v1/completions instead.",
+    ),
+    (
+        "/v1/responses",
+        "denno does not implement the OpenAI Responses API. \
+         Use POST /v1/chat/completions (or POST /v1/messages for the Anthropic protocol) instead.",
+    ),
+];
+
+/// task 1051: 末尾スラッシュだけを落とした比較用のキー。
+///
+/// `/v1/embeddings/` のような 1 個だけの末尾スラッシュも同じ経路として扱う
+/// (`/v1/embeddings//` や中間スラッシュは別物なのでそのまま 404)。
+fn unimplemented_key(path: &str) -> &str {
+    match path.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => path,
+    }
+}
+
+/// task 1051: 実装していない OpenAI 互換パスなら説明文を返す。
+pub fn unimplemented_openai_hint(path: &str) -> Option<&'static str> {
+    let key = unimplemented_key(path);
+    UNIMPLEMENTED_OPENAI_PATHS
+        .iter()
+        .find(|(p, _)| *p == key)
+        .map(|(_, hint)| *hint)
+}
+
 /// task 916: 未知ルートの 404 (OpenAI 形式の JSON 封筒)。
+///
+/// task 1051: 実装していない既知の OpenAI 経路 (`/v1/embeddings` /
+/// `/v1/responses`) だけは 501 の封筒へ振り替える。メソッドは問わない
+/// (経路そのものが無いので 405 は立てられない)。
 async fn route_not_found(req: axum::extract::Request) -> Response {
     let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    if let Some(hint) = unimplemented_openai_hint(&path) {
+        return openai_error_envelope(
+            StatusCode::NOT_IMPLEMENTED,
+            "api_error",
+            "not_implemented",
+            None::<&str>,
+            format!("{method} {path} is not implemented: {hint}"),
+        );
+    }
     openai_error_response(
         StatusCode::NOT_FOUND,
         "unknown_route",
-        format!("Unknown route: {} {}", req.method(), path),
+        format!("Unknown route: {} {}", method, path),
     )
 }
 
@@ -1423,11 +1484,26 @@ async fn method_not_allowed(req: axum::extract::Request) -> Response {
 /// OpenAI 互換のエラー封筒
 /// `{"error":{"message","type","param","code"}}` を組み立てる。
 fn openai_error_response(status: StatusCode, code: &str, message: String) -> Response {
+    openai_error_envelope(status, "invalid_request_error", code, None::<&str>, message)
+}
+
+/// task 1051: `type` と `param` まで指定できる封筒。
+///
+/// 既存の [`openai_error_response`] は `type = "invalid_request_error"` /
+/// `param = null` 固定なので、そのまま委譲する (既存テストの本文形を変えない)。
+/// `param` は `None` のとき JSON の `null` を出す (キー自体は常に存在させる)。
+fn openai_error_envelope<P: AsRef<str>>(
+    status: StatusCode,
+    error_type: &str,
+    code: &str,
+    param: Option<P>,
+    message: String,
+) -> Response {
     let body = json!({
         "error": {
             "message": message,
-            "type": "invalid_request_error",
-            "param": null,
+            "type": error_type,
+            "param": param.map(|p| p.as_ref().to_string()),
             "code": code,
         }
     });
