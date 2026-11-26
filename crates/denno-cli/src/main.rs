@@ -172,6 +172,9 @@ enum Commands {
         /// HTTP 読み取りタイムアウト秒
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// 引数と入力ファイルだけ検証し、サーバーへは何も送らない
+        #[arg(long)]
+        dry_run: bool,
     },
     /// P801: 起動中のサーバーに対する再現可能ベンチ (llama-bench 風 pp/tg)。
     /// プロンプトはサーバーの usage.input_tokens で目標トークン数へ較正する。
@@ -943,6 +946,7 @@ fn main() -> Result<()> {
             eval_max_tokens,
             embed_snapshots,
             timeout,
+            dry_run,
         } => {
             abliterate::run(abliterate::AbliterateOptions {
                 url,
@@ -958,6 +962,7 @@ fn main() -> Result<()> {
                 eval_max_tokens,
                 embed_snapshots,
                 timeout_secs: timeout,
+                dry_run,
             })?;
         }
         Commands::Bench {

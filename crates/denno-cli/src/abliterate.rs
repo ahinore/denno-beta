@@ -38,6 +38,8 @@ pub struct AbliterateOptions {
     pub eval_max_tokens: usize,
     pub embed_snapshots: bool,
     pub timeout_secs: u64,
+    /// サーバーへ何も送らず、検証結果と作る body だけを出す。
+    pub dry_run: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +61,106 @@ pub fn check_capture_mode(s: &str) -> Result<()> {
         "all" | "last_prompt_token" => Ok(()),
         other => bail!("未知の capture_mode {other:?} (all / last_prompt_token)"),
     }
+}
+
+/// `tag` の検証。
+///
+/// `tag` はそのままスナップショット名 `<tag>_pos` になり、`<tag>_pos.dns` の
+/// ファイル名と `GET /v1/steer/export?name=...` のクエリ値 (URL エンコード
+/// なし) に載る。記号を通すとクエリが壊れるか別ディレクトリへ書けてしまう
+/// ので、英数字と `_ - .` だけを受ける。
+pub fn check_tag(tag: &str) -> Result<()> {
+    if tag.is_empty() {
+        bail!("tag が空 (`_pos` / `_neg` という名前になる)");
+    }
+    if tag.len() > 64 {
+        bail!("tag が長すぎる ({} bytes, 上限 64)", tag.len());
+    }
+    if let Some(c) = tag
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    {
+        bail!("tag に使えない文字 {c:?} (英数字 / _ / - / . のみ): {tag:?}");
+    }
+    if tag.starts_with('.') {
+        bail!("tag を . で始めない: {tag:?}");
+    }
+    Ok(())
+}
+
+/// ベース URL の検証。`http://host[:port]` か `https://host[:port]` だけ受ける。
+pub fn check_url(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"));
+    match rest {
+        Some(r) if !r.trim_end_matches('/').is_empty() => Ok(()),
+        Some(_) => bail!("url に host が無い: {url:?}"),
+        None => bail!("url は http:// か https:// で始める: {url:?}"),
+    }
+}
+
+/// `alpha` の検証。0 は「適用なし」と同じなので設定ミスとして弾く。
+pub fn check_alpha(alpha: f32) -> Result<()> {
+    if !alpha.is_finite() {
+        bail!("alpha が有限でない: {alpha}");
+    }
+    if alpha <= 0.0 {
+        bail!("alpha は正の値 (0 は「適用なし」と同じ): {alpha}");
+    }
+    Ok(())
+}
+
+/// `denno abliterate` の引数をまとめて検証する。`run` の先頭で呼ぶ。
+pub fn validate_options(opts: &AbliterateOptions) -> Result<()> {
+    check_capture_mode(&opts.capture_mode)?;
+    check_alpha(opts.alpha)?;
+    check_tag(&opts.tag)?;
+    check_url(&opts.url)?;
+    if opts.timeout_secs == 0 {
+        bail!("timeout が 0 (1 秒以上を指定する)");
+    }
+    if opts.eval_max_tokens == 0 {
+        bail!("eval_max_tokens が 0");
+    }
+    if opts.out_dir.as_os_str().is_empty() {
+        bail!("out_dir が空");
+    }
+    Ok(())
+}
+
+/// サーバーの `recommended_range` を層数 `n` の範囲へ正規化する。
+///
+/// - 欠け / `null` / 空配列 → `Ok(None)` (呼び出し側が全層へ落とす)
+/// - 2 要素でない / 非整数 / 負値 → `Err` (黙って 0 で埋めない)
+/// - `n` を超える値は `n` に丸める。丸めた結果が空区間なら `Ok(None)`
+pub fn parse_layer_range(v: &Value, n: usize) -> Result<Option<(usize, usize)>> {
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None if v.is_null() => return Ok(None),
+        None => bail!("recommended_range が配列でない: {v}"),
+    };
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    if arr.len() != 2 {
+        bail!("recommended_range は [from, to] の 2 要素: {v}");
+    }
+    let mut out = [0usize; 2];
+    for (i, e) in arr.iter().enumerate() {
+        let x = match e.as_u64() {
+            Some(x) => x,
+            None => match e.as_f64() {
+                Some(f) if f.is_finite() && f >= 0.0 && f.fract() == 0.0 => f as u64,
+                _ => bail!("recommended_range[{i}] が非負整数でない: {e}"),
+            },
+        };
+        out[i] = usize::try_from(x).unwrap_or(usize::MAX).min(n);
+    }
+    if out[0] >= out[1] {
+        return Ok(None);
+    }
+    Ok(Some((out[0], out[1])))
 }
 
 /// `/v1/steer/analyze` の 1 層分。
@@ -122,29 +224,30 @@ impl Analysis {
         }
         layers.sort_by_key(|l| l.layer);
         let n = layers.len();
-        let (mut from, mut to) = match v["recommended_range"].as_array() {
-            Some(r) if r.len() == 2 => (
-                r[0].as_u64().unwrap_or(0) as usize,
-                r[1].as_u64().unwrap_or(0) as usize,
-            ),
-            _ => (0, n),
+        let (from, to) = match parse_layer_range(&v["recommended_range"], n)? {
+            Some(r) => r,
+            None => {
+                // サーバーの推奨が空/範囲外でも作業を止めない (全層に掛ける)。
+                eprintln!("[abliterate] 警告: recommended_range が空または範囲外。全層 [0, {n}) を使う");
+                (0, n)
+            }
         };
-        if from >= to {
-            // サーバーの推奨が空でも作業を止めない (全層に掛ける)。
-            eprintln!("[abliterate] 警告: recommended_range [{from}, {to}) が空。全層 [0, {n}) を使う");
-            from = 0;
-            to = n;
-        }
-        let peak_layer = v["peak_layer"]
-            .as_u64()
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                layers
-                    .iter()
-                    .max_by(|a, b| a.sep.partial_cmp(&b.sep).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|l| l.layer)
-                    .unwrap_or(0)
-            });
+        let argmax_layer = || {
+            layers
+                .iter()
+                .max_by(|a, b| a.sep.partial_cmp(&b.sep).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|l| l.layer)
+                .unwrap_or(0)
+        };
+        let peak_layer = match v["peak_layer"].as_u64().map(|x| x as usize) {
+            Some(p) if layers.iter().any(|l| l.layer == p) => p,
+            Some(p) => {
+                let m = argmax_layer();
+                eprintln!("[abliterate] 警告: peak_layer {p} が layers に無い。sep 最大の層 {m} を使う");
+                m
+            }
+            None => argmax_layer(),
+        };
         Ok(Analysis {
             pos,
             neg,
@@ -547,21 +650,78 @@ fn eval_off_on(
     Ok(())
 }
 
+/// `--dry-run`: サーバーには何も送らず、検証済みの設定と送る body を出す。
+fn print_plan(
+    opts: &AbliterateOptions,
+    pos: &[String],
+    neg: &[String],
+    eval: Option<&[String]>,
+) -> Result<()> {
+    if opts.out_dir.exists() && !opts.out_dir.is_dir() {
+        bail!("out_dir がディレクトリでない: {}", opts.out_dir.display());
+    }
+    if let Some(p) = &opts.out_recipe {
+        if p.is_dir() {
+            bail!("out_recipe がディレクトリ: {}", p.display());
+        }
+    }
+    let pos_name = format!("{}_pos", opts.tag);
+    let neg_name = format!("{}_neg", opts.tag);
+    let model = opts.model.as_deref().unwrap_or("<GET /v1/models の先頭>");
+    println!("dry-run: サーバーへは何も送らない");
+    println!("  url             = {}", opts.url);
+    println!("  model           = {model}");
+    println!("  snapshots       = {pos_name}, {neg_name}");
+    println!(
+        "  prompts         = pos {} / neg {} / eval {}",
+        pos.len(),
+        neg.len(),
+        eval.map(|e| e.len()).unwrap_or(0)
+    );
+    println!("  capture_mode    = {}", opts.capture_mode);
+    println!("  alpha           = {}", opts.alpha);
+    println!("  layers          = analyze の recommended_range (空なら全層)");
+    println!("  out_dir         = {}", opts.out_dir.display());
+    println!(
+        "  out_recipe      = {}",
+        opts.out_recipe
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("  eval_max_tokens = {}", opts.eval_max_tokens);
+    println!("  timeout         = {}s", opts.timeout_secs);
+    println!(
+        "record body (pos) = {}",
+        record_body(&pos_name, &opts.capture_mode)
+    );
+    println!(
+        "record body (neg) = {}",
+        record_body(&neg_name, &opts.capture_mode)
+    );
+    println!(
+        "apply  = terms {pos_name} +1.0 / {neg_name} -1.0, mode=subtract, alpha={}",
+        opts.alpha
+    );
+    println!(
+        "recipe = {}-recipe (embed_snapshots={})",
+        opts.tag, opts.embed_snapshots
+    );
+    Ok(())
+}
+
 /// `denno abliterate` の本体。
 pub fn run(opts: AbliterateOptions) -> Result<()> {
-    check_capture_mode(&opts.capture_mode)?;
-    if !opts.alpha.is_finite() {
-        bail!("alpha が有限でない: {}", opts.alpha);
-    }
-    if opts.eval_max_tokens == 0 {
-        bail!("eval_max_tokens が 0");
-    }
+    validate_options(&opts)?;
     let pos_prompts = read_prompts(&opts.pos_file)?;
     let neg_prompts = read_prompts(&opts.neg_file)?;
     let eval_prompts = match &opts.eval_file {
         Some(p) => Some(read_prompts(p)?),
         None => None,
     };
+    if opts.dry_run {
+        return print_plan(&opts, &pos_prompts, &neg_prompts, eval_prompts.as_deref());
+    }
 
     let pos_name = format!("{}_pos", opts.tag);
     let neg_name = format!("{}_neg", opts.tag);
@@ -788,5 +948,162 @@ mod tests {
         assert_eq!(head("a\nb", 10), "a b");
         assert_eq!(head("abcdef", 3), "abc...");
         assert_eq!(head("abc", 3), "abc");
+    }
+
+    // -----------------------------------------------------------------
+    // task 1031: 引数検証と層範囲のパース
+    // -----------------------------------------------------------------
+
+    fn opts() -> AbliterateOptions {
+        AbliterateOptions {
+            url: "http://127.0.0.1:8098".into(),
+            pos_file: PathBuf::from("pos.txt"),
+            neg_file: PathBuf::from("neg.txt"),
+            eval_file: None,
+            capture_mode: "all".into(),
+            alpha: 1.0,
+            out_dir: ".".into(),
+            out_recipe: None,
+            tag: "ablit".into(),
+            model: None,
+            eval_max_tokens: 32,
+            embed_snapshots: false,
+            timeout_secs: 600,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn tag_accepts_plain_names_and_rejects_url_or_path_hostile_ones() {
+        for ok in ["ablit", "t865", "a_b-c.d", "A1"] {
+            assert!(check_tag(ok).is_ok(), "{ok}");
+        }
+        for (bad, needle) in [
+            ("", "空"),
+            (".hidden", "."),
+            ("a b", "使えない文字"),
+            ("a/b", "使えない文字"),
+            ("a&b=1", "使えない文字"),
+            ("a?b", "使えない文字"),
+            ("a\u{65e5}b", "使えない文字"),
+        ] {
+            let e = check_tag(bad).unwrap_err().to_string();
+            assert!(e.contains(needle), "{bad:?}: {e}");
+        }
+        let long = "a".repeat(65);
+        assert!(check_tag(&long).unwrap_err().to_string().contains("長すぎる"));
+        assert!(check_tag(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn url_requires_http_scheme_and_host() {
+        for ok in ["http://127.0.0.1:8098", "https://example", "http://h/"] {
+            assert!(check_url(ok).is_ok(), "{ok}");
+        }
+        for bad in ["127.0.0.1:8098", "http://", "https:///", "ftp://h", ""] {
+            assert!(check_url(bad).is_err(), "{bad}");
+        }
+        assert!(check_url("http://")
+            .unwrap_err()
+            .to_string()
+            .contains("host"));
+        assert!(check_url("ftp://h")
+            .unwrap_err()
+            .to_string()
+            .contains("http://"));
+    }
+
+    #[test]
+    fn alpha_must_be_positive_and_finite() {
+        assert!(check_alpha(1.0).is_ok());
+        assert!(check_alpha(0.25).is_ok());
+        assert!(check_alpha(0.0).unwrap_err().to_string().contains("正の値"));
+        assert!(check_alpha(-1.0).unwrap_err().to_string().contains("正の値"));
+        assert!(check_alpha(f32::NAN)
+            .unwrap_err()
+            .to_string()
+            .contains("有限"));
+        assert!(check_alpha(f32::INFINITY)
+            .unwrap_err()
+            .to_string()
+            .contains("有限"));
+    }
+
+    #[test]
+    fn validate_options_covers_every_scalar() {
+        assert!(validate_options(&opts()).is_ok());
+
+        let mut o = opts();
+        o.capture_mode = "last".into();
+        assert!(validate_options(&o).unwrap_err().to_string().contains("capture_mode"));
+
+        let mut o = opts();
+        o.timeout_secs = 0;
+        assert!(validate_options(&o).unwrap_err().to_string().contains("timeout"));
+
+        let mut o = opts();
+        o.eval_max_tokens = 0;
+        assert!(validate_options(&o)
+            .unwrap_err()
+            .to_string()
+            .contains("eval_max_tokens"));
+
+        let mut o = opts();
+        o.out_dir = PathBuf::new();
+        assert!(validate_options(&o).unwrap_err().to_string().contains("out_dir"));
+
+        let mut o = opts();
+        o.tag = "a b".into();
+        assert!(validate_options(&o).unwrap_err().to_string().contains("tag"));
+
+        let mut o = opts();
+        o.url = "localhost:8098".into();
+        assert!(validate_options(&o).unwrap_err().to_string().contains("url"));
+    }
+
+    #[test]
+    fn layer_range_is_normalized_and_clamped_to_the_layer_count() {
+        let n = 5;
+        assert_eq!(parse_layer_range(&json!([1, 3]), n).unwrap(), Some((1, 3)));
+        assert_eq!(parse_layer_range(&json!([0, 5]), n).unwrap(), Some((0, 5)));
+        // 整数値の浮動小数は受ける
+        assert_eq!(parse_layer_range(&json!([1.0, 3.0]), n).unwrap(), Some((1, 3)));
+        // はみ出しは n に丸める
+        assert_eq!(parse_layer_range(&json!([2, 99]), n).unwrap(), Some((2, 5)));
+        // 丸めた結果が空 / 元から空 / 逆順
+        assert_eq!(parse_layer_range(&json!([7, 99]), n).unwrap(), None);
+        assert_eq!(parse_layer_range(&json!([2, 2]), n).unwrap(), None);
+        assert_eq!(parse_layer_range(&json!([3, 1]), n).unwrap(), None);
+        // 欠け・null・空配列は「指定なし」
+        assert_eq!(parse_layer_range(&Value::Null, n).unwrap(), None);
+        assert_eq!(parse_layer_range(&json!([]), n).unwrap(), None);
+        // 黙って 0 にしない
+        for bad in [json!(["1", 3]), json!([1.5, 3]), json!([-1, 3]), json!([1]), json!([1, 2, 3]), json!({"from": 1})] {
+            assert!(parse_layer_range(&bad, n).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn analysis_clamps_out_of_range_recommendation() {
+        let mut v = analysis_json();
+        v["recommended_range"] = json!([3, 40]);
+        let a = Analysis::from_json(&v).unwrap();
+        assert_eq!(a.range, (3, 5));
+    }
+
+    #[test]
+    fn analysis_rejects_non_integer_recommendation() {
+        let mut v = analysis_json();
+        v["recommended_range"] = json!([1.5, 3]);
+        let e = Analysis::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("recommended_range"), "{e}");
+    }
+
+    #[test]
+    fn analysis_drops_peak_layer_not_in_layers() {
+        let mut v = analysis_json();
+        v["peak_layer"] = json!(99);
+        let a = Analysis::from_json(&v).unwrap();
+        assert_eq!(a.peak_layer, 2, "sep 最大の層に落ちる");
     }
 }
