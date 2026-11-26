@@ -311,6 +311,50 @@ paths:
           $ref: '#/components/responses/OpenAIRateLimited'
         '500':
           $ref: '#/components/responses/OpenAIServerError'
+  /v1/cache/stats:
+    get:
+      tags: [ops]
+      summary: KV prefix cache statistics
+      operationId: cacheStats
+      x-denno-impl: engine
+      description: |
+        Counters of the multi-entry KV prefix cache plus the KV slot occupancy.
+        `slots_capacity` is the LRU budget in **tokens**, not an entry count:
+        once the summed KV size of the retained entries exceeds it the oldest
+        entries are evicted. `hits` / `misses` count completed requests that
+        did / did not reuse a prefix and `hit_rate` is `hits / (hits + misses)`
+        (0 when no request has completed yet). `kv_slots` / `kv_slots_busy` are
+        the scheduler's KV slots and how many are running a request — a
+        different pool from the prefix entries.
+      responses:
+        '200':
+          description: Current cache counters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheStats'
+        '401':
+          $ref: '#/components/responses/AnthropicUnauthorized'
+  /v1/cache:
+    delete:
+      tags: [ops]
+      summary: Flush the KV prefix cache
+      operationId: cacheFlush
+      x-denno-impl: engine
+      description: |
+        Drops every retained prefix entry (conversation snapshot). In-flight
+        requests keep their per-slot KV and are not interrupted, so their
+        output is unchanged; the next request pays a full prefill. `flushed`
+        is the number of entries that were dropped.
+      responses:
+        '200':
+          description: Entries dropped and the state after the flush
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheFlushResult'
+        '401':
+          $ref: '#/components/responses/AnthropicUnauthorized'
   /api/tags:
     get:
       tags: [ollama]
@@ -411,6 +455,58 @@ paths:
           $ref: '#/components/responses/OllamaNotFound'
         '503':
           $ref: '#/components/responses/OllamaOverloaded'
+  /api/show:
+    post:
+      tags: [ollama]
+      summary: Ollama show model
+      operationId: ollamaShow
+      x-denno-impl: engine
+      description: |
+        Model metadata read from the immutable engine info captured at startup;
+        weights are not touched, so this works while a generation is running.
+        `model` (or the alias `name`) is required: an empty or omitted value is
+        a 400, an unknown model name is a 404. `parameters` and `template` are
+        always empty because denno exposes neither per-model parameter
+        overrides nor the chat template (both are fixed in the engine).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OllamaShowRequest'
+      responses:
+        '200':
+          description: Model metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OllamaShow'
+        '400':
+          $ref: '#/components/responses/OllamaBadRequest'
+        '401':
+          $ref: '#/components/responses/OllamaUnauthorized'
+        '404':
+          $ref: '#/components/responses/OllamaNotFound'
+  /api/ps:
+    get:
+      tags: [ollama]
+      summary: Ollama running models
+      operationId: ollamaPs
+      x-denno-impl: engine
+      description: |
+        Always the single model loaded at startup: denno keeps it for the life
+        of the process and never unloads it. `expires_at` is 100 years out to
+        express that; `size` / `size_vram` are 0 because the engine does not
+        expose weight bytes (a made-up number would be worse than 0).
+      responses:
+        '200':
+          description: Running models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OllamaPs'
+        '401':
+          $ref: '#/components/responses/OllamaUnauthorized'
   /v1/telemetry/ws:
     get:
       tags: [ops]
@@ -1285,6 +1381,59 @@ components:
             additionalProperties: true
         usage:
           $ref: '#/components/schemas/OpenAIUsage'
+    CacheStats:
+      type: object
+      required:
+        - slots_used
+        - slots_capacity
+        - hits
+        - misses
+        - hit_rate
+        - total_reused_tokens
+        - kv_slots
+        - kv_slots_busy
+      properties:
+        slots_used:
+          type: integer
+          description: Retained prefix entries (conversation snapshots)
+        slots_capacity:
+          type: integer
+          description: LRU budget in tokens, not an entry count
+        hits:
+          type: integer
+          description: Completed requests that reused a prefix
+        misses:
+          type: integer
+          description: Completed requests that did not reuse a prefix
+        hit_rate:
+          type: number
+          format: double
+          description: '`hits / (hits + misses)`; 0 when no request has completed'
+        total_reused_tokens:
+          type: integer
+          description: Cumulative reused prompt tokens
+        kv_slots:
+          type: integer
+          description: Scheduler KV slots (separate from prefix entries)
+        kv_slots_busy:
+          type: integer
+          description: KV slots currently running a request
+    CacheFlushResult:
+      type: object
+      required:
+        - flushed
+        - slots_used
+        - slots_capacity
+      properties:
+        flushed:
+          type: integer
+          description: Prefix entries dropped by this call
+        slots_used:
+          type: integer
+          description: Retained prefix entries after the flush
+        slots_capacity:
+          type: integer
+          description: LRU budget in tokens (unchanged by the flush)
     OllamaTags:
       type: object
       required: [models]
@@ -1322,6 +1471,107 @@ components:
                     type: string
                   quantization_level:
                     type: string
+    OllamaShowRequest:
+      type: object
+      description: |
+        `model` is the canonical name; `name` is accepted as the Ollama alias.
+        At least one of them must be non-empty.
+      properties:
+        model:
+          type: string
+        name:
+          type: string
+    OllamaShow:
+      type: object
+      required:
+        - modelfile
+        - parameters
+        - template
+        - details
+        - model_info
+        - capabilities
+        - modified_at
+      properties:
+        modelfile:
+          type: string
+          description: Generated text, not a file on disk
+        parameters:
+          type: string
+          description: Always empty (denno has no per-model parameters)
+        template:
+          type: string
+          description: Always empty (the chat template is fixed in the engine)
+        details:
+          type: object
+          properties:
+            parent_model:
+              type: string
+            format:
+              type: string
+            family:
+              type: string
+            families:
+              type: array
+              items:
+                type: string
+            parameter_size:
+              type: string
+            quantization_level:
+              type: string
+        model_info:
+          type: object
+          description: Architecture, context length, block count, KV slots, quantization
+          additionalProperties: true
+        capabilities:
+          type: array
+          items:
+            type: string
+        modified_at:
+          type: string
+          format: date-time
+    OllamaPs:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              model:
+                type: string
+              size:
+                type: integer
+                description: Always 0 (weight bytes are not exposed)
+              size_vram:
+                type: integer
+                description: Always 0 (weight bytes are not exposed)
+              digest:
+                type: string
+                description: Deterministic display identifier, not a weight hash
+              details:
+                type: object
+                properties:
+                  parent_model:
+                    type: string
+                  format:
+                    type: string
+                  family:
+                    type: string
+                  families:
+                    type: array
+                    items:
+                      type: string
+                  parameter_size:
+                    type: string
+                  quantization_level:
+                    type: string
+              expires_at:
+                type: string
+                format: date-time
+                description: 100 years out; denno never unloads the model
     OllamaOptions:
       type: object
       properties:

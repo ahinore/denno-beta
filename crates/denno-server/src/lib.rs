@@ -1149,7 +1149,8 @@ pub fn router_with_body_limit(
         // `GET /v1/models/{id}`) と 1:1 なので、他のルートと同じくここで登録する。
         .route("/v1/models/:id", get(openai::model_by_id))
         // task 926: prefix cache の管理 (`/v1/cache/stats` / `DELETE /v1/cache`)。
-        // パスは定数なので、task 893 の `.route("` 行の契約テストには現れない。
+        // パスは定数 (`CACHE_STATS_PATH` / `CACHE_FLUSH_PATH`)。task 1026 から
+        // `tests/openapi_contract.rs` が定数登録も解決して仕様と突き合わせる。
         .merge(cache_admin_router())
         .route("/v1/messages", post(messages))
         // P805: Anthropic 互換のトークン数見積り (prefill しない)
@@ -1164,9 +1165,8 @@ pub fn router_with_body_limit(
         .route("/api/chat", post(ollama::chat))
         .route("/api/generate", post(ollama::generate))
         // task 996: `/api/show` (POST) と `/api/ps` (GET) は ollama.rs の
-        // サブルータ側で登録する。`docs/openapi.yaml` は今回のスコープ外で、
-        // `tests/openapi_contract.rs` は lib.rs の `.route("` 行だけを拾うため、
-        // ここに直接書くと契約テストが赤になる。
+        // サブルータ側で登録する。task 1026 で `docs/openapi.yaml` にも載せ、
+        // `tests/openapi_contract.rs` は ollama.rs の `.route("` 行も読む。
         .merge(ollama::admin_router())
         // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
         // Anthropic 互換 API とは別系統で、互換性には影響しない。
@@ -1669,9 +1669,9 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Response {
 
 /// `GET /v1/cache/stats` のパス。
 ///
-/// `.route("...")` を直書きしないのは、task 893 の契約テストが lib.rs の
-/// `.route("` 行を `docs/openapi.yaml` と突き合わせるため。仕様書はこのタスクの
-/// scope 外なので、サブルーター登録にして route 行を増やさない。
+/// `.route("...")` を直書きせず定数で渡しているのは、パスを 1 か所にまとめる
+/// ため。task 1026 から `tests/openapi_contract.rs` の逆方向検査もこの定数を
+/// 解決するので、`docs/openapi.yaml` との対応はテストで守られる。
 const CACHE_STATS_PATH: &str = "/v1/cache/stats";
 /// `DELETE /v1/cache` のパス。
 const CACHE_FLUSH_PATH: &str = "/v1/cache";

@@ -38,6 +38,9 @@ const SPEC: &str = include_str!("../../../docs/openapi.yaml");
 const FLASH_SRC: &str = include_str!("../../denno-cli/src/serve_flash.rs");
 /// denno-server のルータ定義（逆方向の突き合わせ用）。
 const ROUTER_SRC: &str = include_str!("../src/lib.rs");
+/// task 1026: `router()` が `.merge` するサブルータ。`/api/show` と `/api/ps` は
+/// `lib.rs` ではなくここに `.route(...)` を書いている。
+const OLLAMA_SRC: &str = include_str!("../src/ollama.rs");
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Op {
@@ -130,14 +133,65 @@ fn normalize_params(path: &str) -> String {
 ///
 /// axum 0.7 のパスパラメータは `:id` だが、仕様書 (OpenAPI) は `{id}` と
 /// 書くので、ここで正規化して比較できるようにする (task 961)。
+///
+/// task 1026: `router()` は 2 つのサブルータを `.merge` する。`lib.rs` の
+/// `.route(...)` 行だけを見ると `cache_admin_router()` の 2 本と
+/// `ollama::admin_router()` の 2 本が無言で漏れるので、次の 3 つを読む:
+///
+/// 1. `lib.rs` の `.route("...")` 行 (従来どおり)
+/// 2. `lib.rs` の `.route(CONST, ...)` 行 — 定数は `const NAME: &str = "...";`
+///    から解決する (cache の 2 本)
+/// 3. `ollama.rs` の `.route(...)` 行 (show / ps)
+///
+/// `.merge` の一覧はここに固定する。知らないサブルータが増えたら panic して
+/// 仕様の追随漏れを落とす。
 fn parse_router_source() -> Vec<Op> {
-    let mut out = Vec::new();
+    let consts = parse_str_consts(ROUTER_SRC);
+    let mut out = parse_route_lines(ROUTER_SRC, &consts);
     for line in ROUTER_SRC.lines() {
         let t = line.trim();
-        let Some(rest) = t.strip_prefix(".route(\"") else { continue };
-        let Some(end) = rest.find('"') else { continue };
-        let path = normalize_params(&rest[..end]);
-        let tail = &rest[end + 1..];
+        let Some(rest) = t.strip_prefix(".merge(") else { continue };
+        assert!(
+            rest.starts_with("cache_admin_router()") || rest.starts_with("ollama::admin_router()"),
+            "未知のサブルータ: {t} (tests/openapi_contract.rs の parse_router_source に追加する)"
+        );
+    }
+    out.extend(parse_route_lines(OLLAMA_SRC, &[]));
+    assert!(!out.is_empty(), "router() の .route(...) を 1 つも読めない");
+    out
+}
+
+/// `const NAME: &str = "VALUE";` を (NAME, VALUE) で返す (1 行 1 定数のみ)。
+fn parse_str_consts(src: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("const ") else { continue };
+        let Some((name, tail)) = rest.split_once(": &str = \"") else { continue };
+        let Some(end) = tail.find('"') else { continue };
+        out.push((name.trim().to_string(), tail[..end].to_string()));
+    }
+    out
+}
+
+fn parse_route_lines(src: &str, consts: &[(String, String)]) -> Vec<Op> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix(".route(") else { continue };
+        let (raw_path, tail) = if let Some(after_quote) = rest.strip_prefix('"') {
+            let Some(end) = after_quote.find('"') else { continue };
+            (after_quote[..end].to_string(), &after_quote[end + 1..])
+        } else {
+            // `.route(CACHE_STATS_PATH, ...)`: 定数を解決する。
+            let Some(comma) = rest.find(',') else { continue };
+            let name = rest[..comma].trim();
+            let Some((_, value)) = consts.iter().find(|(n, _)| n == name) else {
+                panic!("パス定数 {name} の定義が見つからない");
+            };
+            (value.clone(), &rest[comma..])
+        };
+        let path = normalize_params(&raw_path);
         let method = if tail.contains("get(") {
             "GET"
         } else if tail.contains("post(") {
@@ -151,7 +205,6 @@ fn parse_router_source() -> Vec<Op> {
         };
         out.push(Op::new(method, path.as_str()));
     }
-    assert!(!out.is_empty(), "router() の .route(...) を 1 つも読めない");
     out
 }
 
@@ -193,6 +246,7 @@ struct Probe {
 
 fn probes() -> Vec<Probe> {
     let valid_msg = r#"{"model":"denno-test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#;
+    let show_body = r#"{"model":"denno-test"}"#;
     vec![
         // 運用 (認証不要)
         Probe { op: Op::new("GET", "/health"), uri: "/health", body: None, status: 200, content_type: "application/json" },
@@ -214,6 +268,13 @@ fn probes() -> Vec<Probe> {
         Probe { op: Op::new("GET", "/api/version"), uri: "/api/version", body: None, status: 200, content_type: "application/json" },
         Probe { op: Op::new("POST", "/api/chat"), uri: "/api/chat", body: Some(""), status: 400, content_type: "application/json" },
         Probe { op: Op::new("POST", "/api/generate"), uri: "/api/generate", body: Some(""), status: 400, content_type: "application/json" },
+        // task 1026: prefix cache 管理 (`cache_admin_router` のサブルータ) と
+        // Ollama 照会系 (`ollama::admin_router` のサブルータ)。どれも認証は
+        // 他の /v1 と同じで、テストの AppState は api_key 無しなので 200。
+        Probe { op: Op::new("GET", "/v1/cache/stats"), uri: "/v1/cache/stats", body: None, status: 200, content_type: "application/json" },
+        Probe { op: Op::new("DELETE", "/v1/cache"), uri: "/v1/cache", body: None, status: 200, content_type: "application/json" },
+        Probe { op: Op::new("POST", "/api/show"), uri: "/api/show", body: Some(show_body), status: 200, content_type: "application/json" },
+        Probe { op: Op::new("GET", "/api/ps"), uri: "/api/ps", body: None, status: 200, content_type: "application/json" },
         // アップグレードヘッダ無しの WS は 400。
         Probe { op: Op::new("GET", "/v1/telemetry/ws"), uri: "/v1/telemetry/ws", body: None, status: 400, content_type: "text/plain" },
     ]
@@ -332,6 +393,29 @@ async fn every_documented_engine_route_answers_as_specified() {
     }
 }
 
+/// task 1026: サブルータ側の `.route(...)` をテストが見落としていないこと。
+///
+/// `every_router_route_is_documented` は「拾えた集合の一致」しか見ないので、
+/// パーサがサブルータを無言で読めなくなると、仕様からも同時に消さない限り
+/// 気づけない。ここで 4 本が確実に拾えていることを固定する。
+#[test]
+fn merged_subrouter_routes_are_parsed() {
+    let routed = parse_router_source();
+    for op in [
+        Op::new("GET", "/v1/cache/stats"),   // cache_admin_router + 定数解決
+        Op::new("DELETE", "/v1/cache"),      // 同上
+        Op::new("POST", "/api/show"),        // ollama::admin_router
+        Op::new("GET", "/api/ps"),           // 同上
+    ] {
+        assert!(
+            routed.contains(&op),
+            "サブルータの {} {} を parse_router_source が拾えていない",
+            op.method,
+            op.path
+        );
+    }
+}
+
 #[test]
 fn every_router_route_is_documented() {
     let mut routed = parse_router_source();
@@ -427,6 +511,10 @@ fn probe_table_covers_expected_engine_routes() {
         "/api/tags",
         "/api/chat",
         "/api/generate",
+        "/api/show",
+        "/api/ps",
+        "/v1/cache/stats",
+        "/v1/cache",
         "/health",
         "/ready",
         "/metrics",
