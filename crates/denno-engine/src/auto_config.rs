@@ -28,8 +28,12 @@
 //! - 32 GB (RTX 5090) では手動の定番と同じ値になること
 //!   (`expert_vram=22000` / `gpu_weight=12000` / `min_hit=0`) をテストで縛る。
 //!   これが「auto が手動ピークと 1% 以内」の前提になる。
-//! - 8 / 10 / 16 / 24 / 32 GB × Q3 / Q4 の全組み合わせで
+//! - 8 / 10 / 12 / 16 / 24 / 32 GB × Q3 / Q4 の全組み合わせで
 //!   「VRAM を使い切らず、かつ 0 に潰さない」ことをテストで縛る。
+//! - 段の判定は**公称 VRAM の実測ずれ** ([`VRAM_TIER_SLACK_MB`]) を含める
+//!   (task 886)。12 GB の RTX 4070 は 12,282 MiB、16 GB の RTX 4080 は
+//!   16,376 MiB を報告するので、公称値の `>=` で切ると 12 GB が 10 GB 扱いに
+//!   なって P45 ゲートが 0.5 のまま残る (thrash floor)。
 
 /// `DENNO_AUTO_CONFIG`: auto 計画を有効にする env。`1` / `true` / `on` /
 /// `auto` が真。`--vram-budget auto` と同じ意味 (CLI が優先)。
@@ -70,6 +74,21 @@ pub const MIN_EXPERT_MB: u64 = 1024;
 /// `DENNO_EXPERT_GPU_MIN_HIT=0` を入れる下限 (MiB)。これ未満は P45 ゲートの
 /// 既定 (0.5) を残す = ヒット率が低いカードで VRAM を往復させない。
 pub const MIN_HIT_ZERO_FROM_MB: u64 = 12 * 1024;
+
+/// 公称 VRAM と実測のずれの許容 (MiB)。task 886。
+///
+/// 12 GB 級は公称 12,288 MiB でも実測は少し小さい (RTX 4070 = 12,282、
+/// 16 GB の RTX 4080 = 16,376、5070 Ti = 16,303)。閾値を公称値の `>=` で
+/// 切ると 4070 は 12 GB 未満と判定され、P45 ゲートが既定 0.5 のまま残って
+/// **CPU/GPU を往復する thrash floor** に落ちる (task 794a の 2 割の揺れと
+/// 同じ機構)。段の判定は「公称 - 256 MiB 以上」= 実測が公称より 256 MiB
+/// 小さくても同じ段として扱う。
+pub const VRAM_TIER_SLACK_MB: u64 = 256;
+
+/// `vram_mb` が公称 `nominal_mb` の段以上か ([`VRAM_TIER_SLACK_MB`] 込み)。
+pub fn tier_at_least(vram_mb: u64, nominal_mb: u64) -> bool {
+    vram_mb.saturating_add(VRAM_TIER_SLACK_MB) >= nominal_mb
+}
 
 /// ホスト RAM tier (`DENNO_EXPERT_RAM_MB=auto`) を入れる VRAM の上限 (MiB)。
 ///
@@ -205,15 +224,18 @@ pub fn plan_gpu_config(
     }
 
     let expert_gpu = expert > 0;
-    let expert_gpu_min_hit = if expert > 0 && vram_mb >= MIN_HIT_ZERO_FROM_MB {
+    let expert_gpu_min_hit = if expert > 0 && tier_at_least(vram_mb, MIN_HIT_ZERO_FROM_MB) {
         // P45 のヒット率ゲートは 0.5 だと CPU/GPU を往復する (lab t794a の
         // 2 割の揺れ)。手動ピークも 0 を明示している。
+        // task 886: 12 GB 級の実測 (12,282 MiB) も 12 GB として扱う。
         Some(0.0)
     } else {
         None
     };
 
-    let expert_ram = if vram_mb <= RAM_TIER_MAX_VRAM_MB && ram_mb >= RAM_TIER_MIN_RAM_MB {
+    let expert_ram = if vram_mb <= RAM_TIER_MAX_VRAM_MB + VRAM_TIER_SLACK_MB
+        && ram_mb >= RAM_TIER_MIN_RAM_MB
+    {
         Some("auto")
     } else {
         None
@@ -221,10 +243,11 @@ pub fn plan_gpu_config(
 
     // prefill の資源: VRAM が小さいカードは expert が CPU/ディスクへ落ちるので、
     // 同時 pread を絞って 1 グループの待ちを短くする (大きいカードは既定 =
-    // P814 の memadapt に任せる)。
-    let (pread_threads, pf_chunk) = if vram_mb <= SMALL_VRAM_MB {
+    // P814 の memadapt に任せる)。段は**上限**側の境界なので、公称より少し
+    // 小さい実測 (12,282 / 16,376) を同じ段に残す向きに slack を足す。
+    let (pread_threads, pf_chunk) = if vram_mb <= SMALL_VRAM_MB + VRAM_TIER_SLACK_MB {
         (Some(8), Some(1024))
-    } else if vram_mb <= MID_VRAM_MB {
+    } else if vram_mb <= MID_VRAM_MB + VRAM_TIER_SLACK_MB {
         (Some(12), Some(1536))
     } else {
         (None, None)
@@ -390,6 +413,27 @@ pub fn auto_requested(cli: Option<&str>, env: Option<&str>) -> bool {
     }
 }
 
+/// `DENNO_VRAM_TOTAL_MB`: 計画に使う総 VRAM を MiB で上書きする env。task 886。
+///
+/// 存在理由は 2 つ。
+/// - `--vram-budget <MiB>` と同じ用途を env でも渡せるようにする (lab の
+///   COND は `DENNO_*` しか渡せないので、10 / 12 / 16 GB の段を実カード無しで
+///   検証するには env 側の入口が要る)。
+/// - 段の検証 (CI・ユニット) で実 GPU を要求しない。
+///
+/// 優先順位は `--vram-budget` の数値 > この env > 実カードの検出。
+/// `auto` / 空 / 0 は「上書きしない」。
+pub const VRAM_TOTAL_ENV: &str = "DENNO_VRAM_TOTAL_MB";
+
+/// [`VRAM_TOTAL_ENV`] の解釈 (純関数)。`auto` / 空 / 0 / 非数は `None`。
+pub fn vram_total_override(raw: Option<&str>) -> Option<u64> {
+    let t = raw?.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    t.parse::<u64>().ok().filter(|&n| n > 0)
+}
+
 /// `/proc/meminfo` の `MemTotal` を MiB で返す純関数 (テスト用に本文を受ける)。
 pub fn parse_meminfo_total_mb(text: &str) -> Option<u64> {
     for line in text.lines() {
@@ -483,13 +527,13 @@ mod tests {
 
     const GB: u64 = 1024;
 
-    /// 8 / 10 / 16 / 24 / 32 GB x Q3 / Q4 の全 10 通り。
+    /// 8 / 10 / 12 / 16 / 24 / 32 GB x Q3 / Q4 の全 12 通り。
     fn cases() -> Vec<(u64, u64, u64, ModelQuant)> {
         // 110 GB 級 (UD-Q4_K_XL) と 84 GB 級 (UD-IQ3_XXS) のファイル長。
         let q4_bytes = 111u64 * 1000 * 1000 * 1000;
         let q3_bytes = 84u64 * 1000 * 1000 * 1000;
         let mut v = Vec::new();
-        for gb in [8u64, 10, 16, 24, 32] {
+        for gb in [8u64, 10, 12, 16, 24, 32] {
             v.push((gb * 1024, 64 * GB, q3_bytes, ModelQuant::Q3));
             v.push((gb * 1024, 64 * GB, q4_bytes, ModelQuant::Q4));
         }
@@ -600,6 +644,96 @@ mod tests {
         let z = plan_gpu_config(0, 0, 0, ModelQuant::Q3);
         assert_eq!(z.expert_vram_mb, 0);
         assert_eq!(z.gpu_weight_mb, 0);
+    }
+
+    /// task 886: 8 / 12 / 16 / 24 / 32 GB の段ごとの計画値を**表で**縛る
+    /// (式を書き換えたらここで落ちる)。10 GB は 12 GB の下限側の境界として残す。
+    #[test]
+    fn plan_tier_table_matches_expected_values() {
+        // (公称 GB, weight MiB, expert MiB, min_hit, pread, chunk, ram_tier)
+        let table: [(u64, u64, u64, Option<f32>, Option<usize>, Option<usize>, bool); 6] = [
+            (8, 2_867, 5_160, None, Some(8), Some(1024), true),
+            (10, 3_686, 6_635, None, Some(8), Some(1024), true),
+            (12, 4_505, 8_110, Some(0.0), Some(12), Some(1536), true),
+            (16, 6_144, 11_059, Some(0.0), Some(12), Some(1536), true),
+            (24, 9_420, 16_957, Some(0.0), None, None, false),
+            (32, 12_000, 22_000, Some(0.0), None, None, false),
+        ];
+        for (gb, weight, expert, min_hit, pread, chunk, ram_tier) in table {
+            for q in [ModelQuant::Q3, ModelQuant::Q4] {
+                let c = plan_gpu_config(gb * 1024, 64 * GB, 111_000_000_000, q);
+                assert_eq!(c.gpu_weight_mb, weight, "{gb} GB {q:?} weight");
+                assert_eq!(c.expert_vram_mb, expert, "{gb} GB {q:?} expert");
+                assert_eq!(c.expert_gpu_min_hit, min_hit, "{gb} GB {q:?} min_hit");
+                assert_eq!(c.pread_threads, pread, "{gb} GB {q:?} pread");
+                assert_eq!(c.pf_chunk, chunk, "{gb} GB {q:?} chunk");
+                assert_eq!(
+                    c.expert_ram.is_some(),
+                    ram_tier,
+                    "{gb} GB {q:?} ram_tier"
+                );
+                // 予算の和は「使える VRAM の 120%」以内 (丸めの暴走を検出。
+                // 40% + 72% = 112% なので 12/16 GB でもこの範囲)
+                let usable = gb * 1024 - PLAN_RESERVE_MB;
+                assert!(
+                    c.gpu_weight_mb + c.expert_vram_mb <= usable * 120 / 100,
+                    "{gb} GB {q:?}: {} + {} > {usable}*1.20",
+                    c.gpu_weight_mb,
+                    c.expert_vram_mb
+                );
+            }
+        }
+    }
+
+    /// task 886: 実カードの実測 VRAM (公称より少し小さい) が公称の段に入る。
+    /// ここが 12 GB の thrash floor (P45 ゲート 0.5 のまま) の回帰点。
+    #[test]
+    fn plan_real_card_sizes_land_in_nominal_tier() {
+        // 実測値の例: RTX 4070 12,282 / 4080 16,376 / 5070 Ti 16,303 / 4090 24,564。
+        let c12 = plan_gpu_config(12_282, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        assert_eq!(c12.expert_gpu_min_hit, Some(0.0), "12,282 MiB が 12 GB 扱いでない");
+        assert_eq!(c12.pread_threads, Some(12));
+        assert_eq!(c12.expert_ram, Some("auto"));
+        // 10 GB の 3080 (10,240) は 12 GB 扱いしない (ゲートは既定のまま)
+        let c10 = plan_gpu_config(10_240, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        assert_eq!(c10.expert_gpu_min_hit, None);
+        // 16 GB 級は 12 GB と同じ pread / RAM tier、24 GB 級は触らない
+        for v in [16_303u64, 16_376] {
+            let c = plan_gpu_config(v, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+            assert_eq!(c.expert_gpu_min_hit, Some(0.0), "{v}");
+            assert_eq!(c.pread_threads, Some(12), "{v}");
+            assert_eq!(c.expert_ram, Some("auto"), "{v}");
+        }
+        let c24 = plan_gpu_config(24_564, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        assert_eq!(c24.expert_gpu_min_hit, Some(0.0));
+        assert_eq!(c24.pread_threads, None, "24 GB は P814 に任せる");
+        assert_eq!(c24.expert_ram, None);
+        // slack は 256 MiB。境界の内と外を 1 MiB で確かめる
+        assert!(tier_at_least(12 * 1024 - VRAM_TIER_SLACK_MB, 12 * 1024));
+        assert!(!tier_at_least(12 * 1024 - VRAM_TIER_SLACK_MB - 1, 12 * 1024));
+    }
+
+    /// task 886: `DENNO_VRAM_TOTAL_MB` の解釈 (lab の COND は env しか渡せない)。
+    #[test]
+    fn vram_total_override_parses() {
+        assert_eq!(vram_total_override(Some("12288")), Some(12_288));
+        assert_eq!(vram_total_override(Some(" 16000 ")), Some(16_000));
+        assert_eq!(vram_total_override(Some("auto")), None);
+        assert_eq!(vram_total_override(Some("AUTO")), None);
+        assert_eq!(vram_total_override(Some("")), None);
+        assert_eq!(vram_total_override(Some("0")), None);
+        assert_eq!(vram_total_override(Some("x")), None);
+        assert_eq!(vram_total_override(None), None);
+        // 上書きした総量で組んだ計画が、同じ総量の実カードと同じ値になる
+        let sim = plan_gpu_config(
+            vram_total_override(Some("12288")).unwrap(),
+            64 * GB,
+            111_000_000_000,
+            ModelQuant::Q4,
+        );
+        let real = plan_gpu_config(12_288, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        assert_eq!(sim, real);
+        assert_eq!(sim.expert_vram_mb, 8_110);
     }
 
     #[test]
