@@ -5481,8 +5481,9 @@ impl Qwen4Exp {
         let iv = IvView::of(&iv_cfg);
         // task 218: 残差の平均の記録 / ステアリング。適用の設定も step の先頭で
         // 1 回だけ読む (層ループの中では Arc を参照するだけ)。
-        let steer_state = steer::snapshot();
-        let steer_apply = steer_state.apply.as_ref();
+        // task 957: 未設定ならロックを取らない (`apply_on` の原子的読み 1 回だけ)。
+        let steer_state = steer::active();
+        let steer_apply = steer_state.as_ref().and_then(|s| s.apply.as_ref());
         let steer_rec = steer::rec_on();
         // P78: 逐次 prefill の中だけ層の外を区間計測する (decode では false)。
         let prof = prekprof::measuring();
@@ -5540,9 +5541,12 @@ impl Qwen4Exp {
             // decode は (0, 1) なので常に真、逐次 prefill は末尾の 1 トークンだけ。
             // P58 の RoleAct も同じ規則。
             // task 218: ステアリングは層の入口 (層 `il-1` の出口と同じ点) に掛け、
-            // 記録は層の出口で取る。
+            // 記録は層の出口で取る。task 957: `covers` を先に見て、範囲外の層では
+            // `apply_one` を呼ばない (規則の走査もしない)。
             if let Some(a) = steer_apply {
-                a.apply_one(il, &mut res.data);
+                if a.covers(il) {
+                    a.apply_one(il, &mut res.data);
+                }
             }
             self.run_layer(
                 il,

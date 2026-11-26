@@ -5023,8 +5023,9 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 218: 記録 / ステアリングもデバイスで閉じられるか**層を進める前に**見る。
         // steer の PTX が無い・確保できないときは常駐連鎖を諦め、呼び出し側が
         // ホスト経路で記録 / 適用する (値は同じ、速度だけ落ちる)。
-        let steer_state = steer::snapshot();
-        let steer_apply = steer_state.apply.as_ref();
+        // task 957: 未設定ならロックを取らない (`apply_on` の原子的読み 1 回だけ)。
+        let steer_state = steer::active();
+        let steer_apply = steer_state.as_ref().and_then(|s| s.apply.as_ref());
         let steer_rec = steer::rec_on();
         // task 849: 重ね掛け (rules) は 1 本の合成ベクトルに畳めない (規則ごとに
         // 層範囲 / alpha / mode が違う)。GPU の常駐経路は使わずホスト経路へ落とす
@@ -5792,8 +5793,9 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             Self::pf_note_decline("残差の退避域を確保できない");
             return Ok(None);
         }
-        let steer_state = steer::snapshot();
-        let steer_apply = steer_state.apply.as_ref();
+        // task 957: 未設定ならロックを取らない (`apply_on` の原子的読み 1 回だけ)。
+        let steer_state = steer::active();
+        let steer_apply = steer_state.as_ref().and_then(|s| s.apply.as_ref());
         let steer_rec = steer::rec_on();
         // task 849: 重ね掛け (rules) は 1 本の合成ベクトルに畳めない (規則ごとに
         // 層範囲 / alpha / mode が違う)。GPU の常駐経路は使わずホスト経路へ落とす
@@ -6738,8 +6740,9 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         let iv_cfg = intervene::snapshot();
         let iv = IvView::of(&iv_cfg);
         // task 218: 残差の平均の記録 / ステアリング (ホスト経路)。
-        let steer_state = steer::snapshot();
-        let steer_apply = steer_state.apply.as_ref();
+        // task 957: 未設定ならロックを取らない (`apply_on` の原子的読み 1 回だけ)。
+        let steer_state = steer::active();
+        let steer_apply = steer_state.as_ref().and_then(|s| s.apply.as_ref());
         let steer_rec = steer::rec_on();
         // task 154: hc mix / combine のデバイス常駐 (`DENNO_PF_RESIDENT`)。
         // 観測フック付き (`on_layer`) と全位置 logits (`collect_all`) は
@@ -6837,9 +6840,12 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
 
                 // task 218: ステアリングは層の入口 (層 `il-1` の出口と同じ点)。
+                // task 957: 範囲外の層ではトークンぶんの `apply_one` を呼ばない。
                 if let Some(a) = steer_apply {
-                    for t in 0..nt {
-                        a.apply_one(il, &mut ress[t].data);
+                    if a.covers(il) {
+                        for t in 0..nt {
+                            a.apply_one(il, &mut ress[t].data);
+                        }
                     }
                 }
 

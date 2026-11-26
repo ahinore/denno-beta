@@ -614,3 +614,146 @@ fn shape_and_mode_helpers() {
     }
     assert_eq!(CaptureMode::parse("bogus"), None);
 }
+
+// ---------------------------------------------------------------------------
+// task 957: フックの配線 (無効時の素通り / 有効時の発火) と、
+// 重ね掛け project の正規直交合成 (env ゲート)
+// ---------------------------------------------------------------------------
+
+/// 適用が無い既定経路では `active()` がロックを取らずに `None` を返し、
+/// 層ループの分岐が 1 個だけで終わる。設定したら同じ入口が開き、外したら閉じる。
+#[test]
+fn dispatch_gate_closes_when_no_apply_is_installed() {
+    let _g = setup("dispatch-gate");
+    install("a", |il, s, d| 0.2 * (il as f32 + 1.0) + 0.5 * s as f32 + 0.1 * d as f32);
+    let h0 = data();
+    let run = |h: &mut Vec<f32>| {
+        // ホットパス (decode / prefill) と同じ形。
+        let state = steer::active();
+        let apply = state.as_ref().and_then(|st| st.apply.as_ref());
+        for il in 0..shape().n_layer {
+            if let Some(a) = apply {
+                a.apply_one(il, h);
+            }
+        }
+    };
+
+    assert!(!steer::apply_on(), "初期状態で適用が立っている");
+    assert!(steer::active().is_none(), "初期状態で active() が Some");
+    let mut h = h0.clone();
+    run(&mut h);
+    assert_eq!(bits(&h), bits(&h0), "無効時に残差が変わった");
+
+    steer::set_apply(vec![term("a", 1.0)], 0, shape().n_layer, 0.5, Mode::Subtract)
+        .expect("適用を設定できる");
+    assert!(steer::apply_on(), "設定後に apply_on() が偽");
+    assert!(steer::active().is_some(), "設定後に active() が None");
+    let mut h = h0.clone();
+    run(&mut h);
+    assert_ne!(bits(&h), bits(&h0), "有効時に残差が変わらない");
+
+    steer::clear_apply();
+    assert!(!steer::apply_on(), "clear 後も apply_on() が真");
+    assert!(steer::active().is_none(), "clear 後も active() が Some");
+    let mut h = h0.clone();
+    run(&mut h);
+    assert_eq!(bits(&h), bits(&h0), "clear 後に残差が変わった");
+}
+
+/// `DENNO_STEER_ORTHO` の既定は逐次合成 (task 849 と同じ 1 ビット)、
+/// `=1` では正規直交基底で掛かり、2 本の方向の成分が両方落ちて冪等になる。
+#[test]
+fn ortho_env_gate_makes_multi_project_composition_exact() {
+    let _g = setup("ortho-gate");
+    let sh = shape();
+    install("a", |il, s, d| 0.1 * (il as f32 + 1.0) + 0.7 * s as f32 + 0.3 * d as f32);
+    install("b", |il, s, d| {
+        ((il * 7 + s * 3 + d * 5) % 11) as f32 * 0.3 - 1.0
+    });
+    let specs = || {
+        vec![
+            RuleSpec {
+                terms: vec![term("a", 1.0)],
+                from: 0,
+                to: sh.n_layer,
+                alpha: 1.0,
+                mode: Mode::Project,
+            },
+            RuleSpec {
+                terms: vec![term("b", 1.0)],
+                from: 0,
+                to: sh.n_layer,
+                alpha: 1.0,
+                mode: Mode::Project,
+            },
+        ]
+    };
+    let h0 = data();
+
+    // 既定 (env 無し): vortho を作らず、規則を順に掛けた結果と 1 ビット一致。
+    std::env::remove_var("DENNO_STEER_ORTHO");
+    let seq = steer::set_rules(specs()).expect("重ね掛け").apply.clone().unwrap();
+    assert!(
+        seq.rules.iter().all(|r| r.vortho.is_empty()),
+        "既定で vortho を作った"
+    );
+    for il in 0..sh.n_layer {
+        let mut want = h0.clone();
+        for r in &seq.rules {
+            r.apply_one(il, &mut want, sh.stride(), sh.n_embd, sh.n_hc);
+        }
+        assert_eq!(bits(&single(&seq, il, &h0)), bits(&want), "層 {il} が逐次適用と違う");
+    }
+
+    // env=1: 正規直交化した方向で掛かる。
+    std::env::set_var("DENNO_STEER_ORTHO", "1");
+    let orth = steer::set_rules(specs()).expect("直交化").apply.clone().unwrap();
+    std::env::remove_var("DENNO_STEER_ORTHO");
+    assert!(
+        orth.rules.iter().all(|r| !r.vortho.is_empty()),
+        "env=1 で vortho が空 (ゲートが不発)"
+    );
+    assert_ne!(
+        bits(&single(&orth, 0, &h0)),
+        bits(&single(&seq, 0, &h0)),
+        "直交化しても値が同じ (ゲートが不発)"
+    );
+
+    for il in 0..sh.n_layer {
+        let once = single(&orth, il, &h0);
+        for st in 0..sh.n_hc {
+            let lo = st * sh.n_embd;
+            let hi = lo + sh.n_embd;
+            for (ri, r) in orth.rules.iter().enumerate() {
+                let q = &r.vortho[il * sh.stride() + lo..il * sh.stride() + hi];
+                let n: f32 = dot(q, q).sqrt();
+                assert_approx(n, 1.0, 1e-5, "正規直交基底のノルム");
+                assert_approx(
+                    dot(&once[lo..hi], q),
+                    0.0,
+                    1e-4,
+                    &format!("層 {il} ストリーム {st} 規則 {ri} の成分が残る"),
+                );
+            }
+        }
+        // 2 回目は不変 (冪等)。
+        let twice = single(&orth, il, &once);
+        for d in 0..once.len() {
+            assert_approx(twice[d], once[d], 1e-5, "直交射影が冪等でない");
+        }
+    }
+
+    // 規則の順を入れ替えても結果が変わらない。
+    std::env::set_var("DENNO_STEER_ORTHO", "1");
+    let mut rev = specs();
+    rev.reverse();
+    let sw = steer::set_rules(rev).expect("入れ替え").apply.clone().unwrap();
+    std::env::remove_var("DENNO_STEER_ORTHO");
+    for il in 0..sh.n_layer {
+        let a = single(&orth, il, &h0);
+        let b = single(&sw, il, &h0);
+        for d in 0..a.len() {
+            assert_approx(a[d], b[d], 1e-5, "規則の順で結果が変わる");
+        }
+    }
+}
