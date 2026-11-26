@@ -27,7 +27,10 @@ info:
 
     The contract test `crates/denno-server/tests/openapi_contract.rs` parses this
     file and fails if a documented path/method disagrees with the implementation.
-    Keep `x-denno-impl` accurate: it decides which implementation is checked.
+    `crates/denno-server/tests/openapi_routes_1636.rs` additionally probes every
+    registered route and checks the returned status, Content-Type and the
+    `required` fields of the referenced schemas. Keep `x-denno-impl` accurate: it
+    decides which implementation is checked.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -240,6 +243,8 @@ paths:
                     minimum: 0
         '400':
           $ref: '#/components/responses/AnthropicBadRequest'
+        '401':
+          $ref: '#/components/responses/AnthropicUnauthorized'
         '404':
           $ref: '#/components/responses/AnthropicNotFound'
         '503':
@@ -305,6 +310,8 @@ paths:
                 type: string
         '400':
           $ref: '#/components/responses/OpenAIBadRequest'
+        '401':
+          $ref: '#/components/responses/OpenAIUnauthorized'
         '404':
           $ref: '#/components/responses/OpenAINotFound'
         '429':
@@ -390,6 +397,8 @@ paths:
                   version:
                     type: string
                     examples: ["0.1.0-denno"]
+        '401':
+          $ref: '#/components/responses/OllamaUnauthorized'
   /api/chat:
     post:
       tags: [ollama]
@@ -419,6 +428,8 @@ paths:
                 $ref: '#/components/schemas/OllamaChatResponse'
         '400':
           $ref: '#/components/responses/OllamaBadRequest'
+        '401':
+          $ref: '#/components/responses/OllamaUnauthorized'
         '404':
           $ref: '#/components/responses/OllamaNotFound'
         '503':
@@ -451,6 +462,8 @@ paths:
                 $ref: '#/components/schemas/OllamaGenerateResponse'
         '400':
           $ref: '#/components/responses/OllamaBadRequest'
+        '401':
+          $ref: '#/components/responses/OllamaUnauthorized'
         '404':
           $ref: '#/components/responses/OllamaNotFound'
         '503':
