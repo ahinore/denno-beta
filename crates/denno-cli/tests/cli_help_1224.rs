@@ -27,6 +27,8 @@ const SUBCOMMANDS: &[&str] = &[
     "inspect",
     "tokenize",
     "doctor",
+    // task 1081: `denno version [--json]`
+    "version",
 ];
 
 fn denno(args: &[&str]) -> Output {

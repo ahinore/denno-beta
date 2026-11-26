@@ -14,7 +14,8 @@
 //! 5. 相反するフラグ (`--text` と `--stdin`) は `cannot be used with` で
 //!    終了コード 2。
 //! 6. 全サブコマンドで `--help` と `-h` が終了コード 0 / 非空 stdout。
-//! 7. `--version` / `-V` は終了コード 0。`version` というサブコマンドは無い。
+//! 7. `--version` / `-V` は終了コード 0。`version` サブコマンドも存在し
+//!    (task 1081 で追加)、単体でバナーを出して終了コード 0。
 //!
 //! 実測メモ: `--port 0` と `--max-tokens 0` は clap に範囲検証が無く解析を
 //! 通る (`--max-body-mb` だけが `1..` の range を持つ)。`--max-tokens 0` を
@@ -38,6 +39,8 @@ const SUBCOMMANDS: &[&str] = &[
     "inspect",
     "tokenize",
     "doctor",
+    // task 1081: `denno version [--json]`
+    "version",
 ];
 
 /// clap の解析エラーは 2、実行時エラーは 1。
@@ -288,7 +291,7 @@ fn top_level_help_succeeds_for_long_and_short() {
 // ------------------------------------------------ 7. バージョン
 
 #[test]
-fn version_flags_succeed_and_version_subcommand_is_absent() {
+fn version_flags_succeed_and_version_subcommand_exists() {
     for flag in ["--version", "-V"] {
         let o = denno(&[flag]);
         let out = stdout(&o);
@@ -306,8 +309,23 @@ fn version_flags_succeed_and_version_subcommand_is_absent() {
             "`denno {flag}`: version number is empty: {out}"
         );
     }
-    // `version` はサブコマンドとしては存在しない (clap は exit 2)。
-    assert_clap_error(&["version"], &["unrecognized subcommand"]);
+    // task 1081: `version` はサブコマンドとして存在し、バナーを出して 0 で終わる。
+    let o = denno(&["version"]);
+    assert!(
+        o.status.success(),
+        "`denno version`: exit was {:?}, stderr={}",
+        o.status.code(),
+        stderr(&o)
+    );
+    let out = stdout(&o);
+    assert!(
+        out.starts_with("denno "),
+        "`denno version`: unexpected banner: {out}"
+    );
+    assert!(
+        out.contains("\nbuild_sha: ") && out.contains("\nfeatures: "),
+        "`denno version`: build info lines missing: {out}"
+    );
 }
 
 // ------------------------------------------------ 解析を通る 0 値 (実測の固定)
