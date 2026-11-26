@@ -193,6 +193,17 @@ pub struct OllamaOptions {
     pub stop: Option<Value>,
 }
 
+/// task 1626: `options` は省略可で、`null` も「未指定」として受ける。
+///
+/// Ollama の Go 実装は `Options map[string]any` なので `"options": null` は
+/// nil map = 空として通る。型違い (配列・文字列・数値等) は従来どおり 400。
+fn de_ollama_options<'de, D>(d: D) -> Result<OllamaOptions, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<OllamaOptions>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OllamaMessage {
     pub role: String,
@@ -209,7 +220,7 @@ pub struct ChatRequest {
     /// Ollama の既定は **true**。
     #[serde(default)]
     pub stream: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_ollama_options")]
     pub options: OllamaOptions,
     /// task 1071: 受理して無視する (モデルは常駐。型は検証しない)。
     #[serde(default)]
@@ -239,7 +250,7 @@ pub struct GenerateRequest {
     pub raw: Option<bool>,
     #[serde(default)]
     pub stream: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_ollama_options")]
     pub options: OllamaOptions,
     /// task 1071: 受理して無視する (型は検証しない)。
     #[serde(default)]
@@ -451,8 +462,32 @@ fn max_tokens_from(num_predict: Option<i64>) -> usize {
 }
 
 /// `options` から生成パラメータを作る (既定値は既存ハンドラと同一)。
-fn build_params(state: &AppState, opts: &OllamaOptions, stop: Vec<String>) -> GenParams {
-    GenParams {
+///
+/// task 1626: `temperature` / `top_p` の非有限 (inf) は 400。JSON の `1e40` は
+/// f32 で inf になるため、検証しないと sampler が一様分布へ落ちる
+/// (OpenAI / Anthropic 経路は P966 で同じ 400 を返す)。範囲の下限・上限は
+/// Ollama の意味論 (`temperature <= 0` = greedy、`top_p` 無効値 = 無効) を
+/// 保つため拒否しない。
+fn build_params(
+    state: &AppState,
+    opts: &OllamaOptions,
+    stop: Vec<String>,
+) -> Result<GenParams, OllamaError> {
+    if let Some(t) = opts.temperature {
+        if !t.is_finite() {
+            return Err(OllamaError::invalid(
+                "options.temperature: must be a finite number (got NaN or infinity)",
+            ));
+        }
+    }
+    if let Some(p) = opts.top_p {
+        if !p.is_finite() {
+            return Err(OllamaError::invalid(
+                "options.top_p: must be a finite number (got NaN or infinity)",
+            ));
+        }
+    }
+    Ok(GenParams {
         max_tokens: max_tokens_from(opts.num_predict),
         temperature: apply_temperature_cap(opts.temperature, state.temperature_cap),
         top_p: opts.top_p,
@@ -463,7 +498,7 @@ fn build_params(state: &AppState, opts: &OllamaOptions, stop: Vec<String>) -> Ge
         frequency_penalty: None,
         presence_penalty: None,
         no_repeat_ngram_size: None,
-    }
+    })
 }
 
 /// モデル名の照合。空 (未指定) は既定モデルとして受理する。
@@ -895,7 +930,7 @@ pub async fn chat(
         ));
     }
     let stop = normalize_stop(&req.options.stop)?;
-    let params = build_params(&state, &req.options, stop);
+    let params = build_params(&state, &req.options, stop)?;
     // task 1071: tools (OpenAI 形式) を template 用の JSON へ。形が不正な要素は
     // 読み飛ばすので 400 にはならない。
     let tool_defs = ollama_tool_defs(&req.tools);
@@ -985,7 +1020,7 @@ pub async fn generate(
         ));
     }
     let stop = normalize_stop(&req.options.stop)?;
-    let params = build_params(&state, &req.options, stop);
+    let params = build_params(&state, &req.options, stop)?;
     let raw = req.raw.unwrap_or(false);
     let stream = req.stream.unwrap_or(true);
     // task 1071: `format` の JSON 指示と `think` の写像 (chat と同じ規則)。
