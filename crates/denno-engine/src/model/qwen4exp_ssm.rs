@@ -151,6 +151,37 @@ pub struct SsmLayer {
     pub state: GdnState,
 }
 
+/// task 900: decode submission の scan が読む beta / alpha の先頭行
+/// (ba 出力ブロック = `xba` の beta/alpha 節域の先頭からの行数)。
+///
+/// 3 つの座標系が混ざるので分けて書く:
+///
+/// - `beta_rows` / `alpha_rows` は **連結バッファ** の行範囲
+///   ([`FusedLinear::range`])。写しなし連結は GGUF のファイル順を保存するので、
+///   実モデル (ファイル上 alpha が先) では `beta_rows.start != 0`。
+/// - デバイスが ba を計算するとき (`device_ba`)、単位の出力はこの連結バッファの
+///   座標に書かれる ([`FusedLinear::gemv_unit_out_offset`] と同じ規約)。よって
+///   scan は `beta_rows.start` / `alpha_rows.start` から読むのが正しい。
+/// - ホストが ba を計算するとき (型がデバイスで扱えない)、staging には
+///   beta → alpha の **論理順** で詰めるので (0, nv)。
+///
+/// 補正 (`DENNO_GDN_BA_ORDER_FIX`) off は従来の (0, nv) 固定。これはファイル順が
+/// `[alpha | beta]` のモデルで beta と alpha を入れ替えて scan に渡す (P864)。
+#[cfg(feature = "cuda")]
+pub(crate) fn gdn_ba_scan_rows(
+    beta_rows: std::ops::Range<usize>,
+    alpha_rows: std::ops::Range<usize>,
+    nv: usize,
+    device_ba: bool,
+    fix: bool,
+) -> (usize, usize) {
+    if fix && device_ba {
+        (beta_rows.start, alpha_rows.start)
+    } else {
+        (0, nv)
+    }
+}
+
 impl SsmLayer {
     /// `blk.{il}.*` から読む。ハイパーパラメータは [`GdnParams::qwen4exp`] (実モデル) 固定。
     pub fn from_gguf(f: &GgufFile, il: usize) -> Result<Self> {
@@ -537,6 +568,32 @@ impl SsmLayer {
         qkv_units: &'a [(crate::cuda::GdnGgufUnit<'a>, usize)],
         ba_units: &'a [(crate::cuda::GdnGgufUnit<'a>, usize)],
     ) -> crate::cuda::GdnDecodeReq<'a> {
+        // task 900: 補正 on のときだけ、実モデルで ba がどう連結されているかを 1 回出す
+        // (ゲート内の診断。写しなし連結なら beta_rows が 0 以外から始まる)。
+        if crate::cuda::gdn_ba_order_fix_on() {
+            static NOTE: std::sync::Once = std::sync::Once::new();
+            NOTE.call_once(|| {
+                tracing::info!(
+                    "[gdn-ba-order] fix=on li={} fused={} zero_copy={} beta_rows={:?} alpha_rows={:?} device_ba={}",
+                    self.il,
+                    self.beta_alpha.is_fused(),
+                    self.beta_alpha.is_zero_copy(),
+                    self.beta_alpha.range(0),
+                    self.beta_alpha.range(1),
+                    !ba_units.is_empty(),
+                );
+            });
+        }
+        // task 900: デバイス ba の出力は連結バッファ座標 (= 写しなし連結ではファイル順)
+        // に並ぶ。scan の読み出し位置を行範囲から引く (ゲート on で有効。off は従来の
+        // (0, nv))。
+        let ba_rows = gdn_ba_scan_rows(
+            self.beta_alpha.range(0),
+            self.beta_alpha.range(1),
+            self.p.n_v_heads,
+            !ba_units.is_empty(),
+            crate::cuda::gdn_ba_order_fix_on(),
+        );
         crate::cuda::GdnDecodeReq {
             nonce: self.nonce,
             li: self.il,
@@ -557,6 +614,8 @@ impl SsmLayer {
             beta,
             alpha,
             ba_units,
+            ba_beta_row: ba_rows.0,
+            ba_alpha_row: ba_rows.1,
             conv_host: &self.state.conv,
             ssm_host: &self.state.ssm,
             wconv: &self.conv1d,
@@ -1913,6 +1972,128 @@ mod tests {
             cover.iter().all(|&c| c == 1),
             "beta/alpha の行が重複/欠落している: {cover:?}"
         );
+    }
+
+    /// task 900: decode submission の ba 行順を GPU 無しで鏡映しする。
+    ///
+    /// 実モデルは GGUF 上 alpha が beta より前に来るため、写しなし連結
+    /// ([`FusedLinear::concat`]) の連結バッファは [alpha | beta] の並びになり
+    /// `range(0)` (beta) は先頭ではない。デバイスの ba matvec はこのバッファ座標に
+    /// 書くので、scan が従来の固定位置 (0, nv) から読むと beta と alpha が
+    /// **入れ替わる** (P864)。ここでは「CPU の論理順」と「デバイス出力 + scan の
+    /// 読み出し位置」を突き合わせ、補正 off で入れ替わりが起きること・on で
+    /// CPU と一致することを両方固定する。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_ba_device_row_order_fix_restores_cpu_order() {
+        use crate::quant::WeightBlocks;
+        struct FusedGuard;
+        impl Drop for FusedGuard {
+            fn drop(&mut self) {
+                crate::model::linear_gguf::set_fused_gemv_for_test(None);
+                crate::cuda::gdn_ba_order_fix_reset_force_for_test();
+            }
+        }
+        let _f = FusedGuard;
+        let _g = crate::model::linear_gguf::par_test_lock();
+        crate::model::linear_gguf::set_fused_gemv_for_test(Some(true));
+
+        fn f32_bytes(k: usize, n: usize, rnd: &mut impl FnMut() -> f32) -> Vec<u8> {
+            let mut b = Vec::with_capacity(k * n * 4);
+            for _ in 0..k * n {
+                b.extend_from_slice(&rnd().to_le_bytes());
+            }
+            b
+        }
+
+        let (k, nv) = (16usize, 3usize);
+        let mut rnd = lcg_rng(0x0900_1234_5678_9abc);
+        // ファイル順は実モデルと同じ [alpha | beta]。
+        let alpha_bytes = f32_bytes(k, nv, &mut rnd);
+        let beta_bytes = f32_bytes(k, nv, &mut rnd);
+        let mut file = Vec::new();
+        file.extend_from_slice(&alpha_bytes);
+        file.extend_from_slice(&beta_bytes);
+        let path =
+            std::env::temp_dir().join(format!("denno_p900_ba_mirror_{}.bin", std::process::id()));
+        std::fs::write(&path, &file).expect("write");
+        let fh = std::fs::File::open(&path).expect("open");
+        // SAFETY: 読み取り専用の共有写像。テスト中にこのファイルを書き換えない。
+        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&fh).expect("mmap") });
+        drop(fh);
+
+        let mk = |off: usize, len: usize| {
+            GgufLinear::new(GgmlType::F32, k, nv, WeightBlocks::mapped(map.clone(), off, len))
+                .expect("GgufLinear (F32)")
+        };
+        // 呼び出し順は [beta, alpha] (論理順)。
+        let beta = mk(alpha_bytes.len(), beta_bytes.len());
+        let alpha = mk(0, alpha_bytes.len());
+        let beta_ref = mk(alpha_bytes.len(), beta_bytes.len());
+        let alpha_ref = mk(0, alpha_bytes.len());
+        let fused = FusedLinear::concat(vec![beta, alpha]);
+        assert!(
+            fused.is_fused() && fused.is_zero_copy(),
+            "隣接 + 同型なのに写しなし連結にならない"
+        );
+        let (r0, r1) = (fused.range(0), fused.range(1));
+        assert_eq!(r0, nv..2 * nv, "beta の行範囲 (ファイル順)");
+        assert_eq!(r1, 0..nv, "alpha の行範囲 (ファイル順)");
+
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.17 - 1.1).collect();
+        // CPU (= 論理順): 実装が scan に渡す値。
+        let mut cpu = vec![0f32; fused.n()];
+        fused
+            .gemv_concat_into("ssm_beta", &x, &mut cpu)
+            .expect("gemv_concat_into");
+        let mut want_beta = vec![0f32; nv];
+        let mut want_alpha = vec![0f32; nv];
+        beta_ref.gemv(&x, &mut want_beta).expect("beta");
+        alpha_ref.gemv(&x, &mut want_alpha).expect("alpha");
+        assert_eq!(bits(&cpu[r0.clone()]), bits(&want_beta), "CPU の beta");
+        assert_eq!(bits(&cpu[r1.clone()]), bits(&want_alpha), "CPU の alpha");
+        assert!(
+            bits(&want_beta) != bits(&want_alpha),
+            "beta と alpha が同じ値では入れ替わりを検出できない (テストの前提)"
+        );
+
+        // デバイス側の鏡映し: 単位の出力を連結バッファ座標へ書く
+        // (= `gdn_launch_ba_on` が `pba + off*4` に書くのと同じ)。
+        let units = fused.gemv_units();
+        assert_eq!(units.len(), 1, "連結済みは 1 発のはず");
+        let mut dev = vec![0f32; fused.n()];
+        for (i, u) in units.iter().enumerate() {
+            let off = fused.gemv_unit_out_offset(i);
+            u.gemv(&x, &mut dev[off..off + u.n()]).expect("dev gemv");
+        }
+
+        // 補正 off (従来): scan は固定位置 (0, nv) から読む → beta/alpha が入れ替わる。
+        let (br, ar) = gdn_ba_scan_rows(r0.clone(), r1.clone(), nv, true, false);
+        assert_eq!((br, ar), (0, nv), "off の読み出し位置は従来の固定");
+        assert_eq!(
+            bits(&dev[br..br + nv]),
+            bits(&want_alpha),
+            "off では beta の位置に alpha が入る (P864 の入れ替わり)"
+        );
+        assert!(
+            bits(&dev[br..br + nv]) != bits(&want_beta),
+            "off なのに入れ替わりが起きていない (テストの前提が崩れた)"
+        );
+
+        // 補正 on: 行範囲から読む → CPU と同じ。
+        let (br, ar) = gdn_ba_scan_rows(r0.clone(), r1.clone(), nv, true, true);
+        assert_eq!((br, ar), (r0.start, r1.start), "on は行範囲の先頭");
+        assert_eq!(bits(&dev[br..br + nv]), bits(&want_beta), "on の beta");
+        assert_eq!(bits(&dev[ar..ar + nv]), bits(&want_alpha), "on の alpha");
+
+        // ホスト計算 (`ba_units` 空) は staging に論理順で詰めるので (0, nv) のまま。
+        assert_eq!(
+            gdn_ba_scan_rows(r0.clone(), r1.clone(), nv, false, true),
+            (0, nv),
+            "ホスト計算の読み出し位置"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// task 269/285: `DENNO_GDN_BA_GPU` の真理値表 (**既定 on**・明示の偽値だけ off)。

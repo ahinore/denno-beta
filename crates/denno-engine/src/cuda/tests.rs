@@ -448,6 +448,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// task 900: `DENNO_GDN_BA_ORDER_FIX` は既定 off・明示的な真値だけ on。
+    #[test]
+    fn task900_gdn_ba_order_fix_truth_table() {
+        assert!(!parse_gdn_ba_order_fix(None), "未設定は既定 off");
+        for v in ["", "0", "off", "false", "no", "2", " on?"] {
+            assert!(!parse_gdn_ba_order_fix(Some(v)), "raw={v:?}");
+        }
+        for v in ["1", "on", "true", " ON ", " TRUE ", "yes", " YES "] {
+            assert!(parse_gdn_ba_order_fix(Some(v)), "raw={v:?}");
+        }
+        // 強制の上書きが env 解釈より優先される (既定 off のまま on を踏める)。
+        gdn_ba_order_fix_set_for_test(Some(true));
+        assert!(gdn_ba_order_fix_on(), "強制 on が効かない");
+        gdn_ba_order_fix_set_for_test(Some(false));
+        assert!(!gdn_ba_order_fix_on(), "強制 off が効かない");
+        gdn_ba_order_fix_set_for_test(None);
+        assert!(!gdn_ba_order_fix_on(), "解除後は env の解釈 (既定 off) に戻る");
+    }
+
     /// task 464: `DENNO_MIX_NOWAIT` は既定 on (lab t464b で採否)・明示的な偽値だけ off。
     #[test]
     fn task464_mix_nowait_gate_truth_table() {
