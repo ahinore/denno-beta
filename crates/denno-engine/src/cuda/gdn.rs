@@ -6833,7 +6833,7 @@ pub fn gdn_ba_gpu_on() -> bool {
 }
 
 
-/// task 900: `DENNO_GDN_BA_ORDER_FIX` の解釈 (純関数)。**既定 off**。
+/// task 900: `DENNO_GDN_BA_ORDER_FIX` の解釈 (純関数)。**既定 on**。
 ///
 /// decode の submission は ba の出力を `xba` の beta/alpha 節域へ書く。連結済み
 /// (`FusedLinear::concat`) でデバイスが 1 発の matvec を撃つとき、その出力は
@@ -6841,11 +6841,11 @@ pub fn gdn_ba_gpu_on() -> bool {
 /// ファイル上 alpha が先 (`range(0)=nv..2nv`, `range(1)=0..nv`) なので、従来の
 /// 「beta は先頭・alpha は nv 行目」という固定の読み方では beta と alpha が
 /// 入れ替わって scan に渡る (P864)。on にすると scan の読み出し位置を
-/// `range(i).start` にする。既定 off (ベースラインの md5 を保つ)。
+/// `range(i).start` にする。明示的な偽値 (`0`/`off`/`false`/`no`/`""`) だけ off (切り戻し用)。
 pub fn parse_gdn_ba_order_fix(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no") | Some("")
     )
 }
 
@@ -6856,7 +6856,7 @@ static GDN_BA_ORDER_FIX_FORCE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
 
-/// task 900: デバイス ba の行順補正を掛けるか (`DENNO_GDN_BA_ORDER_FIX`・既定 off)。
+/// task 900: デバイス ba の行順補正を掛けるか (`DENNO_GDN_BA_ORDER_FIX`・既定 on)。
 pub fn gdn_ba_order_fix_on() -> bool {
     #[cfg(test)]
     match GDN_BA_ORDER_FIX_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -6875,7 +6875,7 @@ pub fn gdn_ba_order_fix_on() -> bool {
 pub const GDN_BA_ORDER_FIX_ENV: &str = "DENNO_GDN_BA_ORDER_FIX";
 
 
-/// テストが強制を解除して env の解釈 (既定 off) に戻す。
+/// テストが強制を解除して env の解釈 (既定 on) に戻す。
 #[cfg(test)]
 pub fn gdn_ba_order_fix_reset_force_for_test() {
     GDN_BA_ORDER_FIX_FORCE.store(0, std::sync::atomic::Ordering::Relaxed);
