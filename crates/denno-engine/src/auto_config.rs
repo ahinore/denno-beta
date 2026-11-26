@@ -100,6 +100,18 @@ pub const RAM_TIER_MAX_VRAM_MB: u64 = 16 * 1024;
 /// ホスト RAM tier を入れる最低 RAM (MiB)。
 pub const RAM_TIER_MIN_RAM_MB: u64 = 32 * 1024;
 
+/// 毎トークン触る dense 重み (attn / ssm gate・gdn / head / ple) の実測
+/// ワーキングセット (MiB)。task 886。
+///
+/// これ未満に dense 予算を削ると dense の LRU が毎層で入れ替わり、attention が
+/// CPU へ落ちて decode が桁で遅くなる。lab 実測 (UD-IQ3_XXS、12 GB 相当):
+/// `DENNO_GPU_WEIGHT_MB=4505` (= 40% の式のまま) で **355.8 ms/tok**、
+/// 5,600 で **18.0 ms/tok**、6,200 で 19.1、7,000 で 20.7。つまり
+/// ワーキングセットを割ると崖、超えたぶんは expert を減らすだけの損。
+/// 5,632 は崖の上側 (5,600 実測) に 32 MiB の余裕を足した値。両モデルで
+/// dense 側のテンソルは同じ (違うのは expert の量子型だけ) なので共通の値。
+pub const DENSE_WORKING_SET_MB: u64 = 5_632;
+
 /// 小さいカードで prefill の同時 pread を絞る閾値 (MiB)。
 pub const SMALL_VRAM_MB: u64 = 10 * 1024;
 /// 中間のカードの閾値 (MiB)。
@@ -210,12 +222,28 @@ pub fn plan_gpu_config(
     // 小さいカードでも dense が 0 にならないように 256 MiB の床を置く。
     weight = weight.max(256.min(usable));
 
+    // task 886: 10-16 GB のカードでは 40% の dense 枠がワーキングセットを
+    // 下回り、dense の LRU が毎層で入れ替わって attention が CPU に落ちる
+    // (lab t886a: 12 GB 相当で 355.8 ms/tok)。ワーキングセットまで引き上げる。
+    // expert に最低 1 GiB は残す (dense だけで VRAM を使い切らない)。
+    let small_card =
+        tier_at_least(vram_mb, SMALL_VRAM_MB) && vram_mb <= MID_VRAM_MB + VRAM_TIER_SLACK_MB;
+    if small_card {
+        weight = weight.max(DENSE_WORKING_SET_MB.min(usable.saturating_sub(MIN_EXPERT_MB)));
+    }
+
     // expert: 割合の上限と絶対上限の小さい方。expert 総量がそれ未満なら
     // 全部載るので、上限を expert 総量まで下げる (ログの見栄えのため)。
     let expert_total_mb = model_mb.saturating_sub(dense_est_mb);
     let mut expert = (usable * EXPERT_PCT / 100).min(EXPERT_CAP_MB);
     if expert_total_mb > 0 {
         expert = expert.min(expert_total_mb);
+    }
+    // task 886: 小さいカードは dense + expert を「使える VRAM」に収める。
+    // 大きいカードは従来どおり上限だけ (和が総量を超えるのは既定の流儀で、
+    // 実効はカードの空きで丸められる)。
+    if small_card {
+        expert = expert.min(usable.saturating_sub(weight));
     }
     // 使える VRAM の 12% か 1 GiB を expert に回せないカードでは expert を切る
     // (2 GB 級。載せても 1 本も入らずに往復だけが増える)。
@@ -607,12 +635,20 @@ mod tests {
             assert_eq!(c.pread_threads, None);
             assert_eq!(c.pf_chunk, None);
         }
-        // 8 / 10 / 16 / 24 GB は手動ピークより小さい (カードに合わせて縮む)
+        // 8 / 24 GB は式のとおり、10 / 16 GB は dense のワーキングセット床と
+        // 和の整合で変わる (task 886)。どれも手動ピークより小さい。
         for gb in [8u64, 10, 16, 24] {
             let c = plan_gpu_config(gb * 1024, 64 * GB, 111_000_000_000, ModelQuant::Q4);
             let usable = gb * 1024 - PLAN_RESERVE_MB;
-            assert_eq!(c.expert_vram_mb, usable * EXPERT_PCT / 100, "{gb}");
-            assert_eq!(c.gpu_weight_mb, usable * WEIGHT_PCT / 100, "{gb}");
+            if !(10..=16).contains(&gb) {
+                assert_eq!(c.expert_vram_mb, usable * EXPERT_PCT / 100, "{gb}");
+            } else {
+                assert_eq!(c.expert_vram_mb, usable - c.gpu_weight_mb, "{gb}");
+                assert!(c.gpu_weight_mb >= DENSE_WORKING_SET_MB, "{gb}");
+            }
+            if !(10..=16).contains(&gb) {
+                assert_eq!(c.gpu_weight_mb, usable * WEIGHT_PCT / 100, "{gb}");
+            }
             // 32 GB より小さい (単調)
             assert!(c.expert_vram_mb < 22_000, "{gb}");
             assert!(c.gpu_weight_mb < 12_000, "{gb}");
@@ -652,10 +688,12 @@ mod tests {
     fn plan_tier_table_matches_expected_values() {
         // (公称 GB, weight MiB, expert MiB, min_hit, pread, chunk, ram_tier)
         let table: [(u64, u64, u64, Option<f32>, Option<usize>, Option<usize>, bool); 6] = [
+            // 10-16 GB は dense のワーキングセット 5,632 MiB が床 (task 886):
+            // 式の 40% のままだと 12 GB で 4,505 MiB → 崖 (lab t886a)。
             (8, 2_867, 5_160, None, Some(8), Some(1024), true),
-            (10, 3_686, 6_635, None, Some(8), Some(1024), true),
-            (12, 4_505, 8_110, Some(0.0), Some(12), Some(1536), true),
-            (16, 6_144, 11_059, Some(0.0), Some(12), Some(1536), true),
+            (10, 5_632, 3_584, None, Some(8), Some(1024), true),
+            (12, 5_632, 5_632, Some(0.0), Some(12), Some(1536), true),
+            (16, 6_144, 9_216, Some(0.0), Some(12), Some(1536), true),
             (24, 9_420, 16_957, Some(0.0), None, None, false),
             (32, 12_000, 22_000, Some(0.0), None, None, false),
         ];
@@ -733,7 +771,8 @@ mod tests {
         );
         let real = plan_gpu_config(12_288, 64 * GB, 111_000_000_000, ModelQuant::Q4);
         assert_eq!(sim, real);
-        assert_eq!(sim.expert_vram_mb, 8_110);
+        assert_eq!(sim.expert_vram_mb, 5_632);
+        assert_eq!(sim.gpu_weight_mb, 5_632);
     }
 
     #[test]
