@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 
 /// 停止時の待ちの既定値 (ms)。進行中の生成をこの時間だけ待ってから止める。
 pub const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 10_000;
+/// 停止時の待ちの既定値 (秒)。[`DEFAULT_DRAIN_TIMEOUT_MS`] と同じ 10 s。
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// 停止時の待ちの上限 (秒)。暴走した env をそのまま信じない。
+pub const MAX_DRAIN_TIMEOUT_SECS: u64 = 600;
+/// task 1006: 停止時の待ちを **秒** で上書きする env。優先順はこの env が最上位。
+pub const DRAIN_TIMEOUT_SECS_ENV: &str = "DENNO_DRAIN_TIMEOUT_SECS";
+/// 停止時の待ちを **ms** で上書きする env (後方互換。secs が無いときだけ読む)。
+pub const DRAIN_TIMEOUT_MS_ENV: &str = "DENNO_DRAIN_TIMEOUT_MS";
 /// 待ちループのポーリング間隔 (ms)。
 pub const DRAIN_POLL_MS: u64 = 50;
 
@@ -81,32 +89,91 @@ impl Lifecycle {
     }
 }
 
-/// 停止時に進行中の生成を待つ上限。`DENNO_DRAIN_TIMEOUT_MS` (既定 10 s、
-/// 0〜600000 にクランプ) で上書きできる。0 は「待たない」。
+/// 停止時に進行中の生成を待つ上限。優先順は
+/// `DENNO_DRAIN_TIMEOUT_SECS` (秒) > `DENNO_DRAIN_TIMEOUT_MS` (ms) > 既定 10 s。
+/// どちらも 600 s にクランプする。0 は「待たない」。
+///
+/// 純関数版 [`resolve_drain_timeout`] に env の生値を渡すだけなので、
+/// テストは env を触らずに優先順とクランプを固定できる。
 pub fn drain_timeout() -> Duration {
-    let ms = std::env::var("DENNO_DRAIN_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_DRAIN_TIMEOUT_MS)
-        .min(600_000);
-    Duration::from_millis(ms)
+    let secs = std::env::var(DRAIN_TIMEOUT_SECS_ENV).ok();
+    let ms = std::env::var(DRAIN_TIMEOUT_MS_ENV).ok();
+    resolve_drain_timeout(secs.as_deref(), ms.as_deref())
+}
+
+/// task 1006: 2 つの env 文字列から実効の drain 上限を決める純関数。
+///
+/// - `secs` が非負整数として解析できればそれを採用 (最優先)。
+/// - そうでなければ `ms` を採用。
+/// - どちらも無効なら既定 [`DEFAULT_DRAIN_TIMEOUT_SECS`]。
+///
+/// 空白は無視し、負数・小数・空文字は「未設定」と同じ扱い。上限は
+/// [`MAX_DRAIN_TIMEOUT_SECS`] 秒。0 は明示的な「待たない」として保持する。
+pub fn resolve_drain_timeout(secs: Option<&str>, ms: Option<&str>) -> Duration {
+    if let Some(s) = secs.and_then(parse_u64) {
+        return Duration::from_secs(s.min(MAX_DRAIN_TIMEOUT_SECS));
+    }
+    if let Some(v) = ms.and_then(parse_u64) {
+        return Duration::from_millis(v.min(MAX_DRAIN_TIMEOUT_SECS * 1_000));
+    }
+    Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS)
+}
+
+/// 空白を除いて非負整数として読む。解析できなければ None。
+fn parse_u64(raw: &str) -> Option<u64> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<u64>().ok()
+}
+
+/// task 1006: 1 回のポーリング後の drain 判定。純関数なので、
+/// 実時間を待たずに 3 分岐すべてを決定的に踏める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStep {
+    /// 進行中が 0 — 待たずに完了。
+    Idle,
+    /// まだ進行中で上限未満 — 次のポーリングへ。
+    Wait,
+    /// 上限に到達 — 打ち切る。
+    TimedOut,
+}
+
+impl DrainStep {
+    /// この判定で drain の待ちが終わるか (完了 or 打ち切り)。
+    pub fn is_final(self) -> bool {
+        !matches!(self, DrainStep::Wait)
+    }
+}
+
+/// task 1006: 判定の 1 段。`is_idle()` が真なら常に [`DrainStep::Idle`]
+/// (上限 0 でもアイドルは成功)。そうでなければ `elapsed >= timeout` で打ち切り。
+pub fn drain_step(is_idle: bool, elapsed: Duration, timeout: Duration) -> DrainStep {
+    if is_idle {
+        DrainStep::Idle
+    } else if elapsed >= timeout {
+        DrainStep::TimedOut
+    } else {
+        DrainStep::Wait
+    }
 }
 
 /// `is_idle()` が true になるか `timeout` まで待つ。true = 空になった。
 ///
 /// `poll` 間隔で `tokio::time::sleep` するので、非同期の停止経路 (axum の
-/// graceful shutdown) からそのまま await できる。
+/// graceful shutdown) からそのまま await できる。判定は [`drain_step`] に
+/// 集約してあり、この関数は「判定 -> 待つ」を回すだけ。
 pub async fn wait_for_idle<F>(is_idle: F, timeout: Duration, poll: Duration) -> bool
 where
     F: Fn() -> bool,
 {
     let start = Instant::now();
     loop {
-        if is_idle() {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
+        match drain_step(is_idle(), start.elapsed(), timeout) {
+            DrainStep::Idle => return true,
+            DrainStep::TimedOut => return false,
+            DrainStep::Wait => {}
         }
         let left = timeout.saturating_sub(start.elapsed());
         tokio::time::sleep(poll.min(left)).await;
@@ -138,7 +205,116 @@ mod tests {
     #[test]
     fn drain_timeout_default_is_bounded() {
         // env を汚さない範囲で既定値の範囲だけ確認する (値そのものは env 依存)。
-        assert!(drain_timeout() <= Duration::from_secs(600));
+        assert!(drain_timeout() <= Duration::from_secs(MAX_DRAIN_TIMEOUT_SECS));
+    }
+
+    // --- task 1006: DENNO_DRAIN_TIMEOUT_SECS の解決 (純関数・決定的) ---
+
+    #[test]
+    fn resolve_drain_timeout_prefers_secs_over_ms() {
+        // secs が最優先。ms があっても無視する。
+        assert_eq!(
+            resolve_drain_timeout(Some("3"), Some("9000")),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            resolve_drain_timeout(Some(" 7 "), None),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn resolve_drain_timeout_falls_back_to_ms_then_default() {
+        // secs が未設定 or 解析不能なら ms。
+        assert_eq!(
+            resolve_drain_timeout(None, Some("1500")),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            resolve_drain_timeout(Some("abc"), Some("250")),
+            Duration::from_millis(250)
+        );
+        // どちらも無効なら既定 10 s。
+        assert_eq!(resolve_drain_timeout(None, None), Duration::from_secs(10));
+        assert_eq!(
+            resolve_drain_timeout(Some(""), Some("  ")),
+            Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS)
+        );
+        // 負数・小数は未設定扱い (u64 として解析できない)。
+        assert_eq!(
+            resolve_drain_timeout(Some("-1"), Some("2.5")),
+            Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn resolve_drain_timeout_clamps_and_keeps_zero() {
+        // 上限 600 s にクランプ (secs 経路と ms 経路の両方)。
+        assert_eq!(
+            resolve_drain_timeout(Some("999999"), None),
+            Duration::from_secs(MAX_DRAIN_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            resolve_drain_timeout(None, Some("999999999")),
+            Duration::from_millis(MAX_DRAIN_TIMEOUT_SECS * 1_000)
+        );
+        // 0 は明示的な「待たない」として保持する (既定に化けない)。
+        assert_eq!(resolve_drain_timeout(Some("0"), None), Duration::ZERO);
+        assert_eq!(resolve_drain_timeout(None, Some("0")), Duration::ZERO);
+        // u64 の上限を超える文字列は解析不能 -> ms/既定へ落ちる。
+        assert_eq!(
+            resolve_drain_timeout(Some("18446744073709551616"), None),
+            Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn drain_step_covers_all_three_branches_deterministically() {
+        let timeout = Duration::from_millis(100);
+        let mut idle = 0usize;
+        let mut wait = 0usize;
+        let mut timed_out = 0usize;
+        for (is_idle, elapsed_ms, want) in [
+            (true, 0u64, DrainStep::Idle),
+            (true, 100, DrainStep::Idle), // 上限ちょうどでもアイドルが勝つ
+            (false, 0, DrainStep::Wait),
+            (false, 99, DrainStep::Wait),
+            (false, 100, DrainStep::TimedOut), // 境界: >= で打ち切り
+            (false, 101, DrainStep::TimedOut),
+        ] {
+            let got = drain_step(is_idle, Duration::from_millis(elapsed_ms), timeout);
+            assert_eq!(
+                got, want,
+                "drain_step(idle={is_idle}, elapsed={elapsed_ms}ms)"
+            );
+            assert_eq!(got.is_final(), want != DrainStep::Wait);
+            match got {
+                DrainStep::Idle => idle += 1,
+                DrainStep::Wait => wait += 1,
+                DrainStep::TimedOut => timed_out += 1,
+            }
+        }
+        // 3 分岐すべてが発火したことを数える (緑 = 分岐が踏まれた証拠)。
+        assert_eq!((idle, wait, timed_out), (2, 2, 2));
+
+        // timeout = 0 はアイドルでなければ即打ち切り。
+        assert_eq!(
+            drain_step(false, Duration::ZERO, Duration::ZERO),
+            DrainStep::TimedOut
+        );
+        assert_eq!(
+            drain_step(true, Duration::ZERO, Duration::ZERO),
+            DrainStep::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_with_zero_timeout_does_not_wait() {
+        let start = Instant::now();
+        assert!(!wait_for_idle(|| false, Duration::ZERO, Duration::from_millis(5)).await);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        // アイドルなら上限 0 でも成功。
+        assert!(wait_for_idle(|| true, Duration::ZERO, Duration::from_millis(5)).await);
     }
 
     #[tokio::test]

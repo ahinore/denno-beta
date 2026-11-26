@@ -37,7 +37,11 @@ pub mod startup;
 mod ollama;
 mod scheduler;
 mod stream_asm;
-pub use lifecycle::{Lifecycle, DEFAULT_DRAIN_TIMEOUT_MS};
+pub use lifecycle::{
+    drain_step, drain_timeout, resolve_drain_timeout, wait_for_idle, DrainStep, Lifecycle,
+    DEFAULT_DRAIN_TIMEOUT_MS, DEFAULT_DRAIN_TIMEOUT_SECS, DRAIN_POLL_MS, DRAIN_TIMEOUT_SECS_ENV,
+    MAX_DRAIN_TIMEOUT_SECS,
+};
 pub use logging::{
     access_log_json, access_log_line, init_serve_logging, set_access_log_json, NonBlockingStdout,
 };
@@ -1917,8 +1921,9 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         })
     );
     // P817: SIGTERM / SIGINT では即死せず drain する。新規要求は 503 にし、
-    // 進行中の生成を短い上限 (`DENNO_DRAIN_TIMEOUT_MS`、既定 10 s) まで待って
-    // から axum を止める。expert 使用回数もここで書く。
+    // 進行中の生成を短い上限 (`DENNO_DRAIN_TIMEOUT_SECS`、旧
+    // `DENNO_DRAIN_TIMEOUT_MS`、既定 10 s) まで待ってから axum を止める。
+    // expert 使用回数もここで書く。
     axum::serve(listener, app)
         .with_graceful_shutdown(drain_on_signal(state))
         .await?;
