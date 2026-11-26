@@ -140,20 +140,46 @@ pub(crate) fn eligible_with(gate: bool, major: i32, decode: bool, stream_is_null
 }
 
 /// [`eligible_with`] の実環境版。ホットパスでは分岐 3 回だけ。
+///
+/// 窓の外 (prefill / 背景スレッド) は **DEVICE_SM も読まずに** 落とす。
+/// ゲート on の prefill は 1 リクエストで数十万回 `launch_async_on` を通るので、
+/// decode に関係しない発行で共有カウンタを叩くと atomic の contention だけが
+/// 増える。`skipped` は「decode の中で属性を付けなかった回数」の意味になる。
 pub(crate) fn eligible(stream: CUstream) -> bool {
     if !enabled() {
         return false;
     }
-    let ok = eligible_with(
+    if !in_decode_window() {
+        return false;
+    }
+    let (attach, count_skip) = decide(
         true,
         DEVICE_SM.load(Ordering::Relaxed),
-        in_decode_window(),
+        true,
         stream.is_null(),
     );
-    if !ok {
+    if count_skip {
         PDL_SKIPPED.fetch_add(1, Ordering::Relaxed);
     }
-    ok
+    attach
+}
+
+/// [`eligible`] の判定を純関数に切り出したもの。戻り値は
+/// (属性を付けるか, `skipped` に数えるか)。
+///
+/// 窓の外とゲート off は**どちらも数えない** (`skipped` は decode の中で
+/// 属性を付けられなかった回だけ、という契約をテストで固定する)。
+pub(crate) fn decide(
+    gate: bool,
+    sm: i32,
+    in_window: bool,
+    stream_is_null: bool,
+) -> (bool, bool) {
+    if !gate || !in_window {
+        return (false, false);
+    }
+    let attach = eligible_with(gate, sm, in_window, stream_is_null);
+    (attach, !attach)
 }
 
 /// decode 1 トークンの鎖のガード。`on == false` では何もしない。
@@ -341,6 +367,35 @@ mod tests {
         assert_eq!(sm_number(9, 0), 90);
         assert!(sm_supports(sm_number(12, 0)));
         assert!(!sm_supports(12), "major だけを見ると 5090 を取りこぼす");
+    }
+
+    #[test]
+    fn skip_counting_is_decode_window_only() {
+        // 窓の中の null ストリーム = 付ける (数えない)
+        assert_eq!(decide(true, 120, true, true), (true, false));
+        // 窓の中の side stream = 付けない・数える
+        assert_eq!(decide(true, 120, true, false), (false, true));
+        // SM 不足 = 付けない・数える
+        assert_eq!(decide(true, 89, true, true), (false, true));
+        // 窓の外 (prefill) = 付けない・**数えない** (共有カウンタを叩かない)
+        assert_eq!(decide(true, 120, false, true), (false, false));
+        assert_eq!(decide(true, 120, false, false), (false, false));
+        // ゲート off = 付けない・数えない
+        assert_eq!(decide(false, 120, true, true), (false, false));
+        // decide と eligible_with の判定は一致する
+        for gate in [true, false] {
+            for sm in [89, 90, 120] {
+                for win in [true, false] {
+                    for null in [true, false] {
+                        assert_eq!(
+                            decide(gate, sm, win, null).0,
+                            eligible_with(gate, sm, win, null),
+                            "gate={gate} sm={sm} win={win} null={null}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
