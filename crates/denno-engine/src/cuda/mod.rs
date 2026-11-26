@@ -3275,8 +3275,14 @@ pub const SEG_K_ENV: &str = "DENNO_SEG_K";
 pub const DEC_SYNC_STREAM_ENV: &str = "DENNO_DEC_SYNC_STREAM";
 
 
-/// 既定 (採否は lab t368x で決める。採用したら true にして既定 on にする)。
-pub const DEC_SYNC_STREAM_DEFAULT: bool = false;
+/// 既定。task 1377 で **on** にした (lab t1377d、UD-IQ3_XXS、depth8k)。
+///
+/// 8k 文脈の decode が base 47.1 -> 37.8 ms/tok (-19.7%)、その次ターン
+/// 41.7 -> 35.9 (-14.0%)、2k cold 38.2 -> 35.8 (-6.3%)。全 COND で
+/// md5 SAME / errors 0。短い decode (128 tok、34 ms/tok) では -0.1% で
+/// 中立なので、効くのは「文脈が長く、他ストリームに仕事がある」ときだけ。
+/// `DENNO_DEC_SYNC_STREAM=0` で従来の `cuCtxSynchronize` に戻せる。
+pub const DEC_SYNC_STREAM_DEFAULT: bool = true;
 
 
 /// イベントのスロット。`seg_ev` の 0..=6 / 8 とは分ける (記録と待ちは必ず
