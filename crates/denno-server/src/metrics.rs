@@ -11,6 +11,9 @@
 //! - **ゲージ** — スクレイプ時点のスケジューラ状態を `/metrics` ハンドラが直接読む
 //!   (`in_flight` / queued / 完了・打ち切り計数)。状態は既存の
 //!   [`crate::Scheduler`] が持つ値を読むだけで、ここでは持たない。
+//! - **prefix cache** — ヒット / ミス / 再利用トークンを `/metrics` と
+//!   `/v1/cache/stats` が同じ計器から読む (task 1011)。
+//! - **レート制限** — トークンバケットが 429 で拒否した数 (task 1011)。
 //!
 //! 設計の縛り:
 //! - 依存クレートを足さない (prometheus crate を使わない)。カウンタは
@@ -97,6 +100,79 @@ static PROMPT_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPLETION_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static KV_CACHE_READ_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPLETED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// 429 を返したレート制限の拒否数 (task 1011)。
+///
+/// 数えるのは [`crate::ratelimit`] のトークンバケットが拒否したものだけ。
+/// キュー満杯 (503) や KV スロット枯渇 (429, `rate_limit_error`) は別の
+/// 仕組みなのでここには入れない (混ぜると「設定した RPM が効いているか」が
+/// 読めなくなる)。
+static RATE_LIMIT_REJECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// prefix cache (task 1011)
+// ---------------------------------------------------------------------------
+//
+// `/metrics` と `/v1/cache/stats` が同じ計器を読む。計器本体はここに置き、
+// 記録は完了したリクエストの終端 1 回だけ (Relaxed の原子加算 1〜2 回)。
+// ロックも確保もしない。
+//
+// 注意: これらは `DENNO_SERVER_METRICS=0` でも数え続ける。`/v1/cache/stats`
+// は運用 API であって Prometheus の計器ではないため、メトリクス出力だけを
+// 止めたときに cache stats が 0 になると意味が変わる。
+
+/// prefix 再利用したリクエスト数 (累積)。
+static PREFIX_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+/// 再利用なし (フル prefill) だったリクエスト数 (累積)。
+static PREFIX_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+/// 再利用した先頭トークン数の合計 (累積)。
+static PREFIX_CACHE_REUSED_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// 完了したリクエスト 1 本ぶんの prefix 再利用を数える。
+///
+/// `reused` は KV prefix cache から使い回した先頭トークン数
+/// (`ChatOutput::cache_read_input_tokens`)。失敗 / 打ち切りで完走しなかった
+/// リクエストは数えない (再利用の実績ではないため)。
+pub fn record_prefix_cache_reuse(reused: usize) {
+    if reused > 0 {
+        PREFIX_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        PREFIX_CACHE_REUSED_TOKENS.fetch_add(reused as u64, Ordering::Relaxed);
+    } else {
+        PREFIX_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 累積カウンタ `(hits, misses, total_reused_tokens)` を読む (状態は変えない)。
+pub fn prefix_cache_counters() -> (u64, u64, u64) {
+    (
+        PREFIX_CACHE_HITS.load(Ordering::Relaxed),
+        PREFIX_CACHE_MISSES.load(Ordering::Relaxed),
+        PREFIX_CACHE_REUSED_TOKENS.load(Ordering::Relaxed),
+    )
+}
+
+/// `hits / (hits + misses)`。ルックアップ 0 なら 0 (純関数)。
+pub fn prefix_cache_hit_rate(hits: u64, misses: u64) -> f64 {
+    let lookups = hits.saturating_add(misses);
+    if lookups == 0 {
+        0.0
+    } else {
+        hits as f64 / lookups as f64
+    }
+}
+
+/// レート制限 (トークンバケット) が 429 を返した回数を 1 増やす。
+pub fn record_rate_limit_rejection() {
+    if !enabled() {
+        return;
+    }
+    RATE_LIMIT_REJECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// レート制限の拒否数 (累積)。状態は変えない。
+pub fn rate_limit_rejections() -> u64 {
+    RATE_LIMIT_REJECTIONS_TOTAL.load(Ordering::Relaxed)
+}
 
 /// 1 リクエストぶんの完走サンプル。
 pub struct CompletionSample {
@@ -302,6 +378,52 @@ pub fn render(model: &str, in_flight: usize, queued: usize, stats: &RunStatsSnap
         "gauge",
         "",
         fmt_f(ratio),
+    );
+    // task 1011: prefix cache のヒット / ミス / 再利用トークン。
+    let (pc_hits, pc_misses, pc_reused) = prefix_cache_counters();
+    metric(
+        &mut o,
+        "denno_prefix_cache_hits_total",
+        "Completed requests that reused at least one token from the KV prefix cache.",
+        "counter",
+        "",
+        pc_hits,
+    );
+    metric(
+        &mut o,
+        "denno_prefix_cache_misses_total",
+        "Completed requests that reused no token from the KV prefix cache.",
+        "counter",
+        "",
+        pc_misses,
+    );
+    metric(
+        &mut o,
+        "denno_prefix_cache_reused_tokens_total",
+        "Prompt tokens served from the KV prefix cache, summed over completed requests.",
+        "counter",
+        "",
+        pc_reused,
+    );
+    metric(
+        &mut o,
+        "denno_prefix_cache_hit_rate",
+        "Fraction of completed requests that reused the KV prefix cache (cumulative).",
+        "gauge",
+        "",
+        fmt_f(prefix_cache_hit_rate(pc_hits, pc_misses)),
+    );
+    // task 1011: レート制限が 429 で拒否した数。ラベル付き counter は
+    // ラベル値ごとに必ず 1 行出す (0 でも系列を消さない)。
+    let _ = writeln!(
+        o,
+        "# HELP denno_ratelimit_rejections_total Requests rejected with HTTP 429 by the rate limiter."
+    );
+    let _ = writeln!(o, "# TYPE denno_ratelimit_rejections_total counter");
+    let _ = writeln!(
+        o,
+        "denno_ratelimit_rejections_total{{reason=\"token_bucket\"}} {}",
+        rate_limit_rejections()
     );
     hist(
         &mut o,
