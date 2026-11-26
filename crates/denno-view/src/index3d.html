@@ -129,6 +129,8 @@
        <span class="ram">RAM <b id="n_ram">0</b></span> ·
        <span class="ssd">DISK <b id="n_ssd">0</b></span></div>
   <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b></div>
+  <div id="connbanner" class="off" hidden
+       style="color:#ffb3bd;border:1px solid #7a1c24;border-radius:3px;padding:1px 7px;margin:3px 0"></div>
   <div id="tier" class="dim">vram <b id="t_vram">--</b> / <b id="t_total">--</b> MB · ram experts <b id="t_ram">--</b> · disk reads <b id="t_ssd">--</b></div>
   <div id="pleline" class="dim">PLE (layer 2 only): <b id="ple_v">--</b> <span class="dim">ngram 3 x 8 heads = 16 tables</span></div>
   <div id="tokline" class="dim">tokens: prompt <b id="tok_total">--</b> · fed <b id="tok_fed">--</b> ·
@@ -221,6 +223,8 @@ import {
   createLayerJump, beginLayerJump, cancelLayerJump, isLayerJumpKey, digitFromKey,
   pushLayerDigit, jumpToLayer,
 } from '/keys3d.mjs';
+// task 1106: 再接続の待ち時間と接続表示 (/, /2d と共通の規則)。
+import { createReconnect } from '/reconnect.mjs';
 
 // ===== 実モデルの数 (GGUF ヘッダ実測) =====================================
 const Q = new URLSearchParams(location.search);
@@ -1869,14 +1873,29 @@ function handleFrame(f) {
   }
 }
 
-let wsRetry = 2000, wsRef = null, liveReconnect = true;
+let wsRef = null, liveReconnect = true;
+// task 1106: 待ち時間は backoff (0.5 s から 2 倍、15 s で頭打ち)、
+// offlineAfter 回失敗したら帯を出す。文言も reconnect.mjs が作る。
+const conn = createReconnect();
+
+function applyConn() {
+  const s = conn.status();
+  if (hudEl.ws) hudEl.ws.textContent = s.label;
+  const b = document.getElementById('connbanner');
+  if (b) { b.hidden = !s.showBanner; b.textContent = s.showBanner ? s.banner : ''; }
+}
 function connectLive() {
   const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
   let ws;
-  try { ws = new WebSocket(url); } catch (e) { setTimeout(connectLive, wsRetry); return; }
+  try { ws = new WebSocket(url); } catch (e) {
+    const delay = conn.onClose();
+    applyConn();
+    setTimeout(connectLive, delay);
+    return;
+  }
   wsRef = ws;
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { hudEl.ws.textContent = 'connected'; };
+  ws.onopen = () => { conn.onOpen(); applyConn(); };
   ws.onmessage = (ev) => {
     const buf = new Uint8Array(ev.data);
     let off = 0;
@@ -1892,8 +1911,9 @@ function connectLive() {
     }
   };
   ws.onclose = () => {
-    hudEl.ws.textContent = 'disconnected';
-    if (liveReconnect) setTimeout(connectLive, wsRetry);
+    const delay = conn.onClose();
+    applyConn();
+    if (liveReconnect) setTimeout(connectLive, delay);
   };
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }

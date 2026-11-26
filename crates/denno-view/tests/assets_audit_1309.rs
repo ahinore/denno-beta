@@ -172,6 +172,7 @@ const JS_MODULES: &[&str] = &[
     "/dash.mjs",
     "/keys3d.mjs",
     "/chat.mjs",
+    "/reconnect.mjs",
 ];
 
 /// /vendor/* 配下 (three.js 本体と addons)。
