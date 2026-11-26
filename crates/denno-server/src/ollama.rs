@@ -808,11 +808,11 @@ async fn await_output(
         Ok(Ok(Ok(out))) => Ok(out),
         Ok(Ok(Err(e))) => Err(OllamaError::from(crate::error_from_anyhow(e))),
         Ok(Err(e)) => Err(OllamaError::server(format!("scheduler dropped: {e}"))),
-        Err(_) => Err(OllamaError::server(format!(
+        Err(_) => Err(OllamaError::from(ApiError::gateway_timeout(format!(
             "timeout: no response from the engine within {:.1}s; \
              the request was abandoned (retry later)",
             wait.as_secs_f64()
-        ))),
+        )))),
     }
 }
 
