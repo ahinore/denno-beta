@@ -324,6 +324,12 @@ pub fn plan_env_pairs(c: &GpuConfig) -> Vec<(&'static str, String)> {
     if let Some(n) = c.pf_chunk {
         v.push(("DENNO_PF_CHUNK", n.to_string()));
     }
+    // task 1377: GPU がある前提の計画なので、**既定 off の GPU 経路**も明示で
+    // 立てる。auto に任せた環境で、これらの env を書き忘れて黙って CPU 経路に
+    // 落ちるのを防ぐ (値は int-auto で実績のある 1)。
+    // 明示 env がある環境では `apply_env_pairs` が触らない (kept 側)。
+    v.push(("DENNO_MIX_GPU", "1".to_string()));
+    v.push(("DENNO_ROUTER_GPU", "1".to_string()));
     v
 }
 
@@ -799,6 +805,8 @@ mod tests {
             "DENNO_PF_PREAD_THREADS",
             "DENNO_PF_CHUNK",
             "DENNO_EXPERT_RAM_MB",
+            "DENNO_MIX_GPU",
+            "DENNO_ROUTER_GPU",
         ] {
             std::env::remove_var(k);
         }
@@ -861,6 +869,8 @@ mod tests {
             "DENNO_PF_PREAD_THREADS",
             "DENNO_PF_CHUNK",
             "DENNO_EXPERT_RAM_MB",
+            "DENNO_MIX_GPU",
+            "DENNO_ROUTER_GPU",
         ] {
             std::env::remove_var(k);
         }
@@ -885,6 +895,9 @@ mod tests {
         assert_eq!(get("DENNO_PF_PREAD_THREADS"), None);
         assert_eq!(get("DENNO_PF_CHUNK"), None);
         assert_eq!(get("DENNO_EXPERT_RAM_MB"), None);
+        // task 1377: 既定 off の GPU 経路も auto が明示で立てる
+        assert_eq!(get("DENNO_MIX_GPU"), Some("1"));
+        assert_eq!(get("DENNO_ROUTER_GPU"), Some("1"));
 
         // expert を切る計画では expert の env を出さない (0 を書いても同じだが、
         // ログの kept/applied を読みやすくする)
@@ -892,6 +905,42 @@ mod tests {
         let pt = plan_env_pairs(&tiny);
         assert!(pt.iter().all(|(n, _)| *n != "DENNO_EXPERT_GPU"));
         assert!(pt.iter().any(|(n, v)| *n == "DENNO_EXPERT_VRAM_MB" && v == "0"));
+        // expert を切る計画でも GPU 経路の 2 本は立てる (mix / router は
+        // expert の常駐とは無関係に効く)
+        assert!(pt.iter().any(|(n, v)| *n == "DENNO_MIX_GPU" && v == "1"));
+        assert!(pt.iter().any(|(n, v)| *n == "DENNO_ROUTER_GPU" && v == "1"));
+    }
+
+    /// task 1377: `DENNO_MIX_GPU` / `DENNO_ROUTER_GPU` は auto が 1 を書くが、
+    /// 明示 env があれば触らない (従来の「手で書いた値が勝つ」の不変条件)。
+    #[test]
+    fn auto_gpu_flags_respect_explicit_env() {
+        let _g = lock();
+        for k in ["DENNO_MIX_GPU", "DENNO_ROUTER_GPU"] {
+            std::env::remove_var(k);
+        }
+        let c = plan_gpu_config(32_607, 64 * GB, 111_000_000_000, ModelQuant::Q4);
+        let pairs = plan_env_pairs(&c);
+        let (applied, kept) = apply_env_pairs(&pairs);
+        assert!(applied.contains(&"DENNO_MIX_GPU"));
+        assert!(applied.contains(&"DENNO_ROUTER_GPU"));
+        assert_eq!(std::env::var("DENNO_MIX_GPU").unwrap(), "1");
+        assert_eq!(std::env::var("DENNO_ROUTER_GPU").unwrap(), "1");
+
+        // 明示の 0 は上書きしない
+        std::env::set_var("DENNO_MIX_GPU", "0");
+        std::env::set_var("DENNO_ROUTER_GPU", "off");
+        let (applied2, kept2) = apply_env_pairs(&pairs);
+        assert!(!applied2.contains(&"DENNO_MIX_GPU"));
+        assert!(!applied2.contains(&"DENNO_ROUTER_GPU"));
+        assert!(kept2.contains(&"DENNO_MIX_GPU"));
+        assert!(kept2.contains(&"DENNO_ROUTER_GPU"));
+        assert_eq!(std::env::var("DENNO_MIX_GPU").unwrap(), "0");
+        assert_eq!(std::env::var("DENNO_ROUTER_GPU").unwrap(), "off");
+
+        for k in ["DENNO_MIX_GPU", "DENNO_ROUTER_GPU"] {
+            std::env::remove_var(k);
+        }
     }
 
     #[test]

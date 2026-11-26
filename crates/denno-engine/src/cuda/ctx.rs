@@ -1275,6 +1275,9 @@ impl CudaCtx {
             crate::mem_audit::note_module("moe_v2", PTX_MOE_V2.len());
             crate::mem_audit::note_module("gemm_q", PTX_GEMM_Q.len());
 
+            // task 1377: PDL の可否は SM で決まる。ここで 1 回だけ置く。
+            pdl::set_device_sm(maj);
+
             Ok(Self {
                 device: dev,
                 name,
@@ -1403,21 +1406,49 @@ impl CudaCtx {
             shmem,
             0,
         );
+        // task 1377: decode の鎖 (SM 90+ / ゲート on) では PDL 属性付きで発行する。
+        // 属性付きが失敗したら、その 1 回は従来の launch でやり直す (fail closed)。
+        let mut pdl_res: Option<CUresult> = None;
+        if pdl::eligible(stream) {
+            if let Some(fex) = lib.launch_ex {
+                let mut attr = pdl::programmatic_attr();
+                let cfg = pdl::launch_config(grid, block, shmem, stream, &mut attr);
+                let res = (fex)(
+                    &cfg as *const pdl::CUlaunchConfig,
+                    f,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                );
+                if res == CUDA_SUCCESS {
+                    pdl::note_launch();
+                    pdl_res = Some(res);
+                } else {
+                    pdl::note_fallback(res);
+                }
+            }
+        }
         let r = check(
-            (lib.launch)(
-                f,
-                grid.0,
-                grid.1,
-                grid.2,
-                block.0,
-                block.1,
-                block.2,
-                shmem,
-                stream,
-                args.as_mut_ptr(),
-                std::ptr::null_mut(),
-            ),
-            "cuLaunchKernel",
+            match pdl_res {
+                Some(res) => res,
+                None => (lib.launch)(
+                    f,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
+                    shmem,
+                    stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+            },
+            if pdl_res.is_some() {
+                "cuLaunchKernelEx(PDL)"
+            } else {
+                "cuLaunchKernel"
+            },
         );
         dec_kprof::op_end(kp);
         if let Some(a) = ev0 {

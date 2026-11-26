@@ -58,6 +58,8 @@ mod mix;
 mod moe_dec;
 pub(crate) mod moe_pf;
 mod pf_chain;
+// task 1377: PDL (`cuLaunchKernelEx` + PROGRAMMATIC_STREAM_SERIALIZATION)。
+pub(crate) mod pdl;
 #[cfg(test)] mod tests;
 
 pub use self::attn::*;
@@ -203,6 +205,14 @@ pub(crate) type FnCuLaunchKernel = unsafe extern "C" fn(
 
 pub(crate) type CUstream = *mut c_void;
 
+/// task 1377: PDL 付き起動 (`cuLaunchKernelEx`)。任意シンボル (Option で持つ)。
+pub(crate) type FnCuLaunchKernelEx = unsafe extern "C" fn(
+    *const pdl::CUlaunchConfig,
+    CUfunction,
+    *mut *mut c_void,
+    *mut *mut c_void,
+) -> CUresult;
+
 pub(crate) type CUevent = *mut c_void;
 
 
@@ -257,6 +267,8 @@ pub(crate) struct CudaLib {
     // s169 (P8): 位相計測 (cuEventElapsedTime)。無ければ計測は静かに OFF。
     event_elapsed_time: Option<FnCuEventElapsedTime>,
     launch: FnCuLaunchKernel,
+    // task 1377: PDL 用 (CUDA 11.8 以降)。無ければ従来の launch だけを使う。
+    launch_ex: Option<FnCuLaunchKernelEx>,
 }
 
 
@@ -682,6 +694,9 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         event_elapsed_time: sym_opt(handle, "cuEventElapsedTime")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventElapsedTime>(p) }),
         launch: std::mem::transmute(sym(handle, "cuLaunchKernel")?),
+        // task 1377: cuLaunchKernelEx は任意 (古い driver では従来経路)。
+        launch_ex: sym_opt(handle, "cuLaunchKernelEx")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuLaunchKernelEx>(p) }),
     })
 }
 
