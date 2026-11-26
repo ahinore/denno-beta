@@ -767,6 +767,173 @@ mod tests {
         assert_eq!(select_topk(&probs, 2), vec![0, 2]);
     }
 
+    /// task 922: 入力の作り方 (mode ごとに同値・±0.0・非正規数・±inf・NaN を作る)。
+    fn edge_probs(mode: usize, n: usize, seed: &mut u64) -> Vec<f32> {
+        let mut next = || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        (0..n)
+            .map(|i| match mode {
+                // 同値だらけ (5 段階)
+                0 => ((i * 37) % 5) as f32,
+                // 一様乱数 (同値なし)
+                1 => (next() >> 40) as f32 / 1.0e7,
+                // 全部同じ
+                2 => 0.25,
+                // 単調
+                3 => i as f32,
+                // ±0.0 の同値 (比較では等しいがビットは違う)
+                4 => {
+                    if i % 2 == 0 {
+                        0.0
+                    } else {
+                        -0.0
+                    }
+                }
+                // 非正規数 (同値の塊)
+                5 => f32::from_bits(1 + (i as u32 % 7)),
+                // ±inf 混在
+                6 => match i % 7 {
+                    0 => f32::INFINITY,
+                    1 => f32::NEG_INFINITY,
+                    _ => (i % 3) as f32,
+                },
+                // NaN 混在 (先頭も NaN にして走査版の規則も通す)
+                7 => {
+                    if i % 5 == 0 {
+                        f32::NAN
+                    } else {
+                        (i % 4) as f32
+                    }
+                }
+                // 巨大値の 2 値
+                8 => {
+                    if i % 3 == 0 {
+                        1.0e30
+                    } else {
+                        -1.0e30
+                    }
+                }
+                // 4 段階 (k 番目の境界に同値の塊が来やすい)
+                _ => ((i * 61) % 4) as f32 / 2.0,
+            })
+            .collect()
+    }
+
+    /// task 922: 挿入法 (`select_topk_into_fast` = decode の既定経路) が参照実装 2 つ
+    /// (`select_topk` = `select_nth_unstable_by` 版 / `select_topk_scan` = 走査版) と
+    /// **同じ集合を同じ順序で** 返すこと。
+    ///
+    /// 同値・±0.0・非正規数・±inf・NaN を混ぜ、k は 1 / 2 / k 番目が同値の塊に
+    /// 当たる形 / `MAX_K` を超える 33・64 (挿入法が nth 版へ落ちる分岐) を含める。
+    #[test]
+    fn select_topk_fast_matches_scan_on_edge_inputs() {
+        let mut seed = 0x9220_0000_0000_0001u64;
+        let mut cases = 0usize;
+        for &n in &[1usize, 2, 3, 4, 7, 8, 33, 64, 127, 512] {
+            for &k in &[1usize, 2, 3, 4, 8, 10, 32, 33, 64, n] {
+                if k > n {
+                    continue;
+                }
+                for mode in 0..10 {
+                    let probs = edge_probs(mode, n, &mut seed);
+                    let mut want = vec![0usize; k];
+                    select_topk_scan(&probs, k, &mut want);
+                    let nth = select_topk(&probs, k);
+                    let mut fast = vec![usize::MAX; k];
+                    select_topk_into_fast(&probs, k, &mut fast);
+                    assert_eq!(nth, want, "select_topk: n={n} k={k} mode={mode}");
+                    assert_eq!(fast, want, "挿入法: n={n} k={k} mode={mode}");
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 400, "場合分けが少なすぎる ({cases})");
+    }
+
+    /// mask 付き top-k の独立参照 (許可集合だけを走査する実装)。
+    fn masked_scan_ref(probs: &[f32], k: usize, allowed: &[usize]) -> Vec<usize> {
+        assert!(k <= allowed.len());
+        let mut used = vec![false; probs.len()];
+        let mut out = Vec::with_capacity(k);
+        for _ in 0..k {
+            let mut best: Option<usize> = None;
+            for &i in allowed {
+                if used[i] {
+                    continue;
+                }
+                match best {
+                    None => best = Some(i),
+                    Some(b) => {
+                        if probs[i] > probs[b] {
+                            best = Some(i);
+                        }
+                    }
+                }
+            }
+            let b = best.expect("k <= 許可数なので候補は残る");
+            used[b] = true;
+            out.push(b);
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// task 922: mask 付き top-k が「許可集合だけを走査する参照実装」と一致すること。
+    ///
+    /// 無効ビットの位置 (先頭 / 末尾 / 飛び飛び / ほぼ全部) と、同値・±0.0・NaN を
+    /// 混ぜる。許可集合が k 未満のときは mask 無しの選択へ落ちる (規則を固定)。
+    #[test]
+    fn select_topk_mask_matches_restricted_scan() {
+        let mut seed = 0x9220_0000_0000_0002u64;
+        let n = 64usize;
+        for mode in [0usize, 2, 4, 7] {
+            let probs = edge_probs(mode, n, &mut seed);
+            for &k in &[1usize, 2, 3, 4] {
+                for pattern in 0..6 {
+                    let mut m = [0u64; 1];
+                    for i in 0..n {
+                        let off = match pattern {
+                            0 => i < 2,                    // 先頭 2 個
+                            1 => i >= n - 2,               // 末尾 2 個
+                            2 => i % 7 == 0,               // 飛び飛び
+                            3 => i % 2 == 0,               // 半分
+                            4 => i < 8,                    // 先頭 8 個
+                            // 残り 2 個だけ (k=3,4 は許可不足 → フォールバック)
+                            _ => i >= 2,
+                        };
+                        if off {
+                            m[0] |= 1u64 << i;
+                        }
+                    }
+                    let allowed: Vec<usize> =
+                        (0..n).filter(|i| m[0] & (1u64 << i) == 0).collect();
+                    let got = select_topk_mask(&probs, k, &m);
+                    if allowed.len() >= k {
+                        let want = masked_scan_ref(&probs, k, &allowed);
+                        assert_eq!(
+                            got, want,
+                            "mask top-k: mode={mode} k={k} pattern={pattern}"
+                        );
+                        for &e in &got {
+                            assert_eq!(m[0] & (1u64 << e), 0, "無効 expert {e} が選ばれた");
+                        }
+                    } else {
+                        // 残りが k 未満: mask を無視した従来の選択へ落ちる。
+                        assert_eq!(
+                            got,
+                            select_topk(&probs, k),
+                            "残り不足のフォールバック: mode={mode} k={k} pattern={pattern}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// 4. k == n_expert なら全 expert を使い、dense 合成と一致する。
     ///
     /// f32 では softmax の総和が厳密に 1.0 にならないため、norm_topk_prob=true で
