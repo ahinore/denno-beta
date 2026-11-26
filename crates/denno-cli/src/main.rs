@@ -103,6 +103,11 @@ enum Commands {
         /// task 906: 解決結果を表示して終了する (サーバーは起動しない)。
         #[arg(long)]
         print_config: bool,
+        /// task 1611: 起動時の `DENNO_*` 診断を厳格にする。警告が 1 件でもあれば
+        /// サーバーを起動しない (環境変数 `DENNO_FLASH_STRICT_ENV=1` でも同じ)。
+        /// 既定は警告を stderr に出すだけで起動する。
+        #[arg(long)]
+        strict_env: bool,
     },
     /// task 861: 起動中のサーバーと話す対話 REPL (`/help` で一覧)。
     Chat {
@@ -814,6 +819,32 @@ fn flash_cfg_path(v: PathBuf, key: &str) -> Result<String> {
     })
 }
 
+/// task 1611: 起動時診断の 1 行出力。戻り値は (警告数, エラー数)。
+/// 秘密名の値は `Diag::line()` の時点で伏せられている (config::diag の契約)。
+fn print_config_diags(diags: &[config::diag::Diag]) -> (usize, usize) {
+    let mut warn = 0usize;
+    let mut err = 0usize;
+    for d in diags {
+        eprintln!("[flash] env: {}", d.line());
+        match d.level {
+            config::diag::Level::Warn => warn += 1,
+            config::diag::Level::Error => err += 1,
+        }
+    }
+    (warn, err)
+}
+
+/// task 1611: `DENNO_FLASH_STRICT_ENV` の真側の綴り
+/// (`DENNO_AUTO_CONFIG` と同じ 4 つだけ。それ以外は無効)。
+fn strict_env_from_env(env: &std::collections::BTreeMap<String, String>) -> bool {
+    matches!(
+        env.get("DENNO_FLASH_STRICT_ENV")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
 /// task 906: `serve-flash` の設定を CLI 明示値 > `DENNO_*` > 設定ファイル > 既定値
 /// の順で解決する。`--print-config` のときは表示して `Ok(None)` を返す。
 #[allow(clippy::too_many_arguments)]
@@ -830,6 +861,7 @@ fn resolve_flash_config(
     vram_budget: Option<String>,
     config_path: Option<PathBuf>,
     print_config: bool,
+    strict_env: bool,
 ) -> Result<Option<serve_flash::FlashConfig>> {
     // clap の既定値は使っていない (Option) ので、ここに入るのは明示値だけ。
     let mut cli_vals: Vec<(&'static str, String)> = Vec::new();
@@ -869,6 +901,18 @@ fn resolve_flash_config(
         None => None,
     };
     let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    // task 1611: 起動前診断 (typo / 非推奨 / 出所の食い違い / 実効値の矛盾)。
+    // denno-engine 側の `DENNO_*` は既知の設定名に近くない限り黙る
+    // (ラボの env を警告で埋めない)。`--print-config` でも警告は出す。
+    let strict = strict_env || strict_env_from_env(&env);
+    let diags = config::diag::diagnose_with(&cli_vals, &env, file.as_ref(), true);
+    let (warn, err) = print_config_diags(&diags);
+    if strict && err == 0 && !diags.is_empty() && !print_config {
+        return Err(anyhow::anyhow!(
+            "--strict-env: 警告 {warn} 件で起動を中止した (上記を直すか `--strict-env` / \
+             DENNO_FLASH_STRICT_ENV を外す)"
+        ));
+    }
     let resolved = config::resolve(&cli_vals, &env, file.as_ref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -1175,6 +1219,7 @@ fn main() -> Result<()> {
             vram_budget,
             config,
             print_config,
+            strict_env,
         } => {
             // task 906: CLI 明示値 > DENNO_* > 設定ファイル > 既定値。
             // --print-config のときはここで表示して終わる (サーバーは起動しない)。
@@ -1191,6 +1236,7 @@ fn main() -> Result<()> {
                 vram_budget,
                 config,
                 print_config,
+                strict_env,
             )? {
                 serve_flash::run(cfg)?;
             }

@@ -740,6 +740,46 @@ pub mod diag {
         cands.into_iter().map(|(n, _)| n).collect()
     }
 
+    /// serve-flash 自身が読むが `SPEC` には無い env 名 (解決には使わない)。
+    ///
+    /// `serve-flash --strict-env` を env でも立てられるようにするためのゲート。
+    /// `SPEC` に足すと `--print-config` と解決順の表に出てしまうので、ここに置く。
+    pub const KNOWN_NON_CONFIG_ENV: [&str; 1] = ["DENNO_FLASH_STRICT_ENV"];
+
+    /// serve-flash 起動時の「未知の `DENNO_*`」報告から外す名前か。
+    ///
+    /// serve-flash の設定として解決に使うのは `SPEC` の 10 本だけなので、それ以外の
+    /// `DENNO_*` はすべてこの起動では読まれない。ただし denno-engine / denno-server
+    /// が読むチューニング名は 600 本以上あり (`DENNO_PF_*` / `DENNO_EXPERT_*` など)、
+    /// ラボの env を毎回「未知」と言うと警告で埋まる。そこで既定では次だけを黙る:
+    ///
+    /// - エンジン側の名前空間 (`DENNO_FLASH_` 以外) で、設定名に近くないもの
+    /// - 既知の非設定名 (`KNOWN_NON_CONFIG_ENV`)
+    ///
+    /// `DENNO_FLASH_` 空間と、設定名に近い名前 (誤字の疑い) は残す。
+    /// 値の検査は元々「既知の名前」にしか無いので、黙っても検査は落ちない。
+    pub fn is_quiet_unknown(name: &str) -> bool {
+        if !name.starts_with("DENNO_") {
+            return false;
+        }
+        if KNOWN_NON_CONFIG_ENV.contains(&name) {
+            return true;
+        }
+        if name.starts_with("DENNO_FLASH_") {
+            return false;
+        }
+        // 秘密っぽい名前は黙らない (読まれない API キーを設定している事故を
+        // 見逃さない。値は出さず名前だけ出す)。
+        if is_secret_name(name) {
+            return false;
+        }
+        if known_env_vars().contains(&name) || DEPRECATED_ENV.iter().any(|(old, _)| *old == name) {
+            return false;
+        }
+        // 設定名に近い = 誤字の疑いがあるので報告する
+        suggest_env(name).is_empty()
+    }
+
     /// `DENNO_AUTO_CONFIG` が真偽値として解釈できる綴りか。
     /// (`denno_engine::auto_config::auto_requested` が受けるのは真側の 5 つだけ。
     /// それ以外は黙って「無効」になるので、ここで列挙して警告する。)
@@ -752,12 +792,20 @@ pub mod diag {
 
     /// env だけを見る診断 (ファイルも CLI も見ない純関数)。
     pub fn diagnose_env(env: &BTreeMap<String, String>) -> Vec<Diag> {
+        diagnose_env_with(env, false)
+    }
+
+    /// `diagnose_env` の scoped 版。`quiet_engine` が true なら
+    /// `is_quiet_unknown` の名前を `env_unknown` として報告しない
+    /// (serve-flash 起動用。ラボのエンジン env で警告を埋めない)。
+    pub fn diagnose_env_with(env: &BTreeMap<String, String>, quiet_engine: bool) -> Vec<Diag> {
         let known = known_env_vars();
         let mut out: Vec<Diag> = Vec::new();
 
         for (name, value) in env {
             let upper = name.to_ascii_uppercase();
-            let exact = known.iter().any(|k| *k == name.as_str());
+            let exact = known.iter().any(|k| *k == name.as_str())
+                || KNOWN_NON_CONFIG_ENV.contains(&name.as_str());
             let deprecated = DEPRECATED_ENV
                 .iter()
                 .find(|(old, _)| *old == upper.as_str());
@@ -781,7 +829,9 @@ pub mod diag {
             }
 
             // 大文字に直すと既知 = 大小の取り違え (接頭辞の検査より先に見る)
-            if !exact && known.iter().any(|k| *k == upper) {
+            let upper_known = known.iter().any(|k| *k == upper)
+                || KNOWN_NON_CONFIG_ENV.contains(&upper.as_str());
+            if !exact && upper_known {
                 out.push(Diag::new(
                     Level::Warn,
                     "env_case",
@@ -812,6 +862,10 @@ pub mod diag {
             }
 
             if !exact {
+                // エンジン側の env (設定名に近くない `DENNO_*`) は黙る
+                if quiet_engine && is_quiet_unknown(name) {
+                    continue;
+                }
                 let hint = match suggest_env(name) {
                     v if v.is_empty() => String::new(),
                     v => format!("。もしかして: {}", v.join(", ")),
@@ -905,7 +959,17 @@ pub mod diag {
         env: &BTreeMap<String, String>,
         file: Option<&FileConfig>,
     ) -> Vec<Diag> {
-        let mut out = diagnose_env(env);
+        diagnose_with(cli, env, file, false)
+    }
+
+    /// `diagnose` の scoped 版。`quiet_engine` の意味は `diagnose_env_with` と同じ。
+    pub fn diagnose_with(
+        cli: &[(&'static str, String)],
+        env: &BTreeMap<String, String>,
+        file: Option<&FileConfig>,
+        quiet_engine: bool,
+    ) -> Vec<Diag> {
+        let mut out = diagnose_env_with(env, quiet_engine);
 
         for key in KEYS {
             let cli_val = cli.iter().find(|(k, _)| *k == key).map(|(_, v)| v.trim());
