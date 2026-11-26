@@ -6833,6 +6833,69 @@ pub fn gdn_ba_gpu_on() -> bool {
 }
 
 
+/// task 900: `DENNO_GDN_BA_ORDER_FIX` の解釈 (純関数)。**既定 off**。
+///
+/// decode の submission は ba の出力を `xba` の beta/alpha 節域へ書く。連結済み
+/// (`FusedLinear::concat`) でデバイスが 1 発の matvec を撃つとき、その出力は
+/// **連結バッファの座標** (= 写しなし連結では GGUF のファイル順) に並ぶ。実モデルは
+/// ファイル上 alpha が先 (`range(0)=nv..2nv`, `range(1)=0..nv`) なので、従来の
+/// 「beta は先頭・alpha は nv 行目」という固定の読み方では beta と alpha が
+/// 入れ替わって scan に渡る (P864)。on にすると scan の読み出し位置を
+/// `range(i).start` にする。既定 off (ベースラインの md5 を保つ)。
+pub fn parse_gdn_ba_order_fix(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+
+/// テストが env を立てずにゲートを強制する (1 = on、2 = off、0 = env の解釈)。
+#[cfg(test)]
+static GDN_BA_ORDER_FIX_FORCE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+
+/// task 900: デバイス ba の行順補正を掛けるか (`DENNO_GDN_BA_ORDER_FIX`・既定 off)。
+pub fn gdn_ba_order_fix_on() -> bool {
+    #[cfg(test)]
+    match GDN_BA_ORDER_FIX_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_gdn_ba_order_fix(std::env::var(GDN_BA_ORDER_FIX_ENV).ok().as_deref())
+    })
+}
+
+
+/// [`GDN_BA_ORDER_FIX_ENV`] の名前。
+pub const GDN_BA_ORDER_FIX_ENV: &str = "DENNO_GDN_BA_ORDER_FIX";
+
+
+/// テストが強制を解除して env の解釈 (既定 off) に戻す。
+#[cfg(test)]
+pub fn gdn_ba_order_fix_reset_force_for_test() {
+    GDN_BA_ORDER_FIX_FORCE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+
+/// テストがゲートを強制する (`Some(true)` = on、`Some(false)` = off、`None` = 解除)。
+#[cfg(test)]
+pub fn gdn_ba_order_fix_set_for_test(v: Option<bool>) {
+    GDN_BA_ORDER_FIX_FORCE.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+
 /// task 269: beta/alpha の重み型がデバイス経路で扱えるか (純関数)。
 pub fn gdn_ba_ty_ok(ty: crate::kquant::GgmlType) -> bool {
     matches!(
@@ -7145,6 +7208,14 @@ pub struct GdnDecodeReq<'a> {
     /// 空でなければホストの `beta` / `alpha` は読まず、`xba` の beta/alpha 節域へ
     /// f32 matvec を 1 発ずつ積む (`DENNO_GDN_BA_GPU`)。
     pub ba_units: &'a [(GdnGgufUnit<'a>, usize)],
+    /// task 900: scan が読む beta / alpha の先頭行 (ba 出力ブロックの先頭から。
+    /// 単位は行 = f32)。連結済みの ba をデバイスで計算するときは、デバイス出力が
+    /// 連結バッファの座標 (= 写しなし連結では GGUF のファイル順) に並ぶので
+    /// `range(0).start` / `range(1).start`。ホスト計算 (`ba_units` 空) は staging に
+    /// 論理順で詰めるので (0, nv)。`DENNO_GDN_BA_ORDER_FIX` が off のときは常に
+    /// (0, nv) (従来の固定の読み方 = ファイル順が逆のモデルでは入れ替わる)。
+    pub ba_beta_row: usize,
+    pub ba_alpha_row: usize,
     /// ホスト正本の状態 (デバイスが古いときのシードに使う)。
     pub conv_host: &'a [f32],
     pub ssm_host: &'a [f32],
@@ -8025,11 +8096,24 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         }
         // x は xba の先頭 (従来) か mix の `mixed` (H2D を省いた回)。
         // beta/alpha は常に xba の側に置く。
-        let (px, pb) = match x_alias {
-            Some(p) => (p, e.xba.ptr()),
-            None => (e.xba.ptr(), e.xba.ptr() + (req.n_embd * 4) as CUdeviceptr),
+        //
+        // task 900: ba 出力ブロックの先頭 (`pba`) と、scan が読む beta / alpha の
+        // 位置は別物。連結済みの ba をデバイスで計算するときは単位の出力が
+        // 連結バッファ座標 (= ファイル順) に並ぶので、読み出し位置は req が持つ
+        // (`range(i).start`。補正 off では従来どおり (0, nv))。
+        let pba = match x_alias {
+            Some(_) => e.xba.ptr(),
+            None => e.xba.ptr() + (req.n_embd * 4) as CUdeviceptr,
         };
-        let pa = pb + (req.nv * 4) as CUdeviceptr;
+        let (pb, pa) = (
+            pba + (req.ba_beta_row * 4) as CUdeviceptr,
+            pba + (req.ba_alpha_row * 4) as CUdeviceptr,
+        );
+        // qkv GEMV の入力 (mix の控えがあればそれ)。
+        let px = match x_alias {
+            Some(p) => p,
+            None => e.xba.ptr(),
+        };
         // task 269: beta/alpha の f32 matvec を qkv GEMV より前に積む
         // (scan は最後なので順序は同一ストリームで保証される)。
         //
@@ -8044,7 +8128,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         };
         let ba_overlapped = ba_stream.is_some();
         for (u, off) in req.ba_units {
-            gdn_launch_ba_on(ctx, ba_stream, u, px, pb + (*off * 4) as CUdeviceptr)?;
+            gdn_launch_ba_on(ctx, ba_stream, u, px, pba + (*off * 4) as CUdeviceptr)?;
             stage_sync!("ba_gemv");
         }
         if ba_overlapped {
@@ -8343,6 +8427,8 @@ mod gdn_decode_scan_tests {
             beta: &[],
             alpha: &[],
             ba_units: &[],
+            ba_beta_row: 0,
+            ba_alpha_row: 0,
             conv_host: &[],
             ssm_host: &[],
             wconv: &[],
