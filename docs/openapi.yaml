@@ -1511,7 +1511,11 @@ components:
         - model_info
         - capabilities
         - modified_at
+        - license
       properties:
+        license:
+          type: string
+          description: Always empty (denno does not expose a model license string)
         modelfile:
           type: string
           description: Generated text, not a file on disk
