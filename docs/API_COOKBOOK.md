@@ -81,6 +81,41 @@ That is non-fatal. Pass `--vram-budget 24576` (MiB) to force a plan without
 probing. When the plan is applied it prints one line starting with
 `[auto-config] plan vram=...`.
 
+#### Small-card tiers (10 / 12 / 16 GB)
+
+`DENNO_VRAM_TOTAL_MB=<MiB>` overrides the detected total VRAM without touching
+the CLI, so the same plan can be exercised on a bigger card (the lab uses this to
+validate the 10 / 12 / 16 GB tiers). Precedence: numeric `--vram-budget` >
+`DENNO_VRAM_TOTAL_MB` > probe. `auto` / empty / `0` mean "do not override".
+
+Tier boundaries use a 256 MiB slack (`VRAM_TIER_SLACK_MB`) so real cards whose
+reported total is slightly under the nominal size land in the right tier:
+RTX 4070 reports 12,282 MiB, RTX 4080 16,376, RTX 5070 Ti 16,303. Without the
+slack a 12 GB card stays "below 12 GB", keeps the default P45 gate (0.5) and
+thrashes experts between CPU and GPU.
+
+On 10-16 GB cards the dense budget is raised to `DENSE_WORKING_SET_MB` (5,632
+MiB), the per-token dense working set (attention / ssm / gate / gdn / head /
+ple). Below it the dense LRU turns over every layer and attention falls back to
+the CPU: measured decode on UD-IQ3_XXS with a 12 GB budget was 355.8 ms/tok at
+4,505 MiB of dense weights and 18.0 ms/tok at 5,600. The expert budget for those
+tiers is `usable - dense`, so the plan fits the card.
+
+| nominal VRAM | `DENNO_GPU_WEIGHT_MB` | `DENNO_EXPERT_VRAM_MB` | `MIN_HIT` | pread / chunk | measured decode |
+| ---: | ---: | ---: | --- | --- | --- |
+| 8 GB | 2,867 | 5,160 | default 0.5 | 8 / 1024 | not measured |
+| 10 GB | 5,632 | 3,584 | default 0.5 | 8 / 1024 | 28.8 ms/tok (Q4_K_XL) |
+| 12 GB | 5,632 | 5,632 | 0 | 12 / 1536 | 25.4 ms/tok (Q4_K_XL), ~18.0 (IQ3_XXS) |
+| 16 GB | 6,144 | 9,216 | 0 | 12 / 1536 | 20.7 ms/tok (Q4_K_XL), 14.5 (IQ3_XXS) |
+| 24 GB | 9,420 | 16,957 | 0 | default | not measured |
+| 32 GB | 12,000 | 22,000 | 0 | default | 13.0 ms/tok (Q4_K_XL), 9.8-11.1 (IQ3_XXS) |
+
+Decode figures are lab measurements on an RTX 5090 with the 32 GB card
+simulated down through these budgets (lab t886a/b/c, `decode` scenario). The
+12 GB IQ3_XXS number is from a split identical to the plan within 32 MiB; the
+10 / 12 / 16 GB rows are the same binary that computes the table above.
+The `24 GB` row is the formula only, no measurement.
+
 ### 1.3 Readiness and liveness
 
 `/health` is liveness and never requires auth. `/ready` is readiness: 200 only
