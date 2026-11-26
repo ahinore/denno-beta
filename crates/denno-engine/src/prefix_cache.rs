@@ -122,8 +122,14 @@ impl PrefixCache {
         kv_len + (gdn_bytes + self.bytes_per_token - 1) / self.bytes_per_token
     }
 
-    /// prompt との LCP が最大のエントリを返す (同点は最後に使用した方)。
-    /// LCP が 0 のエントリしか無ければ None。
+    /// prompt との LCP が最大のエントリを返す (同点は先に見つかった方 =
+    /// 挿入順で先のエントリ)。LCP が 0 のエントリしか無ければ None。
+    ///
+    /// task 917 監査: 同点時の順序は「最近使われた方」ではない。同一 prompt の
+    /// 再挿入は `insert_snapshot` がその場で置き換えるため、entries の並びは
+    /// 挿入順のまま (LRU 時刻だけが更新される)。同点のどちらを復元しても
+    /// 出力は同じ (KV + 状態は復元位置まで一致している) なので、決定性のため
+    /// 走査順で固定している。
     pub fn best_match(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize)> = None; // (index, lcp)
         for (i, e) in self.entries.iter().enumerate() {
@@ -133,7 +139,7 @@ impl PrefixCache {
             }
             let better = match best {
                 None => true,
-                Some((_, bl)) => lcp > bl, // 同点は先に見つかった方 (= より最近使われた方) を維持
+                Some((_, bl)) => lcp > bl, // 同点は先に見つかった方を維持
             };
             if better {
                 best = Some((i, lcp));

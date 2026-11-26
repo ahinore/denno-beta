@@ -739,6 +739,12 @@ impl Engine {
             if restored {
                 lcp = entry_lcp;
                 hit = PrefixHit::Entry;
+                // task 917 監査: ヒットしたエントリの LRU 時刻を進める。
+                // 以前は `touch` がどこからも呼ばれず、eviction は実質
+                // 「挿入順」で選ばれていた (直前に使った文脈が先に捨てられる)。
+                // 数値経路には触れない (どのエントリを残すかだけが変わり、
+                // 捨てた場合は従来どおり full prefill にフォールバックする)。
+                self.prefix_cache.touch(idx);
             } else {
                 // 状態を持てない位置での復元要求など → フル prefill にフォールバック
                 self.caches[slot].reset();
@@ -2173,6 +2179,113 @@ mod tests {
         let out3 = e.chat(None, &m3, &params(3), |_| {}).unwrap();
         assert_eq!(e.last_prefix_hit(), PrefixHit::Entry);
         assert_eq!(out3, expect3, "2 回目のエントリ復元後の出力がフル prefill と不一致");
+    }
+
+    /// task 917: 再帰モデルで 2 つのマルチターン会話 (A, B) を交互に流す。
+    /// 各ターンの復元はエントリ経由 (KV + GDN 状態のペア) で、出力は
+    /// 「新規構築 + full prefill」の参照エンジンと完全一致する。
+    /// 片方の会話を進めても、もう片方の文脈 (エントリ) は壊れない。
+    #[test]
+    fn recurrent_two_multiturn_conversations_interleaved_bitexact() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
+        let mut e = recurrent_engine("recur", None).unwrap();
+        // この検査は文脈の混線を見る。LRU 追い出しでエントリが消えると
+        // 「full prefill に落ちて出力は一致するがヒット数が減る」ので、
+        // 予算を広げて eviction を排除する (eviction は別テスト)。
+        e.set_prefix_cache_max_tokens(4096);
+
+        let qa = ["t0", "t15", "t13"];
+        let qb = ["t1", "t2", "t3"];
+        let mut ha: Vec<(String, String)> = Vec::new();
+        let mut hb: Vec<(String, String)> = Vec::new();
+
+        for turn in 0..3 {
+            for (k, (hist, q)) in [(&mut ha, qa[turn]), (&mut hb, qb[turn])]
+                .into_iter()
+                .enumerate()
+            {
+                hist.push(("user".to_string(), q.to_string()));
+                let m: Vec<ChatMessage> = hist
+                    .iter()
+                    .map(|(r, c)| ChatMessage {
+                        role: r.as_str().into(),
+                        content: c.as_str().into(),
+                    })
+                    .collect();
+                // 参照: 新規構築してこの履歴を full prefill する。
+                let mut r = recurrent_engine("recur-ref", None).unwrap();
+                let expect = r.chat(None, &m, &params(3), |_| {}).unwrap();
+                let out = e.chat(None, &m, &params(3), |_| {}).unwrap();
+                if turn > 0 {
+                    assert_eq!(
+                        e.last_prefix_hit(),
+                        PrefixHit::Entry,
+                        "会話{} turn{}: GDN 状態付きエントリから復元していない",
+                        if k == 0 { "A" } else { "B" },
+                        turn + 1
+                    );
+                }
+                assert_eq!(
+                    out,
+                    expect,
+                    "会話{} turn{}: 復元後の出力が full prefill と不一致",
+                    if k == 0 { "A" } else { "B" },
+                    turn + 1
+                );
+                hist.push(("assistant".to_string(), out.text));
+            }
+        }
+        // 2 会話 × 3 ターンぶんのエントリが残っている (片方が潰されていない)。
+        assert!(
+            e.prefix_cache_entries() >= 4,
+            "エントリ数 {} が少なすぎる (会話の文脈が捨てられた)",
+            e.prefix_cache_entries()
+        );
+    }
+
+    /// task 917 監査: エントリ復元で LRU 時刻が更新される。
+    ///
+    /// 修正前は `PrefixCache::touch` がエンジンから一度も呼ばれず、eviction は
+    /// 実質「挿入順」で選ばれていた (直前に復元した文脈が先に捨てられる)。
+    /// ここでは「長い親エントリ L を短い要求 S が部分復元する」形を使う
+    /// (S の再挿入は S 自身のエントリを更新するだけで、復元元の L は
+    ///  touch しない限り LRU 時刻が古いまま残る)。
+    #[test]
+    fn prefix_cache_hit_refreshes_lru() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
+        let mut e = dummy_engine("m", None).unwrap();
+        // 長い親プロンプト L (2 ターン) と短い要求 S/D (1 ターン)。
+        let l_msgs = msgs_multi(&[("user", "t0"), ("assistant", "t5"), ("user", "t15")]);
+        let s_msgs = msgs("t0"); // L の先頭 5 トークンと一致する短い要求
+        let d_msgs = msgs("t15"); // L とは 3 トークン目で分かれる別要求
+        let len_of = |m: &[ChatMessage]| {
+            let p = e.tok.apply_chat_template(None, m, None, None).unwrap();
+            e.tok.encode(&p).unwrap().len()
+        };
+        let (ll, sl, dl) = (len_of(&l_msgs), len_of(&s_msgs), len_of(&d_msgs));
+        assert!(ll > sl, "親プロンプトが短い要求より長くない ({ll} vs {sl})");
+        // L + D がちょうど収まり、S の挿入で 1 本あふれる予算。
+        e.set_prefix_cache_max_tokens(ll + dl);
+
+        e.chat(None, &l_msgs, &params(3), |_| {}).unwrap();
+        e.chat(None, &d_msgs, &params(3), |_| {}).unwrap();
+        assert_eq!(e.prefix_cache_entries(), 2);
+
+        // S は L の接頭辞 → エントリ復元 (ヒット)。L の LRU 時刻が進む。
+        e.chat(None, &s_msgs, &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::Entry);
+        assert_eq!(e.prefix_cache_entries(), 2, "予算内に収まっていない");
+
+        // 直後に L をもう一度要求すると、L が生き残っていればエントリ復元。
+        // (touch が無いと LRU=挿入順で L が捨てられ、Live 経路に落ちる)
+        e.chat(None, &l_msgs, &params(3), |_| {}).unwrap();
+        assert_eq!(
+            e.last_prefix_hit(),
+            PrefixHit::Entry,
+            "ヒットした L が LRU で先に捨てられた (touch が効いていない)"
+        );
     }
 
     /// A4: 部分一致 (LCP < エントリ prompt 長) の prompt では再帰モデルは
