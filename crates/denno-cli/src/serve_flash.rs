@@ -4293,12 +4293,17 @@ fn apply_auto_config(
     let req = budget
         .and_then(ac::VramBudget::parse)
         .unwrap_or(ac::VramBudget::Auto);
-    let vram = match req.vram_mb() {
+    // task 886: 数値の `--vram-budget` が最優先、次に `DENNO_VRAM_TOTAL_MB`、
+    // 最後に実カードの検出 (lab の COND は env しか渡せないため)。
+    let vram = match req.vram_mb().or_else(|| {
+        ac::vram_total_override(std::env::var(ac::VRAM_TOTAL_ENV).ok().as_deref())
+    }) {
         Some(n) => n,
         None => ac::probe_vram_mb().ok_or_else(|| {
             anyhow::anyhow!(
                 "VRAM を検出できない (cuda feature 無し / libcuda 無し)。\
-                 `--vram-budget <MiB>` で総 VRAM を明示できる"
+                 `--vram-budget <MiB>` か `{}` で総 VRAM を明示できる",
+                ac::VRAM_TOTAL_ENV
             )
         })?,
     };
