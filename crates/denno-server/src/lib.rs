@@ -1443,6 +1443,8 @@ async fn rate_limit_middleware(
 ) -> Response {
     if limiter.is_enabled() && req.method() != axum::http::Method::OPTIONS {
         if let ratelimit::Decision::Deny { retry_after_secs } = limiter.check(req.uri().path()) {
+            // task 1011: `/metrics` の拒否カウンタ (Relaxed の原子加算 1 回)。
+            metrics::record_rate_limit_rejection();
             return ratelimit::too_many_requests_response(retry_after_secs);
         }
     }
@@ -1674,35 +1676,20 @@ const CACHE_STATS_PATH: &str = "/v1/cache/stats";
 /// `DELETE /v1/cache` のパス。
 const CACHE_FLUSH_PATH: &str = "/v1/cache";
 
-/// prefix 再利用したリクエスト数 (累積)。
-static PREFIX_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-/// 再利用なし (フル prefill) だったリクエスト数 (累積)。
-static PREFIX_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-/// 再利用した先頭トークン数の合計 (累積)。
-static PREFIX_CACHE_REUSED_TOKENS: AtomicU64 = AtomicU64::new(0);
-
-/// 完了したリクエスト 1 本ぶんの prefix 再利用を数える。
+/// 完了したリクエスト 1 本ぶんの prefix 再利用を数える (task 1011: 計器本体は
+/// [`metrics`] に移した。`/metrics` と `/v1/cache/stats` が同じ値を読む)。
 ///
 /// `reused` は KV prefix cache から使い回した先頭トークン数
 /// (`ChatOutput::cache_read_input_tokens`)。ホットパスでは Relaxed の
 /// 原子加算 1〜2 回だけで、ロックも確保もしない。失敗 / 打ち切りで完走しなかった
 /// リクエストは数えない (再利用の実績ではないため)。
 pub fn record_prefix_cache_reuse(reused: usize) {
-    if reused > 0 {
-        PREFIX_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-        PREFIX_CACHE_REUSED_TOKENS.fetch_add(reused as u64, Ordering::Relaxed);
-    } else {
-        PREFIX_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-    }
+    metrics::record_prefix_cache_reuse(reused);
 }
 
 /// 累積カウンタ `(hits, misses, total_reused_tokens)` を読む (状態は変えない)。
 pub fn prefix_cache_counters() -> (u64, u64, u64) {
-    (
-        PREFIX_CACHE_HITS.load(Ordering::Relaxed),
-        PREFIX_CACHE_MISSES.load(Ordering::Relaxed),
-        PREFIX_CACHE_REUSED_TOKENS.load(Ordering::Relaxed),
-    )
+    metrics::prefix_cache_counters()
 }
 
 /// `/v1/cache/stats` の本文。
