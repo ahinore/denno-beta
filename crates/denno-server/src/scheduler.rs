@@ -49,6 +49,25 @@
 //!   KV スロットを解放してクライアントへエラーを返す (生成そのものは中断できない —
 //!   エンジンロックを握った 1 ステップが返ってきた境界で必ず整理する)。
 //!   打ち切り理由は [`RunStats`] に数える (切断 / 期限 / エラー)。
+//!
+//! - task 1041: 受付公平性の監査 (実装は変えず、不変条件を明文化 + テストで固定)。
+//!   受付キューは `mpsc::sync_channel` の FIFO で、worker は空きスロットがある限り
+//!   先頭から pull し、pull 順に prefill する — つまり **受付順 = 実行開始順**。
+//!   ジョブ種 (`Job::Chat` / `Stream` / `OpenaiStream`) とプロトコル (Anthropic /
+//!   OpenAI / Ollama) はキュー上で同格で、経路ごとの優先度は無い。飢餓は
+//!   [`Limits::admit`] (受付 → 実行開始の上限) と [`Limits::stall`] (無進捗の上限)
+//!   で有界。飽和 (キュー満杯) の応答はハンドラ側のプロトコル別マッピング
+//!   (Anthropic 503 `overloaded_error` / OpenAI 429 `rate_limit_exceeded` /
+//!   Ollama 503) + `Retry-After` に委ね、スケジューラは [`QueueFull`] だけを返す。
+//!   検証は `crates/denno-server/tests/scheduler_fair_1041.rs`。
+//!
+//!   既知の限界 (挙動は変えていない):
+//!   - キュー内でクライアントが切断したジョブは、worker が pull して admit で
+//!     切断を検知するまでキュー容量を占有する。スロットが埋まっている間は
+//!     新規クライアントが 503 を見ることがある (公平性ではなく容量の話)。
+//!   - worker が死んで `try_send` が `Disconnected` を返す場合も [`QueueFull`]
+//!     として返す (`submit_*` の戻り値型を広げないため)。ワーカーの死活は
+//!     `/ready` (`Lifecycle::worker_alive`) が別途報告する。
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
