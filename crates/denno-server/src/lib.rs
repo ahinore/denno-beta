@@ -1193,6 +1193,9 @@ pub fn router_with_body_limit(
             async move { cors_middleware(cors, req, next).await }
         }))
         .layer(axum::middleware::from_fn(log_requests))
+        // task 1036: 最も外側で全応答 (404 / 405 / 413 / 429 / SSE を含む) に
+        // ヘッダ衛生 (nosniff / cache-control / x-accel-buffering / charset) を付ける。
+        .layer(axum::middleware::from_fn(header_hygiene))
         .with_state(state)
 }
 
@@ -1431,6 +1434,69 @@ fn openai_error_response(status: StatusCode, code: &str, message: String) -> Res
     (status, Json(body)).into_response()
 }
 
+
+// ---------- task 1036: HTTP ヘッダ衛生 ----------
+
+/// task 1036: 推論系のパス (生成内容を含むのでキャッシュ禁止にする)。
+///
+/// パスは [`router_with_body_limit`] が登録するルートと同じ定数で持つ
+/// (クエリは [`is_inference_path`] の呼び出し側で落とす)。
+pub const INFERENCE_PATHS: &[&str] = &[
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/api/chat",
+    "/api/generate",
+];
+
+/// task 1036: 推論系のパスか (完全一致)。
+pub fn is_inference_path(path: &str) -> bool {
+    INFERENCE_PATHS.contains(&path)
+}
+
+/// task 1036: 全応答に付けるヘッダ衛生層。
+///
+/// - `x-content-type-options: nosniff` を全応答に付ける (MIME スニッフィング禁止)。
+/// - SSE (`text/event-stream`) は `cache-control: no-store` と
+///   `x-accel-buffering: no` (nginx 等のプロキシが chunk を溜めない) を付ける。
+///   content-type は `text/event-stream` のまま (SSE は仕様上 UTF-8)。
+/// - 推論系の応答と `/metrics` は `cache-control: no-store`。
+/// - 2xx/3xx の `application/json` / `text/*` は `charset=utf-8` を補う
+///   (既に charset があるものは触らない)。
+///
+/// エラー封筒の `content-type` は既存テストが完全一致で固定しているので
+/// そのまま (`application/json`、charset 無し) にする。
+async fn header_hygiene(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut resp = next.run(req).await;
+    let status = resp.status();
+    set_header_str(&mut resp, "x-content-type-options", "nosniff");
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ct.starts_with("text/event-stream") {
+        set_header_str(&mut resp, "cache-control", "no-store");
+        set_header_str(&mut resp, "x-accel-buffering", "no");
+        // content-type は触らない (`text/event-stream` の完全一致を固定する
+        // 既存テスト (drain_edge_1274) があるため。SSE は仕様上 UTF-8)。
+        return resp;
+    }
+    if is_inference_path(&path) || path == "/metrics" {
+        set_header_str(&mut resp, "cache-control", "no-store");
+    }
+    if status.is_success() && !ct.contains("charset") {
+        if ct.starts_with("application/json") {
+            set_header_str(&mut resp, "content-type", "application/json; charset=utf-8");
+        } else if ct.starts_with("text/") {
+            set_header_str(&mut resp, "content-type", &format!("{ct}; charset=utf-8"));
+        }
+    }
+    resp
+}
 
 /// task 931: 推論エンドポイントのレート制限層。
 ///
