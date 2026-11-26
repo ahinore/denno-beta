@@ -307,16 +307,28 @@ enum Commands {
     },
     /// task 941: GGUF のトークナイザ・メタデータだけで文字列をトークン化する
     /// (重みは読まない)。トークン数 / id / 復号した断片を出す。
+    /// task 1111: `--system` / `--user` か `--messages-json` を渡すと、
+    /// chat_template を描画したプロンプトを数えるプレビューになる。
     Tokenize {
         /// 単一の GGUF か、分割 GGUF のあるディレクトリ
         #[arg(long)]
         dir: PathBuf,
         /// トークン化する文字列 (空文字列 `""` も指定できる)
-        #[arg(long, conflicts_with = "stdin")]
+        #[arg(long, conflicts_with_all = ["stdin", "system", "user", "messages_json"])]
         text: Option<String>,
         /// 標準入力から UTF-8 のテキストを読む
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["system", "user", "messages_json"])]
         stdin: bool,
+        /// チャットプレビュー: system メッセージ (--user と組で使う)
+        #[arg(long, conflicts_with = "messages_json")]
+        system: Option<String>,
+        /// チャットプレビュー: user メッセージ (chat_template で描画して数える)
+        #[arg(long, conflicts_with = "messages_json")]
+        user: Option<String>,
+        /// チャットプレビュー: `{"messages":[{"role","content"},...]}` か
+        /// `[{"role","content"},...]` の JSON ファイル
+        #[arg(long)]
+        messages_json: Option<PathBuf>,
         /// 機械可読な JSON で出力する
         #[arg(long)]
         json: bool,
@@ -1192,11 +1204,28 @@ fn main() -> Result<()> {
         Commands::Inspect { path, json, expert_cache_mib } => {
             inspect::run(&path, json, expert_cache_mib)?;
         }
-        Commands::Tokenize { dir, text, stdin, json } => {
+        Commands::Tokenize {
+            dir,
+            text,
+            stdin,
+            system,
+            user,
+            messages_json,
+            json,
+        } => {
             // task 941: 失敗は終了コードを分けて返す (2=使い方 / 3=GGUF /
             // 4=標準入力が UTF-8 でない)。main の `?` だとすべて 1 になるため
             // ここだけ自前で stderr に出して exit する。
-            if let Err(e) = tokenize::run(&dir, text.as_deref(), stdin, json) {
+            let args = tokenize::RunArgs {
+                dir: &dir,
+                text: text.as_deref(),
+                stdin,
+                system: system.as_deref(),
+                user: user.as_deref(),
+                messages_json: messages_json.as_deref(),
+                json,
+            };
+            if let Err(e) = tokenize::run(args) {
                 use std::io::Write;
                 let _ = writeln!(std::io::stderr(), "denno tokenize: {}", e.message);
                 std::process::exit(e.code);

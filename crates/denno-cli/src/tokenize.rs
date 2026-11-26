@@ -8,10 +8,20 @@
 //!
 //! 出すもの: トークン数 / トークン id / 断片 (復号した文字列) / 全体の復号結果。
 //!
+//! task 1111: チャットプレビュー。`--system <TEXT>` / `--user <TEXT>` か
+//! `--messages-json <PATH>` を渡すと、GGUF の `tokenizer.chat_template` で
+//! プロンプトを描画してから同じ形 (トークン数 / id / 断片) で出す。描画結果は
+//! `chat.rendered` (JSON) と `prompt:` 行 (テキスト) に載る。テンプレートが
+//! 無い / 描画できない GGUF は推測で組まずに 3 で落ちる。
+//! 既存の `--text` / `--stdin` の出力 (JSON のキーと意味) は変えない:
+//! `chat` キーはチャットプレビューのときだけ現れる。
+//!
 //! 終了コード (呼び出し側が機械的に分けられるようにする):
 //! - 0: 成功 (空入力も成功 = 0 トークン)
-//! - 2: 使い方の誤り (`--text` も `--stdin` も無い)
-//! - 3: GGUF / トークナイザを読めない (パスが無い・.gguf が無い・壊れている)
+//! - 2: 使い方の誤り (`--text` も `--stdin` も無い / 入力源の同時指定 /
+//!      `--messages-json` が無い・読めない・JSON として壊れている)
+//! - 3: GGUF / トークナイザを読めない (パスが無い・.gguf が無い・壊れている・
+//!      chat_template が無い)
 //! - 4: 標準入力が UTF-8 でない
 //!
 //! 数値経路 (推論) には触れない。既定の挙動は不変。
@@ -66,6 +76,25 @@ pub struct TokenEntry {
     pub raw: String,
 }
 
+/// チャットプレビューの 1 メッセージ (描画に渡した形のまま)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatMessageEntry {
+    pub role: String,
+    pub content: String,
+}
+
+/// task 1111: `--system` / `--user` / `--messages-json` のプレビュー情報。
+///
+/// `rendered` が chat_template の描画結果で、`token_count` / `tokens` /
+/// `decoded` / `text_bytes` / `text_chars` はすべてこの文字列に対する値。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatPreview {
+    pub system: Option<String>,
+    pub messages: Vec<ChatMessageEntry>,
+    /// chat_template を描画した生のプロンプト (トークン化の入力そのもの)
+    pub rendered: String,
+}
+
 /// `denno tokenize` の結果。`--json` はこれをそのまま出す。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TokenizeReport {
@@ -83,6 +112,10 @@ pub struct TokenizeReport {
     pub tokens: Vec<TokenEntry>,
     /// トークン列全体の復号結果 (入力の往復検査に使える)
     pub decoded: String,
+    /// task 1111: チャットプレビューのときだけ入る。既存の `--text` /
+    /// `--stdin` ではキー自体を出さない (JSON の互換を保つ)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatPreview>,
 }
 
 /// `--dir` から GGUF のパスを解決する。
@@ -155,6 +188,7 @@ fn analyze(
         token_count: ids.len(),
         tokens,
         decoded,
+        chat: None,
     })
 }
 
@@ -196,6 +230,18 @@ pub fn render_text(r: &TokenizeReport) -> String {
         "input: {} bytes / {} chars\n",
         r.text_bytes, r.text_chars
     ));
+    if let Some(c) = &r.chat {
+        s.push_str(&format!(
+            "chat: system={} messages={}\n",
+            if c.system.as_deref().is_some_and(|x| !x.is_empty()) {
+                "yes"
+            } else {
+                "no"
+            },
+            c.messages.len()
+        ));
+        s.push_str(&format!("prompt: \"{}\"\n", escape(&c.rendered)));
+    }
     s.push_str(&format!("tokens: {}\n", r.token_count));
     for (i, t) in r.tokens.iter().enumerate() {
         s.push_str(&format!(
@@ -209,41 +255,214 @@ pub fn render_text(r: &TokenizeReport) -> String {
     s
 }
 
+/// `denno tokenize` の引数。入力源は「テキスト」か「チャットプレビュー」の
+/// どちらか一方だけ (main 側の clap でも同じ制約を掛けている)。
+#[derive(Debug, Clone)]
+pub struct RunArgs<'a> {
+    pub dir: &'a Path,
+    /// `--text` の文字列
+    pub text: Option<&'a str>,
+    /// `--stdin` を読む
+    pub stdin: bool,
+    /// `--system` (チャットプレビュー)
+    pub system: Option<&'a str>,
+    /// `--user` (チャットプレビュー)
+    pub user: Option<&'a str>,
+    /// `--messages-json <PATH>` (チャットプレビュー)
+    pub messages_json: Option<&'a Path>,
+    /// `--json`
+    pub json: bool,
+}
+
+/// task 1111: `--messages-json` の JSON を (system, messages) に解く。
+///
+/// 受ける形は 2 つ:
+/// - `[{"role": "user", "content": "..."}, ...]`
+/// - `{"system": "...", "messages": [...]}` (`system` は省略可)
+///
+/// 壊れている / 形が違うときは終了コード 2 の理由を返す (呼ぶ側がパスを前置する)。
+fn parse_messages_json(
+    raw: &str,
+) -> std::result::Result<(Option<String>, Vec<ChatMessageEntry>), TokenizeError> {
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        TokenizeError::usage(format!(
+            "JSON として読めない: {e} ([{{\"role\":\"user\",\"content\":\"...\"}}] か \
+             {{\"messages\":[...]}} の形で書く)"
+        ))
+    })?;
+    let (system, arr) = match &v {
+        serde_json::Value::Array(a) => (None, a),
+        serde_json::Value::Object(o) => {
+            let system = match o.get("system") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return Err(TokenizeError::usage(
+                        "system が文字列でない (文字列で書く)".to_string(),
+                    ))
+                }
+            };
+            let arr = o.get("messages").and_then(|m| m.as_array()).ok_or_else(|| {
+                TokenizeError::usage(
+                    "messages が配列でない ({\"messages\":[{\"role\":...,\"content\":...}]} の形で書く)"
+                        .to_string(),
+                )
+            })?;
+            (system, arr)
+        }
+        _ => {
+            return Err(TokenizeError::usage(
+                "配列か {\"messages\":[...]} のオブジェクトで書く".to_string(),
+            ))
+        }
+    };
+    if arr.is_empty() {
+        return Err(TokenizeError::usage(
+            "messages が空 (role と content を持つ要素を 1 件以上書く)".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, m) in arr.iter().enumerate() {
+        let obj = m.as_object().ok_or_else(|| {
+            TokenizeError::usage(format!("messages[{i}] がオブジェクトでない"))
+        })?;
+        let role = obj.get("role").and_then(|x| x.as_str()).ok_or_else(|| {
+            TokenizeError::usage(format!("messages[{i}].role が文字列でない"))
+        })?;
+        let content = obj.get("content").and_then(|x| x.as_str()).ok_or_else(|| {
+            TokenizeError::usage(format!("messages[{i}].content が文字列でない"))
+        })?;
+        if role.is_empty() {
+            return Err(TokenizeError::usage(format!(
+                "messages[{i}].role が空 (user / assistant / system などを書く)"
+            )));
+        }
+        out.push(ChatMessageEntry {
+            role: role.to_string(),
+            content: content.to_string(),
+        });
+    }
+    Ok((system, out))
+}
+
+/// 標準入力から UTF-8 を読む。
+fn read_stdin() -> std::result::Result<String, TokenizeError> {
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|e| TokenizeError::new(EXIT_INPUT, format!("標準入力を読めない: {e}")))?;
+    String::from_utf8(buf)
+        .map_err(|_| TokenizeError::new(EXIT_INPUT, "標準入力が UTF-8 ではない".to_string()))
+}
+
+/// `run` が入力を決めた結果 (トークナイザを開く前の段階)。
+enum Resolved {
+    Text(String),
+    Chat(Option<String>, Vec<ChatMessageEntry>),
+}
+
 /// `denno tokenize` の本体。stdout に結果を出し、終了コードを返す。
-pub fn run(
-    dir: &Path,
-    text: Option<&str>,
-    stdin: bool,
-    json: bool,
-) -> std::result::Result<(), TokenizeError> {
-    // 入力の選び方: ちょうど 1 つ。両方/どちらも無しは使い方の誤り。
-    let input: String = match (text, stdin) {
-        (Some(t), false) => t.to_string(),
-        (None, true) => {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .map_err(|e| TokenizeError::new(EXIT_INPUT, format!("標準入力を読めない: {e}")))?;
-            String::from_utf8(buf).map_err(|_| {
-                TokenizeError::new(EXIT_INPUT, "標準入力が UTF-8 ではない".to_string())
-            })?
-        }
-        (Some(_), true) => {
+pub fn run(args: RunArgs<'_>) -> std::result::Result<(), TokenizeError> {
+    let RunArgs {
+        dir,
+        text,
+        stdin,
+        system,
+        user,
+        messages_json,
+        json,
+    } = args;
+    let chat_mode = system.is_some() || user.is_some() || messages_json.is_some();
+
+    // 先に入力源を決める。使い方の誤りと --messages-json の失敗は GGUF を
+    // 開く前に返す (2 が 3 に化けないようにする)。
+    let resolved = if chat_mode {
+        // テキスト入力とチャットプレビューは混ぜない (どちらを数えたのか
+        // 分からなくなるため)。clap の conflicts と二重に守る。
+        if text.is_some() || stdin {
             return Err(TokenizeError::usage(
-                "--text と --stdin は同時に指定できない",
-            ))
+                "--text / --stdin と --system / --user / --messages-json は同時に指定できない",
+            ));
         }
-        (None, false) => {
-            return Err(TokenizeError::usage(
-                "--text <str> か --stdin のどちらかを指定する",
-            ))
+        if let Some(path) = messages_json {
+            if system.is_some() || user.is_some() {
+                return Err(TokenizeError::usage(
+                    "--messages-json と --system / --user は同時に指定できない",
+                ));
+            }
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                TokenizeError::usage(format!(
+                    "--messages-json {} を読めない: {e} (UTF-8 の JSON ファイルを指定する)",
+                    path.display()
+                ))
+            })?;
+            let (system, messages) = parse_messages_json(&raw).map_err(|e| TokenizeError {
+                code: e.code,
+                message: format!("--messages-json {}: {}", path.display(), e.message),
+            })?;
+            Resolved::Chat(system, messages)
+        } else {
+            let Some(user) = user else {
+                return Err(TokenizeError::usage(
+                    "--system を使うときは --user も指定する",
+                ));
+            };
+            Resolved::Chat(
+                system.map(|s| s.to_string()),
+                vec![ChatMessageEntry {
+                    role: "user".to_string(),
+                    content: user.to_string(),
+                }],
+            )
         }
+    } else {
+        Resolved::Text(match (text, stdin) {
+            (Some(t), false) => t.to_string(),
+            (None, true) => read_stdin()?,
+            (Some(_), true) => {
+                return Err(TokenizeError::usage(
+                    "--text と --stdin は同時に指定できない",
+                ))
+            }
+            (None, false) => {
+                return Err(TokenizeError::usage(
+                    "--text <str> か --stdin のどちらかを指定する",
+                ))
+            }
+        })
     };
 
     let paths = gguf_paths(dir)?;
     let tok = load_tokenizer(&paths)?;
-    let report = analyze(dir, &paths, &tok, &input)
+    let (input, chat) = match resolved {
+        Resolved::Text(t) => (t, None),
+        Resolved::Chat(system, messages) => {
+            let pairs: Vec<(String, String)> = messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect();
+            // 描画は engine と同じ minijinja 経路 (enable_thinking=false は
+            // encode_chat / 1 ターンと同じ条件)。
+            let rendered = tok
+                .render_messages(system.as_deref(), &pairs, None, false)
+                .ok_or_else(|| {
+                    TokenizeError::load(
+                        "GGUF に tokenizer.chat_template が無いか、描画に失敗した \
+                         (chat_template を持つモデルを指定する)",
+                    )
+                })?;
+            let preview = ChatPreview {
+                system,
+                messages,
+                rendered: rendered.clone(),
+            };
+            (rendered, Some(preview))
+        }
+    };
+
+    let mut report = analyze(dir, &paths, &tok, &input)
         .map_err(|e| TokenizeError::load(format!("トークン化に失敗: {e:#}")))?;
+    report.chat = chat;
     if json {
         println!("{}", serde_json::to_string_pretty(&report).map_err(|e| {
             TokenizeError::load(format!("JSON にできない: {e}"))
