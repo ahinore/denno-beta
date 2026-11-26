@@ -18,6 +18,11 @@
 //! ここは「数える・見積もる・整形する」だけ。カーネル引数・発行順・丸め順は
 //! 1 つも変えない。`cuda.rs` 側の変更は集計とログの抑制だけで、GPU に渡す値は
 //! 同一 (ビット一致の議論が不要な種類の変更)。
+//!
+//! task 932: 見積り式と診断 1 行の監査。本数の保存 (`dev + host + expert`),
+//! Q8_0 作り直しの見積り, KV / staging の線形性, MiB の丸め (0.5 で切り上げ・
+//! 飽和), LRU の会計 (`used_bytes` = 記帳の和, 使用中は退避しない),
+//! `plan_weight_evictions` の空き VRAM 余裕の扱いをユニットテストで縛る。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1273,5 +1278,290 @@ mod tests {
     fn arena_chunk_matches_cuda() {
         // cuda.rs の ARENA_CHUNK と drift しないこと (推定と実装の式を縛る)。
         assert_eq!(SCRATCH_ARENA_CHUNK, crate::cuda::ARENA_CHUNK as u64);
+    }
+
+    // ---- task 932: 見積り式と診断整形の監査 -------------------------------
+
+    /// 分類は本数を保存する (dev + host + expert = 入力数)。expert の次元は
+    /// staging 見積り (max_k / max_n) に混ざらない。
+    #[test]
+    fn classify_conserves_tensor_counts() {
+        let rows = vec![
+            t("blk.0.attn_q.weight", GgmlType::Q8_0, 4096, 4096, 100),
+            t("blk.0.attn_k.weight", GgmlType::IQ3S, 4096, 1024, 90),
+            t("blk.0.ffn_gate_exps.weight", GgmlType::Q4K, 4096, 2048, 80),
+            t("blk.0.ffn_down_exps.weight", GgmlType::Q5K, 4096, 2048, 70),
+            t("blk.0.ffn_gate_inp.weight", GgmlType::F32, 4096, 8, 60),
+            t("output_norm.weight", GgmlType::F32, 4096, 1, 50),
+        ];
+        let w = classify_weights(rows.iter().map(|r| (r.0.as_str(), r.1, r.2, r.3)));
+        assert_eq!(w.dev_tensors + w.host_tensors + w.expert_tensors, rows.len());
+        assert_eq!(w.expert_tensors, 2);
+        assert_eq!(w.expert_bytes, 150);
+        assert_eq!(w.dev_tensors, 2, "Q8_0 と IQ3S (Q8 へ作り直し)");
+        assert_eq!(w.host_tensors, 2);
+        assert_eq!(w.max_k, 4096);
+        assert_eq!(w.max_n, 4096, "expert の n=2048 を混ぜていない");
+        // `_exps.weight` で終わる名前だけが expert。
+        let bak = classify_weights([(
+            "blk.0.ffn_gate_exps.weight.bak",
+            GgmlType::Q4K,
+            [4096, 8, 1, 1],
+            1,
+        )]);
+        assert_eq!((bak.expert_tensors, bak.dev_tensors), (0, 1));
+    }
+
+    /// Q4_0 / Q6K も `maybe_requant` で Q8_0 に作り直されてから載る
+    /// (Q4_0 用の別レジストリとは別経路)。Q4 のままの過小見積りにしない。
+    #[test]
+    fn q4_0_and_q6k_are_estimated_as_q8_on_device() {
+        for ty in [GgmlType::Q4_0, GgmlType::Q6K] {
+            assert!(is_requantized_to_q8(ty), "{ty:?}");
+            assert!(!is_device_weight(ty), "{ty:?}");
+            let w = classify_weights([("blk.0.attn_q.weight", ty, [4096, 3, 1, 1], 1)]);
+            assert_eq!(w.dev_bytes, 3 * (4096 / 32 * 34), "{ty:?}");
+            assert_eq!(w.dev_tensors, 1);
+        }
+    }
+
+    /// MiB の丸めは 0.5 MiB で切り上がり、飽和する (budget_line 経由で見る)。
+    #[test]
+    fn budget_line_mib_rounds_half_up_and_saturates() {
+        let mk = |bytes: u64| FlashBudget {
+            max_ctx: 0,
+            weights_dev: bytes,
+            weights_dev_tensors: 0,
+            staging_peak: 0,
+            arena_dev: 0,
+            kv_host_max: 0,
+            host_weights: 0,
+            experts_ram: 0,
+        };
+        for (bytes, want) in [
+            (0u64, 0u64),
+            (1, 0),
+            (524_287, 0),
+            (524_288, 1),
+            (1 << 20, 1),
+            ((1 << 20) + 524_287, 1),
+            ((1 << 20) + 524_288, 2),
+            (u64::MAX, u64::MAX >> 20),
+        ] {
+            let line = budget_line(&mk(bytes));
+            assert!(
+                line.contains(&format!("weights={want} MiB (0 本)")),
+                "bytes={bytes} want={want}: {line}"
+            );
+        }
+    }
+
+    /// flash_budget の各項: KV は層数 x ctx x kv_dim に線形、staging は
+    /// max_k + max_n に線形で ctx に依存しない、arena は q4 フラグだけ。
+    #[test]
+    fn flash_budget_terms_are_monotone_and_linear() {
+        let totals = WeightTotals {
+            dev_bytes: 7,
+            dev_tensors: 1,
+            max_k: 5120,
+            max_n: 1280,
+            ..Default::default()
+        };
+        let steps = [
+            (1usize, 64usize, 1usize),
+            (1, 64, 1024),
+            (2, 64, 1024),
+            (2, 128, 1024),
+            (2, 128, 8192),
+            (4, 256, 32768),
+        ];
+        let mut prev = flash_budget(totals, steps[0].0, steps[0].1, steps[0].2, false);
+        for (layers, kv, ctx) in steps {
+            let b = flash_budget(totals, layers, kv, ctx, false);
+            assert!(b.kv_host_max >= prev.kv_host_max);
+            assert_eq!(b.staging_peak, prev.staging_peak);
+            assert_eq!(b.weights_dev, 7);
+            assert_eq!(b.arena_dev, 0);
+            prev = b;
+        }
+        let a = flash_budget(totals, 12, 512, 16_384, false);
+        let b = flash_budget(totals, 12, 512, 32_768, false);
+        assert_eq!(b.kv_host_max, a.kv_host_max * 2, "ctx に線形");
+        assert_eq!(a.staging_peak, (5120 + 1280) * 4);
+        assert_eq!(b.staging_peak, a.staging_peak, "ctx は staging に入らない");
+        assert_eq!(flash_budget(totals, 12, 512, 16_384, true).arena_dev, SCRATCH_ARENA_CHUNK);
+    }
+
+    /// 予算 1 行: 項の順序が固定で、1 行・二重空白なし。parts は末尾にだけ付く。
+    #[test]
+    fn budget_line_field_order_is_fixed() {
+        let b = FlashBudget {
+            max_ctx: 65_536,
+            weights_dev: 5_736 << 20,
+            weights_dev_tensors: 497,
+            staging_peak: (5120 + 248_320) * 4,
+            arena_dev: SCRATCH_ARENA_CHUNK,
+            kv_host_max: 3072 << 20,
+            host_weights: 2 << 20,
+            experts_ram: 20_000 << 20,
+        };
+        let line = budget_line(&b);
+        assert!(!line.contains('\n'), "{line}");
+        assert!(!line.contains("  "), "二重空白: {line}");
+        assert_eq!(line.trim_end(), line.as_str());
+        let order = [
+            "max_ctx=65536",
+            "weights=5736 MiB (497 本)",
+            "staging=",
+            "arena=1024 MiB",
+            "kv=3072 MiB (host, max_ctx 比例)",
+            "host_weights=2 MiB",
+            "experts=20000 MiB (mmap)",
+        ];
+        let mut at = 0;
+        for k in order {
+            let i = line[at..]
+                .find(k)
+                .unwrap_or_else(|| panic!("{k} が順序どおりに出ない: {line}"))
+                + at;
+            at = i + k.len();
+        }
+        assert_eq!(budget_line_with_parts(&b, 3), format!("{line} parts=3"));
+    }
+
+    /// 集計 1 行: 割合は 1 桁小数、試行 0 と cap 0 の表記が崩れない。
+    #[test]
+    fn summary_line_percentages_and_lru_are_consistent() {
+        let s = |up: u64, fail: u64| WeightUploadStats {
+            uploaded: up,
+            failed: fail,
+            ..Default::default()
+        };
+        assert!(summary_line(&s(0, 1)).contains("(全 1 本のうち 100.0%)"));
+        assert!(summary_line(&s(999, 1)).contains("(全 1000 本のうち 0.1%)"));
+        assert!(summary_line(&s(1, 1)).contains("(全 2 本のうち 50.0%)"));
+        let empty = summary_line(&WeightUploadStats::default());
+        assert!(empty.contains("登録を試みていない"), "{empty}");
+        assert!(empty.contains("/ 無制限 /"), "cap 0 は無制限: {empty}");
+        // cap があるときだけ「上限 N MiB」。
+        let capped = WeightUploadStats {
+            cap_bytes: 12_288 << 20,
+            ..Default::default()
+        };
+        assert!(summary_line(&capped).contains("上限 12288 MiB"));
+    }
+
+    /// LRU の会計不変条件: used_bytes は常に記帳の和、len は表の大きさ、
+    /// 退避は使用中のものを含まない、上限は (1 本だけの超過を除き) 守る。
+    #[test]
+    fn lru_accounting_stays_consistent_under_churn() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed >> 33
+        }
+        let cap = 8u64 << 20;
+        let mut lru = WeightLru::new(cap);
+        let mut live: HashMap<u64, (u64, u32)> = HashMap::new(); // uid -> (bytes, pins)
+        let mut seed = 0x5eed_u64;
+        for step in 0..400 {
+            let op = next(&mut seed) % 6;
+            let uid = next(&mut seed) % 10;
+            match op {
+                0 | 1 => {
+                    let bytes = (1 + next(&mut seed) % 3) << 20;
+                    let pinned: std::collections::HashSet<u64> = live
+                        .iter()
+                        .filter(|(_, v)| v.1 > 0)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    let victims = lru.note_insert(uid, bytes);
+                    for v in &victims {
+                        assert!(!pinned.contains(v), "step={step}: 使用中を退避した");
+                        live.remove(v);
+                    }
+                    live.insert(uid, (bytes, 0));
+                }
+                2 => lru.touch(uid),
+                3 => {
+                    if lru.pin(uid) {
+                        live.get_mut(&uid).unwrap().1 += 1;
+                    }
+                }
+                4 => {
+                    lru.unpin(uid);
+                    if let Some(e) = live.get_mut(&uid) {
+                        e.1 = e.1.saturating_sub(1);
+                    }
+                }
+                _ => {
+                    let b = lru.note_remove(uid);
+                    match live.remove(&uid) {
+                        Some((nb, _)) => assert_eq!(b, nb),
+                        None => assert_eq!(b, 0),
+                    }
+                }
+            }
+            let want_used: u64 = live.values().map(|(b, _)| *b).sum();
+            assert_eq!(lru.used_bytes(), want_used, "step={step} op={op}");
+            assert_eq!(lru.len(), live.len(), "step={step} op={op}");
+            for (k, (bytes, pins)) in &live {
+                assert_eq!(lru.pins(*k), *pins, "step={step}: pin 数がずれた");
+                assert!(lru.contains(*k) && *bytes > 0);
+            }
+            // 上限は「退避できる相手がいる間」だけ守る。使用中 (pinned) が
+            // 多いと上限を超えたままになるのが仕様 (note_insert の doc)。
+            let unpinned = live.values().filter(|(_, p)| *p == 0).count();
+            assert!(
+                lru.used_bytes() <= cap || unpinned <= 1,
+                "step={step}: 上限超過 (unpinned={unpinned})"
+            );
+        }
+    }
+
+    /// `plan_weight_evictions` は「自分」と「使用中」を落とさず、上限か
+    /// 空き VRAM (確保分 + 余裕) を満たすまで古い順に落とす。決定的。
+    #[test]
+    fn plan_weight_evictions_is_safe_and_deterministic() {
+        let mb = 1u64 << 20;
+        let run = || {
+            let mut lru = WeightLru::new(8 * 1024 * mb);
+            for uid in 1..=5u64 {
+                lru.note_insert(uid, 100 * mb);
+            }
+            lru.pin(2);
+            let v = plan_weight_evictions(&mut lru, 9, 200 * mb, 8 * 1024 * mb, Some(300));
+            (v, lru.used_bytes(), lru.evicted_tensors())
+        };
+        let (v, used, ev) = run();
+        // 空き 300 MiB に 200 MiB 確保 + 256 MiB 余裕 = 457 MiB が要る。
+        // 100 MiB を 2 本 (uid=1, 3) 落とす。使用中の 2 と自分 9 は残す。
+        assert_eq!(v, vec![1, 3], "古い順に 2 本ではない: {v:?}");
+        assert_eq!(used, 500 * mb);
+        assert_eq!(ev, 2);
+        assert_eq!(run().0, v, "同じ入力で退避列が変わった (非決定的)");
+
+        // 空きが分からない (None): 上限の分だけ。上限に余裕があるので 0 本。
+        let mut lru = WeightLru::new(8 * 1024 * mb);
+        for uid in 1..=5u64 {
+            lru.note_insert(uid, 100 * mb);
+        }
+        assert!(plan_weight_evictions(&mut lru, 9, 200 * mb, 8 * 1024 * mb, None).is_empty());
+        assert_eq!(lru.len(), 6);
+
+        // 上限 0 (既定): 空きが 1 MiB でも 1 本も落とさない = 挙動不変。
+        let mut lru = WeightLru::new(0);
+        lru.note_insert(1, 100 * mb);
+        assert!(plan_weight_evictions(&mut lru, 2, 200 * mb, 0, Some(1)).is_empty());
+
+        // 全員使用中なら余裕を満たせなくても落とさない (候補が尽きる)。
+        let mut lru = WeightLru::new(8 * 1024 * mb);
+        lru.note_insert(1, 100 * mb);
+        lru.note_insert(2, 100 * mb);
+        lru.pin(1);
+        lru.pin(2);
+        assert!(plan_weight_evictions(&mut lru, 9, 200 * mb, 8 * 1024 * mb, Some(0)).is_empty());
+        assert!(lru.contains(1) && lru.contains(2));
     }
 }
