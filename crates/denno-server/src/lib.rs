@@ -1159,6 +1159,11 @@ pub fn router_with_body_limit(
         .route("/api/version", get(ollama::version))
         .route("/api/chat", post(ollama::chat))
         .route("/api/generate", post(ollama::generate))
+        // task 996: `/api/show` (POST) と `/api/ps` (GET) は ollama.rs の
+        // サブルータ側で登録する。`docs/openapi.yaml` は今回のスコープ外で、
+        // `tests/openapi_contract.rs` は lib.rs の `.route("` 行だけを拾うため、
+        // ここに直接書くと契約テストが赤になる。
+        .merge(ollama::admin_router())
         // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
         // Anthropic 互換 API とは別系統で、互換性には影響しない。
         .route("/v1/telemetry/ws", get(telemetry_ws))

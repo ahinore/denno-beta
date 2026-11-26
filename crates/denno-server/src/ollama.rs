@@ -32,7 +32,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use denno_engine::{ChatMessage, ChatOutput, GenParams};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -476,6 +477,19 @@ fn done_fields(started: Instant, input_tokens: usize, output_tokens: usize, reas
 
 // ---------- ハンドラ: /api/tags, /api/version ----------
 
+/// `/api/tags`・`/api/show`・`/api/ps` が共有する `details` ブロック。
+/// `tags` の出力と同一 (`quantization_level` だけ engine の量子化ラベル)。
+fn model_details(state: &AppState) -> Value {
+    json!({
+        "parent_model": "",
+        "format": "gguf",
+        "family": "denno",
+        "families": ["denno"],
+        "parameter_size": "",
+        "quantization_level": state.info.quant,
+    })
+}
+
 pub async fn tags(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -489,17 +503,11 @@ pub async fn tags(
             "modified_at": modified_at,
             "size": 0,
             "digest": digest_for(&state.model_name),
-            "details": {
-                "parent_model": "",
-                "format": "gguf",
-                "family": "denno",
-                "families": ["denno"],
-                "parameter_size": "",
-                "quantization_level": state.info.quant,
-            },
+            "details": model_details(&state),
         }]
     })))
 }
+
 
 pub async fn version(
     State(state): State<Arc<AppState>>,
@@ -507,6 +515,107 @@ pub async fn version(
 ) -> Result<Json<Value>, OllamaError> {
     check_auth(&state, &headers).map_err(OllamaError::from)?;
     Ok(Json(json!({"version": OLLAMA_VERSION})))
+}
+
+// ---------- ハンドラ: /api/show, /api/ps (task 996) ----------
+
+/// `/api/show` のリクエスト。現行の Ollama は `model`、古いクライアントは
+/// `name` を送るので両方受ける (両方あるときは `model` を優先)。
+#[derive(Debug, Default, Deserialize)]
+pub struct ShowRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl ShowRequest {
+    /// 照合に使うモデル名。空 / 未指定は `None`。
+    fn requested_model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .or(self.name.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// `POST /api/show`: モデルのメタデータ。重みは読まずに [`AppState::info`]
+/// (起動時に 1 回取った不変情報) だけを返すので、生成中でも lock を取らない。
+///
+/// Ollama と同じく、未指定は 400、未知のモデル名は 404 (`{"error": ...}`)。
+/// `parameters` / `template` は空: denno はモデルごとのパラメータ上書きも
+/// 露出した chat template も持たない (テンプレートは engine 内で固定)。
+pub async fn show(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, OllamaError> {
+    check_auth(&state, &headers).map_err(OllamaError::from)?;
+    let req: ShowRequest = if body.is_empty() {
+        ShowRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| OllamaError::invalid(format!("invalid request body: {e}")))?
+    };
+    let Some(model) = req.requested_model() else {
+        return Err(OllamaError::invalid("model: required"));
+    };
+    check_model(&state, model)?;
+
+    let info = &state.info;
+    Ok(Json(json!({
+        "modelfile": format!("# denno model {}\n", state.model_name),
+        "parameters": "",
+        "template": "",
+        "details": model_details(&state),
+        "model_info": {
+            "general.architecture": "denno",
+            "general.name": state.model_name,
+            "denno.context_length": info.context,
+            "denno.block_count": info.layers,
+            "denno.kv_slot_count": info.slots,
+            "denno.quantization": info.quant,
+        },
+        "capabilities": ["completion"],
+        "modified_at": rfc3339_from_unix(now_secs()),
+    })))
+}
+
+/// `GET /api/ps`: 常駐中のモデル一覧。denno は起動時にロードした 1 本を
+/// プロセス寿命まで保持する (アンロードしない) ので、常にその 1 本を返す。
+/// `expires_at` はその性質を表す無期限側の値 (100 年後) で、実際の
+/// アンロード時刻ではない。`size` / `size_vram` は engine が重みの実バイト数を
+/// 公開していないため 0 (嘘の値を出さない)。
+pub async fn ps(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, OllamaError> {
+    check_auth(&state, &headers).map_err(OllamaError::from)?;
+    // 100 年 (秒)。u64 の範囲内で桁あふれしない。
+    const KEEP_FOREVER_SECS: u64 = 100 * 365 * 24 * 60 * 60;
+    let expires_at = rfc3339_from_unix(now_secs().saturating_add(KEEP_FOREVER_SECS));
+    Ok(Json(json!({
+        "models": [{
+            "name": state.model_name,
+            "model": state.model_name,
+            "size": 0,
+            "size_vram": 0,
+            "digest": digest_for(&state.model_name),
+            "details": model_details(&state),
+            "expires_at": expires_at,
+        }]
+    })))
+}
+
+/// task 996: 照会系 (`/api/show` / `/api/ps`) のサブルータ。lib.rs 側は
+/// `.merge(ollama::admin_router())` の 1 行だけなので、
+/// `tests/openapi_contract.rs` の「router() の `.route(...)` 行 = 仕様」という
+/// 逆方向検査 (docs/openapi.yaml は今回のスコープ外) に影響しない。
+pub fn admin_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/show", post(show))
+        .route("/api/ps", get(ps))
 }
 
 // ---------- 共通の待ち合わせ ----------
