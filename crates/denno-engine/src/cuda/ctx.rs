@@ -1275,8 +1275,9 @@ impl CudaCtx {
             crate::mem_audit::note_module("moe_v2", PTX_MOE_V2.len());
             crate::mem_audit::note_module("gemm_q", PTX_GEMM_Q.len());
 
-            // task 1377: PDL の可否は SM で決まる。ここで 1 回だけ置く。
-            pdl::set_device_sm(maj);
+            // task 1377: PDL の可否は SM 番号で決まる。ここで 1 回だけ置く
+            // (5090 は (12, 0)。major だけ見ると 12 < 90 で一度も付かない)。
+            pdl::set_device_sm(pdl::sm_number(maj, min));
 
             Ok(Self {
                 device: dev,

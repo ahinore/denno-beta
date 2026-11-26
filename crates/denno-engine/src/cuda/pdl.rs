@@ -38,8 +38,17 @@ pub(crate) const PDL_ENV: &str = "DENNO_CUDA_PDL";
 /// `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` (CUDA 12.x)。
 pub(crate) const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
 
-/// PDL を付けてよい最小の compute capability (major)。Hopper = 90。
+/// PDL を付けてよい最小の SM 番号。Hopper = 90、Blackwell の RTX 5090 = 120。
+///
+/// driver の `cuDeviceComputeCapability` は (major, minor) を返すので、
+/// **必ず [`sm_number`] で 1 つの番号に直してから比べる** (5090 は (12, 0) で
+/// major だけ見ると 12 < 90 になり、属性が一度も付かない。lab t1377b で踏んだ)。
 pub(crate) const MIN_PDL_SM: i32 = 90;
+
+/// (major, minor) を SM 番号にする。`(12, 0)` -> 120、`(9, 0)` -> 90。
+pub(crate) fn sm_number(major: i32, minor: i32) -> i32 {
+    major.saturating_mul(10).saturating_add(minor)
+}
 
 /// `CUlaunchAttributeValue` の実体は 64 バイトの union。driver は
 /// `programmaticStreamSerializationAllowed` (先頭 4 バイト) だけを読む。
@@ -109,9 +118,10 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| parse_enabled(std::env::var(PDL_ENV).ok().as_deref()))
 }
 
-/// `CudaCtx::new` がデバイスの compute capability を 1 回だけ置く。
-pub(crate) fn set_device_sm(major: i32) {
-    DEVICE_SM.store(major, Ordering::Relaxed);
+/// `CudaCtx::new` がデバイスの compute capability を 1 回だけ置く
+/// (引数は [`sm_number`] で直した SM 番号)。
+pub(crate) fn set_device_sm(sm: i32) {
+    DEVICE_SM.store(sm, Ordering::Relaxed);
 }
 
 /// このデバイスで PDL 属性を付けてよいか (純関数)。
@@ -324,7 +334,13 @@ mod tests {
         assert!(!eligible_with(true, 120, false, true));
         assert!(!eligible_with(true, 120, true, false));
         assert!(sm_supports(90));
+        assert!(sm_supports(120));
         assert!(!sm_supports(89));
+        // (major, minor) の生値ではなく SM 番号で比べること (lab t1377b の罠)
+        assert_eq!(sm_number(12, 0), 120);
+        assert_eq!(sm_number(9, 0), 90);
+        assert!(sm_supports(sm_number(12, 0)));
+        assert!(!sm_supports(12), "major だけを見ると 5090 を取りこぼす");
     }
 
     #[test]
