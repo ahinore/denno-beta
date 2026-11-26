@@ -457,6 +457,53 @@ impl Resolved {
         }
         out
     }
+
+    /// task 1001: 構造化サマリ。`--print-config --json` で出す形。
+    ///
+    /// キーは `KEYS` の順で 1 個ずつ、未設定なら `{"set": false, "source": "unset"}`。
+    /// 設定済みなら `set` / `value` (整数キーは JSON 数値) / `source` / `detail` /
+    /// `origin` / `spec` を持つ。`origin` は `render()` の `# source:` と同じ表記。
+    #[allow(dead_code)]
+    pub fn summary_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        for key in KEYS {
+            let entry = match self.slot(key) {
+                Some(slot) => {
+                    let kind = kind_of(key).unwrap_or(Kind::Str);
+                    let value = match kind {
+                        Kind::Int { .. } => match slot.value.trim().parse::<u64>() {
+                            Ok(n) => serde_json::Value::from(n),
+                            Err(_) => serde_json::Value::from(slot.value.clone()),
+                        },
+                        Kind::Str => serde_json::Value::from(slot.value.clone()),
+                    };
+                    let spec = match kind {
+                        Kind::Int { min, max } => {
+                            serde_json::json!({"kind": "int", "min": min, "max": max})
+                        }
+                        Kind::Str => serde_json::json!({"kind": "str"}),
+                    };
+                    serde_json::json!({
+                        "set": true,
+                        "value": value,
+                        "source": slot.source.as_str(),
+                        "detail": slot.detail,
+                        "origin": slot.origin_label(),
+                        "spec": spec,
+                    })
+                }
+                None => serde_json::json!({"set": false, "source": "unset"}),
+            };
+            obj.insert(key.to_string(), entry);
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    /// `summary_json` を整形した本文 (テストの往復用)。
+    #[allow(dead_code)]
+    pub fn render_json(&self) -> String {
+        serde_json::to_string_pretty(&self.summary_json()).unwrap_or_else(|_| "{}".to_string())
+    }
 }
 
 fn quote(s: &str) -> String {
