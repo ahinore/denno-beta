@@ -2878,6 +2878,8 @@
         #[test]
         #[ignore = "実形状の CPU マイクロベンチ (手動)"]
         fn bench_hc_mix_quant_real_shape() {
+            use crate::model::linear_gguf::par_test_lock;
+            let _g = par_test_lock();
             let (hp, _norm, down, up, inject, res) = mix_q8_case(4, 2560, 320);
             let norm: Vec<f32> = (0..hp.hc * hp.n_embd)
                 .map(|i| 0.9 + ((i % 13) as f32) * 0.01)
@@ -5456,6 +5458,8 @@
         #[test]
         #[ignore = "実形状の CPU マイクロベンチ (手動)"]
         fn bench_mix_batch_real_shape() {
+            use crate::model::linear_gguf::par_test_lock;
+            let _g = par_test_lock();
             let hp = HyperParams {
                 hc: 4,
                 n_embd: 2560,
