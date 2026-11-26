@@ -585,8 +585,8 @@ impl SsmLayer {
             });
         }
         // task 900: デバイス ba の出力は連結バッファ座標 (= 写しなし連結ではファイル順)
-        // に並ぶ。scan の読み出し位置を行範囲から引く (ゲート on で有効。off は従来の
-        // (0, nv))。
+        // に並ぶ。scan の読み出し位置を行範囲から引く (既定 on。DENNO_GDN_BA_ORDER_FIX=0 で
+        // 従来の (0, nv) へ切り戻せる)。
         let ba_rows = gdn_ba_scan_rows(
             self.beta_alpha.range(0),
             self.beta_alpha.range(1),
