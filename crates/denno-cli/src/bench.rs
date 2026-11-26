@@ -29,27 +29,76 @@ const INSTRUCTION: &str = "\n\nContinue with a clear, detailed explanation of th
 // 統計
 // ---------------------------------------------------------------------------
 
+/// 非有限 f64 (NaN / ±Inf) を JSON の `null` として書き、読むときは 0.0 に落とす
+/// serde 補助 (task 1021)。
+///
+/// serde_json は NaN / ±Inf を `null` で書くが、`null` をそのまま f64 へ戻すと
+/// "invalid type: null, expected f64" になる。つまり NaN を 1 つでも含むレポートは
+/// `--json` で書いた後に `--compare` で読めない。ここで両方向を揃え、
+/// 「非有限 = 値なし = 0.0」という決定的な往復にする (0.0 は `NoValue` 判定になる)。
+pub mod finite_f64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if v.is_finite() {
+            s.serialize_f64(*v)
+        } else {
+            s.serialize_none()
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        let v = Option::<f64>::deserialize(d)?;
+        Ok(v.filter(|x| x.is_finite()).unwrap_or(0.0))
+    }
+
+    /// `Vec<f64>` 版 (`ttft_runs_ms` / `runs_tok_s`)。要素ごとに同じ規則。
+    pub mod vec {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        pub fn serialize<S: Serializer>(v: &[f64], s: S) -> Result<S::Ok, S::Error> {
+            let out: Vec<Option<f64>> = v
+                .iter()
+                .map(|x| if x.is_finite() { Some(*x) } else { None })
+                .collect();
+            out.serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+            let v = Vec::<Option<f64>>::deserialize(d)?;
+            Ok(v.into_iter()
+                .map(|x| x.filter(|y| y.is_finite()).unwrap_or(0.0))
+                .collect())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Stats {
     pub n: usize,
+    #[serde(with = "finite_f64")]
     pub mean: f64,
+    #[serde(with = "finite_f64")]
     pub median: f64,
+    #[serde(with = "finite_f64")]
     pub min: f64,
+    #[serde(with = "finite_f64")]
     pub max: f64,
+    #[serde(with = "finite_f64")]
     pub stddev: f64,
+    #[serde(with = "finite_f64")]
     pub p90: f64,
+    #[serde(with = "finite_f64")]
     pub p99: f64,
 }
 
 impl Stats {
     pub fn from_slice(xs: &[f64]) -> Stats {
-        if xs.is_empty() {
+        // 非有限サンプルは捨てる (NaN 1 つで CLI を panic させない)。
+        let mut v: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
+        if v.is_empty() {
             return Stats::default();
-        }
-        let mut v = xs.to_vec();
-        for x in v.iter() {
-            assert!(x.is_finite(), "non-finite sample in stats: {x}");
         }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = v.len();
@@ -814,11 +863,11 @@ pub struct PpRow {
     pub depth: usize,
     #[serde(default)]
     pub total_tokens: usize,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64")]
     pub ttft_ms: f64,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64")]
     pub pp_tok_s: f64,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64::vec")]
     pub ttft_runs_ms: Vec<f64>,
     #[serde(default)]
     pub error: Option<String>,
@@ -831,15 +880,15 @@ pub struct TgRow {
     pub gen_tokens: usize,
     #[serde(default)]
     pub prompt_tokens: usize,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64")]
     pub ttft_ms: f64,
     #[serde(default)]
     pub tpot_ms: Stats,
     #[serde(default)]
     pub itl_ms: Stats,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64")]
     pub tg_tok_s: f64,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64::vec")]
     pub runs_tok_s: Vec<f64>,
     #[serde(default)]
     pub error: Option<String>,
@@ -865,11 +914,11 @@ pub struct Determinism {
 pub struct Turn2 {
     #[serde(default)]
     pub depth: usize,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64")]
     pub cold_ttft_ms: f64,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64")]
     pub reuse_ttft_ms: f64,
-    #[serde(default)]
+    #[serde(default, with = "finite_f64")]
     pub speedup: f64,
     #[serde(default)]
     pub error: Option<String>,
@@ -887,6 +936,11 @@ pub struct BenchReport {
     pub context_length: Option<usize>,
     #[serde(default)]
     pub rounds: usize,
+    /// task 1021: プロンプト生成 seed。`None` は seed を記録していない古いレポート。
+    /// 比較時に両方が `Some` かつ不一致なら警告を出す (プロンプトが違う = 比較が
+    /// 意味を持たないため)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
     #[serde(default)]
     pub created_unix: u64,
     #[serde(default)]
@@ -1242,6 +1296,7 @@ pub fn run(opts: &BenchOptions) -> Result<BenchReport> {
         model,
         context_length,
         rounds: opts.rounds,
+        seed: Some(opts.seed),
         created_unix: now_unix(),
         pp: pp_rows,
         tg: tg_rows,
@@ -1349,7 +1404,12 @@ pub fn pct_delta(base: f64, new: f64) -> Option<f64> {
     if !base.is_finite() || !new.is_finite() || base == 0.0 {
         return None;
     }
-    Some((new - base) / base * 100.0)
+    let d = (new - base) / base * 100.0;
+    // 極端な桁 (1e-300 -> 1e300 など) は f64 で inf になる。表に inf を出さない。
+    if !d.is_finite() {
+        return None;
+    }
+    Some(d)
 }
 
 /// 1 行の判定。
@@ -1402,6 +1462,17 @@ pub struct CompareOutcome {
     pub regressions: usize,
     pub missing: usize,
     pub exit_fail: bool,
+    /// task 1021: 判定に使った閾値 % (None = 差分のみ)。
+    pub threshold_pct: Option<f64>,
+    /// task 1021: 両レポートが seed を記録していて、値が違う。
+    pub seed_mismatch: bool,
+    pub base_seed: Option<u64>,
+    pub new_seed: Option<u64>,
+    /// task 1021: 要約 JSON に載せる識別情報。
+    pub base_model: String,
+    pub new_model: String,
+    pub base_url: String,
+    pub new_url: String,
 }
 
 /// 1 行を組み立てる。`threshold` は退行とみなす % (絶対値)。
@@ -1413,6 +1484,9 @@ fn mk_row(
     higher_is_better: bool,
     threshold: Option<f64>,
 ) -> CompareRow {
+    // 非有限は「値なし」に畳む (表にも JSON にも inf/NaN を出さない)。
+    let base = base.filter(|x| x.is_finite());
+    let new = new.filter(|x| x.is_finite());
     let delta_pct = match (base, new) {
         (Some(b), Some(n)) => pct_delta(b, n),
         _ => None,
@@ -1425,8 +1499,10 @@ fn mk_row(
             Some(d) => {
                 let signed = if higher_is_better { d } else { -d };
                 match threshold {
-                    Some(t) if signed <= -t => Verdict::Regress,
-                    Some(t) if signed >= t => Verdict::Improve,
+                    // task 1021: 閾値ちょうどは「超えていない」ので Flat。
+                    // これが無いと `--fail-on-regress-pct 0` で無変化でも退行になる。
+                    Some(t) if signed < -t => Verdict::Regress,
+                    Some(t) if signed > t => Verdict::Improve,
                     Some(_) => Verdict::Flat,
                     None => Verdict::Flat,
                 }
@@ -1577,6 +1653,10 @@ pub fn compare_reports(
 
     let exit_fail = regressions > 0 || det_match == Some(false);
 
+    // ---- seed: 両方が記録していて違うなら、プロンプトが違う = 比較の前提が崩れる ----
+    let (base_seed, new_seed) = (base.seed, new.seed);
+    let seed_mismatch = matches!((base_seed, new_seed), (Some(a), Some(b)) if a != b);
+
     // ---- Markdown ----
     let mut s = String::new();
     s.push_str("### denno bench compare\n\n");
@@ -1586,6 +1666,13 @@ pub fn compare_reports(
     ));
     if base.model != new.model {
         s.push_str("- warning: model differs between base and new\n");
+    }
+    if seed_mismatch {
+        s.push_str(&format!(
+            "- warning: seed differs between base ({}) and new ({}); prompts are not the same\n",
+            base_seed.unwrap_or(0),
+            new_seed.unwrap_or(0)
+        ));
     }
     s.push('\n');
     s.push_str("| test | metric | base | new | delta | status |\n");
@@ -1642,6 +1729,14 @@ pub fn compare_reports(
         regressions,
         missing,
         exit_fail,
+        threshold_pct: threshold,
+        seed_mismatch,
+        base_seed,
+        new_seed,
+        base_model: base.model.clone(),
+        new_model: new.model.clone(),
+        base_url: base.url.clone(),
+        new_url: new.url.clone(),
     }
 }
 
@@ -1687,6 +1782,53 @@ pub fn render_compare_ansi(outcome: &CompareOutcome, color: bool) -> String {
         None => s.push_str(&format!("{yellow}determinism{reset} missing in one report\n")),
     }
     s
+}
+
+/// task 1021: `bench --compare --compare-json <PATH>` 用の要約 JSON。
+///
+/// 表 (markdown) と同じ内容を機械可読にしたもの。値は全て有限か null で、
+/// NaN / ±Inf は `null` になる (mk_row で畳んでいるので実際には出ない)。
+pub fn render_compare_json(outcome: &CompareOutcome) -> Result<String> {
+    fn row_json(r: &CompareRow) -> serde_json::Value {
+        serde_json::json!({
+            "case": r.case.as_str(),
+            "metric": r.metric.as_str(),
+            "base": r.base,
+            "new": r.new,
+            "delta_pct": r.delta_pct,
+            "verdict": r.verdict.label(),
+        })
+    }
+    let det = match outcome.determinism_match {
+        Some(true) => "match",
+        Some(false) => "mismatch",
+        None => "missing",
+    };
+    let rows: Vec<serde_json::Value> = outcome.rows.iter().map(row_json).collect();
+    let v = serde_json::json!({
+        "schema": "denno.bench.compare/1",
+        "base": {
+            "model": outcome.base_model.as_str(),
+            "url": outcome.base_url.as_str(),
+            "seed": outcome.base_seed,
+            "md5": outcome.base_md5,
+        },
+        "new": {
+            "model": outcome.new_model.as_str(),
+            "url": outcome.new_url.as_str(),
+            "seed": outcome.new_seed,
+            "md5": outcome.new_md5,
+        },
+        "threshold_pct": outcome.threshold_pct,
+        "seed_mismatch": outcome.seed_mismatch,
+        "determinism": det,
+        "regressions": outcome.regressions,
+        "missing": outcome.missing,
+        "exit_fail": outcome.exit_fail,
+        "rows": rows,
+        "turn2": outcome.turn2.as_ref().map(row_json),
+    });
+    Ok(serde_json::to_string_pretty(&v)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -2219,6 +2361,7 @@ mod tests {
             model: "m".to_string(),
             context_length: Some(32768),
             rounds: 3,
+            seed: None,
             created_unix: 1,
             pp: pp
                 .iter()
@@ -2430,6 +2573,144 @@ mod tests {
         std::fs::remove_file(&base).ok();
         std::fs::remove_file(&new).ok();
         std::fs::remove_dir(&dir).ok();
+    }
+
+    // ---- task 1021: NaN / ゼロ / seed の境界 ----
+
+    #[test]
+    fn stats_drops_non_finite_samples() {
+        // NaN 1 つで panic しない (以前は assert! で落ちていた)。
+        let s = Stats::from_slice(&[1.0, f64::NAN, 3.0]);
+        assert_eq!(s.n, 2);
+        assert_eq!(s.min, 1.0);
+        assert_eq!(s.max, 3.0);
+        assert!((s.mean - 2.0).abs() < 1e-12);
+        assert!(s.median == 2.0);
+
+        // 全部非有限なら空と同じ既定値。
+        let e = Stats::from_slice(&[f64::NAN, f64::INFINITY]);
+        assert_eq!(e, Stats::default());
+        assert_eq!(e.n, 0);
+    }
+
+    #[test]
+    fn nan_report_roundtrips_through_json() {
+        let mut r = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        // 測定失敗を模した非有限値。
+        r.pp[0].pp_tok_s = f64::NAN;
+        r.pp[0].ttft_ms = f64::INFINITY;
+        r.pp[0].ttft_runs_ms = vec![1000.0, f64::NAN];
+        r.tg[0].tg_tok_s = f64::NEG_INFINITY;
+        r.tg[0].tpot_ms = Stats::from_slice(&[f64::NAN]);
+        r.turn2.as_mut().unwrap().speedup = f64::NAN;
+        r.seed = Some(801);
+
+        let json = render_json(&r).expect("NaN must not break serialization");
+        assert!(
+            !json.contains("NaN") && !json.contains("inf"),
+            "JSON must not contain non-finite literals:\n{json}"
+        );
+        assert!(json.contains("null"), "non-finite must be written as null");
+
+        let back = parse_report_json(&json).expect("NaN report must parse back");
+        assert_eq!(back.pp[0].pp_tok_s, 0.0);
+        assert_eq!(back.pp[0].ttft_ms, 0.0);
+        assert_eq!(back.pp[0].ttft_runs_ms, vec![1000.0, 0.0]);
+        assert_eq!(back.tg[0].tg_tok_s, 0.0);
+        assert_eq!(back.tg[0].tpot_ms.n, 0);
+        assert_eq!(back.turn2.as_ref().unwrap().speedup, 0.0);
+        assert_eq!(back.seed, Some(801));
+        // 2 回目以降は不動点 (null -> 0.0 に畳まれた後は安定)。
+        let back2 = parse_report_json(&render_json(&back).unwrap()).unwrap();
+        assert_eq!(back2.pp[0].pp_tok_s, 0.0);
+        assert_eq!(render_json(&back2).unwrap(), render_json(&back).unwrap());
+    }
+
+    #[test]
+    fn report_seed_is_optional_for_old_reports() {
+        let r = rep(&[(512, 0, 1.0)], &[], None, None);
+        assert_eq!(r.seed, None);
+        let json = render_json(&r).unwrap();
+        assert!(
+            !json.contains("\"seed\""),
+            "legacy/None seed must be omitted:\n{json}"
+        );
+        let m = parse_report_json(&json).unwrap();
+        assert_eq!(m.seed, None);
+    }
+
+    #[test]
+    fn compare_flags_seed_mismatch() {
+        let mut a = rep(&[(512, 0, 1000.0)], &[], None, None);
+        let mut b = a.clone();
+        a.seed = Some(801);
+        b.seed = Some(802);
+        let out = compare_reports(&a, &b, None);
+        assert!(out.seed_mismatch);
+        assert!(out.markdown.contains("seed differs"));
+        assert!(!out.exit_fail, "seed の不一致は警告だけで失敗にしない");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&render_compare_json(&out).unwrap()).unwrap();
+        assert_eq!(v["seed_mismatch"], true);
+        assert_eq!(v["base"]["seed"], 801);
+        assert_eq!(v["new"]["seed"], 802);
+
+        // 片方でも未記録 (None) なら警告しない。
+        b.seed = None;
+        let out2 = compare_reports(&a, &b, None);
+        assert!(!out2.seed_mismatch);
+        assert!(!out2.markdown.contains("seed differs"));
+    }
+
+    #[test]
+    fn compare_zero_metrics_are_no_value() {
+        let a = rep(&[(512, 0, 0.0)], &[(128, 0, 0.0)], None, None);
+        let b = a.clone();
+        let out = compare_reports(&a, &b, Some(5.0));
+        assert_eq!(out.rows.len(), 2);
+        for row in &out.rows {
+            assert_eq!(row.verdict, Verdict::NoValue, "case {}", row.case);
+            assert!(row.delta_pct.is_none());
+            assert_eq!(row.base, Some(0.0));
+        }
+        assert_eq!(out.regressions, 0);
+        assert!(!out.exit_fail);
+        assert!(out.markdown.contains("| - | - | - |"));
+
+        // 比較不能な値は JSON では null。
+        let v: serde_json::Value =
+            serde_json::from_str(&render_compare_json(&out).unwrap()).unwrap();
+        assert!(v["rows"][0]["delta_pct"].is_null());
+        assert_eq!(v["rows"][0]["verdict"], "-");
+        // turn2 はレポートに無いので Missing/NoValue 側に倒れる。
+        assert_eq!(v["turn2"]["verdict"], "-");
+        assert!(v["turn2"]["base"].is_null() && v["turn2"]["new"].is_null());
+    }
+
+    #[test]
+    fn compare_json_summary_shape() {
+        let a = rep(&[(512, 0, 1000.0)], &[(128, 0, 50.0)], Some(2.0), Some(H1));
+        let b = rep(&[(512, 0, 800.0)], &[(128, 0, 60.0)], Some(2.0), Some(H2));
+        let out = compare_reports(&a, &b, Some(5.0));
+        assert!(out.exit_fail);
+        let v: serde_json::Value =
+            serde_json::from_str(&render_compare_json(&out).unwrap()).unwrap();
+        assert_eq!(v["schema"], "denno.bench.compare/1");
+        assert_eq!(v["threshold_pct"], 5.0);
+        assert_eq!(v["determinism"], "mismatch");
+        assert_eq!(v["exit_fail"], true);
+        assert_eq!(v["regressions"], 1);
+        assert_eq!(v["missing"], 0);
+        assert_eq!(v["base"]["model"], "m");
+        assert_eq!(v["base"]["md5"], H1);
+        assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(v["rows"][0]["verdict"], "REGRESS");
+        assert_eq!(v["rows"][1]["verdict"], "improve");
+        assert!(v["turn2"]["verdict"] == "ok");
+        // delta は -20% (有限)。
+        let d = v["rows"][0]["delta_pct"].as_f64().unwrap();
+        assert!((d + 20.0).abs() < 1e-9);
     }
 }
 
