@@ -43,7 +43,8 @@ pub use lifecycle::{
     MAX_DRAIN_TIMEOUT_SECS,
 };
 pub use logging::{
-    access_log_json, access_log_line, init_serve_logging, set_access_log_json, NonBlockingStdout,
+    access_log_json, access_log_line, init_serve_logging, is_sensitive_query_name,
+    redact_path_and_query, redact_query, set_access_log_json, NonBlockingStdout,
 };
 pub use scheduler::{
     AdmitFailure, AdmitKind, Job, Limits, RunStatsSnapshot, MAX_ACTIVE_SESSIONS,
@@ -1871,7 +1872,14 @@ async fn log_requests(
 ) -> Response {
     let started = std::time::Instant::now();
     let method = req.method().as_str().to_string();
-    let path = req.uri().path().to_string();
+    let uri_path = req.uri().path().to_string();
+    // task 1101: アクセスログの path はクエリ込みで残す。ただし秘匿対象の
+    // パラメータ値 (api_key / token / secret など) は伏せる。ヘッダ値は載せない。
+    let path = match req.uri().query() {
+        Some(q) => format!("{uri_path}?{q}"),
+        None => uri_path.clone(),
+    };
+    let log_path = logging::redact_path_and_query(&path);
     // task 911: クライアントの `x-request-id` を無害化して引き継ぐ。
     // 無効 (空 / 制御文字だけ / 非 ASCII だけ) なら新しい ID を振る。
     let request_id = req
@@ -1881,11 +1889,12 @@ async fn log_requests(
         .and_then(sanitize_request_id_bytes)
         .unwrap_or_else(generate_request_id);
     // P877: ラベルは既知ルート名へ正規化する (未知のパスは `other`)。
-    let endpoint = metrics::normalize_endpoint(&path);
+    // クエリは含めない (ラベルが無限に増えないようにする)。
+    let endpoint = metrics::normalize_endpoint(&uri_path);
     if logging::access_log_json() {
         // JSON 形式は 1 リクエスト 1 行 (応答後にまとめて出す)。
     } else {
-        tracing::info!("{} {} rid={}", method, path, request_id);
+        tracing::info!("{} {} rid={}", method, log_path, request_id);
     }
     let mut resp = next.run(req).await;
     let status = resp.status();
@@ -1900,7 +1909,7 @@ async fn log_requests(
     if logging::access_log_json() {
         let line = logging::access_log_line(
             &method,
-            &path,
+            &log_path,
             status.as_u16(),
             elapsed.as_secs_f64() * 1000.0,
             &request_id,
