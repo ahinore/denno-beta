@@ -268,7 +268,8 @@
   <a id="chatpage" href="/chat" target="_blank" rel="noopener"
      title="最小のチャット画面を別タブで開く (/chat)。同じ上流なので、こちらで送ったプロンプトの活性化はこの地図にも流れる (task 889)">chat ↗</a>
   <div id="banner" class="banner">no intervention · no steering</div>
-  <div id="connbanner" class="banner off" hidden></div>
+  <div id="connbanner" class="banner off" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+  <div id="stalestat" class="banner off" role="status" aria-live="polite" aria-atomic="true" hidden></div>
 </header>
 
 <main>
@@ -606,7 +607,7 @@ import {
   parsePreset, presetFileName, presetSummary, validateInterveneBody,
 } from '/hud2d.mjs';
 // task 1106: 再接続の待ち時間と接続表示 (/, /3d と共通の規則)。
-import { createReconnect } from '/reconnect.mjs';
+import { createReconnect, staleLabel } from '/reconnect.mjs';
 
 const $ = (id) => document.getElementById(id);
 const Q = new URLSearchParams(location.search);
@@ -3179,6 +3180,25 @@ function connBanner() {
   b.hidden = !s.showBanner;
   b.textContent = s.showBanner ? s.banner : '';
 }
+
+// task 1521: WS が開いたままフレームが止まった (stale) ときも帯で知らせる。
+async function pollStatus() {
+  const el = $('stalestat');
+  if (!el) return;
+  let msg = '';
+  try {
+    const r = await fetch('/status', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const s = await r.json();
+    if (conn.connected) msg = staleLabel(s);
+  } catch (e) {
+    msg = '';
+  }
+  el.textContent = msg;
+  el.hidden = !msg;
+}
+setInterval(pollStatus, 5000);
+pollStatus();
 
 function applyConn() {
   const s = conn.status();

@@ -18,7 +18,7 @@ use axum::routing::get;
 use axum::Router;
 use denno_telemetry::{self as telem, Frame};
 use futures_util::StreamExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -42,6 +42,79 @@ struct AppState {
 
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
+/// 上流テレメトリ WS に今つながっているか (pump が更新する)。
+static UPSTREAM_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// 最後にフレームを受け取った時刻 (Unix ms、0 = まだ 1 枚も来ていない)。
+static LAST_FRAME_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// /status が「stale」とみなす無フレーム時間 (ms)。WS が開いたままでも
+/// これ以上フレームが来なければ UI は stale として知らせる。
+const STALE_AFTER_MS: u64 = 5000;
+const STATUS_SCHEMA: u32 = 1;
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// /status の本文。now_ms を引数にして単体テストから決定的に叩ける。
+fn status_body(
+    connected: bool,
+    frames: u64,
+    bytes: u64,
+    last_frame_ms: Option<u64>,
+    now_ms: u64,
+) -> serde_json::Value {
+    let age = last_frame_ms.map(|t| now_ms.saturating_sub(t));
+    let stale = age.map_or(true, |a| a > STALE_AFTER_MS);
+    serde_json::json!({
+        "schema": STATUS_SCHEMA,
+        "service": "denno-view",
+        "status": "ok",
+        "ok": true,
+        "upstream": {
+            "connected": connected,
+            "last_frame_age_ms": age,
+            "stale": stale,
+            "stale_after_ms": STALE_AFTER_MS,
+        },
+        "frames": frames,
+        "bytes": bytes,
+    })
+}
+
+/// GET /status — ビューの健康状態と上流テレメトリの鮮度を JSON で返す。
+/// 自分自身が応答できている限り 200 (上流断は upstream.connected=false で表す)。
+async fn status_json() -> axum::response::Response {
+    let last = LAST_FRAME_UNIX_MS.load(Ordering::Relaxed);
+    let body = status_body(
+        UPSTREAM_CONNECTED.load(Ordering::Relaxed),
+        FRAMES.load(Ordering::Relaxed),
+        BYTES.load(Ordering::Relaxed),
+        (last != 0).then_some(last),
+        now_unix_ms(),
+    );
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "application/json; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// GET /healthz — ロードバランサ向けの最小ヘルスチェック (上流は見ない)。
+async fn healthz() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "application/json; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(
+            r#"{"schema":1,"service":"denno-view","status":"ok","ok":true}"#,
+        ))
+        .unwrap()
+}
 
 /// tokenizer.json (ブラウザ側でのトークン→文字デコード用)。
 /// `VIEW_TOKENIZER` でパス指定があった場合のみ読み込む (無ければ 404 → UI は id 表示)。
@@ -236,6 +309,8 @@ async fn main() -> anyhow::Result<()> {
 fn build_router(app: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/status", get(status_json))
+        .route("/healthz", get(healthz))
         .route("/2d", get(dashboard2d))
         .route("/3d", get(dashboard3d))
         .route("/frames.mjs", get(frames_mjs))
@@ -352,12 +427,14 @@ async fn pump_upstream(
         match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => {
                 tracing::info!("upstream connected");
+                UPSTREAM_CONNECTED.store(true, Ordering::Relaxed);
                 let (_, mut read) = ws.split();
                 while let Some(msg) = read.next().await {
                     match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
                             FRAMES.fetch_add(1, Ordering::Relaxed);
                             BYTES.fetch_add(bin.len() as u64, Ordering::Relaxed);
+                            LAST_FRAME_UNIX_MS.store(now_unix_ms(), Ordering::Relaxed);
                             // ServerInfo / SessionAdmit / SessionDone / Gap はログにも出す
                             if let Ok(f) = Frame::decode(&bin) {
                                 match &f {
@@ -415,8 +492,10 @@ async fn pump_upstream(
                     }
                 }
                 tracing::warn!("upstream disconnected, retrying in 2s ...");
+                UPSTREAM_CONNECTED.store(false, Ordering::Relaxed);
             }
             Err(e) => {
+                UPSTREAM_CONNECTED.store(false, Ordering::Relaxed);
                 tracing::warn!("connect failed: {e} (retrying in 2s)");
             }
         }

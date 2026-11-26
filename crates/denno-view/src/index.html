@@ -201,8 +201,9 @@
   <span id="sess" class="muted"></span>
   <span id="gap" class="warn"></span>
   <span id="navhint" class="muted" style="font-size:10px">[2] /2d · [3] /3d · [R] refresh</span>
-  <span id="stat" class="muted" style="margin-left:auto"></span>
-  <span id="connbanner" class="warn" hidden></span>
+  <span id="stat" class="muted" style="margin-left:auto" role="status" aria-live="polite" aria-atomic="true"></span>
+  <span id="connbanner" class="warn" role="status" aria-live="polite" aria-atomic="true" hidden></span>
+  <span id="stalestat" class="warn" role="status" aria-live="polite" aria-atomic="true" hidden></span>
   <label class="muted">speed
     <span style="font-size:10px">low</span>
     <input id="speed" type="range" min="0.5" max="8" step="0.5" value="8">
@@ -1156,6 +1157,26 @@ function connBanner() {
   b.hidden = false;
   b.textContent = s.banner;
 }
+
+// task 1521: WS が開いたままフレームが止まった (stale) ときも帯で知らせる。
+// 取得失敗は握りつぶす (reconnect 側の帯が既に切断を表示している)。
+async function pollStatus() {
+  const el = $("stalestat");
+  if (!el) return;
+  let msg = "";
+  try {
+    const r = await fetch("/status", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    if (conn && conn.connected && connMod) msg = connMod.staleLabel(s);
+  } catch (e) {
+    msg = "";
+  }
+  el.textContent = msg;
+  el.hidden = !msg;
+}
+setInterval(pollStatus, 5000);
+pollStatus();
 
 let gapCount = 0;
 function connect() {
