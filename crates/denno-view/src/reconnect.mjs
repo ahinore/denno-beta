@@ -134,6 +134,35 @@ export function connectionBanner(input, opts) {
   return connectionStatus(input, opts).banner;
 }
 
+// task 1521: サーバーの /status 応答から「フレームが来ていない (stale)」を判定する。
+// 既定は 5 s。upstream.stale を尊重し、無ければ last_frame_age_ms から決める。
+export const STALE_AFTER_MS = 5000;
+
+export function isStaleStatus(status, staleAfterMs) {
+  const src = status && typeof status === 'object' ? status : {};
+  const up = src.upstream && typeof src.upstream === 'object' ? src.upstream : {};
+  if (up.stale === true) return true;
+  const limit =
+    typeof staleAfterMs === 'number' && Number.isFinite(staleAfterMs) && staleAfterMs > 0
+      ? staleAfterMs
+      : STALE_AFTER_MS;
+  const age = up.last_frame_age_ms;
+  if (typeof age !== 'number' || !Number.isFinite(age)) return true;
+  return age > limit;
+}
+
+// 帯用の 1 行。stale でなければ空文字 (呼び出し側は空なら帯を隠す)。
+export function staleLabel(status, staleAfterMs) {
+  if (!isStaleStatus(status, staleAfterMs)) return '';
+  const up = status && status.upstream && typeof status.upstream === 'object' ? status.upstream : {};
+  const age = up.last_frame_age_ms;
+  if (typeof age !== 'number' || !Number.isFinite(age)) {
+    return 'telemetry stale - no frames received';
+  }
+  const s = Math.max(0, Math.floor(age / 1000));
+  return 'telemetry stale - last frame ' + s + ' s ago';
+}
+
 // 画面が持つ小さな状態機械。タイマーは持たず、待ち時間を返すだけ
 // (実際の setTimeout は呼び出し側 = 各画面)。
 export function createReconnect(opts) {
