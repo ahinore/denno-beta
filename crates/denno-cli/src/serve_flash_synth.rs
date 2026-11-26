@@ -1569,6 +1569,152 @@ fn disconnect_in_side_request_keeps_main_ctx() {
     std::env::remove_var("DENNO_FLASH_AUX_CTX");
 }
 
+/// task 917: 履歴から 1 ターンの要求を作る (max_tokens 6, temperature 0)。
+fn hist_req(sys: Option<&str>, hist: &[(String, String)]) -> GenReq {
+    let msgs: Vec<serde_json::Value> = hist
+        .iter()
+        .map(|(r, c)| serde_json::json!({"role": r, "content": c}))
+        .collect();
+    let mut v = serde_json::json!({"messages": msgs, "max_tokens": 6, "temperature": 0.0});
+    if let Some(s) = sys {
+        v["system"] = serde_json::json!(s);
+    }
+    GenReq::from_json(&v, 6).expect("hist_req")
+}
+
+/// task 917: 主会話 A (3 ターン) と脇会話 B (3 ターン) を交互に流す。
+///
+/// 監査した契約を 1 本で固定する:
+/// - LCP 一致: A の各ターンは主の文脈、B の各ターンは脇の文脈を選び
+///   (pick = Main / Aux)、2 ターン目以降は直前の文脈長を全長再利用する。
+/// - GDN 状態の持ち回り: 各ターンの出力は「新規構築 + full prefill」と
+///   ビット一致する (状態の写し忘れ・混線があれば貪欲列が変わる)。
+/// - 脇の非追い出し: A が進んでも B の文脈は消えず・書き換わらず、
+///   B が進んでも A の文脈は消えず・書き換わらない (MainAfterEvict も起きない)。
+#[test]
+fn aux_multi_turn_interleaved_matches_fresh_build() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    std::env::set_var("DENNO_FLASH_AUX_CTX", "1");
+    // 3 ターンで B のプロンプトが伸びるため、既定の比 4 だと 3 ターン目に
+    // 「主より十分短い」条件を外れて主へ回る。比 3 なら全ターンで脇に載る
+    // (比は「短い要求を脇へ回す」閾値で、数値経路には影響しない)。
+    std::env::set_var("DENNO_FLASH_AUX_RATIO", "3");
+    std::env::remove_var("DENNO_FLASH_AUX_TOK");
+
+    let dir = TempDir::new("flash-aux-mt");
+    let mut flash = build_flash(&dir);
+    flash.max_ctx = 512;
+
+    let sys_b = "you are a title generator";
+    let mut a_hist: Vec<(String, String)> = Vec::new();
+    let mut b_hist: Vec<(String, String)> = Vec::new();
+    let mut a_ctx_len = 0usize;
+    let mut b_ctx_len = 0usize;
+    let mut a_toks: Vec<u32> = Vec::new();
+    let mut b_toks: Vec<u32> = Vec::new();
+
+    for turn in 0..3 {
+        // --- 主会話 A: 1 ターン ---
+        a_hist.push((
+            "user".to_string(),
+            if turn == 0 {
+                LONG_A.to_string()
+            } else {
+                format!("a{turn}")
+            },
+        ));
+        let a_req = hist_req(None, &a_hist);
+        let a_out = flash.generate(&a_req, no_emit).expect("A");
+        // 参照エンジンの generate は TEST_LAST_PICK / TEST_LAST_REUSE を
+        // 上書きするので、先にこのリクエストの診断値を控える。
+        let a_pick = last_pick();
+        let a_reuse = TEST_LAST_REUSE.load(Ordering::Relaxed);
+        // 出力は新規構築 + full prefill とビット一致 (状態の持ち回りで変わらない)。
+        let dir_ref = TempDir::new(&format!("flash-aux-mt-a{turn}"));
+        let mut a_ref = build_flash(&dir_ref);
+        a_ref.max_ctx = 512;
+        let a_expect = a_ref.generate(&a_req, no_emit).expect("A ref");
+        assert_eq!(
+            (a_out.text.as_str(), a_out.n_out),
+            (a_expect.text.as_str(), a_expect.n_out),
+            "A turn{} の出力が新規構築と違う",
+            turn + 1
+        );
+        assert_eq!(a_out.text, "\t\t\t\t\t\t", "合成モデルの決定列");
+        if turn == 0 {
+            assert_eq!(a_pick, CtxPick::Fresh, "A turn1 が新規でない");
+            assert_eq!(a_reuse, 0);
+        } else {
+            assert_eq!(a_pick, CtxPick::Main, "A turn{} が主でない", turn + 1);
+            assert_eq!(
+                a_reuse, a_ctx_len,
+                "A turn{} が直前の主文脈を全長再利用していない (reuse={a_reuse}, want={a_ctx_len})",
+                turn + 1
+            );
+        }
+        // 主の文脈は A のものだけ (脇のトークン列を吸っていない)。
+        let a_after = flash.main_ctx().expect("A の文脈が無い").toks.clone();
+        assert!(!a_after.is_empty(), "A の文脈が空");
+        a_ctx_len = a_after.len();
+        a_toks = a_after;
+        a_hist.push(("assistant".to_string(), a_out.text));
+
+        // --- 脇会話 B: 1 ターン ---
+        b_hist.push((
+            "user".to_string(),
+            match turn {
+                0 => "hi".to_string(),
+                1 => "yo".to_string(),
+                _ => "ok".to_string(),
+            },
+        ));
+        let b_req = hist_req(Some(sys_b), &b_hist);
+        let b_out = flash.generate(&b_req, no_emit).expect("B");
+        let b_pick = last_pick();
+        let reuse_b = TEST_LAST_REUSE.load(Ordering::Relaxed);
+        let dir_ref_b = TempDir::new(&format!("flash-aux-mt-b{turn}"));
+        let mut b_ref = build_flash(&dir_ref_b);
+        b_ref.max_ctx = 512;
+        let b_expect = b_ref.generate(&b_req, no_emit).expect("B ref");
+        assert_eq!(
+            (b_out.text.as_str(), b_out.n_out),
+            (b_expect.text.as_str(), b_expect.n_out),
+            "B turn{} の出力が新規構築と違う",
+            turn + 1
+        );
+        assert_eq!(b_out.text, "\t\t\t\t\t\t", "合成モデルの決定列");
+        assert_eq!(b_pick, CtxPick::Aux, "B turn{} が脇でない", turn + 1);
+        if turn == 0 {
+            assert_eq!(reuse_b, 0, "B turn1 で reuse した");
+        } else {
+            assert_eq!(
+                reuse_b, b_ctx_len,
+                "B turn{} が直前の脇文脈を全長再利用していない (reuse={reuse_b}, want={b_ctx_len})",
+                turn + 1
+            );
+        }
+        // 脇の文脈だけが B のものへ進み、主の文脈は 1 トークンも変わらない。
+        let b_after = flash.aux_ctx().expect("B の文脈が無い").toks.clone();
+        b_ctx_len = b_after.len();
+        b_toks = b_after;
+        assert_eq!(
+            flash.main_ctx().expect("A が消えた").toks,
+            a_toks,
+            "B turn{} が主の文脈を書き換えた",
+            turn + 1
+        );
+        b_hist.push(("assistant".to_string(), b_out.text));
+    }
+
+    // 最後まで両方の文脈が残っている (追い出しなし)。
+    assert!(a_ctx_len > 0 && b_ctx_len > 0);
+    assert_eq!(flash.aux_ctx().expect("B").toks, b_toks);
+    std::env::remove_var("DENNO_FLASH_AUX_CTX");
+    std::env::remove_var("DENNO_FLASH_AUX_RATIO");
+}
+
 /// task 206 (4): 脇の容量 (メモリ上限) を超える短いリクエストは、脇を捨てて
 /// 主へ載せる (上限を超えた状態は保持しない)。
 #[test]
