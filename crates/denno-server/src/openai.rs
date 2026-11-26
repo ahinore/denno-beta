@@ -34,6 +34,7 @@
 //! `response_format` (`text` | `json_object` | `json_schema`)。未知フィールドは無視する
 //! (serde 既定)。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -423,8 +424,12 @@ pub struct OaMessage {
 }
 
 /// OpenAI の `tools[]` 1 件 (`type="function"` のみ対応)。
-#[derive(Debug, Deserialize)]
+///
+/// P1016: `function` 自体を省略可能にし、形の不正は [`map_tools`] が
+/// `tools[i]...` の param 付き 400 にする (serde の汎用 400 に落とさない)。
+#[derive(Debug, Default, Deserialize)]
 pub struct OaFunctionDef {
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -437,6 +442,7 @@ pub struct OaFunctionDef {
 pub struct OaTool {
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
+    #[serde(default)]
     pub function: OaFunctionDef,
 }
 
@@ -463,7 +469,7 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     pub stream_options: Option<StreamOptions>,
     #[serde(default)]
-    pub tools: Option<Vec<OaTool>>,
+    pub tools: Option<Vec<Value>>,
     pub tool_choice: Option<Value>,
     /// `{"type": "text" | "json_object" | "json_schema"}` (P837 で json_schema を追加)
     pub response_format: Option<Value>,
@@ -622,10 +628,16 @@ fn split_messages(msgs: &[OaMessage]) -> Result<(Option<String>, Vec<ChatMessage
 }
 
 /// OpenAI の `tools[]` を engine の [`ToolDef`] 列へ写す。
-fn map_tools(tools: &Option<Vec<OaTool>>) -> Result<Vec<ToolDef>, OaError> {
+fn map_tools(tools: &Option<Vec<Value>>) -> Result<Vec<ToolDef>, OaError> {
     let Some(tools) = tools else { return Ok(Vec::new()) };
     let mut out = Vec::with_capacity(tools.len());
-    for (i, t) in tools.iter().enumerate() {
+    for (i, raw) in tools.iter().enumerate() {
+        // P1016: 要素の形の不正は `tools[i]` の param 付き 400 にする
+        // (serde の汎用 body エラーへ落とすと param が付かない)。
+        let t: OaTool = serde_json::from_value(raw.clone()).map_err(|e| {
+            OaError::invalid(format!("tools[{i}] is not a valid tool definition: {e}"))
+                .with_param(format!("tools[{i}]"))
+        })?;
         if let Some(kind) = &t.kind {
             if kind != "function" {
                 return Err(OaError::invalid(format!(
@@ -633,6 +645,12 @@ fn map_tools(tools: &Option<Vec<OaTool>>) -> Result<Vec<ToolDef>, OaError> {
                 ))
                 .with_param(format!("tools[{i}].type")));
             }
+        }
+        if t.function.name.trim().is_empty() {
+            return Err(OaError::invalid(format!(
+                "tools[{i}].function.name must be a non-empty string"
+            ))
+            .with_param(format!("tools[{i}].function.name")));
         }
         let input_schema = match &t.function.parameters {
             None | Some(Value::Null) => json!({"type": "object", "properties": {}}),
@@ -764,8 +782,14 @@ fn new_chatcmpl_id() -> String {
 }
 
 /// tool call の id (OpenAI の `call_` + 24hex)。
+///
+/// P1016: 同一応答内で必ず一意になるよう、下位 8 hex にプロセス内で単調増加する
+/// カウンタを埋める (上位 16 hex は乱数)。24 hex の形式は OpenAI 互換のまま。
 fn new_call_id() -> String {
-    format!("call_{}", hex24())
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let rnd: u64 = rand::thread_rng().gen();
+    format!("call_{rnd:016x}{:08x}", seq as u32)
 }
 
 fn usage_json(input_tokens: usize, output_tokens: usize) -> Value {
