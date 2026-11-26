@@ -678,14 +678,27 @@ pub mod diag {
     /// 動く事故があるので、後継を案内する。
     pub const DEPRECATED_ENV: [(&str, &str); 1] = [("DENNO_MAX_CTX", "DENNO_FLASH_MAX_CTX")];
 
+    /// 値が秘密ではない「数値リミット」の名前。`*TOKEN*` の規約では伏せられるが、
+    /// 中身は公開してよい上限値なので例外にする。
+    ///
+    /// **完全一致だけ**を例外にする (接尾辞・部分一致・大小の揺れは認めない)。
+    /// 例外の綴りを少し変えた名前 (`DENNO_FLASH_MAX_TOKENS_X` など) は
+    /// 従来どおり伏せる — fail-closed。
+    pub const NON_SECRET_VALUE_NAMES: [&str; 2] = ["DENNO_FLASH_MAX_TOKENS", "DENNO_MAX_TOKENS"];
+
     /// 秘密っぽい名前か。**値は見ない** (名前だけで判定する)。
     /// doctor.rs の `is_secret_key` と同じ規約 (伏せすぎる側に倒す)。
+    /// `NON_SECRET_VALUE_NAMES` の完全一致だけが例外。
     pub fn is_secret_name(name: &str) -> bool {
+        if NON_SECRET_VALUE_NAMES.contains(&name) {
+            return false;
+        }
         let k = name.to_ascii_uppercase();
         k.contains("API_KEY")
             || k.contains("SECRET")
             || k.contains("TOKEN")
             || k.contains("PASSWORD")
+            || k.contains("AUTH")
             || k.ends_with("_KEY")
             || k.ends_with("_KEYS")
     }
