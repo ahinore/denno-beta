@@ -64,6 +64,13 @@ mod kv_radix;
 // (`tests/kv_radix_edge_1601.rs`) から同じ関数を固定できるようにした。
 use kv_radix::kv_radix_enabled;
 
+// task 1606: 連続バッチングの受付キュー / スロットスケジューラ。既定
+// (`DENNO_FLASH_MAX_BATCH` 未設定 = 1) ではこのモジュールを駆動せず、従来の
+// 逐次経路がそのまま動く (バイト一致)。2 以上で起動したときだけ、次のタスクが
+// `forward_batch_decode(m)` の m と並び順をここから取る。
+#[path = "flash_batch.rs"]
+mod flash_batch;
+
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
@@ -4720,6 +4727,16 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                 "[flash] kv-radix: slots={kv_slots} では不活性 (main/aux 経路のまま。--kv-slots 3 以上で有効)"
             );
         }
+    }
+    // task 1606: 連続バッチングのゲート。既定 (未設定 = 1) は何も出さず、
+    // 逐次経路のまま。2 以上で有効になり、バッチ幅とスケジューラの準備を 1 行で出す。
+    let max_batch =
+        flash_batch::max_batch_from(std::env::var(flash_batch::ENV_MAX_BATCH).ok().as_deref());
+    if max_batch > flash_batch::DEFAULT_MAX_BATCH {
+        eprintln!(
+            "[flash] max batch={max_batch} ({}): 連続バッチングのスケジューラを用意 (decode はまだ逐次)",
+            flash_batch::ENV_MAX_BATCH
+        );
     }
     let mut flash = Flash {
         parts,
