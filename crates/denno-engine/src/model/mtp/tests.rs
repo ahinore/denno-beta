@@ -850,3 +850,263 @@ fn real_mtp_file_loads_and_runs_one_step() {
     assert_eq!(kv.k, kv2.k);
     assert_eq!(kv.v, kv2.v);
 }
+
+// ---------------------------------------------------------------------------
+// task 950: KV の境界・resync・低 VRAM ポリシー
+// ---------------------------------------------------------------------------
+
+fn kv_row(cache: &MtpKvCache, i: usize) -> Vec<f32> {
+    let s = cache.stride();
+    cache.k[i * s..(i + 1) * s].to_vec()
+}
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn kv_push_checked_rejects_bad_row_lengths() {
+    let mut kv = MtpKvCache::new(1, 4);
+    assert_eq!(kv.stride(), 4);
+    assert!(
+        kv.push_checked(&[0.0; 3], &[0.0; 4]).is_err(),
+        "短い k が通った"
+    );
+    assert!(
+        kv.push_checked(&[0.0; 4], &[0.0; 3]).is_err(),
+        "短い v が通った"
+    );
+    assert!(
+        kv.push_checked(&[0.0; 5], &[0.0; 5]).is_err(),
+        "長い行が通った"
+    );
+    assert!(kv.is_empty(), "拒否した行が残っている");
+    assert_eq!(kv.pos_end(), 0);
+    kv.push_checked(&[0.0; 4], &[0.0; 4]).unwrap();
+    assert_eq!(kv.len(), 1);
+    assert_eq!(kv.pos_end(), 1);
+}
+
+#[test]
+fn kv_push_checked_rejects_non_finite() {
+    let mut kv = MtpKvCache::new(2, 2);
+    let mut k = [1.0f32; 4];
+    k[1] = f32::NAN;
+    let err = kv.push_checked(&k, &[1.0; 4]).unwrap_err().to_string();
+    assert!(err.contains("有限でない"), "err={err}");
+    let mut v = [1.0f32; 4];
+    v[3] = f32::INFINITY;
+    let err = kv.push_checked(&[1.0; 4], &v).unwrap_err().to_string();
+    assert!(err.contains("有限でない"), "err={err}");
+    assert!(kv.is_empty());
+}
+
+#[test]
+fn kv_resync_truncates_and_rejects_unheld_positions() {
+    let mut kv = MtpKvCache::new(2, 2);
+    for i in 0..3 {
+        kv.push(&[i as f32; 4], &[i as f32; 4]);
+    }
+    assert_eq!(kv.pos_end(), 3);
+    kv.resync(1).unwrap();
+    assert_eq!(kv.len(), 1);
+    assert_eq!(kv.pos_end(), 1);
+    kv.resync(1).unwrap(); // 同じ位置は no-op
+    assert!(kv.resync(5).is_err(), "持っていない位置へ進めた");
+    kv.clear();
+    assert!(kv.is_empty());
+    assert_eq!(kv.pos_end(), 0);
+}
+
+#[test]
+fn draft_rolls_back_kv_when_lm_head_fails() {
+    let (_p, cfg, m) = build_tiny("kv_rollback");
+    let e = cfg.n_embd;
+    let h: Vec<f32> = (0..cfg.hc * e).map(|i| (i as f32 * 0.13).sin()).collect();
+    let emb: Vec<f32> = (0..e).map(|i| (i as f32 * 0.17).cos()).collect();
+
+    let mut kv = MtpKvCache::new(cfg.n_head_kv, cfg.head_dim);
+    let mut fail = |_v: &[f32]| -> Result<Vec<f32>> { bail!("boom") };
+    assert!(m.draft(&h, &emb, &mut kv, &mut fail).is_err());
+    assert_eq!(kv.len(), 0, "失敗した step の KV 行が残っている");
+    assert_eq!(kv.pos_end(), 0);
+
+    // やり直すと、失敗を挟まない場合とビット一致 (位置がずれていない)
+    let mut lm = |v: &[f32]| dummy_lm_head(v);
+    let a = m.draft(&h, &emb, &mut kv, &mut lm).unwrap();
+    assert_eq!(a.pos, 0);
+    let mut kv2 = MtpKvCache::new(cfg.n_head_kv, cfg.head_dim);
+    let b = m.draft(&h, &emb, &mut kv2, &mut lm).unwrap();
+    assert_eq!(bits(&a.logits), bits(&b.logits));
+    assert_eq!(kv.k, kv2.k);
+}
+
+#[test]
+fn draft_second_step_rollback_keeps_prefix_bits() {
+    let (_p, cfg, m) = build_tiny("kv_rollback2");
+    let e = cfg.n_embd;
+    let h: Vec<f32> = (0..cfg.hc * e).map(|i| (i as f32 * 0.07).sin()).collect();
+    let emb: Vec<f32> = (0..e).map(|i| (i as f32 * 0.29).cos()).collect();
+    let mut lm = |v: &[f32]| dummy_lm_head(v);
+
+    let mut kv = MtpKvCache::new(cfg.n_head_kv, cfg.head_dim);
+    let first = m.draft(&h, &emb, &mut kv, &mut lm).unwrap();
+    let mut fail = |_v: &[f32]| -> Result<Vec<f32>> { bail!("step2 boom") };
+    assert!(m.draft(&h, &emb, &mut kv, &mut fail).is_err());
+    assert_eq!(kv.len(), 1, "2 段目失敗で 1 段目の KV まで消えた");
+    assert_eq!(kv.pos_end(), 1);
+
+    let retry = m.draft(&h, &emb, &mut kv, &mut lm).unwrap();
+    assert_eq!(retry.pos, 1, "巻き戻し後の位置が違う");
+
+    let mut kv_ref = MtpKvCache::new(cfg.n_head_kv, cfg.head_dim);
+    let r1 = m.draft(&h, &emb, &mut kv_ref, &mut lm).unwrap();
+    let r2 = m.draft(&h, &emb, &mut kv_ref, &mut lm).unwrap();
+    assert_eq!(bits(&r1.logits), bits(&first.logits));
+    assert_eq!(bits(&retry.logits), bits(&r2.logits));
+    assert_eq!(kv.k, kv_ref.k);
+    assert_eq!(kv.v, kv_ref.v);
+}
+
+#[test]
+fn kv_policy_parse_reads_env_values() {
+    assert_eq!(KvPolicy::parse(None, None, 2048).unwrap(), KvPolicy::off());
+    assert_eq!(
+        KvPolicy::parse(Some("0"), Some("0"), 2048).unwrap(),
+        KvPolicy::off(),
+        "0 は無効"
+    );
+    assert_eq!(
+        KvPolicy::parse(Some("17"), None, 2048).unwrap().max_pos,
+        Some(17)
+    );
+    // 両方あるときは位置数を優先
+    assert_eq!(
+        KvPolicy::parse(Some("17"), Some("999"), 2048)
+            .unwrap()
+            .max_pos,
+        Some(17)
+    );
+    // 8 MiB / 2048 B = 4096 位置
+    assert_eq!(
+        KvPolicy::parse(None, Some("8"), 2048).unwrap().max_pos,
+        Some(4096)
+    );
+    // 予算が 1 行に満たない → 位置 0 → 無効
+    assert_eq!(
+        KvPolicy::parse(None, Some("1"), 2 * 1024 * 1024).unwrap(),
+        KvPolicy::off()
+    );
+    // 不正値はエラー (from_env 側で off に倒す)
+    assert!(KvPolicy::parse(Some("abc"), None, 2048).is_err());
+    assert!(KvPolicy::parse(None, Some("12x"), 2048).is_err());
+    // env 名は公開 API として固定
+    assert_eq!(MTP_KV_MAX_POS_ENV, "DENNO_MTP_KV_MAX_POS");
+    assert_eq!(MTP_KV_MB_ENV, "DENNO_MTP_KV_MB");
+}
+
+#[test]
+fn kv_policy_off_keeps_all_positions() {
+    let mut kv = MtpKvCache::new(1, 2);
+    for i in 0..7u32 {
+        kv.push(&[i as f32; 2], &[i as f32; 2]);
+    }
+    assert_eq!(kv.max_pos(), None);
+    assert_eq!(kv.len(), 7);
+    assert_eq!(kv.evicted(), 0);
+    assert_eq!(kv.pos_end(), 7);
+}
+
+#[test]
+fn kv_policy_evicts_oldest_positions_and_tracks_absolute_pos() {
+    let mut kv = MtpKvCache::with_policy(1, 2, KvPolicy { max_pos: Some(3) });
+    for i in 0..5u32 {
+        kv.push(&[i as f32; 2], &[-(i as f32); 2]);
+    }
+    assert_eq!(kv.len(), 3, "上限 3 を超えて保持している");
+    assert_eq!(kv.evicted(), 2, "古い位置が捨てられていない");
+    assert_eq!(kv.pos_end(), 5, "絶対位置がずれた");
+    assert_eq!(kv_row(&kv, 0), vec![2.0, 2.0], "残ったのが最新 3 行でない");
+    assert_eq!(kv_row(&kv, 2), vec![4.0, 4.0]);
+    assert_eq!(kv.v[..2], [-2.0, -2.0], "v が同じ行で揃っていない");
+}
+
+#[test]
+fn kv_resync_after_eviction_rejects_and_truncates_absolute() {
+    let mut kv = MtpKvCache::with_policy(1, 2, KvPolicy { max_pos: Some(2) });
+    for i in 0..4u32 {
+        kv.push(&[i as f32; 2], &[i as f32; 2]);
+    }
+    assert_eq!((kv.len(), kv.evicted(), kv.pos_end()), (2, 2, 4));
+    assert!(kv.resync(1).is_err(), "eviction 済みの位置へ戻せてしまった");
+    kv.resync(3).unwrap();
+    assert_eq!(kv.len(), 1);
+    assert_eq!(kv.pos_end(), 3);
+    assert_eq!(kv_row(&kv, 0), vec![2.0, 2.0]);
+}
+
+#[test]
+fn kv_policy_with_headroom_matches_ungated_bits() {
+    // 上限に届かない範囲では、ゲートを入れても数値が従来とビット一致する
+    let (_p, cfg, m) = build_tiny("kv_headroom");
+    let e = cfg.n_embd;
+    let h: Vec<f32> = (0..cfg.hc * e).map(|i| (i as f32 * 0.19).sin()).collect();
+    let emb: Vec<f32> = (0..e).map(|i| (i as f32 * 0.31).cos()).collect();
+    let mut lm = |v: &[f32]| dummy_lm_head(v);
+
+    let mut plain = MtpKvCache::new(cfg.n_head_kv, cfg.head_dim);
+    let mut gated =
+        MtpKvCache::with_policy(cfg.n_head_kv, cfg.head_dim, KvPolicy { max_pos: Some(4) });
+    for step in 0..3 {
+        let a = m.draft(&h, &emb, &mut plain, &mut lm).unwrap();
+        let b = m.draft(&h, &emb, &mut gated, &mut lm).unwrap();
+        assert_eq!(a.pos, step);
+        assert_eq!(b.pos, step);
+        assert_eq!(
+            bits(&a.logits),
+            bits(&b.logits),
+            "step {step} で logits が違う"
+        );
+        assert_eq!(a.hidden_next, b.hidden_next);
+    }
+    assert_eq!(gated.evicted(), 0);
+    assert_eq!(plain.k, gated.k);
+    assert_eq!(plain.v, gated.v);
+}
+
+#[test]
+fn kv_policy_eviction_fires_in_draft_and_bounds_storage() {
+    // 上限 1 で 3 step 回すと、保持は 1 行・捨てたのは 2 位置。位置は進み続ける。
+    let (_p, cfg, m) = build_tiny("kv_evict");
+    let e = cfg.n_embd;
+    let h: Vec<f32> = (0..cfg.hc * e).map(|i| (i as f32 * 0.23).sin()).collect();
+    let emb: Vec<f32> = (0..e).map(|i| (i as f32 * 0.37).cos()).collect();
+    let mut lm = |v: &[f32]| dummy_lm_head(v);
+    let mut kv =
+        MtpKvCache::with_policy(cfg.n_head_kv, cfg.head_dim, KvPolicy { max_pos: Some(1) });
+    for step in 0..3 {
+        let d = m.draft(&h, &emb, &mut kv, &mut lm).unwrap();
+        assert_eq!(d.pos, step);
+        assert!(d.logits.iter().all(|v| v.is_finite()));
+        assert_eq!(kv.len(), 1, "step {step} で KV が上限を超えた");
+        assert_eq!(kv.pos_end(), step + 1);
+    }
+    assert_eq!(kv.evicted(), 2);
+}
+
+#[test]
+fn draft_failure_under_eviction_policy_keeps_positions_consistent() {
+    let (_p, cfg, m) = build_tiny("kv_evict_fail");
+    let e = cfg.n_embd;
+    let h: Vec<f32> = (0..cfg.hc * e).map(|i| (i as f32 * 0.41).sin()).collect();
+    let emb: Vec<f32> = (0..e).map(|i| (i as f32 * 0.43).cos()).collect();
+    let mut lm = |v: &[f32]| dummy_lm_head(v);
+    let mut kv =
+        MtpKvCache::with_policy(cfg.n_head_kv, cfg.head_dim, KvPolicy { max_pos: Some(2) });
+    m.draft(&h, &emb, &mut kv, &mut lm).unwrap();
+    m.draft(&h, &emb, &mut kv, &mut lm).unwrap();
+    let mut fail = |_v: &[f32]| -> Result<Vec<f32>> { bail!("boom") };
+    assert!(m.draft(&h, &emb, &mut kv, &mut fail).is_err());
+    assert_eq!(kv.pos_end(), 2, "失敗 step のあと位置が戻っていない");
+    assert!(kv.len() <= 2, "上限を超えた");
+}

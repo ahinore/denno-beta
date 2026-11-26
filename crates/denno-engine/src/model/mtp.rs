@@ -48,6 +48,17 @@
 //!
 //! このタスクでは `.cu` を触れないため CUDA 経路は無い。重みはホスト f32
 //! (実形で約 250 MB。expert は選択分だけ都度展開するので常駐しない)。
+//!
+//! ## KV の位置上限 (task 950)
+//!
+//! 低 VRAM の環境では MTP の KV が位置数に比例して伸びる。`DENNO_MTP_KV_MAX_POS`
+//! (位置数) または `DENNO_MTP_KV_MB` (MiB 予算) を置くと、[`MtpKvCache`] が
+//! 上限を超えたぶんを古い位置から捨てる。**既定は無効** (両方未設定 / 0)。
+//! 捨てた位置は attention から見えなくなるので数値が変わる。上限に達していない
+//! 範囲では従来とビット一致する (テスト `kv_policy_with_headroom_matches_ungated_bits`)。
+//!
+//! 失敗した draft step の KV 行は [`MtpModel::draft`] が自動で巻き戻す
+//! ([`MtpKvCache::resync`])。失敗が次の step の位置を 1 つずらすのを防ぐ。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -932,7 +943,8 @@ impl MtpModel {
     ///
     /// - `h`: trunk の hc-wide 残差 `[hc*n_embd]`
     /// - `e_embd`: 次トークンの埋め込み `[n_embd]`
-    /// - `kv`: この MTP 層の KV (前の draft step まで)。呼ぶと 1 位置伸びる。
+    /// - `kv`: この MTP 層の KV (前の draft step まで)。成功すると 1 位置伸びる。
+    ///   途中で失敗したときは呼ぶ前の位置へ巻き戻す (task 950)。
     /// - `lm_head`: `[n_embd] -> logits`。trunk の lm_head をそのまま渡す。
     pub fn draft(
         &self,
@@ -942,12 +954,7 @@ impl MtpModel {
         lm_head: &mut dyn FnMut(&[f32]) -> Result<Vec<f32>>,
     ) -> Result<MtpDraft> {
         let cfg = &self.cfg;
-        let hp = self.hp();
-        let layer = self
-            .layers
-            .first()
-            .with_context(|| "MTP 層がロードされていない")?;
-        let pos = kv.len();
+        let pos = kv.pos_end();
         if pos >= cfg.indexer_top_k {
             bail!(
                 "位置 {pos} が indexer_budget {} 以上。QSA の indexer 選択は未実装なので \
@@ -955,6 +962,29 @@ impl MtpModel {
                 cfg.indexer_top_k
             );
         }
+        // task 950: 途中で失敗したら KV を呼ぶ前の位置へ戻す (resync)。
+        // 失敗した draft step の KV 行が残ると、次の step が 1 位置ずれて走る。
+        let r = self.draft_at(h, e_embd, kv, lm_head, pos);
+        if r.is_err() {
+            let _ = kv.resync(pos);
+        }
+        r
+    }
+
+    fn draft_at(
+        &self,
+        h: &[f32],
+        e_embd: &[f32],
+        kv: &mut MtpKvCache,
+        lm_head: &mut dyn FnMut(&[f32]) -> Result<Vec<f32>>,
+        pos: usize,
+    ) -> Result<MtpDraft> {
+        let cfg = &self.cfg;
+        let hp = self.hp();
+        let layer = self
+            .layers
+            .first()
+            .with_context(|| "MTP 層がロードされていない")?;
 
         let mut res = self.input_projection(h, e_embd)?;
         let mut streams = HyperStreams {
@@ -999,7 +1029,7 @@ impl MtpModel {
         let dh = cfg.head_dim;
         let nh = cfg.n_head;
         let nkv = cfg.n_head_kv;
-        let pos = kv.len();
+        let pos = kv.pos_end();
         if kv.n_head_kv != nkv || kv.head_dim != dh {
             bail!(
                 "KV の形状 ({}, {}) が設定 ({nkv}, {dh}) と違う",
@@ -1058,7 +1088,7 @@ impl MtpModel {
             pos,
             cfg.rope_theta,
         );
-        kv.push(&k, &v);
+        kv.push_checked(&k, &v)?;
 
         // dense GQA (q head h は kv head h / (nh/nkv) を見る)
         let group = nh / nkv;
@@ -1190,42 +1220,224 @@ impl MtpDraft {
 // KV キャッシュ
 // ---------------------------------------------------------------------------
 
+/// MTP の KV をメモリ予算で切るときの設定 (task 950)。既定は無効。
+///
+/// 低 VRAM の環境 (MTP head の KV を GPU 常駐させる想定) では、位置数が
+/// 伸びると KV だけで VRAM を食う。ここでは保持する位置数の上限だけを決め、
+/// 超えた分は**古い位置から捨てる** (sliding window)。捨てた位置の attention
+/// は見えなくなるので数値は変わる。だから既定 off、env でだけ入る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KvPolicy {
+    /// 保持する最大位置数。`None` = 無制限 (既定)。
+    pub max_pos: Option<usize>,
+}
+
+/// 保持する位置数の上限 (task 950)。未設定 / 0 = 無制限。
+pub const MTP_KV_MAX_POS_ENV: &str = "DENNO_MTP_KV_MAX_POS";
+/// KV に許すバイト数 (MiB)。位置数へ換算する。未設定 / 0 = 無制限。
+pub const MTP_KV_MB_ENV: &str = "DENNO_MTP_KV_MB";
+
+impl KvPolicy {
+    /// 無制限 (既定)。
+    pub const fn off() -> Self {
+        KvPolicy { max_pos: None }
+    }
+
+    /// env の文字列を解釈する純関数 (env は読まない。テストで分岐を固定する)。
+    ///
+    /// - `max_pos`: 位置数。`0` は無効。
+    /// - `mb`: KV のバイト予算 (MiB)。`row_bytes` で割って位置数へ。
+    ///   両方あるときは `max_pos` を優先する。
+    pub fn parse(max_pos: Option<&str>, mb: Option<&str>, row_bytes: usize) -> Result<Self> {
+        let num = |key: &str, s: &str| -> Result<u64> {
+            s.trim()
+                .parse::<u64>()
+                .with_context(|| format!("{key}={s:?} が整数として読めない"))
+        };
+        if let Some(s) = max_pos {
+            let v = num(MTP_KV_MAX_POS_ENV, s)?;
+            if v > 0 {
+                return Ok(KvPolicy {
+                    max_pos: Some(usize::try_from(v).unwrap_or(usize::MAX)),
+                });
+            }
+        }
+        if let Some(s) = mb {
+            let v = num(MTP_KV_MB_ENV, s)?;
+            if v > 0 {
+                if row_bytes == 0 {
+                    bail!("KV の行長が 0 なので {MTP_KV_MB_ENV} を位置数に換算できない");
+                }
+                let bytes = v.saturating_mul(1024 * 1024);
+                let pos = bytes / row_bytes as u64;
+                if pos > 0 {
+                    return Ok(KvPolicy {
+                        max_pos: Some(usize::try_from(pos).unwrap_or(usize::MAX)),
+                    });
+                }
+            }
+        }
+        Ok(KvPolicy::off())
+    }
+
+    /// このプロセスの env から読む。不正値は off に倒して 1 行だけ出す
+    /// (起動を止めない)。`row_bytes` は 1 位置ぶんの k+v のバイト数。
+    pub fn from_env(row_bytes: usize) -> Self {
+        let max_pos = std::env::var_os(MTP_KV_MAX_POS_ENV);
+        let mb = std::env::var_os(MTP_KV_MB_ENV);
+        let parse = |v: &Option<std::ffi::OsString>| -> Option<String> {
+            v.as_ref().map(|s| s.to_string_lossy().into_owned())
+        };
+        match Self::parse(parse(&max_pos).as_deref(), parse(&mb).as_deref(), row_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[mtp] {e} → KV の位置上限は無効 (既定)");
+                KvPolicy::off()
+            }
+        }
+    }
+}
+
 /// MTP 層 1 本ぶんの KV。`k` / `v` は `[pos][n_kv_heads * head_dim]`。
+///
+/// 添字は常に**保持している行**の先頭から数える。絶対位置は
+/// [`MtpKvCache::pos_end`] が返し、eviction で捨てた行数 (`evicted`) を足した値。
 pub struct MtpKvCache {
     pub n_head_kv: usize,
     pub head_dim: usize,
     pub k: Vec<f32>,
     pub v: Vec<f32>,
+    policy: KvPolicy,
+    /// 低 VRAM ポリシーで先頭から捨てた位置数。
+    evicted: usize,
 }
 
 impl MtpKvCache {
+    /// 無制限 (既定)。従来と同じ挙動。
     pub fn new(n_head_kv: usize, head_dim: usize) -> Self {
+        Self::with_policy(n_head_kv, head_dim, KvPolicy::off())
+    }
+
+    /// 位置上限つきで作る (task 950 の A/B 用)。
+    pub fn with_policy(n_head_kv: usize, head_dim: usize, policy: KvPolicy) -> Self {
         MtpKvCache {
             n_head_kv,
             head_dim,
             k: Vec::new(),
             v: Vec::new(),
+            policy,
+            evicted: 0,
         }
     }
 
+    /// 1 位置ぶんの要素数。
+    pub fn stride(&self) -> usize {
+        self.n_head_kv * self.head_dim
+    }
+
+    /// 保持している行数。
     pub fn len(&self) -> usize {
-        self.k.len() / (self.n_head_kv * self.head_dim)
+        let s = self.stride();
+        if s == 0 {
+            0
+        } else {
+            self.k.len() / s
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.k.is_empty()
     }
 
-    pub fn push(&mut self, k: &[f32], v: &[f32]) {
-        debug_assert_eq!(k.len(), self.n_head_kv * self.head_dim);
-        debug_assert_eq!(v.len(), k.len());
-        self.k.extend_from_slice(k);
-        self.v.extend_from_slice(v);
+    /// 次の位置 (絶対)。eviction で捨てた分も数える。
+    pub fn pos_end(&self) -> usize {
+        self.evicted + self.len()
     }
 
+    /// eviction で捨てた位置数。
+    pub fn evicted(&self) -> usize {
+        self.evicted
+    }
+
+    /// いま効いている位置上限 (無制限なら `None`)。
+    pub fn max_pos(&self) -> Option<usize> {
+        self.policy.max_pos
+    }
+
+    /// 1 行を足す。行長・非有限値・位置上限を**release でも**検査する。
+    ///
+    /// 上限を超えたら最も古い位置から 1 行ずつ捨てる (sliding window)。
+    /// 捨てた位置は attention から見えなくなる (数値が変わる。env ゲート時だけ)。
+    pub fn push_checked(&mut self, k: &[f32], v: &[f32]) -> Result<()> {
+        let s = self.stride();
+        if s == 0 {
+            bail!("KV の n_head_kv / head_dim が 0");
+        }
+        if k.len() != s || v.len() != s {
+            bail!("KV の行長が違う: k={} v={} stride={}", k.len(), v.len(), s);
+        }
+        if let Some(i) = k.iter().position(|x| !x.is_finite()) {
+            bail!("KV の k[{i}]={} が有限でない", k[i]);
+        }
+        if let Some(i) = v.iter().position(|x| !x.is_finite()) {
+            bail!("KV の v[{i}]={} が有限でない", v[i]);
+        }
+        // 不変条件: 既存の k/v は stride の倍数。
+        debug_assert_eq!(self.k.len() % s, 0);
+        debug_assert_eq!(self.v.len(), self.k.len());
+        self.k.extend_from_slice(k);
+        self.v.extend_from_slice(v);
+        if let Some(cap) = self.policy.max_pos {
+            if cap == 0 {
+                // 0 は「全部捨てる」ではなく無効として扱う (env 側で弾く)。
+                return Ok(());
+            }
+            while self.len() > cap {
+                self.k.drain(..s);
+                self.v.drain(..s);
+                self.evicted += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// 行長を検査しない従来版 (内部の不変条件つき)。破れていたら panic する。
+    pub fn push(&mut self, k: &[f32], v: &[f32]) {
+        self.push_checked(k, v)
+            .unwrap_or_else(|e| panic!("MTP KV push: {e}"));
+    }
+
+    /// 指定した**絶対位置**でキャッシュを終わらせる (resync)。
+    ///
+    /// - `end_pos` が今より小さい: 末尾を捨てる (失敗した draft step の巻き戻し)。
+    /// - 同じ: 何もしない。
+    /// - 大きい: 持っていない位置なのでエラー (勝手に伸ばさない)。
+    /// - eviction 済みの位置より前: 戻せないのでエラー。
+    pub fn resync(&mut self, end_pos: usize) -> Result<()> {
+        let s = self.stride();
+        if end_pos < self.evicted {
+            bail!(
+                "KV を位置 {end_pos} へ戻せない ({} 行は eviction 済み)",
+                self.evicted
+            );
+        }
+        let keep = end_pos - self.evicted;
+        if keep > self.len() {
+            bail!(
+                "KV を位置 {end_pos} へ進められない (持っているのは {} 行)",
+                self.len()
+            );
+        }
+        self.k.truncate(keep * s);
+        self.v.truncate(keep * s);
+        Ok(())
+    }
+
+    /// 全部捨てる。絶対位置も 0 に戻る。
     pub fn clear(&mut self) {
         self.k.clear();
         self.v.clear();
+        self.evicted = 0;
     }
 }
 
