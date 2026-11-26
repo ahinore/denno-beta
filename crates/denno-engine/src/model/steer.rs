@@ -52,6 +52,18 @@
 //! 掛けると自己消去してテキストが壊れる (t218b)。実用的な例は
 //! `A/1.0/20-28/0.05/subtract` (層 20-28 の 9 層、alpha 0.05) で、
 //! 内容を保ったまま言い回しが変わる (t218c の `sub`)。
+//!
+//! # フックの配線 (task 957)
+//!
+//! - 層ループの入口は [`apply_on`] (原子的読み 1 回) と [`active`] だけ。何も
+//!   掛けていない既定経路は `RwLock` も取らず、規則も 1 本も掛けない
+//!   (`steer::snapshot()` を毎トークン読まない)。設定したときだけ
+//!   [`snapshot`] を 1 回読み、層ループの中では `Arc` を参照する。
+//! - 重ね掛け ([`Apply::apply_one`]) は規則を順に掛ける (task 849 の数値のまま)。
+//!   `DENNO_STEER_ORTHO=1` では、同じ層に掛かる project 規則の方向を
+//!   (layer, stream) ごとに正規直交化してから掛けるので、
+//!   `h -= Σ_i alpha_i (h・q_i) q_i` になり、規則の順序に依らず、
+//!   alpha 1 の方向は残差から厳密に落ちる (既定 off)。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -223,12 +235,31 @@ pub struct Rule {
     pub v: Vec<f32>,
     /// `v` を (layer, stream) ごとに正規化したもの (範囲外は 0)。
     pub vhat: Vec<f32>,
+    /// task 957: `DENNO_STEER_ORTHO=1` のときだけ入る、先行する project 規則の
+    /// 方向に対して正規直交化した方向 (範囲外と、依存で落ちた (layer, stream) は 0)。
+    /// 空なら project は `vhat` を使う (従来 = 規則を順に掛けるだけ)。
+    pub vortho: Vec<f32>,
 }
+
+/// task 957: ホットパスが実際に規則を掛けた回数 (テストで「無効時に 0 回」を数える)。
+#[cfg(test)]
+pub(crate) static APPLY_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl Rule {
     #[inline]
     pub fn covers(&self, layer: usize) -> bool {
         layer >= self.from && layer < self.to
+    }
+
+    /// project に使う方向 (`vortho` があればそちら、無ければ `vhat`)。
+    #[inline]
+    fn project_dir(&self) -> &[f32] {
+        if self.vortho.is_empty() {
+            &self.vhat
+        } else {
+            &self.vortho
+        }
     }
 
     /// 1 トークンぶんの残差 (`[hc][n_embd]`) に、この規則だけを適用する。
@@ -237,6 +268,8 @@ impl Rule {
         if st == 0 || !self.covers(layer) || data.len() < st {
             return;
         }
+        #[cfg(test)]
+        APPLY_CALLS.fetch_add(1, Ordering::Relaxed);
         let base = layer * st;
         match self.mode {
             Mode::Subtract => {
@@ -247,8 +280,9 @@ impl Rule {
                 }
             }
             Mode::Project => {
+                let dir = self.project_dir();
                 for s in 0..hc {
-                    let vp = &self.vhat[base + s * e..base + (s + 1) * e];
+                    let vp = &dir[base + s * e..base + (s + 1) * e];
                     let hp = &mut data[s * e..(s + 1) * e];
                     let mut dot = 0.0f32;
                     for d in 0..e {
@@ -321,6 +355,8 @@ impl Apply {
         if st == 0 || !self.covers(layer) || data.len() < st {
             return;
         }
+        #[cfg(test)]
+        APPLY_CALLS.fetch_add(1, Ordering::Relaxed);
         // task 849: 重ね掛けは規則の順に 1 個ずつ掛ける (範囲も alpha も別)。
         if !self.rules.is_empty() {
             let e = self.shape.n_embd;
@@ -418,6 +454,35 @@ fn meta_cell() -> &'static RwLock<Option<(Shape, String)>> {
 fn rec_cell() -> &'static Mutex<Option<Rec>> {
     static R: OnceLock<Mutex<Option<Rec>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(None))
+}
+
+/// task 957: 適用 (`apply`) が設定されているか。ホットパスの入口で 1 回見るだけで、
+/// 何も設定されていないときは `RwLock` も取らずに層ループを素通りするためのもの。
+/// 値は [`install_apply`] / [`clear_apply`] / [`reset_for_test`] だけが書く。
+static APPLY_ON: AtomicBool = AtomicBool::new(false);
+
+/// task 957: 適用が設定されているか (ホットパスの分岐 1 個)。
+#[inline]
+pub fn apply_on() -> bool {
+    APPLY_ON.load(Ordering::Relaxed)
+}
+
+/// task 957: ホットパス用の入口。適用が無ければ `None` を返し、ロックも取らない。
+///
+/// 何も掛けていない既定経路の decode / prefill は、これ 1 回の原子的読みだけで
+/// ステアリングの分岐を抜ける (`steer::snapshot()` の `RwLock` + `Arc` clone をしない)。
+/// 適用があるときだけ [`snapshot`] を 1 回読み、層ループの中では `Arc` を参照する。
+#[inline]
+pub fn active() -> Option<Arc<Steer>> {
+    if !apply_on() {
+        return None;
+    }
+    let s = snapshot();
+    if s.apply.is_some() {
+        Some(s)
+    } else {
+        None
+    }
 }
 
 /// 記録中か (ホットパスの分岐 1 個)。
@@ -618,6 +683,77 @@ fn normalize_layers(shape: &Shape, v: &[f32], from: usize, to: usize) -> Vec<f32
 /// task 849: 重ね掛けする規則の上限 (壊れた入力でメモリを食い潰さないため)。
 pub const MAX_RULES: usize = 16;
 
+/// task 957: 重ね掛けの project を正規直交基底で掛ける (`DENNO_STEER_ORTHO=1`)。
+///
+/// 既定は off (従来 = 規則を順に掛ける)。on にすると、同じ層に掛かる project 規則の
+/// 方向を (layer, stream) ごとに Gram-Schmidt で正規直交化してから掛けるので、
+/// `h -= Σ_i alpha_i (h·q_i) q_i` の形になり、規則の順序に依存せず、
+/// alpha 1 の規則の方向は残差から厳密に落ちる (2 回掛けても変わらない)。
+pub fn ortho_on() -> bool {
+    match std::env::var("DENNO_STEER_ORTHO") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
+}
+
+/// task 957: 重ね掛けの project 方向を (layer, stream) ごとに正規直交化する。
+///
+/// 各規則の `vortho` に正規化した基底を書く。先行する project 方向と一次従属な
+/// (layer, stream) は 0 のまま (その規則はその層では何もしない = 射影の像が同じ)。
+/// 正規化は `vhat` と同じく f64 の二乗和から `1/sqrt` を掛けて f32 に丸める。
+fn orthogonalize_rules(shape: &Shape, rules: &mut [Rule]) {
+    let e = shape.n_embd;
+    let st = shape.stride();
+    if e == 0 || st == 0 || rules.is_empty() {
+        return;
+    }
+    let mut out = vec![vec![0.0f32; shape.len()]; rules.len()];
+    let mut basis: Vec<Vec<f32>> = Vec::with_capacity(rules.len());
+    let mut x = vec![0.0f32; e];
+    for il in 0..shape.n_layer {
+        let base = il * st;
+        for s in 0..shape.n_hc {
+            basis.clear();
+            for (ri, r) in rules.iter().enumerate() {
+                if r.mode != Mode::Project || !r.covers(il) {
+                    continue;
+                }
+                let src = &r.vhat[base + s * e..base + (s + 1) * e];
+                x.copy_from_slice(src);
+                // 2 回まわす (f32 の直交性を上げる。値は `vhat` 由来なので安い)。
+                for _ in 0..2 {
+                    for q in &basis {
+                        let mut d = 0.0f32;
+                        for k in 0..e {
+                            d += x[k] * q[k];
+                        }
+                        for k in 0..e {
+                            x[k] -= d * q[k];
+                        }
+                    }
+                }
+                let mut ss = 0.0f64;
+                for k in 0..e {
+                    ss += (x[k] as f64) * (x[k] as f64);
+                }
+                // 依存 (残りが 0) ならその層では掛けない (0 ベクトルで何もしない)。
+                if ss <= 1e-18 {
+                    continue;
+                }
+                let inv = 1.0 / ss.sqrt();
+                let dst = &mut out[ri][base + s * e..base + (s + 1) * e];
+                for k in 0..e {
+                    dst[k] = (x[k] as f64 * inv) as f32;
+                }
+                basis.push(dst.to_vec());
+            }
+        }
+    }
+    for (r, v) in rules.iter_mut().zip(out) {
+        r.vortho = v;
+    }
+}
+
 /// task 849: 規則ごとの層範囲・alpha・mode を持つ適用を組み立てる。
 ///
 /// 単一規則の [`build_apply`] と同じ規則で各項を検証し、規則ごとに
@@ -628,6 +764,18 @@ fn build_rules_apply(
     shape: &Shape,
     snaps: &[Arc<Snapshot>],
     specs: &[RuleSpec],
+) -> Result<Apply, String> {
+    // task 957: 正規直交化は env ゲート (`DENNO_STEER_ORTHO`)。既定は従来どおり
+    // 規則を順に掛けるだけ (task 849 の数値と 1 ビットも変えない)。
+    build_rules_apply_opt(shape, snaps, specs, ortho_on())
+}
+
+/// task 849 / 957: `ortho` を明示できる版 (テストが env を触らずに両方を確かめる)。
+fn build_rules_apply_opt(
+    shape: &Shape,
+    snaps: &[Arc<Snapshot>],
+    specs: &[RuleSpec],
+    ortho: bool,
 ) -> Result<Apply, String> {
     if !shape.is_valid() {
         return Err("モデルの形が未初期化 (steer::init を先に呼ぶ)".into());
@@ -705,7 +853,11 @@ fn build_rules_apply(
             mode: sp.mode,
             v,
             vhat,
+            vortho: Vec::new(),
         });
+    }
+    if ortho {
+        orthogonalize_rules(shape, &mut rules);
     }
     let from = rules.iter().map(|r| r.from).min().unwrap_or(0);
     let to = rules.iter().map(|r| r.to).max().unwrap_or(0);
@@ -732,6 +884,8 @@ fn install_apply(a: Apply) -> Arc<Steer> {
         apply: Some(a),
     });
     *g = Arc::clone(&s);
+    // task 957: ホットパスの入口 (`apply_on`) を先に立ててから差し替える。
+    APPLY_ON.store(true, Ordering::Release);
     s
 }
 
@@ -772,6 +926,8 @@ pub fn clear_apply() -> Arc<Steer> {
     let mut g = cur_cell().write().unwrap_or_else(|e| e.into_inner());
     let s = Arc::new(Steer::empty(epoch));
     *g = Arc::clone(&s);
+    // task 957: ホットパスの入口を落とす (次からは `active()` がロックを取らない)。
+    APPLY_ON.store(false, Ordering::Release);
     s
 }
 
@@ -2325,6 +2481,7 @@ pub fn reset_for_test() {
     *rec_cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
     let epoch = super::intervene::bump_epoch();
     *cur_cell().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Steer::empty(epoch));
+    APPLY_ON.store(false, Ordering::SeqCst);
     *snaps_cell().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Vec::new());
 }
 
@@ -3615,5 +3772,317 @@ mod tests {
         // 失敗した適用は状態を変えない。
         assert!(apply_status().is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// task 957: 何も掛けていない既定経路はロックを取らず (`active()` が `None`)、
+    /// 規則を 1 本も掛けない。掛けたら層数ぶんだけ発火し、外したら元に戻る。
+    #[test]
+    fn disabled_dispatch_takes_no_lock_and_applies_nothing() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("dispatch");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "stack-model");
+        reset_for_test();
+        assert!(!apply_on(), "初期状態で適用が立っている");
+        assert!(active().is_none(), "初期状態で active() が Some");
+
+        let h0 = rows(&s, 1, 0.375).pop().unwrap();
+        let mut h = h0.clone();
+        APPLY_CALLS.store(0, Ordering::Relaxed);
+        for il in 0..s.n_layer {
+            // ホットパスと同じ形 (`active()` の分岐 1 個)。
+            let state = active();
+            if let Some(a) = state.as_ref().and_then(|x| x.apply.as_ref()) {
+                a.apply_one(il, &mut h);
+            }
+        }
+        assert_eq!(h, h0, "無効時に残差が変わった");
+        assert_eq!(
+            APPLY_CALLS.load(Ordering::Relaxed),
+            0,
+            "無効時に規則が掛かった"
+        );
+
+        // 掛けたら層数ぶんだけ発火する (分岐が本当に開く)。
+        add_snap(&s, "A", 0.25);
+        set_apply(vec![tr("A", 1.0)], 0, s.n_layer, 0.5, Mode::Subtract).expect("適用");
+        assert!(apply_on(), "設定後に apply_on() が偽");
+        assert!(active().is_some(), "設定後に active() が None");
+        let mut h = h0.clone();
+        APPLY_CALLS.store(0, Ordering::Relaxed);
+        for il in 0..s.n_layer {
+            let state = active();
+            if let Some(a) = state.as_ref().and_then(|x| x.apply.as_ref()) {
+                a.apply_one(il, &mut h);
+            }
+        }
+        assert_eq!(
+            APPLY_CALLS.load(Ordering::Relaxed),
+            s.n_layer,
+            "適用の回数が層数と違う"
+        );
+        assert_ne!(h, h0, "適用しても残差が変わらない");
+
+        // 重ね掛けでも同じ入口で開く。
+        set_rules(vec![
+            RuleSpec {
+                terms: vec![tr("A", 1.0)],
+                from: 0,
+                to: 2,
+                alpha: 0.5,
+                mode: Mode::Project,
+            },
+            RuleSpec {
+                terms: vec![tr("A", -1.0)],
+                from: 1,
+                to: 3,
+                alpha: 1.0,
+                mode: Mode::Subtract,
+            },
+        ])
+        .expect("重ね掛け");
+        assert!(apply_on());
+        let mut h = h0.clone();
+        APPLY_CALLS.store(0, Ordering::Relaxed);
+        for il in 0..s.n_layer {
+            let state = active();
+            if let Some(a) = state.as_ref().and_then(|x| x.apply.as_ref()) {
+                a.apply_one(il, &mut h);
+            }
+        }
+        // 層ごとに `Apply::apply_one` が 1 回 + 規則が層 0:1 本 / 層 1:2 本 / 層 2:1 本。
+        assert_eq!(
+            APPLY_CALLS.load(Ordering::Relaxed),
+            s.n_layer + 1 + 2 + 1,
+            "重ね掛けの適用回数"
+        );
+
+        // 外したら分岐が閉じる。
+        clear_apply();
+        assert!(!apply_on(), "clear 後も apply_on() が真");
+        assert!(active().is_none(), "clear 後も active() が Some");
+        let mut h = h0.clone();
+        APPLY_CALLS.store(0, Ordering::Relaxed);
+        for il in 0..s.n_layer {
+            let state = active();
+            if let Some(a) = state.as_ref().and_then(|x| x.apply.as_ref()) {
+                a.apply_one(il, &mut h);
+            }
+        }
+        assert_eq!(APPLY_CALLS.load(Ordering::Relaxed), 0, "clear 後に掛かった");
+        assert_eq!(h, h0, "clear 後に残差が変わった");
+        reset_for_test();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 重ね掛けの project を正規直交化したときの参照 (Gram-Schmidt を f64 で)。
+    fn ortho_reference(vhats: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let e = vhats[0].len();
+        let mut basis: Vec<Vec<f64>> = Vec::new();
+        let mut out = Vec::new();
+        for v in vhats {
+            let mut x: Vec<f64> = v.iter().map(|&z| z as f64).collect();
+            for q in &basis {
+                let d: f64 = x.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                for k in 0..e {
+                    x[k] -= d * q[k];
+                }
+            }
+            let n: f64 = x.iter().map(|a| a * a).sum::<f64>().sqrt();
+            if n <= 1e-6 {
+                out.push(vec![0.0f32; e]);
+                continue;
+            }
+            let q: Vec<f64> = x.iter().map(|a| a / n).collect();
+            out.push(q.iter().map(|&a| a as f32).collect());
+            basis.push(q);
+        }
+        out
+    }
+
+    fn dotf(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    }
+
+    /// task 957: `DENNO_STEER_ORTHO` の on/off で、重ね掛け project の合成が
+    /// 「逐次 (従来)」と「正規直交基底 (順序に依らず厳密)」に切り替わる。
+    #[test]
+    fn orthogonal_composition_is_order_independent_and_exact() {
+        let _g = LOCK.lock().unwrap();
+        let dir = tmpdir("ortho");
+        std::env::set_var("DENNO_STEER_DIR", &dir);
+        let s = shape();
+        init(s, "stack-model");
+        // 2 本の方向が平行でないことを保証する (add_snap の ramps は平行になる)。
+        let add_custom = |name: &str, f: &dyn Fn(usize) -> f32| {
+            push_snapshot(Arc::new(Snapshot {
+                name: name.into(),
+                tokens: 4,
+                created: 1,
+                model: "stack-model".into(),
+                layers: s.n_layer,
+                n_hc: s.n_hc,
+                n_embd: s.n_embd,
+                mean: (0..s.len()).map(f).collect(),
+            }));
+        };
+        add_custom("A", &|i| i as f32 * 0.125 + 0.25);
+        add_custom("B", &|i| ((i * 37) % 17) as f32 * 0.5 - 3.0);
+        // 方向が平行でないこと (vhat の内積が 1 から離れる) を確かめる。
+        let snaps = {
+            let g = snaps_cell().read().unwrap();
+            g.as_ref().clone()
+        };
+        {
+            let a = &snaps.iter().find(|z| z.name == "A").unwrap().mean;
+            let b = &snaps.iter().find(|z| z.name == "B").unwrap().mean;
+            let na: f32 = a[..s.n_embd].iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b[..s.n_embd].iter().map(|x| x * x).sum::<f32>().sqrt();
+            let d: f32 = a[..s.n_embd]
+                .iter()
+                .zip(&b[..s.n_embd])
+                .map(|(x, y)| x * y)
+                .sum();
+            assert!((d / (na * nb)).abs() < 0.99, "2 本の方向がほぼ平行");
+        }
+        let specs = vec![
+            RuleSpec {
+                terms: vec![tr("A", 1.0)],
+                from: 0,
+                to: s.n_layer,
+                alpha: 1.0,
+                mode: Mode::Project,
+            },
+            RuleSpec {
+                terms: vec![tr("B", 1.0)],
+                from: 0,
+                to: s.n_layer,
+                alpha: 1.0,
+                mode: Mode::Project,
+            },
+        ];
+        let h0 = rows(&s, 1, 0.375).pop().unwrap();
+
+        // 既定 (ortho off) は vortho を作らず、逐次適用と 1 ビット一致。
+        let seq = build_rules_apply_opt(&s, &snaps, &specs, false).expect("既定");
+        assert!(
+            seq.rules.iter().all(|r| r.vortho.is_empty()),
+            "off で vortho を作った"
+        );
+        let mut want = h0.clone();
+        for il in 0..s.n_layer {
+            for r in &seq.rules {
+                r.apply_one(il, &mut want, s.stride(), s.n_embd, s.n_hc);
+            }
+        }
+        let mut got_seq = h0.clone();
+        for il in 0..s.n_layer {
+            seq.apply_one(il, &mut got_seq);
+        }
+        assert_eq!(got_seq, want, "既定が逐次適用と違う");
+
+        // ortho on: 各層/ストリームで参照の正規直交基底と一致する。
+        // (残差 1 行を層ごとに別々に掛ける。1 本のバッファに層を続けて掛けると
+        //  最後の層の結果しか残らないため。)
+        let orth = build_rules_apply_opt(&s, &snaps, &specs, true).expect("直交化");
+        let per_layer = |a: &Apply| -> Vec<Vec<f32>> {
+            (0..s.n_layer)
+                .map(|il| {
+                    let mut row = h0.clone();
+                    a.apply_one(il, &mut row);
+                    row
+                })
+                .collect()
+        };
+        let got = per_layer(&orth);
+        let got_seq_l = per_layer(&seq);
+        assert_ne!(got, got_seq_l, "直交化しても値が同じ (ゲートが不発)");
+        for il in 0..s.n_layer {
+            let row = &got[il];
+            for st in 0..s.n_hc {
+                let lo = st * s.n_embd;
+                let hi = lo + s.n_embd;
+                let vhats: Vec<Vec<f32>> = orth
+                    .rules
+                    .iter()
+                    .map(|r| r.vhat[il * s.stride() + lo..il * s.stride() + hi].to_vec())
+                    .collect();
+                let want_q = ortho_reference(&vhats);
+                for (ri, r) in orth.rules.iter().enumerate() {
+                    let q = &r.vortho[il * s.stride() + lo..il * s.stride() + hi];
+                    for k in 0..s.n_embd {
+                        assert!(
+                            (q[k] - want_q[ri][k]).abs() <= 1e-5,
+                            "層 {il} ストリーム {st} 規則 {ri} 要素 {k}: {} != {}",
+                            q[k],
+                            want_q[ri][k]
+                        );
+                    }
+                    // 残差の q 方向の成分は落ちている (alpha 1)。
+                    assert!(
+                        dotf(&row[lo..hi], q).abs() <= 1e-4,
+                        "層 {il} ストリーム {st} 規則 {ri} の成分が残る"
+                    );
+                }
+                // 2 本の方向に直交する成分は保存される (直交射影)。
+                let mut hh = h0[lo..hi].to_vec();
+                for r in &orth.rules {
+                    let q = &r.vortho[il * s.stride() + lo..il * s.stride() + hi];
+                    let d = dotf(&hh, q);
+                    for k in 0..s.n_embd {
+                        hh[k] -= d * q[k];
+                    }
+                }
+                for k in 0..s.n_embd {
+                    assert!(
+                        (row[lo + k] - hh[k]).abs() <= 1e-5,
+                        "層 {il} ストリーム {st} 要素 {k} が閉じた式と違う"
+                    );
+                }
+            }
+        }
+
+        // 2 回目は不変 (冪等)。
+        for il in 0..s.n_layer {
+            let mut twice = got[il].clone();
+            orth.apply_one(il, &mut twice);
+            for k in 0..twice.len() {
+                assert!(
+                    (twice[k] - got[il][k]).abs() <= 1e-5,
+                    "直交化した射影が冪等でない (層 {il} 要素 {k})"
+                );
+            }
+        }
+
+        // 規則の順を入れ替えても結果が変わらない (順序非依存)。
+        let swapped = build_rules_apply_opt(&s, &snaps, &[specs[1].clone(), specs[0].clone()], true)
+            .expect("入れ替え");
+        let got_sw = per_layer(&swapped);
+        for il in 0..s.n_layer {
+            for k in 0..s.n_embd * s.n_hc {
+                assert!(
+                    (got_sw[il][k] - got[il][k]).abs() <= 1e-5,
+                    "規則の順で結果が変わる (層 {il} 要素 {k})"
+                );
+            }
+        }
+        reset_for_test();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// task 957: `DENNO_STEER_ORTHO` は既定 off で、`=1` のときだけ効く。
+    #[test]
+    fn ortho_env_gate_defaults_off() {
+        let _g = LOCK.lock().unwrap();
+        std::env::remove_var("DENNO_STEER_ORTHO");
+        assert!(!ortho_on(), "既定で on になっている");
+        std::env::set_var("DENNO_STEER_ORTHO", "0");
+        assert!(!ortho_on(), "=0 で on になっている");
+        std::env::set_var("DENNO_STEER_ORTHO", "");
+        assert!(!ortho_on(), "空文字で on になっている");
+        std::env::set_var("DENNO_STEER_ORTHO", "1");
+        assert!(ortho_on(), "=1 で on にならない");
+        std::env::remove_var("DENNO_STEER_ORTHO");
     }
 }
