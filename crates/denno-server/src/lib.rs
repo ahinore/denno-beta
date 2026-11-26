@@ -912,17 +912,54 @@ pub(crate) fn tool_use_to_xml(name: &str, input: &serde_json::Value) -> String {
     s
 }
 
-/// system: 文字列 or [{type:"text",...}]
+/// system: 文字列 or `[{type:"text", text: "..."}]`
+///
+/// task 991: ブロック配列の検証を厳格化する (以前は text 以外のブロックを
+/// 黙って読み飛ばし、`text` の欠落や空文字も空文字として通していた)。
+/// - ブロックはオブジェクトであること (`system[i]: each block must be an object`)
+/// - `type` は **"text" のみ**。`image` / `document` などのマルチモーダル
+///   ブロックはテキスト専用モデルでは解釈できないため 400 で明示的に拒否する
+///   (黙って落とすとプロンプトから静かに内容が消える)。
+/// - `text` は文字列で、かつ非空白であること (空 text ブロックは 400)。
+/// - 複数ブロックは出現順に連結する (区切り文字は挟まない。単一ブロックの
+///   既存経路と同一のプロンプトになり、`cache_control` は従来どおり無視する)。
+/// - 空配列は「system 無し」ではなく空文字列の system として扱う (既存挙動)。
+///
+/// エラーはすべて `400 invalid_request_error` の Anthropic 封筒になる
+/// (`ApiError::invalid_request` は `error.type = "invalid_request_error"`)。
 fn system_to_text(v: &Option<serde_json::Value>) -> Result<Option<String>, ApiError> {
     match v {
         None => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
         Some(serde_json::Value::Array(blocks)) => {
             let mut out = String::new();
-            for b in blocks {
-                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    out.push_str(b.get("text").and_then(|t| t.as_str()).unwrap_or_default());
+            for (i, b) in blocks.iter().enumerate() {
+                if !b.is_object() {
+                    return Err(ApiError::invalid_request(format!(
+                        "system[{i}]: each block must be an object"
+                    )));
                 }
+                let ty = b.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
+                    ApiError::invalid_request(format!(
+                        "system[{i}].type: must be a string (text blocks only)"
+                    ))
+                })?;
+                if ty != "text" {
+                    return Err(ApiError::invalid_request(format!(
+                        "system[{i}].type: unsupported value {ty:?} (text blocks only)"
+                    )));
+                }
+                let text = b.get("text").and_then(|t| t.as_str()).ok_or_else(|| {
+                    ApiError::invalid_request(format!(
+                        "system[{i}].text: must be a string"
+                    ))
+                })?;
+                if text.trim().is_empty() {
+                    return Err(ApiError::invalid_request(format!(
+                        "system[{i}].text: text blocks must be non-empty"
+                    )));
+                }
+                out.push_str(text);
             }
             Ok(Some(out))
         }
@@ -3167,5 +3204,120 @@ mod temperature_cap_tests {
     #[test]
     fn cap_above_request_does_not_raise_it() {
         assert_eq!(apply_temperature_cap(Some(0.2), Some(2.0)), Some(0.2));
+    }
+}
+
+/// task 991: `system` のブロック配列の正規化 (連結順・空 text・マルチモーダル拒否)。
+#[cfg(test)]
+mod system_blocks_991_tests {
+    use super::system_to_text;
+    use serde_json::json;
+
+    fn err_msg(v: serde_json::Value) -> String {
+        match system_to_text(&Some(v)) {
+            Ok(ok) => panic!("400 を期待したが通った: {ok:?}"),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn string_system_is_passthrough() {
+        assert_eq!(
+            system_to_text(&Some(json!("You are a test."))).unwrap(),
+            Some("You are a test.".to_string())
+        );
+        assert_eq!(system_to_text(&None).unwrap(), None);
+        // 空文字列は従来どおり通す (ブロック配列の空 text だけが 400)
+        assert_eq!(system_to_text(&Some(json!(""))).unwrap(), Some(String::new()));
+    }
+
+    #[test]
+    fn multi_blocks_concatenate_in_order() {
+        // 連結順は配列順。区切り文字は挟まない (単一ブロック経路と同じ文字列になる)
+        let v = json!([
+            {"type": "text", "text": "aaa"},
+            {"type": "text", "text": "bbb", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "ccc"},
+        ]);
+        assert_eq!(system_to_text(&Some(v)).unwrap(), Some("aaabbbccc".to_string()));
+    }
+
+    #[test]
+    fn single_text_block_matches_string_form() {
+        let blk = system_to_text(&Some(json!([{"type": "text", "text": "abc"}]))).unwrap();
+        let s = system_to_text(&Some(json!("abc"))).unwrap();
+        assert_eq!(blk, s);
+    }
+
+    #[test]
+    fn empty_system_array_is_empty_string() {
+        assert_eq!(
+            system_to_text(&Some(json!([]))).unwrap(),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn empty_or_whitespace_text_block_is_rejected() {
+        for text in ["", " ", "\n\t "] {
+            let m = err_msg(json!([{"type": "text", "text": text}]));
+            assert!(m.contains("system[0].text"), "message = {m}");
+            assert!(m.contains("non-empty"), "message = {m}");
+        }
+    }
+
+    #[test]
+    fn missing_or_non_string_text_is_rejected() {
+        let m = err_msg(json!([{"type": "text"}]));
+        assert!(m.contains("system[0].text: must be a string"), "message = {m}");
+        let m = err_msg(json!([{"type": "text", "text": 5}]));
+        assert!(m.contains("system[0].text: must be a string"), "message = {m}");
+        let m = err_msg(json!([{"type": "text", "text": null}]));
+        assert!(m.contains("system[0].text: must be a string"), "message = {m}");
+    }
+
+    #[test]
+    fn multimodal_blocks_are_rejected() {
+        let image = json!([{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+        }]);
+        let m = err_msg(image);
+        assert!(m.contains("system[0].type"), "message = {m}");
+        assert!(m.contains("image"), "message = {m}");
+
+        let doc = json!([{
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": "hi"}
+        }]);
+        let m = err_msg(doc);
+        assert!(m.contains("system[0].type"), "message = {m}");
+        assert!(m.contains("document"), "message = {m}");
+
+        // 2 個目が image なら index が 1 になる
+        let mixed = json!([
+            {"type": "text", "text": "ok"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA"}},
+        ]);
+        let m = err_msg(mixed);
+        assert!(m.contains("system[1].type"), "message = {m}");
+    }
+
+    #[test]
+    fn missing_type_and_non_object_blocks_are_rejected() {
+        let m = err_msg(json!([{"text": "hi"}]));
+        assert!(m.contains("system[0].type"), "message = {m}");
+        let m = err_msg(json!([{"type": 3, "text": "hi"}]));
+        assert!(m.contains("system[0].type"), "message = {m}");
+        let m = err_msg(json!(["hi"]));
+        assert!(m.contains("system[0]: each block must be an object"), "message = {m}");
+    }
+
+    #[test]
+    fn non_string_non_array_system_is_rejected() {
+        let m = err_msg(json!(42));
+        assert!(m.contains("system must be a string or an array"), "message = {m}");
+        let m = err_msg(json!({"type": "text", "text": "hi"}));
+        assert!(m.contains("system must be a string or an array"), "message = {m}");
     }
 }
