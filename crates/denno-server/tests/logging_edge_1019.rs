@@ -172,9 +172,11 @@ fn json_access_log_escapes_control_quotes_newlines_and_non_ascii() {
     assert!(line.contains("\\\\"), "バックスラッシュがエスケープされていない: {line}");
 }
 
-/// JSON アクセスログは 6 フィールドちょうど (`ts_ms` / `method` / `path` /
-/// `status` / `duration_ms` / `request_id`) を持ち、ヘッダ値が独立したフィールド
-/// (authorization / headers / api_key / cookie) として漏れないこと。
+/// JSON アクセスログは閉じたフィールド集合 (`ts_ms` / `method` / `path` /
+/// `status` / `latency_ms` / `duration_ms` / `request_id`) を持ち、
+/// ヘッダ値が独立したフィールド (authorization / headers / api_key / cookie)
+/// として漏れないこと。
+/// task 1101: `latency_ms` を追加 (`duration_ms` は互換のため同値で残す)。
 /// Authorization らしき文字列を path に混ぜても「値」に閉じ込められること。
 #[test]
 fn json_access_log_has_exact_fields_and_no_header_leak() {
@@ -189,7 +191,7 @@ fn json_access_log_has_exact_fields_and_no_header_leak() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["duration_ms", "method", "path", "request_id", "status", "ts_ms"],
+        vec!["duration_ms", "latency_ms", "method", "path", "request_id", "status", "ts_ms"],
         "フィールド集合が変わった (ヘッダ漏えいの余地): {keys:?}"
     );
     for forbidden in [

@@ -184,12 +184,70 @@ pub fn access_log_json() -> bool {
     ACCESS_JSON.load(Ordering::Relaxed)
 }
 
+// ---------- task 1101: クエリ文字列の秘匿 ----------
+
+/// 値の秘匿対象になるクエリパラメータ名 (小文字で比較)。
+/// task 1101 の指定: `api_key` / `key` / `token` / `secret` / `authorization`。
+/// 同じ意味の綴り (`apikey` / `api-key` / `access_token` など) も値ごと伏せる。
+const SENSITIVE_QUERY_NAMES: &[&str] = &[
+    "api_key",
+    "apikey",
+    "api-key",
+    "key",
+    "token",
+    "access_token",
+    "refresh_token",
+    "secret",
+    "client_secret",
+    "authorization",
+    "auth",
+    "password",
+];
+
+/// 秘匿した値の置換文字列。
+const REDACTED: &str = "REDACTED";
+
+/// クエリパラメータ名が秘匿対象か (ASCII 大文字小文字を無視)。
+pub fn is_sensitive_query_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE_QUERY_NAMES.contains(&lower.as_str())
+}
+
+/// クエリ文字列 (`?` の後ろ) のうち、秘匿対象パラメータの値だけを
+/// [`REDACTED`] に置き換える。名前・順序・区切り (`&`) はそのまま保つ。
+/// 秘匿対象が無ければ入力と同一の文字列を返す。
+pub fn redact_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if is_sensitive_query_name(name) => format!("{name}={REDACTED}"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// パス (+ クエリ) からアクセスログ用の文字列を作る。
+/// クエリが無ければそのまま、あれば秘匿対象の値だけを伏せる。
+/// 冪等 (伏せた後の `REDACTED` は再適用しても変わらない)。
+pub fn redact_path_and_query(path: &str) -> String {
+    match path.split_once('?') {
+        Some((p, q)) => format!("{p}?{}", redact_query(q)),
+        None => path.to_string(),
+    }
+}
+
 /// 1 リクエストぶんの JSON アクセスログ行 (`--log-format json`)。
 /// `log_requests` ミドルウェアが応答後に 1 行だけ出す。
 ///
 /// task 911: `request_id` は応答ヘッダ `x-request-id` と同じ値
 /// (クライアントが送った ID の無害化版、または生成した ID)。ログ行と
 /// クライアント側の記録を突き合わせるための鍵になる。
+///
+/// task 1101: `path` はクエリ込み。秘匿対象パラメータの値は
+/// [`redact_path_and_query`] で伏せる (ヘッダ値は決して載せない)。
+/// 経過時間は `latency_ms` (task 1101 の新名) と `duration_ms`
+/// (既存の収集系との互換のため同値で残す) の両方に入れる。
 pub fn access_log_line(
     method: &str,
     path: &str,
@@ -201,11 +259,13 @@ pub fn access_log_line(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let path = redact_path_and_query(path);
     serde_json::json!({
         "ts_ms": ts_ms,
         "method": method,
         "path": path,
         "status": status,
+        "latency_ms": duration_ms,
         "duration_ms": duration_ms,
         "request_id": request_id,
     })
@@ -377,6 +437,7 @@ mod tests {
         assert_eq!(v["path"], "/v1/messages");
         assert_eq!(v["status"], 200);
         assert_eq!(v["request_id"], "req-000000000001");
+        assert!((v["latency_ms"].as_f64().unwrap() - 12.5).abs() < 1e-9);
         assert!((v["duration_ms"].as_f64().unwrap() - 12.5).abs() < 1e-9);
         assert!(v["ts_ms"].as_u64().unwrap() > 0);
         // 既定 (text) に戻す — 同じプロセスの他テストに漏らさない。

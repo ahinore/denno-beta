@@ -326,7 +326,7 @@ fn json_access_log_has_closed_field_set() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["duration_ms", "method", "path", "request_id", "status", "ts_ms"],
+        ["duration_ms", "latency_ms", "method", "path", "request_id", "status", "ts_ms"],
         "フィールド集合が変わった (ヘッダ/キーが乗る余地): {keys:?}"
     );
     for forbidden in ["api_key", "x-api-key", "authorization", "headers", "cookie", "env"] {
