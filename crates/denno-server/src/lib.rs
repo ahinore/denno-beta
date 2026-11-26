@@ -842,6 +842,18 @@ impl InMessage {
                                     tuid
                                 )));
                             }
+                            // task 1061: Anthropic 仕様で `is_error` は省略可能な
+                            // boolean。型違いは実 API と同じく 400。値自体は履歴
+                            // テキストへ織り込まない (Qwen3.5 テンプレートの
+                            // multi_step_tool 判定は `<tool_response>` 包みだけを見る)。
+                            match b.get("is_error") {
+                                None | Some(serde_json::Value::Bool(_)) => {}
+                                Some(_) => {
+                                    return Err(ApiError::invalid_request(
+                                        "tool_result.is_error must be a boolean",
+                                    ))
+                                }
+                            }
                             let body = match b.get("content") {
                                 None | Some(serde_json::Value::Null) => String::new(),
                                 Some(serde_json::Value::String(s)) => s.clone(),
@@ -850,10 +862,21 @@ impl InMessage {
                                     for it in items {
                                         if it.get("type").and_then(|t| t.as_str()) == Some("text")
                                         {
-                                            s.push_str(
-                                                it.get("text").and_then(|t| t.as_str())
-                                                    .unwrap_or_default(),
-                                            );
+                                            // task 1061: text block の `text` は
+                                            // 実 API と同じく文字列のみ受理 (欠落 /
+                                            // null は空文字)。型違いは 400。
+                                            let text = match it.get("text") {
+                                                None | Some(serde_json::Value::Null) => "",
+                                                Some(serde_json::Value::String(t)) => {
+                                                    t.as_str()
+                                                }
+                                                Some(_) => {
+                                                    return Err(ApiError::invalid_request(
+                                                        "tool_result.content[].text must be a string",
+                                                    ))
+                                                }
+                                            };
+                                            s.push_str(text);
                                         } else {
                                             return Err(ApiError::invalid_request(format!(
                                                 "unsupported tool_result content block type: {:?} (text blocks only)",
@@ -2982,6 +3005,90 @@ mod tool_tests {
             content: json!([{"type": "tool_result", "tool_use_id": "nope", "content": 3}]),
         };
         assert!(m.to_text(&mut ids).is_err());
+    }
+
+    // ---- task 1061: is_error 型検証と text block の型検証 ----
+
+    #[test]
+    fn tool_result_is_error_bool_is_accepted_and_not_woven_into_text() {
+        let mut ids = HashSet::new();
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "toolu_e", "name": "f", "input": {}}]),
+        };
+        m.to_text(&mut ids).unwrap();
+
+        let want = "<tool_response>\nboom\n</tool_response>";
+        for is_error in [json!(null), json!(false), json!(true)] {
+            let mut block = json!({
+                "type": "tool_result", "tool_use_id": "toolu_e", "content": "boom"
+            });
+            if !is_error.is_null() {
+                block["is_error"] = is_error.clone();
+            }
+            let m = InMessage {
+                role: "user".into(),
+                content: json!([block]),
+            };
+            assert_eq!(m.to_text(&mut ids).unwrap(), want, "is_error={is_error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_is_error_non_bool_is_rejected() {
+        let mut ids = HashSet::new();
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "toolu_e", "name": "f", "input": {}}]),
+        };
+        m.to_text(&mut ids).unwrap();
+        for bad in [json!("true"), json!(1), json!(0.0), json!([]), json!({}), json!(null)] {
+            let m = InMessage {
+                role: "user".into(),
+                content: json!([{
+                    "type": "tool_result", "tool_use_id": "toolu_e",
+                    "content": "x", "is_error": bad
+                }]),
+            };
+            let err = m.to_text(&mut ids).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("is_error"),
+                "is_error={bad} のエラーが is_error に言及しない: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_text_block_text_must_be_string() {
+        let mut ids = HashSet::new();
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "toolu_t", "name": "f", "input": {}}]),
+        };
+        m.to_text(&mut ids).unwrap();
+        // 欠落 / null は空文字として受理
+        let m = InMessage {
+            role: "user".into(),
+            content: json!([{
+                "type": "tool_result", "tool_use_id": "toolu_t",
+                "content": [{"type": "text", "text": "a"}, {"type": "text"}]
+            }]),
+        };
+        assert_eq!(
+            m.to_text(&mut ids).unwrap(),
+            "<tool_response>\na\n</tool_response>"
+        );
+        // 型違いは 400
+        for bad in [json!(3), json!(true), json!(["x"]), json!({"t": 1})] {
+            let m = InMessage {
+                role: "user".into(),
+                content: json!([{
+                    "type": "tool_result", "tool_use_id": "toolu_t",
+                    "content": [{"type": "text", "text": bad}]
+                }]),
+            };
+            assert!(m.to_text(&mut ids).is_err(), "text={bad} が受理された");
+        }
     }
 
     // ---- tool_call 抽出 ----
