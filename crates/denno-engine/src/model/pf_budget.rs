@@ -622,9 +622,20 @@ mod tests {
         assert!((MIN_RC_CACHE_MB..=2048).contains(&p.tuning.rc_cache_mb));
         assert!(p.tuning.pool_mb >= MIN_POOL_MB);
         assert!(p.tuning.lm_tile >= MIN_LM_TILE);
-        // 恒等の段なら base と完全一致 (64 GiB ホストの平常時)。
+        // 恒等の段なら匿名メモリ上限で丸められない限り base と完全一致 (16 GiB 級 CI ランナーでは pool_mb が上限で丸まる)。
         if p.pressure == Pressure::Healthy && p.total_mib < LARGE_TOTAL_MIB {
-            assert_eq!(p.tuning, b);
+            assert_eq!(p.tuning.pread_threads, b.pread_threads);
+            assert_eq!(p.tuning.ra_threads, b.ra_threads);
+            assert_eq!(p.tuning.lm_tile, b.lm_tile);
+            assert_eq!(p.tuning.pread_kb_cap, b.pread_kb_cap);
+            assert!(p.tuning.pool_mb <= b.pool_mb);
+            assert!(p.tuning.rc_cache_mb <= b.rc_cache_mb);
+            let anon_cap = p.avail_mib * ANON_PCT / 100;
+            if (anon_cap / POOL_DIV) >= b.pool_mb as u64
+                && (anon_cap / RC_DIV) >= b.rc_cache_mb as u64
+            {
+                assert_eq!(p.tuning, b);
+            }
         }
         // ゲート本体も 1 回通す (ログは --nocapture で見える)。
         assert!(crate::model::exp_pf::pread_threads() <= 64);
