@@ -54,6 +54,8 @@ mod ctx;
 mod gdn;
 mod gemm;
 pub(crate) mod h2d;
+// task 1577: task 1372 の L2 persisting cache (br1372 から移植)。既定 off。
+mod l2;
 mod mix;
 mod moe_dec;
 pub(crate) mod moe_pf;
@@ -215,6 +217,14 @@ pub(crate) type FnCuLaunchKernelEx = unsafe extern "C" fn(
 
 pub(crate) type CUevent = *mut c_void;
 
+// task 1577: L2 persisting cache (任意シンボル。無ければ機能ごと no-op)。
+pub(crate) type FnCuCtxSetLimit = unsafe extern "C" fn(c_int, usize) -> CUresult;
+
+pub(crate) type FnCuCtxResetPersistingL2Cache = unsafe extern "C" fn() -> CUresult;
+
+pub(crate) type FnCuStreamSetAttribute =
+    unsafe extern "C" fn(CUstream, c_int, *const l2::CUstreamAttrValue) -> CUresult;
+
 
 /// Driver API の関数ポインタ群 (dlsym は1度だけ行う)
 pub(crate) struct CudaLib {
@@ -266,6 +276,11 @@ pub(crate) struct CudaLib {
     event_sync: Option<FnCuEventSynchronize>,
     // s169 (P8): 位相計測 (cuEventElapsedTime)。無ければ計測は静かに OFF。
     event_elapsed_time: Option<FnCuEventElapsedTime>,
+    // task 1577: L2 persisting cache (`DENNO_CUDA_L2_PERSIST` 既定 off)。
+    // 古い driver で dlsym に失敗しても起動を壊さないよう全て Option。
+    ctx_set_limit: Option<FnCuCtxSetLimit>,
+    ctx_reset_persisting_l2: Option<FnCuCtxResetPersistingL2Cache>,
+    stream_set_attribute: Option<FnCuStreamSetAttribute>,
     launch: FnCuLaunchKernel,
     // task 1377: PDL 用 (CUDA 11.8 以降)。無ければ従来の launch だけを使う。
     launch_ex: Option<FnCuLaunchKernelEx>,
@@ -693,6 +708,13 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         // s169 (P8): 位相計測用 (無い driver では計測だけが OFF になる)。
         event_elapsed_time: sym_opt(handle, "cuEventElapsedTime")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventElapsedTime>(p) }),
+        // task 1577: L2 persisting cache (任意。無ければ機能ごと no-op)。
+        ctx_set_limit: sym_opt(handle, "cuCtxSetLimit")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuCtxSetLimit>(p) }),
+        ctx_reset_persisting_l2: sym_opt(handle, "cuCtxResetPersistingL2Cache")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuCtxResetPersistingL2Cache>(p) }),
+        stream_set_attribute: sym_opt(handle, "cuStreamSetAttribute")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuStreamSetAttribute>(p) }),
         launch: std::mem::transmute(sym(handle, "cuLaunchKernel")?),
         // task 1377: cuLaunchKernelEx は任意 (古い driver では従来経路)。
         launch_ex: sym_opt(handle, "cuLaunchKernelEx")

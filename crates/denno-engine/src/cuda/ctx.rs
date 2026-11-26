@@ -761,6 +761,10 @@ impl CudaCtx {
             check((lib.primary_ctx_retain)(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
             check((lib.ctx_set_current)(ctx), "cuCtxSetCurrent")?;
 
+            // task 1577: L2 persisting cache の予約 (既定 off)。未対応 GPU/driver・
+            // env off では何もしない (失敗しても ctx 生成は続行)。
+            l2::init(dev);
+
             // PTX は NUL 終端が必要
             let mut image = PTX.to_vec();
             image.push(0);
@@ -1330,18 +1334,43 @@ impl CudaCtx {
 
     /// "NVIDIA GeForce RTX 5090 (sm_120, driver 13010)" 形式の情報
     pub fn info(&self) -> String {
+        // task 1577: L2 persisting の状態を 1 語だけ添える (既定 off は "off")。
+        let l2 = match l2::state() {
+            Some(st) if st.cfg.enabled => {
+                format!(", l2-persist on ({} MiB)", st.cfg.limit_bytes / l2::MIB)
+            }
+            Some(_) => ", l2-persist off".to_string(),
+            None => String::new(),
+        };
         format!(
-            "{} (sm_{}{}, driver {}, attn_pf dyn smem {}KB)",
+            "{} (sm_{}{}, driver {}, attn_pf dyn smem {}KB{})",
             self.name,
             self.cc.0,
             self.cc.1,
             self.driver_ver,
-            self.attn_pf_dyn_smem / 1024
+            self.attn_pf_dyn_smem / 1024,
+            l2
         )
     }
 
     pub fn device(&self) -> c_int {
         self.device
+    }
+
+    /// task 1577: 再利用する device 範囲を L2 persisting にする
+    /// (`CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW`, default stream)。
+    ///
+    /// `DENNO_CUDA_L2_PERSIST` が off・未対応 GPU・窓の設定失敗では false を
+    /// 返すだけで何も起きない (数値・発行順は不変)。ストリームに窓は 1 本しか
+    /// 持てないので、既存の窓より小さい範囲は無視される ([`l2::persist_range`])。
+    pub fn persist_l2_range(&self, base: CUdeviceptr, bytes: usize) -> bool {
+        l2::persist_range(base, bytes)
+    }
+
+    /// task 1577: persisting L2 の窓と予約を捨てる (`cuCtxResetPersistingL2Cache`)。
+    /// 無効時は no-op。
+    pub fn reset_persisting_l2(&self) {
+        l2::reset()
     }
 
     /// カーネル起動のみ (同期しない — デフォルトストリームにエンキュー)。
