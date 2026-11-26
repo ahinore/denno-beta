@@ -120,6 +120,36 @@ def main():
         pack32.append("%d" % (x & 0xFFFFFFFF))
     out.append("// IQ3_S の詰めた表 (各本の下位 32 bit。上位 32 bit は全 0 で未使用)。")
     emit_u32(out, "dno_iq3s_grid32", "IQ3S_GRID", pack32)
+
+    # task 940: IQ3_S の格子は 1 値 4 bit (下位 4 バイトの全バイトが 0..15)。
+    # 4 値を 1 本の u16 に詰める (2 KB -> 1 KB。shared への写しも読みも半分)。
+    pack16 = []
+    for v in iq3s:
+        x = int(v, 0)
+        p = 0
+        for j in range(4):
+            b = (x >> (8 * j)) & 0xFF
+            if b > 15:
+                raise SystemExit("IQ3S_GRID の下位 4 バイトが 4 bit に収まらない: %#x" % x)
+            p |= b << (4 * j)
+        pack16.append("%d" % p)
+    out.append("// IQ3_S の 4 bit 詰め表 (1 本 = 4 値 x 4 bit、下位 4 バイトのみ)。")
+    emit_u16(out, "dno_iq3s_grid16", "IQ3S_GRID", pack16)
+
+    # task 940: ksigns を u32 語でも持つ (カーネルがレーンごとに 1 語だけ読み、
+    # __shfl_sync で引く。shared のバイト gather を置き換える)。
+    # 語 = 連続する 4 バイトの little-endian。
+    ks = parse(src, "KSIGNS_IQ2XS")
+    if len(ks) != 128:
+        raise SystemExit("KSIGNS_IQ2XS が 128 本でない: %d" % len(ks))
+    words = []
+    for i in range(0, 128, 4):
+        w = 0
+        for j in range(4):
+            w |= int(ks[i + j], 0) << (8 * j)
+        words.append("%d" % w)
+    out.append("// ksigns の u32 語 (4 バイトずつ little-endian、32 語 = 128 バイト)。")
+    emit_u32(out, "dno_ksigns_iq2xs32", "KSIGNS_IQ2XS", words)
     sys.stdout.write("\n".join(out) + "\n")
 
 

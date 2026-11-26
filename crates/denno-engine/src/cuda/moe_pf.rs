@@ -977,12 +977,17 @@ pub(crate) fn load_exp_iq_module(path: &std::path::Path, tag: &str) -> Option<Ex
 
 /// PTX から**指定したスロットだけ**引く (task 275)。
 ///
-/// `load_exp_iq_module` は 6 スロット + silu が揃っていることを要求するが、
-/// v3 は IQ2_S / IQ3_S の 2 本しか持たない。引けなかったスロットは null のまま
-/// 返し、呼び出し側 ([`exp_iq_kernels_decode`]) が v2/v1 のもので埋める。
+/// `load_exp_iq_module` は 6 スロット + silu が揃っていることを要求するが、v3 は
+/// IQ2_S / IQ3_S の 2 本しか持たない。引けなかったスロットは null のまま返し、
+/// 呼び出し側 ([`exp_iq_kernels_decode`]) が v2/v1 のもので埋める。
+///
+/// エントリ名は `{kernel_name}{suffix}` (v3 は `_v3`、task 940 の LUT 版は `_lut`)。
+/// **`.param` の数が 8 でないエントリは使わない** (cuLaunchKernel は足りない引数を
+/// 不定のまま読むので、ABI が違う PTX を掴むと黙って別の行に書く)。
 pub(crate) fn load_exp_iq_slots(
     path: &std::path::Path,
     tag: &str,
+    suffix: &str,
     slots: &[usize],
 ) -> Option<ExpIqKernels> {
     let mut image = match std::fs::read(path) {
@@ -995,6 +1000,7 @@ pub(crate) fn load_exp_iq_slots(
             return None;
         }
     };
+    let text = String::from_utf8_lossy(&image).into_owned();
     image.push(0);
     let lib = lib().ok()?;
     let mut module: CUmodule = std::ptr::null_mut();
@@ -1010,13 +1016,23 @@ pub(crate) fn load_exp_iq_slots(
         let Some(name) = crate::model::exp_iq::kernel_name(i) else {
             return None;
         };
-        let mut cname = format!("{name}_v3").into_bytes();
+        let full = format!("{name}{suffix}");
+        match crate::cuda::ptx_entry_params(&text, &full) {
+            Some(8) => {}
+            n => {
+                eprintln!(
+                    "[exp-iq] {tag}: PTX の {full} が 8 引数でない ({n:?}) → 従来経路へ"
+                );
+                return None;
+            }
+        }
+        let mut cname = full.into_bytes();
         cname.push(0);
         unsafe {
             if (lib.module_get_function)(&mut fns[i], module, cname.as_ptr() as *const c_char)
                 != CUDA_SUCCESS
             {
-                eprintln!("[exp-iq] {tag}: PTX に {name}_v3 が無い → v2 のまま");
+                eprintln!("[exp-iq] {tag}: PTX に {name}{suffix} が無い → v2 のまま");
                 return None;
             }
         }

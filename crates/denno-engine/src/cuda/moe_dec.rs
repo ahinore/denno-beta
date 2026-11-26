@@ -811,7 +811,35 @@ fn exp_iq_kernels_v3() -> Option<&'static ExpIqKernels> {
             load_exp_iq_slots(
                 &exp_iq_v3_ptx_path(),
                 "v3",
+                "_v3",
                 &crate::model::exp_iq::IQ_V3_SLOTS,
+            )
+        })
+        .as_ref()
+}
+
+
+/// task 940: LUT 版の PTX の置き場所 (`DENNO_EXP_IQ_LUT_PTX` で差し替え可)。
+fn exp_iq_lut_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_IQ_LUT_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_lut.ptx"),
+    }
+}
+
+
+/// task 940: LUT 版カーネル (`DENNO_CUDA_IQ3_LUT_OPT` が on のときだけ使う)。
+/// PTX が無い / 引数の数が 8 でないときは `None` = `_v2` / `_v3` のまま。
+fn exp_iq_kernels_lut() -> Option<&'static ExpIqKernels> {
+    EXP_IQ_KERNELS_LUT
+        .get_or_init(|| {
+            load_exp_iq_slots(
+                &exp_iq_lut_ptx_path(),
+                "lut",
+                crate::model::exp_iq::IQ_LUT_SUFFIX,
+                &crate::model::exp_iq::IQ_LUT_SLOTS,
             )
         })
         .as_ref()
@@ -843,6 +871,17 @@ pub(crate) fn exp_iq_kernels_decode() -> Option<&'static ExpIqKernels> {
                     for &i in crate::model::exp_iq::IQ_V3_SLOTS.iter() {
                         if !v3.fns[i].is_null() {
                             k.fns[i] = v3.fns[i];
+                        }
+                    }
+                }
+            }
+            // task 940: LUT 版 (opt-in、既定 off)。IQ3_XXS / IQ3_S のスロットだけ
+            // 差し替える。PTX 不在 / ABI 不一致なら v2/v3 のまま。
+            if crate::model::exp_iq::iq_lut_enabled() {
+                if let Some(lut) = exp_iq_kernels_lut() {
+                    for &i in crate::model::exp_iq::IQ_LUT_SLOTS.iter() {
+                        if !lut.fns[i].is_null() {
+                            k.fns[i] = lut.fns[i];
                         }
                     }
                 }

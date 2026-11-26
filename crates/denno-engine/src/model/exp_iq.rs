@@ -182,6 +182,37 @@ pub fn iq_v3_enabled() -> bool {
 /// v3 が差し替えるスロット (`kernels_exp_iq_v3.cu` にあるカーネルの型)。
 pub const IQ_V3_SLOTS: [usize; 2] = [0, 2];
 
+/// task 940: `DENNO_CUDA_IQ3_LUT_OPT` — IQ3_XXS / IQ3_S の decode GEMV を
+/// LUT 版 (`kernels_exp_iq_lut.ptx`) で回す。**既定 off** (opt-in。GPU ラボで
+/// 採否を決める)。
+///
+/// 変えるのは表の持ち方だけで、表の値・積の順・アキュムレータ 4 本・warp の木・
+/// 起動形は v2 / v3 と同一 = **出力はビット一致**(性能だけのゲート)。
+///
+/// - IQ3_XXS: ksigns (128 バイト) を shared のバイト gather ではなく
+///   「1 レーン = 1 語をレジスタに持ち `__shfl_sync` で引く」形にする。
+/// - IQ3_S: 格子を u32 (2 KB) から 4 bit 詰めの u16 (1 KB) にする。
+///
+/// PTX が無い / `.param` の数が 8 でないときは v2 / v3 のまま (fail closed)。
+pub const EXPERT_IQ_LUT_ENV: &str = "DENNO_CUDA_IQ3_LUT_OPT";
+
+/// [`EXPERT_IQ_LUT_ENV`] の解釈 (純関数)。既定 off、`1` / `true` / `on` だけが真。
+pub fn iq_lut_from_value(v: Option<&str>) -> bool {
+    crate::model::expert_vram::flag_on(v)
+}
+
+/// LUT 版を使うか (プロセスで 1 回だけ env を読む)。
+pub fn iq_lut_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| iq_lut_from_value(std::env::var(EXPERT_IQ_LUT_ENV).ok().as_deref()))
+}
+
+/// LUT 版が差し替えるスロット (IQ3_XXS = 1 / IQ3_S = 2)。
+pub const IQ_LUT_SLOTS: [usize; 2] = [1, 2];
+
+/// LUT 版の PTX のエントリ名の接尾辞 (`dno_exp_gemv_iq3xxs_lut` など)。
+pub const IQ_LUT_SUFFIX: &str = "_lut";
+
 // ---------------------------------------------------------------------------
 // task 356: expert 段の寄与 D2H を専用ストリームへ (`DENNO_DEC_EXP_D2H_STREAM`)
 // ---------------------------------------------------------------------------
@@ -1470,4 +1501,318 @@ mod tests {
         assert_eq!(upload_from_value(Some("24")), 24);
         assert_eq!(upload_from_value(Some("x")), DEFAULT_UPLOAD_PER_TOKEN);
     }
+
+    // -----------------------------------------------------------------------
+    // task 940: LUT 版 (`DENNO_CUDA_IQ3_LUT_OPT`) の CPU ミラー
+    //
+    // カーネル (`kernels_exp_iq_lut.cu`) は v2 / v3 と **表の持ち方だけ**が違う
+    // (IQ3_XXS は ksigns を u32 語 + shuffle、IQ3_S は格子を 4 bit 詰めの u16)。
+    // ここでは同じ索引・同じ詰め表を使うミラーを書き、参照ミラー
+    // ([`dot_mirror`] / [`mirror_block`]) と f32 のビットまで一致することを固定する。
+    // GPU が無くても「詰め方が値を変えていない」ことがここで落ちる。
+    // -----------------------------------------------------------------------
+
+    /// テスト用の f32 列 ([-0.5, 0.5) の一様)。NaN / inf を作らない。
+    fn xs(seed: u64, k: usize) -> Vec<f32> {
+        let mut b = vec![0u8; k * 4];
+        fill(seed, &mut b);
+        b.chunks_exact(4)
+            .map(|c| {
+                let u = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                (u >> 8) as f32 / 16_777_216.0 - 0.5
+            })
+            .collect()
+    }
+
+    /// LUT 版カーネルと同じ索引 + 詰め表で 1 ブロックを `out_block` へ書く。
+    ///
+    /// `ks32` は ksigns の u32 語 (32 本)、`g16` は IQ3_S 格子の 4 bit 詰め (512 本)。
+    /// 1 レーン = 8 要素の割り当てと積の順は [`mirror_block`] と同じ。
+    fn mirror_block_lut(
+        ty: GgmlType,
+        blk: &[u8],
+        lane: usize,
+        out_block: &mut [f32],
+        ks32: &[u32],
+        g16: &[u16],
+    ) -> Option<usize> {
+        use crate::kquant_tables as t;
+        match ty {
+            GgmlType::IQ3Xxs => {
+                let d = f16(blk, 0);
+                let ib32 = lane >> 2;
+                let l4 = lane & 3;
+                let aux = u32::from_le_bytes([
+                    blk[66 + ib32 * 4],
+                    blk[67 + ib32 * 4],
+                    blk[68 + ib32 * 4],
+                    blk[69 + ib32 * 4],
+                ]);
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+                // `__shfl_sync(my, idx >> 2)`: 語 (idx >> 2) はレーン (idx >> 2) が持つ。
+                let sidx = ((aux >> (7 * l4)) & 127) as usize;
+                let word = ks32[sidx >> 2];
+                let signs = ((word >> (8 * (sidx & 3))) & 0xff) as u8;
+                let g1 = t::IQ3XXS_GRID[blk[2 + ib32 * 8 + 2 * l4] as usize].to_le_bytes();
+                let g2 = t::IQ3XXS_GRID[blk[2 + ib32 * 8 + 2 * l4 + 1] as usize].to_le_bytes();
+                for j in 0..4 {
+                    let s0 = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                    let s1 = if signs & (1 << (j + 4)) != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    out_block[lane * LANE_ELEMS + j] = db * g1[j] as f32 * s0;
+                    out_block[lane * LANE_ELEMS + 4 + j] = db * g2[j] as f32 * s1;
+                }
+                Some(256)
+            }
+            GgmlType::IQ3S => {
+                let d = f16(blk, 0);
+                let g = lane >> 2;
+                let l4 = lane & 3;
+                let sc = blk[106 + (g >> 1)];
+                let nib = if g & 1 != 0 { sc >> 4 } else { sc & 0x0f };
+                let db = d * (1.0 + 2.0 * nib as f32);
+                let qh = blk[66 + g] as u32;
+                let idx1 = blk[2 + g * 8 + 2 * l4] as usize
+                    | (((qh << (8 - 2 * l4)) & 256) as usize);
+                let idx2 = blk[2 + g * 8 + 2 * l4 + 1] as usize
+                    | (((qh << (7 - 2 * l4)) & 256) as usize);
+                let signs = blk[74 + g * 4 + l4];
+                let p1 = g16[idx1];
+                let p2 = g16[idx2];
+                for j in 0..4 {
+                    let v1 = ((p1 >> (4 * j)) & 0xf) as f32;
+                    let v2 = ((p2 >> (4 * j)) & 0xf) as f32;
+                    let s0 = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                    let s1 = if signs & (1 << (j + 4)) != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    out_block[lane * LANE_ELEMS + j] = db * v1 * s0;
+                    out_block[lane * LANE_ELEMS + 4 + j] = db * v2 * s1;
+                }
+                Some(256)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`dot_mirror`] と同じ累積順で、LUT 版の詰め表から 1 行の内積を取る。
+    fn dot_mirror_lut(
+        ty: GgmlType,
+        row: &[u8],
+        k: usize,
+        x: &[f32],
+        ks32: &[u32],
+        g16: &[u16],
+    ) -> Option<f32> {
+        let bs = mirror_block_size(ty)?;
+        if x.len() != k || k % bs != 0 {
+            return None;
+        }
+        let nb = k / bs;
+        let mut lane_acc = [0.0f32; 32];
+        let mut block = vec![0.0f32; bs];
+        for b in 0..nb {
+            let bytes = &row[b * ty.type_size()..(b + 1) * ty.type_size()];
+            let xb = &x[b * bs..(b + 1) * bs];
+            for lane in 0..32 {
+                mirror_block_lut(ty, bytes, lane, &mut block, ks32, g16).expect("mirror");
+                for j in 0..8 {
+                    lane_acc[lane] += block[lane * 8 + j] * xb[lane * 8 + j];
+                }
+            }
+        }
+        let mut a = lane_acc;
+        let mut off = 16;
+        while off > 0 {
+            for l in 0..off {
+                a[l] += a[l + off];
+            }
+            off >>= 1;
+        }
+        Some(a[0])
+    }
+
+    /// 詰め表 (`.h` の `dno_iq3s_grid16` / `dno_ksigns_iq2xs32`) が元の表と同じ値を
+    /// 与えること。4 bit 詰めが成り立つ前提 (下位 4 バイトが 0..15) もここで見る。
+    #[test]
+    fn lut_packed_tables_match_originals() {
+        use crate::kquant_tables as t;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let h = std::fs::read_to_string(dir.join("kernels_exp_iq_tables.h"))
+            .expect(".h が読めない");
+        let g16 = header_values(&h, "dno_iq3s_grid16");
+        assert_eq!(g16.len(), 512, "IQ3_S の 4 bit 詰め表の本数");
+        for i in 0..512 {
+            let full = t::IQ3S_GRID[i].to_le_bytes();
+            for j in 0..4 {
+                assert!(
+                    full[j] < 16,
+                    "iq3s: entry {i} byte {j} が 4 bit に収まらない ({})",
+                    full[j]
+                );
+                let got = (g16[i] >> (4 * j)) & 0xf;
+                assert_eq!(got, full[j] as u64, "iq3s: entry {i} nibble {j}");
+            }
+        }
+        let ks32 = header_values(&h, "dno_ksigns_iq2xs32");
+        assert_eq!(ks32.len(), 32, "ksigns の u32 語の本数");
+        for i in 0..32 {
+            let mut want = 0u64;
+            for j in 0..4 {
+                want |= (t::KSIGNS_IQ2XS[i * 4 + j] as u64) << (8 * j);
+            }
+            assert_eq!(ks32[i], want, "ksigns の語 {i}");
+        }
+        // IQ3_XXS の格子の値は {4,12,20,28,36,44,52,62} の 8 種だけ (監査の前提)。
+        let mut seen = [false; 256];
+        for &v in t::IQ3XXS_GRID.iter() {
+            for j in 0..4 {
+                seen[((v >> (8 * j)) & 0xff) as usize] = true;
+            }
+        }
+        let used: Vec<usize> = (0..256).filter(|&i| seen[i]).collect();
+        assert_eq!(used, vec![4, 12, 20, 28, 36, 44, 52, 62], "iq3xxs の格子の値");
+    }
+
+    /// ミラー全体のビット一致: 参照 (v2 / v3 と同じ表) と LUT 版 (詰め表) が
+    /// 同じ行で同じ f32 を返すこと。行の長さを 2 通り振る。
+    #[test]
+    fn lut_row_mirror_is_bit_identical() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let h = std::fs::read_to_string(dir.join("kernels_exp_iq_tables.h"))
+            .expect(".h が読めない");
+        let ks32: Vec<u32> = header_values(&h, "dno_ksigns_iq2xs32")
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+        let g16: Vec<u16> = header_values(&h, "dno_iq3s_grid16")
+            .into_iter()
+            .map(|v| v as u16)
+            .collect();
+        assert_eq!((ks32.len(), g16.len()), (32, 512));
+        for (ty, k) in [
+            (GgmlType::IQ3Xxs, 512usize),
+            (GgmlType::IQ3Xxs, 2560),
+            (GgmlType::IQ3S, 768),
+            (GgmlType::IQ3S, 2560),
+        ] {
+            let ts = ty.type_size();
+            let nb = k / 256;
+            for seed in [0x1u64, 0x51ed, 0xbeef, 0x9e37] {
+                let mut row = vec![0u8; nb * ts];
+                fill(seed, &mut row);
+                // f16 のスケールの指数部を抑える (inf / NaN を作らない)。
+                for b in 0..nb {
+                    row[b * ts + 1] &= 0x3b;
+                }
+                let x = xs(seed ^ 0x5a5a, k);
+                let r = dot_mirror(ty, &row, k, &x).expect("参照ミラー");
+                let l = dot_mirror_lut(ty, &row, k, &x, &ks32, &g16).expect("LUT ミラー");
+                assert!(r.is_finite() && r != 0.0, "{ty:?} k={k}: 参照が 0 / 非有限");
+                assert_eq!(
+                    r.to_bits(),
+                    l.to_bits(),
+                    "{ty:?} k={k} seed={seed:#x}: 参照 {r} vs LUT {l}"
+                );
+            }
+        }
+    }
+
+
+    /// LUT ミラーが**本当に詰め表を読んでいる**ことの裏取り。
+    ///
+    /// 索引を 0 に固定したブロックを手で作り、(1) 詰め表そのままで参照と一致、
+    /// (2) 詰め表の 1 本を壊すと一致しなくなる、の 2 点を見る。緑 (一致) だけでは
+    /// 「LUT 経路を通っていない」を見抜けないため。
+    #[test]
+    fn lut_mirror_reads_the_packed_tables() {
+        // IQ3_XXS: d = f16(0x3c00) = 1.0、qs の索引と aux (符号索引 0) は 0。
+        let mut xx = vec![0u8; 98];
+        xx[0] = 0x00;
+        xx[1] = 0x3c;
+        let x = vec![1.0f32; 256];
+        let base = vec![0u32; 32];
+        let mut ks32 = base.clone();
+        for i in 0..32 {
+            ks32[i] = crate::kquant::ksigns_iq2xs()[i * 4..i * 4 + 4]
+                .iter()
+                .enumerate()
+                .fold(0u32, |w, (j, &b)| w | ((b as u32) << (8 * j)));
+        }
+        let g16: Vec<u16> = (0..512)
+        .map(|i| {
+            let b = crate::kquant_tables::IQ3S_GRID[i].to_le_bytes();
+            (b[0] as u16) | ((b[1] as u16) << 4) | ((b[2] as u16) << 8) | ((b[3] as u16) << 12)
+        })
+        .collect();
+        let r = dot_mirror(GgmlType::IQ3Xxs, &xx, 256, &x).expect("参照ミラー");
+        let l = dot_mirror_lut(GgmlType::IQ3Xxs, &xx, 256, &x, &ks32, &g16).expect("LUT");
+        assert_eq!(r.to_bits(), l.to_bits(), "IQ3_XXS: 詰め表そのままで不一致");
+        // 符号語 0 を壊すと (符号索引 0 を使っているので) 値が変わる。
+        let mut bad = ks32.clone();
+        bad[0] ^= 0x0000_ffff;
+        let l2 = dot_mirror_lut(GgmlType::IQ3Xxs, &xx, 256, &x, &bad, &g16).expect("LUT");
+        assert_ne!(l.to_bits(), l2.to_bits(), "IQ3_XXS: ksigns32 を読んでいない");
+
+        // IQ3_S: d = 1.0、qs の索引と qh と scales は 0 (格子 0 と 1 を引く)。
+        let mut s3 = vec![0u8; 110];
+        s3[0] = 0x00;
+        s3[1] = 0x3c;
+        let r3 = dot_mirror(GgmlType::IQ3S, &s3, 256, &x).expect("参照ミラー");
+        let l3 = dot_mirror_lut(GgmlType::IQ3S, &s3, 256, &x, &ks32, &g16).expect("LUT");
+        assert_eq!(r3.to_bits(), l3.to_bits(), "IQ3_S: 詰め表そのままで不一致");
+        // 格子 0 の下位ニブルを壊すと値が変わる。
+        let mut bad16 = g16.clone();
+        bad16[0] ^= 0x0001;
+        let l4 = dot_mirror_lut(GgmlType::IQ3S, &s3, 256, &x, &ks32, &bad16).expect("LUT");
+        assert_ne!(l3.to_bits(), l4.to_bits(), "IQ3_S: grid16 を読んでいない");
+    }
+
+
+    /// task 940: ゲート `DENNO_CUDA_IQ3_LUT_OPT` は既定 off。明示的な真値だけ on。
+    #[test]
+    fn lut_gate_defaults_off() {
+        assert!(!iq_lut_from_value(None));
+        assert!(!iq_lut_from_value(Some("")));
+        assert!(!iq_lut_from_value(Some("0")));
+        assert!(!iq_lut_from_value(Some("off")));
+        assert!(!iq_lut_from_value(Some("false")));
+        assert!(!iq_lut_from_value(Some("yes")));
+        assert!(iq_lut_from_value(Some("1")));
+        assert!(iq_lut_from_value(Some(" on ")));
+        assert!(iq_lut_from_value(Some("true")));
+        // 差し替えるスロットと PTX の名前 (取り違え防止)。
+        assert_eq!(IQ_LUT_SLOTS, [1, 2]);
+        assert_eq!(kernel_name(IQ_LUT_SLOTS[0]), Some("dno_exp_gemv_iq3xxs"));
+        assert_eq!(kernel_name(IQ_LUT_SLOTS[1]), Some("dno_exp_gemv_iq3s"));
+        assert_eq!(IQ_LUT_SUFFIX, "_lut");
+        assert_eq!(EXPERT_IQ_LUT_ENV, "DENNO_CUDA_IQ3_LUT_OPT");
+    }
+
+    /// task 940: コミット済みの LUT 版 PTX (あれば) が 8 引数で、`.cu` と同じ
+    /// エントリ名を持つこと。PTX が無いツリーでは何も言わない (fail closed)。
+    #[test]
+    fn lut_committed_ptx_has_expected_params() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq_lut.ptx")) else {
+            return;
+        };
+        let count = |name: &str| -> Option<usize> {
+            let head = format!(".visible .entry {name}(");
+            let i = ptx.find(&head)?;
+            let rest = &ptx[i + head.len()..];
+            let end = rest.find(')').unwrap_or(rest.len());
+            Some(rest[..end].matches(".param").count())
+        };
+        for i in IQ_LUT_SLOTS {
+            let name = format!("{}{}", kernel_name(i).expect("slot"), IQ_LUT_SUFFIX);
+            assert_eq!(count(&name), Some(8), "{name} の引数の数が .cu と違う");
+        }
+    }
+
 }

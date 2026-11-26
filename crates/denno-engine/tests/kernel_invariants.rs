@@ -15256,3 +15256,121 @@ fn t546_odirect_bounce_is_wired() {
         assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
     }
 }
+
+// ===========================================================================
+// task 940: decode IQ3_XXS / IQ3_S の LUT 版 (`kernels_exp_iq_lut.cu`)
+//
+// ゲート `DENNO_CUDA_IQ3_LUT_OPT` (既定 off)。変えるのは表の持ち方だけで、
+// 引数 8 本・起動形 (4 行 / ブロック)・積の順は v2 / v3 と同一 = 出力はビット一致。
+// ===========================================================================
+
+const EXP_IQ_LUT_SRC: &str = include_str!("../kernels/kernels_exp_iq_lut.cu");
+
+/// 2 本のエントリが v2 / v3 と同じ 8 引数・同じ起動形で、表だけを差し替えて
+/// いること。IQ3_S の格子は 4 bit 詰め (u16) で、元の u64 / u32 表は読まない。
+#[test]
+fn exp_iq_lut_kernels_are_wired() {
+    for name in ["dno_exp_gemv_iq3xxs_lut", "dno_exp_gemv_iq3s_lut"] {
+        assert_eq!(
+            kernel_params(EXP_IQ_LUT_SRC, name),
+            vec![
+                "wptrs", "xbase", "obase", "seg", "nseg", "n_in", "n_out", "row_bytes"
+            ],
+            "{name} の引数が v2 / v3 と違う"
+        );
+    }
+    // 起動形は v2 / v3 と同じ (4 行 / ブロック、blockDim 128)。ホストの
+    // `exp_iq::launch_plan` をそのまま使うので、ここがずれると行番号が壊れる。
+    assert!(
+        EXP_IQ_LUT_SRC.contains("#define E4_ROWS 4"),
+        "行数 (4 行 / ブロック) が v2 / v3 と違う"
+    );
+    // IQ3_XXS: ksigns は shared のバイト表を作らず、レジスタ + shuffle で引く。
+    assert!(
+        EXP_IQ_LUT_SRC.contains("const unsigned int ksw = dno_ksigns_iq2xs32[lane];"),
+        "ksigns をレジスタに持っていない"
+    );
+    assert!(
+        EXP_IQ_LUT_SRC.contains("__shfl_sync(0xffffffffu, my, (int)(idx >> 2))"),
+        "ksigns の shuffle 引きが無い"
+    );
+    assert!(
+        !EXP_IQ_LUT_SRC.contains("sh_sign"),
+        "IQ3_XXS が shared の符号表を作っている"
+    );
+    // IQ3_S: 4 bit 詰めの u16 を shared へ。元の表は読まない。
+    assert!(
+        EXP_IQ_LUT_SRC.contains("__shared__ unsigned short sh[512];"),
+        "IQ3_S の格子が u16 の shared でない"
+    );
+    assert!(
+        EXP_IQ_LUT_SRC.contains("sh[i] = dno_iq3s_grid16[i];"),
+        "IQ3_S が 4 bit 詰め表を shared へ写していない"
+    );
+    assert!(
+        !EXP_IQ_LUT_SRC.contains("dno_iq3s_grid["),
+        "LUT 版が IQ3_S の元の u64 表を読んでいる"
+    );
+    assert!(
+        !EXP_IQ_LUT_SRC.contains("dno_iq3s_grid32["),
+        "LUT 版が v3 の u32 表を読んでいる"
+    );
+    // 積の順・アキュムレータ 4 本・畳み方は v2 / v3 と同じ (数値契約を変えない)。
+    for s in [
+        "const float p = (db * gv) * e4_sgn(sg, j);",
+        "float acc = e4_reduce(e4_fold4(a0, a1, a2, a3));",
+        "if (lane == 0) s.out[row] = acc;",
+    ] {
+        assert!(EXP_IQ_LUT_SRC.contains(s), "LUT 版に {s} が無い");
+    }
+    // build_ptx.sh: fmad で targets_all に入っている (targets_all の末尾は
+    // 配線テストが検査しているので、途中に挿れていること)。
+    assert!(
+        BUILD_PTX_SH.contains("exp_iq_lut)   echo \"kernels_exp_iq_lut.cu|fmad\""),
+        "build_ptx.sh の exp_iq_lut が fmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("exp_iq_v3 exp_iq_lut mix_dev3"),
+        "targets_all の exp_iq_lut の位置が想定と違う: {targets}"
+    );
+}
+
+/// ゲートと差し替え先がホスト側に配線されていること。
+#[test]
+fn exp_iq_lut_gate_is_wired() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/exp_iq.rs"),
+    )
+    .expect("exp_iq.rs");
+    for s in [
+        "pub const EXPERT_IQ_LUT_ENV: &str = \"DENNO_CUDA_IQ3_LUT_OPT\";",
+        "pub const IQ_LUT_SLOTS: [usize; 2] = [1, 2];",
+        "pub const IQ_LUT_SUFFIX: &str = \"_lut\";",
+        "pub fn iq_lut_from_value(v: Option<&str>) -> bool {",
+    ] {
+        assert!(src.contains(s), "exp_iq.rs に {s} が無い");
+    }
+    // 既定 off: 純関数は `flag_on` (1 / true / on だけが真) を使う。
+    assert!(
+        src.contains("crate::model::expert_vram::flag_on(v)"),
+        "LUT ゲートが既定 off の純関数でない"
+    );
+    // decode 用の合成で v3 の後ろに LUT 版を重ねる。
+    for s in [
+        "if crate::model::exp_iq::iq_lut_enabled() {",
+        "for &i in crate::model::exp_iq::IQ_LUT_SLOTS.iter() {",
+        "if !lut.fns[i].is_null() {",
+        "k.fns[i] = lut.fns[i];",
+    ] {
+        assert!(cuda_rs().contains(s), "cuda.rs に {s} が無い");
+    }
+    // ABI 検査 (`.param` 8 本) を通してから使う。
+    assert!(
+        cuda_rs().contains("match crate::cuda::ptx_entry_params(&text, &full) {"),
+        "PTX の引数検査が無い"
+    );
+}
