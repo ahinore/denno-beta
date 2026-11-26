@@ -3551,6 +3551,9 @@ pub(crate) static EXP_IQ_KERNELS_V2: OnceLock<Option<ExpIqKernels>> = OnceLock::
 /// task 275: v3 (`kernels_exp_iq_v3.ptx`)。IQ2_S / IQ3_S のスロットだけを持つ。
 pub(crate) static EXP_IQ_KERNELS_V3: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 
+/// task 940: LUT 版 (`kernels_exp_iq_lut.ptx`)。IQ3_XXS / IQ3_S のスロットだけを持つ。
+pub(crate) static EXP_IQ_KERNELS_LUT: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
+
 /// task 275: decode 用の合成 (v2 か v1 に v3 のスロットを重ねたもの)。
 pub(crate) static EXP_IQ_KERNELS_DECODE: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
 
