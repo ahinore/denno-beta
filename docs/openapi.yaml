@@ -874,9 +874,16 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Model'
+        has_more:
+          type: boolean
+          description: Always false; present for Anthropic-style pagination.
     Model:
       type: object
-      required: [id, object, type, display_name, created, owned_by, context_length]
+      description: |
+        One model. `GET /v1/models` returns this object as `data[0]` and
+        `GET /v1/models/{id}` returns exactly the same object, so the two
+        endpoints never drift.
+      required: [id, object, type, display_name, created, owned_by, context_length, context_window, max_context_length, model_id, aliases, capabilities]
       properties:
         id:
           type: string
@@ -890,12 +897,20 @@ components:
           type: string
         created:
           type: integer
+          description: Epoch seconds.
         owned_by:
           type: string
         context_length:
           type: integer
+        context_window:
+          type: integer
+          description: Same value as `context_length` (OpenAI-compatible alias).
         max_context_length:
           type: integer
+          description: Same value as `context_length`.
+        model_id:
+          type: string
+          description: Pull-time repo id (may contain `/`; percent-encode it in a path).
         model_dir:
           type: string
         quant:
@@ -904,8 +919,11 @@ components:
           type: integer
         layers:
           type: integer
-        has_more:
-          type: boolean
+        aliases:
+          type: array
+          items:
+            type: string
+          description: Other ids accepted by `GET /v1/models/{id}`. Never contains `id` itself.
         capabilities:
           type: object
           properties:
@@ -920,6 +938,8 @@ components:
             tools:
               type: boolean
             count_tokens:
+              type: boolean
+            telemetry:
               type: boolean
           additionalProperties: true
       additionalProperties: true
