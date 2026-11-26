@@ -287,8 +287,8 @@ async fn control_endpoints_use_plain_json_and_request_id() {
         assert!(status.is_success(), "{label}: {status} {}", String::from_utf8_lossy(&body));
         assert_eq!(
             assert_concrete_content_type(&headers, label),
-            "application/json",
-            "{label}: JSON 経路は application/json 固定"
+            "application/json; charset=utf-8",
+            "{label}: JSON 経路は application/json; charset=utf-8 固定 (P1036)"
         );
         assert!(one(&headers, "x-request-id", label).starts_with("req-"), "{label}");
         assert_not_cacheable(&headers, label);
@@ -357,7 +357,7 @@ async fn non_streaming_generations_keep_json_headers_and_timing() {
         assert!(status.is_success(), "{label}: {status} {}", String::from_utf8_lossy(&body));
         assert_eq!(
             assert_concrete_content_type(&headers, label),
-            "application/json",
+            "application/json; charset=utf-8",
             "{label}"
         );
         assert!(one(&headers, "x-request-id", label).starts_with("req-"), "{label}");
@@ -389,11 +389,11 @@ async fn sse_sets_event_stream_and_no_cache() {
             "text/event-stream",
             "{label}: SSE の content-type"
         );
-        // axum の Sse が付ける値。重複や上書きを許さない。
+        // P1036 header_hygiene が SSE の cache-control を no-store へ統一する。
         assert_eq!(
             one(&headers, "cache-control", label),
-            "no-cache",
-            "{label}: SSE は中間キャッシュ禁止"
+            "no-store",
+            "{label}: SSE は中間キャッシュ禁止 (P1036 no-store)"
         );
         assert!(
             headers.get("content-length").is_none(),
@@ -424,9 +424,10 @@ async fn ollama_stream_is_ndjson_not_sse() {
         "application/x-ndjson",
         "Ollama は NDJSON。SSE と取り違えない"
     );
-    assert!(
-        all(&headers, "cache-control").is_empty(),
-        "NDJSON に SSE 用の no-cache を混ぜない"
+    assert_eq!(
+        one(&headers, "cache-control", "POST /api/generate stream"),
+        "no-store",
+        "NDJSON 推論経路は P1036 の no-store (SSE 用の no-cache を混ぜない)"
     );
     assert!(one(&headers, "x-request-id", "POST /api/generate stream").starts_with("req-"));
     assert_no_timing(&headers, "POST /api/generate stream");
