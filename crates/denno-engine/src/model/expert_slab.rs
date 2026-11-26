@@ -486,16 +486,47 @@ mod gpu {
         S.get_or_init(Slab::new)
     }
 
+    /// `DENNO_EXPERT_SLAB_DBG=1` のとき、使い回しの累計と断片化の指標を
+    /// 2 の冪の節目でだけ 1 行出す (既定は無言)。
+    pub const SLAB_DBG_ENV: &str = "DENNO_EXPERT_SLAB_DBG";
+
+    fn dbg_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var(SLAB_DBG_ENV)
+                .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+                .unwrap_or(false)
+        })
+    }
+
+    fn log_reuse(hits: u64) {
+        if !dbg_on() || hits == 0 || !hits.is_power_of_two() {
+            return;
+        }
+        let (chunks, allocated, used, idle) = slab().usage();
+        eprintln!(
+            "[slab-reuse] hits={hits} chunks={chunks} allocated_mib={} used_mib={} idle_mib={}",
+            allocated >> 20,
+            used >> 20,
+            idle >> 20
+        );
+    }
+
     /// `slot_bytes` のスロットを 1 つ確保する (チャンクは `TAG_EXPERTS` で計上)。
     ///
     /// task 882: `DENNO_EXPERT_SLAB_REUSE` が on なら、余りが上限内の空きスロット
     /// も使う ([`Slab::alloc_sized`])。off は従来どおり容量の完全一致だけ。
     pub fn alloc_slot(slot_bytes: usize) -> anyhow::Result<SlabSlot<DevBuffer>> {
-        if reuse_enabled() {
-            slab().alloc_sized(slot_bytes, DevBuffer::slab_chunk)
-        } else {
-            slab().alloc(slot_bytes, DevBuffer::slab_chunk)
+        if !reuse_enabled() {
+            return slab().alloc(slot_bytes, DevBuffer::slab_chunk);
         }
+        let before = slab().slack_hits();
+        let slot = slab().alloc_sized(slot_bytes, DevBuffer::slab_chunk);
+        let after = slab().slack_hits();
+        if after > before {
+            log_reuse(after);
+        }
+        slot
     }
 
     /// task 882: 余りを使い回した回数 (診断用)。
