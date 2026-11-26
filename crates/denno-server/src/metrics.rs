@@ -296,8 +296,17 @@ fn hist(
 /// `/metrics` の本文 (Prometheus text format 0.0.4)。
 ///
 /// `in_flight` / `queued` / `stats` は呼び出し側 (ハンドラ) がスケジューラから
-/// 読んだ現在値。この関数はロックを取らずに自分のカウンタだけを読む。
-pub fn render(model: &str, in_flight: usize, queued: usize, stats: &RunStatsSnapshot) -> String {
+/// 読んだ現在値。`ready` は `/ready` の 200 条件と同じ
+/// ([`crate::lifecycle::Lifecycle::serves_requests`])、`draining` は停止要求の
+/// 受領フラグ。この関数はロックを取らずに自分のカウンタだけを読む。
+pub fn render(
+    model: &str,
+    in_flight: usize,
+    queued: usize,
+    stats: &RunStatsSnapshot,
+    ready: bool,
+    draining: bool,
+) -> String {
     let mut o = String::with_capacity(4096);
 
     let prompt = PROMPT_TOKENS_TOTAL.load(Ordering::Relaxed);
@@ -311,6 +320,22 @@ pub fn render(model: &str, in_flight: usize, queued: usize, stats: &RunStatsSnap
         "gauge",
         &format!("model=\"{}\"", esc(model)),
         1,
+    );
+    metric(
+        &mut o,
+        "denno_server_ready",
+        "1 when the server accepts request traffic (loaded, worker alive, not draining).",
+        "gauge",
+        "",
+        u8::from(ready),
+    );
+    metric(
+        &mut o,
+        "denno_server_draining",
+        "1 once shutdown has begun and new generation requests are rejected.",
+        "gauge",
+        "",
+        u8::from(draining),
     );
     metric(
         &mut o,
@@ -486,7 +511,7 @@ mod tests {
         });
         record_http("/v1/messages", 200);
         record_http("/v1/messages", 400);
-        let text = render("denno-test", 1, 2, &snapshot());
+        let text = render("denno-test", 1, 2, &snapshot(), true, false);
 
         assert!(text.contains("# TYPE denno_ttft_seconds histogram"));
         assert!(text.contains("denno_http_requests_total{endpoint=\"/v1/messages\",status=\"200\"}"));

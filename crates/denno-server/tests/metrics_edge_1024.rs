@@ -2,7 +2,7 @@
 //! 並行アクセスのエッジテスト。
 //!
 //! 対象 (`crates/denno-server/src/metrics.rs` を全読して確認した公開面):
-//! - `metrics::render(model, in_flight, queued, &stats)` — 本文生成
+//! - `metrics::render(model, in_flight, queued, &stats, ready, draining)` — 本文生成
 //! - `metrics::record_http(endpoint, status)` / `metrics::normalize_endpoint`
 //! - `metrics::record_completion(&CompletionSample)` — ヒストグラム観測
 //!
