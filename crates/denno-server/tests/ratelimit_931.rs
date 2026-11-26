@@ -441,13 +441,13 @@ async fn rate_limited_response_carries_cors_headers() {
 
 #[tokio::test]
 async fn recovery_after_wait_allows_again() {
-    // 60000 rpm = 1000 token/sec、バースト 1。数 ms 待てば 1 トークン回復する。
-    let app = app_with(60_000, Some(1));
+    // 1200 rpm = 20 token/sec (50 ms/token)、バースト 1。2 発目は確実に 429、100 ms 待てば 1 トークン回復する。
+    let app = app_with(1_200, Some(1));
     let (s, _, _) = send(&app, generation()).await;
     assert_eq!(s, StatusCode::OK);
     let (s, _, _) = send(&app, generation()).await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (s, _, _) = send(&app, generation()).await;
     assert_eq!(s, StatusCode::OK, "待てば回復する");
 }

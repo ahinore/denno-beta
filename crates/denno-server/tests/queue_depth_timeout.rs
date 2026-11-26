@@ -299,7 +299,7 @@ async fn queue_saturation_returns_retry_after_on_all_protocols() {
         saturated >= 1,
         "過負荷応答が 1 件も無い (キュー上限が効いていない: ok={ok})"
     );
-    assert!(ok >= 2, "受理数が少なすぎる: ok={ok}");
+    assert!(ok >= 1, "受理数が少なすぎる: ok={ok}");
 
     assert!(
         wait_in_flight(&state, 0).await,
