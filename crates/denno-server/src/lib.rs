@@ -2813,6 +2813,11 @@ async fn count_tokens(
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
+    // task 1506: `/v1/messages` と同じ順序で drain を先に見る (auth → drain → parse)。
+    // 旧実装は drain 中でも 200 を返し、同じ本文の生成要求が 503 になるのと
+    // 挙動が食い違っていた。ここで拒否すれば、drain 中にエンジンロックを
+    // COUNT_TOKENS_LOCK_TIMEOUT まで待つ経路にも入らない。
+    reject_if_draining(&state)?;
     let req: MessagesRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::invalid_request(format!("invalid request body: {}", e)))?;
     let prepared = prepare_chat(&state, &req)?;
