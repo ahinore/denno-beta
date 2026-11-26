@@ -393,6 +393,55 @@ pub fn rebalance_secs() -> u64 {
     })
 }
 
+/// task 907: 再調整で「落とす鍵」と「載せる鍵」を決める (純関数)。
+///
+/// - `plan_asc` は**出現回数の昇順** (少ない順。`exp_stats::preload_order` の順)。
+/// - `cap` は RAM tier に載せられる本数。
+/// - `vram` は VRAM に常駐している鍵 (同じ expert を 2 か所に持たない)。
+/// - `have` は RAM tier に常駐している鍵。
+///
+/// 戻り値は `(落とす鍵, 載せる鍵)`。どちらも決定的で、載せる順は `plan_asc` の
+/// 昇順 (= 一番熱いのが最後に触られて、次に落とされにくい)。
+///
+/// # thrash を避ける形
+///
+/// 落とす集合は「いま常駐していて、欲しい集合に入らないもの」だけ。欲しい集合は
+/// 回数の上位 `cap` 本から VRAM の同居を除いたもの。drop を先に全部済ませてから
+/// 昇順に埋めるので、埋めている途中で欲しい鍵が LRU に追い出されない
+/// (埋める本数 ≤ 落とした本数 + 空きスロット)。
+///
+/// 適用後にもう一度呼ぶと `(空, 空)` を返す (固定点 = 30 秒ごとに同じ鍵を
+/// 落として載せ直す thrash が起きない)。
+pub fn rebalance_plan(
+    plan_asc: &[(u16, u16)],
+    cap: usize,
+    vram: &std::collections::HashSet<(u16, u16)>,
+    have: &[(u16, u16)],
+) -> (Vec<(u16, u16)>, Vec<(u16, u16)>) {
+    if cap == 0 || plan_asc.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let want: std::collections::HashSet<(u16, u16)> = plan_asc
+        .iter()
+        .rev()
+        .filter(|k| !vram.contains(k))
+        .take(cap)
+        .copied()
+        .collect();
+    let have_set: std::collections::HashSet<(u16, u16)> = have.iter().copied().collect();
+    let drop: Vec<(u16, u16)> = have
+        .iter()
+        .copied()
+        .filter(|k| !want.contains(k))
+        .collect();
+    let fill: Vec<(u16, u16)> = plan_asc
+        .iter()
+        .copied()
+        .filter(|k| want.contains(k) && !have_set.contains(k))
+        .collect();
+    (drop, fill)
+}
+
 /// `MemAvailable` (バイト)。
 pub fn mem_available() -> Option<u64> {
     crate::model::expert_cache::mem_available()
@@ -1066,5 +1115,151 @@ mod tests {
         assert!(r >= (n as u64) / 2, "file_resident が数えていない: {r}");
         install_part_map(Vec::new());
         assert_eq!(file_resident(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // task 907: 再調整プラン (thrash しない形) と 32-64 GiB RAM の予算
+    // -----------------------------------------------------------------
+
+    /// 「回数の昇順」の合成プラン。(0, 0) が一番熱く、(47, 255) が一番冷たい。
+    fn synthetic_plan(n_layer: u16, n_expert: u16) -> Vec<(u16, u16)> {
+        let mut v: Vec<(u64, (u16, u16))> = (0..n_layer)
+            .flat_map(|l| (0..n_expert).map(move |e| (l, e)))
+            .map(|(l, e)| {
+                let count = (n_layer as u64 - l as u64) * 1000 + (n_expert as u64 - e as u64);
+                (count, (l, e))
+            })
+            .collect();
+        v.sort_by_key(|(c, k)| (*c, *k));
+        v.into_iter().map(|(_, k)| k).collect()
+    }
+
+    fn index_of(plan: &[(u16, u16)]) -> std::collections::HashMap<(u16, u16), usize> {
+        plan.iter().enumerate().map(|(i, k)| (*k, i)).collect()
+    }
+
+    /// 欲しい集合は回数の上位 `cap` 本。載せる順は昇順 (冷たい順) で決定的。
+    #[test]
+    fn task907_rebalance_plan_takes_the_hottest_cap_and_fills_ascending() {
+        let plan = synthetic_plan(48, 256);
+        let cap = 10_922; // 32 GiB / 3 MiB 相当
+        // 冷たい方から 1,000 本だけ常駐している (起動充填が途中で止まった形)。
+        let have: Vec<(u16, u16)> = plan.iter().take(1_000).copied().collect();
+        let vram = std::collections::HashSet::new();
+        let (drop, fill) = rebalance_plan(&plan, cap, &vram, &have);
+        assert_eq!(drop.len(), 1_000, "欲しくない常駐を落としていない");
+        let want: std::collections::HashSet<(u16, u16)> =
+            plan.iter().rev().take(cap).copied().collect();
+        assert!(fill.iter().all(|k| want.contains(k)), "上位 cap 本以外を埋めた");
+        assert_eq!(fill.len(), cap, "上位 cap 本を埋めていない");
+        // 昇順 = 一番熱いのが最後に触られる。
+        let idx = index_of(&plan);
+        let pos: Vec<usize> = fill.iter().map(|k| idx[k]).collect();
+        let mut sorted = pos.clone();
+        sorted.sort_unstable();
+        assert_eq!(pos, sorted, "載せる順が昇順でない (熱いのが先に落ちる)");
+        // 落とす集合と載せる集合は交わらない。
+        let fset: std::collections::HashSet<(u16, u16)> = fill.iter().copied().collect();
+        assert!(drop.iter().all(|k| !fset.contains(k)));
+    }
+
+    /// 定常状態では `(空, 空)`。30 秒ごとに同じ鍵を落として載せ直さない。
+    #[test]
+    fn task907_rebalance_plan_is_a_fixpoint() {
+        let plan = synthetic_plan(48, 256);
+        let cap = 6_000;
+        let have: Vec<(u16, u16)> = plan.iter().rev().take(cap).copied().collect();
+        let vram = std::collections::HashSet::new();
+        let (drop, fill) = rebalance_plan(&plan, cap, &vram, &have);
+        assert!(drop.is_empty() && fill.is_empty(), "定常状態で thrash した");
+        // cap が 0 / プランが空なら何もしない。
+        assert_eq!(
+            rebalance_plan(&plan, 0, &vram, &have),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            rebalance_plan(&[], cap, &vram, &have),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    /// 回数が 1 本ぶん入れ替わったときの入れ替えは 1 本だけ (雪崩を起こさない)。
+    #[test]
+    fn task907_rebalance_plan_churns_one_key_for_a_one_key_drift() {
+        let plan = synthetic_plan(48, 256);
+        let cap = 6_000;
+        let have: Vec<(u16, u16)> = plan.iter().rev().take(cap).copied().collect();
+        // 一番冷たかった鍵が一番熱くなる (新しい話題が 1 本だけ入った形)。
+        let mut drifted = plan.clone();
+        let hot = drifted.remove(0);
+        drifted.push(hot);
+        let vram = std::collections::HashSet::new();
+        let (drop, fill) = rebalance_plan(&drifted, cap, &vram, &have);
+        assert_eq!(
+            (drop.len(), fill.len()),
+            (1, 1),
+            "1 本の変化で {} 本落として {} 本載せた (thrash)",
+            drop.len(),
+            fill.len()
+        );
+        // 落ちるのは cap の境界で押し出された鍵、載るのは新しく熱くなった鍵。
+        assert_eq!(drop[0], plan[plan.len() - cap], "押し出しの鍵が違う");
+        assert_eq!(fill[0], hot);
+        assert_ne!(drop[0], fill[0]);
+        // もう一度呼ぶと固定点。
+        let mut have2 = have.clone();
+        have2.retain(|k| *k != drop[0]);
+        have2.push(fill[0]);
+        assert_eq!(
+            rebalance_plan(&drifted, cap, &vram, &have2),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    /// VRAM に居る鍵は RAM tier に重複して置かない (二重常駐しない)。
+    #[test]
+    fn task907_rebalance_plan_never_keeps_a_vram_key_in_ram() {
+        let plan = synthetic_plan(48, 256);
+        let cap = 6_000;
+        let vram: std::collections::HashSet<(u16, u16)> =
+            plan.iter().rev().take(500).copied().collect();
+        let have: Vec<(u16, u16)> = plan.iter().rev().take(cap).copied().collect();
+        let (drop, fill) = rebalance_plan(&plan, cap, &vram, &have);
+        assert!(fill.iter().all(|k| !vram.contains(k)), "VRAM の鍵を載せた");
+        assert_eq!(drop.len(), 500, "VRAM へ移った鍵を RAM に残した");
+        assert!(drop.iter().all(|k| vram.contains(k)));
+        // 欲しい集合 (cap 本から VRAM を除く) のうち、いま載っていない 500 本を埋める。
+        assert_eq!(fill.len(), 500, "欲しい集合の残りを埋めていない");
+    }
+
+    /// 32-64 GiB の RAM で、auto 予算が page cache を食い潰さないこと。
+    #[test]
+    fn task907_ram_budget_fits_32_to_64_gib_of_ram() {
+        let gib = 1u64 << 30;
+        let expert = 77 * gib;
+        let non_expert = 27 * gib;
+        let margin = 8 * gib;
+        // 64 GiB: 64 - 27 - 8 = 29 GiB
+        assert_eq!(
+            budget_bytes_model(Some("auto"), Some(64 * gib), expert, non_expert, margin),
+            29 * gib
+        );
+        // 32 GiB: 32 - 27 - 8 < 0 → tier を作らない
+        assert_eq!(
+            budget_bytes_model(Some("auto"), Some(32 * gib), expert, non_expert, margin),
+            0
+        );
+        // 指定 16 GiB でも空きの範囲 (48 - 27 - 8 = 13 GiB) を超えない
+        assert_eq!(
+            budget_bytes_model(Some("16384"), Some(48 * gib), expert, non_expert, margin),
+            13 * gib
+        );
+        // どこでも「空き - (非 expert + 余裕)」と expert 総量を超えない。
+        for avail_gib in 32..=64u64 {
+            let b = budget_bytes_model(Some("auto"), Some(avail_gib * gib), expert, non_expert, margin);
+            let room = (avail_gib * gib).saturating_sub(non_expert.saturating_add(margin));
+            assert!(b <= expert, "{avail_gib} GiB: expert 総量を超えた");
+            assert!(b <= room, "{avail_gib} GiB: {b} > room {room}");
+        }
     }
 }
