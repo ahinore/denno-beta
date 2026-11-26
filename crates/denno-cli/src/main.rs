@@ -331,6 +331,14 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// task 1081: バージョンとビルド情報 (crate version / 有効な cargo
+    /// feature / target)。ビルド時の定数だけを出し、ホスト名・ユーザ名・
+    /// 環境変数の値・パスは一切含めない。
+    Version {
+        /// 機械可読な JSON で出力する (自動化向け)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// s156: `denno info` の設定解決結果 (テスト可能にするため main から切り出し)
@@ -914,6 +922,85 @@ fn resolve_flash_config(
     }))
 }
 
+/// task 1081: `denno version` の出力。ビルド時に確定する定数だけで、
+/// ホスト名・ユーザ名・環境変数の値・カレントディレクトリは含めない。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct BuildInfo {
+    version: String,
+    /// build.rs が埋める短縮 SHA (git が無ければ "unknown")。
+    build_sha: String,
+    /// このバイナリに有効な cargo feature。昇順・重複なし。無効なら空。
+    features: Vec<String>,
+    target_arch: String,
+    target_os: String,
+    /// "release" か "debug" (cfg!(debug_assertions) で判定)。
+    profile: String,
+}
+
+/// 報告対象の feature 名。denno-cli 自身の feature だけを見る
+/// (denno-engine 側の feature はこの crate からは観測できない)。
+const KNOWN_FEATURES: [&str; 2] = ["cuda", "xe"];
+
+/// cargo は有効な feature ごとに `CARGO_FEATURE_<NAME>` を
+/// **そのクレートのビルド時だけ** 環境変数として渡す。`option_env!` は
+/// 単なる env 参照なので、未定義の feature 名でも unexpected_cfgs 警告は出ない。
+fn feature_enabled(name: &str) -> bool {
+    match name {
+        "cuda" => option_env!("CARGO_FEATURE_CUDA").is_some(),
+        "xe" => option_env!("CARGO_FEATURE_XE").is_some(),
+        _ => false,
+    }
+}
+
+fn build_info() -> BuildInfo {
+    let mut features: Vec<String> = KNOWN_FEATURES
+        .iter()
+        .filter(|name| feature_enabled(name))
+        .map(|name| (*name).to_string())
+        .collect();
+    features.sort();
+    features.dedup();
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_sha: match option_env!("DENNO_BUILD_SHA") {
+            Some(s) => s.to_string(),
+            None => "unknown".to_string(),
+        },
+        features,
+        target_arch: std::env::consts::ARCH.to_string(),
+        target_os: std::env::consts::OS.to_string(),
+        profile: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
+    }
+}
+
+/// テキスト出力。固定キーの行だけにして、テストが行単位で照合できるようにする。
+fn render_build_info(info: &BuildInfo) -> String {
+    let features = if info.features.is_empty() {
+        "(none)".to_string()
+    } else {
+        info.features.join(",")
+    };
+    format!(
+        "denno {}\nbuild_sha: {}\nfeatures: {}\ntarget: {}-{}\nprofile: {}\n",
+        info.version,
+        info.build_sha,
+        features,
+        info.target_arch,
+        info.target_os,
+        info.profile
+    )
+}
+
+fn run_version(json: bool) -> Result<()> {
+    let info = build_info();
+    if json {
+        println!("{}", serde_json::to_string(&info)?);
+    } else {
+        print!("{}", render_build_info(&info));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // s44: serve のみ非同期ロギングを使う (logging.rs — stdout 消費者の凍結で
@@ -1117,6 +1204,9 @@ fn main() -> Result<()> {
         }
         Commands::Doctor { dir, json } => {
             doctor::run(dir.as_deref(), json)?;
+        }
+        Commands::Version { json } => {
+            run_version(json)?;
         }
         Commands::Models => {
             let root = cache_root();
@@ -2109,5 +2199,84 @@ mod tests {
         let none: Vec<&str> = Vec::new();
         noarch.write_gguf_meta("y.gguf", &[("tokenizer.ggml.tokens", GgufMeta::ArrStr(&none))]);
         assert!(info_resolve(&noarch.path).is_err());
+    }
+
+    // task 1081: `denno version` の組み立て。実際のバイナリ起動は
+    // tests/version_1081.rs が受け持つので、ここでは構造と整形だけを見る。
+    #[test]
+    fn version_build_info_is_self_consistent() {
+        let info = build_info();
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert!(!info.version.is_empty());
+        assert!(!info.build_sha.is_empty());
+        assert_eq!(info.target_arch, std::env::consts::ARCH);
+        assert_eq!(info.target_os, std::env::consts::OS);
+        assert!(info.profile == "debug" || info.profile == "release");
+        // feature は既知の名前だけ・昇順・重複なし。
+        for f in &info.features {
+            assert!(KNOWN_FEATURES.contains(&f.as_str()), "unknown feature: {f}");
+        }
+        let mut sorted = info.features.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(info.features, sorted);
+    }
+
+    #[test]
+    fn version_text_has_fixed_keys() {
+        let info = build_info();
+        let text = render_build_info(&info);
+        assert_eq!(text.lines().count(), 5, "unexpected lines: {text}");
+        assert!(text.starts_with(&format!("denno {}\n", info.version)));
+        assert!(text.contains(&format!("build_sha: {}\n", info.build_sha)));
+        assert!(text.contains(&format!("target: {}-{}\n", info.target_arch, info.target_os)));
+        assert!(text.contains(&format!("profile: {}\n", info.profile)));
+        let expected = if info.features.is_empty() {
+            "features: (none)\n".to_string()
+        } else {
+            format!("features: {}\n", info.features.join(","))
+        };
+        assert!(text.contains(&expected), "unexpected feature line: {text}");
+    }
+
+    #[test]
+    fn version_render_joins_features() {
+        let info = BuildInfo {
+            version: "9.9.9".into(),
+            build_sha: "deadbeef".into(),
+            features: vec!["cuda".into(), "xe".into()],
+            target_arch: "x86_64".into(),
+            target_os: "linux".into(),
+            profile: "release".into(),
+        };
+        let text = render_build_info(&info);
+        assert!(text.contains("features: cuda,xe\n"), "got: {text}");
+        assert!(text.starts_with("denno 9.9.9\n"));
+    }
+
+    #[test]
+    fn version_json_has_expected_keys_and_no_secrets() {
+        let info = build_info();
+        // 実際の `--json` と同じ経路 (serde_json::to_string) で直列化する。
+        let json = serde_json::to_string(&info).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let obj = v.as_object().expect("object");
+        for key in ["version", "build_sha", "features", "target_arch", "target_os", "profile"] {
+            assert!(obj.contains_key(key), "missing key: {key}");
+        }
+        assert!(obj["features"].is_array());
+        // 秘密・ホスト情報の混入が無いこと (キーも値も固定の語彙だけ)。
+        assert!(!json.contains('@'), "email-like content: {json}");
+        assert!(!json.contains("127.0.0.1"));
+        assert!(!json.contains("localhost"));
+        for (k, val) in obj {
+            assert!(
+                matches!(
+                    k.as_str(),
+                    "version" | "build_sha" | "features" | "target_arch" | "target_os" | "profile"
+                ),
+                "unexpected key: {k} = {val}"
+            );
+        }
     }
 }
