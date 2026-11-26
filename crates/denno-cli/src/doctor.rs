@@ -5,14 +5,22 @@
 //! `--dir` を渡されたときの分割 GGUF の欠け検出。最後に `denno serve-flash` の
 //! 推奨フラグを出す。
 //!
+//! task 1046 で追加: ディスクの合計/空き (`statvfs`)、開けるファイル記述子の
+//! soft/hard 上限 (`getrlimit(RLIMIT_NOFILE)`)、プロセスに効いている
+//! `DENNO_*` 環境変数の一覧 (`DENNO_API_KEY` 系は値を伏せる)。
+//!
 //! **GPU を実行しない**。ライブラリのファイル存在と `/proc` の読み取りだけで、
 //! CUDA API の初期化も `nvidia-smi` の起動もしない (dev コンテナでも安全)。
+//! 拡張検査も `statvfs` / `getrlimit` の読み取りだけで、ファイルを書かない。
 //! そのため VRAM の実容量は出さない (取れないものを捏造しない)。
 //!
 //! 数値経路には触れない。推論の既定挙動は不変。
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+
+/// 秘密とみなして値を伏せる env の値。
+pub const REDACTED: &str = "<redacted>";
 
 /// 共有ライブラリの探索先。`LD_LIBRARY_PATH` を先に、次に固定候補。
 const LIB_DIRS: [&str; 6] = [
@@ -78,7 +86,50 @@ pub struct Report {
     pub memory: MemReport,
     pub gpu: GpuReport,
     pub model: ModelReport,
+    /// task 1046: 検査対象パスのディスク (合計/空き)。
+    pub disk: DiskReport,
+    /// task 1046: 開けるファイル記述子の上限。
+    pub fd_limits: FdLimitReport,
+    /// task 1046: 効いている `DENNO_*` 環境変数 (秘密は伏せる)。
+    pub env: EnvReport,
     pub recommendations: Vec<String>,
+}
+
+/// `statvfs` で読んだディスクの容量。取れなかった項目は `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiskReport {
+    /// 検査したパス (`--dir`、無ければカレント)。
+    pub path: String,
+    /// ファイルシステム全体のサイズ。
+    pub total_bytes: Option<u64>,
+    /// 非特権ユーザーが使える空き (`f_bavail`)。root 予約分は含めない。
+    pub available_bytes: Option<u64>,
+}
+
+/// `getrlimit(RLIMIT_NOFILE)` の結果。`*_unlimited` は無制限 (RLIM_INFINITY)。
+/// 無制限または取得不能のとき `soft`/`hard` は `None` になる。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FdLimitReport {
+    pub soft: Option<u64>,
+    pub hard: Option<u64>,
+    pub soft_unlimited: bool,
+    pub hard_unlimited: bool,
+}
+
+/// `DENNO_*` 環境変数 1 本。`redacted` が true なら `value` は `REDACTED`。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnvEntry {
+    pub key: String,
+    pub value: String,
+    pub redacted: bool,
+}
+
+/// プロセスに効いている `DENNO_*` 環境変数の一覧 (key 昇順で決定的)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnvReport {
+    pub entries: Vec<EnvEntry>,
+    /// 値を伏せた key (表示用)。
+    pub redacted_keys: Vec<String>,
 }
 
 /// `cpu` セクション (HwReport の CPU 部分を素直に分けたもの)。
@@ -267,6 +318,143 @@ fn detect_hw() -> HwReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 1046: ディスク / fd 上限 / env の検査 (すべて読み取りだけ)
+// ---------------------------------------------------------------------------
+
+/// `path` のファイルシステムの (合計, 非特権の空き) を `statvfs` で読む。
+/// 取れない/失敗したら `(None, None)` (0 を事実として出さない)。
+#[cfg(unix)]
+fn disk_space(path: &Path) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        // パスに NUL が入るのは異常。検査不能として扱う。
+        Err(_) => return (None, None),
+    };
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` は NUL 終端の有効な CString、`st` は書き込み可能なローカル。
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return (None, None);
+    }
+    // f_frsize が 0 のファイルシステムがあるので f_bsize へ落とす。
+    let bs = if st.f_frsize != 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    } as u64;
+    let total = (st.f_blocks as u64).saturating_mul(bs);
+    let avail = (st.f_bavail as u64).saturating_mul(bs);
+    (Some(total), Some(avail))
+}
+
+#[cfg(not(unix))]
+fn disk_space(_path: &Path) -> (Option<u64>, Option<u64>) {
+    // 非 unix では statvfs が無い。捏造せず「不明」を返す。
+    (None, None)
+}
+
+/// `path` を検査対象として `DiskReport` を作る。
+fn detect_disk(path: &Path) -> DiskReport {
+    let (total, avail) = disk_space(path);
+    DiskReport {
+        path: path.display().to_string(),
+        total_bytes: total,
+        available_bytes: avail,
+    }
+}
+
+/// `getrlimit(RLIMIT_NOFILE)` を読む。失敗したら既定値 (全部 None/無制限なし)。
+#[cfg(unix)]
+fn fd_limits() -> FdLimitReport {
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: RLIMIT_NOFILE は読み取りのみで、`rl` は書き込み可能なローカル。
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+    if rc != 0 {
+        return FdLimitReport::default();
+    }
+    let split = |v: libc::rlim_t| -> (Option<u64>, bool) {
+        if v == libc::RLIM_INFINITY {
+            (None, true)
+        } else {
+            (Some(v as u64), false)
+        }
+    };
+    let (soft, soft_unlimited) = split(rl.rlim_cur);
+    let (hard, hard_unlimited) = split(rl.rlim_max);
+    FdLimitReport {
+        soft,
+        hard,
+        soft_unlimited,
+        hard_unlimited,
+    }
+}
+
+#[cfg(not(unix))]
+fn fd_limits() -> FdLimitReport {
+    FdLimitReport::default()
+}
+
+/// key が秘密っぽいか。値そのものは見ない (名前だけで判定する)。
+/// `DENNO_API_KEY` / `DENNO_API_KEYS` に加え、`*_KEY` / `*_SECRET` / `*TOKEN` /
+/// `*PASSWORD` も伏せる側に倒す (漏らすより伏せすぎる方が安全)。
+fn is_secret_key(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    k.contains("API_KEY")
+        || k.contains("SECRET")
+        || k.contains("TOKEN")
+        || k.contains("PASSWORD")
+        || k.ends_with("_KEY")
+        || k.ends_with("_KEYS")
+}
+
+/// 与えられた (key, value) から `DENNO_*` だけを抜き、秘密を伏せて key 昇順に
+/// 並べる。テストが大域 env を触らずに済むよう純関数にしてある。
+fn audit_env_from<I>(vars: I) -> EnvReport
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut entries: Vec<EnvEntry> = Vec::new();
+    for (key, value) in vars {
+        if !key.starts_with("DENNO_") {
+            continue;
+        }
+        let redacted = is_secret_key(&key);
+        entries.push(EnvEntry {
+            value: if redacted {
+                REDACTED.to_string()
+            } else {
+                value
+            },
+            redacted,
+            key,
+        });
+    }
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    entries.dedup_by(|a, b| a.key == b.key);
+    let redacted_keys: Vec<String> = entries
+        .iter()
+        .filter(|e| e.redacted)
+        .map(|e| e.key.clone())
+        .collect();
+    EnvReport {
+        entries,
+        redacted_keys,
+    }
+}
+
+/// このプロセスの実 env を読む。非 UTF-8 は lossy 変換 (値は表示用)。
+fn detect_env() -> EnvReport {
+    let vars = std::env::vars_os().map(|(k, v)| {
+        (
+            k.to_string_lossy().to_string(),
+            v.to_string_lossy().to_string(),
+        )
+    });
+    audit_env_from(vars)
+}
+
 /// `name` が `<prefix>-NNNNN-of-MMMMM.gguf` なら `(index, total)`。
 /// llama.cpp / HF の split GGUF 命名。数字は 0 始まりでも 1 始まりでもない
 /// (1 始まり) ので、`idx == 0` や `idx > total` は命名として不正 = `None`。
@@ -411,6 +599,25 @@ fn recommend(report: &Report) -> Vec<String> {
         }
     }
 
+    // task 1046: ファイル記述子の上限とディスクの空き
+    if let Some(soft) = report.fd_limits.soft {
+        if soft < 4096 {
+            v.push(format!(
+                "ファイル記述子の soft 上限 {soft} は小さい: `ulimit -n 65536` などで上げる \
+                 (expert の並列 read と接続で尽きる)"
+            ));
+        }
+    }
+    if let Some(avail) = report.disk.available_bytes {
+        let gibs = avail as f64 / (1024.0 * 1024.0 * 1024.0);
+        if gibs < 8.0 {
+            v.push(format!(
+                "空きディスク {gibs:.1} GiB ({}): モデルのシャードと cache が入らない可能性がある",
+                report.disk.path
+            ));
+        }
+    }
+
     match &report.model.dir {
         Some(_) => {
             if !report.model.ok {
@@ -446,6 +653,23 @@ fn recommend(report: &Report) -> Vec<String> {
 
 fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// fd 上限 1 行。`None` は無制限か取得不能かで表示を分ける。
+fn fd_limit_line(v: Option<u64>, unlimited: bool) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None if unlimited => "(無制限)".to_string(),
+        None => "(不明)".to_string(),
+    }
+}
+
+/// テキスト出力用: 制御文字 (改行/タブ等) を空白にして 1 行 1 変数を保つ。
+/// JSON 側は値をそのまま出すので、ここだけで加工する。
+fn sanitize_env_value(v: &str) -> String {
+    v.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn opt_or_dash<T: ToString>(v: &Option<T>) -> String {
@@ -484,6 +708,33 @@ fn render_text(r: &Report) -> String {
             .available_bytes
             .map(gib)
             .unwrap_or_else(|| "(不明)".into())
+    ));
+
+    o.push_str("[ディスク]\n");
+    o.push_str(&format!("  path            {}\n", r.disk.path));
+    o.push_str(&format!(
+        "  合計            {}\n",
+        r.disk
+            .total_bytes
+            .map(gib)
+            .unwrap_or_else(|| "(不明)".into())
+    ));
+    o.push_str(&format!(
+        "  空き            {}\n",
+        r.disk
+            .available_bytes
+            .map(gib)
+            .unwrap_or_else(|| "(不明)".into())
+    ));
+
+    o.push_str("[ファイル記述子]\n");
+    o.push_str(&format!(
+        "  上限 (soft)     {}\n",
+        fd_limit_line(r.fd_limits.soft, r.fd_limits.soft_unlimited)
+    ));
+    o.push_str(&format!(
+        "  上限 (hard)     {}\n",
+        fd_limit_line(r.fd_limits.hard, r.fd_limits.hard_unlimited)
     ));
 
     o.push_str("[GPU]\n");
@@ -547,6 +798,20 @@ fn render_text(r: &Report) -> String {
         }
     }
 
+    o.push_str("[環境変数 (DENNO_*)]\n");
+    if r.env.entries.is_empty() {
+        o.push_str("  (DENNO_* は未設定)\n");
+    }
+    for e in &r.env.entries {
+        let mark = if e.redacted { "  (値は非表示)" } else { "" };
+        o.push_str(&format!(
+            "  {}={}{}\n",
+            e.key,
+            sanitize_env_value(&e.value),
+            mark
+        ));
+    }
+
     o.push_str("[推奨]\n");
     if r.recommendations.is_empty() {
         o.push_str("  (無し)\n");
@@ -564,6 +829,11 @@ pub fn run(dir: Option<&Path>, json: bool) -> Result<()> {
     let model = match dir {
         Some(d) => check_shards(d)?,
         None => ModelReport::default(),
+    };
+    // task 1046: ディスクは --dir を優先。未指定ならカレントを見る。
+    let disk_path = match dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
     let mut report = Report {
         cpu: CpuReport {
@@ -584,6 +854,9 @@ pub fn run(dir: Option<&Path>, json: bool) -> Result<()> {
             level_zero_intel_driver: hw.level_zero_intel_driver.clone(),
         },
         model,
+        disk: detect_disk(&disk_path),
+        fd_limits: fd_limits(),
+        env: detect_env(),
         recommendations: Vec::new(),
     };
     report.recommendations = recommend(&report);
@@ -673,6 +946,18 @@ mod tests {
             },
             gpu,
             model: ModelReport::default(),
+            disk: DiskReport {
+                path: "/tmp".to_string(),
+                total_bytes: Some(500 * 1024 * 1024 * 1024),
+                available_bytes: Some(200 * 1024 * 1024 * 1024),
+            },
+            fd_limits: FdLimitReport {
+                soft: Some(65536),
+                hard: Some(65536),
+                soft_unlimited: false,
+                hard_unlimited: false,
+            },
+            env: EnvReport::default(),
             recommendations: Vec::new(),
         };
         r.recommendations = recommend(&r);
@@ -859,5 +1144,234 @@ mod tests {
         }
         // x86_64 なら SIMD は最低 1 つ (SSE2 は必ずある) を期待するが、
         // 実行環境依存なので「空でも panic しない」だけを確認する。
+    }
+
+    // ---- task 1046: env 監査 (純関数。大域 env は触らない) ----
+
+    #[test]
+    fn env_audit_filters_and_sorts_denno_keys() {
+        let r = audit_env_from(vec![
+            ("DENNO_Z_LAST".to_string(), "z".to_string()),
+            ("PATH".to_string(), "/bin".to_string()),
+            ("DENNO_MAX_CTX".to_string(), "8192".to_string()),
+            ("denno_lower".to_string(), "nope".to_string()),
+        ]);
+        let keys: Vec<&str> = r.entries.iter().map(|e| e.key.as_str()).collect();
+        // DENNO_ 以外 (PATH, 小文字) は落ち、key 昇順になる
+        assert_eq!(keys, vec!["DENNO_MAX_CTX", "DENNO_Z_LAST"]);
+        assert_eq!(r.entries[0].value, "8192");
+        assert!(!r.entries[0].redacted);
+        assert!(r.redacted_keys.is_empty());
+    }
+
+    #[test]
+    fn env_audit_redacts_api_key_names() {
+        let r = audit_env_from(vec![
+            ("DENNO_API_KEY".to_string(), "sk-very-secret".to_string()),
+            ("DENNO_API_KEYS".to_string(), "a,b".to_string()),
+            ("DENNO_EXPERT_CACHE_MB".to_string(), "2048".to_string()),
+        ]);
+        for e in &r.entries {
+            if e.key == "DENNO_API_KEY" || e.key == "DENNO_API_KEYS" {
+                assert_eq!(e.value, REDACTED, "{} leaked: {}", e.key, e.value);
+                assert!(e.redacted, "{} not marked redacted", e.key);
+            }
+        }
+        assert_eq!(
+            r.redacted_keys,
+            vec!["DENNO_API_KEY".to_string(), "DENNO_API_KEYS".to_string()]
+        );
+        // 秘密でない値はそのまま
+        let cache = r
+            .entries
+            .iter()
+            .find(|e| e.key == "DENNO_EXPERT_CACHE_MB")
+            .expect("entry");
+        assert_eq!(cache.value, "2048");
+        assert!(!cache.redacted);
+        // 出力全体に生の秘密が現れない
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(!json.contains("sk-very-secret"), "{json}");
+        let text = render_text(&{
+            let mut rep = synth(true, true, false);
+            rep.env = r.clone();
+            rep
+        });
+        assert!(!text.contains("sk-very-secret"), "secret in text:\n{text}");
+        assert!(text.contains("DENNO_API_KEY=<redacted>"), "{text}");
+    }
+
+    #[test]
+    fn secret_key_detection_is_broad_but_not_greedy() {
+        for k in [
+            "DENNO_API_KEY",
+            "DENNO_API_KEYS",
+            "DENNO_HF_TOKEN",
+            "DENNO_CLIENT_SECRET",
+            "DENNO_DB_PASSWORD",
+            "DENNO_WEBHOOK_KEY",
+        ] {
+            assert!(is_secret_key(k), "{k} should be redacted");
+        }
+        for k in ["DENNO_MAX_CTX", "DENNO_MODEL_DIR", "DENNO_KEYRING_DIR_X"] {
+            assert!(!is_secret_key(k), "{k} should not be redacted");
+        }
+    }
+
+    // ---- task 1046: ディスク / fd 上限の実測 (panic せず妥当な値) ----
+
+    #[test]
+    fn disk_space_reads_real_filesystem() {
+        let (total, avail) = disk_space(&std::env::temp_dir());
+        let (total, avail) = match (total, avail) {
+            (Some(t), Some(a)) => (t, a),
+            other => panic!("statvfs on temp dir returned {other:?}"),
+        };
+        assert!(total > 0, "total={total}");
+        assert!(avail <= total, "avail {avail} > total {total}");
+    }
+
+    #[test]
+    fn disk_report_keeps_path_and_numbers() {
+        let d = detect_disk(Path::new("/"));
+        assert_eq!(d.path, "/");
+        assert!(d.total_bytes.unwrap_or(0) > 0);
+        assert!(d.available_bytes.unwrap_or(0) <= d.total_bytes.unwrap_or(0));
+        // 存在しないパスは statvfs が失敗する → 値を捏造しない
+        let missing = detect_disk(Path::new("/nonexistent-dennotest-dir/xyz"));
+        assert_eq!(missing.total_bytes, None);
+        assert_eq!(missing.available_bytes, None);
+    }
+
+    #[test]
+    fn fd_limits_are_consistent() {
+        let f = fd_limits();
+        // soft <= hard。どちらかが無制限なら他方も無制限か数値。
+        if let (Some(s), Some(h)) = (f.soft, f.hard) {
+            assert!(s <= h, "soft {s} > hard {h}");
+            assert!(s >= 3, "soft {s} is implausibly low");
+        }
+        if f.hard_unlimited {
+            assert!(f.hard.is_none());
+        }
+        if f.soft_unlimited {
+            assert!(f.soft.is_none());
+        }
+    }
+
+    // fd 上限が小さいときだけ推奨行が出る (分岐の発火を数える)
+    #[test]
+    fn low_fd_limit_produces_recommendation() {
+        let mut r = synth(true, true, false);
+        r.fd_limits = FdLimitReport {
+            soft: Some(1024),
+            hard: Some(1024),
+            soft_unlimited: false,
+            hard_unlimited: false,
+        };
+        r.recommendations = recommend(&r);
+        assert!(
+            r.recommendations
+                .iter()
+                .any(|s| s.contains("ファイル記述子の soft 上限 1024")),
+            "{:?}",
+            r.recommendations
+        );
+
+        // 十分大きいときは出ない
+        let mut r2 = synth(true, true, false);
+        r2.fd_limits = FdLimitReport {
+            soft: Some(1_048_576),
+            hard: Some(1_048_576),
+            soft_unlimited: false,
+            hard_unlimited: false,
+        };
+        r2.recommendations = recommend(&r2);
+        assert!(
+            !r2.recommendations
+                .iter()
+                .any(|s| s.contains("ファイル記述子")),
+            "{:?}",
+            r2.recommendations
+        );
+    }
+
+    // 空きが少ないときだけディスクの推奨行が出る
+    #[test]
+    fn low_disk_space_produces_recommendation() {
+        let mut r = synth(true, true, false);
+        r.disk.available_bytes = Some(1024 * 1024 * 1024); // 1 GiB
+        r.recommendations = recommend(&r);
+        assert!(
+            r.recommendations
+                .iter()
+                .any(|s| s.contains("空きディスク") && s.contains("/tmp")),
+            "{:?}",
+            r.recommendations
+        );
+
+        let mut r2 = synth(true, true, false);
+        r2.disk.available_bytes = Some(100 * 1024 * 1024 * 1024);
+        r2.recommendations = recommend(&r2);
+        assert!(
+            !r2.recommendations.iter().any(|s| s.contains("空きディスク")),
+            "{:?}",
+            r2.recommendations
+        );
+    }
+
+    // テキストに新セクションが出て、fd は無制限/不明を区別する
+    #[test]
+    fn text_has_disk_fd_and_env_sections() {
+        let mut r = synth(true, true, false);
+        r.env = audit_env_from(vec![
+            ("DENNO_MAX_CTX".to_string(), "4096".to_string()),
+            ("DENNO_API_KEY".to_string(), "sekrit".to_string()),
+        ]);
+        let t = render_text(&r);
+        for sec in ["[ディスク]", "[ファイル記述子]", "[環境変数 (DENNO_*)]"] {
+            assert!(t.contains(sec), "missing {sec} in:\n{t}");
+        }
+        assert!(t.contains("上限 (soft)     65536"), "{t}");
+        assert!(t.contains("DENNO_MAX_CTX=4096"), "{t}");
+        assert!(!t.contains("sekrit"), "secret leaked:\n{t}");
+
+        let mut u = r.clone();
+        u.fd_limits = FdLimitReport {
+            soft: None,
+            hard: None,
+            soft_unlimited: true,
+            hard_unlimited: true,
+        };
+        let tu = render_text(&u);
+        assert!(tu.contains("上限 (soft)     (無制限)"), "{tu}");
+        assert!(tu.contains("上限 (hard)     (無制限)"), "{tu}");
+
+        // 改行を含む値でも 1 行 1 変数を保つ
+        let mut n = r.clone();
+        n.env = audit_env_from(vec![("DENNO_X".to_string(), "a\nb".to_string())]);
+        let tn = render_text(&n);
+        assert!(tn.contains("DENNO_X=a b"), "{tn}");
+        assert!(!tn.contains("DENNO_X=a\nb"), "{tn}");
+    }
+
+    // 新フィールドが JSON round-trip し、既存キーを壊さない
+    #[test]
+    fn json_includes_new_sections_and_roundtrips() {
+        let mut r = synth(false, true, false);
+        r.env = audit_env_from(vec![("DENNO_API_KEY".to_string(), "zz".to_string())]);
+        let s = serde_json::to_string(&r).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("parse");
+        assert!(v["disk"]["path"].is_string());
+        assert!(v["disk"]["total_bytes"].is_u64());
+        assert!(v["fd_limits"]["soft"].is_u64());
+        assert_eq!(v["fd_limits"]["soft_unlimited"], false);
+        assert_eq!(v["env"]["entries"][0]["key"], "DENNO_API_KEY");
+        assert_eq!(v["env"]["entries"][0]["value"], REDACTED);
+        assert_eq!(v["env"]["entries"][0]["redacted"], true);
+        assert_eq!(v["env"]["redacted_keys"][0], "DENNO_API_KEY");
+        assert!(!s.contains("\"zz\""), "secret leaked into json: {s}");
+        let back: Report = serde_json::from_str(&s).expect("roundtrip");
+        assert_eq!(back, r);
     }
 }
