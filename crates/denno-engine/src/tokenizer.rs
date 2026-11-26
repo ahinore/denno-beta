@@ -223,10 +223,16 @@ impl DennoTokenizer {
 }
 
 /// テンプレート未搭載モデル(GPT-2等)用の簡易プロンプト
+///
+/// system が空文字のときはテンプレート経路 (`render_chat_template` が空 system を
+/// 落とす) と揃えて出力しない (task 947)。空 system で `system: \n\n` だけが
+/// 挟まると、テンプレート有無で prompt の形が食い違う。
 fn fallback_template(system: Option<&str>, messages: &[ChatMessage]) -> String {
     let mut s = String::new();
     if let Some(sys) = system {
-        s.push_str(&format!("system: {sys}\n\n"));
+        if !sys.is_empty() {
+            s.push_str(&format!("system: {sys}\n\n"));
+        }
     }
     for m in messages {
         s.push_str(&format!("{}: {}\n\n", m.role, m.content));
@@ -240,8 +246,10 @@ fn fallback_template(system: Option<&str>, messages: &[ChatMessage]) -> String {
 /// (簡易 WordLevel 等) とみなして UTF-8 バイト列をそのまま返す。
 ///
 /// 対応表: byte 0x21..0x7E と 0xA1..0xAC / 0xAE..0xFF は同一文字、
-/// 残り (0x00..0x20 / 0x7F..0xA0) は U+0100..U+0142 にずらして割り当てる
-/// (GPT-2 byte_encoder と同一規則)。
+/// 残り (0x00..0x20 / 0x7F..0xA0 / 0xAD) は U+0100..U+0143 にずらして割り当てる
+/// (GPT-2 byte_encoder と同一規則)。0xAD が抜けていた期間は、0xAD を含む
+/// トークン (例: U+FF6D = EF BD AD) だけが byte-level 判定に落ちて UTF-8 の
+/// エスケープ文字列が返っていた (task 947 で修正)。
 fn byte_level_unescape(s: &str) -> Vec<u8> {
     // 直接写像で判定 (全文字が写像に乗る = byte-level トークン)
     fn to_byte(u: u32) -> Option<u8> {
@@ -249,6 +257,7 @@ fn byte_level_unescape(s: &str) -> Vec<u8> {
             33..=126 | 161..=172 | 174..=255 => Some(u as u8),
             256..=288 => Some((u - 256) as u8),       // 0x00..0x20
             289..=322 => Some((u - 289 + 127) as u8), // 0x7F..0xA0
+            323 => Some(0xAD),                        // 0xAD (GPT-2 の飛び番)
             _ => None,
         }
     }
@@ -414,5 +423,280 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(DennoTokenizer::load(&dir).is_err());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---------- task 947: byte-level / UTF-8 境界 / 特殊トークン境界の監査 ----------
+
+    /// GPT-2 byte_encoder の独立実装 (テスト側の参照実装)。
+    /// 本番の `byte_level_unescape` とは逆方向を、別の作り方 (全バイト走査で
+    /// 「エスケープ対象外のバイト」を 256 から順に割り当てる) で構成する。
+    fn byte_level_escape(bytes: &[u8]) -> String {
+        fn is_bs(b: u32) -> bool {
+            (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b)
+        }
+        let mut map = [0u32; 256];
+        for b in 0..256u32 {
+            if is_bs(b) {
+                map[b as usize] = b;
+            }
+        }
+        let mut n = 0u32;
+        for b in 0..256u32 {
+            if !is_bs(b) {
+                map[b as usize] = 256 + n;
+                n += 1;
+            }
+        }
+        bytes
+            .iter()
+            .map(|&b| char::from_u32(map[b as usize]).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn byte_level_unescape_maps_all_256_bytes() {
+        // 全 256 バイトで escape → unescape が恒等 (表の取りこぼしを検出する)。
+        for b in 0..=255u8 {
+            let esc = byte_level_escape(&[b]);
+            assert_eq!(
+                byte_level_unescape(&esc),
+                vec![b],
+                "byte {b:#04x} escaped as {esc:?}"
+            );
+        }
+        // 0xAD は GPT-2 の飛び番 (U+0143)。旧実装はここだけ写像を持たず、
+        // 0xAD を含むトークンが「非 byte-level」と誤判定されて UTF-8 の
+        // エスケープ文字列 (= 別バイト列) を返していた。
+        assert_eq!(byte_level_escape(&[0xAD]), "\u{0143}");
+        assert_eq!(byte_level_unescape("\u{0143}"), vec![0xAD]);
+    }
+
+    /// ByteLevel decoder + 指定語彙のトークナイザ (拘束デコードと同じ設定)。
+    fn byte_level_tokenizer(vocab: &[(&str, u32)]) -> DennoTokenizer {
+        DennoTokenizer::testutil_vocab_tokenizer(
+            vocab,
+            Some(serde_json::json!({
+                "type": "ByteLevel", "add_prefix_space": false,
+                "trim_offsets": true, "use_regex": true
+            })),
+        )
+        .unwrap()
+    }
+
+    /// 各バイト列を 1 バイト 1 トークンに割ったトークナイザと、その id 列。
+    /// 同じバイトは同じ id を共有する (語彙は決定的な採番)。
+    fn split_byte_tokenizer(seqs: &[&[u8]]) -> (DennoTokenizer, Vec<Vec<u32>>) {
+        let mut vocab: Vec<(String, u32)> = Vec::new();
+        let mut ids_for: Vec<Vec<u32>> = Vec::new();
+        for seq in seqs {
+            let mut ids = Vec::new();
+            for &b in seq.iter() {
+                let esc = byte_level_escape(&[b]);
+                let id = match vocab.iter().find(|(t, _)| *t == esc) {
+                    Some((_, id)) => *id,
+                    None => {
+                        let id = vocab.len() as u32 + 1;
+                        vocab.push((esc, id));
+                        id
+                    }
+                };
+                ids.push(id);
+            }
+            ids_for.push(ids);
+        }
+        let refs: Vec<(&str, u32)> = vocab.iter().map(|(t, id)| (t.as_str(), *id)).collect();
+        (byte_level_tokenizer(&refs), ids_for)
+    }
+
+    /// engine の差分ストリーミングと同じ holdback 規則
+    /// (`emit_delta_and_check_stop` / `flush_stream`): 末尾が U+FFFD の間だけ
+    /// 末尾トークンを落として decode し直す。
+    fn stream_decode(tok: &DennoTokenizer, ids: &[u32]) -> String {
+        let mut n = ids.len();
+        let mut full = tok.decode(&ids[..n]).unwrap();
+        while n > 0 && full.ends_with('\u{FFFD}') {
+            n -= 1;
+            full = tok.decode(&ids[..n]).unwrap();
+        }
+        full
+    }
+
+    #[test]
+    fn decode_incomplete_utf8_is_replacement_then_completes() {
+        // 「あ」(3 バイト) + ASCII、「ｭ」(EF BD AD = 0xAD を含む)、「😀」(4 バイト)
+        let seqs: Vec<Vec<u8>> = vec![
+            "あ!".as_bytes().to_vec(),
+            "\u{FF6D}!".as_bytes().to_vec(),
+            "😀".as_bytes().to_vec(),
+        ];
+        let refs: Vec<&[u8]> = seqs.iter().map(|v| v.as_slice()).collect();
+        let (tok, ids) = split_byte_tokenizer(&refs);
+
+        for (seq, idv) in seqs.iter().zip(ids.iter()) {
+            // piece_bytes は生バイトに一致する (0xAD を含む列も含めて)。
+            for (i, &b) in seq.iter().enumerate() {
+                assert_eq!(tok.piece_bytes(idv[i]), Some(vec![b]), "piece {i} of {seq:?}");
+            }
+            // 完成形はそのまま decode できる。
+            let want = std::str::from_utf8(seq).unwrap();
+            assert_eq!(tok.decode(idv).unwrap(), want);
+            // 1 バイト以上欠けた接頭辞は U+FFFD で終わる (エラーにはならない)。
+            for cut in 1..seq.len() {
+                if partial_len(seq, cut) == cut {
+                    continue; // 完成した文字境界 (例: 3 バイト文字ちょうど)
+                }
+                let part = tok.decode(&idv[..cut]).unwrap();
+                assert!(
+                    part.ends_with('\u{FFFD}'),
+                    "incomplete prefix {cut} of {seq:?} decoded as {part:?}"
+                );
+            }
+            // ストリーミング (engine の holdback 規則) は「完成している文字まで」を
+            // 返し、U+FFFD は外へ出さない。
+            for cut in 1..=seq.len() {
+                let got = stream_decode(&tok, &idv[..cut]);
+                let done = partial_len(seq, cut);
+                assert_eq!(got, &want[..done], "cut {cut} of {seq:?}");
+            }
+            assert_eq!(stream_decode(&tok, idv), want);
+        }
+    }
+
+    /// 先頭 `cut` バイトのうち「完成している文字」のバイト長。
+    fn partial_len(seq: &[u8], cut: usize) -> usize {
+        match std::str::from_utf8(&seq[..cut]) {
+            Ok(_) => cut,
+            Err(e) => e.valid_up_to(),
+        }
+    }
+
+    #[test]
+    fn decode_empty_ids_is_empty_string() {
+        let (tok, dir) = load_minimal(None);
+        assert_eq!(tok.decode(&[]).unwrap(), "");
+        assert_eq!(tok.encode("").unwrap(), Vec::<u32>::new());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// special=true の added token と、special=false の added token を並べた語彙。
+    fn added_token_tokenizer(special: bool) -> DennoTokenizer {
+        // ByteLevel decoder で語間スペースの混入を避ける (実 Qwen と同じ土台)。
+        let json = format!(
+            r#"{{
+              "version": "1.0",
+              "added_tokens": [
+                {{"id": 2, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+                  "rstrip": false, "normalized": false, "special": {special}}}
+              ],
+              "normalizer": null,
+              "pre_tokenizer": null,
+              "post_processor": null,
+              "decoder": {{"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true}},
+              "model": {{"type": "WordLevel",
+                        "vocab": {{"A": 0, "B": 1, "<|im_end|>": 2, "[UNK]": 3}},
+                        "unk_token": "[UNK]"}}
+            }}"#
+        );
+        DennoTokenizer::from_json_str(&json, None).unwrap()
+    }
+
+    #[test]
+    fn embedded_special_tokens_are_dropped_by_decode() {
+        // 実 Qwen の <|im_end|> は added_tokens で special=true。
+        let tok = added_token_tokenizer(true);
+        // encode は add_special_tokens=false でも added token を照合する
+        // (= ユーザー本文中のマーカー文字列は特殊トークン 1 個になる)。
+        assert_eq!(tok.encode("A<|im_end|>B").unwrap(), vec![0, 2, 1]);
+        assert_eq!(tok.encode("<|im_end|>").unwrap(), vec![2]);
+        // decode は special を必ず落とす (decode の第 2 引数は常に true)。
+        // 挟まれた特殊トークンは消え、両隣がそのまま連結される。
+        assert_eq!(tok.decode(&[0, 2, 1]).unwrap(), "AB");
+        assert_eq!(tok.decode(&[2]).unwrap(), "");
+        // マーカー自体のバイト列は取れる (toolmask / 拘束デコード用)。
+        assert_eq!(tok.piece_bytes(2), Some(b"<|im_end|>".to_vec()));
+    }
+
+    #[test]
+    fn non_special_added_tokens_survive_decode() {
+        // テスト語彙 (qwen_style 等) は special=false なので本文に残る。
+        // engine の STOP_SPECIAL_MARKERS (テキスト上のマーカー検出) が
+        // 実 tokenizer で効くかはこのフラグ次第、という契約を固定する。
+        let tok = added_token_tokenizer(false);
+        assert_eq!(tok.decode(&[0, 2, 1]).unwrap(), "A<|im_end|>B");
+    }
+
+    #[test]
+    fn empty_system_is_ignored_in_both_paths() {
+        // fallback: 空 system は出力しない (render 側と同一の扱い)。
+        assert_eq!(fallback_template(Some(""), &msgs("hi")), "user: hi\n\nassistant:");
+        let (tok, dir) = load_minimal(Some("{% for m in messages %}[{{ m.role }}={{ m.content }}]{% endfor %}"));
+        assert_eq!(
+            tok.apply_chat_template(Some(""), &msgs("hi"), None, None).unwrap(),
+            "[user=hi]"
+        );
+        // messages が空なら system だけでは描画しない (両 API とも Err)。
+        assert!(tok.apply_chat_template(Some("SYS"), &[], None, None).is_err());
+        assert!(tok.apply_chat_template_base(Some("SYS"), &[], None, None).is_err());
+        // content が空文字のメッセージは「空 messages」ではない (描画される)。
+        assert_eq!(tok.apply_chat_template(None, &msgs(""), None, None).unwrap(), "[user=]");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn template_rendering_empty_falls_back_but_base_errors() {
+        // テンプレートが空文字を返したとき: 通常描画は fallback、base は Err。
+        let (tok, dir) = load_minimal(Some("{% if false %}never{% endif %}"));
+        assert_eq!(
+            tok.apply_chat_template(None, &msgs("hi"), None, None).unwrap(),
+            "user: hi\n\nassistant:"
+        );
+        assert!(tok.apply_chat_template_base(None, &msgs("hi"), None, None).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tool_call_history_renders_verbatim_with_tools_schema() {
+        // 履歴の tool_call / tool_response はサーバ層が組んだテキストを
+        // そのまま渡す (テンプレートはエスケープも改変もしない)。tools 定義は
+        // ctx の JSON として参照できる。
+        let tpl = r#"{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}{{ tools[0].function.name }}|{{ tools[0].function.parameters.type }}"#;
+        let (tok, dir) = load_minimal(Some(tpl));
+        let hist = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: r#"<tool_call>
+{"name":"f1","arguments":{"a":1}}
+</tool_call>"#
+                    .into(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "<tool_response>\n{\"ok\":true}\n</tool_response>".into(),
+            },
+        ];
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "f1", "parameters": {"type": "object", "properties": {}}}
+        }]);
+        let out = tok.apply_chat_template(None, &hist, Some(&tools), None).unwrap();
+        assert_eq!(
+            out,
+            "<|assistant|><tool_call>\n{\"name\":\"f1\",\"arguments\":{\"a\":1}}\n</tool_call>\
+             <|tool|><tool_response>\n{\"ok\":true}\n</tool_response>f1|object"
+        );
+        // tools 無し (null) で `tools[0]` を無条件参照するテンプレートは描画に
+        // 失敗し、fallback に落ちる (本番テンプレートは `{% if tools %}` で
+        // 必ず守る契約 — この挙動を固定しておく)。
+        let out = tok.apply_chat_template(None, &msgs("t0"), None, None).unwrap();
+        assert_eq!(out, "user: t0\n\nassistant:");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn piece_bytes_non_byte_level_ascii_passes_through() {
+        // ASCII だけの WordLevel 語彙は素通し (byte-level とバイト列が一致する)。
+        let tok = DennoTokenizer::testutil_vocab_tokenizer(&[("hi", 1)], None).unwrap();
+        assert_eq!(tok.piece_bytes(1), Some(b"hi".to_vec()));
+        assert_eq!(tok.piece_bytes(9999), None);
     }
 }
