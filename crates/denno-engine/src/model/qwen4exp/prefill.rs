@@ -5683,8 +5683,6 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 419: 層ループ入口の確保と追い出し階段を分けて数える (診断)。
         let sub_setup = q4ledger::sub(q4ledger::SUB_PF_SETUP);
         {
-            let k = self.p.n_expert_used;
-            let ff = self.p.n_ff_exp;
             // task 250: tensor core 経路は gate/up を融合して act に直接書くので、
             // 作業域は act 1 枚で足りる (g/u は取らない)。見積りも 3 → 1 に落とす
             // (過大に見積もると、要らない expert まで追い出して decode を冷やす)。
@@ -5695,19 +5693,27 @@ pub(crate) fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             };
             // task 250: MoE をトークンで割るときは h / act もその行数で足りる。
             // task 279: 行数は選んだタイル (プールのレイアウトと同じ値) を使う。
-            let tile_rows = tile.saturating_mul(k);
-            let act_rows = if act_terms == 1 {
-                tile_rows
-            } else if crate::model::exp_pf::lm_group_local() {
-                tile_rows.div_ceil(4).max(1)
-            } else {
-                tile_rows
+            // task 915: 見積りは `pf_pool::lm_work_need` (純関数) に集約した。
+            // 旧式は残差の退避域を `chunk * hc` で数えており (`hc * e` の
+            // `e` が抜け)、16K-32K では退避域が 0.7-1.4 GB あるため追い出しが
+            // 2-3 割足りず、確保失敗 → 常駐経路の降下を招いていた。
+            let need = {
+                let n = self.pf_pool_need_for(nt_all, tile, chunk, hc, lr);
+                // task 915: 切り戻しは `DENNO_PF_LM_NEED_LEGACY=1` (旧式)。
+                if crate::model::pf_pool::lm_need_legacy_from_value(
+                    std::env::var(crate::model::pf_pool::LM_NEED_LEGACY_ENV)
+                        .ok()
+                        .as_deref(),
+                ) {
+                    crate::model::pf_pool::lm_work_need_legacy(
+                        &n,
+                        act_terms,
+                        crate::model::exp_pf::lm_group_local(),
+                    )
+                } else {
+                    crate::model::pf_pool::lm_work_need(&n, act_terms)
+                }
             };
-            let need = nt_all * e * 8
-                + ranges.len() * chunk * hc * 4
-                + (tile_rows + nt_all) * e * 4
-                + act_terms * act_rows * ff * 4
-                + (64usize << 20);
             // lab t242b: この `need` を満たしても、14k では `h` (1,505 MiB) の
             // 確保が「空き 1,243 MiB」で失敗し、`DevBuffer::alloc_tagged` の
             // 追い出し階段が **expert の LRU を全部捨てる** (39,755 MiB)。

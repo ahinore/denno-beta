@@ -275,11 +275,16 @@ pub fn chunk_balance_from_value(v: Option<&str>) -> bool {
 /// - `n <= base` なら 1 チャンク (`n`)。
 /// - それ以外は「`cap` で割ったときのチャンク数」を保ったまま均等に割る
 ///   (端数の小さい最後の 1 枚を作らない)。
+///
+/// **どの枝でも `cap` を超えない** (task 915)。`n <= base` の枝が `cap` を
+/// 見ていなかったため、`base > cap` (既定のストリーミング経路では起きないが、
+/// 将来 `DEFAULT_PF_CHUNK_STREAM` を上げたときや、`DENNO_PREFILL_BATCH_CHUNK`
+/// を直に大きくしたとき) に GDN 連鎖の境界 2048 を踏みうる。
 pub fn balanced_chunk(n: usize, base: usize, cap: usize) -> usize {
     let base = base.max(1);
     let cap = cap.max(1);
     if n == 0 || n <= base {
-        return n.max(1).min(base);
+        return n.max(1).min(base).min(cap);
     }
     let nch = n.div_ceil(cap);
     n.div_ceil(nch).clamp(1, cap)
@@ -7283,6 +7288,82 @@ mod tests {
                 chunk_for_prefill(n, base, cap, true, false, true, false),
                 "n={n} で long が短い側の答えを変えた"
             );
+        }
+    }
+
+    /// task 915: 16K-32K のチャンク編成の不変条件 (固定 / 均等割りの両方)。
+    ///
+    /// 長文で守るべきは 3 つ:
+    /// (1) 1 枚が GDN 前処理の連鎖の境界 `GDN_CHUNK_MIN_TOKENS` (2,048) を踏まない
+    ///     (踏むと ssm がデバイス連鎖の外へ落ちる。task 197 の 3.96 -> 24.7 s)。
+    /// (2) チャンクの覆いに隙間も重なりも無い (最後の 1 枚だけ短い)。
+    /// (3) 均等割りは枚数を増やさない (ミス expert の上げ直しを増やさない)。
+    #[test]
+    fn chunk_schedule_at_16k_and_32k() {
+        let (base, cap) = (DEFAULT_PF_CHUNK_STREAM, CHUNK_BALANCE_CAP);
+        for n in [16_375usize, 16_384, 20_000, 24_576, 30_000, 32_768] {
+            // 固定 (既定): 1 枚は base、枚数は ceil(n/base)。
+            let fixed = chunk_for_prefill(n, base, cap, false, false, true, false);
+            assert_eq!(fixed, base, "balance off は固定 {base}");
+            assert_eq!(n.div_ceil(fixed), n.div_ceil(base));
+            // 均等割り (long on): 上限以下・境界未満・枚数は固定以下。
+            let bal = chunk_for_prefill(n, base, cap, true, true, true, false);
+            assert!(bal >= 1 && bal <= cap, "n={n} chunk={bal}");
+            // 上限は GDN 連鎖の境界 2,048 の手前 (cap + 1 がその境界)。
+            assert!(bal < cap + 1, "GDN 連鎖の境界を踏んだ: n={n} chunk={bal}");
+            let nch = n.div_ceil(bal);
+            assert!(nch <= n.div_ceil(base), "n={n}: 枚数が増えた {nch}");
+            // 覆いは厳密で、空のチャンクを作らない。
+            let mut cov = 0usize;
+            let mut last = 0usize;
+            for i in 0..nch {
+                let a = i * bal;
+                let b = ((i + 1) * bal).min(n);
+                assert!(b > a, "n={n}: 空のチャンク {i}");
+                cov += b - a;
+                last = b - a;
+            }
+            assert_eq!(cov, n, "n={n}: 覆いが合わない (chunk={bal} nch={nch})");
+            // 端数の小さい最後の 1 枚を作らない (半分以上)。
+            assert!(
+                2 * last >= bal.min(n),
+                "n={n}: 端数 {last} が chunk {bal} の半分未満"
+            );
+        }
+        // 32,768 の固定編成は末尾がちょうど 512 で、ストリーミング経路の
+        // 下限 (`DEFAULT_STREAM_MIN_TOK`) に載る (下回ると末尾だけ従来経路)。
+        let tail = 32_768 - (32_768usize.div_ceil(base) - 1) * base;
+        assert_eq!(tail, 512);
+        assert!(tail >= DEFAULT_STREAM_MIN_TOK, "末尾が従来経路へ落ちる");
+    }
+
+    /// task 915: 均等割りは **どの枝でも** 上限を超えない。
+    ///
+    /// 旧実装は `n <= base` の枝だけ `cap` を見ておらず、`base > cap` のとき
+    /// 上限 (GDN 連鎖の境界の手前) を超える値を返せた。
+    #[test]
+    fn balanced_chunk_never_exceeds_the_cap() {
+        for n in [0usize, 1, 512, 1024, 1536, 2047, 2048, 4094, 4095, 16_384, 32_768] {
+            for base in [1024usize, 1536, 2047, 4096] {
+                for cap in [1024usize, 2047] {
+                    let c = balanced_chunk(n, base, cap);
+                    assert!(c >= 1 && c <= cap, "n={n} base={base} cap={cap} -> {c}");
+                    // 覆いは c で厳密 (n = 0 はこの検査の外)。
+                    if n > 0 {
+                        let nch = n.div_ceil(c);
+                        assert!(nch * c >= n);
+                        assert!((nch - 1) * c < n, "n={n} c={c}: 最後の 1 枚が空");
+                    }
+                }
+            }
+        }
+        // base > cap でも cap で切る (旧実装は 3000 を返した)。
+        assert_eq!(balanced_chunk(3000, 4096, 2047), 2047);
+        assert_eq!(balanced_chunk(100, 4096, 2047), 100);
+        // cap を割る枚数は「cap で割ったときの枚数」を超えない。
+        for n in [4094usize, 4095, 16_384, 32_768] {
+            let c = balanced_chunk(n, 1536, 2047);
+            assert!(n.div_ceil(c) <= n.div_ceil(2047), "n={n} c={c}");
         }
     }
 

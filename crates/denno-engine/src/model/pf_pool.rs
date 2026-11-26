@@ -451,6 +451,89 @@ pub fn fits(l: &Layout, pool: usize) -> bool {
     l.total <= pool
 }
 
+/// `DENNO_PF_LM_NEED_LEGACY`: 層優先 prefill の作業域の見積りを**旧式**に戻す
+/// (task 915、既定 off = 修正版)。
+///
+/// 旧式は残差の退避域を `チャンク数 * チャンク長 * hc` で数えており、
+/// `hc * e` の `e` が抜けていた (実区画の 1/600)。そのため長文で追い出す
+/// expert が足りず、`pf_lm_ensure` / `pf_res_park_ensure` の確保が失敗して
+/// 常駐経路が黙って降下しうる。数値 (logits) は変わらないが、メモリが
+/// 厳しいときの**追い出し量**が変わるので切り戻せるようにしておく。
+pub const LM_NEED_LEGACY_ENV: &str = "DENNO_PF_LM_NEED_LEGACY";
+
+/// [`LM_NEED_LEGACY_ENV`] の解釈 (純関数)。**明示的な真値だけ on**。
+pub fn lm_need_legacy_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// 旧式の見積り (task 915 より前の式)。A/B と切り戻しのためだけに残す。
+///
+/// `group_local` は `DENNO_PF_LM_GROUP_LOCAL` (= `exp_pf::lm_group_local()`)
+/// で、旧式は g / u の行数を 1/4 にしていた。切り戻しを当時の式に一致させる
+/// ためだけの引数。
+pub fn lm_work_need_legacy(n: &Need, act_terms: usize, group_local: bool) -> usize {
+    let chunk = n.chunk.max(1);
+    let tile_rows = n.tile.saturating_mul(n.k);
+    let act_rows = if act_terms == 1 {
+        tile_rows
+    } else if group_local {
+        tile_rows.div_ceil(4).max(1)
+    } else {
+        tile_rows
+    };
+    let chunks = n.nt_all.div_ceil(chunk);
+    n.nt_all
+        .saturating_mul(n.e)
+        .saturating_mul(8)
+        .saturating_add(chunks.saturating_mul(chunk).saturating_mul(n.hc).saturating_mul(4))
+        .saturating_add(tile_rows.saturating_add(n.nt_all).saturating_mul(n.e).saturating_mul(4))
+        .saturating_add(act_terms.saturating_mul(act_rows).saturating_mul(n.ff).saturating_mul(4))
+        .saturating_add(64usize << 20)
+}
+
+/// 層優先 prefill の作業域の見積り (バイト、純関数)。
+///
+/// `forward_prefill_batch_resident_lm` が実際に確保する区画をそのまま足す:
+/// `pf_begin` (DevRes / DevXn / DevGate / DevLo / DevMixed / DevInj / DevBo /
+/// DevGamma)、`pf_res_park_ensure` (DevPark)、`pf_lm_ensure` (LmMixed / LmFfn /
+/// LmInj)、MoE の作業域 (H / Act、`act_terms` = 3 なら G / U も)。
+///
+/// # なぜ純関数にしてテストするか
+///
+/// この値は「作業域を確保する前に expert をどれだけ追い出しておくか」
+/// (`emergency_free_keys`) と `DENNO_PF_LM_RESERVE` の外部予約に使う。
+/// **実際より小さいと追い出しが足りず、`pf_lm_ensure` / `pf_res_park_ensure`
+/// の確保が失敗して常駐経路が黙って降下する**。16K-32K では DevPark
+/// (= チャンク数 × チャンク長 × `hc * e`) が 0.7-1.4 GB になるため、
+/// ここを `hc` のまま (× `e` 抜け) 見積もると 2-3 割の過小評価になる。
+///
+/// `H` だけは行数を `nt_all` で取る (従来の安全側。実際は
+/// `tile * k + shared の行`)。したがって戻り値は実区画の合計以上になる。
+pub fn lm_work_need(n: &Need, act_terms: usize) -> usize {
+    let chunk = n.chunk.max(1);
+    if n.nt_all == 0 || n.e == 0 || n.hc == 0 {
+        return 0;
+    }
+    let hc_dim = n.hc.saturating_mul(n.e);
+    let chunks = n.nt_all.div_ceil(chunk);
+    let tile_rows = n.tile.saturating_mul(n.k);
+    let b = |x: usize| x.saturating_mul(4);
+    b(n.nt_all.saturating_mul(n.e).saturating_mul(2)) // LmMixed + LmFfn
+        .saturating_add(b(chunks.saturating_mul(chunk).saturating_mul(hc_dim))) // DevPark
+        .saturating_add(b(chunk.saturating_mul(hc_dim).saturating_mul(3))) // DevRes + DevXn + DevGate
+        .saturating_add(b(chunk.saturating_mul(n.hc))) // DevInj
+        .saturating_add(b(hc_dim)) // DevGamma
+        .saturating_add(b(chunk.saturating_mul(n.lr.max(1)))) // DevLo
+        .saturating_add(b(chunk.saturating_mul(n.e).saturating_mul(2))) // DevMixed + DevBo
+        .saturating_add(b(chunks.saturating_mul(chunk).saturating_mul(n.hc))) // LmInj
+        .saturating_add(b(tile_rows.saturating_add(n.nt_all).saturating_mul(n.e))) // H
+        .saturating_add(b(act_terms.max(1).saturating_mul(tile_rows).saturating_mul(n.ff))) // Act (+G/U)
+        .saturating_add(64usize << 20) // 余白 (従来と同じ)
+}
+
 // ---------------------------------------------------------------------------
 // task 279: 長いプロンプトで「1 パスあたりのトークン数」とチャンクを上げる
 // ---------------------------------------------------------------------------
@@ -1234,6 +1317,123 @@ mod tests {
             k32_def.1
         );
         assert!(k32_def.2.total <= cap_def);
+    }
+
+    /// task 915: 層優先 prefill の作業域の見積りが実区画を覆う (16K-32K)。
+    ///
+    /// 見積りは「作業域を確保する前に expert をどれだけ追い出すか」に使う。
+    /// 実際より小さいと確保が失敗して常駐経路が黙って降下するので、
+    /// `layout()` の区画の合計を下回ってはいけない。
+    #[test]
+    fn lm_work_need_covers_the_regions_at_16k_and_32k() {
+        const MIB: usize = 1 << 20;
+        let covered = [
+            R::LmMixed,
+            R::LmFfn,
+            R::LmInj,
+            R::DevRes,
+            R::DevXn,
+            R::DevGate,
+            R::DevLo,
+            R::DevMixed,
+            R::DevInj,
+            R::DevBo,
+            R::DevGamma,
+            R::DevPark,
+            R::H,
+            R::Act,
+        ];
+        for nt in [14_018usize, 16_384, 32_768] {
+            for tile in [5_120usize, nt] {
+                let n = Need { nt_all: nt, tile, ..need_nt(nt) };
+                let l = layout(&n).expect("レイアウト");
+                let mut regions = 0usize;
+                for r in covered {
+                    regions += l.region(r).bytes;
+                }
+                // `need()` は tensor core 経路 (tc = true) なので act 1 枚。
+                let act_terms = if n.tc { 1 } else { 3 };
+                let need_b = lm_work_need(&n, act_terms);
+                assert!(
+                    need_b >= regions,
+                    "見積りが実区画より小さい: nt={nt} tile={tile} need={} regions={}",
+                    need_b >> 20,
+                    regions >> 20
+                );
+                // 過大評価もしない (H を nt_all 行で取るぶんだけ大きい)。
+                let h_slack = (nt - tile) * n.e * 4;
+                assert!(
+                    need_b <= regions + (64 * MIB) + h_slack,
+                    "見積りが過大: nt={nt} tile={tile} need={} regions={}",
+                    need_b >> 20,
+                    regions >> 20
+                );
+            }
+        }
+    }
+
+    /// task 915: 旧式との差は文脈長に比例する (切り戻しゲートの意味)。
+    #[test]
+    fn lm_need_legacy_gate_and_gap() {
+        assert!(!lm_need_legacy_from_value(None), "既定は修正版");
+        assert!(!lm_need_legacy_from_value(Some("")));
+        assert!(!lm_need_legacy_from_value(Some("0")));
+        assert!(!lm_need_legacy_from_value(Some("off")));
+        assert!(lm_need_legacy_from_value(Some("1")));
+        assert!(lm_need_legacy_from_value(Some(" on ")));
+        let n32 = Need {
+            nt_all: 32_768,
+            tile: 5_120,
+            ..need_nt(32_768)
+        };
+        let (new, old) = (lm_work_need(&n32, 1), lm_work_need_legacy(&n32, 1, false));
+        assert!(
+            new > old + (1 << 30),
+            "32K の差が 1 GiB 未満: new={} MiB old={} MiB",
+            new >> 20,
+            old >> 20
+        );
+        // 4k では差は小さい (退避域が 1/8)。
+        let n4 = Need {
+            nt_all: 4_000,
+            tile: 4_000,
+            ..need_nt(4_000)
+        };
+        let d4 = lm_work_need(&n4, 1) - lm_work_need_legacy(&n4, 1, false);
+        assert!(d4 < (512 << 20), "4k の差が大きすぎる: {} MiB", d4 >> 20);
+        // 形が 0 なら 0 (パニックしない)。
+        let z = Need {
+            nt_all: 0,
+            ..need_nt(0)
+        };
+        assert_eq!(lm_work_need(&z, 1), 0);
+    }
+
+    /// task 915: 残差の退避域 (`DevPark`) は `chunk × チャンク数 × hc × e`。
+    ///
+    /// 旧式は `e` が抜けていたので、16K で 0.7 GB / 32K で 1.4 GB を
+    /// 見落としていた (本番形状 hc=4 / e=2560)。
+    #[test]
+    fn lm_work_need_counts_the_park_with_hc_times_e() {
+        const MIB: usize = 1 << 20;
+        let park = |nt: usize| {
+            let n = Need { nt_all: nt, tile: 5_120, ..need_nt(nt) };
+            // 退避域だけを引く (同じ形で chunk を 1 減らすと区画が 1 枚減る)。
+            let with = layout(&n).expect("レイアウト").region(R::DevPark).bytes;
+            let chunks = nt.div_ceil(n.chunk);
+            let hc_dim = n.hc * n.e;
+            assert_eq!(with, chunks * n.chunk * hc_dim * 4, "nt={nt}");
+            with
+        };
+        let p16 = park(16_384);
+        let p32 = park(32_768);
+        assert_eq!(p16, 11 * 1_536 * 10_240 * 4, "16K の退避域");
+        assert_eq!(p16 >> 20, 660);
+        assert_eq!(p32, 22 * 1_536 * 10_240 * 4, "32K の退避域");
+        assert_eq!(p32 >> 20, 1_320);
+        // 旧式 (`chunk * hc`) は 4 桁小さい = 見積りに入っていなかった。
+        let old16 = 11 * 1_536 * 4 * 4;
+        assert!(old16 * 1000 < p16, "旧式は 3 桁以上小さい");
     }
 
     /// 3,826 の大きい形 (チャンク 1,913) も既定のプールに収まる。
