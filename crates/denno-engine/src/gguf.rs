@@ -33,6 +33,18 @@ fn err<T>(msg: impl Into<String>) -> Result<T, GgufError> {
     Err(GgufError(msg.into()))
 }
 
+/// 読み込み時の全テンソル範囲検査を有効にする env ゲート (task 912)。
+///
+/// 既定は off。`DENNO_GGUF_VALIDATE_LAYOUT=1` で `open` / `open_split` が
+/// テンソルのデータ範囲をファイル長と突き合わせ、外れていれば `Err` を返す。
+/// 値が `0` のときは off (`=0` で明示的に切り戻せる)。
+fn layout_validation_enabled() -> bool {
+    match std::env::var_os("DENNO_GGUF_VALIDATE_LAYOUT") {
+        None => false,
+        Some(v) => v != "0",
+    }
+}
+
 // GGUF メタデータ値型 (gguf.h enum gguf_type と同一)
 const GT_U8: u32 = 0;
 const GT_I8: u32 = 1;
@@ -164,7 +176,17 @@ impl GgufFile {
         let mut part = GgufPart::map(path.as_ref())?;
         let p = parse_fields(&part.mmap)?;
         part.data_start = p.data_start;
-        Ok(Self::from_parts(vec![part], p))
+        let f = Self::from_parts(vec![part], p);
+        // 2026-11-26 (task 912): 読み込み時に全テンソルの範囲を検査するのは
+        // env ゲート `DENNO_GGUF_VALIDATE_LAYOUT=1` のときだけ (既定 off)。
+        // 既定 on にしない理由: `denno tokenize` などのトークナイザ専用 GGUF は
+        // 「テンソルを宣言するがデータを置かない」形が既存の利用 (テスト fixture
+        // 含む) にあり、そこで開けなくなると後方互換が壊れる。境界検査そのものは
+        // `tensor_bytes` / `validate_layout` が常に行う (パニックはしない)。
+        if layout_validation_enabled() {
+            f.validate_layout()?;
+        }
+        Ok(f)
     }
 
     /// P-MOE-A1: split GGUF (`*-00001-of-00006.gguf` 形式) を 1 つのテンソル表として開く。
@@ -295,7 +317,7 @@ impl GgufFile {
         let mut parts: Vec<GgufPart> = vec![head.part];
         parts.extend(shards.into_iter().map(|s| s.part));
 
-        Ok(GgufFile {
+        let f = GgufFile {
             parts,
             version: head.parsed.version,
             alignment: head.parsed.alignment,
@@ -303,7 +325,16 @@ impl GgufFile {
             metadata,
             tensors,
             tensor_order,
-        })
+        };
+        // 2026-11-26 (task 912): 各パートのファイル長に対するテンソル範囲の検証。
+        // split では「offset はそのパートのデータ部先頭から」なので、パートごとに
+        // 自分の mmap 長で検査する (`tensor_abs_range` が `info.file` を見る)。
+        // 単一ファイルと同じく既定 off の env ゲート (メタデータだけのパートを
+        // 壊れたファイルと誤判定しないため)。
+        if layout_validation_enabled() {
+            f.validate_layout()?;
+        }
+        Ok(f)
     }
 
     fn from_parts(parts: Vec<GgufPart>, p: ParsedFields) -> Self {
@@ -358,14 +389,51 @@ impl GgufFile {
 
     /// P-MOE-A1: `(パート番号, そのパートの mmap 内オフセット, 長さ)`。
     pub fn tensor_mapping_parts(&self, name: &str) -> Option<(usize, usize, usize)> {
-        let t = self.tensor(name)?;
-        let part = self.parts.get(t.file)?;
-        let start = part.data_start + t.offset;
-        let end = start + t.nbytes;
+        let (file, start, end) = self.tensor_abs_range(name).ok()?;
+        Some((file, start as usize, (end - start) as usize))
+    }
+
+    /// テンソルのデータが属するパートと、そのパートの mmap 内の絶対範囲
+    /// `(ファイル番号, start, end)` を返す。
+    ///
+    /// 2026-11-26 (task 912): `data_start + offset` / `+ nbytes` は `u64` で
+    /// 桁溢れしうる。溢れたまま比較すると終端検査を通り抜けてスライスで
+    /// パニックするので、`checked_add` で溢れをエラーにし、`end` が
+    /// 必ず `mmap.len()` 以下であることをここで保証する。
+    fn tensor_abs_range(&self, name: &str) -> Result<(usize, u64, u64), GgufError> {
+        let t = self
+            .tensor(name)
+            .ok_or_else(|| GgufError(format!("テンソル {name} が無い")))?;
+        let part = self
+            .parts
+            .get(t.file)
+            .ok_or_else(|| GgufError(format!("{name}: パート {} が範囲外", t.file)))?;
+        let start = part
+            .data_start
+            .checked_add(t.offset)
+            .ok_or_else(|| GgufError(format!("{name}: 開始位置の加算が桁溢れ")))?;
+        let end = start
+            .checked_add(t.nbytes)
+            .ok_or_else(|| GgufError(format!("{name}: 終端の加算が桁溢れ")))?;
         if end > part.mmap.len() as u64 {
-            return None;
+            return err(format!(
+                "{name}: データがファイル終端を超過 ({end} > {})",
+                part.mmap.len()
+            ));
         }
-        Some((t.file, start as usize, t.nbytes as usize))
+        Ok((t.file, start, end))
+    }
+
+    /// 全テンソルのデータ範囲が各パートのファイル長に収まっているかを検証する。
+    ///
+    /// `DENNO_GGUF_VALIDATE_LAYOUT=1` のとき `open` / `open_split` が自動で呼ぶ
+    /// (既定 off。理由は `open` のコメント参照)。壊れた・途中で切れたファイルを
+    /// その場で `Err` にしたい呼び出し側は明示的に呼ぶ。
+    pub fn validate_layout(&self) -> Result<(), GgufError> {
+        for name in &self.tensor_order {
+            self.tensor_abs_range(name)?;
+        }
+        Ok(())
     }
 
     /// P58-5: 読み終わったファイルページを手放す (`MADV_DONTNEED`)。
@@ -405,21 +473,11 @@ impl GgufFile {
 
     /// テンソルの生バイト列を返す。split GGUF ではテンソルが属するパートから読む。
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], GgufError> {
-        let t = self
-            .tensor(name)
-            .ok_or_else(|| GgufError(format!("テンソル {name} が無い")))?;
+        let (file, start, end) = self.tensor_abs_range(name)?;
         let part = self
             .parts
-            .get(t.file)
-            .ok_or_else(|| GgufError(format!("{name}: パート {} が範囲外", t.file)))?;
-        let start = part.data_start + t.offset;
-        let end = start + t.nbytes;
-        if end as usize > part.mmap.len() {
-            return err(format!(
-                "{name}: データがファイル終端を超過 ({end} > {})",
-                part.mmap.len()
-            ));
-        }
+            .get(file)
+            .ok_or_else(|| GgufError(format!("{name}: パート {file} が範囲外")))?;
         Ok(&part.mmap[start as usize..end as usize])
     }
 
@@ -429,9 +487,17 @@ impl GgufFile {
             .tensor(name)
             .ok_or_else(|| GgufError(format!("テンソル {name} が無い")))?;
         let bytes = self.tensor_bytes(name)?;
-        let n = t.dims.iter().product::<u64>() as usize;
+        // 2026-11-26 (task 912): 積の桁溢れを `as usize` で黙って切らない。
+        let mut ne: u64 = 1;
+        for d in t.dims.iter() {
+            ne = ne
+                .checked_mul(*d)
+                .ok_or_else(|| GgufError(format!("{name}: 次元の積が u64 を超える")))?;
+        }
+        let n = usize::try_from(ne)
+            .map_err(|_| GgufError(format!("{name}: 要素数 {ne} が usize を超える")))?;
         let bs = t.ty.blck_size();
-        if bs > 1 && n % bs != 0 {
+        if n % bs != 0 {
             return err(format!("{name}: 要素数 {n} がブロックサイズ {bs} の倍数でない"));
         }
         Ok(crate::kquant::dequant_row(t.ty, bytes, n))
@@ -787,8 +853,15 @@ impl GgufHeader {
         let t = self
             .tensor(name)
             .ok_or_else(|| GgufError(format!("テンソル {name} が無い")))?;
-        let start = self.data_start + t.offset;
-        Ok((start, start + t.nbytes))
+        // 2026-11-26 (task 912): 桁溢れはエラー (wrap した範囲を返さない)。
+        let start = self
+            .data_start
+            .checked_add(t.offset)
+            .ok_or_else(|| GgufError(format!("{name}: 開始位置の加算が桁溢れ")))?;
+        let end = start
+            .checked_add(t.nbytes)
+            .ok_or_else(|| GgufError(format!("{name}: 終端の加算が桁溢れ")))?;
+        Ok((start, end))
     }
 }
 
@@ -811,11 +884,29 @@ fn parse_fields(b: &[u8]) -> Result<ParsedFields, GgufError> {
         return err(format!("bad magic {magic:#x} (not GGUF)"));
     }
     let version = rd_u32(b, &mut p)?;
-    if version < 2 {
+    if version < 2 || version > 3 {
         return err(format!("GGUF v{version} は未対応 (v2/v3 のみ)"));
     }
     let tensor_count = rd_u64(b, &mut p)?;
     let kv_count = rd_u64(b, &mut p)?;
+
+    // 2026-11-26 (task 912): 宣言された件数は `u64` なので、そのまま
+    // `Vec::with_capacity` に渡すと容量計算でパニック/abort する。各エントリは
+    // 最低でも 24 B (tensor) / 12 B (kv) を消費するので、バッファ長で上限を切る。
+    // メッセージは "EOF" で始める (呼び出し側の「バッファを伸ばして再試行」を
+    // 壊さないため)。
+    if kv_count.saturating_mul(12) > b.len() as u64 {
+        return err(format!(
+            "EOF (kv_count={kv_count} がバッファ {} B に収まらない)",
+            b.len()
+        ));
+    }
+    if tensor_count.saturating_mul(24) > b.len() as u64 {
+        return err(format!(
+            "EOF (tensor_count={tensor_count} がバッファ {} B に収まらない)",
+            b.len()
+        ));
+    }
 
     let mut metadata = HashMap::new();
     for _ in 0..kv_count {
@@ -828,6 +919,11 @@ fn parse_fields(b: &[u8]) -> Result<ParsedFields, GgufError> {
     let mut tensors = HashMap::new();
     for _ in 0..tensor_count {
         let name = rd_string(b, &mut p)?;
+        if tensors.contains_key(&name) {
+            // 2026-11-26 (task 912): 単一ファイル内のテンソル名重複は破損
+            // (split 経路のパート間重複検査と同じ規則)。
+            return err(format!("テンソル名が重複: {name}"));
+        }
         let n_dims = rd_u32(b, &mut p)? as usize;
         if n_dims > 4 {
             return err(format!("{name}: n_dims={n_dims} > 4"));
@@ -841,10 +937,22 @@ fn parse_fields(b: &[u8]) -> Result<ParsedFields, GgufError> {
             .ok_or_else(|| GgufError(format!("{name}: 未対応の型 id={ty_id}")))?;
         let offset = rd_u64(b, &mut p)?;
 
-        let ne: u64 = dims.iter().take(n_dims).product::<u64>().max(1);
+        // 2026-11-26 (task 912): 次元の積と nbytes はどちらも桁溢れしうる
+        // (release では黙って wrap して nbytes が小さくなり、後段の範囲検査を
+        // すり抜ける)。溢れは破損としてエラーにする。
+        let mut ne: u64 = 1;
+        for d in dims.iter().take(n_dims) {
+            ne = ne
+                .checked_mul(*d)
+                .ok_or_else(|| GgufError(format!("{name}: 次元の積が u64 を超える")))?;
+        }
+        let ne = ne.max(1);
         let blck = ty.blck_size() as u64;
-        let nbytes = ne / blck * ty.type_size() as u64
-            + if ne % blck != 0 { ty.type_size() as u64 } else { 0 };
+        let tsz = ty.type_size() as u64;
+        let nbytes = (ne / blck)
+            .checked_mul(tsz)
+            .and_then(|v| v.checked_add(if ne % blck != 0 { tsz } else { 0 }))
+            .ok_or_else(|| GgufError(format!("{name}: バイト数が u64 を超える")))?;
         tensor_order.push(name.clone());
         tensors.insert(
             name.clone(),
@@ -856,18 +964,30 @@ fn parse_fields(b: &[u8]) -> Result<ParsedFields, GgufError> {
         .get("general.alignment")
         .and_then(|v| v.as_u64())
         .unwrap_or(32);
-    if !alignment.is_power_of_two() {
+    if alignment == 0 || !alignment.is_power_of_two() {
         return err(format!("general.alignment={alignment} (2の冪が必要)"));
     }
-    // データ部は alignment に整列
-    let data_start = (p + (alignment as usize - 1)) & !(alignment as usize - 1);
+    // 2026-11-26 (task 912): 上限を設ける。巨大な alignment は data_start を
+    // ファイル終端の彼方へ飛ばし、以降の範囲検査を無意味にする。
+    if alignment > (1 << 24) {
+        return err(format!("general.alignment={alignment} が大きすぎる (上限 16777216)"));
+    }
+    // データ部は alignment に整列 (u64 で計算。上限 2^24 なので溢れない)
+    let data_start = ((p as u64) + alignment - 1) & !(alignment - 1);
     // 2026-11-16: unsloth 11-13 版の分割 GGUF は先頭がメタデータだけ (tensor 0 個) で、
     // 末尾の alignment 詰めが無い。tensor が無ければデータ部は読まないので許す。
-    if data_start > b.len() && !tensors.is_empty() {
+    if data_start > b.len() as u64 && !tensors.is_empty() {
         return err("データ部がファイル終端を超えている");
     }
 
-    Ok(ParsedFields { version, alignment, data_start: data_start as u64, metadata, tensors, tensor_order })
+    Ok(ParsedFields {
+        version,
+        alignment,
+        data_start,
+        metadata,
+        tensors,
+        tensor_order,
+    })
 }
 
 #[inline]
@@ -891,13 +1011,24 @@ fn rd_u64(b: &[u8], p: &mut usize) -> Result<u64, GgufError> {
     Ok(u64::from_le_bytes(a))
 }
 
+/// 文字列 (`u64` 長 + UTF-8 バイト列) を読む。
+///
+/// 2026-11-26 (task 912): 長さが `u64` 由来なので `*p + len` が `usize` で
+/// 桁溢れしうる。溢れたまま比較すると範囲チェックを通り抜けてスライスで
+/// パニックするため、`checked_add` で溢れを EOF エラーに落とす。
+/// エラー文字列は先頭が "EOF" であること — 呼び出し側 (`GgufHeader::parse` の
+/// 再試行ループ) はそれを「バッファ不足」の合図に使う。
 fn rd_string(b: &[u8], p: &mut usize) -> Result<String, GgufError> {
-    let len = rd_u64(b, p)? as usize;
-    if *p + len > b.len() {
+    let len_u64 = rd_u64(b, p)?;
+    let len = usize::try_from(len_u64).map_err(|_| GgufError("EOF (string) 長すぎる".into()))?;
+    let end = (*p)
+        .checked_add(len)
+        .ok_or_else(|| GgufError("EOF (string) 長さの加算が桁溢れ".into()))?;
+    if end > b.len() {
         return err("EOF (string)");
     }
-    let s = String::from_utf8_lossy(&b[*p..*p + len]).into_owned();
-    *p += len;
+    let s = String::from_utf8_lossy(&b[*p..end]).into_owned();
+    *p = end;
     Ok(s)
 }
 
@@ -916,7 +1047,10 @@ fn rd_value(b: &[u8], p: &mut usize) -> Result<GgufValue, GgufError> {
         GT_ARRAY => {
             let elem_ty = rd_u32(b, p)?;
             let count = rd_u64(b, p)? as usize;
-            let mut v = Vec::with_capacity(count.min(1 << 20));
+            // 2026-11-26 (task 912): 宣言数は信頼しない。要素は最低 1 B を消費する
+            // ので、バッファ長でも上限を切る (4 B の入力から数十 MB を確保しない)。
+            let cap = count.min(1 << 20).min(b.len());
+            let mut v = Vec::with_capacity(cap);
             for _ in 0..count {
                 v.push(rd_value_of(b, p, elem_ty)?);
             }
@@ -2975,5 +3109,811 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =====================================================================
+    // task 912: 壊れた / 途中で切れた GGUF の境界検査
+    //
+    // 目的は「変な入力でパニックしない・必ず `Err` を返す」ことの証拠。
+    // 実モデルは使わず、ヘッダをバイト列で組み立てて渡す。
+    // =====================================================================
+
+    const T912_DEFAULT_ALIGN: usize = 32;
+
+    fn t912_u32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    fn t912_u64(v: &mut Vec<u8>, x: u64) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    fn t912_str(v: &mut Vec<u8>, s: &str) {
+        t912_u64(v, s.len() as u64);
+        v.extend_from_slice(s.as_bytes());
+    }
+
+    fn t912_pad(v: &mut Vec<u8>, align: usize) {
+        while v.len() % align != 0 {
+            v.push(0);
+        }
+    }
+
+    /// テスト用メタデータ値 (GGUF の型 id をそのまま書く)。
+    #[derive(Clone, Copy)]
+    enum T912Val<'a> {
+        Str(&'a str),
+        U32(u32),
+        U64(u64),
+    }
+
+    impl T912Val<'_> {
+        fn write(&self, v: &mut Vec<u8>) {
+            match *self {
+                T912Val::Str(s) => {
+                    t912_u32(v, 8); // GT_STRING
+                    t912_str(v, s);
+                }
+                T912Val::U32(x) => {
+                    t912_u32(v, 4); // GT_U32
+                    t912_u32(v, x);
+                }
+                T912Val::U64(x) => {
+                    t912_u32(v, 10); // GT_U64
+                    t912_u64(v, x);
+                }
+            }
+        }
+    }
+
+    struct T912Tensor<'a> {
+        name: &'a str,
+        dims: &'a [u64],
+        ty: u32,
+        offset: u64,
+    }
+
+    /// 合成 GGUF をバイト列で返す。`data_len` バイトのデータ部を後ろに付ける。
+    fn t912_gguf(
+        version: u32,
+        alignment: Option<u32>,
+        kvs: &[(&str, T912Val)],
+        tensors: &[T912Tensor],
+        data_len: usize,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        t912_u32(&mut b, version);
+        t912_u64(&mut b, tensors.len() as u64);
+        let kv_extra = usize::from(alignment.is_some());
+        t912_u64(&mut b, (kvs.len() + kv_extra) as u64);
+        for (k, v) in kvs {
+            t912_str(&mut b, k);
+            v.write(&mut b);
+        }
+        if let Some(a) = alignment {
+            t912_str(&mut b, "general.alignment");
+            T912Val::U32(a).write(&mut b);
+        }
+        for t in tensors {
+            t912_str(&mut b, t.name);
+            t912_u32(&mut b, t.dims.len() as u32);
+            for d in t.dims {
+                t912_u64(&mut b, *d);
+            }
+            t912_u32(&mut b, t.ty);
+            t912_u64(&mut b, t.offset);
+        }
+        let align = match alignment {
+            Some(a) if a.is_power_of_two() && a as usize <= 4096 => a as usize,
+            _ => T912_DEFAULT_ALIGN,
+        };
+        t912_pad(&mut b, align);
+        let n = b.len();
+        b.resize(n + data_len, 0);
+        b
+    }
+
+    /// Q4_0 (32 要素 / 18 B) の `n` 行 × `k` 要素のバイト数。
+    fn t912_q4_bytes(k: u64, n: u64) -> u64 {
+        (k / 32) * 18 * n
+    }
+
+    /// テスト専用の一時ディレクトリ (drop で消す)。
+    struct T912Dir(std::path::PathBuf);
+
+    impl T912Dir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("denno_t912_{tag}_{}_{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("temp dir");
+            T912Dir(p)
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, bytes).expect("write gguf");
+            p
+        }
+    }
+
+    impl Drop for T912Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// テスト中だけ env を立てるガード (drop で元に戻す)。
+    ///
+    /// ゲート (`DENNO_GGUF_VALIDATE_LAYOUT`) は `open` のたびに読むので、
+    /// テストのスコープ外へ漏らさないようここで確実に戻す。
+    struct EnvVar {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    /// env ゲートを触るテスト同士を直列化する (env はプロセス全体で共有)。
+    fn t912_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            EnvVar { key, prev }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// 正常な合成 GGUF (2 テンソル) が実際に通ることの基準線。
+    /// 以降の異常系テストはこの形を 1 バイトずつ壊して作る。
+    #[test]
+    fn t912_baseline_synth_gguf_parses_and_reads_bytes() {
+        let dir = T912Dir::new("baseline");
+        let dims = [128u64, 3];
+        let nb = t912_q4_bytes(128, 3);
+        let buf = t912_gguf(
+            3,
+            None,
+            &[("general.architecture", T912Val::Str("qwen3_5"))],
+            &[T912Tensor { name: "blk.0.attn_q.weight", dims: &dims, ty: 2, offset: 0 }],
+            nb as usize,
+        );
+        let path = dir.write("t.gguf", &buf);
+        let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+        assert_eq!(f.version, 3);
+        assert_eq!(f.alignment, 32);
+        assert_eq!(f.part_count(), 1);
+        assert_eq!(f.get("general.architecture").and_then(|v| v.as_str()), Some("qwen3_5"));
+        let t = f.tensor("blk.0.attn_q.weight").expect("tensor");
+        assert_eq!(t.nbytes, nb);
+        assert_eq!(f.tensor_bytes("blk.0.attn_q.weight").expect("bytes").len(), nb as usize);
+        assert_eq!(f.tensor_mapping_parts("blk.0.attn_q.weight"), Some((0, f.data_start as usize, nb as usize)));
+        assert!(f.tensor_mapping("blk.0.attn_q.weight").is_some());
+        f.validate_layout().expect("validate_layout");
+    }
+
+    /// ヘッダの全プレフィックス長でパースする。途中で切れた入力はすべて `Err`、
+    /// パニックはしない (以前は `rd_string` の `usize` 桁溢れでスライス panic が
+    /// ありえた)。
+    #[test]
+    fn t912_truncated_prefixes_are_clean_errors() {
+        let dims = [64u64, 2];
+        let buf = t912_gguf(
+            3,
+            None,
+            &[
+                ("general.architecture", T912Val::Str("qwen4exp")),
+                ("qwen4exp.block_count", T912Val::U32(1)),
+            ],
+            &[
+                T912Tensor { name: "a.weight", dims: &dims, ty: 2, offset: 0 },
+                T912Tensor { name: "b.weight", dims: &dims, ty: 2, offset: 72 },
+            ],
+            (t912_q4_bytes(64, 2) * 2) as usize,
+        );
+        let full = parse_fields(&buf).expect("完全なヘッダは通る");
+        assert_eq!(full.tensor_order.len(), 2);
+
+        // ヘッダ末尾 (データ部の手前) までの全長で切る
+        let header_len = full.data_start as usize;
+        let mut ok = 0;
+        let mut eof = 0;
+        for len in 0..header_len {
+            match parse_fields(&buf[..len]) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    assert!(!e.0.is_empty(), "len={len}: 空のエラー文字列");
+                    if e.0.starts_with("EOF") {
+                        eof += 1;
+                    }
+                }
+            }
+            // データ部だけを切る (ヘッダ長以上) のも混ぜる
+            if len % 7 == 0 {
+                let cut = header_len + len.min(buf.len() - header_len);
+                match parse_fields(&buf[..cut]) {
+                    Ok(_) | Err(_) => {}
+                }
+            }
+        }
+        assert!(eof > 0, "EOF エラーが 1 件も出ていない (切り詰め検出が効いていない)");
+        assert!(ok < header_len, "全ての切り詰めが通ってしまった (検査が効いていない)");
+    }
+
+    /// `kv_count` / `tensor_count` に `u64::MAX` 級の値を書かれても、
+    /// 事前確保で abort せず `Err` を返す。
+    #[test]
+    fn t912_huge_counts_rejected_without_allocation() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        t912_u32(&mut b, 3);
+        t912_u64(&mut b, u64::MAX); // tensor_count
+        t912_u64(&mut b, u64::MAX); // kv_count
+        let e = parse_fields(&b).err().expect("u64::MAX 件数が通った");
+        assert!(e.0.starts_with("EOF"), "予期しないエラー: {}", e.0);
+
+        // tensor_count だけ巨大
+        let mut b2 = Vec::new();
+        b2.extend_from_slice(b"GGUF");
+        t912_u32(&mut b2, 3);
+        t912_u64(&mut b2, u64::MAX / 2);
+        t912_u64(&mut b2, 0);
+        let e2 = parse_fields(&b2).err().expect("巨大 tensor_count が通った");
+        assert!(e2.0.starts_with("EOF"), "予期しないエラー: {}", e2.0);
+    }
+
+    /// 文字列長 `u64::MAX` は `*p + len` の桁溢れを起こしていた。
+    #[test]
+    fn t912_string_length_overflow_is_eof_error() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        t912_u32(&mut b, 3);
+        t912_u64(&mut b, 0); // tensor_count
+        t912_u64(&mut b, 1); // kv_count
+        t912_u64(&mut b, u64::MAX); // key の長さ (桁溢れ)
+        let e = parse_fields(&b).err().expect("長さ u64::MAX の文字列が通った");
+        assert!(e.0.starts_with("EOF"), "予期しないエラー: {}", e.0);
+
+        // usize::MAX ちょうどでも通らない
+        let mut b2 = b.clone();
+        b2.truncate(b2.len() - 8);
+        t912_u64(&mut b2, usize::MAX as u64);
+        let e2 = parse_fields(&b2).err().expect("長さ usize::MAX の文字列が通った");
+        assert!(e2.0.starts_with("EOF"), "予期しないエラー: {}", e2.0);
+    }
+
+    /// 次元の積 (`u64`) の桁溢れはエラー。wrap した `nbytes` を返さない。
+    #[test]
+    fn t912_dimension_product_overflow_rejected() {
+        let dims = [u64::MAX, 4, 2, 2];
+        let buf = t912_gguf(
+            3,
+            None,
+            &[],
+            &[T912Tensor { name: "huge.weight", dims: &dims, ty: 2, offset: 0 }],
+            0,
+        );
+        let e = parse_fields(&buf).err().expect("次元の積の桁溢れが通った");
+        assert!(e.0.contains("次元の積"), "予期しないエラー: {}", e.0);
+
+        // nbytes だけが溢れる組み合わせ (要素数の積は u64 に収まる)
+        // F32 (blck 1・4 B) で ne = 2^63 → nbytes = 2^65 が溢れる
+        let dims2 = [1u64 << 63];
+        let buf2 = t912_gguf(
+            3,
+            None,
+            &[],
+            &[T912Tensor { name: "huge2.weight", dims: &dims2, ty: 0, offset: 0 }],
+            0,
+        );
+        let e2 = parse_fields(&buf2).err().expect("nbytes の桁溢れが通った");
+        assert!(e2.0.contains("バイト数"), "予期しないエラー: {}", e2.0);
+    }
+
+    /// `general.alignment` は 2 の冪・0 でない・上限以下。
+    #[test]
+    fn t912_alignment_validation() {
+        let dims = [32u64, 1];
+        let nb = t912_q4_bytes(32, 1) as usize;
+        for bad in [0u32, 3, 24, 1 << 25] {
+            let buf = t912_gguf(
+                3,
+                Some(bad),
+                &[],
+                &[T912Tensor { name: "t.weight", dims: &dims, ty: 2, offset: 0 }],
+                nb,
+            );
+            let e = parse_fields(&buf).err().expect(&format!("alignment={bad} が通った"));
+            assert!(e.0.contains("alignment"), "alignment={bad} のエラー: {}", e.0);
+        }
+        // 正常値は通る (バッファ側もその alignment で詰めてある)
+        for ok in [1u32, 32, 64] {
+            let buf = t912_gguf(
+                3,
+                Some(ok),
+                &[],
+                &[T912Tensor { name: "t.weight", dims: &dims, ty: 2, offset: 0 }],
+                nb,
+            );
+            let pf = parse_fields(&buf).expect("正しい alignment が落ちた");
+            assert_eq!(pf.alignment, ok as u64);
+            assert_eq!(pf.data_start % ok as u64, 0, "data_start が alignment に整列していない");
+        }
+    }
+
+    /// 単一ファイル内のテンソル名重複は破損 (split のパート間重複と同じ規則)。
+    #[test]
+    fn t912_duplicate_tensor_names_rejected() {
+        let dims = [32u64, 1];
+        let nb = t912_q4_bytes(32, 1) as usize;
+        let buf = t912_gguf(
+            3,
+            None,
+            &[],
+            &[
+                T912Tensor { name: "dup.weight", dims: &dims, ty: 2, offset: 0 },
+                T912Tensor { name: "dup.weight", dims: &dims, ty: 2, offset: 32 },
+            ],
+            2 * nb,
+        );
+        let e = parse_fields(&buf).err().expect("テンソル名重複が通った");
+        assert!(e.0.contains("重複"), "予期しないエラー: {}", e.0);
+    }
+
+    /// version と magic、未対応の型 id、未対応のメタデータ型。
+    #[test]
+    fn t912_version_magic_and_type_ids() {
+        let dims = [32u64, 1];
+        let nb = t912_q4_bytes(32, 1) as usize;
+        for v in [0u32, 1, 4, u32::MAX] {
+            let buf = t912_gguf(
+                v,
+                None,
+                &[],
+                &[T912Tensor { name: "t.weight", dims: &dims, ty: 2, offset: 0 }],
+                nb,
+            );
+            let e = parse_fields(&buf).err().expect(&format!("v{v} が通った"));
+            assert!(e.0.contains("未対応"), "v{v} のエラー: {}", e.0);
+        }
+        // v2 は通る
+        for v in [2u32, 3] {
+            let buf = t912_gguf(
+                v,
+                None,
+                &[],
+                &[T912Tensor { name: "t.weight", dims: &dims, ty: 2, offset: 0 }],
+                nb,
+            );
+            parse_fields(&buf).expect("v2/v3 が落ちた");
+        }
+
+        let mut bad_magic = t912_gguf(
+            3,
+            None,
+            &[],
+            &[T912Tensor { name: "t.weight", dims: &dims, ty: 2, offset: 0 }],
+            nb,
+        );
+        bad_magic[0] = b'X';
+        let e = parse_fields(&bad_magic).err().expect("bad magic が通った");
+        assert!(e.0.contains("bad magic"), "予期しないエラー: {}", e.0);
+
+        // 型 id 999
+        let buf = t912_gguf(
+            3,
+            None,
+            &[],
+            &[T912Tensor { name: "t.weight", dims: &dims, ty: 999, offset: 0 }],
+            nb,
+        );
+        let e = parse_fields(&buf).err().expect("未知の型 id が通った");
+        assert!(e.0.contains("型 id"), "予期しないエラー: {}", e.0);
+
+        // n_dims = 5
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        t912_u32(&mut b, 3);
+        t912_u64(&mut b, 1);
+        t912_u64(&mut b, 0);
+        t912_str(&mut b, "t.weight");
+        t912_u32(&mut b, 5);
+        for _ in 0..5 {
+            t912_u64(&mut b, 2);
+        }
+        t912_u32(&mut b, 2);
+        t912_u64(&mut b, 0);
+        let e = parse_fields(&b).err().expect("n_dims=5 が通った");
+        assert!(e.0.contains("n_dims"), "予期しないエラー: {}", e.0);
+
+        // 未知のメタデータ型 (id 99)
+        let mut b2 = Vec::new();
+        b2.extend_from_slice(b"GGUF");
+        t912_u32(&mut b2, 3);
+        t912_u64(&mut b2, 0);
+        t912_u64(&mut b2, 1);
+        t912_str(&mut b2, "k");
+        t912_u32(&mut b2, 99);
+        let e = parse_fields(&b2).err().expect("未知のメタデータ型が通った");
+        assert!(e.0.contains("メタデータ型"), "予期しないエラー: {}", e.0);
+    }
+
+    /// 決定的な擬似乱数でヘッダを 1 バイトずつ壊す。`Ok` でも `Err` でもよいが、
+    /// パニックしてはいけない (両方の結果が出ることも確かめる)。
+    #[test]
+    fn t912_byte_mutation_fuzz_never_panics() {
+        let dims = [64u64, 2];
+        let base = t912_gguf(
+            3,
+            Some(32),
+            &[
+                ("general.architecture", T912Val::Str("qwen4exp")),
+                ("qwen4exp.block_count", T912Val::U32(2)),
+                ("qwen4exp.x", T912Val::U64(u64::MAX)),
+            ],
+            &[
+                T912Tensor { name: "blk.0.a.weight", dims: &dims, ty: 2, offset: 0 },
+                T912Tensor { name: "blk.1.b.weight", dims: &dims, ty: 8, offset: 144 },
+            ],
+            (t912_q4_bytes(64, 2) * 2) as usize,
+        );
+        parse_fields(&base).expect("基準の合成 GGUF が通らない");
+
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut ok = 0usize;
+        let mut err = 0usize;
+        const ITERS: usize = 4000;
+        for _ in 0..ITERS {
+            let mut b = base.clone();
+            let mutations = 1 + (next() % 4) as usize;
+            for _ in 0..mutations {
+                let i = (next() as usize) % b.len();
+                // 8 割は 1 バイト書き換え、2 割は u64 幅の極端値
+                if next() % 10 < 8 {
+                    b[i] = (next() & 0xff) as u8;
+                } else {
+                    let i = i.min(b.len().saturating_sub(8));
+                    let v = if next() % 2 == 0 { u64::MAX } else { 1u64 << 62 };
+                    let n = 8.min(b.len() - i);
+                    b[i..i + n].copy_from_slice(&v.to_le_bytes()[..n]);
+                }
+            }
+            // 3 割はランダム長に切り詰める
+            if next() % 10 < 3 {
+                let n = (next() as usize) % b.len();
+                b.truncate(n);
+            }
+            match parse_fields(&b) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    assert!(!e.0.is_empty(), "空のエラー文字列");
+                    err += 1;
+                }
+            }
+        }
+        println!("[t912] mutation fuzz: {ITERS} 回で Ok {ok} / Err {err}");
+        assert!(err > 0, "壊した入力が 1 件もエラーにならなかった");
+        assert!(ok > 0, "健全な入力が 1 件も通らなかった (fuzz が効いていない)");
+    }
+
+    /// 途中で切れた実ファイルは `validate_layout` で `Err` (遅延エラーにしない)。
+    /// env ゲート `DENNO_GGUF_VALIDATE_LAYOUT` の挙動もここで確かめる。
+    #[test]
+    fn t912_open_truncated_data_is_error() {
+        let _lock = t912_env_lock();
+        assert!(!layout_validation_enabled(), "既定が off でない");
+        let dir = T912Dir::new("trunc");
+        let dims = [64u64, 4];
+        let nb = t912_q4_bytes(64, 4) as usize;
+        let buf = t912_gguf(
+            3,
+            None,
+            &[],
+            &[T912Tensor { name: "t.weight", dims: &dims, ty: 2, offset: 0 }],
+            nb,
+        );
+        // データ部を 10 B 削る
+        let path = dir.write("trunc.gguf", &buf[..buf.len() - 10]);
+        // 既定 (ゲート off) では open は通り、validate_layout が Err
+        let f = GgufFile::open(&path).expect("ゲート off の open が落ちた");
+        let e = f.validate_layout().err().expect("データ欠けが validate_layout を通過した");
+        assert!(e.0.contains("ファイル終端"), "予期しないエラー: {}", e.0);
+        let e2 = f.tensor_bytes("t.weight").err().expect("tensor_bytes が欠けを通した");
+        assert!(e2.0.contains("ファイル終端"), "予期しないエラー: {}", e2.0);
+        assert!(f.tensor_mapping_parts("t.weight").is_none());
+
+        // ゲート on なら open 自体が Err
+        let _g = EnvVar::set("DENNO_GGUF_VALIDATE_LAYOUT", "1");
+        let e3 = GgufFile::open(&path).err().expect("ゲート on で open が通った");
+        assert!(e3.0.contains("ファイル終端"), "予期しないエラー: {}", e3.0);
+        // 完全なファイルはゲート on でも開ける (基準線)
+        let ok = dir.write("ok.gguf", &buf);
+        GgufFile::open(&ok).expect("完全なファイルが開けない");
+    }
+
+    /// env ゲートの on/off (値 `0` は明示的な切り戻し)。
+    #[test]
+    fn t912_validate_layout_env_gate() {
+        let _lock = t912_env_lock();
+        assert!(!layout_validation_enabled(), "既定が off でない");
+        {
+            let _g = EnvVar::set("DENNO_GGUF_VALIDATE_LAYOUT", "1");
+            assert!(layout_validation_enabled());
+        }
+        {
+            let _g = EnvVar::set("DENNO_GGUF_VALIDATE_LAYOUT", "0");
+            assert!(!layout_validation_enabled(), "=0 が off になっていない");
+        }
+        assert!(!layout_validation_enabled());
+    }
+
+    /// テンソルの offset が巨大な値だと `data_start + offset` が桁溢れする。
+    /// `open` と `tensor_bytes` の両方がパニックせず `Err` を返す。
+    #[test]
+    fn t912_tensor_offset_overflow_is_error() {
+        let dir = T912Dir::new("off");
+        let dims = [64u64, 1];
+        let nb = t912_q4_bytes(64, 1) as usize;
+        for off in [u64::MAX, u64::MAX - 4, 1u64 << 63] {
+            let buf = t912_gguf(
+                3,
+                None,
+                &[],
+                &[T912Tensor { name: "t.weight", dims: &dims, ty: 2, offset: off }],
+                nb,
+            );
+            // ヘッダだけのパースは通る (ファイル長を知らないため)
+            let hdr = GgufHeader::parse(&buf).expect("ヘッダだけのパースが落ちた");
+            // `u64::MAX` 級はヘッダ側の `tensor_range` でも桁溢れになる。
+            // `1<<63` は加算自体は溢れないのでファイル長でしか弾けない。
+            if off >= u64::MAX - 4 {
+                let e = hdr
+                    .tensor_range("t.weight")
+                    .err()
+                    .expect("tensor_range の桁溢れが通った");
+                assert!(e.0.contains("桁溢れ"), "offset={off} のエラー: {}", e.0);
+            } else {
+                let r = hdr.tensor_range("t.weight").expect("1<<63 の範囲計算が落ちた");
+                assert!(r.1 > r.0);
+            }
+
+            let path = dir.write("off.gguf", &buf);
+            // 既定 (ゲート off) の open は通るが、範囲検査は必ず Err
+            let f = GgufFile::open(&path).expect("ゲート off の open が落ちた");
+            let e2 = f
+                .validate_layout()
+                .err()
+                .expect("offset 巨大の GGUF が validate_layout を通過した");
+            assert!(
+                e2.0.contains("桁溢れ") || e2.0.contains("ファイル終端"),
+                "offset={off} の validate_layout エラー: {}",
+                e2.0
+            );
+            let e3 = f
+                .tensor_bytes("t.weight")
+                .err()
+                .expect("tensor_bytes が巨大 offset を通した");
+            assert!(
+                e3.0.contains("桁溢れ") || e3.0.contains("ファイル終端"),
+                "offset={off} の tensor_bytes エラー: {}",
+                e3.0
+            );
+        }
+    }
+
+    // ---- split GGUF の境界検査 ----
+
+    /// 1 パートぶんの合成 split シェード。
+    fn t912_shard(
+        no: u64,
+        count: u64,
+        total: Option<u64>,
+        kvs: &[(&str, T912Val)],
+        tensors: &[T912Tensor],
+        data_len: usize,
+    ) -> Vec<u8> {
+        let mut all: Vec<(&str, T912Val)> = Vec::new();
+        all.push(("split.no", T912Val::U64(no)));
+        all.push(("split.count", T912Val::U64(count)));
+        if let Some(t) = total {
+            all.push(("split.tensors.count", T912Val::U64(t)));
+        }
+        all.extend_from_slice(kvs);
+        t912_gguf(3, None, &all, tensors, data_len)
+    }
+
+    /// 正常な 3 分割 (2 + 1 テンソル) が 1 つの表にまとまり、`tensor_bytes` が
+    /// 各パートから正しいバイト列を返す。
+    #[test]
+    fn t912_split_baseline_ok() {
+        let dir = T912Dir::new("split_ok");
+        let dims = [64u64, 1];
+        let nb = t912_q4_bytes(64, 1) as usize;
+        // パート 0: 2 テンソル (offset 0, 32)、パート 1: 1 テンソル
+        let mut s0 = t912_shard(
+            0,
+            2,
+            Some(3),
+            &[("general.architecture", T912Val::Str("qwen4exp"))],
+            &[
+                T912Tensor { name: "a.weight", dims: &dims, ty: 2, offset: 0 },
+                T912Tensor { name: "b.weight", dims: &dims, ty: 2, offset: 32 },
+            ],
+            2 * nb,
+        );
+        let mut s1 = t912_shard(
+            1,
+            2,
+            Some(3),
+            &[],
+            &[T912Tensor { name: "c.weight", dims: &dims, ty: 2, offset: 0 }],
+            nb,
+        );
+        // 各パートのデータ部を識別できるよう、データ中身を no で埋める
+        let d0 = parse_fields(&s0).expect("shard0 header").data_start as usize;
+        let d1 = parse_fields(&s1).expect("shard1 header").data_start as usize;
+        for b in &mut s0[d0..] {
+            *b = 0x11;
+        }
+        for b in &mut s1[d1..] {
+            *b = 0x22;
+        }
+        let p0 = dir.write("m-00001-of-00002.gguf", &s0);
+        let p1 = dir.write("m-00002-of-00002.gguf", &s1);
+
+        let f = GgufFile::open_split(&[p0, p1]).expect("正常な split が開けない");
+        assert_eq!(f.part_count(), 2);
+        assert_eq!(f.tensor_order.len(), 3);
+        assert_eq!(f.get("general.architecture").and_then(|v| v.as_str()), Some("qwen4exp"));
+        assert!(!f.tensor_bytes("a.weight").expect("a").iter().any(|&b| b != 0x11));
+        assert!(!f.tensor_bytes("c.weight").expect("c").iter().any(|&b| b != 0x22));
+        assert_eq!(f.tensor("c.weight").expect("c").file, 1);
+        assert!(f.tensor_mapping("c.weight").is_none(), "パート 1 のテンソルに tensor_mapping が返った");
+        assert!(f.tensor_mapping_parts("c.weight").is_some());
+        // 逆順に渡しても split.no で並ぶ
+        let p0b = dir.write("m-00001-of-00002.gguf", &s0);
+        let p1b = dir.write("m-00002-of-00002.gguf", &s1);
+        let f2 = GgufFile::open_split(&[p1b, p0b]).expect("逆順の split が開けない");
+        assert_eq!(f2.tensor_order, f.tensor_order);
+        // パス 1 本は単一ファイル経路へ落ちる
+        let single = dir.write("single.gguf", &t912_gguf(3, None, &[], &[T912Tensor { name: "s.weight", dims: &dims, ty: 2, offset: 0 }], nb));
+        let f3 = GgufFile::open_split(&[single]).expect("1 本の open_split");
+        assert_eq!(f3.part_count(), 1);
+        // 空は Err
+        assert!(GgufFile::open_split(&[]).is_err());
+    }
+
+    /// split の整合性検査 (欠番・件数不一致・ヘッダ欠け・名前重複・全体数不一致)。
+    #[test]
+    fn t912_split_rejects_broken_layouts() {
+        let dir = T912Dir::new("split_bad");
+        let dims = [64u64, 1];
+        let nb = t912_q4_bytes(64, 1) as usize;
+        let t = |name: &'static str| T912Tensor { name, dims: &dims, ty: 2, offset: 0 };
+
+        // 欠番 (0 と 2)
+        let a = dir.write("a1.gguf", &t912_shard(0, 2, Some(2), &[], &[t("a.weight")], nb));
+        let b = dir.write("a2.gguf", &t912_shard(2, 2, Some(2), &[], &[t("b.weight")], nb));
+        let e = GgufFile::open_split(&[a, b]).err().expect("欠番が通った");
+        assert!(e.0.contains("連番"), "予期しないエラー: {}", e.0);
+
+        // split.count が渡したパート数と違う
+        let a = dir.write("b1.gguf", &t912_shard(0, 3, Some(2), &[], &[t("a.weight")], nb));
+        let b = dir.write("b2.gguf", &t912_shard(1, 3, Some(2), &[], &[t("b.weight")], nb));
+        let e = GgufFile::open_split(&[a, b]).err().expect("count 不一致が通った");
+        assert!(e.0.contains("split.count"), "予期しないエラー: {}", e.0);
+
+        // split.no / split.count が無い
+        let a = dir.write("c1.gguf", &t912_gguf(3, None, &[], &[t("a.weight")], nb));
+        let b = dir.write("c2.gguf", &t912_shard(1, 2, Some(2), &[], &[t("b.weight")], nb));
+        let e = GgufFile::open_split(&[a, b]).err().expect("split.no 無しが通った");
+        assert!(e.0.contains("split.no"), "予期しないエラー: {}", e.0);
+
+        // パート間でテンソル名が重複
+        let a = dir.write("d1.gguf", &t912_shard(0, 2, Some(2), &[], &[t("same.weight")], nb));
+        let b = dir.write("d2.gguf", &t912_shard(1, 2, Some(2), &[], &[t("same.weight")], nb));
+        let e = GgufFile::open_split(&[a, b]).err().expect("split 間の名前重複が通った");
+        assert!(e.0.contains("重複"), "予期しないエラー: {}", e.0);
+
+        // split.tensors.count が実際と違う
+        let a = dir.write("e1.gguf", &t912_shard(0, 2, Some(99), &[], &[t("a.weight")], nb));
+        let b = dir.write("e2.gguf", &t912_shard(1, 2, Some(99), &[], &[t("b.weight")], nb));
+        let e = GgufFile::open_split(&[a, b]).err().expect("tensors.count 不一致が通った");
+        assert!(e.0.contains("split.tensors.count"), "予期しないエラー: {}", e.0);
+
+        // パート間で split.tensors.count が食い違う
+        let a = dir.write("f1.gguf", &t912_shard(0, 2, Some(2), &[], &[t("a.weight")], nb));
+        let b = dir.write("f2.gguf", &t912_shard(1, 2, Some(3), &[], &[t("b.weight")], nb));
+        let e = GgufFile::open_split(&[a, b]).err().expect("tensors.count 食い違いが通った");
+        assert!(e.0.contains("食い違う"), "予期しないエラー: {}", e.0);
+    }
+
+    /// split のうち 1 パートだけデータが途中で切れている場合、
+    /// `open_split` が `Err` を返す (パートごとのファイル長で検査している証拠)。
+    #[test]
+    fn t912_split_part_beyond_file_end_is_error() {
+        let dir = T912Dir::new("split_eof");
+        let dims = [64u64, 2];
+        let nb = t912_q4_bytes(64, 2) as usize;
+        let s0 = t912_shard(
+            0,
+            2,
+            Some(2),
+            &[],
+            &[T912Tensor { name: "a.weight", dims: &dims, ty: 2, offset: 0 }],
+            nb,
+        );
+        // パート 1 はデータを 8 B 削る
+        let mut s1 = t912_shard(
+            1,
+            2,
+            Some(2),
+            &[],
+            &[T912Tensor { name: "b.weight", dims: &dims, ty: 2, offset: 0 }],
+            nb,
+        );
+        s1.truncate(s1.len() - 8);
+        let p0 = dir.write("g1.gguf", &s0);
+        let p1 = dir.write("g2.gguf", &s1);
+        let f = GgufFile::open_split(&[p0, p1]).expect("ゲート off の open_split が落ちた");
+        let e = f
+            .validate_layout()
+            .err()
+            .expect("データ欠けのパートが validate_layout を通過した");
+        assert!(e.0.contains("ファイル終端"), "予期しないエラー: {}", e.0);
+        // ゲート on なら open_split 自体が Err
+        let _lock = t912_env_lock();
+        let _g = EnvVar::set("DENNO_GGUF_VALIDATE_LAYOUT", "1");
+        let e_gate = GgufFile::open_split(&[dir.write("g1b.gguf", &s0), dir.write("g2b.gguf", &s1)])
+            .err()
+            .expect("ゲート on で open_split が通った");
+        assert!(e_gate.0.contains("ファイル終端"), "予期しないエラー: {}", e_gate.0);
+        drop(_g);
+
+        // offset がそのパートのファイル長を超える場合も Err
+        let s0 = t912_shard(
+            0,
+            2,
+            Some(2),
+            &[],
+            &[T912Tensor { name: "a.weight", dims: &dims, ty: 2, offset: 1 << 40 }],
+            nb,
+        );
+        let s1 = t912_shard(
+            1,
+            2,
+            Some(2),
+            &[],
+            &[T912Tensor { name: "b.weight", dims: &dims, ty: 2, offset: 0 }],
+            nb,
+        );
+        let p0 = dir.write("h1.gguf", &s0);
+        let p1 = dir.write("h2.gguf", &s1);
+        let f = GgufFile::open_split(&[p0, p1]).expect("ゲート off の open_split が落ちた");
+        let e = f
+            .validate_layout()
+            .err()
+            .expect("offset 超過のパートが validate_layout を通過した");
+        assert!(e.0.contains("ファイル終端"), "予期しないエラー: {}", e.0);
     }
 }
