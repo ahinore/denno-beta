@@ -2058,6 +2058,8 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Response {
         state.scheduler.in_flight(),
         state.scheduler.pending(),
         &state.scheduler.stats(),
+        state.scheduler.lifecycle().serves_requests(),
+        state.scheduler.lifecycle().is_draining(),
     );
     (
         [(
