@@ -73,6 +73,10 @@ Notes on flag behaviour that are easy to get wrong:
   the JSON file.
 - `--json` writes pretty-printed JSON and prints `wrote <path>` on stderr. It does
   not replace the Markdown output.
+- `--json` cannot be combined with `--compare`: comparison writes its own summary
+  object via `--compare-json`, so `--json` is rejected (exit 1) instead of being
+  silently ignored. Likewise `--fail-on-regress-pct` is rejected without
+  `--compare`.
 - `--seed` does **not** get sent to the server, and no `seed` field is added to
   the request body. It only seeds the synthetic prompt generator and the token
   calibration, so that two runs send byte-identical prompts.
@@ -120,6 +124,7 @@ the server does not advertise a context length). Flush failures are recorded in
   "model": "demo",
   "context_length": 8192,
   "rounds": 3,
+  "seed": 801,
   "created_unix": 1760000000,
   "pp": [
     {"pp_tokens": 512, "depth": 0, "total_tokens": 512,
@@ -144,6 +149,9 @@ the server does not advertise a context length). Flush failures are recorded in
 ```
 
 - `context_length` is `null` when the server did not report one.
+- `seed` is the prompt-generation seed (`--seed`). It is the only optional
+  top-level key: reports written before the seed was recorded omit it, and
+  `--compare` treats a missing seed on either side as "not comparable" silently.
 - A failed case keeps its row and sets `error` to a string; it is not dropped.
   `pp_tok_s` / `tg_tok_s` / `ttft_ms` remain 0 in that row, so consumers should
   check `error` before trusting a rate.
