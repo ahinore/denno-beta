@@ -171,8 +171,9 @@ fn seeded_top_p_sampling_is_reproducible() {
 
 #[test]
 fn plain_mode_nan_is_deterministic_and_in_range() {
-    // plain (temperature のみ) では NaN が total に伝播し、累積走査が一度も
-    // 成立しないため末尾添字に倒れる。**パニックせず決定論的**であることが契約。
+    // plain (temperature のみ) では NaN が total に伝播しないようにしてある
+    // (task 942 で修正: NaN は確率 0 = 選ばれない)。パニックせず決定論的で、
+    // 系列は通常どおり seed に依存する。
     let logits = vec![0.5f32, f32::NAN, 1.5, f32::NEG_INFINITY, 1.0];
     let run = |seed: u64| {
         let mut s = sampler(Some(1.0), None, None, Some(seed));
@@ -184,8 +185,10 @@ fn plain_mode_nan_is_deterministic_and_in_range() {
     for &i in &a {
         assert!(i < logits.len(), "範囲外の添字 {i}");
     }
-    // seed を変えても RNG 消費より前に NaN で潰れるため同じ結果になる
-    assert_eq!(a, run(4), "NaN の扱いが RNG に依存している");
+    assert!(!a.iter().any(|&i| logits[i].is_nan()), "NaN の語彙が選ばれた");
+    // NaN は候補から外れるので、RNG は通常どおり消費される (seed が効く)。
+    // 16 ステップすべて一致する確率は 4^-16 相当なので flaky ではない。
+    assert_ne!(a, run(4), "NaN の扱いで RNG 消費が止まっている (旧挙動)");
 }
 
 #[test]

@@ -15,6 +15,15 @@
 //!   バッファ再利用の 2 パス O(n)。分布は数学的に同一だが、RNG→トークンの
 //!   対応が旧実装(降順走査)と変わるため**出力系列は旧実装と異なる**(仕様)。
 //!   greedy(temperature=0)の経路は一切変更していない
+//!
+//! P942 (2026-11-27): 非有限 logits の安全性を監査・修正。
+//! - NaN を「降順の末尾 (-inf と同順)」に写して比較を全順序化
+//!   (以前は NaN 混入 + k == 語彙長 で `sort_by` がパニックした)
+//! - NaN は softmax で確率 0 = **サンプルされない** (以前は total が NaN に
+//!   潰れて「末尾の添字」が返り得た)。NaN を含むときだけ再計算するので
+//!   有限 logits の値・演算順は不変
+//! - +inf は支配トークン (softmax 確率 1) として同値先頭を返す
+//! - RNG・seed の決定論は不変 (テスト: tests/sampler_determinism_942.rs)
 
 use rand::{rngs::StdRng, SeedableRng, Rng};
 
@@ -389,11 +398,17 @@ impl Sampler {
             if n > TOP_P_SUBSET {
                 let m = TOP_P_SUBSET;
                 let mut max = f32::NEG_INFINITY;
-                for &x in logits.iter() {
+                let mut max_i = 0usize;
+                for (i, &x) in logits.iter().enumerate() {
                     let v = x / t;
                     if v > max {
                         max = v;
+                        max_i = i;
                     }
+                }
+                // task 942: +inf は支配的 (softmax 確率 1)。NaN 化を避けて即決。
+                if max == f32::INFINITY {
+                    return max_i;
                 }
                 self.scratch.clear();
                 self.scratch.extend(logits.iter().enumerate().map(|(i, &x)| (x / t, i)));
@@ -403,7 +418,11 @@ impl Sampler {
                 head.sort_by(|a, b| cmp_desc(a, b).then(a.1.cmp(&b.1)));
                 // 部分集合上で softmax + top-p
                 let sub = &s[..m];
-                let probs: Vec<f32> = sub.iter().map(|(x, _)| (x - max).exp()).collect();
+                let mut probs: Vec<f32> = sub.iter().map(|(x, _)| (x - max).exp()).collect();
+                // task 942: NaN を含む場合だけ NaN→確率 0 で計算し直す。
+                if probs.iter().any(|p| p.is_nan()) {
+                    probs = sub.iter().map(|(x, _)| softmax_term(*x, max)).collect();
+                }
                 let total: f32 = probs.iter().sum();
                 let mut cum = 0.0f32;
                 let mut cutoff = m;
@@ -438,11 +457,18 @@ impl Sampler {
         // 分布は旧実装と数学的に同一 (softmax 全体からのカテゴリカル)。
         // RNG→トークンの対応が旧実装と変わる (仕様、モジュール先頭のコメント参照)。
         let mut max = f32::NEG_INFINITY;
-        for &x in logits.iter() {
+        let mut max_i = 0usize;
+        for (i, &x) in logits.iter().enumerate() {
             let v = x / t;
             if v > max {
                 max = v;
+                max_i = i;
             }
+        }
+        // task 942: +inf は支配的 (softmax 確率 1)。`inf - inf = NaN` で全確率が
+        // 潰れて末尾添字が返るのを避ける。有限 logits では分岐しない。
+        if max == f32::INFINITY {
+            return max_i;
         }
         self.exps.clear();
         self.exps.resize(n, 0.0);
@@ -452,6 +478,19 @@ impl Sampler {
             let e = (x / t - max).exp();
             exps[i] = e;
             total += e;
+        }
+        // task 942: NaN が混じると total が NaN になり、累積走査が一度も成立せず
+        // 「末尾の添字」が返る (= NaN の語彙がサンプルされ得た)。NaN を含む場合
+        // **だけ** NaN→確率 0 で計算し直す。有限 logits ではこの分岐に入らないので
+        // 本番経路の softmax 演算と値は従来と同一 (増えるのは max 添字の追跡と
+        // +inf / NaN の比較だけ)。
+        if total.is_nan() {
+            total = 0.0;
+            for (i, &x) in logits.iter().enumerate() {
+                let e = softmax_term(x / t, max);
+                exps[i] = e;
+                total += e;
+            }
         }
         let mut u = self.rng.gen::<f32>() * total;
         for (i, &e) in exps.iter().enumerate() {
@@ -471,14 +510,38 @@ impl Sampler {
             .enumerate()
             .map(|(i, x)| (x / self.temperature, i))
             .collect();
-        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // task 942: NaN を含んでも全順序 (パニックしない)。非 NaN では旧順序と同一。
+        v.sort_by(cmp_desc);
         sample_sorted(&mut self.rng, self.top_p, &v)
     }
 }
 
-/// 値の降順比較 (NaN は同値扱い。旧 sort_by の comparator と同一)
+/// 値の降順比較 (同値は Equal)。
+///
+/// task 942: NaN を **-inf と同じ順位** (降順の末尾) に写す全順序にした。
+/// 以前は `partial_cmp(..).unwrap_or(Equal)` で NaN を「同値」扱いしていたが、
+/// それは全順序ではないため `sort_by` / `select_nth_unstable_by` が
+/// `user-provided comparison function does not correctly implement a total order`
+/// で **パニック**し得た (語彙長と同じ k を指定 + NaN 混入で再現)。
+/// NaN を含まない入力では旧比較と完全に同一の順序になる (±0.0 と +0.0 は
+/// 従来どおり Equal = 添字昇順でタイブレーク)。
 fn cmp_desc(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
-    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+    let ka = if a.0.is_nan() { f32::NEG_INFINITY } else { a.0 };
+    let kb = if b.0.is_nan() { f32::NEG_INFINITY } else { b.0 };
+    kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// softmax の 1 項。NaN の logit は **-inf と同じ** (確率 0) として扱う。
+///
+/// task 942: 以前は NaN が `exp(NaN) = NaN` で total に伝播し、累積走査が
+/// 一度も成立せずに「末尾の添字」が返っていた (= NaN の語彙がサンプルされ得た)。
+/// NaN を -inf に写すと `exp(-inf - max) = 0` になり、NaN は選ばれない。
+/// max 自体が -inf (全 -inf / 全 NaN) のときは従来どおり NaN に潰れて
+/// 末尾添字にフォールバックする (決定論的・範囲内)。有限 logits では分岐しない。
+#[inline]
+fn softmax_term(x: f32, max: f32) -> f32 {
+    let x = if x.is_nan() { f32::NEG_INFINITY } else { x };
+    (x - max).exp()
 }
 
 /// 降順にソート済みの (温度適用済み値, インデックス) スライスから
@@ -486,7 +549,18 @@ fn cmp_desc(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
 /// 旧実装の演算順序 (softmax → top-p → 再正規化 → 累積走査) をそのまま再現。
 fn sample_sorted(rng: &mut StdRng, top_p: Option<f32>, sorted: &[(f32, usize)]) -> usize {
     let max = sorted[0].0;
+    // task 942: +inf の logit は softmax で確率 1 (他は 0) = 支配的。
+    // `inf - inf = NaN` で確率が全滅し「末尾の添字」が返るのを避け、
+    // 先頭 (同値なら添字最小) を返す。有限 logits では分岐しない。
+    if max == f32::INFINITY {
+        return sorted[0].1;
+    }
     let mut probs: Vec<f32> = sorted.iter().map(|(x, _)| (x - max).exp()).collect();
+    // task 942: NaN を含む場合だけ NaN→確率 0 で計算し直す (有限 logits では
+    // 従来と同一の値・同一の演算順)。
+    if probs.iter().any(|p| p.is_nan()) {
+        probs = sorted.iter().map(|(x, _)| softmax_term(*x, max)).collect();
+    }
 
     if let Some(p) = top_p {
         let total: f32 = probs.iter().sum();
