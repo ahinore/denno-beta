@@ -202,6 +202,7 @@
   <span id="gap" class="warn"></span>
   <span id="navhint" class="muted" style="font-size:10px">[2] /2d · [3] /3d · [R] refresh</span>
   <span id="stat" class="muted" style="margin-left:auto"></span>
+  <span id="connbanner" class="warn" hidden></span>
   <label class="muted">speed
     <span style="font-size:10px">low</span>
     <input id="speed" type="range" min="0.5" max="8" step="0.5" value="8">
@@ -1140,19 +1141,44 @@ function drain() {
 setInterval(drain, 33);
 
 // ---------- WS 接続 ----------
+// task 1106: 再接続の待ち時間と接続表示は /reconnect.mjs が決める (/, /2d, /3d 共通)。
+// ここは classic script なので、純関数だけを動的 import で読む (DOM には触らない)。
+let connMod = null, conn = null;
+const connReady = import("/reconnect.mjs")
+  .then((m) => { connMod = m; conn = m.createReconnect(); })
+  .catch(() => { connMod = null; conn = null; });
+
+function connBanner() {
+  const b = $("connbanner");
+  if (!b) return;
+  const s = conn ? conn.status() : null;
+  if (!s || !s.showBanner) { b.hidden = true; b.textContent = ""; return; }
+  b.hidden = false;
+  b.textContent = s.banner;
+}
+
 let gapCount = 0;
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { statEl.textContent = "connected"; };
-  ws.onclose = () => {
-    statEl.textContent = "disconnected — retrying in 2s";
-    setTimeout(connect, 2000);
+  ws.onopen = () => {
+    statEl.textContent = "connected";
+    if (conn) conn.onOpen();
+    connBanner();
+  };
+  ws.onclose = async () => {
+    await connReady;   // モジュール未達でも待ちは 2 s に落として必ず再接続する
+    const delay = conn ? conn.onClose() : 2000;
+    statEl.textContent = conn ? conn.status().label : "disconnected - retrying in 2 s";
+    connBanner();
+    setTimeout(connect, delay);
   };
   ws.onmessage = (ev) => {
     if (rpMode) return;   // リプレイモード中はライブフレームを無視する
     if (!(ev.data instanceof ArrayBuffer)) return;
+    // 受信できた = 接続済み (動的 import が onopen より遅れた場合も文言を戻す)
+    if (conn && !conn.connected) { conn.onOpen(); statEl.textContent = "connected"; connBanner(); }
     try {
       const f = decodeFrame(new Uint8Array(ev.data));
       dashSend(f, performance.now());

@@ -253,6 +253,8 @@ fn build_router(app: AppState) -> Router {
         .route("/code/src", get(code_src))
         .route("/chat", get(chat_page).post(chat_proxy))
         .route("/chat.mjs", get(chat_mjs))
+        // task 1106: 再接続バックオフと接続状態 (3 画面が共有する純ロジック)
+        .route("/reconnect.mjs", get(reconnect_mjs))
         .route("/v1/limits", get(limits_proxy))
         .route("/api/*path", axum::routing::any(api_proxy))
         .with_state(app)
@@ -543,6 +545,12 @@ fn js_response(src: &'static str) -> axum::response::Response {
         .header("cache-control", "no-cache")
         .body(axum::body::Body::from(src.as_bytes().to_vec()))
         .unwrap()
+}
+
+/// GET /reconnect.mjs — 再接続バックオフと接続状態の純関数 (task 1106)。
+/// / と /2d と /3d が同じ待ち時間・同じ文言を使うために共有する。
+async fn reconnect_mjs() -> axum::response::Response {
+    js_response(include_str!("reconnect.mjs"))
 }
 
 /// GET /arch2d.mjs — /2d の構成図 (配置・当たり判定・描画。DOM 非依存)。
@@ -1023,6 +1031,49 @@ mod tests {
                 "{p} の content-type"
             );
             assert!(r.text().await.unwrap().contains(needle), "{p}");
+        }
+    }
+
+    /// task 1106: /, /2d, /3d は同じ再接続ロジック (/reconnect.mjs) を読み、
+    /// オフライン帯の器を持つ。モジュールは 3 画面が使う関数を export する。
+    #[tokio::test]
+    async fn reconnect_module_is_shared_by_all_three_views() {
+        let base = serve(build_router(test_state("http://127.0.0.1:1"))).await;
+        let c = reqwest::Client::new();
+
+        for path in ["/", "/2d", "/3d"] {
+            let r = c.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(r.status(), 200, "GET {path}");
+            let html = r.text().await.unwrap();
+            assert!(
+                html.contains("/reconnect.mjs"),
+                "{path} が /reconnect.mjs を読んでいない"
+            );
+            assert!(
+                html.contains("connbanner"),
+                "{path} にオフライン帯の器 (connbanner) が無い"
+            );
+        }
+
+        let r = c.get(format!("{base}/reconnect.mjs")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "GET /reconnect.mjs");
+        assert!(
+            r.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript"),
+            "reconnect.mjs の content-type"
+        );
+        let js = r.text().await.unwrap();
+        for needle in [
+            "export function backoffDelay",
+            "export function connectionStatus",
+            "export function createReconnect",
+            "export const RECONNECT_DEFAULTS",
+        ] {
+            assert!(js.contains(needle), "reconnect.mjs に {needle} が無い");
         }
     }
 

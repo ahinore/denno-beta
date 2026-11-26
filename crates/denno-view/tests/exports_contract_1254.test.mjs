@@ -15,8 +15,10 @@ import * as arch2d from '../src/arch2d.mjs';
 import * as nodes2d from '../src/nodes2d.mjs';
 import * as view2d from '../src/view2d.mjs';
 import * as hud2d from '../src/hud2d.mjs';
+// task 1106: 再接続バックオフ / 接続状態の純関数。
+import * as reconnect from '../src/reconnect.mjs';
 
-const MODULES = { frames, dash, keys3d, chat, arch2d, nodes2d, view2d, hud2d };
+const MODULES = { frames, dash, keys3d, chat, arch2d, nodes2d, view2d, hud2d, reconnect };
 
 // スナップショット: 期待する export 面。キーは Object.keys(ns).sort() と一致させる。
 const SNAPSHOT = {
@@ -67,7 +69,14 @@ const SNAPSHOT = {
     classes: [],
     objects: ["HUD_LABELS", "SPEC_FRAME_KINDS"],
     consts: {"HUD_SCHEMA": 1, "PRESET_KIND": "denno-view/preset", "PRESET_SCHEMA": 1, "SPEC_KIND_MIN": 18},
-  },};
+  },
+  reconnect: {
+    fns: ["backoffDelay", "clampAttempt", "connectionBanner", "connectionStatus", "createReconnect", "formatRetry", "isOffline", "normaliseOptions"],
+    classes: [],
+    objects: ["RECONNECT_DEFAULTS"],
+    consts: {"RECONNECT_SCHEMA": 1},
+  },
+};
 
 const MODULE_NAMES = Object.keys(SNAPSHOT);
 
@@ -75,8 +84,8 @@ function namesOf(ns) {
   return Object.keys(ns).sort();
 }
 
-test('スナップショット対象は全 8 モジュールを網羅する', () => {
-  assert.deepEqual([...MODULE_NAMES].sort(), ['arch2d', 'chat', 'dash', 'frames', 'hud2d', 'keys3d', 'nodes2d', 'view2d']);
+test('スナップショット対象は全 9 モジュールを網羅する', () => {
+  assert.deepEqual([...MODULE_NAMES].sort(), ['arch2d', 'chat', 'dash', 'frames', 'hud2d', 'keys3d', 'nodes2d', 'reconnect', 'view2d']);
 });
 
 for (const name of MODULE_NAMES) {
@@ -130,5 +139,6 @@ for (const name of MODULE_NAMES) {
 
 test('総 export 数がスナップショットで固定される', () => {
   const total = MODULE_NAMES.reduce((n, m) => n + namesOf(MODULES[m]).length, 0);
-  assert.equal(total, 352);
+  // 352 + reconnect.mjs の 10 export (task 1106)
+  assert.equal(total, 362);
 });
