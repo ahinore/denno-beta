@@ -723,6 +723,8 @@ impl ShowRequest {
 /// Ollama と同じく、未指定は 400、未知のモデル名は 404 (`{"error": ...}`)。
 /// `parameters` / `template` は空: denno はモデルごとのパラメータ上書きも
 /// 露出した chat template も持たない (テンプレートは engine 内で固定)。
+/// `license` は標準クライアントが読むキーなので、値が無いことを表す空文字で
+/// 常に返す (task 1511)。
 pub async fn show(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -742,6 +744,7 @@ pub async fn show(
 
     let info = &state.info;
     Ok(Json(json!({
+        "license": "",
         "modelfile": format!("# denno model {}\n", state.model_name),
         "parameters": "",
         "template": "",
