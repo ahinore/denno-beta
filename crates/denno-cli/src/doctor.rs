@@ -398,13 +398,21 @@ fn fd_limits() -> FdLimitReport {
 
 /// key が秘密っぽいか。値そのものは見ない (名前だけで判定する)。
 /// `DENNO_API_KEY` / `DENNO_API_KEYS` に加え、`*_KEY` / `*_SECRET` / `*TOKEN` /
-/// `*PASSWORD` も伏せる側に倒す (漏らすより伏せすぎる方が安全)。
+/// `*PASSWORD` / `*AUTH` も伏せる側に倒す (漏らすより伏せすぎる方が安全)。
+///
+/// 例外は `config::diag::NON_SECRET_VALUE_NAMES` の完全一致だけ
+/// (`DENNO_FLASH_MAX_TOKENS` / `DENNO_MAX_TOKENS` は公開してよい数値)。
+/// 綴りが 1 文字でも違えば伏せる — fail-closed。
 fn is_secret_key(key: &str) -> bool {
+    if crate::config::diag::NON_SECRET_VALUE_NAMES.contains(&key) {
+        return false;
+    }
     let k = key.to_ascii_uppercase();
     k.contains("API_KEY")
         || k.contains("SECRET")
         || k.contains("TOKEN")
         || k.contains("PASSWORD")
+        || k.contains("AUTH")
         || k.ends_with("_KEY")
         || k.ends_with("_KEYS")
 }
@@ -1210,11 +1218,39 @@ mod tests {
             "DENNO_CLIENT_SECRET",
             "DENNO_DB_PASSWORD",
             "DENNO_WEBHOOK_KEY",
+            "DENNO_AUTH_HEADER",
         ] {
             assert!(is_secret_key(k), "{k} should be redacted");
         }
         for k in ["DENNO_MAX_CTX", "DENNO_MODEL_DIR", "DENNO_KEYRING_DIR_X"] {
             assert!(!is_secret_key(k), "{k} should not be redacted");
+        }
+    }
+
+    // ---- task 1496: 数値リミット名の allowlist (完全一致だけ例外) ----
+
+    #[test]
+    fn harmless_numeric_token_names_are_not_redacted() {
+        for k in crate::config::diag::NON_SECRET_VALUE_NAMES {
+            assert!(!is_secret_key(k), "{k} should be shown");
+            assert!(!crate::config::diag::is_secret_name(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn allowlist_is_exact_match_only() {
+        // 綴りが違う / 前後が付く名前は従来どおり伏せる (fail-closed)
+        for k in [
+            "DENNO_FLASH_MAX_TOKENS_X",
+            "X_DENNO_FLASH_MAX_TOKENS",
+            "DENNO_FLASH_MAX_TOKEN",
+            "DENNO_MAX_TOKENS2",
+            "DENNO_SECRET_MAX_TOKENS",
+            "DENNO_FLASH_MAX_TOKENS_AUTH",
+            "denno_flash_max_tokens",
+        ] {
+            assert!(is_secret_key(k), "{k} should stay redacted");
+            assert!(crate::config::diag::is_secret_name(k), "{k}");
         }
     }
 

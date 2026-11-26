@@ -252,6 +252,7 @@ fn secret_name_detection_matches_doctor_convention() {
         "DENNO_ADMIN_TOKEN",
         "DENNO_CLIENT_SECRET",
         "DENNO_DB_PASSWORD",
+        "DENNO_AUTH_HEADER",
         "denno_api_key",
     ] {
         assert!(config::diag::is_secret_name(name), "{name}");
@@ -259,6 +260,35 @@ fn secret_name_detection_matches_doctor_convention() {
     for name in ["DENNO_FLASH_PORT", "DENNO_FLASH_DIR", "DENNO_MTP_PATH"] {
         assert!(!config::diag::is_secret_name(name), "{name}");
     }
+}
+
+// task 1496: `*TOKEN*` の過剰伏せ字の例外 (完全一致の allowlist だけ)
+#[test]
+fn numeric_limit_names_are_exempt_from_token_redaction() {
+    for name in ["DENNO_FLASH_MAX_TOKENS", "DENNO_MAX_TOKENS"] {
+        assert!(!config::diag::is_secret_name(name), "{name}");
+    }
+    // 綴り違いは従来どおり伏せる (fail-closed)
+    for name in [
+        "DENNO_FLASH_MAX_TOKENS_X",
+        "DENNO_MAX_TOKEN",
+        "DENNO_SECRET_MAX_TOKENS",
+    ] {
+        assert!(config::diag::is_secret_name(name), "{name}");
+    }
+}
+
+#[test]
+fn max_tokens_value_is_shown_in_shadow_message() {
+    // 既知 env `DENNO_FLASH_MAX_TOKENS` の値が CLI に上書きされる場合、
+    // 診断は秘密名判定を通るが数値リミットなので実値を出してよい。
+    let env = env_of(&[("DENNO_FLASH_MAX_TOKENS", "8192")]);
+    let cli = vec![("max_tokens", "1024".to_string())];
+    let d = diagnose(&cli, &env, None);
+    let x = by_code(&d, "env_shadowed_by_cli").expect("env_shadowed_by_cli");
+    assert!(x.message.contains("8192"), "{}", x.message);
+    assert!(x.message.contains("1024"), "{}", x.message);
+    assert!(!x.message.contains("<redacted>"), "{}", x.message);
 }
 
 // ------------------------------------- 出所の食い違い (CLI / env / 設定ファイル)

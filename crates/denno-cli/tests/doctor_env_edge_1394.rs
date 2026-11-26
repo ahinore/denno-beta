@@ -295,16 +295,10 @@ fn known_vars_only_pass_cleanly() {
     let got: Vec<String> = entries.keys().cloned().collect();
     assert_eq!(got, want, "doctor の env 一覧が既知名の集合と一致しない");
 
-    // 既知名は値を隠さない。ただし `DENNO_FLASH_MAX_TOKENS` は名前が
-    // `*TOKEN*` を含むため、doctor の「伏せすぎる側に倒す」規約で伏せられる
-    // (値は秘密ではないが、名前だけでは区別できない)。この過剰伏せ字も契約として固定する。
-    let over_redacted = ["DENNO_FLASH_MAX_TOKENS"];
+    // 既知名は値を隠さない。`DENNO_FLASH_MAX_TOKENS` は名前が `*TOKEN*` を
+    // 含むが、数値リミットとして明示的に許可された名前なので task 1496 から
+    // 値が出る (完全一致の allowlist)。
     for (key, (value, redacted)) in &entries {
-        if over_redacted.contains(&key.as_str()) {
-            assert!(*redacted, "{key} が伏せられていない");
-            assert_eq!(value, "<redacted>", "{key} の値: {value}");
-            continue;
-        }
         assert!(!redacted, "{key} が不要に伏せられている");
         let expected = envs
             .iter()
@@ -319,7 +313,7 @@ fn known_vars_only_pass_cleanly() {
         .iter()
         .map(|x| x.as_str().expect("string"))
         .collect();
-    assert_eq!(red, over_redacted, "{red:?}");
+    assert!(red.is_empty(), "{red:?}");
 
     // 同じ env を診断に掛けても何も出ない
     let diags = diagnose_env(&env_map(&envs));
