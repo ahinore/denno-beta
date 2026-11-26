@@ -373,9 +373,10 @@ base URL を差し替えるだけで繋がる facade。`/v1/messages` / `/v1/cha
 | `model` (任意) | serve 時の `--name`。不一致は 404 |
 | `messages` (必須) | `role` は `system` / `user` / `assistant` (それ以外は 400)。`content` は文字列 or text part 配列。tools (`tool` ロール / `tool_calls`) は非対応 |
 | `stream` (任意) | **未指定は true** (Ollama の既定)。false で単一 JSON |
-| `options.temperature` / `options.top_p` | 対応 (`--temperature-cap` のクランプも同一) |
+| `options.temperature` / `options.top_p` | 対応 (`--temperature-cap` のクランプも同一)。非有限値 (JSON の `1e40` は f32 で inf) は 400。負値・範囲外は Ollama の意味論 (`temperature <= 0` = greedy、`top_p` の無効値 = 無効) を保つため拒否しない |
 | `options.num_predict` | 生成上限。正値のみ採用し、未指定と同じく既定 1024 / 上限 4096 で clamp。負値 (-1 / -2) と 0 は「未指定」扱い |
 | `options.stop` | 文字列 or 文字列配列 |
+| `options` 自体 | 省略可。`null` も未指定扱い |
 | その他 | 未知フィールド (`options.num_ctx` / `seed` / `images` 等) は無視 |
 
 thinking の既定は `/v1/messages` と同じ (brief + `enable_thinking=false`) なので、
