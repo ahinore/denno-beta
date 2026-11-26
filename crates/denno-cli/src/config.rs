@@ -595,6 +595,400 @@ pub fn resolve(
     Ok(resolved)
 }
 
+#[allow(dead_code)]
+pub mod diag {
+    use super::*;
+
+    // ---------------------------------------------------------------- 環境変数の診断
+    //
+    // task 1066: `DENNO_*` の「矛盾」と「読まれない名前」を、値を漏らさずに列挙する
+    // 純関数。`serve-flash` の起動前チェックとテストから同じ関数を呼べるよう、
+    // プロセスの env もファイルも触らない (`env` は呼び手が渡す)。
+    //
+    // 検出するもの:
+    // 1. 未知の `DENNO_*` (綴り違いは近い名前を提案する)
+    // 2. 大文字小文字の取り違え / `DENNO_` 接頭辞の欠け (どちらも読まれない)
+    // 3. 非推奨の名前 (`DEPRECATED_ENV`) と、その後継との値の食い違い
+    // 4. 空値 (解決では未設定扱い) / 整数キーの型・範囲外
+    // 5. `DENNO_KV_SLOTS=0` (未指定の旧来の書き方)、`DENNO_AUTO_CONFIG` の真偽値以外
+    // 6. 出所の食い違い (CLI が env を、env が設定ファイルを黙って上書きする)
+    // 7. 実効値どうしの矛盾 (max_tokens > max_ctx)
+    //
+    // **値は秘密名 (`is_secret_name`) なら出さない**。名前だけを出す。
+
+    /// 診断の重大度。`Warn` は起動を止めない、`Error` は解決が失敗する。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Level {
+        Warn,
+        Error,
+    }
+
+    impl Level {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Level::Warn => "warn",
+                Level::Error => "error",
+            }
+        }
+    }
+
+    /// 診断 1 件。`code` は安定した識別子 (`env_unknown` など)、`message` は表示用。
+    /// `vars` は関係する環境変数名だけで、**値は入れない**。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Diag {
+        pub level: Level,
+        pub code: &'static str,
+        pub vars: Vec<String>,
+        pub message: String,
+    }
+
+    impl Diag {
+        fn new(level: Level, code: &'static str, vars: Vec<String>, message: String) -> Self {
+            Diag {
+                level,
+                code,
+                vars,
+                message,
+            }
+        }
+
+        /// `[warn] DENNO_X: ...` の 1 行 (stderr にそのまま出せる形)。
+        pub fn line(&self) -> String {
+            format!(
+                "[{}] {}: {}",
+                self.level.as_str(),
+                self.vars.join(", "),
+                self.message
+            )
+        }
+    }
+
+    /// serve-flash の設定として解決に使う env 名 (`SPEC` から作る)。
+    pub fn known_env_vars() -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = SPEC.iter().filter_map(|s| s.2).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// 非推奨の env 名 → 後継の env 名。
+    ///
+    /// `DENNO_MAX_CTX` はこの crate のどこでも読まれない (config 解決は
+    /// `DENNO_FLASH_MAX_CTX` だけを見る)。汎用名で設定したつもりで既定値のまま
+    /// 動く事故があるので、後継を案内する。
+    pub const DEPRECATED_ENV: [(&str, &str); 1] = [("DENNO_MAX_CTX", "DENNO_FLASH_MAX_CTX")];
+
+    /// 秘密っぽい名前か。**値は見ない** (名前だけで判定する)。
+    /// doctor.rs の `is_secret_key` と同じ規約 (伏せすぎる側に倒す)。
+    pub fn is_secret_name(name: &str) -> bool {
+        let k = name.to_ascii_uppercase();
+        k.contains("API_KEY")
+            || k.contains("SECRET")
+            || k.contains("TOKEN")
+            || k.contains("PASSWORD")
+            || k.ends_with("_KEY")
+            || k.ends_with("_KEYS")
+    }
+
+    /// メッセージに載せてよい値。秘密名なら常に伏せる。
+    fn show_value(name: &str, value: &str) -> String {
+        if is_secret_name(name) {
+            "<redacted>".to_string()
+        } else {
+            format!("`{value}`")
+        }
+    }
+
+    /// 編集距離 (バイト単位)。短い ASCII 名だけを想定する。
+    fn edit_distance(a: &str, b: &str) -> usize {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        let mut cur = vec![0usize; b.len() + 1];
+        for i in 1..=a.len() {
+            cur[0] = i;
+            for j in 1..=b.len() {
+                let cost = usize::from(a[i - 1] != b[j - 1]);
+                cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        prev[b.len()]
+    }
+
+    /// `want` に近い既知の env 名を距離順で返す (誤字のヒント用)。
+    fn suggest_env(want: &str) -> Vec<&'static str> {
+        let mut cands: Vec<(&'static str, usize)> = known_env_vars()
+            .into_iter()
+            .chain(DEPRECATED_ENV.iter().map(|(old, _)| *old))
+            .map(|name| (name, edit_distance(want, name)))
+            .filter(|(name, d)| *name != want && *d <= 2 && *d * 3 <= name.len())
+            .collect();
+        cands.sort_unstable();
+        cands.into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// `DENNO_AUTO_CONFIG` が真偽値として解釈できる綴りか。
+    /// (`denno_engine::auto_config::auto_requested` が受けるのは真側の 5 つだけ。
+    /// それ以外は黙って「無効」になるので、ここで列挙して警告する。)
+    fn auto_config_spelling_ok(v: &str) -> bool {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "auto" | "0" | "false" | "off" | "no"
+        )
+    }
+
+    /// env だけを見る診断 (ファイルも CLI も見ない純関数)。
+    pub fn diagnose_env(env: &BTreeMap<String, String>) -> Vec<Diag> {
+        let known = known_env_vars();
+        let mut out: Vec<Diag> = Vec::new();
+
+        for (name, value) in env {
+            let upper = name.to_ascii_uppercase();
+            let exact = known.iter().any(|k| *k == name.as_str());
+            let deprecated = DEPRECATED_ENV
+                .iter()
+                .find(|(old, _)| *old == upper.as_str());
+
+            if let Some((old, new)) = deprecated {
+                // 大小の取り違えも「読まれない」ので併せて言う
+                let spelling = if *name == upper {
+                    String::new()
+                } else {
+                    format!(" (変数名は大文字小文字を区別する。`{old}` と書く)")
+                };
+                out.push(Diag::new(
+                    Level::Warn,
+                    "env_deprecated",
+                    vec![name.clone()],
+                    format!(
+                        "非推奨の名前。serve-flash は読まない。`{new}` を使う{spelling}"
+                    ),
+                ));
+                continue;
+            }
+
+            // 大文字に直すと既知 = 大小の取り違え (接頭辞の検査より先に見る)
+            if !exact && known.iter().any(|k| *k == upper) {
+                out.push(Diag::new(
+                    Level::Warn,
+                    "env_case",
+                    vec![name.clone()],
+                    format!("変数名は大文字小文字を区別する。`{upper}` と書く (この名前は読まれない)"),
+                ));
+                continue;
+            }
+
+            // `DENNO_` で始まらない名前: 既知の名前と近いときだけ拾う
+            // (無関係な env を毎回警告しないため)。完全一致は上で弾いてある。
+            if !name.starts_with("DENNO_") {
+                let best = known
+                    .iter()
+                    .copied()
+                    .map(|k| (edit_distance(&upper, k), k))
+                    .filter(|(d, _)| *d <= 2)
+                    .min();
+                if let Some((_, best)) = best {
+                    out.push(Diag::new(
+                        Level::Warn,
+                        "env_unprefixed",
+                        vec![name.clone()],
+                        format!("`DENNO_` 接頭辞が無いので読まれない。もしかして: `{best}`"),
+                    ));
+                }
+                continue;
+            }
+
+            if !exact {
+                let hint = match suggest_env(name) {
+                    v if v.is_empty() => String::new(),
+                    v => format!("。もしかして: {}", v.join(", ")),
+                };
+                out.push(Diag::new(
+                    Level::Warn,
+                    "env_unknown",
+                    vec![name.clone()],
+                    format!("未知の `DENNO_*` は無視される{hint}"),
+                ));
+                continue;
+            }
+
+            // ここから既知の名前
+            if value.trim().is_empty() {
+                out.push(Diag::new(
+                    Level::Warn,
+                    "env_empty",
+                    vec![name.clone()],
+                    "空値は未設定として扱う (既定値 / 設定ファイルが使われる)".to_string(),
+                ));
+                continue;
+            }
+
+            let key = known
+                .iter()
+                .find(|k| **k == name.as_str())
+                .and_then(|k| SPEC.iter().find(|s| s.2 == Some(*k)))
+                .map(|s| s.0)
+                .unwrap_or("");
+
+            match kind_of(key) {
+                Some(Kind::Int { min, max }) => {
+                    let raw = value.trim();
+                    match raw.parse::<u64>() {
+                        Ok(n) if n >= min && n <= max => {}
+                        Ok(n) => out.push(Diag::new(
+                            Level::Error,
+                            "env_out_of_range",
+                            vec![name.clone()],
+                            format!("`{key}` の範囲は {min}..={max} (指定値 {n})"),
+                        )),
+                        Err(_) => out.push(Diag::new(
+                            Level::Error,
+                            "env_not_integer",
+                            vec![name.clone()],
+                            format!(
+                                "`{key}` は 10 進整数 {min}..={max} で書く (指定値 {})",
+                                show_value(name, value)
+                            ),
+                        )),
+                    }
+                }
+                _ => {}
+            }
+
+            if name == "DENNO_KV_SLOTS" && value.trim() == "0" {
+                out.push(Diag::new(
+                    Level::Warn,
+                    "kv_slots_legacy_zero",
+                    vec![name.clone()],
+                    "0 は「未指定」の旧来の書き方。既定 2 が使われる (明示するなら 1..=8)".to_string(),
+                ));
+            }
+
+            if name == "DENNO_AUTO_CONFIG" && !auto_config_spelling_ok(value) {
+                out.push(Diag::new(
+                    Level::Warn,
+                    "auto_config_spelling",
+                    vec![name.clone()],
+                    format!(
+                        "真偽値として解釈できないので「無効」になる (指定値 {})。\
+                         受け付けるのは 1/true/on/yes/auto/0/false/off/no。\
+                         MiB は --vram-budget で渡す",
+                        show_value(name, value)
+                    ),
+                ));
+            }
+        }
+
+        sort_diags(&mut out);
+        out
+    }
+
+    /// env と、CLI の明示値と、設定ファイルを突き合わせる。
+    ///
+    /// `resolve()` と同じ引数を取り、**解決はしない** (副作用なし)。解決自体が
+    /// 失敗する場合は `resolve_error` を 1 件足し、実効値どうしの検査は飛ばす。
+    pub fn diagnose(
+        cli: &[(&'static str, String)],
+        env: &BTreeMap<String, String>,
+        file: Option<&FileConfig>,
+    ) -> Vec<Diag> {
+        let mut out = diagnose_env(env);
+
+        for key in KEYS {
+            let cli_val = cli.iter().find(|(k, _)| *k == key).map(|(_, v)| v.trim());
+            let env_name = env_var(key);
+            let env_val = env_name
+                .and_then(|n| env.get(n).map(|v| (n, v.trim())))
+                .filter(|(_, v)| !v.is_empty());
+            let file_val = file
+                .and_then(|f| f.get(key))
+                .map(|v| v.as_text())
+                .map(|v| v.trim().to_string());
+
+            // CLI が env を黙って上書きする
+            if let (Some(c), Some((n, e))) = (cli_val, env_val) {
+                if c != e {
+                    out.push(Diag::new(
+                        Level::Warn,
+                        "env_shadowed_by_cli",
+                        vec![n.to_string()],
+                        format!(
+                            "`{key}` は CLI が最優先。env の値 {} は使われない (実効: {})",
+                            show_value(n, e),
+                            show_value(n, c)
+                        ),
+                    ));
+                }
+            }
+            // env が設定ファイルを黙って上書きする
+            if let (Some((n, e)), Some(f)) = (env_val, file_val.as_deref()) {
+                if e != f {
+                    out.push(Diag::new(
+                        Level::Warn,
+                        "config_shadowed_by_env",
+                        vec![n.to_string()],
+                        format!(
+                            "`{key}` は env > 設定ファイル。{origin} の値 {} は使われない (実効: {})",
+                            show_value(n, f),
+                            show_value(n, e),
+                            origin = file.map(|f| f.origin.as_str()).unwrap_or("")
+                        ),
+                    ));
+                }
+            }
+            // env が無く CLI が設定ファイルを上書きする
+            if let (Some(c), None, Some(f)) = (cli_val, env_val, file_val.as_deref()) {
+                if c != f {
+                    out.push(Diag::new(
+                        Level::Warn,
+                        "config_shadowed_by_cli",
+                        vec![],
+                        format!(
+                            "`{key}` は CLI が最優先。{origin} の値 `{f}` は使われない (実効: `{c}`)",
+                            origin = file.map(|f| f.origin.as_str()).unwrap_or("")
+                        ),
+                    ));
+                }
+            }
+        }
+
+        match resolve(cli, env, file) {
+            Ok(r) => value_diags(&r, &mut out),
+            Err(e) => out.push(Diag::new(Level::Error, "resolve_error", vec![], e)),
+        }
+
+        sort_diags(&mut out);
+        out
+    }
+
+    /// 解決済みの実効値どうしの矛盾を見る。
+    fn value_diags(r: &Resolved, out: &mut Vec<Diag>) {
+        // max_tokens が文脈長を超える: 文脈が埋まった時点で止まるので上限に届かない。
+        if let (Ok(Some(mt)), Ok(Some(mc))) = (r.number("max_tokens"), r.number("max_ctx")) {
+            if mt > mc {
+                out.push(Diag::new(
+                    Level::Warn,
+                    "max_tokens_over_ctx",
+                    vec![],
+                    format!(
+                        "max_tokens={mt} が max_ctx={mc} を超える。文脈が埋まった時点で止まるので {mt} には届かない"
+                    ),
+                ));
+            }
+        }
+    }
+
+    /// 出力順を安定させる (`code` → `vars`)。
+    fn sort_diags(out: &mut [Diag]) {
+        out.sort_by(|a, b| {
+            a.code
+                .cmp(b.code)
+                .then_with(|| a.vars.join(",").cmp(&b.vars.join(",")))
+                .then_with(|| a.message.cmp(&b.message))
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
