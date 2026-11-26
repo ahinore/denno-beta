@@ -351,6 +351,8 @@ struct FixedInner {
     used: u64,
     /// 予算切れ / 空き不足で伸ばすのをやめた。
     stop: bool,
+    /// 読者が居るせいで予算へ戻せなかった区間の本数 (task 907 の診断)。
+    lost: u64,
 }
 
 /// 1 塊のバイト数。
@@ -370,12 +372,20 @@ impl FixedStore {
                 free: Vec::new(),
                 used: 0,
                 stop: false,
+                lost: 0,
             }),
         }
     }
 
     /// `len` バイトの区間を返す。予算切れ・空き不足なら `None`
     /// (呼び出し側はキャッシュしない = 毎回 mmap 経路)。
+    ///
+    /// task 907: (a) 大きい空き区間から切り出した**余りを空きへ返す**
+    /// (捨てると混合量子化で入れ替えのたびにその差分が予算から消え、
+    /// `used` だけが増えて `take` が失敗し続ける = 再調整の thrash)。
+    /// (b) 塊の大きさは `RAM_CHUNK` ではなく**その塊の実バイト**で判定する。
+    /// (c) `stop` は「直近の確保で伸ばせなかった」の意味にし、成功したら戻す
+    /// (一度の空き不足で tier が永久に閉じない)。
     fn take(&self, len: usize) -> Option<Arc<Region>> {
         if len > self.slot_bytes {
             return None;
@@ -390,7 +400,12 @@ impl FixedStore {
             .min_by_key(|(_, &(_, _, l))| l)
             .map(|(i, _)| i);
         if let Some(i) = pick {
-            let (chunk, off, _) = g.free.swap_remove(i);
+            let (chunk, off, l) = g.free.swap_remove(i);
+            if l > len {
+                // 余りは捨てずに空きへ返す (予算の実バイトを失わない)。
+                g.free.push((Arc::clone(&chunk), off + len, l - len));
+            }
+            g.stop = false;
             return Some(Region::new(chunk, off, len));
         }
         // 2. 予算の範囲で次の区間を切り出す。
@@ -398,15 +413,22 @@ impl FixedStore {
             g.stop = true;
             return None;
         }
-        if g.chunks.is_empty() || g.off + len > RAM_CHUNK {
-            // 新しい塊。空きが margin を割るなら伸ばさない。
+        // 新しい塊が要るか。1 塊の上限は RAM_CHUNK だが、予算が小さいときは
+        // 塊も小さいので、**実バイト**で判定する (越えると Region が塊の外を指す)。
+        let need_chunk = match g.chunks.get(g.cur) {
+            Some(c) => g.off + len > c.bytes(),
+            None => true,
+        };
+        if need_chunk {
+            let new_bytes = RAM_CHUNK.min(self.limit_bytes as usize).max(len);
+            // 空きが margin を割るなら伸ばさない。
             if let Some(avail) = mem_available() {
-                if avail < self.margin_bytes.saturating_add(RAM_CHUNK as u64) {
+                if avail < self.margin_bytes.saturating_add(new_bytes as u64) {
                     g.stop = true;
                     return None;
                 }
             }
-            let (chunk, _pinned) = Chunk::new(RAM_CHUNK.min(self.limit_bytes as usize).max(len), self.want_pinned);
+            let (chunk, _pinned) = Chunk::new(new_bytes, self.want_pinned);
             g.chunks.push(chunk);
             g.cur = g.chunks.len() - 1;
             g.off = 0;
@@ -415,17 +437,27 @@ impl FixedStore {
         let off = g.off;
         g.off += len;
         g.used += len as u64;
+        g.stop = false;
         Some(Region::new(chunk, off, len))
     }
 
     /// 追い出した区間を返す (読者が居なければ再利用する)。
+    ///
+    /// 読者が居る (`Arc` が残っている) 区間は返せず、そのバイトは予算から
+    /// 戻らない。診断用に `lost` へ数える (task 907)。
     fn give_back(&self, region: Arc<Region>) {
         let Ok(r) = Arc::try_unwrap(region) else {
+            lock_fixed(&self.inner).lost += 1;
             return; // まだ読者が居る
         };
         let (len, off) = (r.len(), r.off);
         let mut g = lock_fixed(&self.inner);
         g.free.push((r.chunk, off, len));
+    }
+
+    /// 読者が居るせいで予算へ戻せなかった区間の本数 (task 907)。
+    fn lost(&self) -> u64 {
+        lock_fixed(&self.inner).lost
     }
 
     fn pinned_bytes(&self) -> u64 {
@@ -478,6 +510,14 @@ impl Store {
         }
     }
 
+    /// task 907: 固定長ストアか (RAM tier か)。
+    ///
+    /// RAM tier では「予算外は載せない」ので、ヒープへの逃げ道を作らない
+    /// ([`ExpertCache::get`] を参照)。
+    fn is_fixed(&self) -> bool {
+        matches!(self, Store::Fixed(_))
+    }
+
     /// ヒープの作業域を 1 本 (再利用プールから)。
     fn take_vec(&self, len: usize) -> Vec<u8> {
         let mut v = match self {
@@ -524,6 +564,14 @@ impl Store {
     fn reserved_bytes(&self) -> u64 {
         match self {
             Store::Fixed(f) => f.reserved_bytes(),
+            Store::Heap(_) => 0,
+        }
+    }
+
+    /// task 907: 読者が居て予算へ戻せなかった区間の本数。
+    fn lost(&self) -> u64 {
+        match self {
+            Store::Fixed(f) => f.lost(),
             Store::Heap(_) => 0,
         }
     }
@@ -605,7 +653,20 @@ impl Inner {
     }
 
     /// スロットを確保して `key` を入れる。満杯なら tail を追い出す。
+    ///
+    /// task 907: 同じ鍵が別スロットに居る (len 違い) ときは**先に外して区間を返す**。
+    /// 外さずに `map` を上書きすると (a) 古い区間が空きへ戻らず予算から消え、
+    /// (b) 古いスロットが tail だった場合に `unlink` が二度走って LRU の
+    /// リスト (head/tail) が壊れる。
     fn insert(&mut self, key: ExpertKey, len: usize, buf: Arc<Region>, store: &Store) {
+        if let Some(prev) = self.map.remove(&key) {
+            self.unlink(prev);
+            if let Some(old) = self.slots[prev as usize].take() {
+                // 読者が居なければ場所を返す (会計から漏らさない)。
+                store.recycle(old.buf);
+            }
+            self.free.push(prev);
+        }
         let sid = match self.free.pop() {
             Some(s) => s,
             None => {
@@ -622,16 +683,32 @@ impl Inner {
                 v
             }
         };
-        // 同じ鍵が別スロットに居る (len 違い) なら、そちらを捨てる。
-        if let Some(prev) = self.map.insert(key, sid) {
-            if prev != sid {
-                self.unlink(prev);
-                self.slots[prev as usize] = None;
-                self.free.push(prev);
-            }
-        }
+        self.map.insert(key, sid);
         self.slots[sid as usize] = Some(Slot { key, len, buf });
         self.push_front(sid);
+    }
+
+    /// task 907: 一番古い (`tail`) を外して区間を予算へ返す。
+    ///
+    /// 固定長ストアで予算が尽きたとき、`take` の前に LRU を 1 本ゆずるために使う
+    /// (以前はヒープへ逃げていた = 予算外の常駐が増えた)。
+    /// 使用中の読者が居る区間は返せない (その場合は予算が戻らない)。
+    ///
+    /// 戻り値は「1 本外したか」。
+    fn evict_tail(&mut self, store: &Store) -> bool {
+        let v = self.tail;
+        if v == NIL {
+            return false;
+        }
+        self.unlink(v);
+        let Some(old) = self.slots[v as usize].take() else {
+            return false;
+        };
+        self.map.remove(&old.key);
+        self.stats.evictions += 1;
+        store.recycle(old.buf);
+        self.free.push(v);
+        true
     }
 }
 
@@ -713,6 +790,14 @@ impl ExpertCache {
     /// 固定長ストアが既に切り出したバイト数 (予算の使用量)。
     pub fn reserved_bytes(&self) -> u64 {
         self.store.reserved_bytes()
+    }
+
+    /// task 907: 読者が居て予算へ戻せなかった区間の本数 (診断用)。
+    ///
+    /// 0 でないときは、追い出したのに `used` が減っていない = そのバイトは
+    /// 二度と使えない (使用中の `Arc` が drop されるまで)。
+    pub fn lost_regions(&self) -> u64 {
+        self.store.lost()
     }
 
     /// 空き不足 / 予算切れで伸ばすのを止めたか。
@@ -798,6 +883,37 @@ impl ExpertCache {
         // task 260: 固定長ストアでは**区間へ直接 pread する** (pinned メモリに
         // そのまま入るので、ヒープへ読んでから写すコピーが無い)。
         let mut region = self.store.take(len);
+        // task 907: RAM tier (固定長ストア) では**ヒープへ逃げない**。
+        // 逃げると予算外の常駐が増え、pinned の意味 (page cache に追い出されない)
+        // も予算の会計も壊れる。代わりに LRU の古い順に 1 本ずつゆずって
+        // もう一度取り、それでも入らなければ諦める (呼び出し側は mmap 経路)。
+        if region.is_none() && self.store.is_fixed() {
+            loop {
+                // スロットが埋まっているときだけ LRU をゆずる。空きスロットが
+                // あるのに予算が足りない = スロット数の見積りが実バイトより
+                // 大きい (混合量子化の丸め) なので、ゆずっても載らない。
+                // ここで止めて `stop` を立て、呼び出し側 (充填) に伝える。
+                let (evicted, full) = {
+                    let mut g = lock_inner(&self.inner);
+                    let full = g.map.len() >= self.slots;
+                    (if full { g.evict_tail(&self.store) } else { false }, full)
+                };
+                if !full || !evicted {
+                    break;
+                }
+                region = self.store.take(len);
+                if region.is_some() {
+                    break;
+                }
+            }
+        }
+        if region.is_none() && self.store.is_fixed() {
+            bail!(
+                "{:?}: RAM tier の予算が尽きた ({} バイトを載せられない)",
+                key,
+                len
+            );
+        }
         let mut scratch: Option<Vec<u8>> = None;
         if region.is_none() {
             scratch = Some(self.store.take_vec(len));
@@ -1798,6 +1914,10 @@ mod tests {
         let (k0, k1, k2) = (key(0, 0), key(0, 1), key(0, 2));
         let a = c.get(k0, 0, 1024, &src).unwrap();
         assert_eq!(&a[..], &data[0..1024], "区間の中身がファイルと違う");
+        // task 907: 読者が `Arc` を持っている間は区間を予算へ戻せないので、
+        // 使い終わったら落とす (読者が居る場合の挙動は
+        // `task907_ram_store_reports_a_live_reader_blocking_the_budget` が見る)。
+        drop(a);
         let _ = c.get(k1, 1024, 1024, &src).unwrap();
         assert_eq!(c.reserved_bytes(), 2048);
         // 3 本目: 追い出して同じ場所を使い回す (確保は増えない)
@@ -1893,5 +2013,111 @@ mod tests {
         let tiny = ExpertCacheSet::new_ram(1024, specs, &[p], 0, false).expect("set");
         assert_eq!(tiny.slots(ExpertMatrix::Gate), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // task 907: RAM tier の予算会計と thrash (32-64 GiB の機械を想定した形)
+    // -----------------------------------------------------------------
+
+    /// 予算が尽きたら**ヒープへ逃げず**、LRU の古い順に 1 本ゆずる。
+    ///
+    /// 旧実装は `take` が `None` のときヒープの `Vec` に読んで載せていた
+    /// (= 予算外の常駐が増え、pinned の意味も会計も壊れる)。予算 2 KiB /
+    /// 1 本 1 KiB で 6 本引いても、常駐は 2 本・確保は 2 KiB のまま。
+    #[test]
+    fn task907_ram_store_evicts_instead_of_escaping_to_the_heap() {
+        let data = pat(1 << 16);
+        let src = Mem::new(data.clone());
+        let c = ExpertCache::new_fixed(2, 1024, 2048, 0, false);
+        for e in 0..6u16 {
+            let off = e as u64 * 1024;
+            let r = c.get(key(0, e), off, 1024, &src).expect("載るはず");
+            assert_eq!(&r[..], &data[e as usize * 1024..][..1024]);
+        }
+        assert_eq!(c.used(), 2, "予算外の常駐が増えた (ヒープへ逃げた)");
+        assert_eq!(c.reserved_bytes(), 2048, "予算を超えて確保した");
+        assert_eq!(c.lost_regions(), 0, "読者が居ないのに区間を失った");
+        assert!(c.stats().evictions >= 4, "追い出しが起きていない");
+    }
+
+    /// 大きい空き区間から小さい区間を切り出したら、**余りを空きへ返す**。
+    ///
+    /// 余りを捨てると混合量子化 (1 本のバイト数が型ごとに違う) で入れ替えの
+    /// たびに予算の実バイトが痩せ、`take` が失敗して再調整が回り続ける。
+    #[test]
+    fn task907_ram_store_returns_the_split_tail_to_the_free_list() {
+        let data = pat(1 << 16);
+        let src = Mem::new(data);
+        // 予算 4 KiB / スロット 3 本。2048 + 1024 + 1024 で満杯。
+        let c = ExpertCache::new_fixed(3, 2048, 4096, 0, false);
+        let _ = c.get(key(0, 0), 0, 2048, &src).unwrap();
+        let _ = c.get(key(0, 1), 2048, 1024, &src).unwrap();
+        let _ = c.get(key(0, 2), 3072, 1024, &src).unwrap();
+        assert_eq!(c.reserved_bytes(), 4096);
+        // 512 を要求 → 2 KiB の区間をゆずって切り出す。余り 1536 は空きへ。
+        let _ = c.get(key(0, 3), 0, 512, &src).unwrap();
+        assert_eq!(
+            c.reserved_bytes(),
+            4096,
+            "余りを捨てたので塊を増やした (予算の痩せ = thrash の種)"
+        );
+        // 1536 は余りから取れる (塊を増やさない)。
+        let r = c
+            .get(key(0, 4), 4096, 1536, &src)
+            .expect("余りから取れるはず");
+        assert_eq!(r.len(), 1536);
+        assert_eq!(c.reserved_bytes(), 4096, "余りを使わず塊を増やした");
+        assert_eq!(c.used(), 3, "スロット数を超えて常駐した");
+        assert_eq!(c.lost_regions(), 0);
+    }
+
+    /// 使用中の読者が居る区間は予算へ戻せない。載せられないことを隠さず、
+    /// pread もしない (会計は正直に `lost` に出る)。
+    #[test]
+    fn task907_ram_store_reports_a_live_reader_blocking_the_budget() {
+        let data = pat(1 << 16);
+        let src = Mem::new(data);
+        let c = ExpertCache::new_fixed(1, 1024, 1024, 0, false);
+        let held = c.get(key(0, 0), 0, 1024, &src).unwrap();
+        assert!(
+            c.get(key(0, 1), 1024, 1024, &src).is_err(),
+            "使用中で場所が無いのに載せた"
+        );
+        assert_eq!(c.used(), 0, "載らないはずの鍵が載った");
+        assert_eq!(c.lost_regions(), 1, "戻せなかった区間を数えていない");
+        assert_eq!(src.reads(), 1, "載せられないのに pread した");
+        assert_eq!(held.len(), 1024);
+    }
+
+    /// 同じ鍵を違う長さで載せ直しても、古い区間を空きへ返し、LRU を壊さない。
+    ///
+    /// 一番古い (= tail) の鍵を載せ直すのが肝。旧実装は `map` を上書きして
+    /// から `unlink` したので、リストの head/tail が NIL に潰れていた。
+    #[test]
+    fn task907_ram_store_replace_returns_the_old_region() {
+        let data = pat(1 << 16);
+        let src = Mem::new(data);
+        // 予算 4 KiB / スロット 2 本。
+        let c = ExpertCache::new_fixed(2, 2048, 4096, 0, false);
+        let _ = c.get(key(0, 0), 0, 1024, &src).unwrap();
+        let _ = c.get(key(0, 1), 1024, 1024, &src).unwrap();
+        // k0 は tail。同じ鍵を 512 バイトで載せ直す。
+        let r = c.get(key(0, 0), 0, 512, &src).unwrap();
+        assert_eq!(r.len(), 512);
+        assert_eq!(c.used(), 2, "同じ鍵を二重に数えた");
+        assert_eq!(c.lost_regions(), 0, "置き換えで区間を失った");
+        assert_eq!(c.reserved_bytes(), 2560, "置き換えで塊を増やした");
+        assert!(c.keys().contains(&key(0, 1)), "k1 が消えた");
+        // リストが壊れていなければ、次の追い出しは一番古い k1。
+        // (`peek` は LRU を触るので、順序を見る前に呼ばない。)
+        let _ = c.get(key(0, 2), 2048, 1024, &src).unwrap();
+        assert_eq!(c.used(), 2);
+        assert!(
+            !c.keys().contains(&key(0, 1)),
+            "k1 が追い出されていない keys={:?} stats={:?}",
+            c.keys(),
+            c.stats()
+        );
+        assert!(c.peek(key(0, 0), 512).is_some(), "載せ直した k0 が消えた");
     }
 }

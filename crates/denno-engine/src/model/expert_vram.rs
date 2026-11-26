@@ -4401,4 +4401,98 @@ mod tests {
         assert_eq!(ev[0].0, 1, "最古ではなく頻度が最小の 1");
         assert!(c.get_mut(&0).is_some(), "最古でも温かい 0 は残る");
     }
+
+    // -----------------------------------------------------------------
+    // task 907: 12-16 GiB の VRAM と 32-64 GiB の RAM が同時に詰まったとき
+    // -----------------------------------------------------------------
+
+    /// 12 / 16 GiB の VRAM 予算で 27B の decode 列 (48 層 × top-10) を回しても
+    /// `used + pinned <= cap` が崩れない (頻度ゲートが断っても会計は動かない)。
+    ///
+    /// RAM tier (32-64 GiB) は別の予算・別のストアなので、ここには一切効かない
+    /// (`budget_from_parts` の `expert_cap` は VRAM のぶんだけ)。
+    #[test]
+    fn task907_vram_budget_holds_under_12_to_16_gib_pressure() {
+        for cap_gib in [12usize, 16] {
+            let cap = cap_gib << 30;
+            let per = 3 * 1024 * 1024; // 1 本 3 MiB
+            let mut c: VramLru<ExpertKey, u64> =
+                VramLru::with_policy(cap, CachePolicy::TinyLfu);
+            let mut inserts = 0u64;
+            for tok in 0..120u64 {
+                for l in 0..48u16 {
+                    for j in 0..10u64 {
+                        let e = ((tok * 131 + l as u64 * 17 + j * 7) % 256) as u16;
+                        let key = ExpertKey { layer: l, expert: e };
+                        if c.get_mut(&key).is_some() {
+                            continue;
+                        }
+                        // 断られたら CPU 経路へ落ちる (1 本も追い出さない)。
+                        let Ok(ev) = c.make_room_for(&key, per) else {
+                            continue;
+                        };
+                        drop(ev);
+                        c.insert(key, per, inserts);
+                        inserts += 1;
+                        assert!(
+                            c.total_bytes() <= cap,
+                            "cap {cap_gib} GiB: {} > {cap}",
+                            c.total_bytes()
+                        );
+                    }
+                }
+            }
+            assert!(c.stats().evictions > 0, "cap {cap_gib} GiB: 追い出しが無い");
+            assert!(
+                c.stats().admission_rejects > 0,
+                "cap {cap_gib} GiB: 頻度ゲートが 1 度も断らない"
+            );
+            let real: usize = c.entries.values().map(|s| s.bytes).sum();
+            assert_eq!(c.used_bytes(), real, "used_bytes が実体と合わない");
+            assert_eq!(c.pinned_bytes(), 0, "外部予約が残っている");
+        }
+    }
+
+    /// 16 GiB の予算で prefill の外部予約 (1.5 GiB) を 100 回 借りて返しても、
+    /// `pinned` が漏れず `used` を二重に数えない。
+    #[test]
+    fn task907_pinned_reservations_do_not_double_count() {
+        let cap = 16usize << 30;
+        let per = 3 * 1024 * 1024;
+        let mut c: VramLru<ExpertKey, u64> = VramLru::with_policy(cap, CachePolicy::Lru);
+        // decode ぶん 4,096 本 (12 GiB) を載せる。
+        for i in 0..4_096u64 {
+            let key = ExpertKey {
+                layer: (i / 256) as u16,
+                expert: (i % 256) as u16,
+            };
+            let ev = c.make_room(per).unwrap();
+            drop(ev);
+            c.insert(key, per, i);
+        }
+        let pinned_want = 1536usize << 20; // 1.5 GiB
+        let mut used_after_first = None;
+        for round in 0..100 {
+            let ev = c.reserve_pinned(pinned_want).expect("予約できる");
+            assert_eq!(c.pinned_bytes(), pinned_want, "round {round}: 予約量が違う");
+            assert!(c.total_bytes() <= cap, "round {round}: 予算超過");
+            assert_eq!(ev.len(), 0, "round {round}: 12+1.5 GiB は上限内");
+            drop(ev);
+            c.release_pinned(pinned_want);
+            assert_eq!(c.pinned_bytes(), 0, "round {round}: 返却漏れ");
+            assert_eq!(
+                c.total_bytes(),
+                c.used_bytes(),
+                "round {round}: used と pinned の二重計上"
+            );
+            match used_after_first {
+                None => used_after_first = Some(c.used_bytes()),
+                Some(u) => assert_eq!(c.used_bytes(), u, "round {round}: 会計が動いた"),
+            }
+        }
+        // 二重返却しても予算は増えない (pinned は 0 で止まる)。
+        c.release_pinned(1 << 30);
+        assert_eq!(c.pinned_bytes(), 0);
+        assert_eq!(c.cap_bytes(), cap, "返却で上限が動いた");
+    }
 }

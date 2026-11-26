@@ -2690,17 +2690,25 @@ fn expert_ram_fill(
             };
             let key = ExpertKey { layer, expert };
             let mut n = 0u64;
+            let mut ok = true;
             for (mi, w) in [g, u, d].into_iter().enumerate() {
                 let Ok((off, len)) = w.slice_abs(expert as usize) else {
                     return;
                 };
                 let m = ExpertMatrix::ALL[mi];
-                if set.get(m, w.file, key, off, len).is_ok() {
-                    n += len as u64;
+                match set.get(m, w.file, key, off, len) {
+                    Ok(_) => n += len as u64,
+                    // task 907: 予算が尽きたら 3 行列そろわない (tier には載らない)。
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
                 }
             }
             bytes.fetch_add(n, Ordering::Relaxed);
-            done.fetch_add(1, Ordering::Relaxed);
+            if ok {
+                done.fetch_add(1, Ordering::Relaxed);
+            }
         };
         match &pool {
             Ok(p) => {
@@ -4974,26 +4982,8 @@ fn rebalance_once(parts: &[std::path::PathBuf], dir_name: &str) -> Option<String
         .iter()
         .map(|k| (k.layer, k.expert))
         .collect();
-    let want: std::collections::HashSet<(u16, u16)> = plan
-        .iter()
-        .rev()
-        .filter(|k| !vram.contains(k))
-        .take(cap)
-        .copied()
-        .collect();
     let have: Vec<(u16, u16)> = set.keys().iter().map(|k| (k.layer, k.expert)).collect();
-    let have_set: std::collections::HashSet<(u16, u16)> = have.iter().copied().collect();
-    let drop_keys: Vec<ExpertKey> = have
-        .iter()
-        .filter(|k| !want.contains(k))
-        .map(|&(layer, expert)| ExpertKey { layer, expert })
-        .collect();
-    // 昇順 (少ない順) に埋める = 一番熱いのが最後に触られる。
-    let fill_keys: Vec<(u16, u16)> = plan
-        .iter()
-        .filter(|k| want.contains(k) && !have_set.contains(k))
-        .copied()
-        .collect();
+    let (drop_keys, fill_keys) = expert_ram::rebalance_plan(&plan, cap, &vram, &have);
     if drop_keys.is_empty() && fill_keys.is_empty() {
         return None;
     }
@@ -5002,8 +4992,8 @@ fn rebalance_once(parts: &[std::path::PathBuf], dir_name: &str) -> Option<String
         while exp_stats::busy() {
             std::thread::sleep(Duration::from_millis(2));
         }
-        for k in chunk {
-            if set.evict(*k) {
+        for &(layer, expert) in chunk {
+            if set.evict(ExpertKey { layer, expert }) {
                 dropped += 1;
             }
         }
@@ -5048,6 +5038,11 @@ fn rebalance_once(parts: &[std::path::PathBuf], dir_name: &str) -> Option<String
                 if ok {
                     promoted += 1;
                 }
+            }
+            // task 907: 予算 / 空きが尽きたら、このパスはここで止める
+            // (残りは次のパスで、状態が変わったときだけ試す)。
+            if set.stopped() {
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
