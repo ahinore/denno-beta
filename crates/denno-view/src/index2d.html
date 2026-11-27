@@ -3239,7 +3239,13 @@ function connectWs() {
         break;
       }
       off = r.next;
-      handleFrame(r.frame);
+      // task 1641: 1 枚のハンドラ例外で WS ループを止めない (onmessage の外へ
+      // 例外を出さない)。壊れた値は表示にだけ出す。
+      try {
+        handleFrame(r.frame);
+      } catch (e) {
+        $('wsstat').textContent = 'frame error: ' + (e && e.message ? e.message : e);
+      }
     }
   };
   ws.onclose = () => {
