@@ -771,16 +771,28 @@ pub(crate) mod tests {
         ROUTER_SYNCED.with(|c| c.set(false));
     }
 
-    /// task 368: `DENNO_DEC_SYNC_STREAM` の解釈。既定は off (採否前)。
-    /// 明示的な真偽だけを受け付け、壊れた値は既定へ倒す。
+    /// task 368: `DENNO_DEC_SYNC_STREAM` の解釈。既定は off (lab t1377e で
+    /// 利得が出ず既定 off のまま / 定数 [`DEC_SYNC_STREAM_DEFAULT`] を見る)。
+    /// 明示的な真偽だけを受け付け、空文字と壊れた値は既定へ倒す。
     #[test]
     fn dec_sync_stream_gate_reads_only_explicit_values() {
-        assert!(!dec_sync_stream_from_value(None), "既定は off");
+        assert_eq!(
+            dec_sync_stream_from_value(None),
+            DEC_SYNC_STREAM_DEFAULT,
+            "未設定は既定へ"
+        );
         for v in ["1", "on", "ON", " true ", "yes"] {
             assert!(dec_sync_stream_from_value(Some(v)), "{v} を on と読んでいない");
         }
-        for v in ["0", "off", "False", "no", "", "2", "maybe"] {
+        for v in ["0", "off", "False", "no"] {
             assert!(!dec_sync_stream_from_value(Some(v)), "{v} を off と読んでいない");
+        }
+        for v in ["", "2", "maybe"] {
+            assert_eq!(
+                dec_sync_stream_from_value(Some(v)),
+                DEC_SYNC_STREAM_DEFAULT,
+                "{v} が既定へ倒れていない"
+            );
         }
     }
 

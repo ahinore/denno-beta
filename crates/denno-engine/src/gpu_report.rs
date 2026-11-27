@@ -159,3 +159,41 @@ pub fn sh_gu_line() -> Option<String> {
     #[cfg(not(feature = "cuda"))]
     None
 }
+
+/// task 1377: PDL (`DENNO_CUDA_PDL`) の集計行。
+/// ゲート off / 1 回も判定していなければ `None`。cuda 無しでは常に `None`。
+pub fn cuda_pdl_line() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    return crate::cuda::pdl::stats_line();
+    #[cfg(not(feature = "cuda"))]
+    None
+}
+
+/// task 1377: [`cuda_pdl_line`] の積算を 0 に戻す。
+pub fn cuda_pdl_reset() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::pdl::reset();
+}
+
+/// task 1377: decode 1 トークンの鎖のガード。cuda 無しのビルドでは何もしない。
+///
+/// `forward_token_at` が `nt == 1` で開く。この窓の中の **null ストリーム** の
+/// 発行にだけ `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` が付く
+/// (`DENNO_CUDA_PDL=1` かつ SM 90+ のとき)。drop で深さが戻る。
+pub struct CudaPdlWindow {
+    #[cfg(feature = "cuda")]
+    _w: Option<crate::cuda::pdl::DecodeWindow>,
+}
+
+/// task 1377: decode の窓を開く (cuda 無しのビルドでは空のガード)。
+pub fn cuda_pdl_window(on: bool) -> CudaPdlWindow {
+    #[cfg(feature = "cuda")]
+    return CudaPdlWindow {
+        _w: Some(crate::cuda::pdl::decode_window(on)),
+    };
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = on;
+        CudaPdlWindow {}
+    }
+}

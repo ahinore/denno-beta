@@ -5517,6 +5517,10 @@ impl Qwen4Exp {
         // (逐次 prefill の末尾 1 トークンもここに入るが、値は CPU 経路と一致する
         // 契約なので問題にしない)。off ではガードの drop が 1 回走るだけ。
         let _gw = gdn_gpu_win::window(nt == 1);
+        // task 1377: decode 1 トークンの鎖 (`nt == 1`) の間だけ PDL の窓を開く。
+        // 窓の中の null ストリームの発行に `DENNO_CUDA_PDL=1` + SM 90+ で
+        // PROGRAMMATIC_STREAM_SERIALIZATION が付く。off ではガードの drop だけ。
+        let _pw = crate::gpu_report::cuda_pdl_window(nt == 1);
         // task 266: decode (nt == 1) のトークン先頭で、前のトークンの選択に基づく
         // 先読みを背景スレッドへ積む (`DENNO_DEC_PREF=1` のときだけ)。
         if nt == 1 {

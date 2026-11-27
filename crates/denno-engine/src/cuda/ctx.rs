@@ -761,6 +761,10 @@ impl CudaCtx {
             check((lib.primary_ctx_retain)(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
             check((lib.ctx_set_current)(ctx), "cuCtxSetCurrent")?;
 
+            // task 1577: L2 persisting cache の予約 (既定 off)。未対応 GPU/driver・
+            // env off では何もしない (失敗しても ctx 生成は続行)。
+            l2::init(dev);
+
             // PTX は NUL 終端が必要
             let mut image = PTX.to_vec();
             image.push(0);
@@ -1275,6 +1279,10 @@ impl CudaCtx {
             crate::mem_audit::note_module("moe_v2", PTX_MOE_V2.len());
             crate::mem_audit::note_module("gemm_q", PTX_GEMM_Q.len());
 
+            // task 1377: PDL の可否は SM 番号で決まる。ここで 1 回だけ置く
+            // (5090 は (12, 0)。major だけ見ると 12 < 90 で一度も付かない)。
+            pdl::set_device_sm(pdl::sm_number(maj, min));
+
             Ok(Self {
                 device: dev,
                 name,
@@ -1326,18 +1334,43 @@ impl CudaCtx {
 
     /// "NVIDIA GeForce RTX 5090 (sm_120, driver 13010)" 形式の情報
     pub fn info(&self) -> String {
+        // task 1577: L2 persisting の状態を 1 語だけ添える (既定 off は "off")。
+        let l2 = match l2::state() {
+            Some(st) if st.cfg.enabled => {
+                format!(", l2-persist on ({} MiB)", st.cfg.limit_bytes / l2::MIB)
+            }
+            Some(_) => ", l2-persist off".to_string(),
+            None => String::new(),
+        };
         format!(
-            "{} (sm_{}{}, driver {}, attn_pf dyn smem {}KB)",
+            "{} (sm_{}{}, driver {}, attn_pf dyn smem {}KB{})",
             self.name,
             self.cc.0,
             self.cc.1,
             self.driver_ver,
-            self.attn_pf_dyn_smem / 1024
+            self.attn_pf_dyn_smem / 1024,
+            l2
         )
     }
 
     pub fn device(&self) -> c_int {
         self.device
+    }
+
+    /// task 1577: 再利用する device 範囲を L2 persisting にする
+    /// (`CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW`, default stream)。
+    ///
+    /// `DENNO_CUDA_L2_PERSIST` が off・未対応 GPU・窓の設定失敗では false を
+    /// 返すだけで何も起きない (数値・発行順は不変)。ストリームに窓は 1 本しか
+    /// 持てないので、既存の窓より小さい範囲は無視される ([`l2::persist_range`])。
+    pub fn persist_l2_range(&self, base: CUdeviceptr, bytes: usize) -> bool {
+        l2::persist_range(base, bytes)
+    }
+
+    /// task 1577: persisting L2 の窓と予約を捨てる (`cuCtxResetPersistingL2Cache`)。
+    /// 無効時は no-op。
+    pub fn reset_persisting_l2(&self) {
+        l2::reset()
     }
 
     /// カーネル起動のみ (同期しない — デフォルトストリームにエンキュー)。
@@ -1403,21 +1436,49 @@ impl CudaCtx {
             shmem,
             0,
         );
+        // task 1377: decode の鎖 (SM 90+ / ゲート on) では PDL 属性付きで発行する。
+        // 属性付きが失敗したら、その 1 回は従来の launch でやり直す (fail closed)。
+        let mut pdl_res: Option<CUresult> = None;
+        if pdl::eligible(stream) {
+            if let Some(fex) = lib.launch_ex {
+                let mut attr = pdl::programmatic_attr();
+                let cfg = pdl::launch_config(grid, block, shmem, stream, &mut attr);
+                let res = (fex)(
+                    &cfg as *const pdl::CUlaunchConfig,
+                    f,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                );
+                if res == CUDA_SUCCESS {
+                    pdl::note_launch();
+                    pdl_res = Some(res);
+                } else {
+                    pdl::note_fallback(res);
+                }
+            }
+        }
         let r = check(
-            (lib.launch)(
-                f,
-                grid.0,
-                grid.1,
-                grid.2,
-                block.0,
-                block.1,
-                block.2,
-                shmem,
-                stream,
-                args.as_mut_ptr(),
-                std::ptr::null_mut(),
-            ),
-            "cuLaunchKernel",
+            match pdl_res {
+                Some(res) => res,
+                None => (lib.launch)(
+                    f,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
+                    shmem,
+                    stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+            },
+            if pdl_res.is_some() {
+                "cuLaunchKernelEx(PDL)"
+            } else {
+                "cuLaunchKernel"
+            },
         );
         dec_kprof::op_end(kp);
         if let Some(a) = ev0 {

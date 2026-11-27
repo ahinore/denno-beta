@@ -561,10 +561,96 @@ pub(crate) struct GdnStateCache {
     pub(crate) cur_kv: Option<u64>,          // この正本が属する KV キャッシュ ID (None = 未使用)
     pub(crate) ssm: Vec<Option<DevBuffer>>, // [layer] ssm [nv, dk, dv] (デバイス正本)
     pub(crate) valid: Vec<bool>,            // [layer] = ホスト KvCache::gdn と一致している
+    /// task 1577: 連結プール (`DENNO_CUDA_GDN_POOL`, 既定 off)。Some のとき
+    /// `conv` / `ssm` の各層はこのプールの**非所有ビュー**になる (drop で解放しない)。
+    pool: Option<GdnPool>,
     srows: Option<DevBuffer>,    // [n, nv, dk, dv] hoist 経路の境界行
     srows_n: usize,              // srows がいま表現している n (0 = 未初期化)
     rows: usize,                 // 行数 (= nk*dk = vd)
     cols: usize,                 // 列数 (= dk*dv)
+}
+
+
+/// task 1577: 全層の GDN 状態を 1 本に詰めた連続領域。
+///
+/// P1372 の L2 persisting 窓はストリームに 1 本しか張れないため、層ごとに
+/// 別々に確保された状態では 1 層しか固定できない。ここを 1 本にすれば
+/// プール全体 (36-48 層で約 380-510 MiB) を 1 本の窓で persisting にできる
+/// (窓の上限は `MAX_ACCESS_POLICY_WINDOW_SIZE` で clamp される)。
+struct GdnPool {
+    buf: DevBuffer,
+    /// 収容できる層数 (倍々で伸ばす)。
+    cap_layers: usize,
+    conv_len: usize,
+    rows: usize,
+    cols: usize,
+}
+
+
+// ---------------------------------------------------------------------------
+// task 1577: 連結 GDN 状態プールの純関数 (`DENNO_CUDA_GDN_POOL`, 既定 off)
+//
+// レイアウト (層 li の先頭 = pool + li * stride):
+//   [conv (conv_len*4 を 256 B に切り上げ)] [ssm (rows*cols*4 を 256 B に切り上げ)]
+// 層数は最初の decode で 1 層ずつ増えるので、容量は倍々で伸ばし、伸ばすときは
+// 旧領域の中身を同期 D2D で先頭へ写す (値と `valid` の意味は不変)。
+// ---------------------------------------------------------------------------
+
+/// プール内のスロット境界。cuMemcpyDtoD の宛先整列と conv/ssm の取り違え防止。
+pub(crate) const GDN_POOL_ALIGN: usize = 256;
+
+/// `bytes` を [`GDN_POOL_ALIGN`] の倍数に切り上げる (純関数)。
+pub(crate) fn gdn_pool_align_up(bytes: usize) -> usize {
+    bytes.saturating_add(GDN_POOL_ALIGN - 1) & !(GDN_POOL_ALIGN - 1)
+}
+
+/// 層 1 本のレイアウト `(conv スロット, ssm スロット, 層ストライド)`。
+/// どちらかが 0 要素になる形は None (プールに載せず従来経路へ落とす)。
+pub(crate) fn gdn_pool_layout(
+    conv_len: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<(usize, usize, usize)> {
+    const F: usize = std::mem::size_of::<f32>();
+    let conv = conv_len.checked_mul(F).filter(|v| *v > 0)?;
+    let ssm = rows.checked_mul(cols)?.checked_mul(F).filter(|v| *v > 0)?;
+    let conv = gdn_pool_align_up(conv);
+    let ssm = gdn_pool_align_up(ssm);
+    Some((conv, ssm, conv.checked_add(ssm)?))
+}
+
+/// プールの総バイト数 (純関数)。
+pub(crate) fn gdn_pool_bytes(
+    layers: usize,
+    conv_len: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<usize> {
+    let (_, _, stride) = gdn_pool_layout(conv_len, rows, cols)?;
+    layers.checked_mul(stride).filter(|v| *v > 0)
+}
+
+/// 必要な層数を満たす容量 (純関数)。最小 8 層から倍々 (8, 16, 32, ...)。
+pub(crate) fn gdn_pool_grow_cap(cap: usize, need: usize) -> usize {
+    let mut c = cap.max(8);
+    while c < need {
+        c = c.saturating_mul(2);
+    }
+    c
+}
+
+/// `DENNO_CUDA_GDN_POOL` の真偽表 (純関数)。1/on/true/yes だけが有効。
+pub(crate) fn parse_gdn_pool(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// プールを使うか (env は 1 回だけ読む。未設定・空・その他の値は off)。
+fn gdn_pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gdn_pool(std::env::var("DENNO_CUDA_GDN_POOL").ok().as_deref()))
 }
 
 
@@ -576,6 +662,7 @@ impl GdnStateCache {
             cur_kv: None,
             ssm: Vec::new(),
             valid: Vec::new(),
+            pool: None,
             srows: None,
             srows_n: 0,
             rows: 0,
@@ -619,9 +706,17 @@ impl GdnStateCache {
         if (self.rows != 0 && (self.rows != rows || self.cols != cols)) || self.rows != rows {
             self.invalidate();
             self.srows_n = 0;
+            if self.pool.is_some() {
+                self.drop_pool();
+            }
         }
         self.rows = rows;
         self.cols = cols;
+        // task 1577: プール有効時は ssm スロットも ensure_conv で張る
+        // (conv 長がそろってからでないと 1 層ぶんのストライドが決まらない)。
+        if gdn_pool_on() {
+            return Ok(());
+        }
         GdnScratch::grow(&mut self.ssm[li], rows * cols * F)?;
         Ok(())
     }
@@ -629,9 +724,149 @@ impl GdnStateCache {
     pub(crate) fn ensure_conv(&mut self, li: usize, len: usize) -> Result<()> {
         const F: usize = std::mem::size_of::<f32>();
         self.touch_layer(li);
-        GdnScratch::grow(&mut self.conv[li], len * F)?;
         self.conv_len = len;
+        // task 1577: 連結プール (既定 off)。載らない形なら従来の層別確保へ落ちる。
+        if gdn_pool_on() {
+            if self.ensure_pool(li + 1, len, self.rows, self.cols)? {
+                return Ok(());
+            }
+            // 載らない形 (conv か ssm が 0 要素) では ensure_layer も確保を
+            // 見送っているので、ここで従来どおり層別に確保してから戻る。
+            let ssm_bytes = self.rows * self.cols * F;
+            if self.ssm[li].is_none() && ssm_bytes > 0 {
+                GdnScratch::grow(&mut self.ssm[li], ssm_bytes)?;
+            }
+        }
+        GdnScratch::grow(&mut self.conv[li], len * F)?;
         Ok(())
+    }
+
+    /// task 1577: プールを畳む。`conv` / `ssm` のビューは生ポインタを持たない
+    /// ように先に捨てる (所有者を消す前に参照を残さない)。
+    fn drop_pool(&mut self) {
+        self.pool = None;
+        for v in self.conv.iter_mut() {
+            *v = None;
+        }
+        for v in self.ssm.iter_mut() {
+            *v = None;
+        }
+    }
+
+    /// task 1577: プールを (必要なら伸ばして) 確保し、層ビューを張り直す。
+    ///
+    /// 戻り値 true = プールに載った (`conv[li]` / `ssm[li]` がプール内ビュー)。
+    /// false = 形が 0 で載せられない (呼び出し側が従来の層別確保へ落ちる)。
+    fn ensure_pool(&mut self, need: usize, conv_len: usize, rows: usize, cols: usize) -> Result<bool> {
+        let Some((cb, sb, stride)) = gdn_pool_layout(conv_len, rows, cols) else {
+            return Ok(false);
+        };
+        let (cap, same_shape) = match &self.pool {
+            Some(p) => (
+                p.cap_layers,
+                p.conv_len == conv_len && p.rows == rows && p.cols == cols,
+            ),
+            None => (0, false),
+        };
+        if same_shape && cap >= need {
+            self.bind_pool_views();
+            return Ok(true);
+        }
+        let cap = gdn_pool_grow_cap(cap, need);
+        if self.pool.is_some() && !same_shape {
+            // 形が変わった: 旧領域の中身は新しいストライドへ写せない →
+            // 次の層利用でホストから seed し直す (`valid` を落とす)。
+            self.invalidate();
+        }
+        let bytes = cap
+            .checked_mul(stride)
+            .ok_or_else(|| anyhow!("gdn pool size overflow"))?;
+        let buf = DevBuffer::alloc_tagged(bytes, crate::mem_audit::TAG_GDN_MIRROR)?;
+        if same_shape {
+            // 容量だけ伸ばす: 旧領域の中身 (valid な層の状態) を先頭へ写す。
+            // 同期 D2D なので戻った時点で写し終わっている (旧領域はこの後 drop)。
+            let mut copied = false;
+            if let Some(old) = &self.pool {
+                let n = old.buf.bytes().min(bytes);
+                if n > 0 {
+                    if let Ok(l) = lib() {
+                        copied = unsafe { (l.memcpy_dtod)(buf.ptr(), old.buf.ptr(), n) } == CUDA_SUCCESS;
+                    }
+                } else {
+                    copied = true;
+                }
+            }
+            if !copied {
+                // 写せないなら中身は信用しない (次にその層を使うときホストから seed)。
+                for v in self.valid.iter_mut() {
+                    *v = false;
+                }
+            }
+        }
+        // 旧ビューは新領域とは別人なので、まず全部落としてから差し替える。
+        for v in self.conv.iter_mut() {
+            *v = None;
+        }
+        for v in self.ssm.iter_mut() {
+            *v = None;
+        }
+        let moved = self.pool.as_ref().map(|p| p.buf.ptr()).unwrap_or(0);
+        self.pool = Some(GdnPool {
+            buf,
+            cap_layers: cap,
+            conv_len,
+            rows,
+            cols,
+        });
+        self.bind_pool_views();
+        let base = self.pool.as_ref().expect("pool 直前に確保").buf.ptr();
+        tracing::info!(
+            "[gdn-pool] alloc {} MiB ({} layers x {} B = conv {} B + ssm {} B)",
+            bytes / (1024 * 1024),
+            cap,
+            stride,
+            cb,
+            sb
+        );
+        // task 1577: 連続領域 1 本を L2 persisting の窓にする
+        // (DENNO_CUDA_L2_PERSIST=1 のときだけ。それ以外は no-op)。
+        // 領域が動いた (再確保) なら古い窓を捨ててから張り直す。
+        if moved != 0 && moved != base {
+            l2::reset();
+        }
+        if l2::persist_range_budgeted(base, bytes) {
+            tracing::info!(
+                "[gdn-pool] L2 persisting window base=0x{base:x} (pool {} MiB, budget で clamp)",
+                bytes / (1024 * 1024)
+            );
+        }
+        Ok(true)
+    }
+
+    /// task 1577: プール内の各層の conv / ssm ビューを (再) 設定する。
+    fn bind_pool_views(&mut self) {
+        let (cap, conv_len, rows, cols, base) = match &self.pool {
+            Some(p) => (p.cap_layers, p.conv_len, p.rows, p.cols, p.buf.ptr()),
+            None => return,
+        };
+        let Some((cb, sb, stride)) = gdn_pool_layout(conv_len, rows, cols) else {
+            return;
+        };
+        if self.conv.len() < cap {
+            self.conv.resize_with(cap, || None);
+            self.ssm.resize_with(cap, || None);
+            self.valid.resize(cap, false);
+        }
+        for li in 0..cap {
+            let cptr = base + (li * stride) as CUdeviceptr;
+            if self.conv[li].as_ref().map(|b| b.ptr()) != Some(cptr) {
+                self.conv[li] = Some(DevBuffer::view(cptr, cb));
+            }
+            let sptr = cptr + cb as CUdeviceptr;
+            if self.ssm[li].as_ref().map(|b| b.ptr()) != Some(sptr) {
+                self.ssm[li] = Some(DevBuffer::view(sptr, sb));
+            }
+        }
     }
     /// hoist 経路の境界行バッファ [n, nv, dk, dv] を確保 (n が同じなら再利用)。
     fn ensure_srows(&mut self, n: usize, rows: usize, cols: usize) -> Result<CUdeviceptr> {
@@ -809,6 +1044,8 @@ pub fn gdn_state_release() {
         let mut c = c.borrow_mut();
         c.invalidate();
         c.ensure_layers(0);
+        // task 1577: 連結プールも返す (VRAM を解放するのがこの関数の目的)。
+        c.drop_pool();
         c.cur_kv = None;
         c.rows = 0;
         c.cols = 0;
@@ -1043,6 +1280,14 @@ fn gdn_state_begin(
         }
         let pc = c.conv[li].as_ref().unwrap().ptr();
         let ps = c.ssm[li].as_ref().unwrap().ptr();
+        // task 1577: GDN のデバイス正本を L2 persisting にする (既定 off)。
+        // プール有効時は ensure_conv がプール全体を 1 本の窓で登録済みで、
+        // ここに来る時点で窓はプール (より大きい) なので driver は呼ばれない。
+        let pooled = c.pool.is_some();
+        if !pooled {
+            l2::persist_range(pc, conv_len * 4);
+            l2::persist_range(ps, rows * cols * 4);
+        }
         Ok((pc, ps))
     })
 }
@@ -8580,5 +8825,107 @@ mod gdn_decode_scan_tests {
         assert_eq!(gdn_invalidate_calls_for_test(), 1, "記帳されていない");
         // ストアにエントリが無くても panic しない (no-op)。
         assert_eq!(gdn_decode_state_entry_count(), 0);
+    }
+}
+
+
+// ---- task 1577: 連結 GDN 状態プールの CPU テスト (GPU 不要・純関数だけ) ----
+
+#[cfg(test)]
+mod gdn_pool_layout_tests {
+    use super::*;
+
+    /// env の真偽表: 1/on/true/yes (大小・前後空白を許す) だけ有効。
+    #[test]
+    fn gdn_pool_env_truth_table() {
+        for on in ["1", "on", "ON", " true ", "yes", "Yes", "TRUE"] {
+            assert!(parse_gdn_pool(Some(on)), "{on:?} は有効のはず");
+        }
+        for off in ["", "0", "off", "OFF", "false", "no", "2", "enable", "1x"] {
+            assert!(!parse_gdn_pool(Some(off)), "{off:?} は無効のはず");
+        }
+        assert!(!parse_gdn_pool(None));
+    }
+
+    /// 256 B 境界への切り上げ (conv と ssm のスロットが混ざらない前提)。
+    #[test]
+    fn gdn_pool_slot_alignment() {
+        assert_eq!(GDN_POOL_ALIGN, 256);
+        assert_eq!(gdn_pool_align_up(0), 0);
+        assert_eq!(gdn_pool_align_up(1), 256);
+        assert_eq!(gdn_pool_align_up(256), 256);
+        assert_eq!(gdn_pool_align_up(257), 512);
+        for n in [0usize, 1, 255, 256, 257, 172_032, 2_621_440] {
+            assert_eq!(gdn_pool_align_up(n) % GDN_POOL_ALIGN, 0);
+            assert!(gdn_pool_align_up(n) >= n);
+        }
+    }
+
+    /// 1 層ぶんのレイアウト。0 要素の形は None (従来の層別確保へ落ちる)。
+    #[test]
+    fn gdn_pool_layer_layout() {
+        // 27B の GDN: conv 43,008 要素 (172,032 B)、ssm [nv,dk,dv] = 2,621,440 要素。
+        let (cb, sb, stride) = gdn_pool_layout(43_008, 1280, 2048).expect("載る形");
+        assert_eq!(cb, 172_032); // 256 の倍数なのでそのまま
+        assert_eq!(sb, gdn_pool_align_up(1280 * 2048 * 4));
+        assert_eq!(stride, cb + sb);
+        assert_eq!(stride % GDN_POOL_ALIGN, 0);
+
+        // 0 要素は載せない (view の長さ 0 を作らない)。
+        assert_eq!(gdn_pool_layout(0, 8, 8), None);
+        assert_eq!(gdn_pool_layout(4, 0, 8), None);
+        assert_eq!(gdn_pool_layout(4, 8, 0), None);
+    }
+
+    /// 総バイト数 = 層数 x ストライド。桁あふれは None。
+    #[test]
+    fn gdn_pool_total_bytes() {
+        let (_, _, stride) = gdn_pool_layout(43_008, 1280, 2048).unwrap();
+        assert_eq!(gdn_pool_bytes(8, 43_008, 1280, 2048), Some(8 * stride));
+        assert_eq!(gdn_pool_bytes(0, 43_008, 1280, 2048), None);
+        assert_eq!(gdn_pool_bytes(usize::MAX, 43_008, 1280, 2048), None);
+    }
+
+    /// 容量は 8 層から倍々。要求を満たす最小の 2 の冪 (8 以上)。
+    #[test]
+    fn gdn_pool_capacity_growth() {
+        assert_eq!(gdn_pool_grow_cap(0, 1), 8);
+        assert_eq!(gdn_pool_grow_cap(0, 8), 8);
+        assert_eq!(gdn_pool_grow_cap(8, 9), 16);
+        assert_eq!(gdn_pool_grow_cap(8, 16), 16);
+        assert_eq!(gdn_pool_grow_cap(16, 17), 32);
+        assert_eq!(gdn_pool_grow_cap(8, 48), 64);
+        // 既に足りていれば伸ばさない (再確保しない = 窓を奪い直さない)。
+        assert_eq!(gdn_pool_grow_cap(64, 48), 64);
+    }
+
+    /// task 1577 の主張: 全層が **1 本の連続領域** に収まり、P1372 が固定できた
+    /// 1 層 (約 3 MiB) より多くの層を persisting 予算に載せられる。
+    #[test]
+    fn gdn_pool_single_range_covers_more_than_one_layer() {
+        const LAYERS: usize = 48;
+        let (cb, sb, stride) = gdn_pool_layout(43_008, 1280, 2048).unwrap();
+        let total = gdn_pool_bytes(LAYERS, 43_008, 1280, 2048).unwrap();
+        // 連続: 層 li の conv/ssm は [base, base+total) の中にあり、重ならない。
+        for li in 0..LAYERS {
+            let c = li * stride;
+            let s = c + cb;
+            assert!(c + cb <= total);
+            assert!(s + sb <= total);
+            assert!(c + cb <= s, "conv と ssm が重なる (layer {li})");
+            if li + 1 < LAYERS {
+                assert!(s + sb <= (li + 1) * stride, "層が重なる (layer {li})");
+            }
+        }
+        // persisting 予算 (既定 48 MiB) に入る層数が 1 より大きいこと。
+        // P1372 は層別確保のため 1 層 (3 MiB) しか固定できなかった。
+        let budget = 48 * 1024 * 1024;
+        assert!(
+            budget / stride >= 4,
+            "48 MiB で {} 層しか固定できない (stride {stride} B)",
+            budget / stride
+        );
+        // 128 MiB の窓上限でも全層は入らない (窓は予算で clamp する前提)。
+        assert!(total > 128 * 1024 * 1024);
     }
 }
