@@ -128,7 +128,7 @@
   <div><span class="vram">VRAM <b id="n_vram">0</b></span> / <span class="dim">cap <b id="cap">10500</b></span> ·
        <span class="ram">RAM <b id="n_ram">0</b></span> ·
        <span class="ssd">DISK <b id="n_ssd">0</b></span></div>
-  <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b></div>
+  <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b><span id="gapline" hidden> · gap <b id="gap_lost">0</b></span></div>
   <div id="connbanner" class="off" role="status" aria-live="polite" aria-atomic="true" hidden
        style="color:#ffb3bd;border:1px solid #7a1c24;border-radius:3px;padding:1px 7px;margin:3px 0"></div>
   <div id="stalestat" class="off" role="status" aria-live="polite" aria-atomic="true" hidden
@@ -1702,7 +1702,7 @@ const hudEl = {
   ssd: document.getElementById('t_ssd'), mode: document.getElementById('mode'),
   cur: document.getElementById('cur'), curkind: document.getElementById('curkind')
 };
-const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0, pfTps: 0, dcTps: 0, pfMax: 0, dcMax: 0 };
+const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0, pfTps: 0, dcTps: 0, pfMax: 0, dcMax: 0, gapLost: 0 };
 let replayOn = false;
 function noteLiveMode() {
   if (fly.on) return;   // フライト中の案内を消さない
@@ -1872,6 +1872,16 @@ function handleFrame(f) {
     case 'TopK':
       window.onTopK(f);
       break;
+    case 'Gap': {
+      // task 1641: relay は高レート洪水で購読が遅れると Gap を出す。
+      // 黙って落とさず累計を HUD に出す (2D / 1D と同じ扱い)。
+      liveState.gapLost = (liveState.gapLost | 0) + f.lost;
+      const gapline = document.getElementById('gapline');
+      if (gapline) gapline.hidden = false;
+      const gapEl = document.getElementById('gap_lost');
+      if (gapEl) gapEl.textContent = String(liveState.gapLost);
+      break;
+    }
   }
 }
 
